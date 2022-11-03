@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3" # Cargo 的新依赖解析方式，与 edition 2024 兼容，能更好地处理依赖冲突
+members = [
+    "src/core",
+    "src/kv",
+    "src/sql",
+    "src/planner",
+    "src/server",
+    "src/common",
+    "src/bin",
+    "tests/regression",
+    "tests/integration",
+]
+
+[workspace.dependencies]
+# 测试相关依赖
+tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+
+[workspace.metadata]
+test-integration = "运行集成测试"
+test-unit = "运行单元测试"
+test-coverage = "生成测试覆盖率报告"

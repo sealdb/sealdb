@@ -1,0 +1,44 @@
+[package]
+name = "sealdb-test-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["SealDB Team"]
+description = "SealDB 测试框架核心库"
+license = "MIT"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 日志
+tracing = "0.1"
+
+# 系统监控
+sysinfo = { version = "0.29", optional = true }
+
+# 正则表达式
+regex = "1.0"
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# 并发控制
+dashmap = "5.4"
+
+[dev-dependencies]
+# 测试
+tokio-test = "0.4"
+tempfile = "3.6"
+
+[features]
+default = []
+full = ["sysinfo"] 

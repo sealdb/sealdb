@@ -1,0 +1,23 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 4000,
+    "max_connections": 1000
+  },
+  "storage": {
+    "tikv_pd_endpoints": [
+      "127.0.0.1:2379"
+    ],
+    "tikv_connect_timeout": 6000,
+    "tikv_request_timeout": 12000
+  },
+  "sql": {
+    "max_query_time": 30000,
+    "max_memory_usage": 1073741824
+  },
+  "logging": {
+    "level": "info",
+    "console": true,
+    "file": "logs/sealdb.log"
+  }
+}

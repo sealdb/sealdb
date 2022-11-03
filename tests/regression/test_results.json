@@ -1,0 +1,25 @@
+{
+  "suite": "performance",
+  "summary": {
+    "concurrency": 8,
+    "duration_seconds": 8.2,
+    "failed": 2,
+    "passed": 13,
+    "total": 15
+  },
+  "tests": [
+    {
+      "description": "基本 SELECT 查询测试",
+      "duration_ms": 120,
+      "name": "test_basic_select",
+      "status": "passed"
+    },
+    {
+      "description": "基本 INSERT 语句测试",
+      "duration_ms": 150,
+      "name": "test_basic_insert",
+      "status": "passed"
+    }
+  ],
+  "timestamp": "2025-08-01T13:42:27.654629053+00:00"
+}

@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  # TiKV 集群（生产环境完整版）
+  pd:
+    image: pingcap/pd:latest
+    container_name: sealdb-prod-pd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+    volumes:
+      - pd-data:/data
+    networks:
+      - sealdb-prod-network
+
+  tikv1:
+    image: pingcap/tikv:latest
+    container_name: sealdb-prod-tikv1
+    ports:
+      - "20160:20160"
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv1:20160
+      - --pd=pd:2379
+      - --data-dir=/data
+    volumes:
+      - tikv1-data:/data
+    depends_on:
+      - pd
+    networks:
+      - sealdb-prod-network
+
+  tikv2:
+    image: pingcap/tikv:latest
+    container_name: sealdb-prod-tikv2
+    ports:
+      - "20161:20160"
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv2:20160
+      - --pd=pd:2379
+      - --data-dir=/data
+    volumes:
+      - tikv2-data:/data
+    depends_on:
+      - pd
+    networks:
+      - sealdb-prod-network
+
+  tikv3:
+    image: pingcap/tikv:latest
+    container_name: sealdb-prod-tikv3
+    ports:
+      - "20162:20160"
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv3:20160
+      - --pd=pd:2379
+      - --data-dir=/data
+    volumes:
+      - tikv3-data:/data
+    depends_on:
+      - pd
+    networks:
+      - sealdb-prod-network
+
+  # SealDB 应用（生产环境）
+  sealdb:
+    build:
+      context: ../..
+      dockerfile: docker/prod/Dockerfile
+    container_name: sealdb-prod-app
+    ports:
+      - "4000:4000"
+    environment:
+      - RUST_LOG=info
+      - SEALDB_CONFIG=/app/config.toml
+    volumes:
+      - ../../config.toml:/app/config.toml:ro
+      - ../../logs:/app/logs
+    depends_on:
+      - pd
+      - tikv1
+      - tikv2
+      - tikv3
+    networks:
+      - sealdb-prod-network
+    restart: unless-stopped
+
+  # 监控服务（生产环境）
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sealdb-prod-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - sealdb-prod-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sealdb-prod-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../../monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ../../monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - sealdb-prod-network
+
+volumes:
+  pd-data:
+  tikv1-data:
+  tikv2-data:
+  tikv3-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  sealdb-prod-network:
+    driver: bridge

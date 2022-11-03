@@ -1,0 +1,52 @@
+# Git 相关
+.git
+.gitignore
+.gitattributes
+
+# Rust 相关
+target/
+Cargo.lock
+
+# 文档
+README.md
+docs/
+*.md
+
+# IDE 相关
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 测试覆盖率报告
+coverage/
+*.profraw
+
+# 构建产物
+dist/
+build/
+
+# Docker 相关
+docker/
+
+# 测试相关
+tests/
+benches/
+
+# 示例和文档
+examples/
+docs/
+
+# 监控配置
+monitoring/ 
