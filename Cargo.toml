@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3" # Cargo 的新依赖解析方式，与 edition 2024 兼容，能更好地处理依赖冲突
+members = [
+    "core",
+    "kv",
+    "sql",
+    "planner",
+    "server",
+    "common",
+    "bin",
+]

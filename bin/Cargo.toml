@@ -1,0 +1,11 @@
+[package]
+name = "bin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 这里写本 crate 需要的依赖
+
+[[bin]]
+name = "sealdb"
+path = "src/sealdb.rs"
