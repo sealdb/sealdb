@@ -1,0 +1,183 @@
+# SealDB 测试框架配置文件
+# 类似 PostgreSQL regress 和 MySQL MTR 的配置
+
+# 数据库连接配置
+database:
+  host: localhost
+  port: 4000
+  username: root
+  password: ""
+  database: test
+  connection_timeout: 30
+  query_timeout: 60
+  max_connections: 10
+
+# 测试套件配置
+test_suites:
+  basic:
+    enabled: true
+    description: "基本 SQL 功能测试"
+    parallel: false
+    retry_count: 3
+    timeout_seconds: 30
+    test_cases_dir: "sql_tests/basic"
+
+  advanced:
+    enabled: true
+    description: "高级 SQL 功能测试"
+    parallel: false
+    retry_count: 2
+    timeout_seconds: 60
+    test_cases_dir: "sql_tests/advanced"
+
+  optimizer:
+    enabled: true
+    description: "查询优化器测试"
+    parallel: true
+    retry_count: 1
+    timeout_seconds: 120
+    test_cases_dir: "sql_tests/optimizer"
+
+  performance:
+    enabled: true
+    description: "性能基准测试"
+    parallel: true
+    retry_count: 1
+    timeout_seconds: 300
+    test_cases_dir: "sql_tests/performance"
+
+  regression:
+    enabled: true
+    description: "回归测试"
+    parallel: false
+    retry_count: 2
+    timeout_seconds: 90
+    test_cases_dir: "sql_tests/regression"
+
+# 结果验证配置
+result_validation:
+  exact_match: true
+  case_sensitive: false
+  ignore_whitespace: true
+  tolerance: 0.01
+  max_diff_rows: 10
+  allow_partial_match: false
+
+# 性能阈值配置
+performance_thresholds:
+  max_execution_time_ms: 1000
+  min_throughput_qps: 1000.0
+  max_memory_usage_mb: 512.0
+  max_cpu_usage_percent: 80.0
+  max_network_io_kb: 1024.0
+  max_disk_io_kb: 512.0
+
+# 日志配置
+logging:
+  level: INFO
+  file_path: "test_framework.log"
+  console: true
+  include_performance: true
+  include_sql: true
+  include_timing: true
+
+# 报告配置
+reporting:
+  generate_html: true
+  generate_json: true
+  generate_junit: false
+  include_performance_charts: true
+  include_failed_details: true
+  output_dir: "reports"
+
+# 并行执行配置
+parallel:
+  max_workers: 10
+  max_memory_per_worker_mb: 100
+  timeout_per_worker_seconds: 300
+
+# 测试数据配置
+test_data:
+  sample_data_file: "data/sample_data.sql"
+  expected_results_dir: "data/expected_results"
+  cleanup_after_test: true
+  preserve_failed_data: true
+
+# 错误处理配置
+error_handling:
+  continue_on_failure: false
+  max_failures: 10
+  retry_failed_tests: true
+  save_error_details: true
+
+# 性能监控配置
+performance_monitoring:
+  enabled: true
+  collect_memory_usage: true
+  collect_cpu_usage: true
+  collect_network_io: true
+  collect_disk_io: true
+  sampling_interval_ms: 100
+
+# 数据库特定配置
+database_specific:
+  # TiKV 特定配置
+  tikv:
+    pd_endpoints: ["localhost:2379"]
+    max_batch_size: 128
+    max_batch_wait_time_ms: 10
+
+  # MySQL 兼容性配置
+  mysql_compatibility:
+    sql_mode: "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"
+    time_zone: "+00:00"
+    character_set: "utf8mb4"
+    collation: "utf8mb4_unicode_ci"
+
+# 测试环境配置
+test_environment:
+  # 清理策略
+  cleanup:
+    drop_tables: true
+    reset_sequences: true
+    clear_cache: true
+
+  # 数据准备
+  setup:
+    create_test_database: true
+    load_sample_data: true
+    create_indexes: true
+
+  # 隔离级别
+  isolation:
+    transaction_isolation: "READ_COMMITTED"
+    enable_foreign_keys: true
+    enable_triggers: true
+
+# 扩展配置
+extensions:
+  # 自定义验证器
+  custom_validators:
+    - name: "json_validator"
+      class: "JsonValidator"
+      enabled: true
+
+  # 自定义报告器
+  custom_reporters:
+    - name: "junit_reporter"
+      class: "JUnitReporter"
+      enabled: false
+
+  # 自定义数据提供者
+  custom_data_providers:
+    - name: "random_data_provider"
+      class: "RandomDataProvider"
+      enabled: true
+
+# 调试配置
+debug:
+  enabled: false
+  verbose_sql: false
+  show_query_plans: false
+  log_all_queries: false
+  profile_performance: false

@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # TiKV 集群（开发环境简化版）
+  pd:
+    image: pingcap/pd:latest
+    container_name: sealdb-dev-pd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+    volumes:
+      - pd-data:/data
+    networks:
+      - sealdb-dev-network
+
+  tikv1:
+    image: pingcap/tikv:latest
+    container_name: sealdb-dev-tikv1
+    ports:
+      - "20160:20160"
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv1:20160
+      - --pd=pd:2379
+      - --data-dir=/data
+    volumes:
+      - tikv1-data:/data
+    depends_on:
+      - pd
+    networks:
+      - sealdb-dev-network
+
+  # SealDB 应用（开发环境）
+  sealdb:
+    build:
+      context: ../..
+      dockerfile: docker/dev/Dockerfile
+    container_name: sealdb-dev-app
+    ports:
+      - "4000:4000"
+    environment:
+      - RUST_LOG=debug
+      - SEALDB_CONFIG=/app/config.toml
+    volumes:
+      - ../../config.toml:/app/config.toml:ro
+      - ../../logs:/app/logs
+    depends_on:
+      - pd
+      - tikv1
+    networks:
+      - sealdb-dev-network
+    restart: unless-stopped
+
+volumes:
+  pd-data:
+  tikv1-data:
+
+networks:
+  sealdb-dev-network:
+    driver: bridge 

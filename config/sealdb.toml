@@ -1,0 +1,33 @@
+# SealDB 配置文件模板
+# 支持 TOML 格式的配置文件
+# 复制此文件并根据需要修改配置项
+
+[server]
+# 服务器监听地址，0.0.0.0 表示监听所有网络接口
+host = "0.0.0.0"
+# 服务器监听端口
+port = 4000
+# 最大并发连接数
+max_connections = 1000
+
+[storage]
+# TiKV PD 集群端点列表，支持多个 PD 节点以实现高可用
+tikv_pd_endpoints = ["127.0.0.1:2379"]
+# TiKV 连接超时时间（毫秒）
+tikv_connect_timeout = 6000
+# TiKV 请求超时时间（毫秒）
+tikv_request_timeout = 12000
+
+[sql]
+# 最大查询执行时间（毫秒），超过此时间的查询将被终止
+max_query_time = 30000
+# 最大内存使用量（字节），1GB = 1073741824 字节
+max_memory_usage = 1073741824
+
+[logging]
+# 日志级别：debug, info, warn, error
+level = "info"
+# 是否将日志输出到控制台
+console = true
+# 日志文件路径，支持相对路径和绝对路径
+file = "logs/sealdb.log"
