@@ -1,15 +1,121 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
+# Build directories
+build/
+build-*/
+out/
+dist/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
 *.so
 *.dylib
+*.dll
 
-# Test binary, built with `go test -c`
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+sealdb
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Coverage files
+*.gcov
+*.gcda
+*.gcno
+coverage/
+*.info
+
+# Valgrind output
+valgrind-out.txt
+
+# Dependencies
+vcpkg_installed/
+conan/
+
+# Package files
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Documentation build
+docs/_build/
+docs/build/
+
+# Test outputs
+test-results/
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# Profiling data
+*.prof
+gmon.out
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Core dumps
+core
+core.*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Config files with sensitive data
+config/local.conf
+config/production.conf
+*.key
+*.pem
+*.crt
