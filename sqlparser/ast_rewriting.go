@@ -20,10 +20,10 @@ import (
 	"strconv"
 	"strings"
 
-	vtrpcpb "github.com/forcedb/forcedb/base/vt/proto/vtrpc"
-	querypb "github.com/forcedb/forcedb/base/vt/proto/query"
-	"github.com/forcedb/forcedb/base/vt/sysvars"
-	"github.com/forcedb/forcedb/base/vt/vterrors"
+	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	"github.com/forcedb/forcedb/sqlparser/depends/vt/sysvars"
+	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
 )
 
 var (

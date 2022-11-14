@@ -29,10 +29,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	vtrpcpb "github.com/forcedb/forcedb/base/vt/proto/vtrpc"
-	querypb "github.com/forcedb/forcedb/base/vt/proto/query"
-	"github.com/forcedb/forcedb/base/sqltypes"
-	"github.com/forcedb/forcedb/base/vt/vterrors"
+	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
+	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
 )
 
 func TestNormalize(t *testing.T) {

@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"unsafe"
 
-	hack "github.com/forcedb/forcedb/base/hack"
+	hack "github.com/forcedb/forcedb/sqlparser/depends/hack"
 )
 
 type cachedObject interface {

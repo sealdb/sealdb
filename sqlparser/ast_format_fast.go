@@ -20,7 +20,7 @@ package sqlparser
 import (
 	"fmt"
 
-	"github.com/forcedb/forcedb/base/sqltypes"
+	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
 )
 
 // formatFast formats the node.

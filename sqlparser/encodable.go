@@ -19,7 +19,7 @@ package sqlparser
 import (
 	"strings"
 
-	"github.com/forcedb/forcedb/base/sqltypes"
+	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
 )
 
 // This file contains types that are 'Encodable'.

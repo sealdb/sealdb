@@ -21,14 +21,14 @@ import (
 	"fmt"
 	"strings"
 
-	vtrpcpb "github.com/forcedb/forcedb/base/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/base/vt/vterrors"
+	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
 
-	"github.com/forcedb/forcedb/base/bytes2"
+	"github.com/forcedb/forcedb/sqlparser/depends/bytes2"
 
-	"github.com/forcedb/forcedb/base/sqltypes"
+	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
 
-	querypb "github.com/forcedb/forcedb/base/vt/proto/query"
+	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
 )
 
 // ParsedQuery represents a parsed query where
