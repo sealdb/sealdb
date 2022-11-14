@@ -26,11 +26,12 @@ testsqlparser: ast
 allpkgs = \
 	${ROOT}/base/...\
 	${ROOT}/sqlparser/...
+covout = /tmp/coverage.out
 
 coverage:
 	go build -v -o bin/gotestcover vendor/github.com/pierrre/gotestcover/*.go
-	bin/gotestcover -coverprofile=coverage.out -v $(allpkgs)
-	go tool cover -html=coverage.out
+	bin/gotestcover -coverprofile=$(covout) -v $(allpkgs)
+	go tool cover -html=$(covout)
 
 clean:
 	cd ${ROOT}/sqlparser && $(MAKE) clean

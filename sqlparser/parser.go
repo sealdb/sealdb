@@ -19,13 +19,10 @@ package sqlparser
 import (
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/forcedb/forcedb/base/flag"
 	"github.com/forcedb/forcedb/base/vt/log"
-	"github.com/forcedb/forcedb/base/vt/servenv"
 	"github.com/forcedb/forcedb/base/vt/vterrors"
 
 	vtrpcpb "github.com/forcedb/forcedb/base/vt/proto/vtrpc"
@@ -103,59 +100,6 @@ func Parse2(sql string) (Statement, BindVars, error) {
 		return nil, nil, ErrEmpty
 	}
 	return tokenizer.ParseTree, tokenizer.BindVars, nil
-}
-
-func checkParserVersionFlag() {
-	if flag.Parsed() {
-		versionFlagSync.Do(func() {
-			if mySQLVersion := servenv.MySQLServerVersion(); mySQLVersion != "" {
-				convVersion, err := convertMySQLVersionToCommentVersion(mySQLVersion)
-				if err != nil {
-					log.Error(err)
-				} else {
-					MySQLVersion = convVersion
-				}
-			}
-		})
-	}
-}
-
-// convertMySQLVersionToCommentVersion converts the MySQL version into comment version format.
-func convertMySQLVersionToCommentVersion(version string) (string, error) {
-	var res = make([]int, 3)
-	idx := 0
-	val := ""
-	for _, c := range version {
-		if c <= '9' && c >= '0' {
-			val += string(c)
-		} else if c == '.' {
-			v, err := strconv.Atoi(val)
-			if err != nil {
-				return "", err
-			}
-			val = ""
-			res[idx] = v
-			idx++
-			if idx == 3 {
-				break
-			}
-		} else {
-			break
-		}
-	}
-	if val != "" {
-		v, err := strconv.Atoi(val)
-		if err != nil {
-			return "", err
-		}
-		res[idx] = v
-		idx++
-	}
-	if idx == 0 {
-		return "", vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "MySQL version not correctly setup - %s.", version)
-	}
-
-	return fmt.Sprintf("%01d%02d%02d", res[0], res[1], res[2]), nil
 }
 
 // ParseExpr parses an expression and transforms it to an AST

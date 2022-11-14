@@ -16,12 +16,6 @@ limitations under the License.
 
 package sqlparser
 
-import (
-	"github.com/spf13/pflag"
-
-	"github.com/forcedb/forcedb/base/vt/servenv"
-)
-
 var (
 	// truncateUILen truncate queries in debug UIs to the given length. 0 means unlimited.
 	truncateUILen = 512
@@ -29,27 +23,6 @@ var (
 	// truncateErrLen truncate queries in error logs to the given length. 0 means unlimited.
 	truncateErrLen = 0
 )
-
-func registerQueryTruncationFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&truncateUILen, "sql-max-length-ui", truncateUILen, "truncate queries in debug UIs to the given length (default 512)")
-	fs.IntVar(&truncateErrLen, "sql-max-length-errors", truncateErrLen, "truncate queries in error logs to the given length (default unlimited)")
-}
-
-func init() {
-	for _, cmd := range []string{
-		"vtgate",
-		"vttablet",
-		"vtcombo",
-		"vtctld",
-		"vtctl",
-		"vtexplain",
-		"vtbackup",
-		"vttestserver",
-		"vtbench",
-	} {
-		servenv.OnParseFor(cmd, registerQueryTruncationFlags)
-	}
-}
 
 // GetTruncateErrLen is a function used to read the value of truncateErrLen
 func GetTruncateErrLen() int {

@@ -52,8 +52,6 @@ type Tokenizer struct {
 // NewStringTokenizer creates a new Tokenizer for the
 // sql string.
 func NewStringTokenizer(sql string) *Tokenizer {
-	checkParserVersionFlag()
-
 	return &Tokenizer{
 		buf:      sql,
 		BindVars: make(map[string]struct{}),
