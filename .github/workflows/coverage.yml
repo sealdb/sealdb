@@ -1,0 +1,26 @@
+name: ForceDB Coverage
+on: [push, pull_request]
+jobs:
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Set up Go 1.19
+      uses: actions/setup-go@v1
+      with:
+        go-version: 1.19
+      id: go
+
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Coverage
+      run: |
+        export PATH=$PATH:$(go env GOPATH)/bin
+        #export CODECOV_TOKEN='8c93d80b-152b-4a44-afe4-0e90f3ef242b'
+        make coverage
+        #bash <(curl -s https://codecov.io/bash) -f "!mock.go"
+        bash <(curl -s https://codecov.io/bash) -f "!mock.go" -t 8c93d80b-152b-4a44-afe4-0e90f3ef242b
+

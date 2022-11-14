@@ -2,10 +2,14 @@ package main
 
 import (
 	"fmt"
-	sqlparser "github.com/forcedb/forcedb/sqlparser"
+
+	"github.com/forcedb/forcedb/sqlparser"
+	"github.com/forcedb/forcedb/version"
 )
 
 func main() {
+	fmt.Printf("version: [%+v]\n", version.GetVersion())
+
 	testcases := []struct {
 		input  string
 		output string
