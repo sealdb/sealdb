@@ -25,3 +25,13 @@ jobs:
         #bash <(curl -s https://codecov.io/bash) -f "!mock.go"
         bash <(curl -s https://codecov.io/bash) -f "!mock.go" -t 27d0f712-a1c6-42b3-92a5-ad7c9117ed1a
 
+    # Only private respository need
+    - name: Coverage Upload
+      uses: codecov/codecov-action@v3
+      with:
+        token: 27d0f712-a1c6-42b3-92a5-ad7c9117ed1a # not required for public repos
+        files: /tmp/forcedb-coverage.out # optional
+        flags: unittests # optional
+        name: codecov-umbrella # optional
+        fail_ci_if_error: true # optional (default = false)
+        verbose: true # optional (default = false)

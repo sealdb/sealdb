@@ -33,7 +33,7 @@ testsqlparser: ast
 allpkgs = \
 	${ROOT}/sqlparser/...\
 	#${ROOT}/server/...
-covout = /tmp/coverage.out
+covout = /tmp/forcedb-coverage.out
 
 coverage:
 	go build -v -o bin/gotestcover vendor/github.com/pierrre/gotestcover/*.go
