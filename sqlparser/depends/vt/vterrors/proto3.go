@@ -17,7 +17,7 @@ limitations under the License.
 package vterrors
 
 import (
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 // This file contains the necessary methods to send and receive errors

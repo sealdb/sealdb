@@ -1,4 +1,4 @@
-name: ForceDB Test
+name: Seal Test
 on: [push, pull_request]
 jobs:
 

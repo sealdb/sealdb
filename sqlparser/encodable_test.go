@@ -20,7 +20,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
 )
 
 func TestEncodable(t *testing.T) {

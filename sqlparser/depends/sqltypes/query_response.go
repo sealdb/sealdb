@@ -17,7 +17,7 @@ limitations under the License.
 package sqltypes
 
 import (
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 // QueryResponse represents a query response for ExecuteBatch.

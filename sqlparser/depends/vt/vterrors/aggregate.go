@@ -20,7 +20,7 @@ import (
 	"sort"
 	"strings"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 // A list of all vtrpcpb.Code, ordered by priority. These priorities are

@@ -17,7 +17,7 @@ limitations under the License.
 package sqlparser
 
 import (
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
 )
 
 // Format formats the node.

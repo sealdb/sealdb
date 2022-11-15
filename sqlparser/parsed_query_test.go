@@ -20,8 +20,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 
 	"github.com/stretchr/testify/assert"
 )

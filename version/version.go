@@ -1,5 +1,5 @@
 /*
- * Copyright 2022-2023 The ForceDB Authors.
+ * Copyright 2022-2023 The Seal Authors.
 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	projectName = "forcedb"
+	projectName = "sealdb"
 	major       = 1
 	minor       = 0
 	patch       = 0

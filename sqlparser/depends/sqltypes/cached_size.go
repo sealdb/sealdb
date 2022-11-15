@@ -17,7 +17,7 @@ limitations under the License.
 
 package sqltypes
 
-import hack "github.com/forcedb/forcedb/sqlparser/depends/hack"
+import hack "github.com/sealdb/seal/sqlparser/depends/hack"
 
 func (cached *Result) CachedSize(alloc bool) int64 {
 	if cached == nil {
@@ -27,14 +27,14 @@ func (cached *Result) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field Fields []*github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query.Field
+	// field Fields []*github.com/sealdb/seal/sqlparser/depends/vt/proto/query.Field
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Fields)) * int64(8))
 		for _, elem := range cached.Fields {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Rows [][]github.com/forcedb/forcedb/sqlparser/depends/sqltypes.Value
+	// field Rows [][]github.com/sealdb/seal/sqlparser/depends/sqltypes.Value
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Rows)) * int64(24))
 		for _, elem := range cached.Rows {

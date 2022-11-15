@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 func TestWrapNil(t *testing.T) {

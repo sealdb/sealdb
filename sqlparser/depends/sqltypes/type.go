@@ -19,7 +19,7 @@ package sqltypes
 import (
 	"fmt"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 type Type = querypb.Type

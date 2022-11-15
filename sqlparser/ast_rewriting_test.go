@@ -22,7 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/sysvars"
+	"github.com/sealdb/seal/sqlparser/depends/vt/sysvars"
 
 	"github.com/stretchr/testify/require"
 )

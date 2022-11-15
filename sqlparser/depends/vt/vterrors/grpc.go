@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 // This file contains functions to convert errors to and from gRPC codes.

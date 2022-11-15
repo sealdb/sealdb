@@ -20,10 +20,10 @@ import (
 	"strconv"
 	"strings"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/sysvars"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
+	"github.com/sealdb/seal/sqlparser/depends/vt/sysvars"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 var (

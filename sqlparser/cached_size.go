@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"unsafe"
 
-	hack "github.com/forcedb/forcedb/sqlparser/depends/hack"
+	hack "github.com/sealdb/seal/sqlparser/depends/hack"
 )
 
 type cachedObject interface {
@@ -37,14 +37,14 @@ func (cached *AddColumns) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.ColumnDefinition
+	// field Columns []*github.com/sealdb/seal/sqlparser.ColumnDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field After *github.com/forcedb/forcedb/sqlparser.ColName
+	// field After *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.After.CachedSize(true)
 	return size
 }
@@ -56,7 +56,7 @@ func (cached *AddConstraintDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(8)
 	}
-	// field ConstraintDefinition *github.com/forcedb/forcedb/sqlparser.ConstraintDefinition
+	// field ConstraintDefinition *github.com/sealdb/seal/sqlparser.ConstraintDefinition
 	size += cached.ConstraintDefinition.CachedSize(true)
 	return size
 }
@@ -68,7 +68,7 @@ func (cached *AddIndexDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(8)
 	}
-	// field IndexDefinition *github.com/forcedb/forcedb/sqlparser.IndexDefinition
+	// field IndexDefinition *github.com/sealdb/seal/sqlparser.IndexDefinition
 	size += cached.IndexDefinition.CachedSize(true)
 	return size
 }
@@ -80,11 +80,11 @@ func (cached *AliasedExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field As github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field As github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.As.CachedSize(false)
 	return size
 }
@@ -96,27 +96,27 @@ func (cached *AliasedTableExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.SimpleTableExpr
+	// field Expr github.com/sealdb/seal/sqlparser.SimpleTableExpr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Partitions github.com/forcedb/forcedb/sqlparser.Partitions
+	// field Partitions github.com/sealdb/seal/sqlparser.Partitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Partitions)) * int64(32))
 		for _, elem := range cached.Partitions {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field As github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field As github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.As.CachedSize(false)
-	// field Hints github.com/forcedb/forcedb/sqlparser.IndexHints
+	// field Hints github.com/sealdb/seal/sqlparser.IndexHints
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Hints)) * int64(8))
 		for _, elem := range cached.Hints {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Columns github.com/forcedb/forcedb/sqlparser.Columns
+	// field Columns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(32))
 		for _, elem := range cached.Columns {
@@ -147,7 +147,7 @@ func (cached *AlterCheck) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -159,9 +159,9 @@ func (cached *AlterColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Column *github.com/forcedb/forcedb/sqlparser.ColName
+	// field Column *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.Column.CachedSize(true)
-	// field DefaultVal github.com/forcedb/forcedb/sqlparser.Expr
+	// field DefaultVal github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.DefaultVal.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -177,9 +177,9 @@ func (cached *AlterDatabase) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field DBName github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field DBName github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.DBName.CachedSize(false)
-	// field AlterOptions []github.com/forcedb/forcedb/sqlparser.DatabaseOption
+	// field AlterOptions []github.com/sealdb/seal/sqlparser.DatabaseOption
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.AlterOptions)) * int64(24))
 		for _, elem := range cached.AlterOptions {
@@ -196,7 +196,7 @@ func (cached *AlterIndex) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -212,7 +212,7 @@ func (cached *AlterMigration) CachedSize(alloc bool) int64 {
 	size += hack.RuntimeAllocSize(int64(len(cached.UUID)))
 	// field Expire string
 	size += hack.RuntimeAllocSize(int64(len(cached.Expire)))
-	// field Ratio *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Ratio *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Ratio.CachedSize(true)
 	// field Shards string
 	size += hack.RuntimeAllocSize(int64(len(cached.Shards)))
@@ -226,9 +226,9 @@ func (cached *AlterTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
-	// field AlterOptions []github.com/forcedb/forcedb/sqlparser.AlterOption
+	// field AlterOptions []github.com/sealdb/seal/sqlparser.AlterOption
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.AlterOptions)) * int64(16))
 		for _, elem := range cached.AlterOptions {
@@ -237,11 +237,11 @@ func (cached *AlterTable) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field PartitionSpec *github.com/forcedb/forcedb/sqlparser.PartitionSpec
+	// field PartitionSpec *github.com/sealdb/seal/sqlparser.PartitionSpec
 	size += cached.PartitionSpec.CachedSize(true)
-	// field PartitionOption *github.com/forcedb/forcedb/sqlparser.PartitionOption
+	// field PartitionOption *github.com/sealdb/seal/sqlparser.PartitionOption
 	size += cached.PartitionOption.CachedSize(true)
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -253,28 +253,28 @@ func (cached *AlterView) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(144)
 	}
-	// field ViewName github.com/forcedb/forcedb/sqlparser.TableName
+	// field ViewName github.com/sealdb/seal/sqlparser.TableName
 	size += cached.ViewName.CachedSize(false)
 	// field Algorithm string
 	size += hack.RuntimeAllocSize(int64(len(cached.Algorithm)))
-	// field Definer *github.com/forcedb/forcedb/sqlparser.Definer
+	// field Definer *github.com/sealdb/seal/sqlparser.Definer
 	size += cached.Definer.CachedSize(true)
 	// field Security string
 	size += hack.RuntimeAllocSize(int64(len(cached.Security)))
-	// field Columns github.com/forcedb/forcedb/sqlparser.Columns
+	// field Columns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(32))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Select github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Select github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Select.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
 	// field CheckOption string
 	size += hack.RuntimeAllocSize(int64(len(cached.CheckOption)))
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -286,18 +286,18 @@ func (cached *AlterVschema) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
-	// field VindexSpec *github.com/forcedb/forcedb/sqlparser.VindexSpec
+	// field VindexSpec *github.com/sealdb/seal/sqlparser.VindexSpec
 	size += cached.VindexSpec.CachedSize(true)
-	// field VindexCols []github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field VindexCols []github.com/sealdb/seal/sqlparser.IdentifierCI
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.VindexCols)) * int64(32))
 		for _, elem := range cached.VindexCols {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field AutoIncSpec *github.com/forcedb/forcedb/sqlparser.AutoIncSpec
+	// field AutoIncSpec *github.com/sealdb/seal/sqlparser.AutoIncSpec
 	size += cached.AutoIncSpec.CachedSize(true)
 	return size
 }
@@ -309,11 +309,11 @@ func (cached *AndExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.Expr
+	// field Right github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -327,7 +327,7 @@ func (cached *ArgumentLessWindowExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field OverClause *github.com/forcedb/forcedb/sqlparser.OverClause
+	// field OverClause *github.com/sealdb/seal/sqlparser.OverClause
 	size += cached.OverClause.CachedSize(true)
 	return size
 }
@@ -339,9 +339,9 @@ func (cached *AutoIncSpec) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Column github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Column github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Column.CachedSize(false)
-	// field Sequence github.com/forcedb/forcedb/sqlparser.TableName
+	// field Sequence github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Sequence.CachedSize(false)
 	return size
 }
@@ -353,7 +353,7 @@ func (cached *Avg) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -367,15 +367,15 @@ func (cached *BetweenExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field From github.com/forcedb/forcedb/sqlparser.Expr
+	// field From github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.From.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field To github.com/forcedb/forcedb/sqlparser.Expr
+	// field To github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.To.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -389,11 +389,11 @@ func (cached *BinaryExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.Expr
+	// field Right github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -438,7 +438,7 @@ func (cached *BitAnd) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -452,7 +452,7 @@ func (cached *BitOr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -466,7 +466,7 @@ func (cached *BitXor) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -480,9 +480,9 @@ func (cached *CallProc) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.TableName
+	// field Name github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Name.CachedSize(false)
-	// field Params github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Params github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Params)) * int64(16))
 		for _, elem := range cached.Params {
@@ -501,18 +501,18 @@ func (cached *CaseExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Whens []*github.com/forcedb/forcedb/sqlparser.When
+	// field Whens []*github.com/sealdb/seal/sqlparser.When
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Whens)) * int64(8))
 		for _, elem := range cached.Whens {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Else github.com/forcedb/forcedb/sqlparser.Expr
+	// field Else github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Else.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -526,11 +526,11 @@ func (cached *CastExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Type *github.com/forcedb/forcedb/sqlparser.ConvertType
+	// field Type *github.com/sealdb/seal/sqlparser.ConvertType
 	size += cached.Type.CachedSize(true)
 	return size
 }
@@ -542,11 +542,11 @@ func (cached *ChangeColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field OldColumn *github.com/forcedb/forcedb/sqlparser.ColName
+	// field OldColumn *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.OldColumn.CachedSize(true)
-	// field NewColDefinition *github.com/forcedb/forcedb/sqlparser.ColumnDefinition
+	// field NewColDefinition *github.com/sealdb/seal/sqlparser.ColumnDefinition
 	size += cached.NewColDefinition.CachedSize(true)
-	// field After *github.com/forcedb/forcedb/sqlparser.ColName
+	// field After *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.After.CachedSize(true)
 	return size
 }
@@ -558,7 +558,7 @@ func (cached *CharExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Exprs github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Exprs github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(16))
 		for _, elem := range cached.Exprs {
@@ -579,7 +579,7 @@ func (cached *CheckConstraintDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -593,9 +593,9 @@ func (cached *ColName) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Qualifier github.com/forcedb/forcedb/sqlparser.TableName
+	// field Qualifier github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Qualifier.CachedSize(false)
 	return size
 }
@@ -607,7 +607,7 @@ func (cached *CollateExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -635,9 +635,9 @@ func (cached *ColumnDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(128)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Type github.com/forcedb/forcedb/sqlparser.ColumnType
+	// field Type github.com/sealdb/seal/sqlparser.ColumnType
 	size += cached.Type.CachedSize(false)
 	return size
 }
@@ -651,13 +651,13 @@ func (cached *ColumnType) CachedSize(alloc bool) int64 {
 	}
 	// field Type string
 	size += hack.RuntimeAllocSize(int64(len(cached.Type)))
-	// field Options *github.com/forcedb/forcedb/sqlparser.ColumnTypeOptions
+	// field Options *github.com/sealdb/seal/sqlparser.ColumnTypeOptions
 	size += cached.Options.CachedSize(true)
-	// field Length *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Length *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Length.CachedSize(true)
-	// field Scale *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Scale *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Scale.CachedSize(true)
-	// field Charset github.com/forcedb/forcedb/sqlparser.ColumnCharset
+	// field Charset github.com/sealdb/seal/sqlparser.ColumnCharset
 	size += cached.Charset.CachedSize(false)
 	// field EnumValues []string
 	{
@@ -678,31 +678,31 @@ func (cached *ColumnTypeOptions) CachedSize(alloc bool) int64 {
 	}
 	// field Null *bool
 	size += hack.RuntimeAllocSize(int64(1))
-	// field Default github.com/forcedb/forcedb/sqlparser.Expr
+	// field Default github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Default.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OnUpdate github.com/forcedb/forcedb/sqlparser.Expr
+	// field OnUpdate github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.OnUpdate.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field As github.com/forcedb/forcedb/sqlparser.Expr
+	// field As github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.As.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Comment *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Comment *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Comment.CachedSize(true)
 	// field Collate string
 	size += hack.RuntimeAllocSize(int64(len(cached.Collate)))
-	// field Reference *github.com/forcedb/forcedb/sqlparser.ReferenceDefinition
+	// field Reference *github.com/sealdb/seal/sqlparser.ReferenceDefinition
 	size += cached.Reference.CachedSize(true)
 	// field Invisible *bool
 	size += hack.RuntimeAllocSize(int64(1))
-	// field EngineAttribute *github.com/forcedb/forcedb/sqlparser.Literal
+	// field EngineAttribute *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.EngineAttribute.CachedSize(true)
-	// field SecondaryEngineAttribute *github.com/forcedb/forcedb/sqlparser.Literal
+	// field SecondaryEngineAttribute *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.SecondaryEngineAttribute.CachedSize(true)
-	// field SRID *github.com/forcedb/forcedb/sqlparser.Literal
+	// field SRID *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.SRID.CachedSize(true)
 	return size
 }
@@ -758,16 +758,16 @@ func (cached *CommonTableExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field ID github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field ID github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.ID.CachedSize(false)
-	// field Columns github.com/forcedb/forcedb/sqlparser.Columns
+	// field Columns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(32))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Subquery *github.com/forcedb/forcedb/sqlparser.Subquery
+	// field Subquery *github.com/sealdb/seal/sqlparser.Subquery
 	size += cached.Subquery.CachedSize(true)
 	return size
 }
@@ -779,15 +779,15 @@ func (cached *ComparisonExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.Expr
+	// field Right github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Escape github.com/forcedb/forcedb/sqlparser.Expr
+	// field Escape github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Escape.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -801,9 +801,9 @@ func (cached *ConstraintDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Details github.com/forcedb/forcedb/sqlparser.ConstraintInfo
+	// field Details github.com/sealdb/seal/sqlparser.ConstraintInfo
 	if cc, ok := cached.Details.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -817,11 +817,11 @@ func (cached *ConvertExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Type *github.com/forcedb/forcedb/sqlparser.ConvertType
+	// field Type *github.com/sealdb/seal/sqlparser.ConvertType
 	size += cached.Type.CachedSize(true)
 	return size
 }
@@ -835,11 +835,11 @@ func (cached *ConvertType) CachedSize(alloc bool) int64 {
 	}
 	// field Type string
 	size += hack.RuntimeAllocSize(int64(len(cached.Type)))
-	// field Length *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Length *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Length.CachedSize(true)
-	// field Scale *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Scale *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Scale.CachedSize(true)
-	// field Charset github.com/forcedb/forcedb/sqlparser.ColumnCharset
+	// field Charset github.com/sealdb/seal/sqlparser.ColumnCharset
 	size += cached.Charset.CachedSize(false)
 	return size
 }
@@ -851,7 +851,7 @@ func (cached *ConvertUsingExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -867,7 +867,7 @@ func (cached *Count) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Args github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Args github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Args)) * int64(16))
 		for _, elem := range cached.Args {
@@ -886,11 +886,11 @@ func (cached *CreateDatabase) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field DBName github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field DBName github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.DBName.CachedSize(false)
-	// field CreateOptions []github.com/forcedb/forcedb/sqlparser.DatabaseOption
+	// field CreateOptions []github.com/sealdb/seal/sqlparser.DatabaseOption
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.CreateOptions)) * int64(24))
 		for _, elem := range cached.CreateOptions {
@@ -907,13 +907,13 @@ func (cached *CreateTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
-	// field TableSpec *github.com/forcedb/forcedb/sqlparser.TableSpec
+	// field TableSpec *github.com/sealdb/seal/sqlparser.TableSpec
 	size += cached.TableSpec.CachedSize(true)
-	// field OptLike *github.com/forcedb/forcedb/sqlparser.OptLike
+	// field OptLike *github.com/sealdb/seal/sqlparser.OptLike
 	size += cached.OptLike.CachedSize(true)
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -925,28 +925,28 @@ func (cached *CreateView) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(144)
 	}
-	// field ViewName github.com/forcedb/forcedb/sqlparser.TableName
+	// field ViewName github.com/sealdb/seal/sqlparser.TableName
 	size += cached.ViewName.CachedSize(false)
 	// field Algorithm string
 	size += hack.RuntimeAllocSize(int64(len(cached.Algorithm)))
-	// field Definer *github.com/forcedb/forcedb/sqlparser.Definer
+	// field Definer *github.com/sealdb/seal/sqlparser.Definer
 	size += cached.Definer.CachedSize(true)
 	// field Security string
 	size += hack.RuntimeAllocSize(int64(len(cached.Security)))
-	// field Columns github.com/forcedb/forcedb/sqlparser.Columns
+	// field Columns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(32))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Select github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Select github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Select.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
 	// field CheckOption string
 	size += hack.RuntimeAllocSize(int64(len(cached.CheckOption)))
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -958,9 +958,9 @@ func (cached *CurTimeFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Fsp github.com/forcedb/forcedb/sqlparser.Expr
+	// field Fsp github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Fsp.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -986,9 +986,9 @@ func (cached *DeallocateStmt) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -1026,18 +1026,18 @@ func (cached *Delete) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(144)
 	}
-	// field With *github.com/forcedb/forcedb/sqlparser.With
+	// field With *github.com/sealdb/seal/sqlparser.With
 	size += cached.With.CachedSize(true)
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Targets github.com/forcedb/forcedb/sqlparser.TableNames
+	// field Targets github.com/sealdb/seal/sqlparser.TableNames
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Targets)) * int64(32))
 		for _, elem := range cached.Targets {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field TableExprs github.com/forcedb/forcedb/sqlparser.TableExprs
+	// field TableExprs github.com/sealdb/seal/sqlparser.TableExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.TableExprs)) * int64(16))
 		for _, elem := range cached.TableExprs {
@@ -1046,23 +1046,23 @@ func (cached *Delete) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field Partitions github.com/forcedb/forcedb/sqlparser.Partitions
+	// field Partitions github.com/sealdb/seal/sqlparser.Partitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Partitions)) * int64(32))
 		for _, elem := range cached.Partitions {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Where *github.com/forcedb/forcedb/sqlparser.Where
+	// field Where *github.com/sealdb/seal/sqlparser.Where
 	size += cached.Where.CachedSize(true)
-	// field OrderBy github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderBy github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderBy)) * int64(8))
 		for _, elem := range cached.OrderBy {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
 	return size
 }
@@ -1074,7 +1074,7 @@ func (cached *DerivedTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Select github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Select github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Select.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1088,7 +1088,7 @@ func (cached *DropColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(8)
 	}
-	// field Name *github.com/forcedb/forcedb/sqlparser.ColName
+	// field Name *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.Name.CachedSize(true)
 	return size
 }
@@ -1100,9 +1100,9 @@ func (cached *DropDatabase) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field DBName github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field DBName github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.DBName.CachedSize(false)
 	return size
 }
@@ -1114,7 +1114,7 @@ func (cached *DropKey) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -1126,14 +1126,14 @@ func (cached *DropTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field FromTables github.com/forcedb/forcedb/sqlparser.TableNames
+	// field FromTables github.com/sealdb/seal/sqlparser.TableNames
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.FromTables)) * int64(32))
 		for _, elem := range cached.FromTables {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -1145,14 +1145,14 @@ func (cached *DropView) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field FromTables github.com/forcedb/forcedb/sqlparser.TableNames
+	// field FromTables github.com/sealdb/seal/sqlparser.TableNames
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.FromTables)) * int64(32))
 		for _, elem := range cached.FromTables {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -1164,11 +1164,11 @@ func (cached *ExecuteStmt) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Arguments []*github.com/forcedb/forcedb/sqlparser.Variable
+	// field Arguments []*github.com/sealdb/seal/sqlparser.Variable
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Arguments)) * int64(8))
 		for _, elem := range cached.Arguments {
@@ -1185,7 +1185,7 @@ func (cached *ExistsExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(8)
 	}
-	// field Subquery *github.com/forcedb/forcedb/sqlparser.Subquery
+	// field Subquery *github.com/sealdb/seal/sqlparser.Subquery
 	size += cached.Subquery.CachedSize(true)
 	return size
 }
@@ -1197,11 +1197,11 @@ func (cached *ExplainStmt) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Statement github.com/forcedb/forcedb/sqlparser.Statement
+	// field Statement github.com/sealdb/seal/sqlparser.Statement
 	if cc, ok := cached.Statement.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -1213,7 +1213,7 @@ func (cached *ExplainTab) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
 	// field Wild string
 	size += hack.RuntimeAllocSize(int64(len(cached.Wild)))
@@ -1227,7 +1227,7 @@ func (cached *ExtractFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1241,11 +1241,11 @@ func (cached *ExtractValueExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Fragment github.com/forcedb/forcedb/sqlparser.Expr
+	// field Fragment github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Fragment.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field XPathExpr github.com/forcedb/forcedb/sqlparser.Expr
+	// field XPathExpr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.XPathExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1259,13 +1259,13 @@ func (cached *ExtractedSubquery) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field Original github.com/forcedb/forcedb/sqlparser.Expr
+	// field Original github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Original.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Subquery *github.com/forcedb/forcedb/sqlparser.Subquery
+	// field Subquery *github.com/sealdb/seal/sqlparser.Subquery
 	size += cached.Subquery.CachedSize(true)
-	// field OtherSide github.com/forcedb/forcedb/sqlparser.Expr
+	// field OtherSide github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.OtherSide.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1273,7 +1273,7 @@ func (cached *ExtractedSubquery) CachedSize(alloc bool) int64 {
 	size += hack.RuntimeAllocSize(int64(len(cached.hasValuesArg)))
 	// field argName string
 	size += hack.RuntimeAllocSize(int64(len(cached.argName)))
-	// field alternative github.com/forcedb/forcedb/sqlparser.Expr
+	// field alternative github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.alternative.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1287,15 +1287,15 @@ func (cached *FirstOrLastValueExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field NullTreatmentClause *github.com/forcedb/forcedb/sqlparser.NullTreatmentClause
+	// field NullTreatmentClause *github.com/sealdb/seal/sqlparser.NullTreatmentClause
 	if cached.NullTreatmentClause != nil {
 		size += hack.RuntimeAllocSize(int64(1))
 	}
-	// field OverClause *github.com/forcedb/forcedb/sqlparser.OverClause
+	// field OverClause *github.com/sealdb/seal/sqlparser.OverClause
 	size += cached.OverClause.CachedSize(true)
 	return size
 }
@@ -1314,7 +1314,7 @@ func (cached *Flush) CachedSize(alloc bool) int64 {
 			size += hack.RuntimeAllocSize(int64(len(elem)))
 		}
 	}
-	// field TableNames github.com/forcedb/forcedb/sqlparser.TableNames
+	// field TableNames github.com/sealdb/seal/sqlparser.TableNames
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.TableNames)) * int64(32))
 		for _, elem := range cached.TableNames {
@@ -1331,16 +1331,16 @@ func (cached *ForeignKeyDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Source github.com/forcedb/forcedb/sqlparser.Columns
+	// field Source github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Source)) * int64(32))
 		for _, elem := range cached.Source {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field IndexName github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field IndexName github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.IndexName.CachedSize(false)
-	// field ReferenceDefinition *github.com/forcedb/forcedb/sqlparser.ReferenceDefinition
+	// field ReferenceDefinition *github.com/sealdb/seal/sqlparser.ReferenceDefinition
 	size += cached.ReferenceDefinition.CachedSize(true)
 	return size
 }
@@ -1352,9 +1352,9 @@ func (cached *FrameClause) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Start *github.com/forcedb/forcedb/sqlparser.FramePoint
+	// field Start *github.com/sealdb/seal/sqlparser.FramePoint
 	size += cached.Start.CachedSize(true)
-	// field End *github.com/forcedb/forcedb/sqlparser.FramePoint
+	// field End *github.com/sealdb/seal/sqlparser.FramePoint
 	size += cached.End.CachedSize(true)
 	return size
 }
@@ -1366,7 +1366,7 @@ func (cached *FramePoint) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1380,11 +1380,11 @@ func (cached *FuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Qualifier github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field Qualifier github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.Qualifier.CachedSize(false)
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Exprs github.com/forcedb/forcedb/sqlparser.SelectExprs
+	// field Exprs github.com/sealdb/seal/sqlparser.SelectExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(16))
 		for _, elem := range cached.Exprs {
@@ -1403,19 +1403,19 @@ func (cached *GTIDFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Set1 github.com/forcedb/forcedb/sqlparser.Expr
+	// field Set1 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Set1.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Set2 github.com/forcedb/forcedb/sqlparser.Expr
+	// field Set2 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Set2.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Timeout github.com/forcedb/forcedb/sqlparser.Expr
+	// field Timeout github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Timeout.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Channel github.com/forcedb/forcedb/sqlparser.Expr
+	// field Channel github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Channel.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1429,7 +1429,7 @@ func (cached *GroupConcatExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Exprs github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Exprs github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(16))
 		for _, elem := range cached.Exprs {
@@ -1438,7 +1438,7 @@ func (cached *GroupConcatExpr) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field OrderBy github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderBy github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderBy)) * int64(8))
 		for _, elem := range cached.OrderBy {
@@ -1447,7 +1447,7 @@ func (cached *GroupConcatExpr) CachedSize(alloc bool) int64 {
 	}
 	// field Separator string
 	size += hack.RuntimeAllocSize(int64(len(cached.Separator)))
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
 	return size
 }
@@ -1485,11 +1485,11 @@ func (cached *IndexColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Column github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Column github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Column.CachedSize(false)
-	// field Length *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Length *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Length.CachedSize(true)
-	// field Expression github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expression github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expression.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1503,16 +1503,16 @@ func (cached *IndexDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Info *github.com/forcedb/forcedb/sqlparser.IndexInfo
+	// field Info *github.com/sealdb/seal/sqlparser.IndexInfo
 	size += cached.Info.CachedSize(true)
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.IndexColumn
+	// field Columns []*github.com/sealdb/seal/sqlparser.IndexColumn
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Options []*github.com/forcedb/forcedb/sqlparser.IndexOption
+	// field Options []*github.com/sealdb/seal/sqlparser.IndexOption
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Options)) * int64(8))
 		for _, elem := range cached.Options {
@@ -1529,7 +1529,7 @@ func (cached *IndexHint) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Indexes []github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Indexes []github.com/sealdb/seal/sqlparser.IdentifierCI
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Indexes)) * int64(32))
 		for _, elem := range cached.Indexes {
@@ -1548,9 +1548,9 @@ func (cached *IndexInfo) CachedSize(alloc bool) int64 {
 	}
 	// field Type string
 	size += hack.RuntimeAllocSize(int64(len(cached.Type)))
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field ConstraintName github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field ConstraintName github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.ConstraintName.CachedSize(false)
 	return size
 }
@@ -1564,7 +1564,7 @@ func (cached *IndexOption) CachedSize(alloc bool) int64 {
 	}
 	// field Name string
 	size += hack.RuntimeAllocSize(int64(len(cached.Name)))
-	// field Value *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Value *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Value.CachedSize(true)
 	// field String string
 	size += hack.RuntimeAllocSize(int64(len(cached.String)))
@@ -1578,29 +1578,29 @@ func (cached *Insert) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(144)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
-	// field Partitions github.com/forcedb/forcedb/sqlparser.Partitions
+	// field Partitions github.com/sealdb/seal/sqlparser.Partitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Partitions)) * int64(32))
 		for _, elem := range cached.Partitions {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Columns github.com/forcedb/forcedb/sqlparser.Columns
+	// field Columns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(32))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Rows github.com/forcedb/forcedb/sqlparser.InsertRows
+	// field Rows github.com/sealdb/seal/sqlparser.InsertRows
 	if cc, ok := cached.Rows.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OnDup github.com/forcedb/forcedb/sqlparser.OnDup
+	// field OnDup github.com/sealdb/seal/sqlparser.OnDup
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OnDup)) * int64(8))
 		for _, elem := range cached.OnDup {
@@ -1617,19 +1617,19 @@ func (cached *InsertExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Str github.com/forcedb/forcedb/sqlparser.Expr
+	// field Str github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Str.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pos github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pos github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pos.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Len github.com/forcedb/forcedb/sqlparser.Expr
+	// field Len github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Len.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field NewStr github.com/forcedb/forcedb/sqlparser.Expr
+	// field NewStr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.NewStr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1643,7 +1643,7 @@ func (cached *IntervalExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1659,11 +1659,11 @@ func (cached *IntervalFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Exprs github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Exprs github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(16))
 		for _, elem := range cached.Exprs {
@@ -1684,7 +1684,7 @@ func (cached *IntroducerExpr) CachedSize(alloc bool) int64 {
 	}
 	// field CharacterSet string
 	size += hack.RuntimeAllocSize(int64(len(cached.CharacterSet)))
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1698,7 +1698,7 @@ func (cached *IsExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1712,7 +1712,7 @@ func (cached *JSONArrayExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Params github.com/forcedb/forcedb/sqlparser.Exprs
+	// field Params github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Params)) * int64(16))
 		for _, elem := range cached.Params {
@@ -1731,11 +1731,11 @@ func (cached *JSONAttributesExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Path github.com/forcedb/forcedb/sqlparser.Expr
+	// field Path github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Path.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1749,15 +1749,15 @@ func (cached *JSONContainsExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Target github.com/forcedb/forcedb/sqlparser.Expr
+	// field Target github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Target.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Candidate github.com/forcedb/forcedb/sqlparser.Expr
+	// field Candidate github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Candidate.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field PathList []github.com/forcedb/forcedb/sqlparser.Expr
+	// field PathList []github.com/sealdb/seal/sqlparser.Expr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PathList)) * int64(16))
 		for _, elem := range cached.PathList {
@@ -1776,15 +1776,15 @@ func (cached *JSONContainsPathExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OneOrAll github.com/forcedb/forcedb/sqlparser.Expr
+	// field OneOrAll github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.OneOrAll.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field PathList []github.com/forcedb/forcedb/sqlparser.Expr
+	// field PathList []github.com/sealdb/seal/sqlparser.Expr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PathList)) * int64(16))
 		for _, elem := range cached.PathList {
@@ -1803,11 +1803,11 @@ func (cached *JSONExtractExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field PathList []github.com/forcedb/forcedb/sqlparser.Expr
+	// field PathList []github.com/sealdb/seal/sqlparser.Expr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PathList)) * int64(16))
 		for _, elem := range cached.PathList {
@@ -1826,11 +1826,11 @@ func (cached *JSONKeysExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Path github.com/forcedb/forcedb/sqlparser.Expr
+	// field Path github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Path.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1844,7 +1844,7 @@ func (cached *JSONObjectExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Params []*github.com/forcedb/forcedb/sqlparser.JSONObjectParam
+	// field Params []*github.com/sealdb/seal/sqlparser.JSONObjectParam
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Params)) * int64(8))
 		for _, elem := range cached.Params {
@@ -1861,11 +1861,11 @@ func (cached *JSONObjectParam) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Key github.com/forcedb/forcedb/sqlparser.Expr
+	// field Key github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Key.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Value github.com/forcedb/forcedb/sqlparser.Expr
+	// field Value github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Value.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1879,11 +1879,11 @@ func (cached *JSONOverlapsExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field JSONDoc1 github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc1 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc1.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field JSONDoc2 github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc2 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc2.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1897,7 +1897,7 @@ func (cached *JSONPrettyExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field JSONVal github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONVal github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONVal.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1911,7 +1911,7 @@ func (cached *JSONQuoteExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field StringArg github.com/forcedb/forcedb/sqlparser.Expr
+	// field StringArg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.StringArg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1925,11 +1925,11 @@ func (cached *JSONRemoveExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field PathList github.com/forcedb/forcedb/sqlparser.Exprs
+	// field PathList github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PathList)) * int64(16))
 		for _, elem := range cached.PathList {
@@ -1948,11 +1948,11 @@ func (cached *JSONSchemaValidFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Schema github.com/forcedb/forcedb/sqlparser.Expr
+	// field Schema github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Schema.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Document github.com/forcedb/forcedb/sqlparser.Expr
+	// field Document github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Document.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1966,11 +1966,11 @@ func (cached *JSONSchemaValidationReportFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Schema github.com/forcedb/forcedb/sqlparser.Expr
+	// field Schema github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Schema.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Document github.com/forcedb/forcedb/sqlparser.Expr
+	// field Document github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Document.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -1984,23 +1984,23 @@ func (cached *JSONSearchExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OneOrAll github.com/forcedb/forcedb/sqlparser.Expr
+	// field OneOrAll github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.OneOrAll.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field SearchStr github.com/forcedb/forcedb/sqlparser.Expr
+	// field SearchStr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.SearchStr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field EscapeChar github.com/forcedb/forcedb/sqlparser.Expr
+	// field EscapeChar github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.EscapeChar.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field PathList []github.com/forcedb/forcedb/sqlparser.Expr
+	// field PathList []github.com/sealdb/seal/sqlparser.Expr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PathList)) * int64(16))
 		for _, elem := range cached.PathList {
@@ -2019,7 +2019,7 @@ func (cached *JSONStorageFreeExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field JSONVal github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONVal github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONVal.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2033,7 +2033,7 @@ func (cached *JSONStorageSizeExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field JSONVal github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONVal github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONVal.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2047,17 +2047,17 @@ func (cached *JSONTableExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Alias github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field Alias github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.Alias.CachedSize(false)
-	// field Filter github.com/forcedb/forcedb/sqlparser.Expr
+	// field Filter github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Filter.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.JtColumnDefinition
+	// field Columns []*github.com/sealdb/seal/sqlparser.JtColumnDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
@@ -2074,7 +2074,7 @@ func (cached *JSONUnquoteExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field JSONValue github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONValue github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONValue.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2088,19 +2088,19 @@ func (cached *JSONValueExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Path github.com/forcedb/forcedb/sqlparser.Expr
+	// field Path github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Path.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field ReturningType *github.com/forcedb/forcedb/sqlparser.ConvertType
+	// field ReturningType *github.com/sealdb/seal/sqlparser.ConvertType
 	size += cached.ReturningType.CachedSize(true)
-	// field EmptyOnResponse *github.com/forcedb/forcedb/sqlparser.JtOnResponse
+	// field EmptyOnResponse *github.com/sealdb/seal/sqlparser.JtOnResponse
 	size += cached.EmptyOnResponse.CachedSize(true)
-	// field ErrorOnResponse *github.com/forcedb/forcedb/sqlparser.JtOnResponse
+	// field ErrorOnResponse *github.com/sealdb/seal/sqlparser.JtOnResponse
 	size += cached.ErrorOnResponse.CachedSize(true)
 	return size
 }
@@ -2112,11 +2112,11 @@ func (cached *JSONValueMergeExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field JSONDocList github.com/forcedb/forcedb/sqlparser.Exprs
+	// field JSONDocList github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.JSONDocList)) * int64(16))
 		for _, elem := range cached.JSONDocList {
@@ -2135,11 +2135,11 @@ func (cached *JSONValueModifierExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field JSONDoc github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONDoc github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONDoc.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Params []*github.com/forcedb/forcedb/sqlparser.JSONObjectParam
+	// field Params []*github.com/sealdb/seal/sqlparser.JSONObjectParam
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Params)) * int64(8))
 		for _, elem := range cached.Params {
@@ -2156,11 +2156,11 @@ func (cached *JoinCondition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field On github.com/forcedb/forcedb/sqlparser.Expr
+	// field On github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.On.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Using github.com/forcedb/forcedb/sqlparser.Columns
+	// field Using github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Using)) * int64(32))
 		for _, elem := range cached.Using {
@@ -2177,15 +2177,15 @@ func (cached *JoinTableExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field LeftExpr github.com/forcedb/forcedb/sqlparser.TableExpr
+	// field LeftExpr github.com/sealdb/seal/sqlparser.TableExpr
 	if cc, ok := cached.LeftExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field RightExpr github.com/forcedb/forcedb/sqlparser.TableExpr
+	// field RightExpr github.com/sealdb/seal/sqlparser.TableExpr
 	if cc, ok := cached.RightExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Condition *github.com/forcedb/forcedb/sqlparser.JoinCondition
+	// field Condition *github.com/sealdb/seal/sqlparser.JoinCondition
 	size += cached.Condition.CachedSize(true)
 	return size
 }
@@ -2197,11 +2197,11 @@ func (cached *JtColumnDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field JtOrdinal *github.com/forcedb/forcedb/sqlparser.JtOrdinalColDef
+	// field JtOrdinal *github.com/sealdb/seal/sqlparser.JtOrdinalColDef
 	size += cached.JtOrdinal.CachedSize(true)
-	// field JtPath *github.com/forcedb/forcedb/sqlparser.JtPathColDef
+	// field JtPath *github.com/sealdb/seal/sqlparser.JtPathColDef
 	size += cached.JtPath.CachedSize(true)
-	// field JtNestedPath *github.com/forcedb/forcedb/sqlparser.JtNestedPathColDef
+	// field JtNestedPath *github.com/sealdb/seal/sqlparser.JtNestedPathColDef
 	size += cached.JtNestedPath.CachedSize(true)
 	return size
 }
@@ -2213,11 +2213,11 @@ func (cached *JtNestedPathColDef) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Path github.com/forcedb/forcedb/sqlparser.Expr
+	// field Path github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Path.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.JtColumnDefinition
+	// field Columns []*github.com/sealdb/seal/sqlparser.JtColumnDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
@@ -2234,7 +2234,7 @@ func (cached *JtOnResponse) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2248,7 +2248,7 @@ func (cached *JtOrdinalColDef) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -2260,17 +2260,17 @@ func (cached *JtPathColDef) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(176)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Type github.com/forcedb/forcedb/sqlparser.ColumnType
+	// field Type github.com/sealdb/seal/sqlparser.ColumnType
 	size += cached.Type.CachedSize(false)
-	// field Path github.com/forcedb/forcedb/sqlparser.Expr
+	// field Path github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Path.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field EmptyOnResponse *github.com/forcedb/forcedb/sqlparser.JtOnResponse
+	// field EmptyOnResponse *github.com/sealdb/seal/sqlparser.JtOnResponse
 	size += cached.EmptyOnResponse.CachedSize(true)
-	// field ErrorOnResponse *github.com/forcedb/forcedb/sqlparser.JtOnResponse
+	// field ErrorOnResponse *github.com/sealdb/seal/sqlparser.JtOnResponse
 	size += cached.ErrorOnResponse.CachedSize(true)
 	return size
 }
@@ -2292,21 +2292,21 @@ func (cached *LagLeadExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field N github.com/forcedb/forcedb/sqlparser.Expr
+	// field N github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.N.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Default github.com/forcedb/forcedb/sqlparser.Expr
+	// field Default github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Default.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OverClause *github.com/forcedb/forcedb/sqlparser.OverClause
+	// field OverClause *github.com/sealdb/seal/sqlparser.OverClause
 	size += cached.OverClause.CachedSize(true)
-	// field NullTreatmentClause *github.com/forcedb/forcedb/sqlparser.NullTreatmentClause
+	// field NullTreatmentClause *github.com/sealdb/seal/sqlparser.NullTreatmentClause
 	if cached.NullTreatmentClause != nil {
 		size += hack.RuntimeAllocSize(int64(1))
 	}
@@ -2320,11 +2320,11 @@ func (cached *Limit) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Offset github.com/forcedb/forcedb/sqlparser.Expr
+	// field Offset github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Offset.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Rowcount github.com/forcedb/forcedb/sqlparser.Expr
+	// field Rowcount github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Rowcount.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2350,15 +2350,15 @@ func (cached *LocateExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field SubStr github.com/forcedb/forcedb/sqlparser.Expr
+	// field SubStr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.SubStr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Str github.com/forcedb/forcedb/sqlparser.Expr
+	// field Str github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Str.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pos github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pos github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pos.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2382,7 +2382,7 @@ func (cached *LockTables) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Tables github.com/forcedb/forcedb/sqlparser.TableAndLockTypes
+	// field Tables github.com/sealdb/seal/sqlparser.TableAndLockTypes
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Tables)) * int64(8))
 		for _, elem := range cached.Tables {
@@ -2399,11 +2399,11 @@ func (cached *LockingFunc) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.Expr
+	// field Name github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Name.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Timeout github.com/forcedb/forcedb/sqlparser.Expr
+	// field Timeout github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Timeout.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2417,14 +2417,14 @@ func (cached *MatchExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.ColName
+	// field Columns []*github.com/sealdb/seal/sqlparser.ColName
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2438,7 +2438,7 @@ func (cached *Max) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2452,11 +2452,11 @@ func (cached *MemberOfExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Value github.com/forcedb/forcedb/sqlparser.Expr
+	// field Value github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Value.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field JSONArr github.com/forcedb/forcedb/sqlparser.Expr
+	// field JSONArr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.JSONArr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2470,7 +2470,7 @@ func (cached *Min) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2484,9 +2484,9 @@ func (cached *ModifyColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field NewColDefinition *github.com/forcedb/forcedb/sqlparser.ColumnDefinition
+	// field NewColDefinition *github.com/sealdb/seal/sqlparser.ColumnDefinition
 	size += cached.NewColDefinition.CachedSize(true)
-	// field After *github.com/forcedb/forcedb/sqlparser.ColName
+	// field After *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.After.CachedSize(true)
 	return size
 }
@@ -2498,21 +2498,21 @@ func (cached *NTHValueExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field N github.com/forcedb/forcedb/sqlparser.Expr
+	// field N github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.N.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OverClause *github.com/forcedb/forcedb/sqlparser.OverClause
+	// field OverClause *github.com/sealdb/seal/sqlparser.OverClause
 	size += cached.OverClause.CachedSize(true)
-	// field FromFirstLastClause *github.com/forcedb/forcedb/sqlparser.FromFirstLastClause
+	// field FromFirstLastClause *github.com/sealdb/seal/sqlparser.FromFirstLastClause
 	if cached.FromFirstLastClause != nil {
 		size += hack.RuntimeAllocSize(int64(1))
 	}
-	// field NullTreatmentClause *github.com/forcedb/forcedb/sqlparser.NullTreatmentClause
+	// field NullTreatmentClause *github.com/sealdb/seal/sqlparser.NullTreatmentClause
 	if cached.NullTreatmentClause != nil {
 		size += hack.RuntimeAllocSize(int64(1))
 	}
@@ -2526,7 +2526,7 @@ func (cached *NamedWindow) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Windows github.com/forcedb/forcedb/sqlparser.WindowDefinitions
+	// field Windows github.com/sealdb/seal/sqlparser.WindowDefinitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Windows)) * int64(8))
 		for _, elem := range cached.Windows {
@@ -2543,7 +2543,7 @@ func (cached *Nextval) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2557,7 +2557,7 @@ func (cached *NotExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2571,11 +2571,11 @@ func (cached *NtileExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field N github.com/forcedb/forcedb/sqlparser.Expr
+	// field N github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.N.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OverClause *github.com/forcedb/forcedb/sqlparser.OverClause
+	// field OverClause *github.com/sealdb/seal/sqlparser.OverClause
 	size += cached.OverClause.CachedSize(true)
 	return size
 }
@@ -2599,7 +2599,7 @@ func (cached *OptLike) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field LikeTable github.com/forcedb/forcedb/sqlparser.TableName
+	// field LikeTable github.com/sealdb/seal/sqlparser.TableName
 	size += cached.LikeTable.CachedSize(false)
 	return size
 }
@@ -2611,11 +2611,11 @@ func (cached *OrExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.Expr
+	// field Right github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2629,7 +2629,7 @@ func (cached *Order) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2643,7 +2643,7 @@ func (cached *OrderByOption) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Cols github.com/forcedb/forcedb/sqlparser.Columns
+	// field Cols github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Cols)) * int64(32))
 		for _, elem := range cached.Cols {
@@ -2660,9 +2660,9 @@ func (cached *OverClause) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field WindowName github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field WindowName github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.WindowName.CachedSize(false)
-	// field WindowSpec *github.com/forcedb/forcedb/sqlparser.WindowSpecification
+	// field WindowSpec *github.com/sealdb/seal/sqlparser.WindowSpecification
 	size += cached.WindowSpec.CachedSize(true)
 	return size
 }
@@ -2674,7 +2674,7 @@ func (cached *ParenTableExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Exprs github.com/forcedb/forcedb/sqlparser.TableExprs
+	// field Exprs github.com/sealdb/seal/sqlparser.TableExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(16))
 		for _, elem := range cached.Exprs {
@@ -2693,14 +2693,14 @@ func (cached *ParsedComments) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field comments github.com/forcedb/forcedb/sqlparser.Comments
+	// field comments github.com/sealdb/seal/sqlparser.Comments
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.comments)) * int64(16))
 		for _, elem := range cached.comments {
 			size += hack.RuntimeAllocSize(int64(len(elem)))
 		}
 	}
-	// field _directives *github.com/forcedb/forcedb/sqlparser.CommentDirectives
+	// field _directives *github.com/sealdb/seal/sqlparser.CommentDirectives
 	size += cached._directives.CachedSize(true)
 	return size
 }
@@ -2714,7 +2714,7 @@ func (cached *ParsedQuery) CachedSize(alloc bool) int64 {
 	}
 	// field Query string
 	size += hack.RuntimeAllocSize(int64(len(cached.Query)))
-	// field bindLocations []github.com/forcedb/forcedb/sqlparser.bindLocation
+	// field bindLocations []github.com/sealdb/seal/sqlparser.bindLocation
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.bindLocations)) * int64(16))
 	}
@@ -2728,9 +2728,9 @@ func (cached *PartitionDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Options *github.com/forcedb/forcedb/sqlparser.PartitionDefinitionOptions
+	// field Options *github.com/sealdb/seal/sqlparser.PartitionDefinitionOptions
 	size += cached.Options.CachedSize(true)
 	return size
 }
@@ -2742,15 +2742,15 @@ func (cached *PartitionDefinitionOptions) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field ValueRange *github.com/forcedb/forcedb/sqlparser.PartitionValueRange
+	// field ValueRange *github.com/sealdb/seal/sqlparser.PartitionValueRange
 	size += cached.ValueRange.CachedSize(true)
-	// field Comment *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Comment *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Comment.CachedSize(true)
-	// field Engine *github.com/forcedb/forcedb/sqlparser.PartitionEngine
+	// field Engine *github.com/sealdb/seal/sqlparser.PartitionEngine
 	size += cached.Engine.CachedSize(true)
-	// field DataDirectory *github.com/forcedb/forcedb/sqlparser.Literal
+	// field DataDirectory *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.DataDirectory.CachedSize(true)
-	// field IndexDirectory *github.com/forcedb/forcedb/sqlparser.Literal
+	// field IndexDirectory *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.IndexDirectory.CachedSize(true)
 	// field MaxRows *int
 	size += hack.RuntimeAllocSize(int64(8))
@@ -2758,7 +2758,7 @@ func (cached *PartitionDefinitionOptions) CachedSize(alloc bool) int64 {
 	size += hack.RuntimeAllocSize(int64(8))
 	// field TableSpace string
 	size += hack.RuntimeAllocSize(int64(len(cached.TableSpace)))
-	// field SubPartitionDefinitions github.com/forcedb/forcedb/sqlparser.SubPartitionDefinitions
+	// field SubPartitionDefinitions github.com/sealdb/seal/sqlparser.SubPartitionDefinitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.SubPartitionDefinitions)) * int64(8))
 		for _, elem := range cached.SubPartitionDefinitions {
@@ -2787,20 +2787,20 @@ func (cached *PartitionOption) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field ColList github.com/forcedb/forcedb/sqlparser.Columns
+	// field ColList github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.ColList)) * int64(32))
 		for _, elem := range cached.ColList {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field SubPartition *github.com/forcedb/forcedb/sqlparser.SubPartition
+	// field SubPartition *github.com/sealdb/seal/sqlparser.SubPartition
 	size += cached.SubPartition.CachedSize(true)
-	// field Definitions []*github.com/forcedb/forcedb/sqlparser.PartitionDefinition
+	// field Definitions []*github.com/sealdb/seal/sqlparser.PartitionDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Definitions)) * int64(8))
 		for _, elem := range cached.Definitions {
@@ -2817,18 +2817,18 @@ func (cached *PartitionSpec) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field Names github.com/forcedb/forcedb/sqlparser.Partitions
+	// field Names github.com/sealdb/seal/sqlparser.Partitions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Names)) * int64(32))
 		for _, elem := range cached.Names {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Number *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Number *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Number.CachedSize(true)
-	// field TableName github.com/forcedb/forcedb/sqlparser.TableName
+	// field TableName github.com/sealdb/seal/sqlparser.TableName
 	size += cached.TableName.CachedSize(false)
-	// field Definitions []*github.com/forcedb/forcedb/sqlparser.PartitionDefinition
+	// field Definitions []*github.com/sealdb/seal/sqlparser.PartitionDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Definitions)) * int64(8))
 		for _, elem := range cached.Definitions {
@@ -2845,7 +2845,7 @@ func (cached *PartitionValueRange) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Range github.com/forcedb/forcedb/sqlparser.ValTuple
+	// field Range github.com/sealdb/seal/sqlparser.ValTuple
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Range)) * int64(16))
 		for _, elem := range cached.Range {
@@ -2864,7 +2864,7 @@ func (cached *PerformanceSchemaFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Argument github.com/forcedb/forcedb/sqlparser.Expr
+	// field Argument github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Argument.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2878,13 +2878,13 @@ func (cached *PrepareStmt) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Statement github.com/forcedb/forcedb/sqlparser.Expr
+	// field Statement github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Statement.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -2896,9 +2896,9 @@ func (cached *ReferenceDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field ReferencedTable github.com/forcedb/forcedb/sqlparser.TableName
+	// field ReferencedTable github.com/sealdb/seal/sqlparser.TableName
 	size += cached.ReferencedTable.CachedSize(false)
-	// field ReferencedColumns github.com/forcedb/forcedb/sqlparser.Columns
+	// field ReferencedColumns github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.ReferencedColumns)) * int64(32))
 		for _, elem := range cached.ReferencedColumns {
@@ -2915,27 +2915,27 @@ func (cached *RegexpInstrExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pattern github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pattern github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pattern.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Position github.com/forcedb/forcedb/sqlparser.Expr
+	// field Position github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Position.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Occurrence github.com/forcedb/forcedb/sqlparser.Expr
+	// field Occurrence github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Occurrence.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field ReturnOption github.com/forcedb/forcedb/sqlparser.Expr
+	// field ReturnOption github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.ReturnOption.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field MatchType github.com/forcedb/forcedb/sqlparser.Expr
+	// field MatchType github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.MatchType.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2949,15 +2949,15 @@ func (cached *RegexpLikeExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pattern github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pattern github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pattern.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field MatchType github.com/forcedb/forcedb/sqlparser.Expr
+	// field MatchType github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.MatchType.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -2971,27 +2971,27 @@ func (cached *RegexpReplaceExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pattern github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pattern github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pattern.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Repl github.com/forcedb/forcedb/sqlparser.Expr
+	// field Repl github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Repl.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Occurrence github.com/forcedb/forcedb/sqlparser.Expr
+	// field Occurrence github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Occurrence.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Position github.com/forcedb/forcedb/sqlparser.Expr
+	// field Position github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Position.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field MatchType github.com/forcedb/forcedb/sqlparser.Expr
+	// field MatchType github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.MatchType.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3005,23 +3005,23 @@ func (cached *RegexpSubstrExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Pattern github.com/forcedb/forcedb/sqlparser.Expr
+	// field Pattern github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Pattern.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Occurrence github.com/forcedb/forcedb/sqlparser.Expr
+	// field Occurrence github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Occurrence.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Position github.com/forcedb/forcedb/sqlparser.Expr
+	// field Position github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Position.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field MatchType github.com/forcedb/forcedb/sqlparser.Expr
+	// field MatchType github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.MatchType.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3035,7 +3035,7 @@ func (cached *Release) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -3047,9 +3047,9 @@ func (cached *RenameColumn) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field OldName *github.com/forcedb/forcedb/sqlparser.ColName
+	// field OldName *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.OldName.CachedSize(true)
-	// field NewName *github.com/forcedb/forcedb/sqlparser.ColName
+	// field NewName *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.NewName.CachedSize(true)
 	return size
 }
@@ -3061,9 +3061,9 @@ func (cached *RenameIndex) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field OldName github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field OldName github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.OldName.CachedSize(false)
-	// field NewName github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field NewName github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.NewName.CachedSize(false)
 	return size
 }
@@ -3075,7 +3075,7 @@ func (cached *RenameTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field TablePairs []*github.com/forcedb/forcedb/sqlparser.RenameTablePair
+	// field TablePairs []*github.com/sealdb/seal/sqlparser.RenameTablePair
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.TablePairs)) * int64(8))
 		for _, elem := range cached.TablePairs {
@@ -3092,7 +3092,7 @@ func (cached *RenameTableName) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
 	return size
 }
@@ -3104,9 +3104,9 @@ func (cached *RenameTablePair) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field FromTable github.com/forcedb/forcedb/sqlparser.TableName
+	// field FromTable github.com/sealdb/seal/sqlparser.TableName
 	size += cached.FromTable.CachedSize(false)
-	// field ToTable github.com/forcedb/forcedb/sqlparser.TableName
+	// field ToTable github.com/sealdb/seal/sqlparser.TableName
 	size += cached.ToTable.CachedSize(false)
 	return size
 }
@@ -3120,7 +3120,7 @@ func (cached *RevertMigration) CachedSize(alloc bool) int64 {
 	}
 	// field UUID string
 	size += hack.RuntimeAllocSize(int64(len(cached.UUID)))
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -3132,7 +3132,7 @@ func (cached *SRollback) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -3144,7 +3144,7 @@ func (cached *Savepoint) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -3158,7 +3158,7 @@ func (cached *Select) CachedSize(alloc bool) int64 {
 	}
 	// field Cache *bool
 	size += hack.RuntimeAllocSize(int64(1))
-	// field From []github.com/forcedb/forcedb/sqlparser.TableExpr
+	// field From []github.com/sealdb/seal/sqlparser.TableExpr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.From)) * int64(16))
 		for _, elem := range cached.From {
@@ -3167,9 +3167,9 @@ func (cached *Select) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field SelectExprs github.com/forcedb/forcedb/sqlparser.SelectExprs
+	// field SelectExprs github.com/sealdb/seal/sqlparser.SelectExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.SelectExprs)) * int64(16))
 		for _, elem := range cached.SelectExprs {
@@ -3178,11 +3178,11 @@ func (cached *Select) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field Where *github.com/forcedb/forcedb/sqlparser.Where
+	// field Where *github.com/sealdb/seal/sqlparser.Where
 	size += cached.Where.CachedSize(true)
-	// field With *github.com/forcedb/forcedb/sqlparser.With
+	// field With *github.com/sealdb/seal/sqlparser.With
 	size += cached.With.CachedSize(true)
-	// field GroupBy github.com/forcedb/forcedb/sqlparser.GroupBy
+	// field GroupBy github.com/sealdb/seal/sqlparser.GroupBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.GroupBy)) * int64(16))
 		for _, elem := range cached.GroupBy {
@@ -3191,25 +3191,25 @@ func (cached *Select) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field Having *github.com/forcedb/forcedb/sqlparser.Where
+	// field Having *github.com/sealdb/seal/sqlparser.Where
 	size += cached.Having.CachedSize(true)
-	// field Windows github.com/forcedb/forcedb/sqlparser.NamedWindows
+	// field Windows github.com/sealdb/seal/sqlparser.NamedWindows
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Windows)) * int64(8))
 		for _, elem := range cached.Windows {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field OrderBy github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderBy github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderBy)) * int64(8))
 		for _, elem := range cached.OrderBy {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
-	// field Into *github.com/forcedb/forcedb/sqlparser.SelectInto
+	// field Into *github.com/sealdb/seal/sqlparser.SelectInto
 	size += cached.Into.CachedSize(true)
 	return size
 }
@@ -3223,7 +3223,7 @@ func (cached *SelectInto) CachedSize(alloc bool) int64 {
 	}
 	// field FileName string
 	size += hack.RuntimeAllocSize(int64(len(cached.FileName)))
-	// field Charset github.com/forcedb/forcedb/sqlparser.ColumnCharset
+	// field Charset github.com/sealdb/seal/sqlparser.ColumnCharset
 	size += cached.Charset.CachedSize(false)
 	// field FormatOption string
 	size += hack.RuntimeAllocSize(int64(len(cached.FormatOption)))
@@ -3243,9 +3243,9 @@ func (cached *Set) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Exprs github.com/forcedb/forcedb/sqlparser.SetExprs
+	// field Exprs github.com/sealdb/seal/sqlparser.SetExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(8))
 		for _, elem := range cached.Exprs {
@@ -3262,9 +3262,9 @@ func (cached *SetExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Var *github.com/forcedb/forcedb/sqlparser.Variable
+	// field Var *github.com/sealdb/seal/sqlparser.Variable
 	size += cached.Var.CachedSize(true)
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3278,9 +3278,9 @@ func (cached *SetTransaction) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field Characteristics []github.com/forcedb/forcedb/sqlparser.Characteristic
+	// field Characteristics []github.com/sealdb/seal/sqlparser.Characteristic
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Characteristics)) * int64(16))
 		for _, elem := range cached.Characteristics {
@@ -3299,7 +3299,7 @@ func (cached *Show) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Internal github.com/forcedb/forcedb/sqlparser.ShowInternal
+	// field Internal github.com/sealdb/seal/sqlparser.ShowInternal
 	if cc, ok := cached.Internal.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3313,11 +3313,11 @@ func (cached *ShowBasic) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Tbl github.com/forcedb/forcedb/sqlparser.TableName
+	// field Tbl github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Tbl.CachedSize(false)
-	// field DbName github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field DbName github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.DbName.CachedSize(false)
-	// field Filter *github.com/forcedb/forcedb/sqlparser.ShowFilter
+	// field Filter *github.com/sealdb/seal/sqlparser.ShowFilter
 	size += cached.Filter.CachedSize(true)
 	return size
 }
@@ -3329,7 +3329,7 @@ func (cached *ShowCreate) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Op github.com/forcedb/forcedb/sqlparser.TableName
+	// field Op github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Op.CachedSize(false)
 	return size
 }
@@ -3343,7 +3343,7 @@ func (cached *ShowFilter) CachedSize(alloc bool) int64 {
 	}
 	// field Like string
 	size += hack.RuntimeAllocSize(int64(len(cached.Like)))
-	// field Filter github.com/forcedb/forcedb/sqlparser.Expr
+	// field Filter github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Filter.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3359,7 +3359,7 @@ func (cached *ShowMigrationLogs) CachedSize(alloc bool) int64 {
 	}
 	// field UUID string
 	size += hack.RuntimeAllocSize(int64(len(cached.UUID)))
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
 	return size
 }
@@ -3383,7 +3383,7 @@ func (cached *ShowThrottledApps) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Comments github.com/forcedb/forcedb/sqlparser.Comments
+	// field Comments github.com/sealdb/seal/sqlparser.Comments
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Comments)) * int64(16))
 		for _, elem := range cached.Comments {
@@ -3400,7 +3400,7 @@ func (cached *StarExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field TableName github.com/forcedb/forcedb/sqlparser.TableName
+	// field TableName github.com/sealdb/seal/sqlparser.TableName
 	size += cached.TableName.CachedSize(false)
 	return size
 }
@@ -3412,7 +3412,7 @@ func (cached *Std) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3426,7 +3426,7 @@ func (cached *StdDev) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3440,7 +3440,7 @@ func (cached *StdPop) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3454,7 +3454,7 @@ func (cached *StdSamp) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3468,13 +3468,13 @@ func (cached *Stream) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field SelectExpr github.com/forcedb/forcedb/sqlparser.SelectExpr
+	// field SelectExpr github.com/sealdb/seal/sqlparser.SelectExpr
 	if cc, ok := cached.SelectExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
 	return size
 }
@@ -3486,14 +3486,14 @@ func (cached *SubPartition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field ColList github.com/forcedb/forcedb/sqlparser.Columns
+	// field ColList github.com/sealdb/seal/sqlparser.Columns
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.ColList)) * int64(32))
 		for _, elem := range cached.ColList {
 			size += elem.CachedSize(false)
 		}
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3507,9 +3507,9 @@ func (cached *SubPartitionDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Options *github.com/forcedb/forcedb/sqlparser.SubPartitionDefinitionOptions
+	// field Options *github.com/sealdb/seal/sqlparser.SubPartitionDefinitionOptions
 	size += cached.Options.CachedSize(true)
 	return size
 }
@@ -3521,13 +3521,13 @@ func (cached *SubPartitionDefinitionOptions) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(64)
 	}
-	// field Comment *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Comment *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Comment.CachedSize(true)
-	// field Engine *github.com/forcedb/forcedb/sqlparser.PartitionEngine
+	// field Engine *github.com/sealdb/seal/sqlparser.PartitionEngine
 	size += cached.Engine.CachedSize(true)
-	// field DataDirectory *github.com/forcedb/forcedb/sqlparser.Literal
+	// field DataDirectory *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.DataDirectory.CachedSize(true)
-	// field IndexDirectory *github.com/forcedb/forcedb/sqlparser.Literal
+	// field IndexDirectory *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.IndexDirectory.CachedSize(true)
 	// field MaxRows *int
 	size += hack.RuntimeAllocSize(int64(8))
@@ -3545,7 +3545,7 @@ func (cached *Subquery) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Select github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Select github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Select.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3559,15 +3559,15 @@ func (cached *SubstrExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.Expr
+	// field Name github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Name.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field From github.com/forcedb/forcedb/sqlparser.Expr
+	// field From github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.From.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field To github.com/forcedb/forcedb/sqlparser.Expr
+	// field To github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.To.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3581,7 +3581,7 @@ func (cached *Sum) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3595,7 +3595,7 @@ func (cached *TableAndLockType) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableExpr
+	// field Table github.com/sealdb/seal/sqlparser.TableExpr
 	if cc, ok := cached.Table.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3609,9 +3609,9 @@ func (cached *TableName) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.Name.CachedSize(false)
-	// field Qualifier github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field Qualifier github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.Qualifier.CachedSize(false)
 	return size
 }
@@ -3625,11 +3625,11 @@ func (cached *TableOption) CachedSize(alloc bool) int64 {
 	}
 	// field Name string
 	size += hack.RuntimeAllocSize(int64(len(cached.Name)))
-	// field Value *github.com/forcedb/forcedb/sqlparser.Literal
+	// field Value *github.com/sealdb/seal/sqlparser.Literal
 	size += cached.Value.CachedSize(true)
 	// field String string
 	size += hack.RuntimeAllocSize(int64(len(cached.String)))
-	// field Tables github.com/forcedb/forcedb/sqlparser.TableNames
+	// field Tables github.com/sealdb/seal/sqlparser.TableNames
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Tables)) * int64(32))
 		for _, elem := range cached.Tables {
@@ -3646,35 +3646,35 @@ func (cached *TableSpec) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field Columns []*github.com/forcedb/forcedb/sqlparser.ColumnDefinition
+	// field Columns []*github.com/sealdb/seal/sqlparser.ColumnDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Columns)) * int64(8))
 		for _, elem := range cached.Columns {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Indexes []*github.com/forcedb/forcedb/sqlparser.IndexDefinition
+	// field Indexes []*github.com/sealdb/seal/sqlparser.IndexDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Indexes)) * int64(8))
 		for _, elem := range cached.Indexes {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Constraints []*github.com/forcedb/forcedb/sqlparser.ConstraintDefinition
+	// field Constraints []*github.com/sealdb/seal/sqlparser.ConstraintDefinition
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Constraints)) * int64(8))
 		for _, elem := range cached.Constraints {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Options github.com/forcedb/forcedb/sqlparser.TableOptions
+	// field Options github.com/sealdb/seal/sqlparser.TableOptions
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Options)) * int64(8))
 		for _, elem := range cached.Options {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field PartitionOption *github.com/forcedb/forcedb/sqlparser.PartitionOption
+	// field PartitionOption *github.com/sealdb/seal/sqlparser.PartitionOption
 	size += cached.PartitionOption.CachedSize(true)
 	return size
 }
@@ -3698,11 +3698,11 @@ func (cached *TimestampFuncExpr) CachedSize(alloc bool) int64 {
 	}
 	// field Name string
 	size += hack.RuntimeAllocSize(int64(len(cached.Name)))
-	// field Expr1 github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr1 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr1.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Expr2 github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr2 github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr2.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3718,11 +3718,11 @@ func (cached *TrimFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field TrimArg github.com/forcedb/forcedb/sqlparser.Expr
+	// field TrimArg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.TrimArg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field StringArg github.com/forcedb/forcedb/sqlparser.Expr
+	// field StringArg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.StringArg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3736,7 +3736,7 @@ func (cached *TruncateTable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
 	return size
 }
@@ -3748,7 +3748,7 @@ func (cached *UnaryExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3762,26 +3762,26 @@ func (cached *Union) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Left github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.SelectStatement
+	// field Right github.com/sealdb/seal/sqlparser.SelectStatement
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field OrderBy github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderBy github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderBy)) * int64(8))
 		for _, elem := range cached.OrderBy {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field With *github.com/forcedb/forcedb/sqlparser.With
+	// field With *github.com/sealdb/seal/sqlparser.With
 	size += cached.With.CachedSize(true)
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
-	// field Into *github.com/forcedb/forcedb/sqlparser.SelectInto
+	// field Into *github.com/sealdb/seal/sqlparser.SelectInto
 	size += cached.Into.CachedSize(true)
 	return size
 }
@@ -3793,11 +3793,11 @@ func (cached *Update) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(112)
 	}
-	// field With *github.com/forcedb/forcedb/sqlparser.With
+	// field With *github.com/sealdb/seal/sqlparser.With
 	size += cached.With.CachedSize(true)
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field TableExprs github.com/forcedb/forcedb/sqlparser.TableExprs
+	// field TableExprs github.com/sealdb/seal/sqlparser.TableExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.TableExprs)) * int64(16))
 		for _, elem := range cached.TableExprs {
@@ -3806,23 +3806,23 @@ func (cached *Update) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field Exprs github.com/forcedb/forcedb/sqlparser.UpdateExprs
+	// field Exprs github.com/sealdb/seal/sqlparser.UpdateExprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Exprs)) * int64(8))
 		for _, elem := range cached.Exprs {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Where *github.com/forcedb/forcedb/sqlparser.Where
+	// field Where *github.com/sealdb/seal/sqlparser.Where
 	size += cached.Where.CachedSize(true)
-	// field OrderBy github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderBy github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderBy)) * int64(8))
 		for _, elem := range cached.OrderBy {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
 	return size
 }
@@ -3834,9 +3834,9 @@ func (cached *UpdateExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Name *github.com/forcedb/forcedb/sqlparser.ColName
+	// field Name *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.Name.CachedSize(true)
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3850,15 +3850,15 @@ func (cached *UpdateXMLExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Target github.com/forcedb/forcedb/sqlparser.Expr
+	// field Target github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Target.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field XPathExpr github.com/forcedb/forcedb/sqlparser.Expr
+	// field XPathExpr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.XPathExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field NewXML github.com/forcedb/forcedb/sqlparser.Expr
+	// field NewXML github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.NewXML.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3872,7 +3872,7 @@ func (cached *Use) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field DBName github.com/forcedb/forcedb/sqlparser.IdentifierCS
+	// field DBName github.com/sealdb/seal/sqlparser.IdentifierCS
 	size += cached.DBName.CachedSize(false)
 	return size
 }
@@ -3884,17 +3884,17 @@ func (cached *VStream) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(80)
 	}
-	// field Comments *github.com/forcedb/forcedb/sqlparser.ParsedComments
+	// field Comments *github.com/sealdb/seal/sqlparser.ParsedComments
 	size += cached.Comments.CachedSize(true)
-	// field SelectExpr github.com/forcedb/forcedb/sqlparser.SelectExpr
+	// field SelectExpr github.com/sealdb/seal/sqlparser.SelectExpr
 	if cc, ok := cached.SelectExpr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Table github.com/forcedb/forcedb/sqlparser.TableName
+	// field Table github.com/sealdb/seal/sqlparser.TableName
 	size += cached.Table.CachedSize(false)
-	// field Where *github.com/forcedb/forcedb/sqlparser.Where
+	// field Where *github.com/sealdb/seal/sqlparser.Where
 	size += cached.Where.CachedSize(true)
-	// field Limit *github.com/forcedb/forcedb/sqlparser.Limit
+	// field Limit *github.com/sealdb/seal/sqlparser.Limit
 	size += cached.Limit.CachedSize(true)
 	return size
 }
@@ -3916,7 +3916,7 @@ func (cached *ValuesFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(8)
 	}
-	// field Name *github.com/forcedb/forcedb/sqlparser.ColName
+	// field Name *github.com/sealdb/seal/sqlparser.ColName
 	size += cached.Name.CachedSize(true)
 	return size
 }
@@ -3928,7 +3928,7 @@ func (cached *VarPop) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3942,7 +3942,7 @@ func (cached *VarSamp) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3956,7 +3956,7 @@ func (cached *Variable) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
 	return size
 }
@@ -3968,7 +3968,7 @@ func (cached *Variance) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(16)
 	}
-	// field Arg github.com/forcedb/forcedb/sqlparser.Expr
+	// field Arg github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Arg.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -3982,7 +3982,7 @@ func (cached *VindexParam) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Key github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Key github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Key.CachedSize(false)
 	// field Val string
 	size += hack.RuntimeAllocSize(int64(len(cached.Val)))
@@ -3996,11 +3996,11 @@ func (cached *VindexSpec) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field Type github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Type github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Type.CachedSize(false)
-	// field Params []github.com/forcedb/forcedb/sqlparser.VindexParam
+	// field Params []github.com/sealdb/seal/sqlparser.VindexParam
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.Params)) * int64(48))
 		for _, elem := range cached.Params {
@@ -4017,11 +4017,11 @@ func (cached *WeightStringFuncExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field As *github.com/forcedb/forcedb/sqlparser.ConvertType
+	// field As *github.com/sealdb/seal/sqlparser.ConvertType
 	size += cached.As.CachedSize(true)
 	return size
 }
@@ -4033,11 +4033,11 @@ func (cached *When) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Cond github.com/forcedb/forcedb/sqlparser.Expr
+	// field Cond github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Cond.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Val github.com/forcedb/forcedb/sqlparser.Expr
+	// field Val github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Val.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -4051,7 +4051,7 @@ func (cached *Where) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(24)
 	}
-	// field Expr github.com/forcedb/forcedb/sqlparser.Expr
+	// field Expr github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Expr.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
@@ -4065,9 +4065,9 @@ func (cached *WindowDefinition) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(48)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field WindowSpec *github.com/forcedb/forcedb/sqlparser.WindowSpecification
+	// field WindowSpec *github.com/sealdb/seal/sqlparser.WindowSpecification
 	size += cached.WindowSpec.CachedSize(true)
 	return size
 }
@@ -4079,9 +4079,9 @@ func (cached *WindowSpecification) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(96)
 	}
-	// field Name github.com/forcedb/forcedb/sqlparser.IdentifierCI
+	// field Name github.com/sealdb/seal/sqlparser.IdentifierCI
 	size += cached.Name.CachedSize(false)
-	// field PartitionClause github.com/forcedb/forcedb/sqlparser.Exprs
+	// field PartitionClause github.com/sealdb/seal/sqlparser.Exprs
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.PartitionClause)) * int64(16))
 		for _, elem := range cached.PartitionClause {
@@ -4090,14 +4090,14 @@ func (cached *WindowSpecification) CachedSize(alloc bool) int64 {
 			}
 		}
 	}
-	// field OrderClause github.com/forcedb/forcedb/sqlparser.OrderBy
+	// field OrderClause github.com/sealdb/seal/sqlparser.OrderBy
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.OrderClause)) * int64(8))
 		for _, elem := range cached.OrderClause {
 			size += elem.CachedSize(true)
 		}
 	}
-	// field FrameClause *github.com/forcedb/forcedb/sqlparser.FrameClause
+	// field FrameClause *github.com/sealdb/seal/sqlparser.FrameClause
 	size += cached.FrameClause.CachedSize(true)
 	return size
 }
@@ -4109,7 +4109,7 @@ func (cached *With) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field ctes []*github.com/forcedb/forcedb/sqlparser.CommonTableExpr
+	// field ctes []*github.com/sealdb/seal/sqlparser.CommonTableExpr
 	{
 		size += hack.RuntimeAllocSize(int64(cap(cached.ctes)) * int64(8))
 		for _, elem := range cached.ctes {
@@ -4126,11 +4126,11 @@ func (cached *XorExpr) CachedSize(alloc bool) int64 {
 	if alloc {
 		size += int64(32)
 	}
-	// field Left github.com/forcedb/forcedb/sqlparser.Expr
+	// field Left github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Left.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}
-	// field Right github.com/forcedb/forcedb/sqlparser.Expr
+	// field Right github.com/sealdb/seal/sqlparser.Expr
 	if cc, ok := cached.Right.(cachedObject); ok {
 		size += cc.CachedSize(true)
 	}

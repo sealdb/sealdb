@@ -20,9 +20,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/test/utils"
+	"github.com/sealdb/seal/sqlparser/depends/test/utils"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 func TestRepair(t *testing.T) {

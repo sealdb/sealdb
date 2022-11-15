@@ -17,7 +17,7 @@ limitations under the License.
 
 package topodata
 
-import hack "github.com/forcedb/forcedb/sqlparser/depends/hack"
+import hack "github.com/sealdb/seal/sqlparser/depends/hack"
 
 func (cached *KeyRange) CachedSize(alloc bool) int64 {
 	if cached == nil {

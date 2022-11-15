@@ -1,9 +1,9 @@
 ROOT:=$(shell pwd)
-NAME:=github.com/forcedb/forcedb
+NAME:=github.com/sealdb/seal
 #export GOPATH := $(shell pwd):$(GOPATH)
 GIT_TAG=$(shell git describe --tags --always || echo "git not found")
 BUILD_TIME=$(shell date "+%Y-%m-%d_%H:%M:%S")
-LDFLAGS="-X github.com/forcedb/forcedb/version.gitTag=${GIT_TAG} -X github.com/forcedb/forcedb/version.buildTime=${BUILD_TIME}"
+LDFLAGS="-X github.com/sealdb/seal/version.gitTag=${GIT_TAG} -X github.com/sealdb/seal/version.buildTime=${BUILD_TIME}"
 
 initmod:
 	rm -f go.mod go.sum
@@ -13,7 +13,7 @@ initmod:
 
 build: ast
 	@mkdir -p bin/
-	go build -v -o bin/forcedb --ldflags $(LDFLAGS) server/main.go
+	go build -v -o bin/seal --ldflags $(LDFLAGS) server/main.go
 	@chmod 755 bin/*
 
 fmt:
@@ -33,10 +33,12 @@ testsqlparser: ast
 allpkgs = \
 	${ROOT}/sqlparser/...\
 	#${ROOT}/server/...
-covout = /tmp/forcedb-coverage.out
+covout = /tmp/seal-coverage.out
 
 coverage:
-	go build -v -o bin/gotestcover vendor/github.com/pierrre/gotestcover/*.go
+	#go get -v github.com/pierrre/gotestcover
+	#go build -v -o bin/gotestcover vendor/github.com/pierrre/gotestcover/*.go
+	go build -v -o bin/gotestcover tools/gotestcover/gotestcover.go
 	bin/gotestcover -coverprofile=$(covout) -v $(allpkgs)
 	go tool cover -html=$(covout)
 

@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 // Functions in this file should only be used for testing.

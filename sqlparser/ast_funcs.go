@@ -25,13 +25,13 @@ import (
 	"strconv"
 	"strings"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/log"
+	"github.com/sealdb/seal/sqlparser/depends/vt/log"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 // Walk calls visit on every node.

@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 var dateFormats = []string{"2006-01-02", "06-01-02", "20060102", "060102"}

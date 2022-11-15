@@ -22,9 +22,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 func TestResult(t *testing.T) {

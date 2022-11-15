@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"sort"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 // QueryMatchesTemplates sees if the given query has the same fingerprint as one of the given templates

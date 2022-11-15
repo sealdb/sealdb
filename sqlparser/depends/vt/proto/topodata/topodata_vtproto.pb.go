@@ -9,7 +9,7 @@ import (
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	io "io"
 	bits "math/bits"
-	vttime "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vttime"
+	vttime "github.com/sealdb/seal/sqlparser/depends/vt/proto/vttime"
 )
 
 const (

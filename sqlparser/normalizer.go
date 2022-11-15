@@ -20,9 +20,9 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 // BindVars is a set of reserved bind variables from a SQL statement

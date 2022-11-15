@@ -16,7 +16,7 @@ limitations under the License.
 
 package sqlparser
 
-import querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+import querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 
 // RedactSQLQuery returns a sql string with the params stripped out for display
 func RedactSQLQuery(sql string) (string, error) {

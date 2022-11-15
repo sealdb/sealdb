@@ -19,9 +19,9 @@ package sqltypes
 import (
 	"google.golang.org/protobuf/proto"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 // This file contains the proto3 conversion functions for the structures

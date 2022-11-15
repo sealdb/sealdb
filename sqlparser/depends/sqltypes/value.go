@@ -26,13 +26,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/bytes2"
-	"github.com/forcedb/forcedb/sqlparser/depends/hack"
+	"github.com/sealdb/seal/sqlparser/depends/bytes2"
+	"github.com/sealdb/seal/sqlparser/depends/hack"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
+	"github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 var (

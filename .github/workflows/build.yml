@@ -1,4 +1,4 @@
-name: ForceDB Build
+name: Seal Build
 on: [push, pull_request]
 jobs:
 

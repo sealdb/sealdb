@@ -53,8 +53,8 @@ import (
 	"log/syslog"
 	"os"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/event"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/log"
+	"github.com/sealdb/seal/sqlparser/depends/event"
+	"github.com/sealdb/seal/sqlparser/depends/vt/log"
 )
 
 // Syslogger is the interface that events should implement if they want to be

@@ -22,10 +22,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/log"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	"github.com/sealdb/seal/sqlparser/depends/vt/log"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 var versionFlagSync sync.Once

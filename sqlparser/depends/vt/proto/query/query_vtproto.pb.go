@@ -12,8 +12,8 @@ import (
 	math "math"
 	bits "math/bits"
 	sync "sync"
-	topodata "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/topodata"
-	vtrpc "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	topodata "github.com/sealdb/seal/sqlparser/depends/vt/proto/topodata"
+	vtrpc "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 const (

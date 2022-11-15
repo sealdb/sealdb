@@ -22,8 +22,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/event"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/log"
+	"github.com/sealdb/seal/sqlparser/depends/event"
+	"github.com/sealdb/seal/sqlparser/depends/vt/log"
 )
 
 type TestEvent struct {

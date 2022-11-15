@@ -26,7 +26,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	querypb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/query"
+	querypb "github.com/sealdb/seal/sqlparser/depends/vt/proto/query"
 )
 
 const (

@@ -93,7 +93,7 @@ import (
 
 	"github.com/spf13/pflag"
 
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
 )
 
 // logErrStacks controls whether or not printing errors includes the

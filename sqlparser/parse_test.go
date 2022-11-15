@@ -29,7 +29,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/test/utils"
+	"github.com/sealdb/seal/sqlparser/depends/test/utils"
 
 	"github.com/google/go-cmp/cmp"
 

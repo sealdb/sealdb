@@ -17,8 +17,8 @@ limitations under the License.
 package sqlparser
 
 import (
-	vtrpcpb "github.com/forcedb/forcedb/sqlparser/depends/vt/proto/vtrpc"
-	"github.com/forcedb/forcedb/sqlparser/depends/vt/vterrors"
+	vtrpcpb "github.com/sealdb/seal/sqlparser/depends/vt/proto/vtrpc"
+	"github.com/sealdb/seal/sqlparser/depends/vt/vterrors"
 )
 
 // ParseTable parses the input as a qualified table name.

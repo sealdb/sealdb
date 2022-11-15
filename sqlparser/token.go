@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/forcedb/forcedb/sqlparser/depends/sqltypes"
+	"github.com/sealdb/seal/sqlparser/depends/sqltypes"
 )
 
 const (
