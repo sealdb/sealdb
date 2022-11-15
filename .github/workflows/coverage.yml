@@ -19,8 +19,9 @@ jobs:
     - name: Coverage
       run: |
         export PATH=$PATH:$(go env GOPATH)/bin
-        #export CODECOV_TOKEN='8c93d80b-152b-4a44-afe4-0e90f3ef242b'
+        # Every acount or organization has a unique token
+        # export CODECOV_TOKEN='CODECOV_TOKEN=27d0f712-a1c6-42b3-92a5-ad7c9117ed1a'
         make coverage
         #bash <(curl -s https://codecov.io/bash) -f "!mock.go"
-        bash <(curl -s https://codecov.io/bash) -f "!mock.go" -t 8c93d80b-152b-4a44-afe4-0e90f3ef242b
+        bash <(curl -s https://codecov.io/bash) -f "!mock.go" -t 27d0f712-a1c6-42b3-92a5-ad7c9117ed1a
 
