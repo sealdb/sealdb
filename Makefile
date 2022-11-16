@@ -13,7 +13,7 @@ initmod:
 
 build: ast
 	@mkdir -p bin/
-	go build -v -o bin/seal --ldflags $(LDFLAGS) server/main.go
+	go build -v -o bin/seal --ldflags $(LDFLAGS) seal/main.go
 	@chmod 755 bin/*
 
 fmt:
