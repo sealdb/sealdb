@@ -35,7 +35,6 @@ Thumbs.db
 .env.production
 
 # 文档生成
-/doc/
 
 # 测试覆盖率
 *.profraw
