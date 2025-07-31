@@ -1,10 +1,26 @@
-# Examples
+# Examples 模块
 
-# 线程池测试程序
+# 线程池测试
 add_executable(thread_pool_test thread_pool_test.cpp)
+
+target_include_directories(thread_pool_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 target_link_libraries(thread_pool_test
     sealdb_common
-    Threads::Threads
+)
+
+# SQL解析器测试
+add_executable(sql_parser_test sql_parser_test.cpp)
+
+target_include_directories(sql_parser_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(sql_parser_test
+    sealdb_common
+    sealdb_sql
 )
 
 # 设置可执行文件输出目录
