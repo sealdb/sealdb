@@ -36,6 +36,18 @@ target_link_libraries(optimizer_test
     sealdb_planner
 )
 
+# Flex + Bison解析器测试
+add_executable(flex_bison_test flex_bison_test.cpp)
+
+target_include_directories(flex_bison_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(flex_bison_test
+    sealdb_common
+    sealdb_sql
+)
+
 # 设置可执行文件输出目录
 set_target_properties(thread_pool_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples
