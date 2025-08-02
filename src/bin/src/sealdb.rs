@@ -9,14 +9,14 @@ use config::Config;
 #[command(about = "SealDB - 高性能分布式数据库")]
 #[command(version)]
 #[command(after_help = "示例用法:
-  sealdb                           # 使用默认配置文件启动
+  sealdb                           # 使用默认配置启动（无需配置文件）
   sealdb -c/--config config.yaml  # 使用指定配置文件
   sealdb -a/--host 127.0.0.1 -p/--port 8080  # 指定主机和端口
   sealdb -l/--log-level debug     # 设置日志级别
   sealdb -s/--show-config         # 显示当前配置
   sealdb -g/--generate-config     # 生成默认配置文件")]
 struct Cli {
-    /// 配置文件路径
+    /// 配置文件路径（可选，如果不存在则使用默认配置）
     #[arg(short, long, value_name = "FILE", default_value = "config.toml")]
     config: String,
 

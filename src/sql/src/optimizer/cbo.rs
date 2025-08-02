@@ -2,11 +2,10 @@
 //! 
 //! 实现基于成本的查询优化，包括连接重排序、索引选择、聚合优化等
 
-use async_trait::async_trait;
 use common::Result;
 use tracing::{debug, info};
 
-use crate::parser::{ParsedExpression, ParsedStatement, ParsedValue, ParsedOperator};
+use crate::parser::{ParsedExpression, ParsedValue};
 
 /// 基于成本的优化器 (CBO)
 pub struct CostBasedOptimizer {
@@ -34,24 +33,33 @@ impl CostBasedOptimizer {
 
     /// 执行基于成本的优化
     pub async fn optimize(&self, plan: OptimizedPlan) -> Result<OptimizedPlan> {
-        info!("Starting cost-based optimization");
+        info!("CBO: 开始基于成本的优化");
+        debug!("CBO: 输入计划: {:#?}", plan);
+        info!("CBO: 输入计划节点数: {}", plan.nodes.len());
+        info!("CBO: 输入计划估计成本: {:.2}", plan.estimated_cost);
 
         // 1. 生成候选计划
+        info!("CBO: 生成候选计划");
         let candidates = self.generate_candidates(&plan).await?;
+        info!("CBO: 生成了 {} 个候选计划", candidates.len());
 
         // 2. 评估每个候选计划的成本
         let mut best_plan = plan;
         let mut best_cost = f64::MAX;
 
-        for candidate in candidates {
+        for (i, candidate) in candidates.iter().enumerate() {
             let cost = self.cost_model.estimate_cost(&candidate).await?;
+            debug!("CBO: 候选计划 {} 成本: {:.2}", i + 1, cost);
+            
             if cost < best_cost {
                 best_cost = cost;
-                best_plan = candidate;
+                best_plan = candidate.clone();
+                info!("CBO: 发现更好的计划 {}，成本: {:.2}", i + 1, cost);
             }
         }
 
-        debug!("Cost-based optimization completed, best cost: {}", best_cost);
+        info!("CBO: 基于成本的优化完成，最佳成本: {:.2}", best_cost);
+        debug!("CBO: 最终优化计划: {:#?}", best_plan);
         Ok(best_plan)
     }
 

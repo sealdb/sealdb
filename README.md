@@ -35,10 +35,14 @@ SealDB 是一个基于 Rust 开发的高性能分布式数据库系统，采用 
 graph TB
     Client[客户端] --> Server[服务层]
     Server --> SQL[SQL 引擎]
+    SQL --> Parser[SQL 解析器]
     SQL --> Optimizer[查询优化器]
-    Optimizer --> Executor[执行器]
-    Executor --> KV[KV 存储层]
-    KV --> TiKV[TiKV 集群]
+    SQL --> Executor[执行器]
+    Executor --> StorageHandler[存储处理器]
+    StorageHandler --> StorageEngine[存储引擎抽象]
+    StorageEngine --> TiKVEngine[TiKV 引擎]
+    StorageEngine --> MemoryEngine[内存引擎]
+    StorageEngine --> RocksDBEngine[RocksDB 引擎]
 
     subgraph "连接管理"
         CM[连接管理器]
@@ -49,6 +53,16 @@ graph TB
     Server --> CM
     CM --> TP
     TP --> PQ
+
+    subgraph "监控系统"
+        RM[资源监控]
+        PM[性能监控]
+        LM[日志管理]
+    end
+
+    TP --> RM
+    RM --> PM
+    PM --> LM
 ```
 
 ## 🚀 快速开始

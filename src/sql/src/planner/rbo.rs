@@ -47,19 +47,29 @@ impl RuleBasedOptimizer {
 
     /// 执行基于规则的优化
     pub async fn optimize(&self, stmt: ParsedStatement) -> Result<OptimizedPlan> {
+        info!("RBO: 开始基于规则的优化");
         let mut plan = OptimizedPlan::from_statement(stmt);
+        debug!("RBO: 初始执行计划: {:#?}", plan);
+        info!("RBO: 初始计划节点数: {}", plan.nodes.len());
 
-        for rule in &self.rules {
+        for (i, rule) in self.rules.iter().enumerate() {
             let rule_name = rule.name();
-            debug!("Applying optimization rule: {}", rule_name);
+            info!("RBO: 应用优化规则 {}: {}", i + 1, rule_name);
 
             let start_time = std::time::Instant::now();
+            let old_plan = plan.clone();
             plan = rule.apply(plan).await?;
             let duration = start_time.elapsed();
 
-            debug!("Rule {} applied in {:?}", rule_name, duration);
+            debug!("RBO: 规则 {} 应用完成，耗时: {:?}", rule_name, duration);
+            debug!("RBO: 规则 {} 应用前计划: {:#?}", rule_name, old_plan);
+            debug!("RBO: 规则 {} 应用后计划: {:#?}", rule_name, plan);
+
+            info!("RBO: 规则 {} 应用后计划节点数: {}", rule_name, plan.nodes.len());
         }
 
+        info!("RBO: 基于规则的优化完成");
+        debug!("RBO: 最终优化计划: {:#?}", plan);
         Ok(plan)
     }
 }
@@ -560,5 +570,5 @@ impl OptimizationRule for UnionOptimizationRule {
     async fn apply(&self, plan: OptimizedPlan) -> Result<OptimizedPlan> { Ok(plan) }
 }
 
-// 从 optimizer.rs 中导入必要的类型
-use super::optimizer::{OptimizedPlan, PlanNode};
+// 从 optimizer 模块导入必要的类型
+use crate::optimizer::optimizer::{OptimizedPlan, PlanNode};
