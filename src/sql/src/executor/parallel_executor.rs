@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use crate::storage::worker_pool::{WorkerPool, WorkerPoolConfig, TaskInfo, TaskPriority, TaskType};
 use crate::optimizer::{OptimizedPlan, PlanNode};
-use crate::executor::{QueryResult, ExecutionContext};
+use crate::executor::{executor::ExecutionContext, execution_models::QueryResult};
 
 /// 并行查询执行器
 pub struct ParallelQueryExecutor {
@@ -331,7 +331,11 @@ impl ParallelQueryExecutor {
         if !parallel_nodes.is_empty() {
             let parallelism = std::cmp::min(parallel_nodes.len(), self.config.read().unwrap().max_parallelism);
             let parallel_result = self.execute_with_parallelism(
-                OptimizedPlan { nodes: parallel_nodes },
+                OptimizedPlan {
+                    nodes: parallel_nodes,
+                    estimated_cost: 1000.0,
+                    estimated_rows: 1000,
+                },
                 context,
                 parallelism
             ).await?;
@@ -444,13 +448,19 @@ mod tests {
         let executor = ParallelQueryExecutor::new();
 
         // 测试空计划
-        let empty_plan = OptimizedPlan { nodes: vec![] };
+        let empty_plan = OptimizedPlan {
+            nodes: vec![],
+            estimated_cost: 0.0,
+            estimated_rows: 0,
+        };
         let strategy = executor.analyze_parallel_strategy(&empty_plan).unwrap();
         assert!(matches!(strategy, ParallelStrategy::Sequential));
 
         // 测试单节点计划
         let single_node_plan = OptimizedPlan {
-            nodes: vec![PlanNode::TableScan { table: "test".to_string(), columns: vec![] }]
+            nodes: vec![PlanNode::TableScan { table: "test".to_string(), columns: vec![] }],
+            estimated_cost: 100.0,
+            estimated_rows: 100,
         };
         let strategy = executor.analyze_parallel_strategy(&single_node_plan).unwrap();
         assert!(matches!(strategy, ParallelStrategy::Sequential));

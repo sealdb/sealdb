@@ -222,6 +222,17 @@ impl QueryResult {
             last_insert_id: None,
         }
     }
+
+    pub fn merge(&mut self, other: QueryResult) {
+        // 合并行数据
+        self.rows.extend(other.rows);
+        // 更新影响的行数
+        self.affected_rows += other.affected_rows;
+        // 如果其他结果有 last_insert_id，使用它
+        if other.last_insert_id.is_some() {
+            self.last_insert_id = other.last_insert_id;
+        }
+    }
 }
 
 /// 执行模型选择器

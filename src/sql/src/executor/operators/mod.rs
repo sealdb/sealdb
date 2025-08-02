@@ -1,21 +1,18 @@
-//! SealDB 查询执行器模块
-//!
-//! 负责查询执行，包括各种执行模型和操作符
-
-pub mod execution_models;
-pub mod operators;
-pub mod executor;
-pub mod parallel_executor;
-
-// 重新导出执行器相关类型
-pub use executor::Executor;
-pub use execution_models::ExecutionEngine;
+pub mod operator_trait;
+pub mod scan_operators;
+pub mod join_operators;
+pub mod aggregate_operators;
+pub mod sort_operators;
+pub mod set_operators;
+pub mod batch_operators;
+pub mod parallel_operators;
+pub mod distributed_operators;
 
 // 重新导出基础操作符 trait
-pub use operators::operator_trait::Operator;
+pub use operator_trait::Operator;
 
 // 重新导出扫描操作符
-pub use operators::scan_operators::{
+pub use scan_operators::{
     ScanOperator,
     IndexScanOperator,
     SeqScanOperator,
@@ -25,7 +22,7 @@ pub use operators::scan_operators::{
 };
 
 // 重新导出连接操作符
-pub use operators::join_operators::{
+pub use join_operators::{
     JoinOperator,
     NestedLoopJoinOperator,
     HashJoinOperator,
@@ -33,28 +30,28 @@ pub use operators::join_operators::{
 };
 
 // 重新导出聚合操作符
-pub use operators::aggregate_operators::{
+pub use aggregate_operators::{
     AggregateOperator,
     HashAggOperator,
     GroupAggOperator,
 };
 
 // 重新导出排序操作符
-pub use operators::sort_operators::{
+pub use sort_operators::{
     SortOperator,
     ExternalSortOperator,
     TopNOperator,
 };
 
 // 重新导出集合操作符
-pub use operators::set_operators::{
+pub use set_operators::{
     UnionOperator,
     IntersectOperator,
     ExceptOperator,
 };
 
 // 重新导出批处理操作符
-pub use operators::batch_operators::{
+pub use batch_operators::{
     BatchScanOperator,
     BatchIndexScanOperator,
     BatchJoinOperator,
@@ -63,7 +60,7 @@ pub use operators::batch_operators::{
 };
 
 // 重新导出并行操作符
-pub use operators::parallel_operators::{
+pub use parallel_operators::{
     ParallelScanTask,
     ParallelIndexScanTask,
     ParallelJoinTask,
@@ -74,9 +71,9 @@ pub use operators::parallel_operators::{
 };
 
 // 重新导出分布式操作符
-pub use operators::distributed_operators::{
+pub use distributed_operators::{
     ShardScanOperator,
     ShardInfo,
     ShardNode,
     DistributedAggOperator,
-};
+}; 

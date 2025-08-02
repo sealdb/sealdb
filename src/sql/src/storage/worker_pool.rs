@@ -53,6 +53,7 @@ pub struct WorkerInfo {
 }
 
 /// 增强的多线程工作池
+#[derive(Debug)]
 pub struct WorkerPool {
     /// 配置
     config: Arc<RwLock<WorkerPoolConfig>>,
