@@ -3,6 +3,7 @@ resolver = "3" # Cargo 的新依赖解析方式，与 edition 2024 兼容，能�
 members = [
     "src/core",
     "src/kv",
+    "src/storage",
     "src/sql",
     "src/planner",
     "src/server",

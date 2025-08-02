@@ -6,6 +6,7 @@ pub mod execution_models;
 pub mod operators;
 pub mod executor;
 pub mod parallel_executor;
+pub mod storage_executor;
 
 // 重新导出执行器相关类型
 pub use executor::Executor;
@@ -13,6 +14,10 @@ pub use execution_models::ExecutionEngine;
 
 // 重新导出基础操作符 trait
 pub use operators::operator_trait::Operator;
+
+// 重新导出存储感知执行器
+pub use storage_executor::{StorageExecutor, StorageOperationType};
+pub use storage::{StorageOperation, StorageOperationResult, EngineType};
 
 // 重新导出扫描操作符
 pub use operators::scan_operators::{

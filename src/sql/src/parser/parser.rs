@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tracing::{debug, info, warn};
 
 /// SQL 解析器
 pub struct SqlParser {
@@ -18,9 +19,11 @@ impl SqlParser {
 
     /// 解析 SQL 语句
     pub fn parse(&self, sql: &str) -> Result<ParsedStatement> {
+        info!("开始解析SQL语句: {}", sql);
+
         // 简化的解析实现
-        if sql.to_uppercase().contains("SELECT") {
-            Ok(ParsedStatement::Select(ParsedSelect {
+        let result = if sql.to_uppercase().contains("SELECT") {
+            let ast = ParsedStatement::Select(ParsedSelect {
                 columns: vec![ParsedColumn {
                     name: "*".to_string(),
                     alias: None,
@@ -34,37 +37,62 @@ impl SqlParser {
                 order_by: vec![],
                 limit: None,
                 offset: None,
-            }))
+            });
+            debug!("解析SELECT语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else if sql.to_uppercase().contains("INSERT") {
-            Ok(ParsedStatement::Insert(ParsedInsert {
+            let ast = ParsedStatement::Insert(ParsedInsert {
                 table: "table".to_string(),
                 columns: vec![],
                 source: ParsedInsertSource::Values(vec![]),
-            }))
+            });
+            debug!("解析INSERT语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else if sql.to_uppercase().contains("UPDATE") {
-            Ok(ParsedStatement::Update(ParsedUpdate {
+            let ast = ParsedStatement::Update(ParsedUpdate {
                 table: "table".to_string(),
                 assignments: vec![],
                 where_clause: None,
-            }))
+            });
+            debug!("解析UPDATE语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else if sql.to_uppercase().contains("DELETE") {
-            Ok(ParsedStatement::Delete(ParsedDelete {
+            let ast = ParsedStatement::Delete(ParsedDelete {
                 table: "table".to_string(),
                 where_clause: None,
-            }))
+            });
+            debug!("解析DELETE语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else if sql.to_uppercase().contains("CREATE TABLE") {
-            Ok(ParsedStatement::CreateTable(ParsedCreateTable {
+            let ast = ParsedStatement::CreateTable(ParsedCreateTable {
                 table: "table".to_string(),
                 columns: vec![],
-            }))
+            });
+            debug!("解析CREATE TABLE语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else if sql.to_uppercase().contains("DROP") {
-            Ok(ParsedStatement::Drop(ParsedDrop {
+            let ast = ParsedStatement::Drop(ParsedDrop {
                 object_type: "TABLE".to_string(),
                 names: vec![],
-            }))
+            });
+            debug!("解析DROP语句成功，AST: {:?}", ast);
+            Ok(ast)
         } else {
+            warn!("不支持的SQL语句类型: {}", sql);
             Err(anyhow::anyhow!("Unsupported SQL statement"))
+        };
+
+        match &result {
+            Ok(ast) => {
+                info!("SQL解析完成，语句类型: {:?}", std::mem::discriminant(ast));
+                debug!("完整AST结构: {:#?}", ast);
+            }
+            Err(e) => {
+                warn!("SQL解析失败: {}", e);
+            }
         }
+
+        result
     }
 }
 

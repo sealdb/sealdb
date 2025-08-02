@@ -31,15 +31,27 @@ impl Optimizer {
 
     /// 优化查询
     pub async fn optimize(&self, stmt: ParsedStatement) -> Result<OptimizedPlan> {
-        info!("Starting query optimization");
+        info!("开始查询优化");
+        debug!("原始SQL语句类型: {:?}", std::mem::discriminant(&stmt));
 
         // 1. 基于规则的优化 (RBO)
+        info!("=== 开始基于规则的优化 (RBO) ===");
         let rbo_optimized = self.rbo.optimize(stmt).await?;
+        debug!("RBO优化完成，执行计划: {:#?}", rbo_optimized);
+        info!("RBO优化后计划节点数: {}", rbo_optimized.nodes.len());
+        info!("RBO优化后估计成本: {:.2}", rbo_optimized.estimated_cost);
+        info!("RBO优化后估计行数: {}", rbo_optimized.estimated_rows);
 
         // 2. 基于成本的优化 (CBO)
+        info!("=== 开始基于成本的优化 (CBO) ===");
         let final_plan = self.cbo.optimize(rbo_optimized).await?;
+        debug!("CBO优化完成，最终执行计划: {:#?}", final_plan);
+        info!("CBO优化后计划节点数: {}", final_plan.nodes.len());
+        info!("CBO优化后估计成本: {:.2}", final_plan.estimated_cost);
+        info!("CBO优化后估计行数: {}", final_plan.estimated_rows);
 
-        debug!("Query optimization completed");
+        info!("查询优化完成");
+        debug!("最终执行计划树结构: {:#?}", final_plan);
         Ok(final_plan)
     }
 }

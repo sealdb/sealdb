@@ -64,17 +64,24 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 从文件加载配置
+    /// 从文件加载配置，如果文件不存在则使用默认配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+
+        // 检查文件是否存在
+        if !path.exists() {
+            eprintln!("警告: 配置文件 {} 不存在，使用默认配置", path.display());
+            return Ok(Self::default());
+        }
+
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        
+
         let extension = path.extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("toml")
             .to_lowercase();
-        
+
         match extension.as_str() {
             "toml" => {
                 let config: Config = toml::from_str(&content)
@@ -99,7 +106,7 @@ impl Config {
             }
         }
     }
-    
+
     /// 保存配置到文件
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
@@ -107,7 +114,7 @@ impl Config {
             .and_then(|ext| ext.to_str())
             .unwrap_or("toml")
             .to_lowercase();
-        
+
         let content = match extension.as_str() {
             "toml" => {
                 toml::to_string_pretty(self)
@@ -126,10 +133,10 @@ impl Config {
                     .with_context(|| "Failed to serialize config to TOML")?
             }
         };
-        
+
         std::fs::write(path, content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
-        
+
         Ok(())
     }
-} 
+}

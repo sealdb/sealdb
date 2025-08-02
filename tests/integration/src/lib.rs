@@ -5,6 +5,7 @@
 pub mod basic_integration_test;
 pub mod advanced_integration_test;
 pub mod cli_integration_test;
+pub mod comprehensive_integration_test;
 
 /// 集成测试配置
 #[derive(Debug, Clone)]

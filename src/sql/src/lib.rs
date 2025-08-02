@@ -13,6 +13,7 @@ pub mod config;
 pub use parser::{SqlParser, ParsedStatement, ParsedExpression};
 pub use optimizer::{Optimizer, RuleBasedOptimizer, CostBasedOptimizer};
 pub use executor::{Executor, ExecutionEngine};
-pub use storage::{MemoryManager, BufferPool, CacheManager, WorkerPool};
+// 注意：这些类型在 storage crate 中不存在，需要从 sql crate 内部导入
+// pub use storage::{MemoryManager, BufferPool, CacheManager, WorkerPool};
 pub use distributed::{DistributedExecutor, NodeManager};
 pub use config::*;
