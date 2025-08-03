@@ -12,16 +12,16 @@ void Logger::log(LogLevel level, const std::string& message) {
     std::cout << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") << " ";
 
     switch (level) {
-        case LogLevel::DEBUG:
+        case LogLevel::LOG_DEBUG:
             std::cout << "[DEBUG] ";
             break;
-        case LogLevel::INFO:
+        case LogLevel::LOG_INFO:
             std::cout << "[INFO] ";
             break;
-        case LogLevel::WARN:
+        case LogLevel::LOG_WARN:
             std::cout << "[WARN] ";
             break;
-        case LogLevel::ERROR:
+        case LogLevel::LOG_ERROR:
             std::cout << "[ERROR] ";
             break;
     }
@@ -30,19 +30,19 @@ void Logger::log(LogLevel level, const std::string& message) {
 }
 
 void Logger::debug(const std::string& message) {
-    log(LogLevel::DEBUG, message);
+    log(LogLevel::LOG_DEBUG, message);
 }
 
 void Logger::info(const std::string& message) {
-    log(LogLevel::INFO, message);
+    log(LogLevel::LOG_INFO, message);
 }
 
 void Logger::warn(const std::string& message) {
-    log(LogLevel::WARN, message);
+    log(LogLevel::LOG_WARN, message);
 }
 
 void Logger::error(const std::string& message) {
-    log(LogLevel::ERROR, message);
+    log(LogLevel::LOG_ERROR, message);
 }
 
 } // namespace sealdb
