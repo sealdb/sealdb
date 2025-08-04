@@ -1,12 +1,12 @@
 //! SealDB 主优化器
-//! 
+//!
 //! 协调基于规则的优化 (RBO) 和基于成本的优化 (CBO)
 
 use common::Result;
 use tracing::{debug, info};
 
 use crate::parser::{ParsedExpression, ParsedStatement};
-use crate::optimizer::rbo::RuleBasedOptimizer;
+use crate::planner::rbo::RuleBasedOptimizer;
 use crate::optimizer::cbo::CostBasedOptimizer;
 
 /// 查询优化器

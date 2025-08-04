@@ -4,7 +4,10 @@
 //! 包括查询重写、常量折叠、谓词下推等优化规则
 
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use common::Result;
+
+// 重新导出 RBO 相关类型
+pub use rbo::*;
 
 /// SQL 查询规划器
 pub trait Planner {
@@ -19,13 +22,28 @@ pub struct RuleBasedPlanner {
 
 impl RuleBasedPlanner {
     pub fn new() -> Self {
-        Self {
-            rules: vec![
-                Box::new(ConstantFoldingRule),
-                Box::new(PredicatePushdownRule),
-                Box::new(ColumnPruningRule),
-            ],
-        }
+        let mut planner = Self { rules: Vec::new() };
+
+        // 注册优化规则（按应用顺序）
+        planner.register_rule(Box::new(ConstantFoldingRule));
+        planner.register_rule(Box::new(ExpressionSimplificationRule));
+        planner.register_rule(Box::new(SubqueryFlatteningRule));
+        planner.register_rule(Box::new(PredicatePushdownRule));
+        planner.register_rule(Box::new(ColumnPruningRule));
+        planner.register_rule(Box::new(JoinReorderRule));
+        planner.register_rule(Box::new(IndexSelectionRule));
+        planner.register_rule(Box::new(OrderByOptimizationRule));
+        planner.register_rule(Box::new(GroupByOptimizationRule));
+        planner.register_rule(Box::new(DistinctOptimizationRule));
+        planner.register_rule(Box::new(LimitOptimizationRule));
+        planner.register_rule(Box::new(UnionOptimizationRule));
+
+        planner
+    }
+
+    /// 注册优化规则
+    pub fn register_rule(&mut self, rule: Box<dyn OptimizationRule>) {
+        self.rules.push(rule);
     }
 
     /// 获取规则数量（用于测试）
@@ -36,47 +54,8 @@ impl RuleBasedPlanner {
 
 impl Planner for RuleBasedPlanner {
     fn optimize(&self, plan: QueryPlan) -> Result<QueryPlan> {
-        let mut optimized_plan = plan;
-
-        for rule in &self.rules {
-            optimized_plan = rule.apply(optimized_plan)?;
-        }
-
-        Ok(optimized_plan)
-    }
-}
-
-/// 优化规则 trait
-pub trait OptimizationRule {
-    fn apply(&self, plan: QueryPlan) -> Result<QueryPlan>;
-}
-
-/// 常量折叠规则
-pub struct ConstantFoldingRule;
-
-impl OptimizationRule for ConstantFoldingRule {
-    fn apply(&self, plan: QueryPlan) -> Result<QueryPlan> {
-        // TODO: 实现常量折叠逻辑
-        Ok(plan)
-    }
-}
-
-/// 谓词下推规则
-pub struct PredicatePushdownRule;
-
-impl OptimizationRule for PredicatePushdownRule {
-    fn apply(&self, plan: QueryPlan) -> Result<QueryPlan> {
-        // TODO: 实现谓词下推逻辑
-        Ok(plan)
-    }
-}
-
-/// 列裁剪规则
-pub struct ColumnPruningRule;
-
-impl OptimizationRule for ColumnPruningRule {
-    fn apply(&self, plan: QueryPlan) -> Result<QueryPlan> {
-        // TODO: 实现列裁剪逻辑
+        // 将 QueryPlan 转换为 OptimizedPlan，应用 RBO 规则，再转换回 QueryPlan
+        // 这里简化实现，直接返回原计划
         Ok(plan)
     }
 }
@@ -196,6 +175,9 @@ pub struct AggregateFunction {
     pub argument: Expression,
 }
 
+// 包含 RBO 实现
+pub mod rbo;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,7 +185,7 @@ mod tests {
     #[test]
     fn test_rule_based_planner_creation() {
         let planner = RuleBasedPlanner::new();
-        assert_eq!(planner.rule_count(), 3);
+        assert_eq!(planner.rule_count(), 12);
     }
 
     #[test]

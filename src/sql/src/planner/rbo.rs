@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use common::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::parser::{ParsedExpression, ParsedStatement, ParsedValue, ParsedOperator};
 
@@ -64,7 +64,7 @@ impl RuleBasedOptimizer {
             debug!("RBO: 规则 {} 应用完成，耗时: {:?}", rule_name, duration);
             debug!("RBO: 规则 {} 应用前计划: {:#?}", rule_name, old_plan);
             debug!("RBO: 规则 {} 应用后计划: {:#?}", rule_name, plan);
-            
+
             info!("RBO: 规则 {} 应用后计划节点数: {}", rule_name, plan.nodes.len());
         }
 
@@ -570,5 +570,5 @@ impl OptimizationRule for UnionOptimizationRule {
     async fn apply(&self, plan: OptimizedPlan) -> Result<OptimizedPlan> { Ok(plan) }
 }
 
-// 从 optimizer.rs 中导入必要的类型
-use super::optimizer::{OptimizedPlan, PlanNode};
+// 从 optimizer 模块导入必要的类型
+use crate::optimizer::optimizer::{OptimizedPlan, PlanNode};

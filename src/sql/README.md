@@ -2,6 +2,32 @@
 
 SealDB SQL 模块提供了完整的 SQL 处理功能，包括解析、优化、执行等。
 
+## 架构概览
+
+```
+SQL 查询处理流程:
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Parser    │───▶│   Planner   │───▶│  Optimizer  │───▶│  Executor   │
+│  (解析器)    │    │  (规划器)    │    │  (优化器)    │    │  (执行器)    │
+│             │    │   RBO       │    │   CBO       │    │             │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+                          │                     │
+                          ▼                     ▼
+                   ┌─────────────┐    ┌─────────────┐
+                   │   Storage   │    │ Distributed │
+                   │  (存储层)    │    │ (分布式层)   │
+                   └─────────────┘    └─────────────┘
+```
+
+### 模块职责分工
+
+1. **Parser (解析器)**: 解析 SQL 语句，生成语法树
+2. **Planner (规划器)**: 基于规则的优化 (RBO)，包括常量折叠、谓词下推等
+3. **Optimizer (优化器)**: 基于成本的优化 (CBO)，包括连接重排序、索引选择等
+4. **Executor (执行器)**: 执行优化后的查询计划
+5. **Storage (存储层)**: 数据存储抽象，支持多种存储引擎
+6. **Distributed (分布式层)**: 分布式执行和节点管理
+
 ## 模块结构
 
 ```
@@ -10,10 +36,12 @@ src/sql/src/
 ├── parser/             # SQL 解析器模块
 │   ├── mod.rs         # 解析器模块入口
 │   └── parser.rs      # SQL 解析器实现
-├── optimizer/          # 查询优化器模块
+├── planner/            # 查询规划器模块 (RBO)
+│   ├── mod.rs         # 规划器模块入口
+│   └── rbo.rs         # 基于规则的优化器实现
+├── optimizer/          # 查询优化器模块 (CBO)
 │   ├── mod.rs         # 优化器模块入口
 │   ├── optimizer.rs   # 主优化器（协调 RBO 和 CBO）
-│   ├── rbo.rs         # 基于规则的优化器 (RBO)
 │   ├── cbo.rs         # 基于成本的优化器 (CBO)
 │   ├── cost_model.rs  # 成本模型
 │   └── statistics.rs  # 统计信息管理
@@ -42,17 +70,24 @@ src/sql/src/
   - `ParsedStatement`: 解析后的语句结构
   - `ParsedExpression`: 解析后的表达式
 
+### 规划器模块 (planner)
+- **功能**: 基于规则的查询优化 (RBO - Rule-Based Optimization)
+- **主要组件**:
+  - `RuleBasedPlanner`: 基于规则的规划器
+  - `RuleBasedOptimizer`: 基于规则的优化器
+  - `OptimizationRule`: 优化规则 trait
+  - `QueryPlan`: 查询计划结构
+  - `PlanNode`: 计划节点类型
+
 ### 优化器模块 (optimizer)
-- **功能**: 查询优化，包括基于规则和基于成本的优化
+- **功能**: 基于成本的查询优化 (CBO - Cost-Based Optimization)
 - **主要组件**:
   - `Optimizer`: 主优化器，协调 RBO 和 CBO
-  - `RuleBasedOptimizer`: 基于规则的优化器
   - `CostBasedOptimizer`: 基于成本的优化器
-  - `OptimizationRule`: 优化规则 trait
   - `CostModel`: 成本模型
   - `StatisticsManager`: 统计信息管理
 
-#### 基于规则的优化 (RBO)
+#### 基于规则的优化 (RBO) - 在 planner 模块中实现
 - **常量折叠**: 在编译时计算常量表达式
 - **表达式简化**: 简化冗余的布尔表达式
 - **子查询扁平化**: 将子查询转换为连接
