@@ -5,7 +5,6 @@ members = [
     "src/kv",
     "src/storage",
     "src/sql",
-    "src/planner",
     "src/server",
     "src/common",
     "src/bin",
