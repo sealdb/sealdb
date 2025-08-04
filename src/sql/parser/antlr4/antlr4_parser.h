@@ -24,7 +24,7 @@
 #endif
 #endif
 
-#include "ast.h"
+#include "../../ast.h"
 #include "../parser_interface.h"
 
 namespace sealdb {
