@@ -7,12 +7,10 @@ add_subdirectory(planner)
 add_subdirectory(optimizer)
 
 set(SQL_SOURCES
-    ast.cpp
     statement.cpp
 )
 
 set(SQL_HEADERS
-    ast.h
     statement.h
 )
 
@@ -29,7 +27,7 @@ target_include_directories(sealdb_sql PUBLIC
 target_link_libraries(sealdb_sql
     sealdb_common
     sealdb_storage
-    sealdb_sql_parser_factory
+    sealdb_sql_parser
     sealdb_sql_executor
     sealdb_sql_planner
     sealdb_sql_optimizer

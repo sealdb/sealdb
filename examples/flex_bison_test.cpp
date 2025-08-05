@@ -1,4 +1,4 @@
-#include "sealdb/parser_factory.h"
+#include "sealdb/parser_interface.h"
 #include "sealdb/logger.h"
 #include <iostream>
 #include <chrono>
@@ -126,7 +126,7 @@ void performance_comparison() {
 
     // 测试可用的解析器
     auto availableTypes = ParserFactory::getAvailableParserTypes();
-    
+
     for (auto type : availableTypes) {
         auto parser = ParserFactory::createParser(type);
         if (!parser) continue;

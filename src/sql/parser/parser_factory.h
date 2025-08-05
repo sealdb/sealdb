@@ -12,7 +12,8 @@ namespace sealdb {
  */
 enum class ParserType {
     ANTLR4,         // ANTLR4解析器
-    POSTGRESQL      // PostgreSQL风格解析器 (Flex + Bison)
+    POSTGRESQL,     // PostgreSQL风格解析器 (Flex + Bison)
+    SEAL            // Seal解析器 (递归下降算法)
 };
 
 /**
@@ -36,7 +37,7 @@ public:
 
     /**
      * 根据配置创建解析器
-     * @param config 配置字符串 ("antlr4" 或 "postgresql")
+     * @param config 配置字符串 ("antlr4", "postgresql" 或 "seal")
      * @return 解析器指针
      */
     static std::unique_ptr<ParserInterface> createParserFromConfig(const std::string& config);

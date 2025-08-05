@@ -32,10 +32,10 @@ class ColumnReference : public Expression {
 public:
     std::string tableName;
     std::string columnName;
-    
+
     ColumnReference(const std::string& table, const std::string& column)
         : tableName(table), columnName(column) {}
-    
+
     std::string getType() const override { return "ColumnReference"; }
 };
 
@@ -51,13 +51,35 @@ public:
         BOOLEAN,
         NULL_VALUE
     };
-    
+
     Type type;
     std::string value;
-    
+
     Literal(Type t, const std::string& val) : type(t), value(val) {}
-    
+
     std::string getType() const override { return "Literal"; }
+};
+
+/**
+ * 二元表达式
+ */
+class BinaryExpression : public Expression {
+public:
+    enum class Operator {
+        ADD, SUBTRACT, MULTIPLY, DIVIDE, MOD,
+        EQUAL, NOT_EQUAL, LESS, LESS_EQUAL, GREATER, GREATER_EQUAL,
+        AND, OR
+    };
+
+    std::shared_ptr<Expression> left;
+    std::shared_ptr<Expression> right;
+    Operator op;
+
+    BinaryExpression() = default;
+    BinaryExpression(std::shared_ptr<Expression> l, std::shared_ptr<Expression> r, Operator o)
+        : left(l), right(r), op(o) {}
+
+    std::string getType() const override { return "BinaryExpression"; }
 };
 
 /**
@@ -67,9 +89,9 @@ class FunctionCall : public Expression {
 public:
     std::string functionName;
     std::vector<std::shared_ptr<Expression>> arguments;
-    
+
     FunctionCall(const std::string& name) : functionName(name) {}
-    
+
     std::string getType() const override { return "FunctionCall"; }
 };
 
@@ -95,7 +117,7 @@ public:
     std::vector<std::shared_ptr<Expression>> orderBy;
     std::shared_ptr<Expression> limitClause;
     std::shared_ptr<Expression> offsetClause;
-    
+
     std::string getType() const override { return "SelectStatement"; }
 };
 
@@ -107,7 +129,7 @@ public:
     std::string tableName;
     std::vector<std::string> columns;
     std::vector<std::vector<std::shared_ptr<Expression>>> values;
-    
+
     std::string getType() const override { return "InsertStatement"; }
 };
 
@@ -119,7 +141,7 @@ public:
     std::string tableName;
     std::vector<std::pair<std::string, std::shared_ptr<Expression>>> setClause;
     std::shared_ptr<Expression> whereClause;
-    
+
     std::string getType() const override { return "UpdateStatement"; }
 };
 
@@ -130,7 +152,7 @@ class DeleteStatement : public Statement {
 public:
     std::string tableName;
     std::shared_ptr<Expression> whereClause;
-    
+
     std::string getType() const override { return "DeleteStatement"; }
 };
 
@@ -141,7 +163,7 @@ class CreateTableStatement : public Statement {
 public:
     std::string tableName;
     std::vector<std::shared_ptr<Expression>> columns;
-    
+
     std::string getType() const override { return "CreateTableStatement"; }
 };
 

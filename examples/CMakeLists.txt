@@ -21,7 +21,7 @@ target_include_directories(sql_parser_test PRIVATE
 target_link_libraries(sql_parser_test
     sealdb_common
     sealdb_sql
-    sealdb_sql_parser_factory
+    sealdb_sql_parser
 )
 
 # 优化器测试
@@ -48,7 +48,20 @@ target_include_directories(flex_bison_test PRIVATE
 target_link_libraries(flex_bison_test
     sealdb_common
     sealdb_sql
-    sealdb_sql_parser_factory
+    sealdb_sql_parser
+)
+
+# ANTLR4解析器测试
+add_executable(antlr4_parser_test antlr4_parser_test.cpp)
+
+target_include_directories(antlr4_parser_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(antlr4_parser_test
+    sealdb_common
+    sealdb_sql
+    sealdb_sql_parser
 )
 
 # 设置可执行文件输出目录
@@ -65,5 +78,9 @@ set_target_properties(optimizer_test PROPERTIES
 )
 
 set_target_properties(flex_bison_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples
+)
+
+set_target_properties(antlr4_parser_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples
 )

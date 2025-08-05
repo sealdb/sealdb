@@ -4,7 +4,7 @@
 find_package(ANTLR4 QUIET)
 
 # 设置解析器选项
-option(USE_ANTLR4_PARSER "Use ANTLR4 parser" OFF)
+option(USE_ANTLR4_PARSER "Use ANTLR4 parser" ON)
 
 set(ANTLR4_PARSER_SOURCES)
 set(ANTLR4_PARSER_HEADERS)
@@ -13,38 +13,43 @@ set(ANTLR4_PARSER_HEADERS)
 if(USE_ANTLR4_PARSER)
     # 检查ANTLR4是否可用
     if(NOT ANTLR4_FOUND)
-        message(FATAL_ERROR "ANTLR4 not found but USE_ANTLR4_PARSER is enabled. Please install ANTLR4 or disable USE_ANTLR4_PARSER.")
+        message(WARNING "ANTLR4 not found, creating interface library only.")
+        set(USE_ANTLR4_PARSER OFF)
     endif()
 
     # 检查语法文件是否存在
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SQL.g4")
-        message(FATAL_ERROR "SQL.g4 not found but USE_ANTLR4_PARSER is enabled.")
+    if(USE_ANTLR4_PARSER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SQL.g4")
+        message(WARNING "SQL.g4 not found, creating interface library only.")
+        set(USE_ANTLR4_PARSER OFF)
     endif()
 
-    # ANTLR4语法文件
-    set(ANTLR4_GRAMMAR_FILES
-        SQL.g4
-    )
+    # ANTLR4解析器实现
+    if(USE_ANTLR4_PARSER)
+        # ANTLR4语法文件
+        set(ANTLR4_GRAMMAR_FILES
+            SQL.g4
+        )
 
-    # 生成ANTLR4解析器
-    antlr4_generate(${ANTLR4_GRAMMAR_FILES})
+        # 生成ANTLR4解析器
+        antlr4_generate(${ANTLR4_GRAMMAR_FILES})
 
-    list(APPEND ANTLR4_PARSER_SOURCES
-        ${ANTLR4_GENERATED_SOURCES}
-        antlr4_parser.cpp
-        antlr4_lexer.cpp
-    )
+        list(APPEND ANTLR4_PARSER_SOURCES
+            ${ANTLR4_GENERATED_SOURCES}
+            antlr4_parser.cpp
+            antlr4_lexer.cpp
+        )
 
-    list(APPEND ANTLR4_PARSER_HEADERS
-        antlr4_parser.h
-        antlr4_lexer.h
-    )
+        list(APPEND ANTLR4_PARSER_HEADERS
+            antlr4_parser.h
+            antlr4_lexer.h
+        )
 
-    add_definitions(-DUSE_ANTLR4_PARSER)
+        add_definitions(-DUSE_ANTLR4_PARSER)
+    endif()
 endif()
 
 # 创建静态库
-if(USE_ANTLR4_PARSER)
+if(USE_ANTLR4_PARSER AND ANTLR4_PARSER_SOURCES)
     add_library(sealdb_sql_antlr4_parser STATIC ${ANTLR4_PARSER_SOURCES})
 
     # 设置包含目录

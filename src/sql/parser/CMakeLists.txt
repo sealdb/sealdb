@@ -3,6 +3,7 @@
 # 添加子目录
 add_subdirectory(antlr4)
 add_subdirectory(pg)
+add_subdirectory(seal)
 
 # 查找flex和bison (用于PostgreSQL风格的解析器)
 find_package(FLEX QUIET)
@@ -29,18 +30,19 @@ set(PARSER_FACTORY_HEADERS
     parser_factory.h
 )
 
-# 创建解析器工厂静态库
-add_library(sealdb_sql_parser_factory STATIC ${PARSER_FACTORY_SOURCES})
+# 创建解析器静态库
+add_library(sealdb_sql_parser STATIC ${PARSER_FACTORY_SOURCES})
 
 # 设置包含目录
-target_include_directories(sealdb_sql_parser_factory PUBLIC
+target_include_directories(sealdb_sql_parser PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # 链接依赖
-target_link_libraries(sealdb_sql_parser_factory
+target_link_libraries(sealdb_sql_parser
     sealdb_common
     sealdb_sql_antlr4_parser
     sealdb_sql_pg_parser
+    sealdb_sql_seal_parser
 )
