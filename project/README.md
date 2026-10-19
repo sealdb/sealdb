@@ -1,4 +1,4 @@
-# SealDB × TiDB 计算层 Rust 重写工程手册
+# SealDB 计算层工程手册
 
 > 本目录是项目的**唯一工程事实来源（single source of truth）**。  
 > 任何正式编码开始前，先读本目录；任何阶段开工前，先通过该阶段的 Gate。
@@ -8,6 +8,8 @@
 ## 1. 项目一句话
 
 用 **Rust** 重写 **TiDB v8.5.8 的计算层**（SQL 协议 → 解析 → 优化 → 执行 → 元数据/事务编排），**完全复用 PD 与 TiKV** 的存储与分布式能力；目录名、文件名、核心算法与 TiDB 保持一致，语言语法糖按 Rust 习惯落地，解析器继续使用 **sqlparser-rs**。
+
+> 源码中不写“移植自 TiDB”之类的来源标记；对齐状态统一维护在 `project/parity/status.json`。
 
 ---
 
@@ -19,29 +21,25 @@
 | TiDB 版本 | **v8.5.8** | `learn/README.md` 与 tag 一致 |
 | TiDB 上游提交 | `f396bb4` | 本地 HEAD 仅额外提交 `learn/` |
 | TiDB Go 版本 | `go 1.25.12` | 以参考仓库 `go.mod` 为准 |
-| PD 本地源码 | `/home/wslu/work/github/db/pingcap/pd` | **v9.0.0-beta.2.pre** |
-| TiKV 本地源码 | `/home/wslu/work/github/db/pingcap/tikv` | **v9.0.0-beta.2.pre** |
-| Rust 工具链 | `rustc/cargo 1.80.1` | 当前仓库 edition 2024 无法被该 Cargo 解析 |
-| SQL 解析 | `sqlparser` **0.63.x**（当前仓库写的是 0.35） | 本项目保留 sqlparser-rs |
-| TiKV Rust 客户端 | `tikv-client` **0.4.x**（当前仓库写的是 0.3） | Phase 0 做能力 spike |
-| 当前 Rust 代码 | `src/`，玩具级脚手架 | 允许整体丢弃/归档，见 ADR-0007 |
+| PD 基线 | **v8.5.8** | 本地 checkout 可能是 9.0 beta；测试用 8.5.8 |
+| TiKV 基线 | **v8.5.8** | 本地 checkout 可能是 9.0 beta；测试用 8.5.8 |
+| Rust 工具链 | **1.99.1**（edition 2024） | 已通过 rsproxy 安装 |
+| SQL 解析 | `sqlparser` **0.63.x** | 本项目保留 sqlparser-rs |
+| TiKV Rust 客户端 | `tikv-client` **0.4.x** | Phase 0 做能力 spike |
+| 旧 Rust 代码 | `legacy-rust-scaffold/` | 已归档，不参与构建 |
 
-> **版本风险**：TiDB 8.5.8 与本地 PD/TiKV 9.0.0-beta 并非同一发行版组合。  
-> 一致性测试优先使用 **PD/TiKV v8.5.x** 镜像；若只能使用本地 9.0 beta，必须在 `progress.md` 记录协议差异与验证结论。
+> **版本统一**：TiDB / PD / TiKV 统一到 **v8.5.8** 发行线。  
+> 本地 PD/TiKV 若仍在 9.0 beta，仅用于快速冒烟；一致性测试必须使用 8.5.8 镜像或切到对应 tag。
 
 ---
 
-## 3. 当前仓库状态（诚实评估）
+## 3. 当前仓库状态
 
-现有 `src/` 不是 TiDB 的移植，而是另一套通用数据库脚手架：
-
-- `src/sql/src/parser/parser.rs`：**没有真正解析 SQL**，只按关键字返回固定结构。
-- `src/storage/src/engine/tikv.rs`：RawClient 可用，但 `begin_transaction` 直接返回未实现。
-- `src/sql` 的 planner/optimizer/executor 是自研 RBO/CBO 形状，与 TiDB 目录和算法不对应。
-- 根 `Cargo.toml` 使用 `edition = "2024"` / `resolver = "3"`，在 Cargo 1.80.1 上 **`cargo metadata` 直接失败**。
-- 现有 `tests/` 是通用集成/回归框架，不是 TiDB 行为对齐测试。
-
-结论：**保留 `docker/`、`monitoring/`、`config/` 作为基础设施参考；`src/` 与旧测试建议按 ADR-0007（待确认）归档后重建。**
+- 旧 `src/`、`tests/`、`docs/`、`Cargo.toml`、`Makefile` 已移动到 `legacy-rust-scaffold/`。
+- 新 workspace 已建立：`pkg/` 下按 TiDB 顶层包粒度拆 crate，`cmd/tidb-server` 为入口。
+- `cargo metadata` / `cargo check --workspace` 已通过（Rust 1.99.1）。
+- `tools/oracle` 的 `parse` 模式已可运行（Go 1.25.12 + 本地 TiDB parser）。
+- `project/scripts/parity_check.py` 已可运行；状态来源为 `project/parity/status.json`。
 
 ---
 
@@ -67,9 +65,9 @@
 
 ## 5. 五条铁律
 
-1. **上游对齐**：每个移植文件必须标注 `PORT_SOURCE: <Go 路径> @ v8.5.8`，禁止凭记忆重写。
+1. **上游对齐**：移植前必须读上游实现、调用方与测试；禁止凭记忆重写。来源与状态记录在 `project/parity/status.json`，不写进源码。
 2. **行为优先于形式**：目录/文件名对齐是硬要求，但真正验收靠 Oracle 差分结果，不靠“看起来像”。
-3. **禁止静默空缺**：暂不实现的文件/函数必须有 `PORT_STATUS: stub|omitted` 和原因；空文件必须带注释。
+3. **禁止静默空缺**：暂不实现的文件/函数必须在 parity manifest 标 `stub|omitted` 并说明原因；源码中只保留通用 `todo!()`/错误返回，不写来源说明。
 4. **先竖切、再铺开**：每个阶段交付一条可运行的 SQL 竖切链路，禁止“全部类型先写完再联调”。
 5. **Gate 不过不进入下一阶段**：验收证据写入 `progress.md`；没有证据 = 未完成。
 
@@ -87,7 +85,7 @@ README → requirements → architecture → conventions
 
 ---
 
-## 7. 常用命令（规划，Phase 0 落地）
+## 7. 常用命令
 
 ```bash
 # 环境自检
@@ -101,13 +99,13 @@ python3 project/scripts/parity_check.py \
 # 安装本项目的 opencode skills
 ./project/scripts/install-skills.sh
 
-# 构建与测试（Phase 0 之后）
+# 构建与测试
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Oracle 差分（Phase 0 之后）
-./project/scripts/oracle_diff.sh --suite parser-smoke
+# Oracle 冒烟
+cd tools/oracle && go run ./cmd/tidb-oracle -sql "select 1" -pretty
 ```
 
 ---
@@ -116,5 +114,5 @@ cargo test --workspace
 
 - `progress.md` 每次工作结束必须更新；不允许“下次再记”。
 - 任何跨阶段/跨模块的决策先写 ADR，再改代码。
-- 任何“与 TiDB 不一致”的行为，必须在 `parity-matrix.md` 的「已知偏差」登记。
+- 任何“与参考实现不一致”的行为，必须在 `parity-matrix.md` 的「已知偏差」登记。
 - 与本手册冲突的临时做法，必须在 PR/提交说明中引用 ADR 或新增 ADR。

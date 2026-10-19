@@ -47,33 +47,35 @@ flowchart LR
 ### 交付物
 
 - [x] `project/` 工程手册（本文档集）
-- [ ] 根 `Cargo.toml`（单 crate，edition 2021）、`rust-toolchain.toml`
-- [ ] `cargo fmt` / `clippy` / `test` 可在空骨架上通过
-- [ ] `tools/oracle/` Go Oracle（parse/plan/execute 三种模式）
-- [ ] `project/scripts/parity_check.py`
-- [ ] `project/scripts/install-skills.sh`
+- [x] 根 `Cargo.toml`（workspace，顶层包粒度）、`rust-toolchain.toml`（1.99.1）
+- [x] `cargo metadata` / `cargo check --workspace` 可在空骨架通过
+- [x] `tools/oracle/` 的 `parse` 模式可运行（`plan`/`execute` 待补）
+- [x] `project/scripts/parity_check.py`
+- [x] `project/scripts/install-skills.sh`
+- [x] 旧 `src/`/`tests/`/`docs/` 归档到 `legacy-rust-scaffold/`
 - [ ] CI（GitHub Actions 或本地脚本）：fmt + clippy + test + oracle smoke
 - [ ] TiKV/PD 连接 spike：PD TSO、RegionCache、乐观/悲观事务、RawClient Coprocessor
-- [ ] 旧 `src/` 处置（ADR-0007）
+- [ ] `project/parity/status.json` 初始登记与 `--strict` 通过
 
 ### Gate 0
 
 ```bash
 cargo metadata --no-deps >/dev/null
+cargo check --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python3 project/scripts/parity_check.py --tidb-root <tidb> --rust-root .
-./tools/oracle/bin/tidb-oracle parse --sql "select 1"
+python3 project/scripts/parity_check.py --tidb-root <tidb> --rust-root . --strict
+cd tools/oracle && go run ./cmd/tidb-oracle -sql "select 1" -pretty
 ```
 
-**通过标准**：全部命令成功；Oracle 能对 `select 1` 输出 AST JSON；parity 报告能列出缺失文件；TiKV spike 有书面结论。
+**通过标准**：全部命令成功；Oracle 能对 `select 1` 输出 AST JSON；parity 报告可生成；TiKV spike 有书面结论。
 
 ### 风险
 
-- Cargo 1.80 与 edition 2024 冲突 → 用 edition 2021。
+- 受限网络下安装 Rust 1.99.1 → 使用 `rsproxy.cn` 镜像。
 - `tikv-client` 能力不足 → 见 ADR-0004 的兜底方案。
-- PD/TiKV 版本不匹配 → 固定 8.5.x 测试镜像。
+- PD/TiKV 版本不统一 → 统一使用 8.5.8 测试镜像/tag。
 
 ---
 
@@ -156,7 +158,7 @@ cargo run --bin tidb-server -- --execute "SELECT * FROM t LIMIT 1"
 - 所有已支持语句 `Restore` 后再次解析，结构一致（round-trip）。
 - 错误输入返回错误而非 panic；AST depth 限制生效。
 - `SELECT 1` / `SELECT * FROM t LIMIT n` 端到端可运行。
-- 未支持语句有明确错误与 `PORT_STATUS`。
+- 未支持语句有明确错误，并在 `project/parity/status.json` 标 `stub/omitted`。
 
 ---
 

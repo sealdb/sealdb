@@ -38,7 +38,7 @@ python3 project/scripts/parity_check.py \
   --tidb-root /home/wslu/work/github/db/pingcap/tidb \
   --rust-root . \
   --require <本阶段包> \
-  --strict-headers \
+  --strict \
   --json > project/reports/phase-XX/parity.json
 
 # 一致性

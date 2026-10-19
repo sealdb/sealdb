@@ -61,67 +61,65 @@ Protocol → Session → Parser → Preprocess → Planner(RBO→CBO) → Execut
 
 ---
 
-## 2. 仓库布局（单 crate 优先）
+## 2. 仓库布局（顶层包粒度 workspace）
 
 ### 2.1 结论
 
-**Phase 0 采用单 crate + `pkg/` 模块树**，最大限度保持目录/文件与 TiDB 一致，降低 20+ 个 `Cargo.toml` 与跨 crate 可见性带来的维护成本。  
-当编译时间或边界管理成为瓶颈时，再按 ADR 拆分 workspace（见 ADR-0002）。
+**Phase 0 采用 Cargo workspace：每个 TiDB 顶层 `pkg/<name>` 一个 crate，子包作为 crate 内模块。**  
+这样既保持 `pkg/<name>` 目录一一对应，又能获得编译并行与包边界；详见 ADR-0002。
 
 ```text
 sealdb/
-├── Cargo.toml                 # [lib] path = "pkg/lib.rs"
-│                              # [[bin]] name = "tidb-server", path = "cmd/tidb-server/main.rs"
-├── rust-toolchain.toml        # 固定工具链
+├── Cargo.toml                 # workspace 根：members + workspace 依赖
+├── rust-toolchain.toml        # 固定 1.99.1
 ├── pkg/
-│   ├── lib.rs                 # 顶层模块声明（Rust 必需，额外文件）
-│   ├── parser/                # 对应 pkg/parser
-│   │   ├── mod.rs             # Rust 模块根（额外文件）
-│   │   ├── parser.rs          # ← parser.go（对外 API / ParseSQL）
-│   │   ├── lexer.rs           # ← lexer.go（薄封装/兼容层）
-│   │   ├── ast/               # ← pkg/parser/ast/*
-│   │   ├── model/             # ← pkg/parser/model/*
-│   │   ├── mysql/             # ← pkg/parser/mysql/*
-│   │   ├── types/             # ← pkg/parser/types/*
-│   │   ├── format/            # ← pkg/parser/format/*
-│   │   ├── opcode/            # ← pkg/parser/opcode/*
-│   │   ├── terror/            # ← pkg/parser/terror/*
-│   │   ├── charset/           # ← pkg/parser/charset/*
-│   │   ├── sqlparser_bridge/  # ★ 额外：TiDBDialect + AST lowering
-│   │   │   ├── mod.rs
-│   │   │   ├── dialect.rs
-│   │   │   └── lower.rs
-│   │   ├── parser.y           # 保留文件名；仅参考注释，不参与编译
+│   ├── parser/                # crate: sealdb-parser
+│   │   ├── Cargo.toml
+│   │   ├── lib.rs             # pub mod ast; pub mod model; ...
+│   │   ├── ast/               # 子包 -> 模块
+│   │   ├── model/
+│   │   ├── mysql/
+│   │   ├── types/
+│   │   ├── format/
+│   │   ├── opcode/
+│   │   ├── terror/
+│   │   ├── charset/
+│   │   ├── sqlparser_bridge/  # ★ 额外模块：Dialect + AST lowering
+│   │   ├── parser.y           # 参考占位，不参与编译
 │   │   └── hintparser.y       # 同上
-│   ├── types/                 # ← pkg/types
-│   ├── kv/                    # ← pkg/kv
-│   ├── meta/                  # ← pkg/meta
-│   ├── infoschema/            # ← pkg/infoschema
-│   ├── domain/                # ← pkg/domain
-│   ├── expression/            # ← pkg/expression
-│   ├── planner/               # ← pkg/planner（core/、property/、cascades/ ...）
-│   ├── executor/              # ← pkg/executor（internal/、join/、aggregate/ ...）
-│   ├── session/               # ← pkg/session
-│   ├── sessionctx/            # ← pkg/sessionctx
-│   ├── sessiontxn/            # ← pkg/sessiontxn
-│   ├── store/                 # ← pkg/store（driver/、copr/）
-│   ├── distsql/               # ← pkg/distsql
-│   ├── ddl/                   # ← pkg/ddl
-│   ├── statistics/            # ← pkg/statistics
-│   ├── privilege/             # ← pkg/privilege
-│   ├── bindinfo/              # ← pkg/bindinfo
-│   ├── config/                # ← pkg/config
-│   ├── table/                 # ← pkg/table
-│   ├── tablecodec/            # ← pkg/tablecodec
-│   ├── errno/                 # ← pkg/errno
-│   └── util/                  # ← pkg/util（chunk/、codec/ ...）
-├── cmd/tidb-server/main.rs    # ← cmd/tidb-server/main.go
-├── tools/oracle/              # ★ 额外：Go Oracle（不参与 parity）
-├── tests/                     # Rust 集成/一致性测试
-├── testdata/                  # 金样/语料
-├── docker/                    # 复用并固定版本
+│   ├── types/                 # crate: sealdb-types
+│   ├── kv/                    # crate: sealdb-kv
+│   ├── util/                  # crate: sealdb-util（chunk/、codec/ ...）
+│   ├── config/                # crate: sealdb-config
+│   ├── errno/                 # crate: sealdb-errno
+│   ├── meta/                  # crate: sealdb-meta（model/ ...）
+│   ├── infoschema/            # crate: sealdb-infoschema
+│   ├── domain/                # crate: sealdb-domain
+│   ├── expression/            # crate: sealdb-expression
+│   ├── planner/               # crate: sealdb-planner（core/、property/ ...）
+│   ├── executor/              # crate: sealdb-executor（internal/、join/ ...）
+│   ├── session/               # crate: sealdb-session
+│   ├── sessionctx/            # crate: sealdb-sessionctx（variable/ ...）
+│   ├── sessiontxn/            # crate: sealdb-sessiontxn（isolation/ ...）
+│   ├── store/                 # crate: sealdb-store（driver/、copr/）
+│   ├── distsql/               # crate: sealdb-distsql（context/ ...）
+│   ├── table/                 # crate: sealdb-table
+│   ├── tablecodec/            # crate: sealdb-tablecodec
+│   ├── statistics/            # crate: sealdb-statistics（handle/ ...）
+│   ├── privilege/             # crate: sealdb-privilege（privileges/ ...）
+│   ├── bindinfo/              # crate: sealdb-bindinfo
+│   ├── ddl/                   # crate: sealdb-ddl
+│   └── server/                # crate: sealdb-server
+├── cmd/tidb-server/           # crate: sealdb-server-bin（bin: sealdb-server）
+│   ├── Cargo.toml
+│   └── main.rs
+├── tools/oracle/              # Go Oracle（不参与 workspace）
+├── tests/                     # Rust 集成/一致性测试（后续）
+├── testdata/                  # 金样/语料（后续）
+├── docker/                    # 复用并固定 8.5.8
 ├── monitoring/                # 复用
 ├── config/                    # 复用并重写
+├── legacy-rust-scaffold/      # 归档旧代码，不参与构建
 └── project/                   # 本工程手册
 ```
 
@@ -131,27 +129,51 @@ sealdb/
 |---|---|
 | R1 | TiDB 的目录在 Rust 中同名存在；计算层目录必须完整。 |
 | R2 | `foo.go` → `foo.rs`，路径相对 `pkg/` 保持一致。 |
-| R3 | 每个目录必须有 `mod.rs`（Rust 模块根）；顶层 `pkg/lib.rs` 声明模块。 |
+| R3 | 每个 crate 根为 `lib.rs`；其下每个子目录模块为 `mod.rs`。 |
 | R4 | `*_test.go` 默认内联为 `#[cfg(test)] mod tests`；需要独立文件时用 `foo_test.rs` 并在 `mod.rs` 注册。 |
-| R5 | TiDB 的生成文件（`parser.go`、`*_generated.go`）若在 Rust 中不生成，则对应 `.rs` 作为**手写替代**，状态标 `reimplemented`。 |
+| R5 | 生成文件（`parser.go`、`*_generated.go`）若在 Rust 中不生成，则对应 `.rs` 作为**手写替代**，状态在 manifest 标 `reimplemented`。 |
 | R6 | `.y`、`.toml`、`.json`、`.md`、testdata 等非 Rust 文件：保留文件名；不参与编译；必要时放只读参考副本或说明文件。 |
-| R7 | 构建文件 `Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml`、`mod.rs`、`lib.rs` 属于**允许的额外文件**。 |
-| R8 | `tools/`、`project/`、`tests/`、`testdata/`、`reports/`、`third_party/` 属于**允许的额外目录**。 |
-| R9 | `pkg/parser/sqlparser_bridge/` 是显式允许的扩展目录；原因：sqlparser-rs 与 TiDB AST 的桥接不属于 TiDB 原树。 |
-| R10 | 不使用的 TiDB 文件可创建 `*.rs` 占位，内容必须包含：`PORT_SOURCE`、`PORT_STATUS: omitted`、原因、后续阶段。 |
+| R7 | 构建文件 `Cargo.toml`（根与每个 crate）、`Cargo.lock`、`rust-toolchain.toml`、`mod.rs`、`lib.rs` 属于**允许的额外文件**。 |
+| R8 | `tools/`、`project/`、`tests/`、`testdata/`、`reports/`、`legacy-rust-scaffold/` 属于**允许的额外目录**。 |
+| R9 | `pkg/parser/sqlparser_bridge/` 是显式允许的扩展模块；原因：sqlparser-rs 与目标 AST 的桥接不属于参考源码树。 |
+| R10 | 暂不使用的文件在 manifest 标 `omitted` 并说明原因与计划阶段；不要求创建空 `.rs`。进入当前阶段的包必须文件齐全（可 `stub`）。 |
+| R11 | **源码中不写来源/移植标记**；状态、来源路径、偏差统一维护在 `project/parity/status.json`。 |
 
-### 2.3 文件头规范（机器可读）
+### 2.3 对齐状态（机器可读）
 
-每个 `.rs` 文件顶部必须有：
+源码保持干净；对齐状态集中在 `project/parity/status.json`：
 
-```rust
-// PORT_SOURCE: pkg/parser/parser.go @ v8.5.8
-// PORT_STATUS: ported | partial | stub | reimplemented | omitted
-// PARITY_NOTES: <可选：与上游的差异/原因>
+```json
+{
+  "baseline": "v8.5.8",
+  "files": {
+    "pkg/parser/parser.go": {
+      "status": "stub",
+      "rust": "pkg/parser/parser.rs",
+      "phase": 2,
+      "notes": "public API skeleton"
+    },
+    "pkg/executor/analyze.go": {
+      "status": "omitted",
+      "phase": 7,
+      "notes": "statistics phase"
+    }
+  }
+}
 ```
 
-`parity_check.py` 依赖这三个字段生成报告。  
-`reimplemented` 用于“文件名对应，但实现方式因 sqlparser-rs/语言差异而不同”的文件（如 `parser.rs`、`parser.y` 的替代）。
+状态语义：
+
+| 状态 | 含义 |
+|---|---|
+| `ported` | 已实现，测试通过 |
+| `partial` | 部分实现，未实现分支有明确错误 |
+| `reimplemented` | 因语言/库差异重写，行为对齐 |
+| `stub` | 接口/骨架存在，未实现 |
+| `omitted` | 本阶段不需要，记录原因与计划阶段 |
+| `not-started` | manifest 未列出时的默认状态 |
+
+`parity_check.py` 以 manifest 为唯一状态来源；`.rs` 存在但 manifest 未登记 => `invalid`。
 
 ---
 
@@ -201,7 +223,7 @@ flowchart BT
   ddl --> meta
 ```
 
-> 实际依赖以 TiDB `import` 图为准。Rust 单 crate 内不强制编译期边界，但**人工评审必须保证依赖方向一致**，禁止反向依赖（如 parser 依赖 executor）。
+> 实际依赖以参考实现的 `import` 图为准。workspace crate 之间必须保持 DAG；出现循环依赖时单独讨论（拆接口 crate 或调整边界），禁止临时打破依赖方向。
 
 ---
 
@@ -393,9 +415,10 @@ pub trait Executor {
 | 用 sqlparser-rs 替代 goyacc | 用户约束 | AST 入口实现不同；通过 lowering 对齐 | ADR-0003 |
 | `pkg/parser/sqlparser_bridge/` 额外目录 | 桥接需要 | 不影响 TiDB 目录对齐 | 本文 R9 |
 | `mod.rs`/`lib.rs` 额外文件 | Rust 模块系统 | 无 | 本文 R7 |
-| 单 crate 而非 Go 包 | 降低初期复杂度 | 编译期边界弱 | ADR-0002 |
-| `tikv-client` 替代 client-go | Rust 生态 | 部分 API 需适配/兜底 | ADR-0004 |
-| edition 2021 / MSRV 1.80 | 当前环境 | 语法略保守 | ADR-0006 |
+| workspace 顶层包粒度 | 兼顾目录对齐与编译/边界 | 每个顶层包多一个 `Cargo.toml` | ADR-0002 |
+| `tikv-client` 替代 Go 客户端 | Rust 生态 | 部分 API 需适配/兜底 | ADR-0004 |
+| Rust 1.99.1 / edition 2024 | 使用近期工具链 | 环境需能安装 1.99.1 | ADR-0006 |
+| 源码不含来源标记 | 用户要求 | 状态依赖 manifest | 本文 R11 |
 | 早期 mock 统计信息 | 分阶段 | CBO 精度后置 | roadmap Phase 4/7 |
 
 > 任何新增偏差必须进入本表 + ADR；否则视为违反需求。

@@ -59,15 +59,15 @@
 
 ## 3. 文件级报告（自动生成）
 
-`parity_check.py` 输出：
+状态唯一来源：`project/parity/status.json`。`parity_check.py` 输出：
 
 ```text
-pkg/parser/parser.go                         -> pkg/parser/parser.rs        [ported]
+pkg/parser/parser.go                         -> pkg/parser/parser.rs        [stub]
 pkg/parser/lexer.go                          -> pkg/parser/lexer.rs         [partial]
-pkg/executor/analyze.go                      -> pkg/executor/analyze.rs     [omitted]
+pkg/executor/analyze.go                      -> (omitted)                   [omitted]
 pkg/executor/foo.go                          -> (missing)                   [not-started]
-pkg/executor/foo.rs                          -> (no PORT_STATUS header)      [invalid]
-pkg/parser/sqlparser_bridge/lower.rs         -> (extra, allowed)             [bridge]
+pkg/executor/foo.rs                          -> (unmapped)                  [invalid]
+pkg/parser/sqlparser_bridge/lower.rs         -> (extra, allowed)            [bridge]
 ```
 
 ### 3.1 使用
@@ -78,20 +78,21 @@ python3 project/scripts/parity_check.py \
   --rust-root . \
   --json > project/reports/parity.json
 
-# 只检查某个阶段涉及的包
 python3 project/scripts/parity_check.py \
   --tidb-root /home/wslu/work/github/db/pingcap/tidb \
   --rust-root . \
-  --require pkg/parser,pkg/types,pkg/util/codec
+  --require pkg/parser,pkg/types,pkg/util/codec \
+  --strict
 ```
 
 ### 3.2 判定
 
 | 情况 | 结果 |
 |---|---|
-| `foo.go` 有 `foo.rs` 且有合法 `PORT_STATUS` | 计入对应状态 |
-| `foo.go` 无 `foo.rs` | `not-started` |
-| `foo.rs` 无 `PORT_STATUS` | `invalid`（CI 失败，`--strict-headers`） |
+| manifest 标 `ported/partial/stub/reimplemented` 且 `.rs` 存在 | 计入对应状态 |
+| manifest 标 `omitted` | `omitted`（不要求 `.rs`） |
+| manifest 未登记 | `not-started` |
+| `.rs` 存在但 manifest 未登记 | `invalid`（`--strict` 失败） |
 | 额外 `.rs` 不在白名单 | `extra`（评审确认） |
 | 目录缺失 | `missing-dir`（阶段 Gate 失败） |
 
@@ -105,11 +106,13 @@ python3 project/scripts/parity_check.py \
 | K2 | `mod.rs` / `lib.rs` | Rust 模块系统 | 额外构建文件 | 允许；R7 |
 | K3 | `parser.y` / `hintparser.y` 仅参考 | 不移植 goyacc | 文法文件不参与编译 | 保留占位注释 |
 | K4 | `parser.go` 对应 `parser.rs` 为手写 | goyacc 生成代码不可直接移植 | 实现方式不同，行为对齐 | `reimplemented` |
-| K5 | 单 crate | 初期降低复杂度 | 编译期边界弱 | ADR-0002 |
-| K6 | `tikv-client` 替代 client-go | Rust 生态 | 部分 API 适配/兜底 | ADR-0004 |
-| K7 | edition 2021/MSRV 1.80 | 当前环境 | 语法保守 | ADR-0006 |
+| K5 | workspace 顶层包粒度 | 目录对齐 + 编译边界 | 每包一个 `Cargo.toml` | ADR-0002 |
+| K6 | `tikv-client` 替代 Go 客户端 | Rust 生态 | 部分 API 适配/兜底 | ADR-0004 |
+| K7 | Rust 1.99.1 / edition 2024 | 近期工具链 | 需安装 1.99.1 | ADR-0006 |
 | K8 | Mock stats（Phase 4） | 分阶段 | CBO 精度后置 | Phase 7 替换 |
 | K9 | 暂不移植 `br/`、`dumpling/`、`lightning/`、`tiflash/`、`tispark/` | 非计算层主链路 | 目录占位 | n/a |
+| K10 | 源码不含来源标记 | 用户要求 | 追溯依赖 manifest | `status.json` |
+| K11 | `legacy-rust-scaffold/` | 归档旧代码 | 不参与构建 | ADR-0007 |
 
 > 新增偏差必须同时更新：本表 + ADR + `requirements.md` §3（如涉及硬约束）。
 

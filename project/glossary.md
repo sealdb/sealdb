@@ -109,6 +109,7 @@
 | **Parity** | Rust 与 TiDB 在目录/行为上的一致性。 |
 | **Vertical Slice** | 一条从 SQL 输入到结果输出的最小可运行链路。 |
 | **Gate** | 阶段验收门槛；不过不得进入下一阶段。 |
-| **PORT_SOURCE / PORT_STATUS** | Rust 文件头中的上游路径与移植状态。 |
+| **Parity manifest** | `project/parity/status.json`：集中记录每个源文件的对齐状态、Rust 路径与说明。 |
 | **reimplemented** | 文件名对应但实现方式因语言/库差异重写。 |
+| **workspace crate** | 每个 `pkg/<name>` 顶层包对应的 Rust crate。 |
 | **stub / omitted** | 未实现/暂不移植，必须显式标注。 |

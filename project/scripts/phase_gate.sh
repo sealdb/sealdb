@@ -52,13 +52,13 @@ if [[ -n "$REQUIRE" ]]; then
     --tidb-root "$TIDB_ROOT" \
     --rust-root "$ROOT" \
     --require "$REQUIRE" \
-    --strict-headers \
+    --strict \
     --json "$REPORT_DIR/parity.json"
 else
   run parity python3 "$ROOT/project/scripts/parity_check.py" \
     --tidb-root "$TIDB_ROOT" \
     --rust-root "$ROOT" \
-    --strict-headers \
+    --strict \
     --json "$REPORT_DIR/parity.json"
 fi
 

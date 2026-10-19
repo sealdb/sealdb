@@ -1,0 +1,10 @@
+[package]
+name = "spike-tikv-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+
+[dependencies]
+tikv-client = "0.4"
+tokio = { version = "1", features = ["full"] }

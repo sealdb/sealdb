@@ -1,0 +1,11 @@
+{
+  "baseline": "v8.5.8",
+  "files": {
+    "cmd/tidb-server/main.go": {
+      "status": "stub",
+      "rust": "cmd/tidb-server/main.rs",
+      "phase": 2,
+      "notes": "process entry skeleton; CLI only"
+    }
+  }
+}

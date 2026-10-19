@@ -77,37 +77,31 @@ tools/oracle/
 
 ### 2.4 示例命令
 
+Phase 0 已实现 `parse`（单条/文件/套件）。`plan` / `execute` 在 Phase 4/5 接入；下表保留目标接口。
+
 ```bash
 cd tools/oracle
 
-# 解析
-go run ./cmd/tidb-oracle parse \
-  --sql "select id, name from t where id = 1" \
-  --out /tmp/ast.json
+# 单条 SQL
+go run ./cmd/tidb-oracle \
+  -sql "select id, name from t where id = 1" \
+  -pretty -out /tmp/ast.json
 
-# 计划（固定统计信息）
-go run ./cmd/tidb-oracle plan \
-  --file testdata/plan_cases.sql \
-  --schema testdata/schema.sql \
-  --stats fixed \
-  --out /tmp/plan.json
+# 套件（目录下每个 *.sql 解析）
+go run ./cmd/tidb-oracle \
+  -suite testdata/parser-smoke \
+  -pretty -out /tmp/parser-smoke.json
 
-# 执行（mockstore/unistore，无需真实 TiKV）
-go run ./cmd/tidb-oracle execute \
-  --file testdata/exec_cases.sql \
-  --schema testdata/schema.sql \
-  --data testdata/data.sql \
-  --store mock \
-  --out /tmp/exec.json
+# 计划（Phase 4 目标接口）
+# go run ./cmd/tidb-oracle -plan -file testdata/plan_cases.sql \
+#   -schema testdata/schema.sql -stats fixed -out /tmp/plan.json
 
-# 执行（真实 TiKV）
-go run ./cmd/tidb-oracle execute \
-  --file testdata/exec_cases.sql \
-  --store "tikv://127.0.0.1:2379" \
-  --out /tmp/exec-tikv.json
+# 执行（Phase 5 目标接口）
+# go run ./cmd/tidb-oracle -execute -file testdata/exec_cases.sql \
+#   -schema testdata/schema.sql -data testdata/data.sql -store mock -out /tmp/exec.json
 ```
 
-> `--store mock` 使用 TiDB `pkg/store/mockstore` / `pkg/testkit`，保证确定性；真实 TiKV 用于集成验证。
+> `-store mock` 将使用本地 mock 存储，保证确定性；真实 TiKV 用于集成验证。
 
 ---
 
@@ -295,7 +289,7 @@ cargo +nightly fuzz run codec_roundtrip
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
-python3 project/scripts/parity_check.py --strict-headers
+python3 project/scripts/parity_check.py --strict
 ```
 
 ### 9.2 每日/夜间（Full）

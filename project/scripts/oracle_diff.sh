@@ -5,15 +5,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ORACLE="$ROOT/tools/oracle"
 SUITE=""
 SQL=""
-MODE="exec"
 OUT="$ROOT/project/reports/oracle-latest.json"
 
 usage() {
   cat <<'EOF'
 usage: oracle_diff.sh --suite <name> [--out FILE]
-       oracle_diff.sh --sql "SELECT ..." --mode ast|plan|exec|error|txn [--out FILE]
+       oracle_diff.sh --sql "SELECT ..." [--out FILE]
 
-Requires tools/oracle (Go module referencing the local TiDB checkout).
+Suite names map to tools/oracle/testdata/<name>/*.sql.
+Requires the Go oracle module.
 EOF
 }
 
@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --suite) SUITE="$2"; shift 2 ;;
     --sql) SQL="$2"; shift 2 ;;
-    --mode) MODE="$2"; shift 2 ;;
+    --mode) shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -34,13 +34,18 @@ if [[ ! -d "$ORACLE" ]]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
+export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+export GOTOOLCHAIN="${GOTOOLCHAIN:-auto}"
 
 if [[ -n "$SUITE" ]]; then
-  echo "oracle suite: $SUITE"
-  (cd "$ORACLE" && go run ./cmd/tidb-oracle run --suite "$SUITE" --out "$OUT")
+  DIR="$ORACLE/testdata/$SUITE"
+  if [[ ! -d "$DIR" ]]; then
+    echo "error: suite not found: $DIR" >&2
+    exit 2
+  fi
+  (cd "$ORACLE" && go run ./cmd/tidb-oracle -suite "testdata/$SUITE" -pretty -out "$OUT")
 elif [[ -n "$SQL" ]]; then
-  echo "oracle mode: $MODE"
-  (cd "$ORACLE" && go run ./cmd/tidb-oracle "$MODE" --sql "$SQL" --out "$OUT")
+  (cd "$ORACLE" && go run ./cmd/tidb-oracle -sql "$SQL" -pretty -out "$OUT")
 else
   usage
   exit 2

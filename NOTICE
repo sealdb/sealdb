@@ -1,0 +1,10 @@
+SealDB
+Copyright 2026 SealDB Authors
+
+This product includes software developed at PingCAP (https://www.pingcap.com/)
+and is derived from TiDB (https://github.com/pingcap/tidb), licensed under the
+Apache License, Version 2.0.
+
+The original TiDB copyright notices and license terms are retained in the
+repository's LICENSE file and in the upstream source tree used as the behavioral
+reference. See the project/ documentation for the reference baseline and scope.
