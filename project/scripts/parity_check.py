@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""TiDB -> Rust parity checker.
+"""Parity checker driven by project/parity/status.json.
 
-Scans the TiDB reference tree (pkg/ and cmd/) and the Rust tree, maps
-`foo.go` -> `foo.rs`, reads `PORT_STATUS` headers, and reports:
+The manifest is the only source of truth for port status. Source files keep no
+upstream provenance markers.
 
-  - missing directories
-  - Go files without a Rust counterpart (not-started)
-  - Rust files without a valid status header (invalid)
-  - explicit status counts (ported/partial/stub/reimplemented/omitted)
-  - extra Rust files outside the allow-list
+Manifest schema:
+  {
+    "baseline": "v8.5.8",
+    "files": {
+      "pkg/parser/parser.go": {
+        "status": "ported|partial|reimplemented|stub|omitted|not-started",
+        "rust": "pkg/parser/parser.rs",
+        "phase": 2,
+        "notes": "..."
+      }
+    }
+  }
 
 Exit codes:
   0  no blocking issues
-  1  blocking issues (invalid headers with --strict-headers, or missing
-     directories/files inside --require)
-  2  usage / IO error
-
-This script intentionally does not modify files.
+  1  blocking issues (missing dirs, required package incomplete, or --strict
+     failures such as unmapped .rs / extra files)
+  2  usage or IO error
 """
 
 from __future__ import annotations
@@ -24,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, asdict
@@ -38,11 +42,8 @@ VALID_STATUS = {
     "omitted",
     "not-started",
 }
-
-STATUS_RE = re.compile(
-    r"PORT_STATUS:\s*(ported|partial|stub|reimplemented|omitted|not-started)\b"
-)
-SOURCE_RE = re.compile(r"PORT_SOURCE:\s*(.+?)\s*$", re.MULTILINE)
+ACTIVE_STATUS = {"ported", "partial", "stub", "reimplemented"}
+DONE_STATUS = {"ported", "partial", "reimplemented", "omitted"}
 
 ALLOWED_RS_NAMES = {"mod.rs", "lib.rs"}
 ALLOWED_RS_SUFFIXES = ("_test.rs",)
@@ -55,7 +56,7 @@ class FileRow:
     go_path: str
     rs_path: str | None
     status: str
-    source: str | None = None
+    phase: int | None = None
     notes: str | None = None
 
 
@@ -63,20 +64,30 @@ class FileRow:
 class Report:
     tidb_root: str
     rust_root: str
+    manifest: str
+    baseline: str | None = None
     required: list[str] = field(default_factory=list)
     go_files: int = 0
     rs_files: int = 0
+    manifest_entries: int = 0
     status_counts: dict[str, int] = field(default_factory=dict)
     missing_dirs: list[str] = field(default_factory=list)
-    invalid_headers: list[str] = field(default_factory=list)
+    missing_rs: list[str] = field(default_factory=list)
+    invalid_entries: list[str] = field(default_factory=list)
+    unmapped_rs: list[str] = field(default_factory=list)
     extra_files: list[str] = field(default_factory=list)
-    missing_in_required: list[str] = field(default_factory=list)
+    incomplete_required: list[str] = field(default_factory=list)
     packages: dict[str, dict] = field(default_factory=dict)
     rows: list[FileRow] = field(default_factory=list)
 
     @property
     def blocking(self) -> bool:
-        return bool(self.missing_dirs or self.missing_in_required)
+        return bool(
+            self.missing_dirs
+            or self.missing_rs
+            or self.invalid_entries
+            or self.incomplete_required
+        )
 
 
 def iter_go_files(root: Path, subdirs: list[str]):
@@ -109,22 +120,6 @@ def go_to_rs(go_rel: str) -> str:
     return go_rel[:-3] + ".rs" if go_rel.endswith(".go") else go_rel
 
 
-def read_header(path: Path) -> tuple[str | None, str | None, str | None]:
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            head = "".join(f.readline() for _ in range(80))
-    except OSError:
-        return None, None, None
-
-    m = STATUS_RE.search(head)
-    status = m.group(1) if m else None
-    sm = SOURCE_RE.search(head)
-    source = sm.group(1).strip() if sm else None
-    nm = re.search(r"PARITY_NOTES:\s*(.+)", head)
-    notes = nm.group(1).strip() if nm else None
-    return status, source, notes
-
-
 def is_allowed_extra(rs_rel: str) -> bool:
     name = os.path.basename(rs_rel)
     if name in ALLOWED_RS_NAMES:
@@ -141,94 +136,126 @@ def package_of(rel: str) -> str:
     return parts[0] if parts else ""
 
 
+def load_manifest(path: Path) -> dict:
+    if not path.exists():
+        return {"baseline": None, "files": {}}
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    files = data.get("files", {})
+    if not isinstance(files, dict):
+        raise ValueError("manifest.files must be an object")
+    return data
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="TiDB -> Rust parity checker")
-    ap.add_argument("--tidb-root", required=True, help="TiDB reference repo root")
-    ap.add_argument("--rust-root", default=".", help="Rust repo root (default: .)")
+    ap = argparse.ArgumentParser(description="Parity checker (manifest-driven)")
+    ap.add_argument("--tidb-root", required=True)
+    ap.add_argument("--rust-root", default=".")
+    ap.add_argument("--manifest", default="")
     ap.add_argument(
         "--require",
         default="",
-        help="Comma-separated package dirs that must exist (e.g. pkg/parser,pkg/types)",
+        help="Comma-separated package dirs that must be complete",
     )
-    ap.add_argument(
-        "--strict-headers",
-        action="store_true",
-        help="Fail if any existing .rs file lacks a valid PORT_STATUS",
-    )
-    ap.add_argument(
-        "--include-extra",
-        action="store_true",
-        help="Report extra .rs files not matching a Go file",
-    )
-    ap.add_argument("--json", metavar="PATH", help="Write JSON report to PATH ('-' = stdout)")
-    ap.add_argument("--limit", type=int, default=50, help="Max detail lines per section")
+    ap.add_argument("--strict", action="store_true", help="Fail on invalid/unmapped/extra files")
+    ap.add_argument("--include-extra", action="store_true", help="Report extra .rs files")
+    ap.add_argument("--json", metavar="PATH", help="Write JSON report ('-' = stdout)")
+    ap.add_argument("--limit", type=int, default=50)
     args = ap.parse_args()
 
     tidb_root = Path(args.tidb_root).resolve()
     rust_root = Path(args.rust_root).resolve()
+    manifest_path = (
+        Path(args.manifest).resolve()
+        if args.manifest
+        else (rust_root / "project/parity/status.json")
+    )
+
     if not (tidb_root / "pkg").is_dir():
-        print(f"error: {tidb_root} does not look like a TiDB repo (pkg/ missing)", file=sys.stderr)
+        print(f"error: {tidb_root} does not look like the reference repo", file=sys.stderr)
         return 2
     if not rust_root.exists():
         print(f"error: rust root {rust_root} does not exist", file=sys.stderr)
         return 2
 
+    try:
+        manifest = load_manifest(manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"error: invalid manifest {manifest_path}: {e}", file=sys.stderr)
+        return 2
+
+    entries: dict[str, dict] = manifest.get("files", {})
     required = [s.strip().strip("/") for s in args.require.split(",") if s.strip()]
     subdirs = ["pkg", "cmd"]
 
-    report = Report(str(tidb_root), str(rust_root), required=required)
+    report = Report(
+        str(tidb_root),
+        str(rust_root),
+        str(manifest_path),
+        baseline=manifest.get("baseline"),
+        required=required,
+    )
 
-    go_map: dict[str, Path] = {}
-    for rel, p in iter_go_files(tidb_root, subdirs):
-        go_map[rel] = p
-
-    rs_map: dict[str, Path] = {}
-    for rel, p in iter_rs_files(rust_root, subdirs):
-        rs_map[rel] = p
-
+    go_map = {rel: p for rel, p in iter_go_files(tidb_root, subdirs)}
+    rs_map = {rel: p for rel, p in iter_rs_files(rust_root, subdirs)}
     report.go_files = len(go_map)
     report.rs_files = len(rs_map)
+    report.manifest_entries = len(entries)
 
-    counts = Counter()
-    pkg_stats: dict[str, dict] = defaultdict(lambda: {"go": 0, "rs": 0, "missing": 0, "status": Counter()})
+    counts: Counter[str] = Counter()
+    pkg_stats: dict[str, dict] = defaultdict(
+        lambda: {"go": 0, "rs": 0, "missing": 0, "status": Counter()}
+    )
+    mapped_rs: set[str] = set()
 
     for go_rel in sorted(go_map):
-        rs_rel = go_to_rs(go_rel)
         pkg = package_of(go_rel)
         pkg_stats[pkg]["go"] += 1
-        rs_path = rust_root / rs_rel
-        if not rs_path.exists():
-            counts["not-started"] += 1
-            pkg_stats[pkg]["missing"] += 1
-            report.rows.append(FileRow(go_rel, None, "not-started"))
-            if required and any(go_rel.startswith(r + "/") or go_rel == r for r in required):
-                report.missing_in_required.append(go_rel)
-            continue
+        entry = entries.get(go_rel)
+        status = (entry or {}).get("status", "not-started")
+        phase = (entry or {}).get("phase")
+        notes = (entry or {}).get("notes")
 
-        pkg_stats[pkg]["rs"] += 1
-        status, source, notes = read_header(rs_path)
-        if status is None:
-            counts["invalid"] += 1
-            report.invalid_headers.append(rs_rel)
-            report.rows.append(FileRow(go_rel, rs_rel, "invalid"))
-            if required and any(go_rel.startswith(r + "/") for r in required):
-                report.missing_in_required.append(go_rel)
-            continue
+        if status not in VALID_STATUS:
+            report.invalid_entries.append(f"{go_rel}: unknown status {status!r}")
+            status = "invalid"
+
+        rs_rel = (entry or {}).get("rust") or go_to_rs(go_rel)
+        rs_exists = (rust_root / rs_rel).exists()
+        if rs_exists:
+            mapped_rs.add(rs_rel)
+            pkg_stats[pkg]["rs"] += 1
+        else:
+            pkg_stats[pkg]["missing"] += 1
+
+        if status in ACTIVE_STATUS and not rs_exists:
+            report.missing_rs.append(f"{go_rel} -> {rs_rel}")
+        if status == "omitted" and rs_exists:
+            report.invalid_entries.append(f"{go_rel}: omitted but {rs_rel} exists")
+        if entry is None and rs_exists:
+            report.invalid_entries.append(f"{rs_rel}: exists but is not in manifest")
+
+        if required and go_rel.startswith(tuple(r + "/" for r in required)):
+            if status not in DONE_STATUS:
+                report.incomplete_required.append(f"{go_rel} [{status}]")
 
         counts[status] += 1
         pkg_stats[pkg]["status"][status] += 1
-        report.rows.append(FileRow(go_rel, rs_rel, status, source, notes))
+        report.rows.append(
+            FileRow(go_rel, rs_rel if rs_exists else None, status, phase, notes)
+        )
 
     for req in required:
         if not (rust_root / req).is_dir():
             report.missing_dirs.append(req)
 
-    if args.include_extra:
+    if args.include_extra or args.strict:
         for rs_rel in sorted(rs_map):
-            if is_allowed_extra(rs_rel):
+            if rs_rel in mapped_rs or is_allowed_extra(rs_rel):
                 continue
-            if go_to_rs(rs_rel) not in go_map:
-                report.extra_files.append(rs_rel)
+            report.extra_files.append(rs_rel)
 
     report.status_counts = dict(counts)
     report.packages = {
@@ -239,13 +266,12 @@ def main() -> int:
     print("== Parity Report ==")
     print(f"TiDB root : {tidb_root}")
     print(f"Rust root : {rust_root}")
+    print(f"Manifest  : {manifest_path}")
+    print(f"Baseline  : {report.baseline or 'unset'}")
     print(f"Go files  : {report.go_files}")
     print(f"Rust files: {report.rs_files}")
+    print(f"Entries   : {report.manifest_entries}")
     print("Status    : " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    print(
-        f"Issues    : invalid={len(report.invalid_headers)}, "
-        f"missing-dirs={len(report.missing_dirs)}, extra={len(report.extra_files)}"
-    )
 
     if required:
         print("\n== Required packages ==")
@@ -267,17 +293,20 @@ def main() -> int:
             print(f"  ... {len(items) - args.limit} more")
 
     show("Missing directories", report.missing_dirs)
-    show("Invalid headers (no PORT_STATUS)", report.invalid_headers)
-    show("Missing files in required packages", report.missing_in_required)
+    show("Missing Rust files (active status)", report.missing_rs)
+    show("Invalid manifest entries", report.invalid_entries)
+    show("Incomplete required files", report.incomplete_required)
     show("Extra Rust files", report.extra_files)
 
     if not counts:
-        print("\nNo Rust files found. Create the Phase 0 skeleton first.")
+        print("\nNo Go files found. Check --tidb-root.")
     elif counts.get("ported", 0) == 0 and counts.get("partial", 0) == 0:
         print("\nNo ported/partial files yet. This is expected before Phase 1.")
 
     payload = asdict(report)
-    payload["blocking"] = report.blocking or bool(report.invalid_headers and args.strict_headers)
+    payload["blocking"] = report.blocking or bool(
+        args.strict and (report.invalid_entries or report.extra_files)
+    )
     if args.json:
         text = json.dumps(payload, indent=2, ensure_ascii=False)
         if args.json == "-":
@@ -288,11 +317,9 @@ def main() -> int:
             out.write_text(text + "\n", encoding="utf-8")
             print(f"\nJSON report: {out}")
 
-    if report.missing_dirs:
+    if report.blocking:
         return 1
-    if report.missing_in_required:
-        return 1
-    if args.strict_headers and report.invalid_headers:
+    if args.strict and (report.invalid_entries or report.extra_files):
         return 1
     return 0
 

@@ -21,21 +21,21 @@ description: 运行 Go Oracle 生成 TiDB 的 AST/Plan/Result 期望，并与 Ru
 
 ### 1. 明确比较层
 
-| 现象 | 先跑 |
-|---|---|
-| 解析失败/AST 不同 | `--mode ast` |
-| 计划形状/选路不同 | `--mode plan` |
-| 行/列/类型不同 | `--mode exec` |
-| 错误码/消息不同 | `--mode error` |
-| 事务行为不同 | `--mode txn` |
+| 现象 | 先跑 | 状态 |
+|---|---|---|
+| 解析失败/AST 不同 | `-sql` / `-suite` | Phase 0 可用 |
+| 计划形状/选路不同 | plan 模式 | Phase 4 |
+| 行/列/类型不同 | execute 模式 | Phase 5 |
+| 错误码/消息不同 | error 模式 | Phase 2+ |
+| 事务行为不同 | txn 模式 | Phase 6 |
 
 ### 2. 生成期望
 
 ```bash
 cd tools/oracle
-go run ./cmd/tidb-oracle parse --sql "SELECT ..." --pretty > /tmp/expected.ast.json
-go run ./cmd/tidb-oracle plan  --sql "SELECT ..." --schema /tmp/schema.sql --stats fixed > /tmp/expected.plan.json
-go run ./cmd/tidb-oracle execute --sql "SELECT ..." --store mock > /tmp/expected.exec.json
+go run ./cmd/tidb-oracle -sql "SELECT ..." -pretty > /tmp/expected.ast.json
+go run ./cmd/tidb-oracle -suite testdata/parser-smoke -pretty > /tmp/expected.suite.json
+# plan/execute 模式将在 Phase 4/5 提供；当前先做 AST 差分。
 ```
 
 ### 3. 生成实际

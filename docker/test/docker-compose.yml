@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # TiKV 集群（测试环境）
   pd:
-    image: pingcap/pd:latest
+    image: pingcap/pd:v8.5.8
     container_name: sealdb-test-pd
     ports:
       - "2379:2379"
@@ -21,7 +21,7 @@ services:
       - sealdb-test-network
 
   tikv1:
-    image: pingcap/tikv:latest
+    image: pingcap/tikv:v8.5.8
     container_name: sealdb-test-tikv1
     ports:
       - "20160:20160"

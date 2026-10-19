@@ -9,8 +9,8 @@
 
 | 项 | 规则 |
 |---|---|
-| Edition | **2021**（Phase 0 基线，见 ADR-0006） |
-| MSRV | **1.80.1**（当前环境）；升级需 ADR |
+| Edition | **2024**（见 ADR-0006） |
+| MSRV | **1.99.1**；升级需 ADR |
 | 格式化 | `cargo fmt --all`，禁止手调对齐 |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 命名 | 类型 `CamelCase`；函数/变量 `snake_case`；常量 `SCREAMING_SNAKE_CASE`；模块 `snake_case` |
@@ -36,11 +36,11 @@
 
 ### 2.2 写 Rust
 
-1. 建同名 `.rs`，加文件头（见 §3）。
+1. 建同名 `.rs`，在 `project/parity/status.json` 登记状态与说明（见 §3）。
 2. 先翻译类型/数据结构，再翻译函数；保持函数名与职责可对应（Rust 命名可调整大小写）。
 3. 保留上游注释中的**关键算法说明**；删除纯语言噪音注释。
 4. 错误码/错误消息：优先保持一致；无法一致时加 `PARITY_NOTES`。
-5. 未实现部分：用 `todo!()` **仅限** `PORT_STATUS: stub` 文件，并在函数上注释原因与计划阶段。
+5. 未实现部分：用 `todo!()` **仅限** manifest 标 `stub` 的文件，并在函数上写通用原因/计划阶段（不写来源路径）。
 6. 不得在移植文件中顺手“优化算法”；优化另开任务/ADR。
 
 ### 2.3 测试
@@ -59,48 +59,51 @@
 
 ---
 
-## 3. 文件头模板
+## 3. 来源与状态记录
 
-### 3.1 正常移植
+源码中**不写**来源/移植标记（C9）。对齐状态统一登记在 `project/parity/status.json`：
 
-```rust
-// Copyright 2025 PingCAP, Inc. (upstream) / SealDB Authors (Rust port)
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// ...
-//
-// PORT_SOURCE: pkg/planner/core/optimizer.go @ v8.5.8
-// PORT_STATUS: ported
-// PARITY_NOTES: RBO 规则顺序与上游 optRuleList 一致；暂未实现 Cascades 分支。
+```json
+{
+  "baseline": "v8.5.8",
+  "files": {
+    "pkg/planner/core/optimizer.go": {
+      "status": "ported",
+      "rust": "pkg/planner/core/optimizer.rs",
+      "phase": 4,
+      "notes": "rule order aligned; cascades not enabled"
+    },
+    "pkg/executor/analyze.go": {
+      "status": "omitted",
+      "phase": 7,
+      "notes": "statistics phase"
+    }
+  }
+}
 ```
 
-### 3.2 部分实现
+规则：
+
+- `rust` 可省略；默认与 Go 文件同路径的 `.rs`。
+- `ported` / `partial` / `reimplemented` / `stub`：`.rs` 必须存在。
+- `omitted`：不要求 `.rs`；`notes` 必填（原因 + 计划阶段）。
+- 未登记：默认 `not-started`。
+- `.rs` 存在但未登记：`invalid`（CI 失败）。
+- 源码中的未实现只写通用说明，例如：
 
 ```rust
-// PORT_SOURCE: pkg/executor/builder.go @ v8.5.8
-// PORT_STATUS: partial
-// PARITY_NOTES: 已覆盖 TableReader/Selection/Projection/Limit；
-//               Join/Agg/DML 分支返回 ErrUnknownPlan，计划 Phase 5。
+pub fn analyze_table() -> Result<()> {
+    todo!("phase 07: statistics")
+}
 ```
-
-### 3.3 空实现 / 暂不移植
 
 ```rust
-// PORT_SOURCE: pkg/executor/analyze.go @ v8.5.8
-// PORT_STATUS: omitted
-// PARITY_NOTES: ANALYZE 属于 Phase 7（统计信息）；本阶段不提供入口。
-//
-// 本文件保留文件名以维持目录对齐，不包含可执行逻辑。
+pub fn analyze_table() -> Result<()> {
+    Err(Error::Unsupported("ANALYZE is not available in this phase"))
+}
 ```
 
-### 3.4 语言差异重实现
-
-```rust
-// PORT_SOURCE: pkg/parser/parser.go @ v8.5.8 (goyacc generated)
-// PORT_STATUS: reimplemented
-// PARITY_NOTES: 上游由 parser.y 生成；本项目用 sqlparser-rs + lowering。
-//               对外 API 与 AST 形状保持一致。
-```
+禁止在源码中写 `// ported from ...`、`// upstream: ...`、`// TiDB ...` 等来源信息。
 
 ---
 
@@ -213,20 +216,23 @@ Notes: ...
 
 ## 11. Parity 状态字段
 
+状态存于 `project/parity/status.json`：
+
 | 状态 | 含义 | 允许的占位实现 |
 |---|---|---|
-| `ported` | 核心逻辑已移植，测试通过 | 无 |
-| `partial` | 部分分支/函数已移植 | 未实现分支返回明确错误 |
-| `reimplemented` | 因语言/库差异重写，行为对齐 | 需 `PARITY_NOTES` |
-| `stub` | 仅有接口/骨架，未实现 | `todo!()` 或 `Err(NotImplemented)` |
-| `omitted` | 本阶段不需要，保留文件名 | 空实现 + 注释 |
-| `not-started` | 尚未创建 `.rs` | 允许（由 parity 脚本报告） |
+| `ported` | 核心逻辑已实现，测试通过 | 无 |
+| `partial` | 部分分支/函数已实现 | 未实现分支返回明确错误 |
+| `reimplemented` | 因语言/库差异重写，行为对齐 | `notes` 说明差异 |
+| `stub` | 仅有接口/骨架，未实现 | `todo!()` 或 `Err(Unsupported)` |
+| `omitted` | 本阶段不需要 | 不要求 `.rs`；`notes` 说明原因与阶段 |
+| `not-started` | 尚未开始（manifest 缺省） | 允许（由 parity 脚本报告） |
 
 ---
 
 ## 12. 评审检查清单（Reviewer）
 
-- [ ] 文件头齐全，`PORT_SOURCE` 指向真实上游路径。
+- [ ] `project/parity/status.json` 已登记，状态与实现一致。
+- [ ] 源码中没有来源/移植标记（C9）。
 - [ ] 算法/分支与上游一致；差异有注释/ADR。
 - [ ] 错误路径可测试；无静默 `unwrap`。
 - [ ] 并发/取消/超时考虑完整。

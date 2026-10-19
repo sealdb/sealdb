@@ -22,7 +22,7 @@
 
 | Phase | 名称 | 状态 | 开始 | 完成 | Gate 证据 | 备注 |
 |---|---|---|---|---|---|---|
-| 0 | 地基与规范 | `in-progress` | 2026-10-19 | — | 本文档集；待补 `Cargo.toml`/Oracle/parity 脚本 | 文档已建；代码地基未动 |
+| 0 | 地基与规范 | `in-progress` | 2026-10-19 | — | 见 §4 | workspace/oracle/parity 已就绪；待 TiKV spike/CI |
 | 1 | 核心类型与编码 | `not-started` | — | — | — | 依赖 Phase 0 |
 | 2 | 解析器 + Mock 链路 | `not-started` | — | — | — | 依赖 Phase 1 |
 | 3 | 元数据与 Bootstrap | `not-started` | — | — | — | 依赖 Phase 2 |
@@ -38,55 +38,73 @@
 
 ## 3. 包级状态（Phase 0 基线）
 
-> LOC 为 TiDB v8.5.8 **非测试 Go 代码**的近似值；状态针对 **Rust 移植**，不是旧 `src/`。
+> 当前所有 crate 只有空骨架（`Cargo.toml` + `lib.rs`），尚未登记任何源文件移植。  
+> 精确文件级状态由 `project/parity/status.json` + `parity_check.py` 生成。
 
-| TiDB 包 | Go LOC | Rust 状态 | 目标阶段 | 备注 |
-|---|---:|---|---|---|
-| `cmd/tidb-server` | — | `not-started` | 2/9 | 先 CLI，后协议 |
-| `pkg/parser` | 62,473 | `not-started` | 2 | sqlparser bridge |
-| `pkg/planner` | 107,549 | `not-started` | 4/7 | RBO/CBO 分批 |
-| `pkg/executor` | 98,789 | `not-started` | 5/8 | 算子分批 |
-| `pkg/expression` | 79,638 | `not-started` | 2/5 | 核心函数优先 |
-| `pkg/session` | 12,726 | `not-started` | 2/6 | 最小 Session 先行 |
-| `pkg/sessionctx` | 15,922 | `not-started` | 2/6 | 变量/StmtCtx |
-| `pkg/sessiontxn` | — | `not-started` | 6 | 隔离级别/Provider |
-| `pkg/kv` | 3,324 | `not-started` | 1/6 | 接口先行 |
-| `pkg/store` | 30,912 | `not-started` | 5/6 | driver/copr |
-| `pkg/types` | 17,937 | `not-started` | 1 | Datum/Decimal/Time |
-| `pkg/meta` | 10,829 | `not-started` | 3 | 元数据 |
-| `pkg/infoschema` | 13,262 | `not-started` | 3 | Schema 缓存 |
-| `pkg/statistics` | 25,512 | `not-started` | 7 | 直方图/CBO |
-| `pkg/domain` | 11,016 | `not-started` | 3/6 | Domain/Reload |
-| `pkg/table` | 9,578 | `not-started` | 5 | 表抽象 |
-| `pkg/tablecodec` | 2,103 | `not-started` | 1 | Key 编码 |
-| `pkg/ddl` | 57,307 | `not-started` | 8 | 在线 DDL |
-| `pkg/distsql` | — | `not-started` | 5 | Cop 请求 |
-| `pkg/privilege` | — | `not-started` | 8 | 权限 |
-| `pkg/bindinfo` | — | `not-started` | 8 | Binding |
-| `pkg/config` | — | `not-started` | 0/9 | 配置 |
-| `pkg/errno` | — | `not-started` | 1 | 错误码 |
-| `pkg/util/chunk` | — | `not-started` | 1/5 | Chunk |
-| `pkg/util/codec` | — | `not-started` | 1 | memcomparable |
-| `pkg/server` | — | `not-started` | 9 | MySQL 协议 |
-
-> `—` 表示本次统计未单独取数；后续由 `parity_check.py` 自动生成精确值。
+| 顶层包 | crate | 骨架 | 文件移植 | 目标阶段 |
+|---|---|---|---|---|
+| `pkg/parser` | `sealdb-parser` | ✅ | 0 | 2 |
+| `pkg/types` | `sealdb-types` | ✅ | 0 | 1 |
+| `pkg/kv` | `sealdb-kv` | ✅ | 0 | 1/6 |
+| `pkg/util` | `sealdb-util` | ✅ | 0 | 1/5 |
+| `pkg/config` | `sealdb-config` | ✅ | 0 | 0/9 |
+| `pkg/errno` | `sealdb-errno` | ✅ | 0 | 1 |
+| `pkg/meta` | `sealdb-meta` | ✅ | 0 | 3 |
+| `pkg/infoschema` | `sealdb-infoschema` | ✅ | 0 | 3 |
+| `pkg/domain` | `sealdb-domain` | ✅ | 0 | 3/6 |
+| `pkg/expression` | `sealdb-expression` | ✅ | 0 | 2/5 |
+| `pkg/planner` | `sealdb-planner` | ✅ | 0 | 4/7 |
+| `pkg/executor` | `sealdb-executor` | ✅ | 0 | 5/8 |
+| `pkg/session` | `sealdb-session` | ✅ | 0 | 2/6 |
+| `pkg/sessionctx` | `sealdb-sessionctx` | ✅ | 0 | 2/6 |
+| `pkg/sessiontxn` | `sealdb-sessiontxn` | ✅ | 0 | 6 |
+| `pkg/store` | `sealdb-store` | ✅ | 0 | 5/6 |
+| `pkg/distsql` | `sealdb-distsql` | ✅ | 0 | 5 |
+| `pkg/table` | `sealdb-table` | ✅ | 0 | 5 |
+| `pkg/tablecodec` | `sealdb-tablecodec` | ✅ | 0 | 1 |
+| `pkg/statistics` | `sealdb-statistics` | ✅ | 0 | 7 |
+| `pkg/privilege` | `sealdb-privilege` | ✅ | 0 | 8 |
+| `pkg/bindinfo` | `sealdb-bindinfo` | ✅ | 0 | 8 |
+| `pkg/ddl` | `sealdb-ddl` | ✅ | 0 | 8 |
+| `pkg/server` | `sealdb-server` | ✅ | 0 | 9 |
+| `cmd/tidb-server` | `sealdb-server-bin` | ✅ | 0 | 2/9 |
 
 ---
 
-## 4. 当前工作（Working On）
+## 4. 当前工作与证据
 
 ### 2026-10-19
 
-- **Phase 0 文档地基**：创建 `project/` 全套规范/路线图/进度/测试/调试/Skill/脚本。
-- **结论记录**：
-  - 现有 `src/` 为玩具脚手架，与 TiDB 目录/算法不对应；建议归档后重建（ADR-0007）。
-  - 当前 `Cargo.toml` edition 2024 在本机 Cargo 1.80.1 上无法解析（`cargo metadata` 失败）。
-  - 参考 TiDB v8.5.8；本地 PD/TiKV 为 9.0.0-beta.2.pre，需固定测试版本。
-- **下一步（Phase 0 剩余）**：
-  1. 根 `Cargo.toml` + `rust-toolchain.toml` + 空 `pkg/lib.rs` 骨架。
-  2. `tools/oracle/` Go harness（parse 模式先行）。
-  3. `project/scripts/parity_check.py` 可运行。
-  4. TiKV/PD 连接 spike（TSO/Region/事务/Coprocessor）。
+**决策落地**
+
+- 旧代码移动到 `legacy-rust-scaffold/`（`src/`、`tests/`、`docs/`、旧 `Cargo.toml`、旧 `Makefile`）。
+- 新 workspace：24 个 `pkg/*` crate + `cmd/tidb-server`，顶层包粒度，共 25 个 package。
+- Rust 升级到 **1.99.1**（rsproxy 镜像），edition 2024，resolver 3。
+- 版本统一：TiDB/PD/TiKV 基线 **v8.5.8**；本地 9.0 beta 仅冒烟。
+- 源码不再使用来源/移植标记；状态改由 `project/parity/status.json` 维护。
+
+**已验证**
+
+```text
+cargo metadata --no-deps   -> 25 packages
+cargo check --workspace    -> success (1.92s)
+tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
+```
+
+**待完成（Phase 0 剩余）**
+
+1. `tools/oracle` 的 `plan` / `execute` 模式。
+2. `project/parity/status.json` 初始登记 + `--strict` 通过。
+3. TiKV/PD 连接 spike（TSO/Region/事务/Coprocessor）。
+4. CI 基线（fmt/clippy/test/oracle smoke）。
+5. 根 Makefile 重写（新命令）。
+6. `docker/` 镜像固定到 v8.5.8。
+
+**TiKV spike 状态**
+
+- 已添加 `tools/spikes/tikv-client`（乐观事务最小示例 + 能力清单）。
+- 当前环境未运行 PD/TiKV，且 rsproxy 索引缺少 `web-sys 0.3.106`，编译验证暂未完成。
+- 解除条件：启动 v8.5.8 集群，或切换可用的 crates 稀疏索引/降级 web-sys。
 
 ---
 
@@ -94,7 +112,7 @@
 
 | Gate | 报告/命令 | 状态 |
 |---|---|---|
-| Gate 0 | `project/reports/phase-00/`（待建） | 未通过 |
+| Gate 0 | `project/reports/phase-00/`（待建） | 进行中 |
 | Gate 1 | `project/reports/phase-01/`（待建） | 未开始 |
 | Gate 2 | `project/reports/phase-02/`（待建） | 未开始 |
 | Gate 3 | `project/reports/phase-03/`（待建） | 未开始 |
@@ -105,21 +123,19 @@
 | Gate 8 | `project/reports/phase-08/`（待建） | 未开始 |
 | Gate 9 | `project/reports/phase-09/`（待建） | 未开始 |
 
-> 证据可以是：测试输出、Oracle diff 报告、命令退出码、CI 链接、抓包文件、benchmark 结果。  
-> 不接受“口头完成”。
-
 ---
 
 ## 6. 已知偏差 / 技术债
 
 | ID | 内容 | 影响 | 计划 |
 |---|---|---|---|
-| D1 | 当前 Rust 代码非 TiDB 移植 | 不能复用 | 归档后重建（ADR-0007） |
-| D2 | edition 2024 vs Cargo 1.80 | 无法构建 | 改 edition 2021（ADR-0006） |
-| D3 | PD/TiKV 9.0 beta vs TiDB 8.5.8 | 行为/协议风险 | 测试固定 8.5.x |
-| D4 | sqlparser-rs 与 TiDB 语法差异 | Parser 覆盖不全 | bridge + 分批补齐（ADR-0003） |
+| D1 | 旧 Rust 代码已归档 | 不可复用 | 保持归档 |
+| D2 | ~~edition 2024 vs Cargo 1.80~~ | 已解决 | Rust 1.99.1 |
+| D3 | 本地 PD/TiKV 仍可能是 9.0 beta | 行为/协议风险 | 测试固定 8.5.8 |
+| D4 | sqlparser-rs 与目标语法差异 | Parser 覆盖不全 | bridge + 分批补齐（ADR-0003） |
 | D5 | tikv-client 能力待验证 | 事务/Cop 可能缺 API | Phase 0 spike（ADR-0004） |
-| D6 | 单 crate 编译时间 | 后期可能变慢 | 按需拆 workspace（ADR-0002） |
+| D6 | workspace crate 边界 | 需显式依赖 | 按顶层包维护；循环依赖单独讨论 |
+| D7 | 源码不含来源标记 | 追溯依赖 manifest | 强制更新 `project/parity/status.json` |
 
 ---
 

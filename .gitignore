@@ -4,7 +4,13 @@
 *.pdb
 
 # Cargo
-Cargo.lock
+# Cargo.lock is committed for reproducible application builds.
+
+# Local tooling
+.sisyphus/
+tools/oracle/tidb-oracle
+legacy-rust-scaffold/target/
+tools/spikes/**/target/
 
 # IDE 和编辑器
 .vscode/

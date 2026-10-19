@@ -12,7 +12,7 @@ description: 将 TiDB Go 源文件按目录/文件对齐规则移植为 Rust，�
 ## 前置阅读
 
 1. `project/requirements.md`（硬约束）
-2. `project/conventions.md`（文件头、错误、测试）
+2. `project/conventions.md`（状态登记、错误、测试）
 3. `project/architecture.md`（目录对齐、依赖方向）
 4. 对应阶段的 `project/roadmap.md` 段落
 
@@ -36,15 +36,20 @@ rg "FuncName" pkg --glob '*_test.go' # 测试
 ### 2. 确认 Rust 落点
 
 - 路径：`pkg/<path>/<file>.rs`（同名）。
-- 若目录不存在：先建 `mod.rs`，在父 `mod.rs`/`pkg/lib.rs` 注册。
+- 若目录不存在：先建 `mod.rs`，在父 `mod.rs`/`lib.rs` 注册。
 - 若文件是桥接/语言差异：放 `pkg/parser/sqlparser_bridge/` 或按 ADR 处理。
 
-### 3. 写文件头
+### 3. 登记状态
 
-```rust
-// PORT_SOURCE: pkg/<path>/<file>.go @ v8.5.8
-// PORT_STATUS: ported | partial | reimplemented | stub | omitted
-// PARITY_NOTES: ...
+在 `project/parity/status.json` 增加条目（源码中不写来源标记）：
+
+```json
+"pkg/<path>/<file>.go": {
+  "status": "stub",
+  "rust": "pkg/<path>/<file>.rs",
+  "phase": 2,
+  "notes": "public API skeleton"
+}
 ```
 
 ### 4. 移植
@@ -52,7 +57,7 @@ rg "FuncName" pkg --glob '*_test.go' # 测试
 - 先类型/结构体/枚举，再函数。
 - 保持函数职责与上游可对应；Rust 命名用 snake_case。
 - 错误路径必须显式；禁止 `unwrap()` 进入生产路径。
-- 未实现分支：`return Err(Error::NotImplemented(...))` 或 `todo!()`（仅 stub 文件），并登记。
+- 未实现分支：`return Err(Error::Unsupported(...))` 或 `todo!()`（仅 stub 文件），并在 manifest 登记。
 - 不要顺手优化算法；优化另开任务/ADR。
 
 ### 5. 测试
@@ -88,7 +93,8 @@ python3 project/scripts/parity_check.py --tidb-root <tidb> --rust-root .
 ## 完成标准
 
 - [ ] 文件存在且路径同名。
-- [ ] 文件头齐全。
+- [ ] `project/parity/status.json` 已登记。
 - [ ] 核心逻辑与上游一致；差异有说明。
 - [ ] 测试通过；Oracle 用例（如适用）通过。
 - [ ] 进度/矩阵已更新。
+- [ ] 源码中没有来源/移植标记。

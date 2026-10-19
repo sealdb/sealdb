@@ -111,9 +111,10 @@ pkg/parser/types      parser 用的类型
 | C3 | **解析器使用 sqlparser-rs** | 不移植 goyacc；通过 `TiDBDialect + AST lowering` 对齐 TiDB AST。 |
 | C4 | **PD/TiKV 能力保持不变** | 只作为客户端使用；不 fork、不修改其源码。 |
 | C5 | **阶段化交付** | 每阶段可运行；优化器早期允许 mock/固定返回。 |
-| C6 | **可追溯** | 每个文件标注上游路径与版本；每个阶段有 Gate 证据。 |
-| C7 | **禁止静默 stub** | 未实现必须显式标注并进入 `progress.md`。 |
+| C6 | **可追溯** | 上游路径、版本、移植状态记录在 `project/parity/status.json`；每个阶段有 Gate 证据。 |
+| C7 | **禁止静默 stub** | 未实现必须在 manifest 标 `stub/omitted` 并进入 `progress.md`。 |
 | C8 | **安全 Rust** | 默认 `#![forbid(unsafe_code)]`；确需 `unsafe` 必须 ADR + 最小封装 + 测试。 |
+| C9 | **源码不写来源标记** | `.rs` 中不出现“移植自/参考 TiDB”等来源注释；说明放在根文档与 `project/`。 |
 
 ---
 
@@ -181,13 +182,14 @@ pkg/parser/types      parser 用的类型
 
 一个 `.rs` 文件算“完成”，必须同时满足：
 
-- [ ] 有 `PORT_SOURCE` / `PORT_STATUS` 头。
+- [ ] 已在 `project/parity/status.json` 登记（`ported/partial/stub/omitted`）。
 - [ ] 核心逻辑与上游一致；偏差有注释/ADR。
 - [ ] 有单元测试或 Oracle 用例覆盖。
 - [ ] `cargo fmt` / `cargo clippy -D warnings` 通过。
 - [ ] `parity-matrix.md` / `progress.md` 已更新。
 - [ ] 无 `unwrap()/expect()` 进入生产路径（测试除外）。
-- [ ] 无静默 `todo!()`；未实现必须 `PORT_STATUS: stub` 并列入进度。
+- [ ] 无静默 `todo!()`；未实现必须 `stub` 并列入进度。
+- [ ] 源码中没有来源/移植标记（C9）。
 
 ### 5.2 阶段 DoD
 
@@ -234,13 +236,18 @@ pkg/parser/types      parser 用的类型
 
 ---
 
-## 8. 开放问题（需确认）
+## 8. 已确认的关键决策
 
-| ID | 问题 | 建议默认值 | 影响 |
-|---|---|---|---|
-| Q1 | 现有 `src/` 直接删除还是先归档？ | 打 tag/分支后删除，保留 `docker/` 等基础设施 | 仓库结构 |
-| Q2 | 单 crate 还是多 crate workspace？ | **单 crate 优先**（保目录对齐、降维护成本），后期按需拆分 | 编译/依赖 |
-| Q3 | Rust edition/MSRV？ | **edition 2021 + MSRV 1.80.1**（当前环境可编译）；后续可升 2024 | 工具链 |
-| Q4 | PD/TiKV 版本？ | 一致性测试固定 **v8.5.x**；本地 9.0 beta 仅做冒烟 | 协议/测试 |
-| Q5 | Phase 2 是否包含完整 MySQL 协议？ | 否；先 CLI/`--execute`，完整协议放 Phase 9 | 交付节奏 |
-| Q6 | 文档语言？ | 中文为主，代码/标识符英文 | 协作 |
+| ID | 问题 | 决策 |
+|---|---|---|
+| Q1 | 旧 `src/` 处置 | 移到 `legacy-rust-scaffold/`，不参与构建；保留 `docker/`/`monitoring/`/`config/` |
+| Q2 | 工程粒度 | workspace，按 TiDB **顶层包粒度**拆 crate；子包为模块 |
+| Q3 | Rust 版本 | **Rust 1.99.1 / edition 2024**（已通过 rsproxy 安装） |
+| Q4 | PD/TiKV 版本 | 统一到 **v8.5.8**；本地 9.0 beta 仅冒烟 |
+| Q5 | Phase 2 协议 | 先 CLI/`--execute`；完整 MySQL 协议放 Phase 9 |
+| Q6 | 错误一致性 | 错误码/SQLSTATE 一致；消息允许近似 |
+| Q7 | sqlparser 缺口 | 短期允许 vendored patch；长期上游 PR |
+| Q8 | 首批语料 | SELECT/DML 基础 + 点查/范围/Join/Agg |
+| Q9 | 文档语言 | 中文为主，代码/标识符英文 |
+
+补充约束：**源码中不体现参考来源**（C9）；来源与状态集中在 `project/parity/status.json`。

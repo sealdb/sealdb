@@ -35,16 +35,16 @@ python3 project/scripts/parity_check.py \
 |---|---|---|
 | `missing-dir` | TiDB 目录在 Rust 缺失 | 建目录 + `mod.rs` + README/占位 |
 | `not-started` | `.go` 无对应 `.rs` | 建占位或加入后续阶段 |
-| `invalid` | `.rs` 无合法 `PORT_STATUS` | 补文件头 |
+| `invalid` | `.rs` 未登记或 manifest 状态非法 | 补 manifest 条目/修正状态 |
 | `extra` | Rust 额外 `.rs` | 确认是否白名单（bridge/测试） |
 | `stub` | 显式未实现 | 确认已登记进度 |
 | `omitted` | 本阶段不移植 | 确认有原因/阶段 |
-| `ported/partial/reimplemented` | 已移植状态 | 抽查文件头与测试 |
+| `ported/partial/reimplemented` | 已移植状态 | 抽查 manifest 与测试 |
 
 ## 判定规则
 
 1. **计算层目录缺失 = Gate 失败**（除非该阶段明确不要求）。
-2. `invalid` 数量必须为 0。
+2. `invalid` 数量必须为 0（manifest 为唯一状态来源）。
 3. `extra` 必须能解释（bridge、测试、工具）。
 4. `stub` 必须同时出现在 `progress.md` 的“技术债/下一步”。
 5. `omitted` 必须有 `PARITY_NOTES` 说明原因与计划阶段。

@@ -23,7 +23,7 @@ description: 分层调试 TiDB Rust 移植中的优化器/执行器问题：从 
 
 ```bash
 cargo run --bin tidb-server -- --parse "SQL" --ast-json > /tmp/rust.ast.json
-go run ./tools/oracle/cmd/tidb-oracle parse --sql "SQL" --pretty > /tmp/tidb.ast.json
+go run ./tools/oracle/cmd/tidb-oracle -sql "SQL" -pretty > /tmp/tidb.ast.json
 diff -u /tmp/tidb.ast.json /tmp/rust.ast.json
 ```
 

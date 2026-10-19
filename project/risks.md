@@ -16,12 +16,12 @@
 | R5 | **行为细节海量**：类型/排序规则/NULL/错误码/边界 | 结果不一致 | 高 | Oracle diff 大量小差异 | 类型/编码先行；差分回归；按优先级收敛 | 1–7 |
 | R6 | **事务语义复杂**：悲观锁/重试/Async Commit/1PC | 数据正确性风险 | 高 | 并发测试不稳定/丢更新 | 先 RR 基础；复用 tikv-client 2PC；逐项对齐 | 6 |
 | R7 | **元数据/DDL 耦合**：InfoSchema 版本、SchemaChecker、MDL | 读写错 schema | 中 | 交叉验证读到旧 schema | 先只读全量 Reload；DDL 后置；版本校验 | 3/8 |
-| R8 | **工具链**：Cargo 1.80 vs edition 2024 | 无法构建 | 高（已发生） | `cargo metadata` 失败 | edition 2021；后续升级 ADR | 0 |
-| R9 | **单 crate 编译时间** | 开发效率下降 | 中 | `cargo check` > 2–3 分钟 | 按需拆分 workspace；feature gate | 后期 |
+| R8 | **工具链**：受限网络下安装 Rust 1.99.1 | 无法构建 | 中 | 工具链下载超时 | 使用 rsproxy 镜像；`rust-toolchain.toml` 固定 | 0 |
+| R9 | **crate 边界与循环依赖** | 需要拆接口/调整边界 | 中 | `cargo check` 报循环依赖 | 顶层包粒度；必要时拆接口 crate | 全程 |
 | R10 | **依赖 License/供应链** | 合规/安全 | 低 | 引入 GPL/AGPL | 依赖审计；固定版本；`cargo deny` | 全程 |
 | R11 | **异步/取消语义**：KV RPC、Cop、排序 spill | 泄漏/卡死 | 中 | 取消后任务不退出 | CancellationToken；Close 可中断；超时/backoff | 5/6 |
 | R12 | **性能回归**：列存/表达式/拷贝 | 生产不可用 | 中 | benchmark 明显劣于 TiDB | 先正确后优化；基准门禁；Profile | 7+ |
-| R13 | **旧代码误导**：现有 `src/` 与 TiDB 无关 | 误用/返工 | 高 | 有人基于旧代码扩展 | 归档/删除；README 明确 | 0 |
+| R13 | **旧代码误导**：`legacy-rust-scaffold/` 与目标无关 | 误用/返工 | 中 | 有人基于归档代码扩展 | 已归档、不参与构建；README 明确 | 0 |
 | R14 | **测试环境不固定**：`:latest` 镜像 | 结果不可复现 | 高 | CI 结果漂移 | 固定 PD/TiKV/TiDB 版本；锁文件 | 0 |
 | R15 | **Oracle 污染**：把 TiDB bug 当标准 | 错误对齐 | 低 | 金样与文档冲突 | 金样人工 review；记录 TiDB 版本/issue | 全程 |
 
@@ -40,14 +40,15 @@
 
 | ID | 问题 | 建议默认值 | 影响 | 状态 |
 |---|---|---|---|---|
-| Q1 | 旧 `src/` 删除还是归档？ | 先打 `legacy-rust` tag/分支，再删除 | 仓库结构 | 待确认 |
-| Q2 | 单 crate vs 多 crate workspace？ | 单 crate 优先 | 编译/边界 | 待确认 |
-| Q3 | edition/MSRV？ | 2021 / 1.80.1（当前环境） | 工具链 | 待确认 |
-| Q4 | PD/TiKV 版本？ | 测试固定 8.5.x；本地 9.0 beta 仅冒烟 | 协议/测试 | 待确认 |
-| Q5 | Phase 2 是否要完整 MySQL 协议？ | 否；先 CLI，协议 Phase 9 | 交付节奏 | 待确认 |
-| Q6 | 是否允许 vendored sqlparser-rs patch？ | 短期允许，长期上游 PR | Parser 覆盖 | 待确认 |
-| Q7 | 是否要求与 TiDB 错误消息逐字一致？ | 核心错误码/SQLSTATE 一致；消息可近似 | 测试策略 | 待确认 |
-| Q8 | 首批目标 SQL 语料？ | SELECT/DML 基础 + 点查/范围/Join/Agg | Phase 2–5 | 待确认 |
+| Q1 | 旧 `src/` 处置？ | 移到 `legacy-rust-scaffold/` | 仓库结构 | 已确认 |
+| Q2 | 工程粒度？ | workspace，顶层包粒度 | 编译/边界 | 已确认 |
+| Q3 | edition/MSRV？ | 2024 / 1.99.1 | 工具链 | 已确认 |
+| Q4 | PD/TiKV 版本？ | 统一 v8.5.8；本地 9.0 beta 仅冒烟 | 协议/测试 | 已确认 |
+| Q5 | Phase 2 是否要完整 MySQL 协议？ | 否；先 CLI，协议 Phase 9 | 交付节奏 | 已确认 |
+| Q6 | 错误消息一致性？ | 错误码/SQLSTATE 一致；消息可近似 | 测试策略 | 已确认 |
+| Q7 | 是否允许 vendored sqlparser-rs patch？ | 短期允许，长期上游 PR | Parser 覆盖 | 已确认 |
+| Q8 | 首批目标 SQL 语料？ | SELECT/DML 基础 + 点查/范围/Join/Agg | Phase 2–5 | 已确认 |
+| Q9 | 文档语言？ | 中文为主，代码/标识符英文 | 协作 | 已确认 |
 
 ---
 
