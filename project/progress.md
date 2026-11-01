@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（表扫描 Projection）  
+> 最后更新：2026-11-01（tikv-persist）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: tikv-persist
+- **完成**:
+  - Domain 启动从 Storage `m` 前缀加载 Mutator
+  - DDL / next_handle 写回同一前缀（含删除残留 meta key）
+  - 新 Domain 可看见上一进程建的表和行
+- **验证**:
+  - `test_schema_persists_across_domain`
+  - `test_tikv_schema_reload_if_available`
+- **下一步**:
+  - SHOW CREATE / COUNT(DISTINCT)
 
 ### 2026-11-01
 

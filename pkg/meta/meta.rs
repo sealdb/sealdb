@@ -5,7 +5,7 @@ use sealdb_errno::{
 };
 use sealdb_kv::Key;
 use sealdb_util::codec::{encode_bytes, encode_uint};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub const META_PREFIX: &[u8] = b"m";
 pub const NEXT_GLOBAL_ID_KEY: &[u8] = b"NextGlobalID";
@@ -78,6 +78,7 @@ pub fn encode_hash_data_key_prefix(key: &[u8]) -> Vec<u8> {
 #[derive(Clone, Debug, Default)]
 pub struct Mutator {
     kv: BTreeMap<Vec<u8>, Vec<u8>>,
+    removed: HashSet<Vec<u8>>,
 }
 
 impl Mutator {
@@ -92,9 +93,26 @@ impl Mutator {
     /// Seed the in-memory NextGlobalID so a `--store tikv` test session
     /// does not reuse leftover table keys from a previous process.
     pub fn set_global_id(&mut self, id: i64) {
-        let encoded = encode_string_data_key(NEXT_GLOBAL_ID_KEY);
-        self.kv
-            .insert(encoded.into_bytes(), id.to_string().into_bytes());
+        self.put(
+            encode_string_data_key(NEXT_GLOBAL_ID_KEY).into_bytes(),
+            id.to_string().into_bytes(),
+        );
+    }
+
+    pub fn alloc_handle(&mut self, table_id: i64) -> Result<i64> {
+        self.inc_int(format!("NextHandle:{table_id}").as_bytes(), 1)
+    }
+
+    pub fn load_encoded(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>) {
+        self.kv.clear();
+        self.removed.clear();
+        for (k, v) in pairs {
+            self.kv.insert(k, v);
+        }
+    }
+
+    pub fn take_removed(&mut self) -> Vec<Vec<u8>> {
+        self.removed.drain().collect()
     }
 
     pub fn get_global_id(&self) -> Result<i64> {
@@ -209,9 +227,10 @@ impl Mutator {
 
     fn inc_int(&mut self, key: &[u8], step: i64) -> Result<i64> {
         let next = self.get_int(key)? + step;
-        let encoded = encode_string_data_key(key);
-        self.kv
-            .insert(encoded.into_bytes(), next.to_string().into_bytes());
+        self.put(
+            encode_string_data_key(key).into_bytes(),
+            next.to_string().into_bytes(),
+        );
         Ok(next)
     }
 
@@ -229,8 +248,18 @@ impl Mutator {
         }
     }
 
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        self.removed.remove(&key);
+        self.kv.insert(key, value);
+    }
+
+    fn remove_key(&mut self, key: Vec<u8>) {
+        self.kv.remove(&key);
+        self.removed.insert(key);
+    }
+
     fn hset(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> Result<()> {
-        self.kv.insert(
+        self.put(
             encode_hash_data_key(key, field).into_bytes(),
             value.to_vec(),
         );
@@ -245,12 +274,20 @@ impl Mutator {
     }
 
     fn hdel(&mut self, key: &[u8], field: &[u8]) {
-        self.kv.remove(encode_hash_data_key(key, field).as_bytes());
+        self.remove_key(encode_hash_data_key(key, field).into_bytes());
     }
 
     fn hclear(&mut self, key: &[u8]) {
         let prefix = encode_hash_data_key_prefix(key);
-        self.kv.retain(|k, _| !k.starts_with(&prefix));
+        let keys: Vec<_> = self
+            .kv
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.remove_key(key);
+        }
     }
 
     fn hget_all(&self, key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

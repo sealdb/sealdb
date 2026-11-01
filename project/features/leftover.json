@@ -38,11 +38,9 @@
     "F02": [
       "online-ddl-jobs",
       "create-like-as-select",
-      "indexes",
-      "tikv-persist"
+      "indexes"
     ],
     "F03": [
-      "tikv-persist",
       "rowcodec"
     ],
     "F04": [

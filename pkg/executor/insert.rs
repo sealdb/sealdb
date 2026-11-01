@@ -150,13 +150,10 @@ fn write_row(
     values: &[Datum],
 ) -> Result<()> {
     let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
-    let handle = values
-        .first()
-        .and_then(|d| match d {
-            Datum::I64(v) => Some(*v),
-            _ => None,
-        })
-        .unwrap_or_else(|| domain.next_handle(info.id));
+    let handle = match values.first() {
+        Some(Datum::I64(v)) => *v,
+        _ => domain.next_handle(info.id)?,
+    };
     let part_val = info.partition_value(values).cloned().unwrap_or(Datum::Null);
     let physical_id = info.locate_partition(&part_val)?;
     let key = encode_row_key_with_handle(physical_id, handle);

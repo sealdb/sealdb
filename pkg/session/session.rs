@@ -35,7 +35,7 @@ impl Session {
 
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let storage = sealdb_store::open(cfg)?;
-        Ok(Self::with_domain(Arc::new(Domain::with_storage(storage))))
+        Ok(Self::with_domain(Arc::new(Domain::with_storage(storage)?)))
     }
 
     pub fn with_domain(domain: Arc<Domain>) -> Self {
@@ -591,8 +591,14 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Datum::I64(1)]]);
     }
 
+    fn tikv_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_tikv_sql_roundtrip_if_available() {
+        let _guard = tikv_test_lock();
         let cfg = Config {
             store: sealdb_config::StoreKind::Tikv,
             ..Config::default()
@@ -606,13 +612,63 @@ mod tests {
         };
         session
             .execute_stmt(
-                "CREATE DATABASE tikv_smoke; CREATE TABLE tikv_smoke.t (id INT, name VARCHAR(20)); INSERT INTO tikv_smoke.t VALUES (1, 'a');",
+                "DROP DATABASE IF EXISTS tikv_smoke; CREATE DATABASE tikv_smoke; CREATE TABLE tikv_smoke.t (id INT, name VARCHAR(20)); INSERT INTO tikv_smoke.t VALUES (1, 'a');",
             )
             .unwrap();
         let rows = session.execute_stmt("SELECT * FROM tikv_smoke.t").unwrap();
         assert_eq!(
             rows.display_rows(),
             vec![vec!["1".to_string(), "a".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_schema_persists_across_domain() {
+        let storage: Arc<dyn sealdb_kv::Storage> = Arc::new(sealdb_kv::MemStorage::new());
+        let first = Session::with_domain(Arc::new(
+            Domain::with_storage(Arc::clone(&storage)).unwrap(),
+        ));
+        first
+            .execute_stmt(
+                "CREATE DATABASE persist_db; CREATE TABLE persist_db.t (id INT, name VARCHAR(20)); INSERT INTO persist_db.t VALUES (1, 'a')",
+            )
+            .unwrap();
+        drop(first);
+        let second = Session::with_domain(Arc::new(Domain::with_storage(storage).unwrap()));
+        let rows = second
+            .execute_stmt("SELECT name FROM persist_db.t")
+            .unwrap();
+        assert_eq!(rows.columns, vec!["name"]);
+        assert_eq!(rows.display_rows(), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn test_tikv_schema_reload_if_available() {
+        let _guard = tikv_test_lock();
+        let cfg = Config {
+            store: sealdb_config::StoreKind::Tikv,
+            ..Config::default()
+        };
+        let first = match Session::from_config(&cfg) {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("skip live tikv schema reload: {err}");
+                return;
+            }
+        };
+        first
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS persist_reload; CREATE DATABASE persist_reload; CREATE TABLE persist_reload.t (id INT, name VARCHAR(20)); INSERT INTO persist_reload.t VALUES (7, 'z')",
+            )
+            .unwrap();
+        drop(first);
+        let second = Session::from_config(&cfg).unwrap();
+        let rows = second
+            .execute_stmt("SELECT * FROM persist_reload.t")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["7".to_string(), "z".to_string()]]
         );
     }
 

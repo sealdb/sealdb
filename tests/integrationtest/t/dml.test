@@ -1,3 +1,4 @@
+DROP DATABASE IF EXISTS itest;
 CREATE DATABASE itest;
 CREATE TABLE itest.t (id INT, name VARCHAR(20));
 CREATE TABLE itest.src (id INT, name VARCHAR(20));

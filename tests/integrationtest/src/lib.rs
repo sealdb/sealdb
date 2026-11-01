@@ -234,10 +234,9 @@ fn open_storage(backend: StoreBackend, pd: Option<&str>) -> Result<Arc<dyn seald
 }
 
 fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
-    Session::with_domain(Arc::new(Domain::with_storage_id_base(
-        storage,
-        unique_id_base(),
-    )))
+    Session::with_domain(Arc::new(
+        Domain::with_storage_id_base(storage, unique_id_base()).expect("domain meta load"),
+    ))
 }
 
 pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<String> {
