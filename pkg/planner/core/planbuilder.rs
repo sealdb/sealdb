@@ -195,6 +195,15 @@ impl PlanBuilder {
             Statement::SetTxn(_) => Ok(PhysicalPlan::Simple {
                 kind: "SetTxn".to_string(),
             }),
+            Statement::Prepare(_) => Ok(PhysicalPlan::Simple {
+                kind: "Prepare".to_string(),
+            }),
+            Statement::Execute(_) => Ok(PhysicalPlan::Simple {
+                kind: "Execute".to_string(),
+            }),
+            Statement::Deallocate(_) => Ok(PhysicalPlan::Simple {
+                kind: "Deallocate".to_string(),
+            }),
             Statement::Explain(explain) => Ok(PhysicalPlan::Explain {
                 format: explain.format,
                 child: Box::new(self.build_with_schema(&explain.stmt, is, current_db, stats)?),

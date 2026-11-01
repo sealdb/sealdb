@@ -141,6 +141,15 @@ case "$FEATURE" in
       --check
     run execute-rc cargo test -q -p sealdb-session --lib test_schema_checker_and_read_committed
     ;;
+  C4)
+    run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
+      --tidb-root "$TIDB_ROOT" \
+      --rust-root "$ROOT" \
+      --out "$ROOT/project/features/leftover.md" \
+      --json "$ROOT/project/features/leftover.json" \
+      --check
+    run execute-prepare cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'; EXECUTE s USING 1; DEALLOCATE PREPARE s"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

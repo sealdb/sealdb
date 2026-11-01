@@ -5,8 +5,8 @@ use super::ddl::{
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantStmt, RevokeStmt, RollbackStmt, SetTxnStmt,
-    ShowStmt, UseStmt,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantStmt, PrepareStmt,
+    RevokeStmt, RollbackStmt, SetTxnStmt, ShowStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -44,6 +44,9 @@ pub enum Statement {
     AnalyzeTable(AnalyzeTableStmt),
     Explain(ExplainStmt),
     SetTxn(SetTxnStmt),
+    Prepare(PrepareStmt),
+    Execute(ExecuteStmt),
+    Deallocate(DeallocateStmt),
 }
 
 impl Node for Statement {
@@ -71,6 +74,9 @@ impl Node for Statement {
             Statement::AnalyzeTable(s) => s.restore(ctx),
             Statement::Explain(s) => s.restore(ctx),
             Statement::SetTxn(s) => s.restore(ctx),
+            Statement::Prepare(s) => s.restore(ctx),
+            Statement::Execute(s) => s.restore(ctx),
+            Statement::Deallocate(s) => s.restore(ctx),
         }
     }
 }
@@ -100,6 +106,9 @@ impl StmtNode for Statement {
             Statement::AnalyzeTable(_) => "AnalyzeTableStmt",
             Statement::Explain(_) => "ExplainStmt",
             Statement::SetTxn(_) => "SetTxnStmt",
+            Statement::Prepare(_) => "PrepareStmt",
+            Statement::Execute(_) => "ExecuteStmt",
+            Statement::Deallocate(_) => "DeallocateStmt",
         }
     }
 }

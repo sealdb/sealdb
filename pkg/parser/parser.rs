@@ -581,4 +581,32 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("SERIALIZABLE"));
     }
+
+    #[test]
+    fn test_parse_prepare_execute() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("PREPARE stmt FROM 'SELECT 1'")
+            .unwrap()
+        {
+            crate::ast::Statement::Prepare(prepare) => {
+                assert_eq!(prepare.name, "stmt");
+                assert!(prepare.sql.to_ascii_uppercase().contains("SELECT"));
+            }
+            other => panic!("expected PrepareStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("EXECUTE stmt USING 1, 'a'").unwrap() {
+            crate::ast::Statement::Execute(exec) => {
+                assert_eq!(exec.name, "stmt");
+                assert_eq!(exec.using.len(), 2);
+            }
+            other => panic!("expected ExecuteStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("DEALLOCATE PREPARE stmt").unwrap() {
+            crate::ast::Statement::Deallocate(dealloc) => {
+                assert_eq!(dealloc.name, "stmt");
+            }
+            other => panic!("expected DeallocateStmt, got {other:?}"),
+        }
+    }
 }

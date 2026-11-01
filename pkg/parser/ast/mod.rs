@@ -22,7 +22,7 @@ pub use expressions::{
     WindowSpec,
 };
 pub use misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, IsolationLevel,
-    PrivElem, PrivilegeType, RevokeStmt, RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
-    UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
+    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, RevokeStmt,
+    RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
 };
