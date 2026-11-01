@@ -4,6 +4,7 @@ SELECT 1 + 2 AS n;
 SELECT 1 AS a, 2 AS b;
 
 # CREATE / INSERT / SELECT *
+DROP DATABASE IF EXISTS itest;
 CREATE DATABASE itest;
 CREATE TABLE itest.t (id INT, name VARCHAR(20));
 INSERT INTO itest.t VALUES (1, 'a'), (2, 'b');

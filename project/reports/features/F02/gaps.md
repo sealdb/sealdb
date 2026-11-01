@@ -9,6 +9,5 @@ These stay out of the core-ported door. Pick them up in the completeness wave.
 - Table-level UNIQUE / PRIMARY KEY / FOREIGN KEY / CHECK (F10 rejects these)
 - Database/table charset and collation options
 - `USE` (unqualified `CREATE TABLE t` needs a current database)
-- Persist meta to a real TiKV cluster
 - Bootstrap `mysql` / `test` system schemas
 - Exact FieldType JSON extras (`Elems`, `Array`) vs TiDB

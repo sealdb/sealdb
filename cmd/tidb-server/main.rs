@@ -78,7 +78,9 @@ fn load_config(cli: &Cli) -> Result<Config, String> {
 
 fn open_domain(cfg: &Config) -> Result<Arc<Domain>, String> {
     let storage = sealdb_store::open(cfg).map_err(|e| e.to_string())?;
-    Ok(Arc::new(Domain::with_storage(storage)))
+    Ok(Arc::new(
+        Domain::with_storage(storage).map_err(|e| e.to_string())?,
+    ))
 }
 
 fn print_parse(sql: &str, pretty: bool) -> Result<(), String> {

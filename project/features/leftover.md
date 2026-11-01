@@ -12,11 +12,9 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `online-ddl-jobs`
 - `create-like-as-select`
 - `indexes`
-- `tikv-persist`
 
 ### F03
 
-- `tikv-persist`
 - `rowcodec`
 
 ### F04
