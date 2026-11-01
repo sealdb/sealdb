@@ -25,7 +25,7 @@ FEATURE_HINTS = {
     "UseStmt": "F11",
     "GrantStmt": "F20",
     "RevokeStmt": "F20",
-    "AnalyzeTableStmt": "F21",
+    "AnalyzeTableStmt": "F21",  # ANALYZE TABLE count/NDV is core-ported
     "PrepareStmt": "C4",
     "ExecuteStmt": "C4",
     "BeginStmt": "F12",  # F13 adds BEGIN PESSIMISTIC on the same stmt

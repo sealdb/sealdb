@@ -265,6 +265,7 @@ dependencies = [
  "sealdb-meta",
  "sealdb-parser",
  "sealdb-privilege",
+ "sealdb-statistics",
  "thiserror",
 ]
 
@@ -286,6 +287,7 @@ dependencies = [
  "sealdb-meta",
  "sealdb-parser",
  "sealdb-planner",
+ "sealdb-statistics",
  "sealdb-tablecodec",
  "sealdb-types",
  "sealdb-util",
@@ -356,6 +358,7 @@ dependencies = [
  "sealdb-infoschema",
  "sealdb-meta",
  "sealdb-parser",
+ "sealdb-statistics",
  "sealdb-types",
  "serde",
  "thiserror",
@@ -396,6 +399,7 @@ dependencies = [
  "sealdb-planner",
  "sealdb-privilege",
  "sealdb-sessiontxn",
+ "sealdb-statistics",
  "sealdb-types",
  "thiserror",
 ]
@@ -416,6 +420,9 @@ dependencies = [
 [[package]]
 name = "sealdb-statistics"
 version = "0.1.0"
+dependencies = [
+ "sealdb-parser",
+]
 
 [[package]]
 name = "sealdb-store"

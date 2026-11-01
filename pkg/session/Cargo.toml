@@ -18,5 +18,6 @@ sealdb-parser.workspace = true
 sealdb-planner.workspace = true
 sealdb-privilege.workspace = true
 sealdb-sessiontxn.workspace = true
+sealdb-statistics.workspace = true
 sealdb-types.workspace = true
 thiserror.workspace = true

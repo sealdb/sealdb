@@ -14,8 +14,8 @@ use crate::ast::expressions::{
     ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
-    BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem, PrivilegeType,
-    RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem,
+    PrivilegeType, RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
 };
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
@@ -283,6 +283,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         }
         SqlStatement::Grant(grant) => lower_grant(grant),
         SqlStatement::Revoke(revoke) => lower_revoke(revoke),
+        SqlStatement::Analyze(analyze) => lower_analyze(analyze),
         SqlStatement::Savepoint { .. } | SqlStatement::ReleaseSavepoint { .. } => {
             Err(Error::unsupported("SAVEPOINT"))
         }
@@ -400,6 +401,26 @@ fn parse_quoted_or_ident(bytes: &[u8], i: usize) -> Result<(String, usize)> {
         return Err(Error::new(ERR_PARSE_ERROR, "missing user identity"));
     }
     Ok((String::from_utf8_lossy(&bytes[i..j]).into_owned(), j))
+}
+
+fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
+    // F21 gaps: ANALYZE INDEX, PARTITION, columns, NOSCAN, COMPUTE STATISTICS extras.
+    if analyze.partitions.as_ref().is_some_and(|p| !p.is_empty()) {
+        return Err(Error::unsupported("ANALYZE PARTITION"));
+    }
+    if analyze.for_columns || !analyze.columns.is_empty() {
+        return Err(Error::unsupported("ANALYZE columns"));
+    }
+    if analyze.noscan || analyze.cache_metadata {
+        return Err(Error::unsupported("ANALYZE option"));
+    }
+    let table = analyze
+        .table_name
+        .as_ref()
+        .ok_or_else(|| Error::unsupported("ANALYZE without table"))?;
+    Ok(Statement::AnalyzeTable(AnalyzeTableStmt {
+        table: object_table_name(table)?,
+    }))
 }
 
 fn lower_grant(grant: &Grant) -> Result<Statement> {

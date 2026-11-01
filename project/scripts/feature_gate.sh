@@ -109,6 +109,9 @@ case "$FEATURE" in
   F20)
     run execute-grant cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
     ;;
+  F21)
+    run execute-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t; SELECT * FROM db1.t WHERE name = 'a'"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

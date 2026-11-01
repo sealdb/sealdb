@@ -186,6 +186,18 @@ fn restore_privs(privs: &[PrivElem], ctx: &mut RestoreCtx) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct AnalyzeTableStmt {
+    pub table: TableName,
+}
+
+impl AnalyzeTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ANALYZE TABLE ");
+        self.table.restore(ctx)
+    }
+}
+
 fn restore_users(users: &[UserIdentity], ctx: &mut RestoreCtx) -> Result<()> {
     for (i, user) in users.iter().enumerate() {
         if i > 0 {
