@@ -32,7 +32,7 @@
 | 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
 | 7 | CBO 与统计 | `in-progress` | 2026-11-01 | — | F21 | ANALYZE 行数/NDV 已通；直方图留完整性波 |
 | 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F20 已通 |
-| 9 | MySQL 协议与运维 | `not-started` | — | — | F22 | 可提前做只读协议 |
+| 9 | MySQL 协议与运维 | `in-progress` | 2026-11-01 | — | F22 | handshake + COM_QUERY 已通；SSL/预处理留完整性波 |
 | 10 | 可选高级能力 | `deferred` | — | — | C6 | 完整性波不阻塞主线 |
 
 ### 2.1 功能波进度
@@ -61,7 +61,7 @@
 | F19 | `core-ported` | `project/reports/features/F19/` |
 | F20 | `core-ported` | `project/reports/features/F20/` |
 | F21 | `core-ported` | `project/reports/features/F21/` |
-| F22 | `not-started` | — |
+| F22 | `core-ported` | `project/reports/features/F22/` |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -104,6 +104,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F22 MySQL 协议 COM_QUERY
+- **完成**:
+  - handshake + `COM_QUERY` / `COM_PING` / `COM_INIT_DB` / `COM_QUIT`
+  - 文本协议结果集 / OK / ERR
+  - `--listen host:port`
+- **验证**:
+  - `./project/scripts/feature_gate.sh F22`
+- **下一步**:
+  - 完整性波 C1 leftover 收口
 
 ### 2026-11-01
 

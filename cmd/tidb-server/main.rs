@@ -12,6 +12,8 @@ struct Cli {
     #[arg(long)]
     execute: Option<String>,
     #[arg(long)]
+    listen: Option<String>,
+    #[arg(long)]
     sql: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -34,6 +36,9 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
     if let Some(sql) = cli.execute.clone() {
         return execute_sql(&sql);
+    }
+    if let Some(addr) = cli.listen.clone() {
+        return listen(&addr);
     }
     match cli.command {
         Some(Command::Parse { sql }) => print_parse(&sql, true),
@@ -63,6 +68,15 @@ fn print_parse(sql: &str, pretty: bool) -> Result<(), String> {
     };
     println!("{text}");
     Ok(())
+}
+
+fn listen(addr: &str) -> Result<(), String> {
+    let server = sealdb_server::Server::bind(addr).map_err(|e| e.to_string())?;
+    eprintln!(
+        "SealDB MySQL protocol listening on {}",
+        server.local_addr().map_err(|e| e.to_string())?
+    );
+    server.serve().map_err(|e| e.to_string())
 }
 
 fn execute_sql(sql: &str) -> Result<(), String> {

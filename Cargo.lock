@@ -375,6 +375,14 @@ dependencies = [
 [[package]]
 name = "sealdb-server"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-executor",
+ "sealdb-parser",
+ "sealdb-session",
+ "sealdb-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-server-bin"
@@ -382,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "sealdb-parser",
+ "sealdb-server",
  "sealdb-session",
  "serde_json",
 ]
