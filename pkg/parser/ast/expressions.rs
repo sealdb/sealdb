@@ -117,11 +117,15 @@ impl FuncCallExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str(&self.name);
         ctx.write_str("(");
-        for (i, arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                ctx.write_str(", ");
+        if self.name.eq_ignore_ascii_case("COUNT") && self.args.is_empty() {
+            ctx.write_str("*");
+        } else {
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                arg.restore(ctx)?;
             }
-            arg.restore(ctx)?;
         }
         ctx.write_str(")");
         Ok(())

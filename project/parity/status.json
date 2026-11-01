@@ -111,7 +111,7 @@
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "SelectStmt + InsertStmt + UpdateStmt + DeleteStmt"
+      "notes": "SelectStmt + InsertStmt + UpdateStmt + DeleteStmt + GROUP BY"
     },
     "pkg/parser/model/model.go": {
       "status": "partial",
@@ -176,12 +176,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, INSERT, UPDATE, DELETE, TableReader, Selection"
+      "notes": "Build constant SELECT, DDL, INSERT, UPDATE, DELETE, TableReader, Selection, HashAgg"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / Insert / Update / Delete / TableReader / Selection"
+      "notes": "TableDual / Projection / DDL / Insert / Update / Delete / TableReader / Selection / HashAgg"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -241,7 +241,7 @@
     "pkg/executor/builder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "select + DDL + insert + update + delete + table reader"
+      "notes": "select + DDL + insert + update + delete + table reader + hash agg"
     },
     "pkg/executor/ddl.go": {
       "status": "partial",
@@ -297,6 +297,41 @@
       "status": "partial",
       "phase": 2,
       "notes": "Open/Next/Close + QueryResult"
+    },
+    "pkg/executor/aggregate/agg_hash_executor.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "in-memory HashAggExec without parallel workers"
+    },
+    "pkg/executor/aggfuncs/aggfuncs.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "AggFunc trait for F08"
+    },
+    "pkg/executor/aggfuncs/builder.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "COUNT/SUM/AVG/MIN/MAX builder"
+    },
+    "pkg/executor/aggfuncs/func_count.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "COUNT / COUNT(*)"
+    },
+    "pkg/executor/aggfuncs/func_sum.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "SUM skips nulls"
+    },
+    "pkg/executor/aggfuncs/func_avg.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "AVG as float"
+    },
+    "pkg/executor/aggfuncs/func_max_min.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "MIN/MAX via Datum compare"
     },
     "pkg/session/session.go": {
       "status": "partial",

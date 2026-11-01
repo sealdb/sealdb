@@ -1,0 +1,43 @@
+{
+  "suite": "testdata/F08",
+  "cases": [
+    {
+      "name": "agg_group_by.sql",
+      "result": {
+        "sql": "SELECT COUNT(*) FROM db1.t;\nSELECT name, COUNT(*) FROM db1.t GROUP BY name;\nSELECT SUM(id) FROM db1.t;\nSELECT MIN(id), MAX(id) FROM db1.t;\nSELECT AVG(id) FROM db1.t;\nSELECT COUNT(*);\n",
+        "statements": [
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT COUNT(1) FROM `db1`.`t`",
+            "text": "SELECT COUNT(*) FROM db1.t;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT `name`,COUNT(1) FROM `db1`.`t` GROUP BY `name`",
+            "text": "SELECT name, COUNT(*) FROM db1.t GROUP BY name;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT SUM(`id`) FROM `db1`.`t`",
+            "text": "SELECT SUM(id) FROM db1.t;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT MIN(`id`),MAX(`id`) FROM `db1`.`t`",
+            "text": "SELECT MIN(id), MAX(id) FROM db1.t;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT AVG(`id`) FROM `db1`.`t`",
+            "text": "SELECT AVG(id) FROM db1.t;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT COUNT(1)",
+            "text": "SELECT COUNT(*);"
+          }
+        ]
+      }
+    }
+  ]
+}

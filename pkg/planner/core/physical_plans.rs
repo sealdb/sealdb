@@ -42,6 +42,9 @@ pub enum PhysicalPlan {
     Limit {
         child: Box<PhysicalPlan>,
     },
+    HashAgg {
+        child: Box<PhysicalPlan>,
+    },
 }
 
 impl PhysicalPlan {
@@ -61,6 +64,7 @@ impl PhysicalPlan {
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
+            PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
         }
     }
 }

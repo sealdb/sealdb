@@ -316,4 +316,44 @@ mod tests {
         let empty = session.execute_stmt("SELECT * FROM db1.t").unwrap();
         assert!(empty.display_rows().is_empty());
     }
+
+    #[test]
+    fn test_agg_and_group_by() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+            )
+            .unwrap();
+        let count = session.execute_stmt("SELECT COUNT(*) FROM db1.t").unwrap();
+        assert_eq!(count.display_rows(), vec![vec!["3".to_string()]]);
+        let scalars = session
+            .execute_stmt("SELECT SUM(id), MIN(id), MAX(id), AVG(id) FROM db1.t")
+            .unwrap();
+        assert_eq!(
+            scalars.display_rows(),
+            vec![vec![
+                "6".to_string(),
+                "1".to_string(),
+                "3".to_string(),
+                "2.0".to_string()
+            ]]
+        );
+        let grouped = session
+            .execute_stmt("SELECT name, COUNT(*) FROM db1.t GROUP BY name ORDER BY name")
+            .unwrap();
+        assert_eq!(
+            grouped.display_rows(),
+            vec![
+                vec!["a".to_string(), "2".to_string()],
+                vec!["b".to_string(), "1".to_string()]
+            ]
+        );
+        let none = session
+            .execute_stmt("SELECT COUNT(*) FROM db1.t WHERE id = 9")
+            .unwrap();
+        assert_eq!(none.display_rows(), vec![vec!["0".to_string()]]);
+        let dual = session.execute_stmt("SELECT COUNT(*)").unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+    }
 }

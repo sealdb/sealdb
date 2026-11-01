@@ -1,3 +1,4 @@
+use crate::aggregate::HashAggExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::insert::InsertExec;
@@ -148,6 +149,15 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
+            PhysicalPlan::HashAgg { child } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("hash agg without select"))?;
+                Ok(Box::new(HashAggExec::new(
+                    select,
+                    Self::build(child, stmt, domain, current_db)?,
+                )?))
+            }
         }
     }
 

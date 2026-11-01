@@ -15,9 +15,10 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName, ObjectType,
-    OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr, Statement as SqlStatement,
-    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, LimitClause, ObjectName,
+    ObjectType, OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr,
+    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
+    Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -49,12 +50,17 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     })
                     .transpose()?;
                 let selection = select.selection.as_ref().map(lower_expr).transpose()?;
+                if select.having.is_some() {
+                    return Err(Error::unsupported("HAVING"));
+                }
+                let group_by = lower_group_by(&select.group_by)?;
                 let order_by = lower_order_by(query.order_by.as_ref())?;
                 let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
                 Ok(Statement::Select(SelectStmt {
                     fields,
                     from,
                     selection,
+                    group_by,
                     order_by,
                     limit,
                     offset,
@@ -225,6 +231,18 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             ERR_UNSUPPORTED,
             format!("statement {other} is not available in this phase"),
         )),
+    }
+}
+
+fn lower_group_by(group_by: &GroupByExpr) -> Result<Vec<ExprNode>> {
+    match group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(Error::unsupported("GROUP BY WITH ROLLUP/CUBE"));
+            }
+            exprs.iter().map(lower_expr).collect()
+        }
+        GroupByExpr::All(_) => Err(Error::unsupported("GROUP BY ALL")),
     }
 }
 
@@ -466,6 +484,12 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
                     arg: FunctionArgExpr::Expr(expr),
                     ..
                 } => lower_expr(expr),
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                | FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
+                    Ok(ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(b"*".to_vec()),
+                    }))
+                }
                 _ => Err(Error::unsupported("function argument form")),
             })
             .collect::<Result<Vec<_>>>()?,
@@ -473,6 +497,15 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         FunctionArguments::Subquery(_) => {
             return Err(Error::unsupported("function subquery argument"));
         }
+    };
+    let args = if name.eq_ignore_ascii_case("COUNT")
+        && matches!(
+            args.as_slice(),
+            [ExprNode::Value(v)] if matches!(&v.datum, Datum::Bytes(b) if b == b"*")
+        ) {
+        Vec::new()
+    } else {
+        args
     };
     Ok(ExprNode::Func(FuncCallExpr { name, args }))
 }
