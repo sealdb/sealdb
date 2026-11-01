@@ -686,6 +686,25 @@ mod tests {
         assert_eq!(desc.columns[0], "Field");
         assert_eq!(desc.display_rows()[0][0], "id");
         assert_eq!(desc.display_rows()[1][0], "name");
+        let is_tables = session
+            .execute_stmt(
+                "SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'db1'",
+            )
+            .unwrap();
+        assert_eq!(is_tables.display_rows(), vec![vec!["t".to_string()]]);
+        let is_cols = session
+            .execute_stmt("SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = 'db1' AND TABLE_NAME = 't' ORDER BY COLUMN_NAME")
+            .unwrap();
+        assert_eq!(
+            is_cols.display_rows(),
+            vec![vec!["id".to_string()], vec!["name".to_string()]]
+        );
+        let schemata = session
+            .execute_stmt(
+                "SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'db1'",
+            )
+            .unwrap();
+        assert_eq!(schemata.display_rows(), vec![vec!["db1".to_string()]]);
     }
 
     #[test]
@@ -706,6 +725,19 @@ mod tests {
                 vec!["1".to_string(), "a".to_string()],
                 vec!["2".to_string(), "b".to_string()]
             ]
+        );
+        session
+            .execute_stmt("CREATE TABLE db1.src (id INT, name VARCHAR(20)); INSERT INTO db1.src VALUES (3, 'c')")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t SELECT * FROM db1.src")
+            .unwrap();
+        let copied = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 3")
+            .unwrap();
+        assert_eq!(
+            copied.display_rows(),
+            vec![vec!["3".to_string(), "c".to_string()]]
         );
     }
 
@@ -739,6 +771,40 @@ mod tests {
         assert!(constant.display_rows().is_empty());
         let keep = session.execute_stmt("SELECT 1 WHERE 1").unwrap();
         assert_eq!(keep.display_rows(), vec![vec!["1".to_string()]]);
+        let between = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id BETWEEN 2 AND 3 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            between.display_rows(),
+            vec![
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()]
+            ]
+        );
+        let like = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name LIKE 'b%'")
+            .unwrap();
+        assert_eq!(
+            like.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let in_list = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id IN (1, 3) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            in_list.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["3".to_string(), "c".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (4, NULL)")
+            .unwrap();
+        let is_null = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name IS NULL")
+            .unwrap();
+        assert_eq!(is_null.display_rows()[0][0], "4");
     }
 
     #[test]
@@ -881,6 +947,19 @@ mod tests {
         assert_eq!(none.display_rows(), vec![vec!["0".to_string()]]);
         let dual = session.execute_stmt("SELECT COUNT(*)").unwrap();
         assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let having = session
+            .execute_stmt(
+                "SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name",
+            )
+            .unwrap();
+        assert_eq!(
+            having.display_rows(),
+            vec![vec!["a".to_string(), "2".to_string()]]
+        );
+        let having_hidden = session
+            .execute_stmt("SELECT name FROM db1.t GROUP BY name HAVING COUNT(*) = 1")
+            .unwrap();
+        assert_eq!(having_hidden.display_rows(), vec![vec!["b".to_string()]]);
     }
 
     #[test]

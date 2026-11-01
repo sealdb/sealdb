@@ -15,6 +15,9 @@ pub enum ExprNode {
     Exists(ExistsExpr),
     InSubquery(InSubqueryExpr),
     InList(InListExpr),
+    Between(BetweenExpr),
+    Like(PatternLikeExpr),
+    IsNull(IsNullExpr),
     ScalarSubquery(ScalarSubqueryExpr),
     Window(WindowFuncExpr),
 }
@@ -31,6 +34,9 @@ impl ExprNode {
             ExprNode::Exists(v) => v.restore(ctx),
             ExprNode::InSubquery(v) => v.restore(ctx),
             ExprNode::InList(v) => v.restore(ctx),
+            ExprNode::Between(v) => v.restore(ctx),
+            ExprNode::Like(v) => v.restore(ctx),
+            ExprNode::IsNull(v) => v.restore(ctx),
             ExprNode::ScalarSubquery(v) => v.restore(ctx),
             ExprNode::Window(v) => v.restore(ctx),
         }
@@ -44,6 +50,11 @@ impl ExprNode {
             ExprNode::Func(f) => f.args.iter().any(Self::has_subquery),
             ExprNode::Cast(c) => c.expr.has_subquery(),
             ExprNode::InList(i) => i.expr.has_subquery() || i.list.iter().any(Self::has_subquery),
+            ExprNode::Between(b) => {
+                b.expr.has_subquery() || b.low.has_subquery() || b.high.has_subquery()
+            }
+            ExprNode::Like(l) => l.expr.has_subquery() || l.pattern.has_subquery(),
+            ExprNode::IsNull(i) => i.expr.has_subquery(),
             ExprNode::Window(w) => {
                 w.args.iter().any(Self::has_subquery)
                     || w.spec.partition_by.iter().any(Self::has_subquery)
@@ -238,6 +249,66 @@ impl InListExpr {
             item.restore(ctx)?;
         }
         ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BetweenExpr {
+    pub expr: Box<ExprNode>,
+    pub not: bool,
+    pub low: Box<ExprNode>,
+    pub high: Box<ExprNode>,
+}
+
+impl BetweenExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        if self.not {
+            ctx.write_str(" NOT BETWEEN ");
+        } else {
+            ctx.write_str(" BETWEEN ");
+        }
+        self.low.restore(ctx)?;
+        ctx.write_str(" AND ");
+        self.high.restore(ctx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PatternLikeExpr {
+    pub expr: Box<ExprNode>,
+    pub not: bool,
+    pub pattern: Box<ExprNode>,
+    pub ci: bool,
+}
+
+impl PatternLikeExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        if self.not {
+            ctx.write_str(" NOT LIKE ");
+        } else {
+            ctx.write_str(" LIKE ");
+        }
+        self.pattern.restore(ctx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IsNullExpr {
+    pub expr: Box<ExprNode>,
+    pub not: bool,
+}
+
+impl IsNullExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        if self.not {
+            ctx.write_str(" IS NOT NULL");
+        } else {
+            ctx.write_str(" IS NULL");
+        }
         Ok(())
     }
 }

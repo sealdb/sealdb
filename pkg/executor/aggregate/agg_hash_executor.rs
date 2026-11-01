@@ -1,12 +1,12 @@
-// F08 core path: in-memory HashAgg for COUNT/SUM/AVG/MIN/MAX + GROUP BY columns.
-// Completeness wave / not this feature: HAVING, DISTINCT aggs, StreamAgg,
+// F08 core path: in-memory HashAgg for COUNT/SUM/AVG/MIN/MAX + GROUP BY + HAVING.
+// Completeness wave / not this feature: DISTINCT aggs, StreamAgg,
 // spill / parallel workers, GROUP BY expressions, ROLLUP/CUBE, AVG decimal scale.
 use crate::aggfuncs::{build_agg_func, is_agg_name};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
-use sealdb_expression::eval_expr_with_row;
+use sealdb_expression::{eval_expr_with_row, eval_filter};
 use sealdb_parser::ast::SelectStmt;
-use sealdb_parser::ast::expressions::{ExprNode, FuncCallExpr};
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, FuncCallExpr};
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -22,6 +22,9 @@ pub struct HashAggExec {
     group_by: Vec<ExprNode>,
     agg_specs: Vec<FuncCallExpr>,
     outputs: Vec<OutputItem>,
+    extra_aggs: usize,
+    having: Option<ExprNode>,
+    filter_schema: Vec<String>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -53,11 +56,39 @@ impl HashAggExec {
                 .ok_or_else(|| Error::unsupported("select list is not in GROUP BY clause"))?;
             outputs.push(OutputItem::Group(idx));
         }
+        let mut extra_aggs = 0;
+        let mut filter_schema = schema.clone();
+        if let Some(having) = &select.having {
+            for agg in collect_aggs(having) {
+                let restored = restore_expr(&ExprNode::Func(agg.clone()));
+                if filter_schema
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&restored))
+                    || agg_specs.iter().any(|existing| {
+                        restore_expr(&ExprNode::Func(existing.clone()))
+                            .eq_ignore_ascii_case(&restored)
+                    })
+                {
+                    continue;
+                }
+                extra_aggs += 1;
+                outputs.push(OutputItem::Agg(agg_specs.len()));
+                agg_specs.push(agg);
+                filter_schema.push(restored);
+            }
+        }
+        let having = select
+            .having
+            .as_ref()
+            .map(|expr| rewrite_having(expr, select));
         Ok(Self {
             child,
             group_by: select.group_by.clone(),
             agg_specs,
             outputs,
+            extra_aggs,
+            having,
+            filter_schema,
             schema,
             rows: Vec::new(),
             emitted: false,
@@ -111,11 +142,11 @@ impl Executor for HashAggExec {
                 .iter()
                 .map(build_agg_func)
                 .collect::<Result<Vec<_>>>()?;
-            self.rows.push(self.finish_row(&[], &mut aggs)?);
+            self.push_group(&[], &mut aggs)?;
         } else {
             for group in groups.into_values() {
                 let GroupState { keys, mut aggs } = group;
-                self.rows.push(self.finish_row(&keys, &mut aggs)?);
+                self.push_group(&keys, &mut aggs)?;
             }
         }
         Ok(())
@@ -148,6 +179,22 @@ struct GroupState {
 }
 
 impl HashAggExec {
+    fn push_group(
+        &mut self,
+        keys: &[Datum],
+        aggs: &mut [Box<dyn crate::aggfuncs::AggFunc>],
+    ) -> Result<()> {
+        let full = self.finish_row(keys, aggs)?;
+        if let Some(having) = &self.having
+            && !eval_filter(having, &self.filter_schema, &full)?
+        {
+            return Ok(());
+        }
+        let visible = full.len().saturating_sub(self.extra_aggs);
+        self.rows.push(full[..visible].to_vec());
+        Ok(())
+    }
+
     fn finish_row(
         &self,
         keys: &[Datum],
@@ -160,6 +207,111 @@ impl HashAggExec {
                 OutputItem::Agg(idx) => aggs[*idx].finalize(),
             })
             .collect()
+    }
+}
+
+fn collect_aggs(expr: &ExprNode) -> Vec<FuncCallExpr> {
+    let mut out = Vec::new();
+    walk_aggs(expr, &mut out);
+    out
+}
+
+fn walk_aggs(expr: &ExprNode, out: &mut Vec<FuncCallExpr>) {
+    match expr {
+        ExprNode::Func(func) if is_agg_name(&func.name) => out.push(func.clone()),
+        ExprNode::Func(func) => func.args.iter().for_each(|arg| walk_aggs(arg, out)),
+        ExprNode::Binary(bin) => {
+            walk_aggs(&bin.left, out);
+            walk_aggs(&bin.right, out);
+        }
+        ExprNode::Unary(unary) => walk_aggs(&unary.expr, out),
+        ExprNode::Cast(cast) => walk_aggs(&cast.expr, out),
+        ExprNode::InList(list) => {
+            walk_aggs(&list.expr, out);
+            list.list.iter().for_each(|item| walk_aggs(item, out));
+        }
+        ExprNode::Between(between) => {
+            walk_aggs(&between.expr, out);
+            walk_aggs(&between.low, out);
+            walk_aggs(&between.high, out);
+        }
+        ExprNode::Like(like) => {
+            walk_aggs(&like.expr, out);
+            walk_aggs(&like.pattern, out);
+        }
+        ExprNode::IsNull(is_null) => walk_aggs(&is_null.expr, out),
+        _ => {}
+    }
+}
+
+fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
+    match expr {
+        ExprNode::Func(func) if is_agg_name(&func.name) => {
+            let restored = restore_expr(expr);
+            let name = select
+                .fields
+                .iter()
+                .find(|field| restore_expr(&field.expr).eq_ignore_ascii_case(&restored))
+                .and_then(|field| field.as_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(restored);
+            ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name,
+            })
+        }
+        ExprNode::Binary(bin) => ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(rewrite_having(&bin.left, select)),
+            right: Box::new(rewrite_having(&bin.right, select)),
+        }),
+        ExprNode::Unary(unary) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+            op: unary.op,
+            expr: Box::new(rewrite_having(&unary.expr, select)),
+        }),
+        ExprNode::Cast(cast) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
+            expr: Box::new(rewrite_having(&cast.expr, select)),
+            target: cast.target.clone(),
+        }),
+        ExprNode::InList(list) => ExprNode::InList(sealdb_parser::ast::expressions::InListExpr {
+            expr: Box::new(rewrite_having(&list.expr, select)),
+            not: list.not,
+            list: list
+                .list
+                .iter()
+                .map(|item| rewrite_having(item, select))
+                .collect(),
+        }),
+        ExprNode::Between(between) => {
+            ExprNode::Between(sealdb_parser::ast::expressions::BetweenExpr {
+                expr: Box::new(rewrite_having(&between.expr, select)),
+                not: between.not,
+                low: Box::new(rewrite_having(&between.low, select)),
+                high: Box::new(rewrite_having(&between.high, select)),
+            })
+        }
+        ExprNode::Like(like) => ExprNode::Like(sealdb_parser::ast::expressions::PatternLikeExpr {
+            expr: Box::new(rewrite_having(&like.expr, select)),
+            not: like.not,
+            pattern: Box::new(rewrite_having(&like.pattern, select)),
+            ci: like.ci,
+        }),
+        ExprNode::IsNull(is_null) => {
+            ExprNode::IsNull(sealdb_parser::ast::expressions::IsNullExpr {
+                expr: Box::new(rewrite_having(&is_null.expr, select)),
+                not: is_null.not,
+            })
+        }
+        ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
+            name: func.name.clone(),
+            args: func
+                .args
+                .iter()
+                .map(|arg| rewrite_having(arg, select))
+                .collect(),
+        }),
+        other => other.clone(),
     }
 }
 

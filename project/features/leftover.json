@@ -43,12 +43,10 @@
     ],
     "F03": [
       "tikv-persist",
-      "rowcodec",
-      "insert-select"
+      "rowcodec"
     ],
     "F04": [
       "ppd",
-      "in-between-like",
       "coprocessor-filter"
     ],
     "F05": [
@@ -66,7 +64,6 @@
       "returning"
     ],
     "F08": [
-      "having",
       "distinct-agg",
       "stream-agg",
       "spill"
@@ -83,7 +80,6 @@
       "range-scan"
     ],
     "F11": [
-      "information_schema-tables",
       "show-create",
       "show-full-columns"
     ],

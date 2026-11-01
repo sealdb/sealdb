@@ -8,8 +8,9 @@ use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, Error, Result};
 use sealdb_expression::{eval_expr_with_row, eval_filter};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
-    InSubqueryExpr, ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
+    BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
+    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, ScalarSubqueryExpr, UnaryOpExpr,
+    ValueExpr,
 };
 use sealdb_parser::ast::{SelectField, SelectStmt, Statement};
 use sealdb_planner::PlanBuilder;
@@ -153,6 +154,22 @@ fn materialize(
                 .map(|item| materialize(item, ctx, cache))
                 .collect::<Result<Vec<_>>>()?,
         })),
+        ExprNode::Between(between) => Ok(ExprNode::Between(BetweenExpr {
+            expr: Box::new(materialize(&between.expr, ctx, cache)?),
+            not: between.not,
+            low: Box::new(materialize(&between.low, ctx, cache)?),
+            high: Box::new(materialize(&between.high, ctx, cache)?),
+        })),
+        ExprNode::Like(like) => Ok(ExprNode::Like(PatternLikeExpr {
+            expr: Box::new(materialize(&like.expr, ctx, cache)?),
+            not: like.not,
+            pattern: Box::new(materialize(&like.pattern, ctx, cache)?),
+            ci: like.ci,
+        })),
+        ExprNode::IsNull(is_null) => Ok(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(materialize(&is_null.expr, ctx, cache)?),
+            not: is_null.not,
+        })),
         other => Ok(other.clone()),
     }
 }
@@ -235,6 +252,10 @@ fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
         .selection
         .as_ref()
         .map(|expr| bind_expr(expr, ctx, inner_table.as_deref(), &inner_cols));
+    out.having = select
+        .having
+        .as_ref()
+        .map(|expr| bind_expr(expr, ctx, inner_table.as_deref(), &inner_cols));
     out.group_by = select
         .group_by
         .iter()
@@ -300,6 +321,22 @@ fn bind_expr(
                 .iter()
                 .map(|item| bind_expr(item, ctx, inner_table, inner_cols))
                 .collect(),
+        }),
+        ExprNode::Between(between) => ExprNode::Between(BetweenExpr {
+            expr: Box::new(bind_expr(&between.expr, ctx, inner_table, inner_cols)),
+            not: between.not,
+            low: Box::new(bind_expr(&between.low, ctx, inner_table, inner_cols)),
+            high: Box::new(bind_expr(&between.high, ctx, inner_table, inner_cols)),
+        }),
+        ExprNode::Like(like) => ExprNode::Like(PatternLikeExpr {
+            expr: Box::new(bind_expr(&like.expr, ctx, inner_table, inner_cols)),
+            not: like.not,
+            pattern: Box::new(bind_expr(&like.pattern, ctx, inner_table, inner_cols)),
+            ci: like.ci,
+        }),
+        ExprNode::IsNull(is_null) => ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(bind_expr(&is_null.expr, ctx, inner_table, inner_cols)),
+            not: is_null.not,
         }),
         ExprNode::Exists(exists) => ExprNode::Exists(ExistsExpr {
             not: exists.not,

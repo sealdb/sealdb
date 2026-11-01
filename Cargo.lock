@@ -1700,6 +1700,7 @@ dependencies = [
  "sealdb-domain",
  "sealdb-errno",
  "sealdb-expression",
+ "sealdb-infoschema",
  "sealdb-kv",
  "sealdb-meta",
  "sealdb-parser",
@@ -1729,6 +1730,7 @@ version = "0.1.0"
 dependencies = [
  "sealdb-errno",
  "sealdb-meta",
+ "sealdb-types",
  "thiserror 2.0.21",
 ]
 

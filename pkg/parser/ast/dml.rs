@@ -123,6 +123,7 @@ pub struct SelectStmt {
     pub join: Option<Join>,
     pub selection: Option<ExprNode>,
     pub group_by: Vec<ExprNode>,
+    pub having: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -179,6 +180,10 @@ impl SelectStmt {
                 expr.restore(ctx)?;
             }
         }
+        if let Some(having) = &self.having {
+            ctx.write_str(" HAVING ");
+            having.restore(ctx)?;
+        }
         if !self.order_by.is_empty() {
             ctx.write_str(" ORDER BY ");
             for (i, item) in self.order_by.iter().enumerate() {
@@ -214,6 +219,7 @@ pub struct InsertStmt {
     pub table: TableName,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ExprNode>>,
+    pub select: Option<Box<SelectStmt>>,
 }
 
 impl InsertStmt {
@@ -229,6 +235,11 @@ impl InsertStmt {
                 ctx.write_name(col);
             }
             ctx.write_str(")");
+        }
+        if let Some(select) = &self.select {
+            ctx.write_str(" ");
+            select.restore(ctx)?;
+            return Ok(());
         }
         ctx.write_str(" VALUES ");
         for (i, row) in self.rows.iter().enumerate() {

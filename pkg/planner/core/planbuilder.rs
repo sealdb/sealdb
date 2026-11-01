@@ -97,7 +97,9 @@ impl PlanBuilder {
                         };
                     }
                 }
-                if (select.join.is_some() || matches!(plan, PhysicalPlan::CTE { .. }))
+                if (select.join.is_some()
+                    || matches!(plan, PhysicalPlan::CTE { .. })
+                    || has_info_schema(&plan))
                     && !is_star_select(select)
                     && !needs_hash_agg(select)
                     && !needs_window(select)
@@ -309,6 +311,21 @@ pub fn stmt_kind(stmt: &Statement) -> &'static str {
     stmt.stmt_type()
 }
 
+fn is_information_schema(from: &TableName, current_db: &str) -> bool {
+    from.schema
+        .as_deref()
+        .or(Some(current_db))
+        .is_some_and(|schema| schema.eq_ignore_ascii_case("information_schema"))
+}
+
+fn has_info_schema(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::InfoSchema { .. } => true,
+        PhysicalPlan::Selection { child } | PhysicalPlan::Apply { child } => has_info_schema(child),
+        _ => false,
+    }
+}
+
 fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
 }
@@ -371,6 +388,11 @@ fn access_plan(
     // equality on a secondary INDEX/KEY becomes IndexLookUpReader.
     // Completeness wave: range, composite prefix, unique PointGet, costed
     // index path enumeration / skyline.
+    if is_information_schema(from, current_db) {
+        return PhysicalPlan::InfoSchema {
+            table: from.name.clone(),
+        };
+    }
     if let Some(info) = is.and_then(|schema| {
         let (db, table) = from.qualified(current_db);
         schema.table_by_name(&db, &table)

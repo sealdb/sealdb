@@ -110,6 +110,22 @@
 
 ### 2026-11-01
 
+- **Phase**: SQL leftover（HAVING / INSERT SELECT / IN BETWEEN LIKE / information_schema）
+- **完成**:
+  - `IN` / `BETWEEN` / `LIKE` / `IS NULL` 谓词
+  - `GROUP BY ... HAVING`（含 select 列表外的聚合）
+  - `INSERT ... SELECT`
+  - `information_schema.SCHEMATA|TABLES|COLUMNS` 可作为 SELECT 源
+- **验证**:
+  - `cargo test --workspace`
+  - parser / session 单测覆盖上述路径
+- **阻塞/风险**:
+  - PPD/coprocessor、DISTINCT agg、其余 I_S 表仍未做
+- **下一步**:
+  - 继续 leftover 或保持 C6 deferred
+
+### 2026-11-01
+
 - **Phase**: 存储后端（MemStorage + TiKV）
 - **完成**:
   - 保留 `MemStorage` 为默认；`--store memory|tikv` / `SEALDB_STORE` 切换

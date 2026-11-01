@@ -1,6 +1,7 @@
 use sealdb_errno::{ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, UnaryOpExpr,
+    BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
+    IsNullExpr, PatternLikeExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
@@ -51,6 +52,9 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
         ExprNode::Func(f) => eval_func(f, schema, row),
         ExprNode::Cast(c) => eval_cast(c, schema, row),
         ExprNode::InList(i) => eval_in_list(i, schema, row),
+        ExprNode::Between(b) => eval_between(b, schema, row),
+        ExprNode::Like(l) => eval_like(l, schema, row),
+        ExprNode::IsNull(i) => eval_is_null(i, schema, row),
         ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => {
             Err(Error::unsupported("subquery evaluation outside Apply"))
         }
@@ -248,7 +252,7 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
             saw_null = true;
             continue;
         }
-        if left.compare(&value).is_eq() {
+        if compare_datums(&left, &value).is_eq() {
             return Ok(bool_datum(!expr.not));
         }
     }
@@ -256,6 +260,67 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
         Ok(Datum::Null)
     } else {
         Ok(bool_datum(expr.not))
+    }
+}
+
+fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let value = eval_expr_with_row(&expr.expr, schema, row)?;
+    let low = eval_expr_with_row(&expr.low, schema, row)?;
+    let high = eval_expr_with_row(&expr.high, schema, row)?;
+    if value.is_null() || low.is_null() || high.is_null() {
+        return Ok(Datum::Null);
+    }
+    let inside = compare_datums(&value, &low).is_ge() && compare_datums(&value, &high).is_le();
+    Ok(bool_datum(if expr.not { !inside } else { inside }))
+}
+
+fn eval_like(expr: &PatternLikeExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let value = eval_expr_with_row(&expr.expr, schema, row)?;
+    let pattern = eval_expr_with_row(&expr.pattern, schema, row)?;
+    if value.is_null() || pattern.is_null() {
+        return Ok(Datum::Null);
+    }
+    let ci = expr.ci || COLLATION_CI.with(|c| *c.borrow());
+    let matched = like_match(&value.as_bytes(), &pattern.as_bytes(), ci);
+    Ok(bool_datum(if expr.not { !matched } else { matched }))
+}
+
+fn eval_is_null(expr: &IsNullExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let value = eval_expr_with_row(&expr.expr, schema, row)?;
+    Ok(bool_datum(if expr.not {
+        !value.is_null()
+    } else {
+        value.is_null()
+    }))
+}
+
+fn like_match(text: &[u8], pattern: &[u8], ci: bool) -> bool {
+    like_at(text, 0, pattern, 0, ci)
+}
+
+fn like_at(text: &[u8], ti: usize, pattern: &[u8], pi: usize, ci: bool) -> bool {
+    if pi == pattern.len() {
+        return ti == text.len();
+    }
+    match pattern[pi] {
+        b'%' => {
+            like_at(text, ti, pattern, pi + 1, ci)
+                || (ti < text.len() && like_at(text, ti + 1, pattern, pi, ci))
+        }
+        b'_' => ti < text.len() && like_at(text, ti + 1, pattern, pi + 1, ci),
+        ch => {
+            ti < text.len()
+                && bytes_eq(text[ti], ch, ci)
+                && like_at(text, ti + 1, pattern, pi + 1, ci)
+        }
+    }
+}
+
+fn bytes_eq(a: u8, b: u8, ci: bool) -> bool {
+    if ci {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
     }
 }
 
