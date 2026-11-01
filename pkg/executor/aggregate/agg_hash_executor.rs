@@ -310,6 +310,7 @@ fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
                 .iter()
                 .map(|arg| rewrite_having(arg, select))
                 .collect(),
+            distinct: func.distinct,
         }),
         other => other.clone(),
     }

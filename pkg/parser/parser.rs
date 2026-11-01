@@ -137,6 +137,20 @@ mod tests {
             parser.parse_one_stmt("USE db1").unwrap().stmt_type(),
             "UseStmt"
         );
+        match parser.parse_one_stmt("SHOW CREATE TABLE db1.t").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::CreateTable);
+                assert_eq!(show.table.unwrap().name, "t");
+            }
+            other => panic!("expected SHOW CREATE TABLE, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SHOW CREATE DATABASE db1").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::CreateDatabase);
+                assert_eq!(show.db_name.as_deref(), Some("db1"));
+            }
+            other => panic!("expected SHOW CREATE DATABASE, got {other:?}"),
+        }
     }
 
     #[test]
@@ -210,6 +224,19 @@ mod tests {
             .parse_one_stmt("SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1")
             .unwrap();
         assert!(having.as_select().unwrap().having.is_some());
+        match parser
+            .parse_one_stmt("SELECT COUNT(DISTINCT name) FROM t")
+            .unwrap()
+        {
+            crate::ast::Statement::Select(select) => match &select.fields[0].expr {
+                crate::ast::expressions::ExprNode::Func(func) => {
+                    assert!(func.name.eq_ignore_ascii_case("COUNT"));
+                    assert!(func.distinct);
+                }
+                other => panic!("expected COUNT DISTINCT, got {other:?}"),
+            },
+            other => panic!("expected SelectStmt, got {other:?}"),
+        }
     }
 
     #[test]

@@ -179,6 +179,7 @@ fn fill_window_agg(
     let spec = FuncCallExpr {
         name: window.name.clone(),
         args: window.args.clone(),
+        distinct: false,
     };
     if window.spec.order_by.is_empty() {
         let mut agg = build_agg_func(&spec)?;

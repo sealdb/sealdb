@@ -140,6 +140,7 @@ fn materialize(
                 .iter()
                 .map(|arg| materialize(arg, ctx, cache))
                 .collect::<Result<Vec<_>>>()?,
+            distinct: func.distinct,
         })),
         ExprNode::Cast(cast) => Ok(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(materialize(&cast.expr, ctx, cache)?),
@@ -308,6 +309,7 @@ fn bind_expr(
                 .iter()
                 .map(|arg| bind_expr(arg, ctx, inner_table, inner_cols))
                 .collect(),
+            distinct: func.distinct,
         }),
         ExprNode::Cast(cast) => ExprNode::Cast(FuncCastExpr {
             expr: Box::new(bind_expr(&cast.expr, ctx, inner_table, inner_cols)),

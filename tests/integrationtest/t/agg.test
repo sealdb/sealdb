@@ -7,3 +7,4 @@ SELECT COUNT(*) FROM itest.t;
 SELECT name, COUNT(*) FROM itest.t GROUP BY name ORDER BY name;
 SELECT name, COUNT(*) FROM itest.t GROUP BY name HAVING COUNT(*) > 1;
 SELECT name FROM itest.t GROUP BY name HAVING COUNT(*) = 1;
+SELECT COUNT(DISTINCT name) FROM itest.t;
