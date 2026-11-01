@@ -17,11 +17,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - `rowcodec`
 
-### F04
-
-- `ppd`
-- `coprocessor-filter`
-
 ### F05
 
 - `topn-spill`

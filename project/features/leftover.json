@@ -43,10 +43,7 @@
     "F03": [
       "rowcodec"
     ],
-    "F04": [
-      "ppd",
-      "coprocessor-filter"
-    ],
+    "F04": [],
     "F05": [
       "topn-spill",
       "parallel-sort"

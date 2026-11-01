@@ -9,7 +9,7 @@
     "F01": {"status": "core-ported", "phase": 2, "notes": "arith/compare/logic/CAST/IF/IFNULL"},
     "F02": {"status": "core-ported", "phase": 3, "notes": "CREATE/DROP DATABASE|TABLE; meta persisted on Storage so --store tikv reloads schema", "gaps": ["online-ddl-jobs", "create-like-as-select", "indexes"]},
     "F03": {"status": "core-ported", "phase": 5, "notes": "INSERT VALUES/SELECT; schema/next_handle persisted with row KV", "gaps": ["rowcodec"]},
-    "F04": {"status": "core-ported", "phase": 5, "notes": "WHERE + IN/BETWEEN/LIKE/IS NULL via SelectionExec", "gaps": ["ppd", "coprocessor-filter"]},
+    "F04": {"status": "core-ported", "phase": 5, "notes": "WHERE + IN/BETWEEN/LIKE/IS NULL; PPD into TableReader/IndexLookUp coprocessor-filter", "gaps": []},
     "F05": {"status": "core-ported", "phase": 5, "notes": "ORDER BY + LIMIT/OFFSET in-memory", "gaps": ["topn-spill", "parallel-sort"]},
     "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle PointGet", "gaps": ["batch-point-get", "index-point-get"]},
     "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE SET / DELETE over in-memory KV", "gaps": ["multi-table", "update-join", "order-limit", "returning"]},

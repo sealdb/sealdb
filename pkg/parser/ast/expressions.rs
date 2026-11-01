@@ -63,6 +63,119 @@ impl ExprNode {
             ExprNode::Value(_) | ExprNode::Column(_) => false,
         }
     }
+
+    pub fn restore_string(&self) -> String {
+        let mut ctx = RestoreCtx::new();
+        let _ = self.restore(&mut ctx);
+        ctx.into_string()
+    }
+
+    pub fn split_cnf(&self) -> Vec<ExprNode> {
+        match self {
+            ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+                let mut out = bin.left.split_cnf();
+                out.extend(bin.right.split_cnf());
+                out
+            }
+            other => vec![other.clone()],
+        }
+    }
+
+    pub fn compose_cnf(exprs: Vec<ExprNode>) -> Option<ExprNode> {
+        exprs.into_iter().reduce(|left, right| {
+            ExprNode::Binary(BinaryOpExpr {
+                op: Op::LogicAnd,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        })
+    }
+
+    pub fn referenced_columns(&self) -> Vec<(Option<String>, String)> {
+        let mut out = Vec::new();
+        self.collect_columns(&mut out);
+        out
+    }
+
+    pub fn eq_column_const(&self) -> Option<(String, Datum)> {
+        let ExprNode::Binary(bin) = self else {
+            return None;
+        };
+        if bin.op != Op::Eq {
+            return None;
+        }
+        match (bin.left.as_ref(), bin.right.as_ref()) {
+            (ExprNode::Column(col), ExprNode::Value(v))
+            | (ExprNode::Value(v), ExprNode::Column(col)) => {
+                Some((col.name.clone(), v.datum.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn eq_const_on(&self, column: &str) -> Option<Datum> {
+        self.split_cnf().into_iter().find_map(|expr| {
+            expr.eq_column_const()
+                .and_then(|(name, value)| name.eq_ignore_ascii_case(column).then_some(value))
+        })
+    }
+
+    fn collect_columns(&self, out: &mut Vec<(Option<String>, String)>) {
+        match self {
+            ExprNode::Column(col) => out.push((col.table.clone(), col.name.clone())),
+            ExprNode::Binary(b) => {
+                b.left.collect_columns(out);
+                b.right.collect_columns(out);
+            }
+            ExprNode::Unary(u) => u.expr.collect_columns(out),
+            ExprNode::Func(f) => {
+                for arg in &f.args {
+                    arg.collect_columns(out);
+                }
+            }
+            ExprNode::Cast(c) => c.expr.collect_columns(out),
+            ExprNode::InList(i) => {
+                i.expr.collect_columns(out);
+                for item in &i.list {
+                    item.collect_columns(out);
+                }
+            }
+            ExprNode::Between(b) => {
+                b.expr.collect_columns(out);
+                b.low.collect_columns(out);
+                b.high.collect_columns(out);
+            }
+            ExprNode::Like(l) => {
+                l.expr.collect_columns(out);
+                l.pattern.collect_columns(out);
+            }
+            ExprNode::IsNull(i) => i.expr.collect_columns(out),
+            ExprNode::Window(w) => {
+                for arg in &w.args {
+                    arg.collect_columns(out);
+                }
+                for part in &w.spec.partition_by {
+                    part.collect_columns(out);
+                }
+                for item in &w.spec.order_by {
+                    item.expr.collect_columns(out);
+                }
+            }
+            ExprNode::Exists(e) => collect_select_columns(&e.query, out),
+            ExprNode::InSubquery(i) => {
+                i.expr.collect_columns(out);
+                collect_select_columns(&i.query, out);
+            }
+            ExprNode::ScalarSubquery(s) => collect_select_columns(&s.query, out),
+            ExprNode::Value(_) => {}
+        }
+    }
+}
+
+fn collect_select_columns(query: &SelectStmt, out: &mut Vec<(Option<String>, String)>) {
+    if let Some(selection) = &query.selection {
+        selection.collect_columns(out);
+    }
 }
 
 #[derive(Clone, Debug)]

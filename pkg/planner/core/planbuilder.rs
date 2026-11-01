@@ -3,13 +3,13 @@ use super::plan_cost::{
     eq_row_count, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
+use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
 use sealdb_parser::ast::{
     JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
 };
-use sealdb_parser::opcode::Op;
 use sealdb_statistics::Handle;
 use sealdb_types::Datum;
 
@@ -41,14 +41,8 @@ impl PlanBuilder {
                     }
                     reorder_hash_join(
                         map_join_type(join.tp),
-                        PhysicalPlan::TableReader {
-                            table: join.left.name.clone(),
-                            partitions: Vec::new(),
-                        },
-                        PhysicalPlan::TableReader {
-                            table: join.right.name.clone(),
-                            partitions: Vec::new(),
-                        },
+                        PhysicalPlan::table_reader(join.left.name.clone(), Vec::new()),
+                        PhysicalPlan::table_reader(join.right.name.clone(), Vec::new()),
                         join.left.name.clone(),
                         join.right.name.clone(),
                         table_row_count(stats, &join.left, current_db),
@@ -74,28 +68,8 @@ impl PlanBuilder {
                         child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                     }
                 };
-                if let Some(filter) = &select.selection
-                    && !matches!(
-                        plan,
-                        PhysicalPlan::PointGet { .. } | PhysicalPlan::IndexLookUpReader { .. }
-                    )
-                {
-                    if filter.has_subquery() {
-                        plan = PhysicalPlan::Apply {
-                            child: Box::new(plan),
-                        };
-                    } else if matches!(plan, PhysicalPlan::Projection { .. }) {
-                        if let PhysicalPlan::Projection { exprs, child } = plan {
-                            plan = PhysicalPlan::Projection {
-                                exprs,
-                                child: Box::new(PhysicalPlan::Selection { child }),
-                            };
-                        }
-                    } else {
-                        plan = PhysicalPlan::Selection {
-                            child: Box::new(plan),
-                        };
-                    }
+                if let Some(filter) = &select.selection {
+                    plan = predicate_push_down(plan, filter, is, current_db);
                 }
                 if needs_hash_agg(select) {
                     if needs_window(select) {
@@ -394,72 +368,54 @@ fn access_plan(
         let (db, table) = from.qualified(current_db);
         schema.table_by_name(&db, &table)
     }) {
-        if let Some((column, value)) = eq_column_const(select.selection.as_ref()) {
-            let first = info.columns.first();
-            if let (Some(first), Datum::I64(handle)) = (first, &value)
-                && first.name.o().eq_ignore_ascii_case(&column)
-            {
-                let _ = point_get_cost();
-                return PhysicalPlan::PointGet {
-                    table: from.name.clone(),
-                    handle: *handle,
-                };
-            }
-            if let Some(index) = info.find_index_covering(&column) {
+        let eqs = eq_column_consts(select.selection.as_ref());
+        if let Some(first) = info.columns.first()
+            && let Some((_, Datum::I64(handle))) = eqs
+                .iter()
+                .find(|(column, _)| first.name.o().eq_ignore_ascii_case(column))
+        {
+            let _ = point_get_cost();
+            return PhysicalPlan::PointGet {
+                table: from.name.clone(),
+                handle: *handle,
+            };
+        }
+        for (column, _) in &eqs {
+            if let Some(index) = info.find_index_covering(column) {
                 // F10: unanalyzed tables keep IndexLookUp.
                 // C2 skyline: after ANALYZE, pick the cheaper of TableReader
                 // vs IndexLookUp. F21 NDV<=1 is the same TableReader winner.
-                if let Some(eq_rows) = eq_row_count(stats, from, current_db, &column) {
+                if let Some(eq_rows) = eq_row_count(stats, from, current_db, column) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
-                        return PhysicalPlan::TableReader {
-                            table: from.name.clone(),
-                            partitions: info.prune_partitions(select.selection.as_ref()),
-                        };
+                        return PhysicalPlan::table_reader(
+                            from.name.clone(),
+                            info.prune_partitions(select.selection.as_ref()),
+                        );
                     }
                 }
                 return PhysicalPlan::IndexLookUpReader {
                     table: from.name.clone(),
                     index: index.name.o().to_string(),
                     partitions: info.prune_partitions(select.selection.as_ref()),
+                    pushed: None,
                 };
             }
         }
-        return PhysicalPlan::TableReader {
-            table: from.name.clone(),
-            partitions: info.prune_partitions(select.selection.as_ref()),
-        };
+        return PhysicalPlan::table_reader(
+            from.name.clone(),
+            info.prune_partitions(select.selection.as_ref()),
+        );
     }
-    if let Some(handle) = point_get_handle(select.selection.as_ref()) {
+    if let Some((_, Datum::I64(handle))) = eq_column_consts(select.selection.as_ref())
+        .into_iter()
+        .find(|(_, value)| matches!(value, Datum::I64(_)))
+    {
         PhysicalPlan::PointGet {
             table: from.name.clone(),
             handle,
         }
     } else {
-        PhysicalPlan::TableReader {
-            table: from.name.clone(),
-            partitions: Vec::new(),
-        }
-    }
-}
-
-fn eq_column_const(selection: Option<&ExprNode>) -> Option<(String, Datum)> {
-    let ExprNode::Binary(bin) = selection? else {
-        return None;
-    };
-    if bin.op != Op::Eq {
-        return None;
-    }
-    match (bin.left.as_ref(), bin.right.as_ref()) {
-        (ExprNode::Column(col), ExprNode::Value(v))
-        | (ExprNode::Value(v), ExprNode::Column(col)) => Some((col.name.clone(), v.datum.clone())),
-        _ => None,
-    }
-}
-
-fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {
-    match eq_column_const(selection) {
-        Some((_, Datum::I64(handle))) => Some(handle),
-        _ => None,
+        PhysicalPlan::table_reader(from.name.clone(), Vec::new())
     }
 }

@@ -46,14 +46,8 @@ mod tests {
 
     #[test]
     fn test_inner_builds_smaller_side() {
-        let left = PhysicalPlan::TableReader {
-            table: "small".to_string(),
-            partitions: Vec::new(),
-        };
-        let right = PhysicalPlan::TableReader {
-            table: "big".to_string(),
-            partitions: Vec::new(),
-        };
+        let left = PhysicalPlan::table_reader("small", Vec::new());
+        let right = PhysicalPlan::table_reader("big", Vec::new());
         let plan = reorder_hash_join(
             JoinType::Inner,
             left,
