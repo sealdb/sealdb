@@ -53,7 +53,8 @@
 | F10 | `core-ported` | `project/reports/features/F10/` |
 | F12 | `core-ported` | `project/reports/features/F12/` |
 | F13 | `core-ported` | `project/reports/features/F13/` |
-| F14–F22 | `not-started` | — |
+| F14 | `core-ported` | `project/reports/features/F14/` |
+| F15–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -96,6 +97,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F14 子查询 / Apply / EXISTS / IN
+- **完成**:
+  - 非相关与相关 `EXISTS` / `IN (SELECT ...)` / 标量子查询
+  - `IN` 值列表
+  - 相关列绑定后走 NestedLoopApply
+- **验证**:
+  - `./project/scripts/feature_gate.sh F14`
+- **下一步**:
+  - F15 `UNION` / `UNION ALL`
 
 ### 2026-11-01
 

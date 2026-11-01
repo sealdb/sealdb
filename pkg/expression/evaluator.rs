@@ -1,6 +1,6 @@
 use sealdb_errno::{ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr,
+    BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
@@ -18,6 +18,10 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
         ExprNode::Unary(u) => eval_unary(u, schema, row),
         ExprNode::Func(f) => eval_func(f, schema, row),
         ExprNode::Cast(c) => eval_cast(c, schema, row),
+        ExprNode::InList(i) => eval_in_list(i, schema, row),
+        ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => {
+            Err(Error::unsupported("subquery evaluation outside Apply"))
+        }
     }
 }
 
@@ -196,6 +200,29 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             ERR_UNKNOWN_FUNCTION,
             format!("FUNCTION {other} does not exist"),
         )),
+    }
+}
+
+fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let left = eval_expr_with_row(&expr.expr, schema, row)?;
+    if left.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut saw_null = false;
+    for item in &expr.list {
+        let value = eval_expr_with_row(item, schema, row)?;
+        if value.is_null() {
+            saw_null = true;
+            continue;
+        }
+        if left.compare(&value).is_eq() {
+            return Ok(bool_datum(!expr.not));
+        }
+    }
+    if saw_null {
+        Ok(Datum::Null)
+    } else {
+        Ok(bool_datum(expr.not))
     }
 }
 

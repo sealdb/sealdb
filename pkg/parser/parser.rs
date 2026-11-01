@@ -296,4 +296,34 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("CREATE INDEX"));
     }
+
+    #[test]
+    fn test_parse_exists_in_subquery() {
+        let parser = Parser::new();
+        let exists = parser
+            .parse_one_stmt("SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2)")
+            .unwrap();
+        assert!(matches!(
+            exists.as_select().unwrap().selection.as_ref(),
+            Some(crate::ast::ExprNode::Exists(_))
+        ));
+        let in_sub = parser
+            .parse_one_stmt("SELECT * FROM t1 WHERE id IN (SELECT id FROM t2)")
+            .unwrap();
+        assert!(matches!(
+            in_sub.as_select().unwrap().selection.as_ref(),
+            Some(crate::ast::ExprNode::InSubquery(_))
+        ));
+        let in_list = parser
+            .parse_one_stmt("SELECT * FROM t1 WHERE id IN (1, 2)")
+            .unwrap();
+        assert!(matches!(
+            in_list.as_select().unwrap().selection.as_ref(),
+            Some(crate::ast::ExprNode::InList(_))
+        ));
+        let err = parser
+            .parse_one_stmt("SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2)")
+            .unwrap_err();
+        assert!(err.message.contains("ANY"));
+    }
 }

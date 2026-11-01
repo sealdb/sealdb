@@ -4,7 +4,7 @@ use crate::delete::DeleteExec;
 use crate::distsql::IndexLookUpExecutor;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
-use crate::join::HashJoinV1Exec;
+use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
 use crate::select::{LimitExec, SelectionExec, TableDualExec};
@@ -188,6 +188,29 @@ impl ExecutorBuilder {
                     select,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )?))
+            }
+            PhysicalPlan::Apply { child } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("apply without select"))?;
+                let filter = select
+                    .selection
+                    .clone()
+                    .ok_or_else(|| Error::unsupported("apply without WHERE"))?;
+                Ok(Box::new(NestedLoopApplyExec::new(
+                    filter,
+                    Self::build(
+                        child,
+                        stmt,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?,
+                    domain,
+                    current_db.to_string(),
+                    txn,
+                    select.from.as_ref().map(|t| t.name.clone()),
+                )))
             }
             PhysicalPlan::HashJoin { left, right, .. } => {
                 let join = stmt

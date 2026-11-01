@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod physical_plans;
 pub mod planbuilder;
 
