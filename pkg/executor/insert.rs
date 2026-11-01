@@ -1,3 +1,4 @@
+use crate::index::write_index_keys;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result};
@@ -78,6 +79,7 @@ impl Executor for InsertExec {
                 .unwrap_or_else(|| self.domain.next_handle(info.id));
             let key = encode_row_key_with_handle(info.id, handle);
             txn.set(key.as_bytes(), &encode_row(&col_ids, &values))?;
+            write_index_keys(&mut *txn, info, handle, &values)?;
         }
         txn.commit()?;
         Ok(())

@@ -31,9 +31,8 @@ Thumbs.db
 # 日志文件
 *.log
 
-# 临时文件
-*.tmp
-*.temp
+# 本地源码编译的 PD/TiKV 数据与工具链
+.cluster/
 
 # 配置文件（如果包含敏感信息）
 .env

@@ -1,3 +1,6 @@
+// F09 core path: two-table Inner/Left/Right HashJoin on equality.
+// Completeness wave / not this feature: semi/anti/full, CROSS/comma joins,
+// n-table, USING/NATURAL, spill/parallel workers, merge/index join, non-equality ON.
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
 use sealdb_expression::eval_expr_with_row;

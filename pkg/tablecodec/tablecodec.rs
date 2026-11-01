@@ -1,6 +1,9 @@
 use sealdb_errno::{Error, Result};
 use sealdb_kv::Key;
-use sealdb_util::codec::{decode_int, encode_int, encode_int_to_cmp_uint};
+use sealdb_types::Datum;
+use sealdb_util::codec::{
+    decode_int, encode_bytes, encode_float, encode_int, encode_int_to_cmp_uint,
+};
 
 pub const TABLE_PREFIX: &[u8] = b"t";
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
@@ -42,6 +45,60 @@ pub fn encode_index_seek_key(table_id: i64, idx_id: i64, encoded_value: &[u8]) -
     encode_int(&mut key, idx_id);
     key.extend_from_slice(encoded_value);
     Key::from_raw(key)
+}
+
+/// Encode one index column value. NULL sorts first.
+/// Completeness wave: unique-index NULL handling and prefix truncation.
+pub fn encode_index_datum(buf: &mut Vec<u8>, value: &Datum) {
+    match value {
+        Datum::Null => buf.push(0),
+        Datum::I64(v) => {
+            buf.push(1);
+            encode_int(buf, *v);
+        }
+        Datum::U64(v) => {
+            buf.push(1);
+            encode_int(buf, *v as i64);
+        }
+        Datum::F64(v) => {
+            buf.push(2);
+            encode_float(buf, *v);
+        }
+        other => {
+            buf.push(3);
+            encode_bytes(buf, &other.as_bytes());
+        }
+    }
+}
+
+pub fn encode_index_values(values: &[Datum]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for value in values {
+        encode_index_datum(&mut buf, value);
+    }
+    buf
+}
+
+/// Non-unique secondary index key: `t{table}_i{idx}{encoded_cols}{handle}`.
+pub fn encode_index_key(table_id: i64, idx_id: i64, values: &[Datum], handle: i64) -> Key {
+    let mut encoded = encode_index_values(values);
+    encode_int(&mut encoded, handle);
+    encode_index_seek_key(table_id, idx_id, &encoded)
+}
+
+pub fn encode_index_seek_prefix(table_id: i64, idx_id: i64, values: &[Datum]) -> Key {
+    encode_index_seek_key(table_id, idx_id, &encode_index_values(values))
+}
+
+pub fn decode_handle_from_index_key(key: &[u8]) -> Result<i64> {
+    if key.len() < PREFIX_LEN + 8 + 8 {
+        return Err(Error::new(
+            sealdb_errno::ERR_INVALID_KEY,
+            "index key too short",
+        ));
+    }
+    let (_, handle) = decode_int(&key[key.len() - 8..])?;
+    Ok(handle)
 }
 
 pub fn gen_table_record_prefix(table_id: i64) -> Key {
@@ -200,6 +257,14 @@ mod tests {
         assert!(raw.starts_with(b"t"));
         assert!(raw.windows(2).any(|w| w == b"_i"));
         assert!(raw.ends_with(b"abc"));
+    }
+
+    #[test]
+    fn test_encode_index_key_roundtrip_handle() {
+        let key = encode_index_key(2, 1, &[Datum::Bytes(b"abc".to_vec())], 9);
+        assert_eq!(decode_handle_from_index_key(key.as_bytes()).unwrap(), 9);
+        let prefix = encode_index_seek_prefix(2, 1, &[Datum::Bytes(b"abc".to_vec())]);
+        assert!(key.as_bytes().starts_with(prefix.as_bytes()));
     }
 
     fn hex(s: &str) -> Vec<u8> {

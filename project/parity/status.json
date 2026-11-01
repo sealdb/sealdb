@@ -81,7 +81,7 @@
     "pkg/tablecodec/tablecodec.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "row/index key layout + compact row values"
+      "notes": "row/index key layout + compact row values + secondary index keys"
     },
     "pkg/parser/parser.go": {
       "status": "reimplemented",
@@ -100,8 +100,8 @@
     },
     "pkg/parser/ast/ddl.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "CREATE/DROP DATABASE|TABLE"
+      "phase": 5,
+      "notes": "CREATE/DROP DATABASE|TABLE + CREATE TABLE INDEX/KEY; CREATE INDEX leftover is F18"
     },
     "pkg/parser/ast/misc.go": {
       "status": "partial",
@@ -176,12 +176,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -195,8 +195,13 @@
     },
     "pkg/meta/model/table.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "TableInfo core JSON"
+      "phase": 5,
+      "notes": "TableInfo core JSON + typed IndexInfo list"
+    },
+    "pkg/meta/model/index.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "IndexInfo / IndexColumn core JSON for F10"
     },
     "pkg/meta/model/column.go": {
       "status": "partial",
@@ -230,8 +235,8 @@
     },
     "pkg/ddl/create_table.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "BuildTableInfo columns only"
+      "phase": 5,
+      "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY"
     },
     "pkg/domain/domain.go": {
       "status": "partial",
@@ -241,7 +246,18 @@
     "pkg/executor/builder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "select + DDL + DML + table reader + hash agg + hash join"
+      "notes": "select + DDL + DML + table reader + hash agg + hash join + IndexLookUp"
+    },
+    "pkg/executor/distsql.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "IndexLookUpExecutor double-read for indexed equality"
+    },
+    "pkg/table/tables/index.go": {
+      "status": "reimplemented",
+      "rust": "pkg/executor/index.rs",
+      "phase": 5,
+      "notes": "F10 index key write/delete helpers; TiDB tables/index.go is the closest counterpart"
     },
     "pkg/executor/ddl.go": {
       "status": "partial",

@@ -1,3 +1,7 @@
+// F07 core path: single-table UPDATE SET.
+// Completeness wave / not this feature: multi-table UPDATE, UPDATE JOIN / FROM,
+// ORDER BY / LIMIT, RETURNING, MySQL-protocol affected-row counts.
+use crate::index::{delete_index_keys, write_index_keys};
 use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
@@ -75,6 +79,7 @@ impl Executor for UpdateExec {
                     _ => None,
                 })
                 .unwrap_or(scanned.handle);
+            delete_index_keys(&mut *txn, &info, scanned.handle, &scanned.values)?;
             if new_handle != scanned.handle {
                 txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
             }
@@ -82,6 +87,7 @@ impl Executor for UpdateExec {
                 encode_row_key_with_handle(info.id, new_handle).as_bytes(),
                 &encode_row(&col_ids, &new_values),
             )?;
+            write_index_keys(&mut *txn, &info, new_handle, &new_values)?;
         }
         txn.commit()?;
         Ok(())

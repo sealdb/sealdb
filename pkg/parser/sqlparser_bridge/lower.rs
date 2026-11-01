@@ -1,7 +1,8 @@
 use super::dialect::dialect;
 use crate::ast::Statement;
 use crate::ast::ddl::{
-    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
+    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, IndexDef,
+    TableName,
 };
 use crate::ast::dml::{
     Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectStmt, UpdateStmt,
@@ -17,8 +18,8 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
     LimitClause, ObjectName, ObjectType, OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
-    Use, Value, Values,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Update, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -43,6 +44,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     .collect::<Result<Vec<_>>>()?;
                 let (from, join) = lower_from(&select.from)?;
                 let selection = select.selection.as_ref().map(lower_expr).transpose()?;
+                // F08 gap / completeness wave: HAVING.
                 if select.having.is_some() {
                     return Err(Error::unsupported("HAVING"));
                 }
@@ -83,13 +85,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             name: schema_name_last(schema_name)?,
         })),
         SqlStatement::CreateTable(create) => {
+            // F02/F18 gaps: TEMPORARY, LIKE, AS SELECT stay deferred.
             if create.temporary || create.query.is_some() || create.like.is_some() {
                 return Err(Error::unsupported(
                     "TEMPORARY / LIKE / AS SELECT CREATE TABLE",
                 ));
-            }
-            if !create.constraints.is_empty() {
-                return Err(Error::unsupported("CREATE TABLE constraints"));
             }
             let cols = create
                 .columns
@@ -104,12 +104,20 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             if cols.is_empty() {
                 return Err(Error::unsupported("CREATE TABLE without columns"));
             }
+            let indices = lower_table_indices(&create.constraints)?;
             Ok(Statement::CreateTable(CreateTableStmt {
                 if_not_exists: create.if_not_exists,
                 table: object_table_name(&create.name)?,
                 cols,
+                indices,
             }))
         }
+        // F18 leftover: online CREATE INDEX / DROP INDEX / ALTER.
+        SqlStatement::CreateIndex(_) => Err(Error::unsupported("CREATE INDEX")),
+        SqlStatement::Drop {
+            object_type: ObjectType::Index,
+            ..
+        } => Err(Error::unsupported("DROP INDEX")),
         SqlStatement::Drop {
             object_type,
             if_exists,
@@ -232,6 +240,7 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join
     if from.is_empty() {
         return Ok((None, None));
     }
+    // F09 gap / completeness wave: comma joins and n-table joins.
     if from.len() > 1 {
         return Err(Error::unsupported("comma joins"));
     }
@@ -256,6 +265,7 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join
         | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
             (JoinType::RightOuter, lower_expr(expr)?)
         }
+        // F09 gap / completeness wave: CROSS / NATURAL / USING / semi / anti / full.
         other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
     };
     Ok((
@@ -279,6 +289,7 @@ fn table_factor_name(factor: &TableFactor) -> Result<TableName> {
 fn lower_group_by(group_by: &GroupByExpr) -> Result<Vec<ExprNode>> {
     match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
+            // F08 gap / completeness wave: ROLLUP / CUBE / GROUPING SETS.
             if !modifiers.is_empty() {
                 return Err(Error::unsupported("GROUP BY WITH ROLLUP/CUBE"));
             }
@@ -333,6 +344,7 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
 }
 
 fn lower_update(update: &Update) -> Result<Statement> {
+    // F07 gaps / completeness wave: UPDATE FROM, RETURNING, ORDER BY, LIMIT, multi-table.
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
     }
@@ -367,6 +379,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
 }
 
 fn lower_delete(delete: &Delete) -> Result<Statement> {
+    // F07 gaps / completeness wave: multi-table, USING, RETURNING, ORDER BY, LIMIT.
     if delete.using.is_some()
         || delete.returning.is_some()
         || delete.output.is_some()
@@ -600,6 +613,57 @@ fn lower_unary_op(op: &UnaryOperator) -> Result<Op> {
         UnaryOperator::Not => Op::Not,
         _ => return Err(Error::unsupported(format!("unary operator {op}"))),
     })
+}
+
+fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>> {
+    let mut indices = Vec::new();
+    for constraint in constraints {
+        match constraint {
+            TableConstraint::Index(idx) => {
+                let columns = idx
+                    .columns
+                    .iter()
+                    .map(index_column_name)
+                    .collect::<Result<Vec<_>>>()?;
+                if columns.is_empty() {
+                    return Err(Error::unsupported("INDEX without columns"));
+                }
+                // F10 gap / completeness wave: prefix length, functional, USING HASH.
+                if idx.index_type.is_some() {
+                    return Err(Error::unsupported("INDEX USING type"));
+                }
+                let name = idx
+                    .name
+                    .as_ref()
+                    .map(|ident| ident.value.clone())
+                    .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+                indices.push(IndexDef { name, columns });
+            }
+            // F10/F18 gaps: UNIQUE, PRIMARY KEY, FK, CHECK, FULLTEXT stay deferred.
+            TableConstraint::Unique(_) => return Err(Error::unsupported("UNIQUE constraint")),
+            TableConstraint::PrimaryKey(_) => return Err(Error::unsupported("PRIMARY KEY")),
+            TableConstraint::ForeignKey(_) => {
+                return Err(Error::unsupported("FOREIGN KEY"));
+            }
+            TableConstraint::Check(_) => return Err(Error::unsupported("CHECK constraint")),
+            TableConstraint::FulltextOrSpatial(_) => {
+                return Err(Error::unsupported("FULLTEXT / SPATIAL INDEX"));
+            }
+            other => {
+                return Err(Error::unsupported(format!(
+                    "CREATE TABLE constraint {other}"
+                )));
+            }
+        }
+    }
+    Ok(indices)
+}
+
+fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {
+    match &col.column.expr {
+        Expr::Identifier(ident) => Ok(ident.value.clone()),
+        other => Err(Error::unsupported(format!("INDEX column {other}"))),
+    }
 }
 
 fn data_type_name(tp: &DataType) -> String {

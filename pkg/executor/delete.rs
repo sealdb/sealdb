@@ -1,3 +1,7 @@
+// F07 core path: single-table DELETE.
+// Completeness wave / not this feature: multi-table DELETE, JOIN / USING,
+// ORDER BY / LIMIT, RETURNING, MySQL-protocol affected-row counts.
+use crate::index::delete_index_keys;
 use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
@@ -53,6 +57,7 @@ impl Executor for DeleteExec {
             {
                 continue;
             }
+            delete_index_keys(&mut *txn, &info, scanned.handle, &scanned.values)?;
             txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
         }
         txn.commit()?;

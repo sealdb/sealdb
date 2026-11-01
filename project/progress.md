@@ -50,7 +50,8 @@
 | F07 | `core-ported` | `project/reports/features/F07/` |
 | F08 | `core-ported` | `project/reports/features/F08/` |
 | F09 | `core-ported` | `project/reports/features/F09/` |
-| F10, F12–F22 | `not-started` | — |
+| F10 | `core-ported` | `project/reports/features/F10/` |
+| F12–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -93,6 +94,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F10 二级索引 / IndexLookUp
+- **完成**:
+  - `CREATE TABLE ... INDEX/KEY` 写入 `IndexInfo`
+  - INSERT/UPDATE/DELETE 维护二级索引 key
+  - 索引列等值走 `IndexLookUpExecutor`
+- **验证**:
+  - `./project/scripts/feature_gate.sh F10`
+- **下一步**:
+  - F12 事务 / BEGIN COMMIT ROLLBACK
 
 ### 2026-11-01
 

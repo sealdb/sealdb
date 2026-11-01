@@ -1,0 +1,16 @@
+{
+  "feature": "F10",
+  "frozen": "2026-11-01",
+  "source": ["TiDB pkg/executor/distsql.go IndexLookUpExecutor", "TiDB pkg/tablecodec/tablecodec.go GenIndexKey"],
+  "cases": [
+    "CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name))",
+    "CREATE TABLE db1.t (id INT, name VARCHAR(20), KEY idx_name (name))",
+    "INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'a')",
+    "SELECT * FROM db1.t WHERE name = 'a'",
+    "SELECT * FROM db1.t WHERE name = 'a' ORDER BY id",
+    "UPDATE db1.t SET name = 'c' WHERE id = 1",
+    "DELETE FROM db1.t WHERE name = 'c'",
+    "CREATE DATABASE db1",
+    "CREATE INDEX idx_name ON db1.t (name)"
+  ]
+}

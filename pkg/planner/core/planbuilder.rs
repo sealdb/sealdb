@@ -1,7 +1,8 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
 use sealdb_errno::Result;
+use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
-use sealdb_parser::ast::{JoinType as AstJoinType, SelectStmt, Statement, StmtNode};
+use sealdb_parser::ast::{JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 
@@ -13,6 +14,15 @@ impl PlanBuilder {
     }
 
     pub fn build(&self, stmt: &Statement) -> Result<PhysicalPlan> {
+        self.build_with_schema(stmt, None, "")
+    }
+
+    pub fn build_with_schema(
+        &self,
+        stmt: &Statement,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+    ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
                 let mut plan = if let Some(join) = &select.join {
@@ -28,16 +38,7 @@ impl PlanBuilder {
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    if let Some(handle) = point_get_handle(select.selection.as_ref()) {
-                        PhysicalPlan::PointGet {
-                            table: from.name.clone(),
-                            handle,
-                        }
-                    } else {
-                        PhysicalPlan::TableReader {
-                            table: from.name.clone(),
-                        }
-                    }
+                    access_plan(select, from, is, current_db)
                 } else {
                     let exprs = select
                         .fields
@@ -50,7 +51,12 @@ impl PlanBuilder {
                         child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                     }
                 };
-                if select.selection.is_some() && !matches!(plan, PhysicalPlan::PointGet { .. }) {
+                if select.selection.is_some()
+                    && !matches!(
+                        plan,
+                        PhysicalPlan::PointGet { .. } | PhysicalPlan::IndexLookUpReader { .. }
+                    )
+                {
                     if matches!(plan, PhysicalPlan::Projection { .. }) {
                         if let PhysicalPlan::Projection { exprs, child } = plan {
                             plan = PhysicalPlan::Projection {
@@ -164,7 +170,54 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
     )
 }
 
-fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {
+fn access_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    // F10 core: integer handle PointGet still wins; otherwise first-column
+    // equality on a secondary INDEX/KEY becomes IndexLookUpReader.
+    // Completeness wave: range, composite prefix, unique PointGet, costed
+    // index path enumeration / skyline.
+    if let Some(info) = is.and_then(|schema| {
+        let (db, table) = from.qualified(current_db);
+        schema.table_by_name(&db, &table)
+    }) {
+        if let Some((column, value)) = eq_column_const(select.selection.as_ref()) {
+            let first = info.columns.first();
+            if let (Some(first), Datum::I64(handle)) = (first, &value)
+                && first.name.o().eq_ignore_ascii_case(&column)
+            {
+                return PhysicalPlan::PointGet {
+                    table: from.name.clone(),
+                    handle: *handle,
+                };
+            }
+            if let Some(index) = info.find_index_covering(&column) {
+                return PhysicalPlan::IndexLookUpReader {
+                    table: from.name.clone(),
+                    index: index.name.o().to_string(),
+                };
+            }
+        }
+        return PhysicalPlan::TableReader {
+            table: from.name.clone(),
+        };
+    }
+    if let Some(handle) = point_get_handle(select.selection.as_ref()) {
+        PhysicalPlan::PointGet {
+            table: from.name.clone(),
+            handle,
+        }
+    } else {
+        PhysicalPlan::TableReader {
+            table: from.name.clone(),
+        }
+    }
+}
+
+fn eq_column_const(selection: Option<&ExprNode>) -> Option<(String, Datum)> {
     let ExprNode::Binary(bin) = selection? else {
         return None;
     };
@@ -172,12 +225,15 @@ fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {
         return None;
     }
     match (bin.left.as_ref(), bin.right.as_ref()) {
-        (ExprNode::Column(_), ExprNode::Value(v)) | (ExprNode::Value(v), ExprNode::Column(_)) => {
-            match v.datum {
-                Datum::I64(handle) => Some(handle),
-                _ => None,
-            }
-        }
+        (ExprNode::Column(col), ExprNode::Value(v))
+        | (ExprNode::Value(v), ExprNode::Column(col)) => Some((col.name.clone(), v.datum.clone())),
+        _ => None,
+    }
+}
+
+fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {
+    match eq_column_const(selection) {
+        Some((_, Datum::I64(handle))) => Some(handle),
         _ => None,
     }
 }

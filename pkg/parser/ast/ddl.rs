@@ -83,11 +83,34 @@ impl DropDatabaseStmt {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl IndexDef {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("INDEX ");
+        ctx.write_name(&self.name);
+        ctx.write_str(" (");
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            ctx.write_name(col);
+        }
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateTableStmt {
     pub if_not_exists: bool,
     pub table: TableName,
     pub cols: Vec<ColumnDef>,
+    pub indices: Vec<IndexDef>,
 }
 
 impl CreateTableStmt {
@@ -103,6 +126,10 @@ impl CreateTableStmt {
                 ctx.write_str(",");
             }
             col.restore(ctx)?;
+        }
+        for index in &self.indices {
+            ctx.write_str(",");
+            index.restore(ctx)?;
         }
         ctx.write_str(")");
         Ok(())

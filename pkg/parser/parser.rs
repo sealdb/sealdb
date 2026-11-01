@@ -209,4 +209,24 @@ mod tests {
         assert_eq!(join.right.name, "t2");
         assert_eq!(join.tp, crate::ast::JoinType::Inner);
     }
+
+    #[test]
+    fn test_parse_create_table_index() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name))")
+            .unwrap();
+        match stmt {
+            crate::ast::Statement::CreateTable(create) => {
+                assert_eq!(create.indices.len(), 1);
+                assert_eq!(create.indices[0].name, "idx_name");
+                assert_eq!(create.indices[0].columns, vec!["name".to_string()]);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("CREATE INDEX idx_name ON db1.t (name)")
+            .unwrap_err();
+        assert!(err.message.contains("CREATE INDEX"));
+    }
 }
