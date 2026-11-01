@@ -242,8 +242,10 @@ version = "0.1.0"
 dependencies = [
  "sealdb-errno",
  "sealdb-infoschema",
+ "sealdb-kv",
  "sealdb-meta",
  "sealdb-parser",
+ "sealdb-tablecodec",
  "sealdb-types",
  "thiserror",
 ]

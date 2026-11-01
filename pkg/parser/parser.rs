@@ -291,10 +291,38 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt("CREATE INDEX idx_name ON db1.t (name)")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateIndex(create) => {
+                assert_eq!(create.name, "idx_name");
+                assert_eq!(create.columns, vec!["name".to_string()]);
+            }
+            other => panic!("expected CreateIndexStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DROP INDEX idx_name ON db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::DropIndex(drop) => {
+                assert_eq!(drop.name, "idx_name");
+            }
+            other => panic!("expected DropIndexStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t ADD COLUMN age INT, DROP INDEX idx_name")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => {
+                assert_eq!(alter.specs.len(), 2);
+            }
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("CREATE UNIQUE INDEX idx_name ON db1.t (name)")
             .unwrap_err();
-        assert!(err.message.contains("CREATE INDEX"));
+        assert!(err.message.contains("UNIQUE"));
     }
 
     #[test]

@@ -106,7 +106,7 @@
     "pkg/parser/ast/ddl.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "CREATE/DROP DATABASE|TABLE + CREATE TABLE INDEX/KEY; CREATE INDEX leftover is F18"
+      "notes": "CREATE/DROP DATABASE|TABLE + CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX"
     },
     "pkg/parser/ast/misc.go": {
       "status": "partial",
@@ -226,7 +226,7 @@
     "pkg/ddl/ddl.go": {
       "status": "partial",
       "phase": 3,
-      "notes": "immediate CREATE/DROP apply; no job queue"
+      "notes": "immediate CREATE/DROP/ALTER apply; job queue / Reorg deferred"
     },
     "pkg/ddl/schema.go": {
       "status": "partial",
@@ -242,6 +242,18 @@
       "status": "partial",
       "phase": 5,
       "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY"
+    },
+    "pkg/ddl/index.go": {
+      "status": "partial",
+      "rust": "pkg/ddl/index.rs",
+      "phase": 8,
+      "notes": "CREATE/DROP INDEX + in-place backfill; job states deferred"
+    },
+    "pkg/ddl/column.go": {
+      "status": "partial",
+      "rust": "pkg/ddl/alter.rs",
+      "phase": 8,
+      "notes": "ALTER ADD/DROP COLUMN; CHANGE/MODIFY/AFTER deferred"
     },
     "pkg/domain/domain.go": {
       "status": "partial",

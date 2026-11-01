@@ -6,6 +6,9 @@ pub enum DdlKind {
     DropDatabase,
     CreateTable,
     DropTable,
+    CreateIndex,
+    DropIndex,
+    AlterTable,
 }
 
 #[derive(Clone, Debug, Serialize)]

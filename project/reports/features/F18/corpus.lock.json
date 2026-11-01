@@ -1,0 +1,23 @@
+{
+  "feature": "F18",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/ddl/index.go",
+    "TiDB pkg/ddl/column.go",
+    "TiDB pkg/ddl/ddl.go"
+  ],
+  "cases": [
+    "CREATE INDEX idx_name ON t (name)",
+    "DROP INDEX idx_name ON t",
+    "ALTER TABLE t ADD COLUMN age INT",
+    "ALTER TABLE t DROP COLUMN age",
+    "ALTER TABLE t ADD INDEX idx_age (age)",
+    "ALTER TABLE t DROP INDEX idx_age",
+    "CREATE UNIQUE INDEX idx_id ON t (id)",
+    "ALTER TABLE t CHANGE name title VARCHAR(20)",
+    "ALTER TABLE t MODIFY name VARCHAR(40)",
+    "ALTER TABLE t RENAME TO t2",
+    "ALTER TABLE t ADD COLUMN age INT AFTER name",
+    "CREATE INDEX idx_name ON t (name(10))"
+  ]
+}

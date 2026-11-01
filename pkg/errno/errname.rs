@@ -28,6 +28,9 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_LOCK_WAIT_TIMEOUT => "ErrLockWaitTimeout",
         errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "ErrWrongNumberOfColumnsInSelect",
+        errcode::ERR_DUP_FIELDNAME => "ErrDupFieldName",
+        errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
+        errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
         _ => "ErrUnknown",
     }
 }
@@ -37,6 +40,9 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_NO_DB => "3D000",
         errcode::ERR_BAD_DB => "42000",
         errcode::ERR_TABLE_EXISTS => "42S01",
+        errcode::ERR_DUP_FIELDNAME => "42S21",
+        errcode::ERR_DUP_KEYNAME => "42000",
+        errcode::ERR_CANT_DROP_FIELD_OR_KEY => "42000",
         errcode::ERR_PARSE_ERROR => "42000",
         errcode::ERR_NO_SUCH_TABLE => "42S02",
         errcode::ERR_BAD_FIELD => "42S22",

@@ -147,6 +147,22 @@ impl Mutator {
         )
     }
 
+    pub fn update_table(&mut self, db_id: i64, table: &TableInfo) -> Result<()> {
+        let db_field = db_key(db_id);
+        let table_field = table_key(table.id);
+        if self.hget(&db_field, &table_field)?.is_none() {
+            return Err(Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{db_id}.{}' doesn't exist", table.name.o()),
+            ));
+        }
+        self.hset(
+            &db_field,
+            &table_field,
+            &serde_json::to_vec(table).map_err(json_err)?,
+        )
+    }
+
     pub fn drop_table_or_view(&mut self, db_id: i64, table_id: i64) -> Result<()> {
         let db_field = db_key(db_id);
         let table_field = table_key(table_id);

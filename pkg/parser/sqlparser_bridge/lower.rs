@@ -1,8 +1,8 @@
 use super::dialect::dialect;
 use crate::ast::Statement;
 use crate::ast::ddl::{
-    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, IndexDef,
-    TableName,
+    AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
+    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, TableName,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
@@ -17,12 +17,13 @@ use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NonBlock, ObjectName,
-    ObjectType, OrderByExpr, OrderByKind, OrderBySort, Query, SchemaName, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement as SqlStatement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values, WindowType, With,
+    AlterTableOperation, AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized, DataType,
+    Delete, DescribeAlias, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause,
+    LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Query,
+    SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
+    Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -96,12 +97,30 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 indices,
             }))
         }
-        // F18 leftover: online CREATE INDEX / DROP INDEX / ALTER.
-        SqlStatement::CreateIndex(_) => Err(Error::unsupported("CREATE INDEX")),
+        SqlStatement::CreateIndex(create) => lower_create_index(create),
         SqlStatement::Drop {
             object_type: ObjectType::Index,
+            if_exists,
+            names,
+            table,
             ..
-        } => Err(Error::unsupported("DROP INDEX")),
+        } => {
+            let table = table
+                .as_ref()
+                .ok_or_else(|| Error::unsupported("DROP INDEX without ON"))?;
+            let name = names
+                .first()
+                .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing index name"))?;
+            if names.len() != 1 {
+                return Err(Error::unsupported("DROP INDEX multiple names"));
+            }
+            Ok(Statement::DropIndex(DropIndexStmt {
+                if_exists: *if_exists,
+                table: object_table_name(table)?,
+                name: object_name_last(name)?,
+            }))
+        }
+        SqlStatement::AlterTable(alter) => lower_alter_table(alter),
         SqlStatement::Drop {
             object_type,
             if_exists,
@@ -1061,6 +1080,122 @@ fn lower_unary_op(op: &UnaryOperator) -> Result<Op> {
         UnaryOperator::Not => Op::Not,
         _ => return Err(Error::unsupported(format!("unary operator {op}"))),
     })
+}
+
+fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement> {
+    // F18 gap / completeness wave: UNIQUE, USING, partial, invisible, ALGORITHM/LOCK.
+    if create.unique {
+        return Err(Error::unsupported("UNIQUE INDEX"));
+    }
+    if create.using.is_some()
+        || !create.include.is_empty()
+        || create.predicate.is_some()
+        || !create.with.is_empty()
+        || !create.alter_options.is_empty()
+        || create.concurrently
+    {
+        return Err(Error::unsupported("CREATE INDEX option"));
+    }
+    let columns = create
+        .columns
+        .iter()
+        .map(index_column_name)
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(Error::unsupported("CREATE INDEX without columns"));
+    }
+    let name = match &create.name {
+        Some(name) => object_name_last(name)?,
+        None => format!("idx_{}", columns.join("_")),
+    };
+    Ok(Statement::CreateIndex(CreateIndexStmt {
+        if_not_exists: create.if_not_exists,
+        table: object_table_name(&create.table_name)?,
+        name,
+        columns,
+    }))
+}
+
+fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<Statement> {
+    // F18 gap / completeness wave: CHANGE/MODIFY/RENAME, multi-spec mix beyond
+    // ADD/DROP COLUMN|INDEX, partitions, AFTER/FIRST, generated columns.
+    if alter.if_exists || alter.only || alter.location.is_some() || alter.on_cluster.is_some() {
+        return Err(Error::unsupported("ALTER TABLE option"));
+    }
+    if alter.operations.is_empty() {
+        return Err(Error::unsupported("ALTER TABLE without operation"));
+    }
+    let specs = alter
+        .operations
+        .iter()
+        .map(lower_alter_spec)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Statement::AlterTable(AlterTableStmt {
+        table: object_table_name(&alter.name)?,
+        specs,
+    }))
+}
+
+fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
+    match op {
+        AlterTableOperation::AddColumn {
+            if_not_exists,
+            column_def,
+            column_position,
+            ..
+        } => {
+            if column_position.is_some() {
+                return Err(Error::unsupported("ALTER TABLE ADD COLUMN AFTER/FIRST"));
+            }
+            Ok(AlterTableSpec::AddColumn {
+                if_not_exists: *if_not_exists,
+                column: ColumnDef {
+                    name: column_def.name.value.clone(),
+                    type_name: column_def.data_type.to_string(),
+                },
+            })
+        }
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
+            if column_names.len() != 1 {
+                return Err(Error::unsupported("ALTER TABLE DROP multiple columns"));
+            }
+            Ok(AlterTableSpec::DropColumn {
+                if_exists: *if_exists,
+                name: column_names[0].value.clone(),
+            })
+        }
+        AlterTableOperation::DropIndex { name } => Ok(AlterTableSpec::DropIndex {
+            if_exists: false,
+            name: name.value.clone(),
+        }),
+        AlterTableOperation::AddConstraint { constraint, .. } => match constraint {
+            TableConstraint::Index(idx) => {
+                let columns = idx
+                    .columns
+                    .iter()
+                    .map(index_column_name)
+                    .collect::<Result<Vec<_>>>()?;
+                if columns.is_empty() {
+                    return Err(Error::unsupported("INDEX without columns"));
+                }
+                if idx.index_type.is_some() {
+                    return Err(Error::unsupported("INDEX USING type"));
+                }
+                let name = idx
+                    .name
+                    .as_ref()
+                    .map(|ident| ident.value.clone())
+                    .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+                Ok(AlterTableSpec::AddIndex(IndexDef { name, columns }))
+            }
+            other => Err(Error::unsupported(format!("ALTER TABLE ADD {other}"))),
+        },
+        other => Err(Error::unsupported(format!("ALTER TABLE {other}"))),
+    }
 }
 
 fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>> {

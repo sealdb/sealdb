@@ -52,7 +52,13 @@ impl Domain {
     pub fn execute_ddl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain ddl lock");
         let snapshot = inner.infoschema.clone();
-        execute_ddl(&mut inner.meta, &snapshot, stmt, current_db)?;
+        execute_ddl(
+            &mut inner.meta,
+            &snapshot,
+            stmt,
+            current_db,
+            self.storage.as_ref(),
+        )?;
         inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
         Ok(())
     }
