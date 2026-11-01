@@ -798,4 +798,80 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("window function"));
     }
+
+    #[test]
+    fn test_cte() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let dual = session
+            .execute_stmt("WITH c AS (SELECT 1 AS id) SELECT * FROM c")
+            .unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let named = session
+            .execute_stmt("WITH c(id) AS (SELECT 2) SELECT id FROM c")
+            .unwrap();
+        assert_eq!(named.display_rows(), vec![vec!["2".to_string()]]);
+        let filtered = session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id < 3) SELECT * FROM c ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            filtered.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let chained = session
+            .execute_stmt(
+                "WITH a AS (SELECT * FROM db1.t WHERE id = 1), b AS (SELECT * FROM a) SELECT * FROM b",
+            )
+            .unwrap();
+        assert_eq!(
+            chained.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let projected = session
+            .execute_stmt("WITH c AS (SELECT id FROM db1.t) SELECT * FROM c ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            projected.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let counted = session
+            .execute_stmt("WITH c AS (SELECT * FROM db1.t) SELECT COUNT(*) FROM c")
+            .unwrap();
+        assert_eq!(counted.display_rows(), vec![vec!["3".to_string()]]);
+        let unioned = session
+            .execute_stmt("WITH c AS (SELECT 1 AS id) SELECT * FROM c UNION SELECT 2")
+            .unwrap();
+        assert_eq!(
+            unioned.display_rows(),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+        let err = session
+            .execute_stmt("WITH RECURSIVE c AS (SELECT 1) SELECT * FROM c")
+            .unwrap_err();
+        assert!(err.message.contains("RECURSIVE"));
+        let err = session
+            .execute_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
+            .unwrap_err();
+        assert!(err.message.contains("UNION"));
+        let err = session
+            .execute_stmt("WITH c(a, b) AS (SELECT 1) SELECT * FROM c")
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            sealdb_errno::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
+        );
+    }
 }

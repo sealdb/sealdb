@@ -1,8 +1,10 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
-use sealdb_errno::Result;
+use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
-use sealdb_parser::ast::{JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName};
+use sealdb_parser::ast::{
+    JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
+};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 
@@ -26,6 +28,11 @@ impl PlanBuilder {
         match stmt {
             Statement::Select(select) => {
                 let mut plan = if let Some(join) = &select.join {
+                    if named_cte(select.with.as_ref(), &join.left.name)
+                        || named_cte(select.with.as_ref(), &join.right.name)
+                    {
+                        return Err(Error::unsupported("CTE in JOIN"));
+                    }
                     PhysicalPlan::HashJoin {
                         tp: map_join_type(join.tp),
                         left: Box::new(PhysicalPlan::TableReader {
@@ -38,7 +45,11 @@ impl PlanBuilder {
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    access_plan(select, from, is, current_db)
+                    if let Some(plan) = self.build_cte_plan(select, from, is, current_db)? {
+                        plan
+                    } else {
+                        access_plan(select, from, is, current_db)
+                    }
                 } else {
                     let exprs = select
                         .fields
@@ -74,7 +85,11 @@ impl PlanBuilder {
                         };
                     }
                 }
-                if select.join.is_some() && !is_star_select(select) {
+                if (select.join.is_some() || matches!(plan, PhysicalPlan::CTE { .. }))
+                    && !is_star_select(select)
+                    && !needs_hash_agg(select)
+                    && !needs_window(select)
+                {
                     let exprs = select
                         .fields
                         .iter()
@@ -148,14 +163,17 @@ impl PlanBuilder {
                 kind: "Rollback".to_string(),
             }),
             Statement::SetOpr(set) => {
-                let mut plan =
-                    self.build_with_schema(&Statement::Select(set.first.clone()), is, current_db)?;
+                let mut plan = self.build_with_schema(
+                    &Statement::Select(with_inherited(set.first.clone(), set.with.as_ref())),
+                    is,
+                    current_db,
+                )?;
                 for (op, select) in &set.rest {
                     plan = PhysicalPlan::Union {
                         distinct: op.is_distinct(),
                         left: Box::new(plan),
                         right: Box::new(self.build_with_schema(
-                            &Statement::Select(select.clone()),
+                            &Statement::Select(with_inherited(select.clone(), set.with.as_ref())),
                             is,
                             current_db,
                         )?),
@@ -177,6 +195,54 @@ impl PlanBuilder {
     }
 }
 
+impl PlanBuilder {
+    fn build_cte_plan(
+        &self,
+        select: &SelectStmt,
+        from: &TableName,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+    ) -> Result<Option<PhysicalPlan>> {
+        let Some(with) = select.with.as_ref() else {
+            return Ok(None);
+        };
+        if with.find(&from.name).is_none() {
+            return Ok(None);
+        }
+        if from.schema.is_some() {
+            return Err(Error::unsupported("qualified CTE name"));
+        }
+        let seed_select = with.seed_select(&from.name)?;
+        let mut seed =
+            self.build_with_schema(&Statement::Select(seed_select.clone()), is, current_db)?;
+        if !is_star_select(&seed_select)
+            && !needs_hash_agg(&seed_select)
+            && !needs_window(&seed_select)
+            && !matches!(seed, PhysicalPlan::Projection { .. })
+        {
+            let exprs = seed_select
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("col{i}"))
+                .collect();
+            seed = PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(seed),
+            };
+        }
+        let columns = with
+            .find(&from.name)
+            .map(|cte| cte.col_name_list.clone())
+            .unwrap_or_default();
+        Ok(Some(PhysicalPlan::CTE {
+            name: from.name.clone(),
+            columns,
+            seed: Box::new(seed),
+        }))
+    }
+}
+
 impl Default for PlanBuilder {
     fn default() -> Self {
         Self::new()
@@ -185,6 +251,17 @@ impl Default for PlanBuilder {
 
 pub fn stmt_kind(stmt: &Statement) -> &'static str {
     stmt.stmt_type()
+}
+
+fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
+    with.is_some_and(|with| with.find(name).is_some())
+}
+
+fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectStmt {
+    if select.with.is_none() {
+        select.with = with.cloned();
+    }
+    select
 }
 
 fn map_join_type(tp: AstJoinType) -> JoinType {

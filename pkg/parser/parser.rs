@@ -373,4 +373,34 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("frame"));
     }
+
+    #[test]
+    fn test_parse_cte() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("WITH c AS (SELECT 1 AS id) SELECT * FROM c")
+            .unwrap();
+        let select = stmt.as_select().unwrap();
+        let with = select.with.as_ref().expect("with clause");
+        assert_eq!(with.ctes.len(), 1);
+        assert_eq!(with.ctes[0].name, "c");
+        assert!(with.ctes[0].col_name_list.is_empty());
+        let named = parser
+            .parse_one_stmt("WITH c(id) AS (SELECT 1) SELECT id FROM c")
+            .unwrap();
+        assert_eq!(
+            named.as_select().unwrap().with.as_ref().unwrap().ctes[0].col_name_list,
+            vec!["id".to_string()]
+        );
+        let err = parser
+            .parse_one_stmt(
+                "WITH RECURSIVE c AS (SELECT 1 UNION SELECT id + 1 FROM c) SELECT * FROM c",
+            )
+            .unwrap_err();
+        assert!(err.message.contains("RECURSIVE"));
+        let err = parser
+            .parse_one_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
+            .unwrap_err();
+        assert!(err.message.contains("UNION"));
+    }
 }

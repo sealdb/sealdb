@@ -181,12 +181,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -251,7 +251,7 @@
     "pkg/executor/builder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "select + DDL + DML + table reader + hash agg + hash join + IndexLookUp"
+      "notes": "select + DDL + DML + table reader + hash agg + hash join + IndexLookUp + Apply + Union + Window + CTE"
     },
     "pkg/executor/distsql.go": {
       "status": "partial",
@@ -396,6 +396,29 @@
       "rust": "pkg/planner/core/union.rs",
       "phase": 8,
       "notes": "PhysicalUnion marker for F15"
+    },
+    "pkg/executor/cte.go": {
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory CTEExec for non-recursive WITH"
+    },
+    "pkg/planner/core/operator/logicalop/logical_cte.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/cte.rs",
+      "phase": 8,
+      "notes": "PhysicalCTE marker for F17"
+    },
+    "pkg/planner/core/operator/logicalop/logical_cte_table.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/cte.rs",
+      "phase": 8,
+      "notes": "CTETableReader shared storage folded into CTEExec for this phase"
+    },
+    "pkg/executor/cte_table_reader.go": {
+      "status": "partial",
+      "rust": "pkg/executor/cte.rs",
+      "phase": 8,
+      "notes": "shared CTETableReader deferred; single-consumer CTEExec materializes the seed"
     },
     "pkg/planner/core/operator/logicalop/logical_apply.go": {
       "status": "partial",

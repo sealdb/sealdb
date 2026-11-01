@@ -22,7 +22,7 @@
     "F14": {"status": "core-ported", "phase": 8, "notes": "EXISTS/IN/scalar subquery via NestedLoopApply plus IN list", "gaps": ["any-all", "from-derived-table", "select-list-subquery", "parallel-apply", "semi-anti-rewrite"]},
     "F15": {"status": "core-ported", "phase": 8, "notes": "UNION / UNION ALL with outer ORDER BY/LIMIT", "gaps": ["except-intersect", "nested-paren-union", "union-in-subquery", "parallel-union"]},
     "F16": {"status": "core-ported", "phase": 8, "notes": "ROW_NUMBER/RANK/DENSE_RANK and window COUNT/SUM/AVG/MIN/MAX", "gaps": ["frame-clause", "named-window", "lag-lead", "ignore-nulls", "pipelined-window"]},
-    "F17": {"status": "not-started", "phase": 8, "gaps": []},
+    "F17": {"status": "core-ported", "phase": 8, "notes": "non-recursive WITH CTE + column list", "gaps": ["recursive-cte", "materialized-hint", "union-in-cte", "cte-in-join", "cte-in-dml", "shared-cte-storage"]},
     "F18": {"status": "not-started", "phase": 8, "gaps": []},
     "F19": {"status": "not-started", "phase": 8, "gaps": []},
     "F20": {"status": "not-started", "phase": 8, "gaps": []},
