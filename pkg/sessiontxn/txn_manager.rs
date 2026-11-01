@@ -1,13 +1,15 @@
 use sealdb_errno::Result;
-use sealdb_kv::{Storage, TxnHandle};
+use sealdb_kv::{IsolationLevel, Storage, TxnHandle};
 use std::sync::Arc;
 
-/// Session-owned transaction lifecycle for F12/F13.
+/// Session-owned transaction lifecycle for F12/F13/C3.
 /// Completeness wave / not this feature: SAVEPOINT, AND CHAIN, XA,
-/// transactional DDL, isolation switching, blocking lock wait.
+/// transactional DDL, blocking lock wait.
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,
+    schema_ver: i64,
+    isolation: IsolationLevel,
 }
 
 impl TxnManager {
@@ -15,6 +17,8 @@ impl TxnManager {
         Self {
             handle: None,
             explicit: false,
+            schema_ver: 0,
+            isolation: IsolationLevel::RepeatableRead,
         }
     }
 
@@ -22,15 +26,39 @@ impl TxnManager {
         self.explicit
     }
 
-    pub fn enter_begin(&mut self, storage: &dyn Storage) -> Result<()> {
-        self.enter(storage, false)
+    pub fn schema_ver(&self) -> i64 {
+        self.schema_ver
     }
 
-    pub fn enter_begin_pessimistic(&mut self, storage: &dyn Storage) -> Result<()> {
-        self.enter(storage, true)
+    pub fn isolation(&self) -> IsolationLevel {
+        self.isolation
     }
 
-    fn enter(&mut self, storage: &dyn Storage, pessimistic: bool) -> Result<()> {
+    pub fn enter_begin(
+        &mut self,
+        storage: &dyn Storage,
+        schema_ver: i64,
+        isolation: IsolationLevel,
+    ) -> Result<()> {
+        self.enter(storage, false, schema_ver, isolation)
+    }
+
+    pub fn enter_begin_pessimistic(
+        &mut self,
+        storage: &dyn Storage,
+        schema_ver: i64,
+        isolation: IsolationLevel,
+    ) -> Result<()> {
+        self.enter(storage, true, schema_ver, isolation)
+    }
+
+    fn enter(
+        &mut self,
+        storage: &dyn Storage,
+        pessimistic: bool,
+        schema_ver: i64,
+        isolation: IsolationLevel,
+    ) -> Result<()> {
         if self.handle.is_some() {
             self.commit()?;
         }
@@ -41,6 +69,8 @@ impl TxnManager {
         };
         self.handle = Some(Arc::new(TxnHandle::new(txn)));
         self.explicit = true;
+        self.schema_ver = schema_ver;
+        self.isolation = isolation;
         Ok(())
     }
 
@@ -72,6 +102,13 @@ impl TxnManager {
         self.handle = Some(Arc::clone(&handle));
         self.explicit = false;
         Ok(handle)
+    }
+
+    pub fn refresh_snapshot(&self) -> Result<()> {
+        if let Some(handle) = &self.handle {
+            handle.with_txn(|txn| txn.refresh_snapshot())?;
+        }
+        Ok(())
     }
 
     pub fn finish_autocommit(&mut self, ok: bool) -> Result<()> {

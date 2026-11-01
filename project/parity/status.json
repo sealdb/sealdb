@@ -483,6 +483,18 @@
       "phase": 6,
       "notes": "PessimisticRRTxnContextProvider marker for F13 RR"
     },
+    "pkg/sessiontxn/isolation/readcommitted.go": {
+      "status": "partial",
+      "rust": "pkg/sessiontxn/isolation/readcommitted.rs",
+      "phase": 10,
+      "notes": "ReadCommittedTxnContextProvider + statement snapshot refresh"
+    },
+    "pkg/domain/schema_checker.go": {
+      "status": "partial",
+      "rust": "pkg/domain/schema_checker.rs",
+      "phase": 10,
+      "notes": "reject explicit-txn DML after concurrent DDL; MDL deferred"
+    },
     "pkg/executor/window.go": {
       "status": "partial",
       "phase": 8,

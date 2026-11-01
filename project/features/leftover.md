@@ -1,6 +1,6 @@
 # Leftover inventory
 
-Baseline features core-ported: C1, C2, F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, U0, U1, U2, U3
+Baseline features core-ported: C1, C2, C3, F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, U0, U1, U2, U3
 
 C1 freezes this file plus `project/features/leftover.json` as the completeness denominator.
 Do not claim leftover pass rates until a later wave marks a subset `ported`.
@@ -269,7 +269,7 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
 - C2 core-ports EXPLAIN row/json/dot, costed skyline, and two-table JoinReorder; ANALYZE / n-table DP / IndexMerge stay open.
-- C3 owns isolation / SchemaChecker / `db_integration`.
+- C3 core-ports SchemaChecker 8028, READ COMMITTED statement snapshots, and same-Domain cross-session RW; TiKV cross-cluster and MDL stay open.
 - C4 owns Prepare / Execute / Binding.
 - C5 owns SET / collation / charset leftover.
 - C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.

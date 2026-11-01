@@ -257,6 +257,12 @@ impl Transaction for MemTransaction {
         self.release_locks();
         Ok(())
     }
+
+    fn refresh_snapshot(&mut self) -> Result<()> {
+        let store = self.store.lock().expect("mem kv");
+        self.snapshot = store.data.clone();
+        Ok(())
+    }
 }
 
 impl Drop for MemTransaction {

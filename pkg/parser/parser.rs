@@ -554,4 +554,31 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("ANALYZE"));
     }
+
+    #[test]
+    fn test_parse_set_transaction() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("START TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .unwrap()
+        {
+            crate::ast::Statement::Begin(begin) => {
+                assert_eq!(begin.isolation, crate::ast::IsolationLevel::ReadCommitted);
+            }
+            other => panic!("expected BeginStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .unwrap()
+        {
+            crate::ast::Statement::SetTxn(set) => {
+                assert_eq!(set.isolation, crate::ast::IsolationLevel::RepeatableRead);
+            }
+            other => panic!("expected SetTxnStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .unwrap_err();
+        assert!(err.message.contains("SERIALIZABLE"));
+    }
 }

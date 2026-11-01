@@ -13,8 +13,9 @@ use crate::ast::expressions::{
     ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem,
-    PrivilegeType, RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, IsolationLevel,
+    PrivElem, PrivilegeType, RevokeStmt, RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
+    UserIdentity,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Statement};
 use crate::opcode::Op;
@@ -26,9 +27,9 @@ use sqlparser::ast::{
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NonBlock,
     ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, Revoke,
-    SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
-    Values, WindowType, With,
+    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionIsolationLevel,
+    TransactionMode, UnaryOperator, Update, Use, Value, Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -258,15 +259,25 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             exception,
             ..
         } => {
-            // F12/F13 gap: isolation modes, read-only, causal consistency,
-            // BEGIN ... END blocks. BEGIN PESSIMISTIC is rewritten before parse.
-            if !modes.is_empty() {
-                return Err(Error::unsupported("START TRANSACTION modes"));
-            }
+            // F12 gap: READ ONLY / causal consistency / BEGIN ... END.
+            // C3: READ COMMITTED / REPEATABLE READ; SERIALIZABLE stays out.
             if !statements.is_empty() || exception.is_some() {
                 return Err(Error::unsupported("BEGIN block"));
             }
-            Ok(Statement::Begin(BeginStmt { pessimistic: false }))
+            Ok(Statement::Begin(BeginStmt {
+                pessimistic: false,
+                isolation: isolation_from_modes(modes)?,
+            }))
+        }
+        SqlStatement::Set(Set::SetTransaction {
+            modes, snapshot, ..
+        }) => {
+            if snapshot.is_some() {
+                return Err(Error::unsupported("SET TRANSACTION SNAPSHOT"));
+            }
+            Ok(Statement::SetTxn(SetTxnStmt {
+                isolation: isolation_from_modes(modes)?,
+            }))
         }
         SqlStatement::Commit {
             chain, modifier, ..
@@ -637,6 +648,25 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn isolation_from_modes(modes: &[TransactionMode]) -> Result<IsolationLevel> {
+    let mut isolation = IsolationLevel::RepeatableRead;
+    for mode in modes {
+        match mode {
+            TransactionMode::IsolationLevel(TransactionIsolationLevel::ReadCommitted) => {
+                isolation = IsolationLevel::ReadCommitted;
+            }
+            TransactionMode::IsolationLevel(TransactionIsolationLevel::RepeatableRead) => {
+                isolation = IsolationLevel::RepeatableRead;
+            }
+            TransactionMode::IsolationLevel(other) => {
+                return Err(Error::unsupported(format!("ISOLATION LEVEL {other}")));
+            }
+            other => return Err(Error::unsupported(format!("START TRANSACTION {other}"))),
+        }
+    }
+    Ok(isolation)
 }
 
 /// sqlparser-rs accepts `FORMAT JSON`, not TiDB `FORMAT = 'dot'`.

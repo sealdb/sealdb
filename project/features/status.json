@@ -30,7 +30,7 @@
     "F22": {"status": "core-ported", "phase": 9, "notes": "MySQL handshake + COM_QUERY/COM_PING/COM_INIT_DB/COM_QUIT", "gaps": ["ssl", "compression", "prepared-stmt", "auth-plugin", "binary-protocol", "multi-resultset"]},
     "C1": {"status": "core-ported", "phase": 10, "notes": "frozen leftover denominator: 91 feature gaps + 56 open stmts + 42 suites", "gaps": ["unmapped-stmts", "stale-gap-labels", "leftover-suite-execution"]},
     "C2": {"status": "core-ported", "phase": 10, "notes": "EXPLAIN row/json/dot + costed skyline + two-table JoinReorder", "gaps": ["explain-analyze", "cop-task-rows", "n-table-dp", "index-merge-join", "cost-model-v2"]},
-    "C3": {"status": "not-started", "phase": 10, "gaps": []},
+    "C3": {"status": "core-ported", "phase": 10, "notes": "SchemaChecker 8028 + READ COMMITTED + same-Domain cross-session RW", "gaps": ["tikv-cross-cluster", "mdl", "schema-lease", "serializable", "savepoint"]},
     "C4": {"status": "not-started", "phase": 10, "gaps": []},
     "C5": {"status": "not-started", "phase": 10, "gaps": []},
     "C6": {"status": "deferred", "phase": 10, "notes": "Cascades/TiFlash/MPP/BR/Lightning/plugin stay out of the main line"}

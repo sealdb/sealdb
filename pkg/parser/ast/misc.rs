@@ -266,9 +266,17 @@ impl UseStmt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    #[default]
+    RepeatableRead,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BeginStmt {
     pub pessimistic: bool,
+    pub isolation: IsolationLevel,
 }
 
 impl BeginStmt {
@@ -277,6 +285,28 @@ impl BeginStmt {
         if self.pessimistic {
             ctx.write_str(" PESSIMISTIC");
         }
+        match self.isolation {
+            IsolationLevel::RepeatableRead => {}
+            IsolationLevel::ReadCommitted => {
+                ctx.write_str(" ISOLATION LEVEL READ COMMITTED");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SetTxnStmt {
+    pub isolation: IsolationLevel,
+}
+
+impl SetTxnStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET TRANSACTION ISOLATION LEVEL ");
+        ctx.write_str(match self.isolation {
+            IsolationLevel::ReadCommitted => "READ COMMITTED",
+            IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        });
         Ok(())
     }
 }

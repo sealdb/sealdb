@@ -2,8 +2,9 @@ use sealdb_domain::Domain;
 use sealdb_errno::Result;
 use sealdb_executor::{ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
+use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
-use sealdb_parser::ast::{PrivilegeType, Statement, UserIdentity};
+use sealdb_parser::ast::{IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity};
 use sealdb_planner::PlanBuilder;
 use sealdb_sessiontxn::TxnManager;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ pub struct Session {
     current_db: Mutex<String>,
     current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
+    isolation: Mutex<IsolationLevel>,
 }
 
 impl Session {
@@ -30,6 +32,7 @@ impl Session {
             current_db: Mutex::new(String::new()),
             current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
+            isolation: Mutex::new(IsolationLevel::RepeatableRead),
         }
     }
 
@@ -92,17 +95,35 @@ impl Session {
                     use_stmt.db_name.clone();
                 return Ok(empty_result());
             }
+            Statement::SetTxn(set) => {
+                *self.isolation.lock().expect("session isolation lock") =
+                    map_isolation(set.isolation);
+                return Ok(empty_result());
+            }
             Statement::Begin(begin) => {
+                let isolation = if begin.isolation != AstIsolation::RepeatableRead {
+                    map_isolation(begin.isolation)
+                } else {
+                    *self.isolation.lock().expect("session isolation lock")
+                };
+                let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
-                    txn.enter_begin_pessimistic(self.domain.as_ref())?;
+                    txn.enter_begin_pessimistic(self.domain.as_ref(), schema_ver, isolation)?;
                 } else {
-                    txn.enter_begin(self.domain.as_ref())?;
+                    txn.enter_begin(self.domain.as_ref(), schema_ver, isolation)?;
                 }
                 return Ok(empty_result());
             }
             Statement::Commit(_) => {
-                self.txn.lock().expect("session txn lock").commit()?;
+                let mut txn = self.txn.lock().expect("session txn lock");
+                if txn.is_explicit() {
+                    sealdb_domain::schema_checker::check(
+                        txn.schema_ver(),
+                        self.domain.infoschema().schema_meta_version(),
+                    )?;
+                }
+                txn.commit()?;
                 return Ok(empty_result());
             }
             Statement::Rollback(_) => {
@@ -120,6 +141,18 @@ impl Session {
                 self.txn.lock().expect("session txn lock").commit()?;
             }
             _ => {}
+        }
+        {
+            let txn = self.txn.lock().expect("session txn lock");
+            if txn.is_explicit() {
+                sealdb_domain::schema_checker::check(
+                    txn.schema_ver(),
+                    self.domain.infoschema().schema_meta_version(),
+                )?;
+                if txn.isolation() == IsolationLevel::ReadCommitted {
+                    txn.refresh_snapshot()?;
+                }
+            }
         }
         let current_db = self
             .current_db
@@ -308,6 +341,13 @@ fn empty_result() -> QueryResult {
     QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
+    }
+}
+
+fn map_isolation(level: AstIsolation) -> IsolationLevel {
+    match level {
+        AstIsolation::ReadCommitted => IsolationLevel::ReadCommitted,
+        AstIsolation::RepeatableRead => IsolationLevel::RepeatableRead,
     }
 }
 
@@ -730,7 +770,7 @@ mod tests {
         let err = session
             .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap_err();
-        assert!(err.message.contains("START TRANSACTION modes"));
+        assert!(err.message.contains("SERIALIZABLE"));
     }
 
     #[test]
@@ -764,6 +804,46 @@ mod tests {
             committed.display_rows(),
             vec![vec!["1".to_string(), "b".to_string()]]
         );
+    }
+
+    #[test]
+    fn test_schema_checker_and_read_committed() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(Arc::clone(&domain));
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        let snap = a.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(snap.display_rows().len(), 1);
+        b.execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT")
+            .unwrap();
+        let err = a.execute_stmt("SELECT * FROM db1.t").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_INFO_SCHEMA_CHANGED);
+        a.execute_stmt("ROLLBACK").unwrap();
+
+        a.execute_stmt("START TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .unwrap();
+        let first = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(first.display_rows()[0][1], "a");
+        b.execute_stmt("UPDATE db1.t SET name = 'c' WHERE id = 1")
+            .unwrap();
+        let second = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(second.display_rows()[0][1], "c");
+        a.execute_stmt("COMMIT").unwrap();
+
+        a.execute_stmt("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        let rr = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(rr.display_rows()[0][1], "c");
+        b.execute_stmt("UPDATE db1.t SET name = 'd' WHERE id = 1")
+            .unwrap();
+        let still = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(still.display_rows()[0][1], "c");
+        a.execute_stmt("ROLLBACK").unwrap();
     }
 
     #[test]
