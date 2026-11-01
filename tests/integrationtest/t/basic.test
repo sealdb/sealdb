@@ -8,4 +8,5 @@ CREATE DATABASE itest;
 CREATE TABLE itest.t (id INT, name VARCHAR(20));
 INSERT INTO itest.t VALUES (1, 'a'), (2, 'b');
 SELECT * FROM itest.t ORDER BY id;
-SELECT * FROM itest.t WHERE id = 2;
+SELECT id AS i FROM itest.t WHERE id = 2;
+SELECT name FROM itest.t ORDER BY id;

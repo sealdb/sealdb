@@ -14,6 +14,10 @@ SELECT * FROM itest.t ORDER BY id;
 id	name
 1	a
 2	b
-SELECT * FROM itest.t WHERE id = 2;
-id	name
-2	b
+SELECT id AS i FROM itest.t WHERE id = 2;
+i
+2
+SELECT name FROM itest.t ORDER BY id;
+name
+a
+b

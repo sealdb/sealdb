@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（集成测试双存储）  
+> 最后更新：2026-11-01（表扫描 Projection）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: 表扫描 Projection
+- **完成**:
+  - 非 `SELECT *` 在 Selection/Sort/Limit 之后包 Projection
+  - `SELECT id AS i` / `SELECT name ORDER BY id` / join 列裁剪
+- **验证**:
+  - `cargo test -p sealdb-session --lib test_table_column_projection`
+  - `./tests/integrationtest/run-tests.sh -t basic --require-tikv`（录金样后）
+- **下一步**:
+  - tikv-persist（schema / next_handle 写 TiKV）
 
 ### 2026-11-01
 

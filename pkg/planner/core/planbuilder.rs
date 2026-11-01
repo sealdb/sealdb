@@ -97,24 +97,6 @@ impl PlanBuilder {
                         };
                     }
                 }
-                if (select.join.is_some()
-                    || matches!(plan, PhysicalPlan::CTE { .. })
-                    || has_info_schema(&plan))
-                    && !is_star_select(select)
-                    && !needs_hash_agg(select)
-                    && !needs_window(select)
-                {
-                    let exprs = select
-                        .fields
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| format!("col{i}"))
-                        .collect();
-                    plan = PhysicalPlan::Projection {
-                        exprs,
-                        child: Box::new(plan),
-                    };
-                }
                 if needs_hash_agg(select) {
                     if needs_window(select) {
                         return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
@@ -144,6 +126,9 @@ impl PlanBuilder {
                         child: Box::new(plan),
                     };
                 }
+                // Project after Selection/Sort so WHERE and ORDER BY still
+                // see the full child schema (TiDB extra-projection shape).
+                plan = wrap_output_projection(plan, select);
                 Ok(plan)
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
@@ -318,14 +303,6 @@ fn is_information_schema(from: &TableName, current_db: &str) -> bool {
         .is_some_and(|schema| schema.eq_ignore_ascii_case("information_schema"))
 }
 
-fn has_info_schema(plan: &PhysicalPlan) -> bool {
-    match plan {
-        PhysicalPlan::InfoSchema { .. } => true,
-        PhysicalPlan::Selection { child } | PhysicalPlan::Apply { child } => has_info_schema(child),
-        _ => false,
-    }
-}
-
 fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
 }
@@ -342,6 +319,26 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
         AstJoinType::Inner => JoinType::Inner,
         AstJoinType::LeftOuter => JoinType::LeftOuter,
         AstJoinType::RightOuter => JoinType::RightOuter,
+    }
+}
+
+fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
+    if is_star_select(select)
+        || needs_hash_agg(select)
+        || needs_window(select)
+        || matches!(plan, PhysicalPlan::Projection { .. })
+    {
+        return plan;
+    }
+    let exprs = select
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("col{i}"))
+        .collect();
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
     }
 }
 

@@ -804,7 +804,43 @@ mod tests {
         let is_null = session
             .execute_stmt("SELECT id FROM db1.t WHERE name IS NULL")
             .unwrap();
-        assert_eq!(is_null.display_rows()[0][0], "4");
+        assert_eq!(is_null.columns, vec!["id"]);
+        assert_eq!(is_null.display_rows(), vec![vec!["4".to_string()]]);
+    }
+
+    #[test]
+    fn test_table_column_projection() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let aliased = session
+            .execute_stmt("SELECT id AS i FROM db1.t WHERE id = 2")
+            .unwrap();
+        assert_eq!(aliased.columns, vec!["i"]);
+        assert_eq!(aliased.display_rows(), vec![vec!["2".to_string()]]);
+        let named = session
+            .execute_stmt("SELECT name FROM db1.t WHERE name = 'b'")
+            .unwrap();
+        assert_eq!(named.columns, vec!["name"]);
+        assert_eq!(named.display_rows(), vec![vec!["b".to_string()]]);
+        let ordered = session
+            .execute_stmt("SELECT name FROM db1.t ORDER BY id DESC LIMIT 1")
+            .unwrap();
+        assert_eq!(ordered.columns, vec!["name"]);
+        assert_eq!(ordered.display_rows(), vec![vec!["c".to_string()]]);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'); INSERT INTO db1.t2 VALUES (1, 'x')",
+            )
+            .unwrap();
+        let projected_join = session
+            .execute_stmt("SELECT t1.name FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id")
+            .unwrap();
+        assert_eq!(projected_join.columns, vec!["t1.name"]);
+        assert_eq!(projected_join.display_rows(), vec![vec!["a".to_string()]]);
     }
 
     #[test]
@@ -1183,11 +1219,12 @@ mod tests {
             .execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
             .unwrap();
         let first = session.execute_stmt("EXECUTE s USING 1").unwrap();
-        assert_eq!(first.display_rows()[0].last().unwrap(), "a");
+        assert_eq!(first.columns, vec!["name"]);
+        assert_eq!(first.display_rows(), vec![vec!["a".to_string()]]);
         let second = session.execute_stmt("EXECUTE s USING 2").unwrap();
-        assert_eq!(second.display_rows()[0].last().unwrap(), "b");
+        assert_eq!(second.display_rows(), vec![vec!["b".to_string()]]);
         let again = session.execute_stmt("EXECUTE s USING 1").unwrap();
-        assert_eq!(again.display_rows()[0].last().unwrap(), "a");
+        assert_eq!(again.display_rows(), vec![vec!["a".to_string()]]);
         session.execute_stmt("DEALLOCATE PREPARE s").unwrap();
         let err = session.execute_stmt("EXECUTE s USING 1").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_UNKNOWN_STMT_HANDLER);
