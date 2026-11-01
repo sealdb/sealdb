@@ -9,9 +9,11 @@ use sealdb_statistics::Handle;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Completeness wave: persist meta / next_handle to PD+TiKV so a
+/// restarted `--store tikv` process can reload tables.
 pub struct Domain {
     inner: Mutex<Inner>,
-    storage: Arc<MemStorage>,
+    storage: Arc<dyn Storage>,
     privilege: Arc<Manager>,
     stats: Arc<Handle>,
 }
@@ -31,14 +33,22 @@ impl Domain {
         Self::with_privilege(Manager::with_grant_table())
     }
 
+    pub fn with_storage(storage: Arc<dyn Storage>) -> Self {
+        Self::with_storage_and_privilege(storage, Manager::skip_with_grant())
+    }
+
     fn with_privilege(privilege: Manager) -> Self {
+        Self::with_storage_and_privilege(Arc::new(MemStorage::new()), privilege)
+    }
+
+    fn with_storage_and_privilege(storage: Arc<dyn Storage>, privilege: Manager) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 meta: Mutator::new(),
                 infoschema: InfoSchema::empty(),
                 next_handle: HashMap::new(),
             }),
-            storage: Arc::new(MemStorage::new()),
+            storage,
             privilege: Arc::new(privilege),
             stats: Arc::new(Handle::new()),
         }
@@ -60,7 +70,7 @@ impl Domain {
             .clone()
     }
 
-    pub fn storage(&self) -> Arc<MemStorage> {
+    pub fn storage(&self) -> Arc<dyn Storage> {
         Arc::clone(&self.storage)
     }
 

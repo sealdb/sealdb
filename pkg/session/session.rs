@@ -1,3 +1,4 @@
+use sealdb_config::Config;
 use sealdb_domain::Domain;
 use sealdb_errno::Result;
 use sealdb_executor::{ExecutorBuilder, QueryResult};
@@ -30,6 +31,11 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self::with_domain(Arc::new(Domain::new()))
+    }
+
+    pub fn from_config(cfg: &Config) -> Result<Self> {
+        let storage = sealdb_store::open(cfg)?;
+        Ok(Self::with_domain(Arc::new(Domain::with_storage(storage))))
     }
 
     pub fn with_domain(domain: Arc<Domain>) -> Self {
@@ -576,6 +582,38 @@ mod tests {
         let session = Session::new();
         let result = session.execute_stmt("SELECT 1").unwrap();
         assert_eq!(result.rows, vec![vec![Datum::I64(1)]]);
+    }
+
+    #[test]
+    fn test_from_config_defaults_to_memory() {
+        let session = Session::from_config(&Config::default()).unwrap();
+        let result = session.execute_stmt("SELECT 1").unwrap();
+        assert_eq!(result.rows, vec![vec![Datum::I64(1)]]);
+    }
+
+    #[test]
+    fn test_tikv_sql_roundtrip_if_available() {
+        let cfg = Config {
+            store: sealdb_config::StoreKind::Tikv,
+            ..Config::default()
+        };
+        let session = match Session::from_config(&cfg) {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("skip live tikv sql: {err}");
+                return;
+            }
+        };
+        session
+            .execute_stmt(
+                "CREATE DATABASE tikv_smoke; CREATE TABLE tikv_smoke.t (id INT, name VARCHAR(20)); INSERT INTO tikv_smoke.t VALUES (1, 'a');",
+            )
+            .unwrap();
+        let rows = session.execute_stmt("SELECT * FROM tikv_smoke.t").unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
     }
 
     #[test]

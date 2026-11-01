@@ -11,7 +11,10 @@ path = "main.rs"
 
 [dependencies]
 clap.workspace = true
+sealdb-config.workspace = true
+sealdb-domain.workspace = true
 sealdb-parser.workspace = true
 sealdb-server.workspace = true
 sealdb-session.workspace = true
+sealdb-store.workspace = true
 serde_json.workspace = true

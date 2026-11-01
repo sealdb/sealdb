@@ -2,3 +2,62 @@
 
 pub mod copr;
 pub mod driver;
+
+use driver::TikvStorage;
+use sealdb_config::{Config, StoreKind};
+use sealdb_errno::Result;
+use sealdb_kv::{MemStorage, Storage};
+use std::sync::Arc;
+
+pub use driver::TikvStorage as TikvStore;
+
+pub fn open(cfg: &Config) -> Result<Arc<dyn Storage>> {
+    match cfg.store {
+        StoreKind::Memory => Ok(Arc::new(MemStorage::new())),
+        StoreKind::Tikv => Ok(Arc::new(TikvStorage::connect(&cfg.pd_endpoints)?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sealdb_config::StoreKind;
+
+    #[test]
+    fn test_open_memory() {
+        let cfg = Config::default();
+        assert_eq!(cfg.store, StoreKind::Memory);
+        let storage = open(&cfg).unwrap();
+        let mut txn = storage.begin().unwrap();
+        txn.set(b"sealdb:mem:k", b"v").unwrap();
+        txn.commit().unwrap();
+        let mut read = storage.begin().unwrap();
+        assert_eq!(read.get(b"sealdb:mem:k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_tikv_roundtrip_if_available() {
+        let store = match TikvStorage::connect(&["127.0.0.1:2379".to_string()]) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("skip live tikv: {err}");
+                return;
+            }
+        };
+        let key = format!(
+            "sealdb:test:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key = key.into_bytes();
+        let mut txn = store.begin().unwrap();
+        txn.set(&key, b"v1").unwrap();
+        txn.commit().unwrap();
+        let mut read = store.begin().unwrap();
+        assert_eq!(read.get(&key).unwrap(), Some(b"v1".to_vec()));
+        read.delete(&key).unwrap();
+        read.commit().unwrap();
+    }
+}

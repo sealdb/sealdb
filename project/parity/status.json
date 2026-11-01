@@ -5,7 +5,7 @@
       "status": "partial",
       "rust": "cmd/tidb-server/main.rs",
       "phase": 2,
-      "notes": "CLI --parse/--execute/--listen MySQL protocol"
+      "notes": "CLI --parse/--execute/--listen plus --store memory|tikv and --pd"
     },
     "pkg/errno/errcode.go": {
       "status": "partial",
@@ -283,6 +283,24 @@
       "phase": 3,
       "notes": "in-memory schema snapshot"
     },
+    "pkg/config/config.go": {
+      "status": "partial",
+      "rust": "pkg/config/lib.rs",
+      "phase": 9,
+      "notes": "StoreKind memory|tikv + PD endpoints via CLI/env; toml file deferred"
+    },
+    "pkg/store/store.go": {
+      "status": "partial",
+      "rust": "pkg/store/lib.rs",
+      "phase": 5,
+      "notes": "open() factory: MemStorage default, TikvStorage when --store tikv"
+    },
+    "pkg/store/driver/tikv_driver.go": {
+      "status": "partial",
+      "rust": "pkg/store/driver/mod.rs",
+      "phase": 5,
+      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; coprocessor deferred"
+    },
     "pkg/server/server.go": {
       "status": "partial",
       "rust": "pkg/server/server.rs",
@@ -354,7 +372,7 @@
     "pkg/domain/domain.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "owns meta + infoschema + MemStorage"
+      "notes": "owns meta + infoschema + Arc<dyn Storage>; MemStorage default"
     },
     "pkg/executor/builder.go": {
       "status": "partial",

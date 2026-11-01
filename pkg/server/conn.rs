@@ -33,13 +33,21 @@ impl ClientConn<TcpStream> {
     pub fn from_tcp(stream: TcpStream, connection_id: u32) -> Self {
         Self::new(stream, connection_id)
     }
+
+    pub fn from_tcp_session(stream: TcpStream, connection_id: u32, session: Session) -> Self {
+        Self::with_session(stream, connection_id, session)
+    }
 }
 
 impl<S: Read + Write> ClientConn<S> {
     pub fn new(stream: S, connection_id: u32) -> Self {
+        Self::with_session(stream, connection_id, Session::new())
+    }
+
+    pub fn with_session(stream: S, connection_id: u32, session: Session) -> Self {
         Self {
             pkt: PacketIO::new(stream),
-            session: Session::new(),
+            session,
             capability: DEFAULT_CAPABILITY,
             connection_id,
         }
