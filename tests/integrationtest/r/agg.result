@@ -18,3 +18,8 @@ b
 SELECT COUNT(DISTINCT name) FROM itest.t;
 COUNT(DISTINCT `name`)
 2
+CREATE TABLE itest.d (name VARCHAR(20), id INT);
+INSERT INTO itest.d VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3);
+SELECT SUM(DISTINCT id), AVG(DISTINCT id), MIN(DISTINCT id), MAX(DISTINCT id) FROM itest.d;
+SUM(DISTINCT `id`)	AVG(DISTINCT `id`)	MIN(DISTINCT `id`)	MAX(DISTINCT `id`)
+6	2.0	1	3

@@ -1,11 +1,23 @@
-use super::aggfuncs::AggFunc;
+use super::aggfuncs::{AggFunc, remember_distinct};
 use sealdb_errno::Result;
 use sealdb_types::Datum;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct Avg {
     sum: f64,
     count: i64,
+    distinct: bool,
+    seen: HashSet<String>,
+}
+
+impl Avg {
+    pub fn distinct() -> Self {
+        Self {
+            distinct: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl AggFunc for Avg {
@@ -14,6 +26,9 @@ impl AggFunc for Avg {
             return Ok(());
         };
         if v.is_null() {
+            return Ok(());
+        }
+        if self.distinct && !remember_distinct(&mut self.seen, v) {
             return Ok(());
         }
         self.sum += v.as_f64()?;

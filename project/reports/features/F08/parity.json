@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 160,
-  "manifest_entries": 110,
+  "rs_files": 162,
+  "manifest_entries": 112,
   "status_counts": {
-    "not-started": 1571,
-    "partial": 103,
+    "not-started": 1569,
+    "partial": 105,
     "reimplemented": 4,
     "ported": 3
   },
@@ -155,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 29,
-      "missing": 156,
+      "rs": 30,
+      "missing": 155,
       "status": {
-        "not-started": 156,
-        "partial": 29
+        "not-started": 155,
+        "partial": 30
       }
     },
     "pkg/expression": {
@@ -267,11 +267,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 11,
-      "missing": 205,
+      "rs": 12,
+      "missing": 204,
       "status": {
-        "not-started": 205,
-        "partial": 11
+        "not-started": 204,
+        "partial": 12
       }
     },
     "pkg/plugin": {
@@ -2473,10 +2473,10 @@
     },
     {
       "go_path": "pkg/executor/coprocessor.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/coprocessor.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "scan-time pushed filter; TiKV Coprocessor DAG / CopClient deferred"
     },
     {
       "go_path": "pkg/executor/cte.go",
@@ -6904,10 +6904,10 @@
     },
     {
       "go_path": "pkg/planner/core/rule_predicate_push_down.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_predicate_push_down.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "CNF push into TableReader/IndexLookUp and join sides; outer-join inner residual"
     },
     {
       "go_path": "pkg/planner/core/rule_predicate_simplification.go",
@@ -8916,7 +8916,7 @@
       "rs_path": "pkg/store/driver/mod.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; coprocessor deferred"
+      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; Coprocessor DAG deferred"
     },
     {
       "go_path": "pkg/store/driver/txn/batch_getter.go",

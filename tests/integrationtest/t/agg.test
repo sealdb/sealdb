@@ -8,3 +8,6 @@ SELECT name, COUNT(*) FROM itest.t GROUP BY name ORDER BY name;
 SELECT name, COUNT(*) FROM itest.t GROUP BY name HAVING COUNT(*) > 1;
 SELECT name FROM itest.t GROUP BY name HAVING COUNT(*) = 1;
 SELECT COUNT(DISTINCT name) FROM itest.t;
+CREATE TABLE itest.d (name VARCHAR(20), id INT);
+INSERT INTO itest.d VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3);
+SELECT SUM(DISTINCT id), AVG(DISTINCT id), MIN(DISTINCT id), MAX(DISTINCT id) FROM itest.d;

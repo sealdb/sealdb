@@ -1,4 +1,4 @@
-use super::aggfuncs::AggFunc;
+use super::aggfuncs::{AggFunc, remember_distinct};
 use sealdb_errno::Result;
 use sealdb_types::Datum;
 use std::collections::HashSet;
@@ -44,7 +44,7 @@ impl AggFunc for Count {
             return Ok(());
         }
         if self.distinct {
-            if self.seen.insert(format!("{v:?}")) {
+            if remember_distinct(&mut self.seen, v) {
                 self.count += 1;
             }
             return Ok(());

@@ -59,7 +59,6 @@
       "returning"
     ],
     "F08": [
-      "distinct-agg",
       "stream-agg",
       "spill"
     ],
