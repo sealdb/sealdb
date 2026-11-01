@@ -226,3 +226,67 @@ impl DeleteStmt {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOprType {
+    Union,
+    UnionAll,
+}
+
+impl SetOprType {
+    pub fn restore(self) -> &'static str {
+        match self {
+            SetOprType::Union => "UNION",
+            SetOprType::UnionAll => "UNION ALL",
+        }
+    }
+
+    pub fn is_distinct(self) -> bool {
+        matches!(self, SetOprType::Union)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SetOprStmt {
+    pub first: SelectStmt,
+    pub rest: Vec<(SetOprType, SelectStmt)>,
+    pub order_by: Vec<ByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+impl SetOprStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.first.restore(ctx)?;
+        for (op, select) in &self.rest {
+            ctx.write_str(" ");
+            ctx.write_str(op.restore());
+            ctx.write_str(" ");
+            select.restore(ctx)?;
+        }
+        if !self.order_by.is_empty() {
+            ctx.write_str(" ORDER BY ");
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                item.expr.restore(ctx)?;
+                if item.desc {
+                    ctx.write_str(" DESC");
+                }
+            }
+        }
+        if let Some(limit) = self.limit {
+            ctx.write_str(" LIMIT ");
+            if let Some(offset) = self.offset {
+                ctx.write_str(&format!("{offset},"));
+            }
+            ctx.write_str(&limit.to_string());
+        } else if let Some(offset) = self.offset {
+            ctx.write_str(" LIMIT ");
+            ctx.write_str(&offset.to_string());
+            ctx.write_str(",18446744073709551615");
+        }
+        Ok(())
+    }
+}

@@ -181,12 +181,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -374,6 +374,17 @@
       "rust": "pkg/sessiontxn/isolation/pessimistic.rs",
       "phase": 6,
       "notes": "PessimisticRRTxnContextProvider marker for F13 RR"
+    },
+    "pkg/executor/unionexec/union.go": {
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory UNION / UNION ALL"
+    },
+    "pkg/planner/core/operator/logicalop/logical_union_all.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/union.rs",
+      "phase": 8,
+      "notes": "PhysicalUnion marker for F15"
     },
     "pkg/planner/core/operator/logicalop/logical_apply.go": {
       "status": "partial",

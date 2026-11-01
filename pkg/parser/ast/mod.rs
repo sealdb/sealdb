@@ -14,7 +14,7 @@ pub use ddl::{
 };
 pub use dml::{
     Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
-    SelectStmt, UpdateStmt,
+    SelectStmt, SetOprStmt, SetOprType, UpdateStmt,
 };
 pub use expressions::{ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, ScalarSubqueryExpr};
 pub use misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};

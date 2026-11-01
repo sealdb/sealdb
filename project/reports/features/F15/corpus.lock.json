@@ -1,0 +1,21 @@
+{
+  "feature": "F15",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/parser/ast/dml.go SetOprStmt",
+    "TiDB pkg/executor/unionexec/union.go",
+    "TiDB pkg/planner/core/operator/logicalop/logical_union_all.go"
+  ],
+  "cases": [
+    "SELECT 1 UNION SELECT 1",
+    "SELECT 1 UNION ALL SELECT 1",
+    "SELECT 1 UNION SELECT 2 UNION ALL SELECT 2",
+    "SELECT * FROM t1 UNION SELECT * FROM t2 ORDER BY id",
+    "SELECT * FROM t1 UNION ALL SELECT * FROM t2 ORDER BY id LIMIT 2",
+    "SELECT 1 UNION SELECT 1, 2",
+    "SELECT 1 EXCEPT SELECT 2",
+    "SELECT 1 INTERSECT SELECT 1",
+    "SELECT 1 FROM t1 UNION SELECT 1 FROM t2",
+    "(SELECT 1 UNION SELECT 2) UNION SELECT 3"
+  ]
+}
