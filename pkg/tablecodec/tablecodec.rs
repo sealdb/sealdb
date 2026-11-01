@@ -1,5 +1,6 @@
+use sealdb_errno::{Error, Result};
 use sealdb_kv::Key;
-use sealdb_util::codec::{encode_int, encode_int_to_cmp_uint};
+use sealdb_util::codec::{decode_int, encode_int, encode_int_to_cmp_uint};
 
 pub const TABLE_PREFIX: &[u8] = b"t";
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
@@ -69,6 +70,17 @@ fn append_table_index_prefix(buf: &mut Vec<u8>, table_id: i64) {
 
 pub fn encode_int_handle(handle: i64) -> Vec<u8> {
     encode_int_to_cmp_uint(handle).to_be_bytes().to_vec()
+}
+
+pub fn decode_handle_from_row_key(key: &[u8]) -> Result<i64> {
+    if key.len() < PREFIX_LEN + 8 {
+        return Err(Error::new(
+            sealdb_errno::ERR_INVALID_KEY,
+            "row key too short",
+        ));
+    }
+    let (_, handle) = decode_int(&key[PREFIX_LEN..])?;
+    Ok(handle)
 }
 
 pub fn next_prefix(prefix: &[u8]) -> Vec<u8> {
@@ -178,6 +190,7 @@ mod tests {
             key.as_bytes(),
             hex("7480000000000000015f728000000000000001")
         );
+        assert_eq!(decode_handle_from_row_key(key.as_bytes()).unwrap(), 1);
     }
 
     #[test]

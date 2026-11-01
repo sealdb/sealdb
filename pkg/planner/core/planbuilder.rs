@@ -67,6 +67,8 @@ impl PlanBuilder {
                 Ok(plan)
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
+            Statement::Update(_) => Ok(PhysicalPlan::Update),
+            Statement::Delete(_) => Ok(PhysicalPlan::Delete),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateDatabase,
             }),

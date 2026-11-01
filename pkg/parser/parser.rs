@@ -161,4 +161,23 @@ mod tests {
             .unwrap();
         assert!(where_stmt.as_select().unwrap().selection.is_some());
     }
+
+    #[test]
+    fn test_parse_update_and_delete() {
+        let parser = Parser::new();
+        assert_eq!(
+            parser
+                .parse_one_stmt("UPDATE db1.t SET name = 'c' WHERE id = 1")
+                .unwrap()
+                .stmt_type(),
+            "UpdateStmt"
+        );
+        assert_eq!(
+            parser
+                .parse_one_stmt("DELETE FROM db1.t WHERE id = 2")
+                .unwrap()
+                .stmt_type(),
+            "DeleteStmt"
+        );
+    }
 }

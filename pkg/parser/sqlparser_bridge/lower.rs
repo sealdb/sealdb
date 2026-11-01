@@ -3,7 +3,9 @@ use crate::ast::Statement;
 use crate::ast::ddl::{
     ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
 };
-use crate::ast::dml::{ByItem, InsertStmt, SelectField, SelectStmt};
+use crate::ast::dml::{
+    Assignment, ByItem, DeleteStmt, InsertStmt, SelectField, SelectStmt, UpdateStmt,
+};
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
 };
@@ -12,9 +14,10 @@ use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    BinaryOperator, DataType, DescribeAlias, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, LimitClause, ObjectName, ObjectType, OrderByKind, OrderBySort, SchemaName,
-    SelectItem, SetExpr, Statement as SqlStatement, TableObject, UnaryOperator, Use, Value, Values,
+    AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName, ObjectType,
+    OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr, Statement as SqlStatement,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -206,6 +209,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 rows,
             }))
         }
+        SqlStatement::Update(update) => lower_update(update),
+        SqlStatement::Delete(delete) => lower_delete(delete),
         SqlStatement::Use(use_stmt) => {
             let name = match use_stmt {
                 Use::Catalog(name)
@@ -264,6 +269,73 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
             other => Err(Error::unsupported(format!("limit literal {other}"))),
         },
         other => Err(Error::unsupported(format!("limit expression {other}"))),
+    }
+}
+
+fn lower_update(update: &Update) -> Result<Statement> {
+    if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
+        return Err(Error::unsupported("UPDATE FROM / RETURNING"));
+    }
+    if !update.order_by.is_empty() || update.limit.is_some() {
+        return Err(Error::unsupported("UPDATE ORDER BY / LIMIT"));
+    }
+    let table = table_from_relation(&update.table)?;
+    let list = update
+        .assignments
+        .iter()
+        .map(|item| {
+            let column = match &item.target {
+                AssignmentTarget::ColumnName(name) => object_name_last(name)?,
+                AssignmentTarget::Tuple(_) => {
+                    return Err(Error::unsupported("tuple UPDATE assignment"));
+                }
+            };
+            Ok(Assignment {
+                column,
+                expr: lower_expr(&item.value)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if list.is_empty() {
+        return Err(Error::unsupported("UPDATE without SET"));
+    }
+    Ok(Statement::Update(UpdateStmt {
+        table,
+        list,
+        selection: update.selection.as_ref().map(lower_expr).transpose()?,
+    }))
+}
+
+fn lower_delete(delete: &Delete) -> Result<Statement> {
+    if delete.using.is_some()
+        || delete.returning.is_some()
+        || delete.output.is_some()
+        || !delete.tables.is_empty()
+    {
+        return Err(Error::unsupported("multi-table / RETURNING DELETE"));
+    }
+    if !delete.order_by.is_empty() || delete.limit.is_some() {
+        return Err(Error::unsupported("DELETE ORDER BY / LIMIT"));
+    }
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return Err(Error::unsupported("multi-table DELETE"));
+    }
+    Ok(Statement::Delete(DeleteStmt {
+        table: table_from_relation(&tables[0])?,
+        selection: delete.selection.as_ref().map(lower_expr).transpose()?,
+    }))
+}
+
+fn table_from_relation(table: &TableWithJoins) -> Result<TableName> {
+    if !table.joins.is_empty() {
+        return Err(Error::unsupported("JOIN in DML"));
+    }
+    match &table.relation {
+        TableFactor::Table { name, .. } => object_table_name(name),
+        other => Err(Error::unsupported(format!("DML target {other}"))),
     }
 }
 

@@ -12,7 +12,7 @@
     "F04": {"status": "core-ported", "phase": 5, "notes": "WHERE filters rows via SelectionExec", "gaps": ["ppd", "in-between-like", "coprocessor-filter"]},
     "F05": {"status": "core-ported", "phase": 5, "notes": "ORDER BY + LIMIT/OFFSET in-memory", "gaps": ["topn-spill", "parallel-sort"]},
     "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle PointGet", "gaps": ["batch-point-get", "index-point-get"]},
-    "F07": {"status": "not-started", "phase": 5, "gaps": []},
+    "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE SET / DELETE over in-memory KV", "gaps": ["multi-table", "update-join", "order-limit", "returning"]},
     "F08": {"status": "not-started", "phase": 5, "gaps": []},
     "F09": {"status": "not-started", "phase": 5, "gaps": []},
     "F10": {"status": "not-started", "phase": 5, "gaps": []},

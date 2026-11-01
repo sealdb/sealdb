@@ -112,3 +112,61 @@ impl InsertStmt {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct Assignment {
+    pub column: String,
+    pub expr: ExprNode,
+}
+
+impl Assignment {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_name(&self.column);
+        ctx.write_str("=");
+        self.expr.restore(ctx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateStmt {
+    pub table: TableName,
+    pub list: Vec<Assignment>,
+    pub selection: Option<ExprNode>,
+}
+
+impl UpdateStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("UPDATE ");
+        self.table.restore(ctx)?;
+        ctx.write_str(" SET ");
+        for (i, item) in self.list.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            item.restore(ctx)?;
+        }
+        if let Some(selection) = &self.selection {
+            ctx.write_str(" WHERE ");
+            selection.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteStmt {
+    pub table: TableName,
+    pub selection: Option<ExprNode>,
+}
+
+impl DeleteStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DELETE FROM ");
+        self.table.restore(ctx)?;
+        if let Some(selection) = &self.selection {
+            ctx.write_str(" WHERE ");
+            selection.restore(ctx)?;
+        }
+        Ok(())
+    }
+}

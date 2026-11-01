@@ -24,6 +24,8 @@ pub enum PhysicalPlan {
         kind: String,
     },
     Insert,
+    Update,
+    Delete,
     TableReader {
         table: String,
     },
@@ -52,6 +54,8 @@ impl PhysicalPlan {
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Insert => "Insert".to_string(),
+            PhysicalPlan::Update => "Update".to_string(),
+            PhysicalPlan::Delete => "Delete".to_string(),
             PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
             PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),

@@ -270,4 +270,50 @@ mod tests {
             .unwrap();
         assert!(miss.display_rows().is_empty());
     }
+
+    #[test]
+    fn test_update_and_delete() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("UPDATE db1.t SET name = 'x' WHERE id = 1")
+            .unwrap();
+        let updated = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            updated.display_rows(),
+            vec![vec!["1".to_string(), "x".to_string()]]
+        );
+        session
+            .execute_stmt("UPDATE db1.t SET name = 'y' WHERE name = 'b'")
+            .unwrap();
+        let by_name = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            by_name.display_rows(),
+            vec![vec!["2".to_string(), "y".to_string()]]
+        );
+        session
+            .execute_stmt("DELETE FROM db1.t WHERE id = 3")
+            .unwrap();
+        let after_delete = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_delete.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "y".to_string()]
+            ]
+        );
+        session.execute_stmt("DELETE FROM db1.t").unwrap();
+        let empty = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert!(empty.display_rows().is_empty());
+    }
 }

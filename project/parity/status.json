@@ -111,7 +111,7 @@
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "SelectStmt + InsertStmt"
+      "notes": "SelectStmt + InsertStmt + UpdateStmt + DeleteStmt"
     },
     "pkg/parser/model/model.go": {
       "status": "partial",
@@ -176,12 +176,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, INSERT, TableReader, Selection"
+      "notes": "Build constant SELECT, DDL, INSERT, UPDATE, DELETE, TableReader, Selection"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / Insert / TableReader / Selection"
+      "notes": "TableDual / Projection / DDL / Insert / Update / Delete / TableReader / Selection"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -241,7 +241,7 @@
     "pkg/executor/builder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "select + DDL + insert + table reader"
+      "notes": "select + DDL + insert + update + delete + table reader"
     },
     "pkg/executor/ddl.go": {
       "status": "partial",
@@ -257,6 +257,16 @@
       "status": "partial",
       "phase": 5,
       "notes": "INSERT VALUES into mem KV"
+    },
+    "pkg/executor/update.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "single-table UPDATE SET into mem KV"
+    },
+    "pkg/executor/delete.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "single-table DELETE from mem KV"
     },
     "pkg/executor/table_reader.go": {
       "status": "partial",
