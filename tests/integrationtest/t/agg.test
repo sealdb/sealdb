@@ -1,0 +1,8 @@
+CREATE DATABASE itest;
+CREATE TABLE itest.t (id INT, name VARCHAR(20));
+INSERT INTO itest.t VALUES (1, 'a'), (2, 'a'), (3, 'b');
+
+SELECT COUNT(*) FROM itest.t;
+SELECT name, COUNT(*) FROM itest.t GROUP BY name ORDER BY name;
+SELECT name, COUNT(*) FROM itest.t GROUP BY name HAVING COUNT(*) > 1;
+SELECT name FROM itest.t GROUP BY name HAVING COUNT(*) = 1;

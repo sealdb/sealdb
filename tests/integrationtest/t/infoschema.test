@@ -1,0 +1,5 @@
+CREATE DATABASE itest;
+CREATE TABLE itest.t (id INT, name VARCHAR(20));
+SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'itest';
+SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = 'itest' AND TABLE_NAME = 't' ORDER BY COLUMN_NAME;
+SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'itest';

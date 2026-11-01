@@ -1,0 +1,14 @@
+CREATE DATABASE itest;
+CREATE TABLE itest.t (id INT, name VARCHAR(20));
+CREATE TABLE itest.src (id INT, name VARCHAR(20));
+INSERT INTO itest.src VALUES (1, 'a'), (2, 'b');
+INSERT INTO itest.t SELECT * FROM itest.src;
+SELECT * FROM itest.t ORDER BY id;
+id	name
+1	a
+2	b
+UPDATE itest.t SET name = 'x' WHERE id = 1;
+DELETE FROM itest.t WHERE id = 2;
+SELECT * FROM itest.t;
+id	name
+1	x

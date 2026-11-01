@@ -1735,6 +1735,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sealdb-integrationtest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "sealdb-errno",
+ "sealdb-session",
+]
+
+[[package]]
 name = "sealdb-kv"
 version = "0.1.0"
 dependencies = [

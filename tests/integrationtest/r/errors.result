@@ -1,0 +1,4 @@
+SELECT * FROM missing.t;
+Error 1146 (42S02): Table 'missing.t' doesn't exist
+SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2);
+Error 1235 (HY000): ANY / SOME subquery is not available in this phase

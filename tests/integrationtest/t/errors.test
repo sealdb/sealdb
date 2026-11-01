@@ -1,0 +1,4 @@
+-- error 1146
+SELECT * FROM missing.t;
+-- error 1235
+SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2);

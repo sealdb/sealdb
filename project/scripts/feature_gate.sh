@@ -38,6 +38,7 @@ run() {
 run fmt cargo fmt --all --check
 run clippy cargo clippy --workspace --all-targets -- -D warnings
 run test cargo test --workspace
+run itest cargo test -q -p sealdb-integrationtest --lib
 run parity python3 "$ROOT/project/scripts/parity_check.py" \
   --tidb-root "$TIDB_ROOT" \
   --rust-root "$ROOT" \

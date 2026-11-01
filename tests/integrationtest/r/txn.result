@@ -1,0 +1,14 @@
+CREATE DATABASE itest;
+CREATE TABLE itest.t (id INT, name VARCHAR(20));
+BEGIN;
+INSERT INTO itest.t VALUES (1, 'a');
+COMMIT;
+SELECT * FROM itest.t;
+id	name
+1	a
+BEGIN;
+INSERT INTO itest.t VALUES (2, 'b');
+ROLLBACK;
+SELECT * FROM itest.t;
+id	name
+1	a
