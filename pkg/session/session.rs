@@ -182,4 +182,36 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_where_selection() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let eq = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            eq.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let and = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id > 1 AND name = 'c'")
+            .unwrap();
+        assert_eq!(
+            and.display_rows(),
+            vec![vec!["3".to_string(), "c".to_string()]]
+        );
+        let none = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 9")
+            .unwrap();
+        assert!(none.display_rows().is_empty());
+        let constant = session.execute_stmt("SELECT 1 WHERE 0").unwrap();
+        assert!(constant.display_rows().is_empty());
+        let keep = session.execute_stmt("SELECT 1 WHERE 1").unwrap();
+        assert_eq!(keep.display_rows(), vec![vec!["1".to_string()]]);
+    }
 }

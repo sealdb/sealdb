@@ -1,6 +1,6 @@
 # Leftover inventory
 
-Baseline features core-ported: F01, F02, F03, F11, U0, U1, U2, U3
+Baseline features core-ported: F01, F02, F03, F04, F11, U0, U1, U2, U3
 
 ## PlanBuilder statement kinds still open
 

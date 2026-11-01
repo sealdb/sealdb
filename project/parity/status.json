@@ -120,8 +120,8 @@
     },
     "pkg/parser/ast/expressions.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "value/binary/unary/func/cast"
+      "phase": 5,
+      "notes": "value/column/binary/unary/func/cast"
     },
     "pkg/parser/format/format.go": {
       "status": "partial",
@@ -176,12 +176,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, INSERT, TableReader"
+      "notes": "Build constant SELECT, DDL, INSERT, TableReader, Selection"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / Insert / TableReader"
+      "notes": "TableDual / Projection / DDL / Insert / TableReader / Selection"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -265,8 +265,8 @@
     },
     "pkg/executor/select.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "TableDual"
+      "phase": 5,
+      "notes": "TableDual + SelectionExec"
     },
     "pkg/executor/projection.go": {
       "status": "partial",

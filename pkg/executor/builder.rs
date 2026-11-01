@@ -2,7 +2,7 @@ use crate::ddl::DDLExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::projection::ProjectionExec;
-use crate::select::TableDualExec;
+use crate::select::{SelectionExec, TableDualExec};
 use crate::show::ShowExec;
 use crate::table_reader::TableReaderExec;
 use sealdb_domain::Domain;
@@ -26,7 +26,7 @@ impl ExecutorBuilder {
                 stmt.clone(),
                 current_db.to_string(),
             ))),
-            PhysicalPlan::Projection { .. } => {
+            PhysicalPlan::Projection { child, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
@@ -39,7 +39,17 @@ impl ExecutorBuilder {
                 Ok(Box::new(ProjectionExec::new(
                     exprs,
                     names,
-                    Box::new(TableDualExec::new()),
+                    Self::build(child, stmt, domain, current_db)?,
+                )))
+            }
+            PhysicalPlan::Selection { child } => {
+                let filter = stmt
+                    .as_select()
+                    .and_then(|s| s.selection.clone())
+                    .ok_or_else(|| Error::unsupported("selection without WHERE"))?;
+                Ok(Box::new(SelectionExec::new(
+                    filter,
+                    Self::build(child, stmt, domain, current_db)?,
                 )))
             }
             PhysicalPlan::Show { .. } => {

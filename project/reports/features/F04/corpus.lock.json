@@ -1,0 +1,18 @@
+{
+  "feature": "F04",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/executor/select.go SelectionExec",
+    "TiDB pkg/planner/core/planbuilder.go"
+  ],
+  "cases": [
+    "SELECT * FROM db1.t WHERE id = 2",
+    "SELECT * FROM db1.t WHERE id > 1",
+    "SELECT * FROM db1.t WHERE name = 'a'",
+    "SELECT * FROM db1.t WHERE id > 1 AND name = 'c'",
+    "SELECT * FROM db1.t WHERE id = 9",
+    "SELECT 1 WHERE 0",
+    "SELECT 1 WHERE 1",
+    "SELECT * FROM t WHERE t.id = 1"
+  ]
+}

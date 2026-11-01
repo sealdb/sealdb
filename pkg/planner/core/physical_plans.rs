@@ -27,6 +27,9 @@ pub enum PhysicalPlan {
     TableReader {
         table: String,
     },
+    Selection {
+        child: Box<PhysicalPlan>,
+    },
 }
 
 impl PhysicalPlan {
@@ -40,6 +43,7 @@ impl PhysicalPlan {
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Insert => "Insert".to_string(),
             PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
+            PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
         }
     }
 }

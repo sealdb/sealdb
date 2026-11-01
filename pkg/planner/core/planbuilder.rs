@@ -12,23 +12,39 @@ impl PlanBuilder {
     pub fn build(&self, stmt: &Statement) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
-                if let Some(from) = &select.from
+                let mut plan = if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    return Ok(PhysicalPlan::TableReader {
+                    PhysicalPlan::TableReader {
                         table: from.name.clone(),
-                    });
+                    }
+                } else {
+                    let exprs = select
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("col{i}"))
+                        .collect();
+                    PhysicalPlan::Projection {
+                        exprs,
+                        child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
+                    }
+                };
+                if select.selection.is_some() {
+                    if matches!(plan, PhysicalPlan::Projection { .. }) {
+                        if let PhysicalPlan::Projection { exprs, child } = plan {
+                            plan = PhysicalPlan::Projection {
+                                exprs,
+                                child: Box::new(PhysicalPlan::Selection { child }),
+                            };
+                        }
+                    } else {
+                        plan = PhysicalPlan::Selection {
+                            child: Box::new(plan),
+                        };
+                    }
                 }
-                let exprs = select
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("col{i}"))
-                    .collect();
-                Ok(PhysicalPlan::Projection {
-                    exprs,
-                    child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
-                })
+                Ok(plan)
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {

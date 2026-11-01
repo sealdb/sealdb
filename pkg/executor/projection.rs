@@ -1,6 +1,6 @@
 use crate::internal::exec::Executor;
 use sealdb_errno::Result;
-use sealdb_expression::eval_expr;
+use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::ExprNode;
 use sealdb_util::chunk::Chunk;
 
@@ -29,16 +29,20 @@ impl Executor for ProjectionExec {
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        if self.child.next()?.is_none() {
+        let Some(input) = self.child.next()? else {
             return Ok(None);
+        };
+        let schema = self.child.schema();
+        let mut chunk = Chunk::new(self.exprs.len(), input.num_rows());
+        for i in 0..input.num_rows() {
+            let row = input.get_row(i);
+            let projected = self
+                .exprs
+                .iter()
+                .map(|expr| eval_expr_with_row(expr, schema, &row))
+                .collect::<Result<Vec<_>>>()?;
+            chunk.append_row(projected);
         }
-        let mut chunk = Chunk::new(self.exprs.len(), 1);
-        let row = self
-            .exprs
-            .iter()
-            .map(eval_expr)
-            .collect::<Result<Vec<_>>>()?;
-        chunk.append_row(row);
         Ok(Some(chunk))
     }
 

@@ -13,6 +13,7 @@ pub struct SelectField {
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
+    pub selection: Option<ExprNode>,
     pub text: String,
 }
 
@@ -32,6 +33,10 @@ impl SelectStmt {
         if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
             from.restore(ctx)?;
+        }
+        if let Some(selection) = &self.selection {
+            ctx.write_str(" WHERE ");
+            selection.restore(ctx)?;
         }
         Ok(())
     }

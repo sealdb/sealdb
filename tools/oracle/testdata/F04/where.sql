@@ -1,0 +1,4 @@
+SELECT * FROM db1.t WHERE id = 2;
+SELECT * FROM db1.t WHERE id > 1 AND name = 'c';
+SELECT 1 WHERE 0;
+SELECT 1 WHERE 1;

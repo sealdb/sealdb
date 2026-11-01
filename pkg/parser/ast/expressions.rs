@@ -6,6 +6,7 @@ use sealdb_types::Datum;
 #[derive(Clone, Debug)]
 pub enum ExprNode {
     Value(ValueExpr),
+    Column(ColumnNameExpr),
     Binary(BinaryOpExpr),
     Unary(UnaryOpExpr),
     Func(FuncCallExpr),
@@ -16,11 +17,34 @@ impl ExprNode {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         match self {
             ExprNode::Value(v) => v.restore(ctx),
+            ExprNode::Column(v) => v.restore(ctx),
             ExprNode::Binary(v) => v.restore(ctx),
             ExprNode::Unary(v) => v.restore(ctx),
             ExprNode::Func(v) => v.restore(ctx),
             ExprNode::Cast(v) => v.restore(ctx),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ColumnNameExpr {
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub name: String,
+}
+
+impl ColumnNameExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(schema) = &self.schema {
+            ctx.write_name(schema);
+            ctx.write_str(".");
+        }
+        if let Some(table) = &self.table {
+            ctx.write_name(table);
+            ctx.write_str(".");
+        }
+        ctx.write_name(&self.name);
+        Ok(())
     }
 }
 

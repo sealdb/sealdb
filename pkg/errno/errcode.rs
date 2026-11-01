@@ -5,6 +5,7 @@ pub const ERR_BAD_DB: i32 = 1049;
 pub const ERR_TABLE_EXISTS: i32 = 1050;
 pub const ERR_PARSE_ERROR: i32 = 1064;
 pub const ERR_UNKNOWN_TABLE: i32 = 1109;
+pub const ERR_BAD_FIELD: i32 = 1054;
 pub const ERR_NO_SUCH_TABLE: i32 = 1146;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;

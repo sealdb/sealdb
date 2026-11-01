@@ -156,5 +156,9 @@ mod tests {
                 .stmt_type(),
             "SelectStmt"
         );
+        let where_stmt = parser
+            .parse_one_stmt("SELECT * FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert!(where_stmt.as_select().unwrap().selection.is_some());
     }
 }

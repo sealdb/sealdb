@@ -1,24 +1,46 @@
-use sealdb_errno::{ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
+use sealdb_errno::{ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr,
+    BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 use sealdb_types::field_type::FieldType;
 
 pub fn eval_expr(expr: &ExprNode) -> Result<Datum> {
+    eval_expr_with_row(expr, &[], &[])
+}
+
+pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match expr {
         ExprNode::Value(v) => Ok(v.datum.clone()),
-        ExprNode::Binary(b) => eval_binary(b),
-        ExprNode::Unary(u) => eval_unary(u),
-        ExprNode::Func(f) => eval_func(f),
-        ExprNode::Cast(c) => eval_cast(c),
+        ExprNode::Column(c) => resolve_column(c, schema, row),
+        ExprNode::Binary(b) => eval_binary(b, schema, row),
+        ExprNode::Unary(u) => eval_unary(u, schema, row),
+        ExprNode::Func(f) => eval_func(f, schema, row),
+        ExprNode::Cast(c) => eval_cast(c, schema, row),
     }
 }
 
-fn eval_binary(expr: &BinaryOpExpr) -> Result<Datum> {
-    let left = eval_expr(&expr.left)?;
-    let right = eval_expr(&expr.right)?;
+pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
+    Ok(truthy(&eval_expr_with_row(expr, schema, row)?).unwrap_or(false))
+}
+
+fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let idx = schema
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(&col.name))
+        .ok_or_else(|| {
+            Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{}' in 'where clause'", col.name),
+            )
+        })?;
+    Ok(row.get(idx).cloned().unwrap_or(Datum::Null))
+}
+
+fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let left = eval_expr_with_row(&expr.left, schema, row)?;
+    let right = eval_expr_with_row(&expr.right, schema, row)?;
     if matches!(expr.op, Op::LogicAnd | Op::LogicOr) {
         return eval_logic(expr.op, &left, &right);
     }
@@ -93,8 +115,8 @@ fn eval_logic(op: Op, left: &Datum, right: &Datum) -> Result<Datum> {
     }
 }
 
-fn eval_unary(expr: &UnaryOpExpr) -> Result<Datum> {
-    let inner = eval_expr(&expr.expr)?;
+fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let inner = eval_expr_with_row(&expr.expr, schema, row)?;
     if inner.is_null() {
         return Ok(Datum::Null);
     }
@@ -110,7 +132,7 @@ fn eval_unary(expr: &UnaryOpExpr) -> Result<Datum> {
     }
 }
 
-fn eval_func(func: &FuncCallExpr) -> Result<Datum> {
+fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
         "IF" => {
             if func.args.len() != 3 {
@@ -119,11 +141,11 @@ fn eval_func(func: &FuncCallExpr) -> Result<Datum> {
                     "IF requires 3 arguments",
                 ));
             }
-            let cond = eval_expr(&func.args[0])?;
+            let cond = eval_expr_with_row(&func.args[0], schema, row)?;
             if truthy(&cond).unwrap_or(false) {
-                eval_expr(&func.args[1])
+                eval_expr_with_row(&func.args[1], schema, row)
             } else {
-                eval_expr(&func.args[2])
+                eval_expr_with_row(&func.args[2], schema, row)
             }
         }
         "IFNULL" => {
@@ -133,9 +155,9 @@ fn eval_func(func: &FuncCallExpr) -> Result<Datum> {
                     "IFNULL requires 2 arguments",
                 ));
             }
-            let first = eval_expr(&func.args[0])?;
+            let first = eval_expr_with_row(&func.args[0], schema, row)?;
             if first.is_null() {
-                eval_expr(&func.args[1])
+                eval_expr_with_row(&func.args[1], schema, row)
             } else {
                 Ok(first)
             }
@@ -147,8 +169,8 @@ fn eval_func(func: &FuncCallExpr) -> Result<Datum> {
     }
 }
 
-fn eval_cast(cast: &FuncCastExpr) -> Result<Datum> {
-    let value = eval_expr(&cast.expr)?;
+fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let value = eval_expr_with_row(&cast.expr, schema, row)?;
     let ft = match cast.target.to_ascii_uppercase().as_str() {
         "SIGNED" | "SIGNED INTEGER" => FieldType::new_longlong(),
         "UNSIGNED" | "UNSIGNED INTEGER" => {
@@ -221,5 +243,18 @@ mod tests {
         );
         assert_eq!(eval_sql_expr("IF(1, 10, 20)"), Datum::I64(10));
         assert_eq!(eval_sql_expr("IFNULL(NULL, 7)"), Datum::I64(7));
+    }
+
+    #[test]
+    fn test_column_filter() {
+        let stmt = Parser::new()
+            .parse_one_stmt("SELECT * FROM t WHERE id = 1 AND name = 'a'")
+            .unwrap();
+        let expr = stmt.as_select().unwrap().selection.as_ref().unwrap();
+        let schema = ["id".to_string(), "name".to_string()];
+        assert!(eval_filter(expr, &schema, &[Datum::I64(1), Datum::Bytes(b"a".to_vec())]).unwrap());
+        assert!(
+            !eval_filter(expr, &schema, &[Datum::I64(2), Datum::Bytes(b"a".to_vec())]).unwrap()
+        );
     }
 }

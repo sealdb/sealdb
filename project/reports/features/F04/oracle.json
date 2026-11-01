@@ -1,0 +1,33 @@
+{
+  "suite": "testdata/F04",
+  "cases": [
+    {
+      "name": "where.sql",
+      "result": {
+        "sql": "SELECT * FROM db1.t WHERE id = 2;\nSELECT * FROM db1.t WHERE id \u003e 1 AND name = 'c';\nSELECT 1 WHERE 0;\nSELECT 1 WHERE 1;\n",
+        "statements": [
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` WHERE `id`=2",
+            "text": "SELECT * FROM db1.t WHERE id = 2;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` WHERE `id`\u003e1 AND `name`=_UTF8MB4'c'",
+            "text": "SELECT * FROM db1.t WHERE id \u003e 1 AND name = 'c';"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1 FROM DUAL WHERE 0",
+            "text": "SELECT 1 WHERE 0;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1 FROM DUAL WHERE 1",
+            "text": "SELECT 1 WHERE 1;"
+          }
+        ]
+      }
+    }
+  ]
+}

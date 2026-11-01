@@ -45,9 +45,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         other => Err(Error::unsupported(format!("FROM {other}"))),
                     })
                     .transpose()?;
+                let selection = select.selection.as_ref().map(lower_expr).transpose()?;
                 Ok(Statement::Select(SelectStmt {
                     fields,
                     from,
+                    selection,
                     text: query.to_string(),
                 }))
             }
@@ -304,6 +306,25 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         Expr::Function(func) => lower_function(func),
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("null") => {
             Ok(ExprNode::Value(ValueExpr { datum: Datum::Null }))
+        }
+        Expr::Identifier(ident) => Ok(ExprNode::Column(crate::ast::expressions::ColumnNameExpr {
+            schema: None,
+            table: None,
+            name: ident.value.clone(),
+        })),
+        Expr::CompoundIdentifier(parts) => {
+            let names: Vec<String> = parts.iter().map(|p| p.value.clone()).collect();
+            let (schema, table, name) = match names.as_slice() {
+                [name] => (None, None, name.clone()),
+                [table, name] => (None, Some(table.clone()), name.clone()),
+                [schema, table, name] => (Some(schema.clone()), Some(table.clone()), name.clone()),
+                _ => return Err(Error::unsupported(format!("column name {expr}"))),
+            };
+            Ok(ExprNode::Column(crate::ast::expressions::ColumnNameExpr {
+                schema,
+                table,
+                name,
+            }))
         }
         other => Err(Error::new(
             ERR_UNSUPPORTED,
