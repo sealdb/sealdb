@@ -14,6 +14,7 @@ pub trait StmtNode: Node {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Statement {
     Select(SelectStmt),
     CreateDatabase(CreateDatabaseStmt),

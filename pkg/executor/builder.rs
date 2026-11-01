@@ -3,6 +3,7 @@ use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
+use crate::join::HashJoinV1Exec;
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
 use crate::select::{LimitExec, SelectionExec, TableDualExec};
@@ -13,6 +14,7 @@ use crate::update::UpdateExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_parser::ast::Statement;
+use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_planner::PhysicalPlan;
 use std::sync::Arc;
 
@@ -36,11 +38,7 @@ impl ExecutorBuilder {
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
                 let exprs = select.fields.iter().map(|f| f.expr.clone()).collect();
-                let names = select
-                    .fields
-                    .iter()
-                    .map(|f| f.as_name.clone().unwrap_or_default())
-                    .collect();
+                let names = select.fields.iter().map(field_output_name).collect();
                 Ok(Box::new(ProjectionExec::new(
                     exprs,
                     names,
@@ -137,11 +135,8 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                 )))
             }
-            PhysicalPlan::TableReader { .. } => {
-                let from = stmt
-                    .as_select()
-                    .and_then(|s| s.from.clone())
-                    .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
+            PhysicalPlan::TableReader { table } => {
+                let from = resolve_reader_table(stmt, table)?;
                 Ok(Box::new(TableReaderExec::new(
                     domain,
                     from,
@@ -157,6 +152,17 @@ impl ExecutorBuilder {
                     select,
                     Self::build(child, stmt, domain, current_db)?,
                 )?))
+            }
+            PhysicalPlan::HashJoin { left, right, .. } => {
+                let join = stmt
+                    .as_select()
+                    .and_then(|s| s.join.clone())
+                    .ok_or_else(|| Error::unsupported("hash join without join"))?;
+                Ok(Box::new(HashJoinV1Exec::new(
+                    join,
+                    Self::build(left, stmt, Arc::clone(&domain), current_db)?,
+                    Self::build(right, stmt, domain, current_db)?,
+                )))
             }
         }
     }
@@ -184,5 +190,38 @@ impl ExecutorBuilder {
         }
         exec.close()?;
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::ast::TableName> {
+    let select = stmt
+        .as_select()
+        .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
+    if let Some(join) = &select.join {
+        if join.left.name.eq_ignore_ascii_case(table) {
+            return Ok(join.left.clone());
+        }
+        if join.right.name.eq_ignore_ascii_case(table) {
+            return Ok(join.right.clone());
+        }
+    }
+    select
+        .from
+        .clone()
+        .ok_or_else(|| Error::unsupported("table reader without FROM"))
+}
+
+fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
+    if let Some(name) = &field.as_name
+        && !name.is_empty()
+    {
+        return name.clone();
+    }
+    match &field.expr {
+        ExprNode::Column(col) => match &col.table {
+            Some(table) => format!("{table}.{}", col.name),
+            None => col.name.clone(),
+        },
+        _ => field.as_name.clone().unwrap_or_default(),
     }
 }

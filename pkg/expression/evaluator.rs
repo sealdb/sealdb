@@ -26,16 +26,46 @@ pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<
 }
 
 fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
-    let idx = schema
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(&col.name))
-        .ok_or_else(|| {
-            Error::new(
-                ERR_BAD_FIELD,
-                format!("Unknown column '{}' in 'where clause'", col.name),
-            )
-        })?;
+    let mut found = None;
+    for (i, name) in schema.iter().enumerate() {
+        if column_matches(col, name) {
+            if found.is_some() && col.table.is_none() {
+                return Err(Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Column '{}' in field list is ambiguous", col.name),
+                ));
+            }
+            found = Some(i);
+        }
+    }
+    let idx = found.ok_or_else(|| {
+        Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column '{}' in 'where clause'", col.name),
+        )
+    })?;
     Ok(row.get(idx).cloned().unwrap_or(Datum::Null))
+}
+
+fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
+    let (table, name) = split_qualified(schema_name);
+    let name_ok =
+        name.eq_ignore_ascii_case(&col.name) || schema_name.eq_ignore_ascii_case(&col.name);
+    match col.table.as_deref() {
+        Some(wanted) => {
+            name_ok
+                && (table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
+                    || schema_name.eq_ignore_ascii_case(&format!("{wanted}.{}", col.name)))
+        }
+        None => name_ok,
+    }
+}
+
+fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    match name.rsplit_once('.') {
+        Some((table, col)) => (Some(table), col),
+        None => (None, name),
+    }
 }
 
 fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {

@@ -197,4 +197,16 @@ mod tests {
             other => panic!("expected COUNT(*), got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_parse_join() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("SELECT * FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id")
+            .unwrap();
+        let join = stmt.as_select().unwrap().join.as_ref().unwrap();
+        assert_eq!(join.left.name, "t1");
+        assert_eq!(join.right.name, "t2");
+        assert_eq!(join.tp, crate::ast::JoinType::Inner);
+    }
 }
