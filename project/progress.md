@@ -62,7 +62,7 @@
 | F20 | `core-ported` | `project/reports/features/F20/` |
 | F21 | `core-ported` | `project/reports/features/F21/` |
 | F22 | `core-ported` | `project/reports/features/F22/` |
-| C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
+| C1 | `core-ported` | `project/reports/features/C1/` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
@@ -104,6 +104,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: C1 leftover 分母
+- **完成**:
+  - 冻结 91 条功能 `gaps[]` + 56 个未核心移植语句 + 42 个 integrationtest suite
+  - `project/features/leftover.json` 作为机器可读分母
+- **验证**:
+  - `./project/scripts/feature_gate.sh C1`
+- **下一步**:
+  - C2 计划形状 / 代价 / Skyline / JoinReorder
 
 ### 2026-11-01
 

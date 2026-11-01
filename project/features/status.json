@@ -28,7 +28,7 @@
     "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + SkipGrantTables default and in-memory checks", "gaps": ["roles", "with-grant-option", "mysql-user-persist", "column-grants", "dynamic-privs", "create-user"]},
     "F21": {"status": "core-ported", "phase": 7, "notes": "ANALYZE TABLE count/NDV + IndexLookUp vs TableReader CBO", "gaps": ["histogram", "topn", "auto-analyze", "analyze-index", "persist-stats", "join-cost"]},
     "F22": {"status": "core-ported", "phase": 9, "notes": "MySQL handshake + COM_QUERY/COM_PING/COM_INIT_DB/COM_QUIT", "gaps": ["ssl", "compression", "prepared-stmt", "auth-plugin", "binary-protocol", "multi-resultset"]},
-    "C1": {"status": "in-progress", "phase": 10, "notes": "leftover inventory script ready"},
+    "C1": {"status": "core-ported", "phase": 10, "notes": "frozen leftover denominator: 91 feature gaps + 56 open stmts + 42 suites", "gaps": ["unmapped-stmts", "stale-gap-labels", "leftover-suite-execution"]},
     "C2": {"status": "not-started", "phase": 10, "gaps": []},
     "C3": {"status": "not-started", "phase": 10, "gaps": []},
     "C4": {"status": "not-started", "phase": 10, "gaps": []},

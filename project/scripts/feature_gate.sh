@@ -115,6 +115,14 @@ case "$FEATURE" in
   F22)
     run execute-com-query cargo test -q -p sealdb-server --lib test_com_query -- --exact
     ;;
+  C1)
+    run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
+      --tidb-root "$TIDB_ROOT" \
+      --rust-root "$ROOT" \
+      --out "$ROOT/project/features/leftover.md" \
+      --json "$ROOT/project/features/leftover.json" \
+      --check
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

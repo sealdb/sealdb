@@ -86,5 +86,5 @@ RBO 规则跟着功能走：F04 带 PPD/ColumnPrune，F09 带 JoinReorder 基础
 
 ```bash
 ./project/scripts/feature_gate.sh F01
-./project/scripts/leftover_inventory.py --tidb-root "$TIDB_ROOT" --out project/features/leftover.md
+./project/scripts/leftover_inventory.py --tidb-root "$TIDB_ROOT" --out project/features/leftover.md --json project/features/leftover.json --check
 ```

@@ -1,0 +1,564 @@
+{
+  "frozen": "2026-11-01",
+  "baseline": "v8.5.8",
+  "core_ported": [
+    "C1",
+    "F01",
+    "F02",
+    "F03",
+    "F04",
+    "F05",
+    "F06",
+    "F07",
+    "F08",
+    "F09",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F18",
+    "F19",
+    "F20",
+    "F21",
+    "F22",
+    "U0",
+    "U1",
+    "U2",
+    "U3"
+  ],
+  "feature_gaps": {
+    "F02": [
+      "online-ddl-jobs",
+      "create-like-as-select",
+      "indexes",
+      "tikv-persist"
+    ],
+    "F03": [
+      "tikv-persist",
+      "rowcodec",
+      "insert-select"
+    ],
+    "F04": [
+      "ppd",
+      "in-between-like",
+      "coprocessor-filter"
+    ],
+    "F05": [
+      "topn-spill",
+      "parallel-sort"
+    ],
+    "F06": [
+      "batch-point-get",
+      "index-point-get"
+    ],
+    "F07": [
+      "multi-table",
+      "update-join",
+      "order-limit",
+      "returning"
+    ],
+    "F08": [
+      "having",
+      "distinct-agg",
+      "stream-agg",
+      "spill"
+    ],
+    "F09": [
+      "semi-anti",
+      "cross-join",
+      "n-table",
+      "spill"
+    ],
+    "F10": [
+      "unique-pk",
+      "covering-reader",
+      "range-scan"
+    ],
+    "F11": [
+      "information_schema-tables",
+      "show-create",
+      "show-full-columns"
+    ],
+    "F12": [
+      "pessimistic",
+      "savepoint",
+      "isolation-modes",
+      "transactional-ddl"
+    ],
+    "F13": [
+      "for-share",
+      "nowait-skip-locked",
+      "blocking-wait",
+      "deadlock",
+      "tikv-pessimistic"
+    ],
+    "F14": [
+      "any-all",
+      "from-derived-table",
+      "select-list-subquery",
+      "parallel-apply",
+      "semi-anti-rewrite"
+    ],
+    "F15": [
+      "except-intersect",
+      "nested-paren-union",
+      "union-in-subquery",
+      "parallel-union"
+    ],
+    "F16": [
+      "frame-clause",
+      "named-window",
+      "lag-lead",
+      "ignore-nulls",
+      "pipelined-window"
+    ],
+    "F17": [
+      "recursive-cte",
+      "materialized-hint",
+      "union-in-cte",
+      "cte-in-join",
+      "cte-in-dml",
+      "shared-cte-storage"
+    ],
+    "F18": [
+      "ddl-job-states",
+      "reorg",
+      "unique-index",
+      "change-modify-rename",
+      "after-first",
+      "algorithm-lock"
+    ],
+    "F19": [
+      "list-key",
+      "range-columns",
+      "expr-keys",
+      "add-drop-partition",
+      "subpartition",
+      "dynamic-prune"
+    ],
+    "F20": [
+      "roles",
+      "with-grant-option",
+      "mysql-user-persist",
+      "column-grants",
+      "dynamic-privs",
+      "create-user"
+    ],
+    "F21": [
+      "histogram",
+      "topn",
+      "auto-analyze",
+      "analyze-index",
+      "persist-stats",
+      "join-cost"
+    ],
+    "F22": [
+      "ssl",
+      "compression",
+      "prepared-stmt",
+      "auth-plugin",
+      "binary-protocol",
+      "multi-resultset"
+    ]
+  },
+  "open_stmts": [
+    {
+      "stmt": "ast.AdminStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DeallocateStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.ExecuteStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.ExplainStmt",
+      "owner": "C2"
+    },
+    {
+      "stmt": "ast.ExplainForStmt",
+      "owner": "C2"
+    },
+    {
+      "stmt": "ast.TraceStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.ImportIntoStmt",
+      "owner": "C6"
+    },
+    {
+      "stmt": "ast.LoadDataStmt",
+      "owner": "C6"
+    },
+    {
+      "stmt": "ast.LoadStatsStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.LockStatsStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.UnlockStatsStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.PlanReplayerStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.PrepareStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.DoStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.SetStmt",
+      "owner": "C5"
+    },
+    {
+      "stmt": "ast.SetConfigStmt",
+      "owner": "C5"
+    },
+    {
+      "stmt": "ast.BinlogStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CreateBindingStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.DropBindingStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.SetBindingStmt",
+      "owner": "C4"
+    },
+    {
+      "stmt": "ast.ChangeStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.SplitRegionStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DistributeTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CompactTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RecommendIndexStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.FlushStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.AlterInstanceStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RenameUserStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.BRIEStmt",
+      "owner": "C6"
+    },
+    {
+      "stmt": "ast.CalibrateResourceStmt",
+      "owner": "C6"
+    },
+    {
+      "stmt": "ast.AddQueryWatchStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DropQueryWatchStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.GrantRoleStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RevokeRoleStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.KillStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DropUserStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.SetPwdStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.ShutdownStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.SetResourceGroupStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.AlterDatabaseStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.AlterSequenceStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CreateViewStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CreateSequenceStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DropSequenceStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.TruncateTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RenameTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RecoverTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.FlashBackTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.FlashBackDatabaseStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.FlashBackToTimestampStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.LockTablesStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CleanupTableLockStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.RepairTableStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.DropPlacementPolicyStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.CreateResourceGroupStmt",
+      "owner": "unmapped"
+    },
+    {
+      "stmt": "ast.OptimizeTableStmt",
+      "owner": "unmapped"
+    }
+  ],
+  "suites": [
+    {
+      "name": "access_path_selection",
+      "owner": "C2"
+    },
+    {
+      "name": "agg_predicate_pushdown",
+      "owner": "C2"
+    },
+    {
+      "name": "black_list",
+      "owner": "C6"
+    },
+    {
+      "name": "clustered_index",
+      "owner": "C2"
+    },
+    {
+      "name": "collation_agg_func",
+      "owner": "C5"
+    },
+    {
+      "name": "collation_check_use_collation",
+      "owner": "C5"
+    },
+    {
+      "name": "collation_misc",
+      "owner": "C5"
+    },
+    {
+      "name": "collation_pointget",
+      "owner": "C5"
+    },
+    {
+      "name": "common_collation",
+      "owner": "C5"
+    },
+    {
+      "name": "cte",
+      "owner": "F17"
+    },
+    {
+      "name": "db_integration",
+      "owner": "C3"
+    },
+    {
+      "name": "explain",
+      "owner": "C2"
+    },
+    {
+      "name": "explain-non-select-stmt",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_complex",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_complex_stats",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_cte",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_easy",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_easy_stats",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_foreign_key",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_generate_column_substitute",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_indexmerge_stats",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_join_stats",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_shard_index",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_stats",
+      "owner": "C2"
+    },
+    {
+      "name": "explain_union_scan",
+      "owner": "C2"
+    },
+    {
+      "name": "generated_columns",
+      "owner": "C2"
+    },
+    {
+      "name": "imdbload",
+      "owner": "C2"
+    },
+    {
+      "name": "index_join",
+      "owner": "C2"
+    },
+    {
+      "name": "index_merge",
+      "owner": "C2"
+    },
+    {
+      "name": "naaj",
+      "owner": "C2"
+    },
+    {
+      "name": "new_character_set",
+      "owner": "C5"
+    },
+    {
+      "name": "new_character_set_builtin",
+      "owner": "C5"
+    },
+    {
+      "name": "new_character_set_invalid",
+      "owner": "C5"
+    },
+    {
+      "name": "null_rejected",
+      "owner": "C2"
+    },
+    {
+      "name": "partition",
+      "owner": "F19"
+    },
+    {
+      "name": "select",
+      "owner": "F04"
+    },
+    {
+      "name": "show",
+      "owner": "F11"
+    },
+    {
+      "name": "subquery",
+      "owner": "F14"
+    },
+    {
+      "name": "topn_push_down",
+      "owner": "F05"
+    },
+    {
+      "name": "topn_pushdown",
+      "owner": "F05"
+    },
+    {
+      "name": "tpch",
+      "owner": "C2"
+    },
+    {
+      "name": "window_function",
+      "owner": "F16"
+    }
+  ]
+}
