@@ -150,12 +150,16 @@ impl UnaryOpExpr {
 pub struct FuncCallExpr {
     pub name: String,
     pub args: Vec<ExprNode>,
+    pub distinct: bool,
 }
 
 impl FuncCallExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str(&self.name);
         ctx.write_str("(");
+        if self.distinct {
+            ctx.write_str("DISTINCT ");
+        }
         if self.name.eq_ignore_ascii_case("COUNT") && self.args.is_empty() {
             ctx.write_str("*");
         } else {

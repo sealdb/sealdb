@@ -1,16 +1,33 @@
 use super::aggfuncs::AggFunc;
 use sealdb_errno::Result;
 use sealdb_types::Datum;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct Count {
     count: i64,
     star: bool,
+    distinct: bool,
+    seen: HashSet<String>,
 }
 
 impl Count {
     pub fn new(star: bool) -> Self {
-        Self { count: 0, star }
+        Self {
+            count: 0,
+            star,
+            distinct: false,
+            seen: HashSet::new(),
+        }
+    }
+
+    pub fn distinct() -> Self {
+        Self {
+            count: 0,
+            star: false,
+            distinct: true,
+            seen: HashSet::new(),
+        }
     }
 }
 
@@ -20,11 +37,19 @@ impl AggFunc for Count {
             self.count += 1;
             return Ok(());
         }
-        if let Some(v) = value
-            && !v.is_null()
-        {
-            self.count += 1;
+        let Some(v) = value else {
+            return Ok(());
+        };
+        if v.is_null() {
+            return Ok(());
         }
+        if self.distinct {
+            if self.seen.insert(format!("{v:?}")) {
+                self.count += 1;
+            }
+            return Ok(());
+        }
+        self.count += 1;
         Ok(())
     }
 

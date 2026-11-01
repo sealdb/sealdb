@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（tikv-persist）  
+> 最后更新：2026-11-01（SHOW CREATE / COUNT DISTINCT）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: SHOW CREATE / COUNT(DISTINCT)
+- **完成**:
+  - `SHOW CREATE TABLE` / `SHOW CREATE DATABASE`
+  - `COUNT(DISTINCT col)`；SUM/AVG/MIN/MAX DISTINCT 仍 unsupported
+- **验证**:
+  - session 单测 + integrationtest agg/infoschema
+- **下一步**:
+  - leftover 其余项或停在当前完整性波
 
 ### 2026-11-01
 

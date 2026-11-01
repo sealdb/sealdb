@@ -11,3 +11,12 @@ name
 SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'itest';
 SCHEMA_NAME
 itest
+SHOW CREATE DATABASE itest;
+Database	Create Database
+itest	CREATE DATABASE `itest`
+SHOW CREATE TABLE itest.t;
+Table	Create Table
+t	CREATE TABLE `t` (
+  `id` int,
+  `name` varchar(20)
+)

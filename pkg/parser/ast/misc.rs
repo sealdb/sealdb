@@ -215,6 +215,8 @@ pub enum ShowStmtKind {
     Tables,
     Columns,
     Grants,
+    CreateTable,
+    CreateDatabase,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +249,18 @@ impl ShowStmt {
                 if let Some(user) = &self.user {
                     ctx.write_str(" FOR ");
                     user.restore(ctx)?;
+                }
+            }
+            ShowStmtKind::CreateTable => {
+                ctx.write_str("SHOW CREATE TABLE ");
+                if let Some(table) = &self.table {
+                    table.restore(ctx)?;
+                }
+            }
+            ShowStmtKind::CreateDatabase => {
+                ctx.write_str("SHOW CREATE DATABASE ");
+                if let Some(db) = &self.db_name {
+                    ctx.write_name(db);
                 }
             }
         }

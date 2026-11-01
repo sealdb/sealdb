@@ -25,19 +25,21 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
-    BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias, Expr, FromTable,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Grant, GrantObjects, GranteeName,
-    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NonBlock,
-    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, Revoke,
-    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionIsolationLevel,
-    TransactionMode, UnaryOperator, Update, Use, Value, Values, WindowType, With,
+    BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias, DuplicateTreatment,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Grant,
+    GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause,
+    LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges,
+    Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier,
+    ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use, Value,
+    Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     let rewritten = rewrite_show_grants(&rewritten)?;
+    let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
@@ -175,6 +177,31 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         .collect::<Result<Vec<_>>>()?,
                 })),
                 other => Err(Error::unsupported(format!("DROP {other}"))),
+            }
+        }
+        SqlStatement::ShowCreate {
+            obj_type: ShowCreateObject::Table,
+            obj_name,
+        } => {
+            let table = object_table_name(obj_name)?;
+            if table
+                .schema
+                .as_deref()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case(SHOW_CREATE_DB_SCHEMA))
+            {
+                Ok(Statement::Show(ShowStmt {
+                    kind: ShowStmtKind::CreateDatabase,
+                    db_name: Some(table.name),
+                    table: None,
+                    user: None,
+                }))
+            } else {
+                Ok(Statement::Show(ShowStmt {
+                    kind: ShowStmtKind::CreateTable,
+                    db_name: None,
+                    table: Some(table),
+                    user: None,
+                }))
             }
         }
         SqlStatement::ShowDatabases { .. } | SqlStatement::ShowSchemas { .. } => {
@@ -364,6 +391,65 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
 
 const SHOW_GRANT_MARKER: &str = "__sealdb_grant__";
 const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
+const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
+
+fn rewrite_show_create_database(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "CREATE") {
+                let after_create = skip_ws(bytes, after_show + "CREATE".len());
+                if keyword_at(bytes, after_create, "DATABASE")
+                    || keyword_at(bytes, after_create, "SCHEMA")
+                {
+                    let kw_len = if keyword_at(bytes, after_create, "DATABASE") {
+                        "DATABASE".len()
+                    } else {
+                        "SCHEMA".len()
+                    };
+                    let after_kw = skip_ws(bytes, after_create + kw_len);
+                    let (name, end) = read_ident(bytes, after_kw);
+                    if !name.is_empty() {
+                        out.push_str("SHOW CREATE TABLE `");
+                        out.push_str(SHOW_CREATE_DB_SCHEMA);
+                        out.push_str("`.`");
+                        out.push_str(&name);
+                        out.push('`');
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
+    if i < bytes.len() && (bytes[i] == b'`' || bytes[i] == b'\'' || bytes[i] == b'"') {
+        let q = bytes[i];
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i] != q {
+            i += 1;
+        }
+        let name = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+        if i < bytes.len() {
+            i += 1;
+        }
+        return (name, i);
+    }
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
+}
 
 fn rewrite_show_grants(sql: &str) -> Result<String> {
     let bytes = sql.as_bytes();
@@ -1821,6 +1907,12 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         return lower_window_func(func, over);
     }
     let name = func.name.to_string();
+    let distinct = match &func.args {
+        FunctionArguments::List(list) => {
+            matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+        }
+        _ => false,
+    };
     let args = match &func.args {
         FunctionArguments::List(list) => list
             .args
@@ -1854,7 +1946,11 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
     } else {
         args
     };
-    Ok(ExprNode::Func(FuncCallExpr { name, args }))
+    Ok(ExprNode::Func(FuncCallExpr {
+        name,
+        args,
+        distinct,
+    }))
 }
 
 fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {

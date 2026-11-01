@@ -761,6 +761,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(schemata.display_rows(), vec![vec!["db1".to_string()]]);
+        let create_db = session.execute_stmt("SHOW CREATE DATABASE db1").unwrap();
+        assert_eq!(create_db.columns, vec!["Database", "Create Database"]);
+        assert_eq!(create_db.display_rows()[0][0], "db1");
+        assert!(create_db.display_rows()[0][1].contains("CREATE DATABASE `db1`"));
+        let create_table = session.execute_stmt("SHOW CREATE TABLE db1.t").unwrap();
+        assert_eq!(create_table.columns, vec!["Table", "Create Table"]);
+        assert_eq!(create_table.display_rows()[0][0], "t");
+        assert!(create_table.display_rows()[0][1].contains("`id` int"));
+        assert!(create_table.display_rows()[0][1].contains("`name` varchar(20)"));
     }
 
     #[test]
@@ -1039,6 +1048,10 @@ mod tests {
         assert_eq!(none.display_rows(), vec![vec!["0".to_string()]]);
         let dual = session.execute_stmt("SELECT COUNT(*)").unwrap();
         assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let distinct = session
+            .execute_stmt("SELECT COUNT(DISTINCT name) FROM db1.t")
+            .unwrap();
+        assert_eq!(distinct.display_rows(), vec![vec!["2".to_string()]]);
         let having = session
             .execute_stmt(
                 "SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name",
