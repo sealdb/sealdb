@@ -31,6 +31,9 @@ pub enum PhysicalPlan {
         kind: String,
     },
     Insert,
+    InfoSchema {
+        table: String,
+    },
     Update,
     Delete,
     TableReader {
@@ -105,6 +108,7 @@ impl PhysicalPlan {
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Simple { kind } => format!("Simple_{kind}"),
             PhysicalPlan::Insert => "Insert".to_string(),
+            PhysicalPlan::InfoSchema { table } => format!("InfoSchema_{table}"),
             PhysicalPlan::Update => "Update".to_string(),
             PhysicalPlan::Delete => "Delete".to_string(),
             PhysicalPlan::TableReader { table, partitions } => {

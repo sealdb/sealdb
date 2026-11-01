@@ -160,6 +160,16 @@ mod tests {
             .parse_one_stmt("SELECT * FROM db1.t WHERE id = 1")
             .unwrap();
         assert!(where_stmt.as_select().unwrap().selection.is_some());
+        match parser
+            .parse_one_stmt("INSERT INTO db1.t SELECT * FROM db1.src")
+            .unwrap()
+        {
+            crate::ast::Statement::Insert(insert) => {
+                assert!(insert.select.is_some());
+                assert!(insert.rows.is_empty());
+            }
+            other => panic!("expected InsertStmt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -196,6 +206,10 @@ mod tests {
             }
             other => panic!("expected COUNT(*), got {other:?}"),
         }
+        let having = parser
+            .parse_one_stmt("SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1")
+            .unwrap();
+        assert!(having.as_select().unwrap().having.is_some());
     }
 
     #[test]
@@ -348,6 +362,36 @@ mod tests {
         assert!(matches!(
             in_list.as_select().unwrap().selection.as_ref(),
             Some(crate::ast::ExprNode::InList(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t WHERE id BETWEEN 1 AND 2")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::Between(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t WHERE name LIKE 'a%'")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::Like(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t WHERE name IS NULL")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::IsNull(_))
         ));
         let err = parser
             .parse_one_stmt("SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2)")

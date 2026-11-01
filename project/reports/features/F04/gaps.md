@@ -3,7 +3,6 @@
 These stay out of the core-ported door. Pick them up in the completeness wave.
 
 - Predicate pushdown / ColumnPrune RBO rules
-- `IN` / `BETWEEN` / `LIKE` / `IS NULL`
 - Qualified column resolution across joins
 - Selection over projected column lists other than `SELECT *`
 - Coprocessor-side filter

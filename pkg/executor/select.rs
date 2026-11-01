@@ -50,6 +50,48 @@ impl Executor for TableDualExec {
     }
 }
 
+pub struct MemTableExec {
+    schema: Vec<String>,
+    rows: Vec<Vec<sealdb_types::Datum>>,
+    emitted: bool,
+}
+
+impl MemTableExec {
+    pub fn new(schema: Vec<String>, rows: Vec<Vec<sealdb_types::Datum>>) -> Self {
+        Self {
+            schema,
+            rows,
+            emitted: false,
+        }
+    }
+}
+
+impl Executor for MemTableExec {
+    fn open(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let mut chunk = Chunk::new(self.schema.len(), self.rows.len());
+        for row in self.rows.drain(..) {
+            chunk.append_row(row);
+        }
+        Ok(Some(chunk))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema(&self) -> &[String] {
+        &self.schema
+    }
+}
+
 pub struct SelectionExec {
     filter: ExprNode,
     child: Box<dyn Executor>,

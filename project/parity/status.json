@@ -281,7 +281,13 @@
     "pkg/infoschema/infoschema.go": {
       "status": "partial",
       "phase": 3,
-      "notes": "in-memory schema snapshot"
+      "notes": "in-memory schema snapshot + information_schema SCHEMATA/TABLES/COLUMNS"
+    },
+    "pkg/infoschema/tables.go": {
+      "status": "partial",
+      "rust": "pkg/infoschema/tables.rs",
+      "phase": 3,
+      "notes": "virtual SCHEMATA/TABLES/COLUMNS; remaining I_S tables deferred"
     },
     "pkg/config/config.go": {
       "status": "partial",

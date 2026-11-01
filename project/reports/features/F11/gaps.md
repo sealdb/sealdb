@@ -2,7 +2,7 @@
 
 These stay out of the core-ported door. Pick them up in the completeness wave.
 
-- `information_schema` virtual tables as SELECT sources
+- Remaining `information_schema` tables beyond SCHEMATA/TABLES/COLUMNS
 - `SHOW CREATE TABLE` / `SHOW CREATE DATABASE`
 - `SHOW COLUMNS` extra flags (`FULL`, `LIKE`, `WHERE`)
 - Exact MySQL Null/Key/Default/Extra values vs TiDB

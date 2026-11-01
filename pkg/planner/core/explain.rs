@@ -141,6 +141,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Insert => ("Insert".to_string(), String::new(), String::new()),
+        PhysicalPlan::InfoSchema { table } => (
+            "MemTable".to_string(),
+            format!("table:{table}"),
+            String::new(),
+        ),
         PhysicalPlan::Update => ("Update".to_string(), String::new(), String::new()),
         PhysicalPlan::Delete => ("Delete".to_string(), String::new(), String::new()),
         PhysicalPlan::TableReader { table, partitions } => (

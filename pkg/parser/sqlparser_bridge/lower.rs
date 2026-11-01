@@ -9,8 +9,9 @@ use crate::ast::dml::{
     SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
-    BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
-    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
+    BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
+    InSubqueryExpr, IsNullExpr, PatternLikeExpr, ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
+    WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
@@ -236,17 +237,18 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .iter()
                 .map(object_name_last)
                 .collect::<Result<Vec<_>>>()?;
-            let rows = match insert.source.as_deref().map(|q| q.body.as_ref()) {
-                Some(SetExpr::Values(values)) => lower_values(values)?,
-                Some(other) => {
-                    return Err(Error::unsupported(format!("INSERT source {other}")));
-                }
+            let (rows, select) = match insert.source.as_deref() {
+                Some(query) => match query.body.as_ref() {
+                    SetExpr::Values(values) => (lower_values(values)?, None),
+                    _ => (Vec::new(), Some(Box::new(lower_query(query)?))),
+                },
                 None => return Err(Error::unsupported("INSERT without VALUES")),
             };
             Ok(Statement::Insert(InsertStmt {
                 table,
                 columns,
                 rows,
+                select,
             }))
         }
         SqlStatement::Update(update) => lower_update(update),
@@ -1405,10 +1407,7 @@ fn lower_select(
         .collect::<Result<Vec<_>>>()?;
     let (from, join) = lower_from(&select.from)?;
     let selection = select.selection.as_ref().map(lower_expr).transpose()?;
-    // F08 gap / completeness wave: HAVING.
-    if select.having.is_some() {
-        return Err(Error::unsupported("HAVING"));
-    }
+    let having = select.having.as_ref().map(lower_expr).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
     let order_by = lower_order_by(order_by)?;
     Ok(SelectStmt {
@@ -1417,6 +1416,7 @@ fn lower_select(
         join,
         selection,
         group_by,
+        having,
         order_by,
         limit,
         offset,
@@ -1743,6 +1743,59 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr: Box::new(lower_expr(expr)?),
             not: *negated,
             list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
+        })),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(ExprNode::Between(BetweenExpr {
+            expr: Box::new(lower_expr(expr)?),
+            not: *negated,
+            low: Box::new(lower_expr(low)?),
+            high: Box::new(lower_expr(high)?),
+        })),
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            if escape_char.is_some() {
+                return Err(Error::unsupported("LIKE ESCAPE"));
+            }
+            Ok(ExprNode::Like(PatternLikeExpr {
+                expr: Box::new(lower_expr(expr)?),
+                not: *negated,
+                pattern: Box::new(lower_expr(pattern)?),
+                ci: false,
+            }))
+        }
+        Expr::ILike {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            if escape_char.is_some() {
+                return Err(Error::unsupported("ILIKE ESCAPE"));
+            }
+            Ok(ExprNode::Like(PatternLikeExpr {
+                expr: Box::new(lower_expr(expr)?),
+                not: *negated,
+                pattern: Box::new(lower_expr(pattern)?),
+                ci: true,
+            }))
+        }
+        Expr::IsNull(expr) => Ok(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(lower_expr(expr)?),
+            not: false,
+        })),
+        Expr::IsNotNull(expr) => Ok(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(lower_expr(expr)?),
+            not: true,
         })),
         Expr::Subquery(subquery) => {
             let query = lower_query(subquery)?;

@@ -18,8 +18,8 @@ pub use dml::{
     SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 pub use expressions::{
-    ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, ScalarSubqueryExpr, WindowFuncExpr,
-    WindowSpec,
+    BetweenExpr, ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr,
+    ScalarSubqueryExpr, WindowFuncExpr, WindowSpec,
 };
 pub use misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,

@@ -18,12 +18,10 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - `tikv-persist`
 - `rowcodec`
-- `insert-select`
 
 ### F04
 
 - `ppd`
-- `in-between-like`
 - `coprocessor-filter`
 
 ### F05
@@ -45,7 +43,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F08
 
-- `having`
 - `distinct-agg`
 - `stream-agg`
 - `spill`
@@ -65,7 +62,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F11
 
-- `information_schema-tables`
 - `show-create`
 - `show-full-columns`
 

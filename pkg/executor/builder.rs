@@ -11,7 +11,7 @@ use crate::internal::exec::{Executor, QueryResult};
 use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
-use crate::select::{LimitExec, SelectionExec, TableDualExec};
+use crate::select::{LimitExec, MemTableExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
 use crate::sortexec::SortExec;
 use crate::table_reader::TableReaderExec;
@@ -108,12 +108,30 @@ impl ExecutorBuilder {
                     Statement::Insert(s) => s.clone(),
                     _ => return Err(Error::unsupported("insert without insert statement")),
                 };
+                let select = insert
+                    .select
+                    .as_ref()
+                    .map(|select| {
+                        Self::build_select_arm(
+                            select,
+                            Arc::clone(&domain),
+                            current_db,
+                            Arc::clone(&txn),
+                        )
+                    })
+                    .transpose()?;
                 Ok(Box::new(InsertExec::new(
                     domain,
                     insert,
                     current_db.to_string(),
                     txn,
+                    select,
                 )))
+            }
+            PhysicalPlan::InfoSchema { table } => {
+                let (columns, rows) =
+                    sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
+                Ok(Box::new(MemTableExec::new(columns, rows)))
             }
             PhysicalPlan::Update => {
                 let update = match stmt {

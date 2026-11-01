@@ -6,6 +6,7 @@ use sealdb_expression::eval_expr;
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
+use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ pub struct InsertExec {
     stmt: InsertStmt,
     current_db: String,
     txn: Arc<TxnHandle>,
+    select: Option<Box<dyn Executor>>,
     done: bool,
 }
 
@@ -23,12 +25,14 @@ impl InsertExec {
         stmt: InsertStmt,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
+        select: Option<Box<dyn Executor>>,
     ) -> Self {
         Self {
             domain,
             stmt,
             current_db: current_db.into(),
             txn,
+            select,
             done: false,
         }
     }
@@ -47,51 +51,30 @@ impl Executor for InsertExec {
                 format!("Table '{schema}.{table}' doesn't exist"),
             )
         })?;
+        let source_rows = if let Some(select) = &mut self.select {
+            select.open()?;
+            let mut rows = Vec::new();
+            while let Some(chunk) = select.next()? {
+                for i in 0..chunk.num_rows() {
+                    rows.push(chunk.get_row(i));
+                }
+            }
+            select.close()?;
+            rows
+        } else {
+            Vec::new()
+        };
         self.txn.with_txn(|txn| {
-            for row in &self.stmt.rows {
-                if row.len() != info.columns.len() && self.stmt.columns.is_empty() {
-                    return Err(Error::new(
-                        ERR_WRONG_VALUE_COUNT,
-                        "Column count doesn't match value count",
-                    ));
+            if self.select.is_some() {
+                for row in &source_rows {
+                    let values = map_insert_row(info, &self.stmt.columns, row)?;
+                    write_row(txn, &self.domain, info, &values)?;
                 }
-                let mut values = Vec::with_capacity(info.columns.len());
-                let mut col_ids = Vec::with_capacity(info.columns.len());
-                if self.stmt.columns.is_empty() {
-                    for (col, expr) in info.columns.iter().zip(row.iter()) {
-                        col_ids.push(col.id);
-                        values.push(eval_expr(expr)?);
-                    }
-                } else {
-                    for col in &info.columns {
-                        col_ids.push(col.id);
-                        if let Some(idx) = self
-                            .stmt
-                            .columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(col.name.o()))
-                        {
-                            values.push(eval_expr(&row[idx])?);
-                        } else {
-                            values.push(sealdb_types::Datum::Null);
-                        }
-                    }
+            } else {
+                for row in &self.stmt.rows {
+                    let values = eval_insert_row(info, &self.stmt.columns, row)?;
+                    write_row(txn, &self.domain, info, &values)?;
                 }
-                let handle = values
-                    .first()
-                    .and_then(|d| match d {
-                        sealdb_types::Datum::I64(v) => Some(*v),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| self.domain.next_handle(info.id));
-                let part_val = info
-                    .partition_value(&values)
-                    .cloned()
-                    .unwrap_or(sealdb_types::Datum::Null);
-                let physical_id = info.locate_partition(&part_val)?;
-                let key = encode_row_key_with_handle(physical_id, handle);
-                txn.set(key.as_bytes(), &encode_row(&col_ids, &values))?;
-                write_index_keys(txn, info, handle, &values, physical_id)?;
             }
             Ok(())
         })
@@ -112,4 +95,71 @@ impl Executor for InsertExec {
     fn schema(&self) -> &[String] {
         &[]
     }
+}
+
+fn eval_insert_row(
+    info: &sealdb_meta::TableInfo,
+    columns: &[String],
+    row: &[sealdb_parser::ast::ExprNode],
+) -> Result<Vec<Datum>> {
+    let mut values = Vec::with_capacity(row.len());
+    for expr in row {
+        values.push(eval_expr(expr)?);
+    }
+    map_insert_row(info, columns, &values)
+}
+
+fn map_insert_row(
+    info: &sealdb_meta::TableInfo,
+    columns: &[String],
+    row: &[Datum],
+) -> Result<Vec<Datum>> {
+    if columns.is_empty() {
+        if row.len() != info.columns.len() {
+            return Err(Error::new(
+                ERR_WRONG_VALUE_COUNT,
+                "Column count doesn't match value count",
+            ));
+        }
+        return Ok(row.to_vec());
+    }
+    if row.len() != columns.len() {
+        return Err(Error::new(
+            ERR_WRONG_VALUE_COUNT,
+            "Column count doesn't match value count",
+        ));
+    }
+    let mut values = Vec::with_capacity(info.columns.len());
+    for col in &info.columns {
+        if let Some(idx) = columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col.name.o()))
+        {
+            values.push(row[idx].clone());
+        } else {
+            values.push(Datum::Null);
+        }
+    }
+    Ok(values)
+}
+
+fn write_row(
+    txn: &mut dyn sealdb_kv::Transaction,
+    domain: &Domain,
+    info: &sealdb_meta::TableInfo,
+    values: &[Datum],
+) -> Result<()> {
+    let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
+    let handle = values
+        .first()
+        .and_then(|d| match d {
+            Datum::I64(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or_else(|| domain.next_handle(info.id));
+    let part_val = info.partition_value(values).cloned().unwrap_or(Datum::Null);
+    let physical_id = info.locate_partition(&part_val)?;
+    let key = encode_row_key_with_handle(physical_id, handle);
+    txn.set(key.as_bytes(), &encode_row(&col_ids, values))?;
+    write_index_keys(txn, info, handle, values, physical_id)
 }

@@ -2,9 +2,9 @@
 
 These stay out of the core-ported door. Pick them up in the completeness wave.
 
-- Persist rows to a live TiKV cluster (`tikv-client` driver)
+- Persist schema/`next_handle` across `--store tikv` restarts
 - TiDB rowcodec / checksum row format (current values are a compact tagged layout)
-- `INSERT ... SELECT`, `REPLACE`, `ON DUPLICATE KEY`
+- `REPLACE`, `ON DUPLICATE KEY`
 - Column default values and auto_increment
 - Coprocessor TableReader / DistSQL
 - `SELECT` column lists other than `*`
