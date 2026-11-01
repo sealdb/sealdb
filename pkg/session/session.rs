@@ -56,12 +56,15 @@ impl Session {
                 rows: Vec::new(),
             });
         }
-        let plan = self.planner.build(stmt)?;
         let current_db = self
             .current_db
             .lock()
             .expect("session current_db lock")
             .clone();
+        let is = self.domain.infoschema();
+        let plan = self
+            .planner
+            .build_with_schema(stmt, Some(&is), &current_db)?;
         let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db)?;
         ExecutorBuilder::run(exec)
     }
@@ -396,5 +399,64 @@ mod tests {
                 vec!["NULL".to_string(), "y".to_string()]
             ]
         );
+    }
+
+    #[test]
+    fn test_secondary_index_lookup() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'a')",
+            )
+            .unwrap();
+        let table = session
+            .infoschema()
+            .table_by_name("db1", "t")
+            .unwrap()
+            .clone();
+        assert_eq!(table.indices.len(), 1);
+        assert_eq!(table.indices[0].name.o(), "idx_name");
+        let hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            hit.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["3".to_string(), "a".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("UPDATE db1.t SET name = 'c' WHERE id = 1")
+            .unwrap();
+        let after_update = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_update.display_rows(),
+            vec![vec!["3".to_string(), "a".to_string()]]
+        );
+        let renamed = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'c'")
+            .unwrap();
+        assert_eq!(
+            renamed.display_rows(),
+            vec![vec!["1".to_string(), "c".to_string()]]
+        );
+        session
+            .execute_stmt("DELETE FROM db1.t WHERE name = 'c'")
+            .unwrap();
+        let after_delete = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'c'")
+            .unwrap();
+        assert!(after_delete.display_rows().is_empty());
+        let miss = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'missing'")
+            .unwrap();
+        assert!(miss.display_rows().is_empty());
+        let err = session
+            .execute_stmt("CREATE INDEX idx_id ON db1.t (id)")
+            .unwrap_err();
+        assert!(err.message.contains("CREATE INDEX"));
     }
 }

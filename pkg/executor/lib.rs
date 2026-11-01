@@ -5,6 +5,8 @@ pub mod aggregate;
 pub mod builder;
 pub mod ddl;
 pub mod delete;
+pub mod distsql;
+pub mod index;
 pub mod insert;
 pub mod internal;
 pub mod join;

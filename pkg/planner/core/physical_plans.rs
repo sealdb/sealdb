@@ -33,6 +33,10 @@ pub enum PhysicalPlan {
         table: String,
         handle: i64,
     },
+    IndexLookUpReader {
+        table: String,
+        index: String,
+    },
     Selection {
         child: Box<PhysicalPlan>,
     },
@@ -73,6 +77,9 @@ impl PhysicalPlan {
             PhysicalPlan::Delete => "Delete".to_string(),
             PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
             PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
+            PhysicalPlan::IndexLookUpReader { table, index } => {
+                format!("IndexLookUpReader_{table}_{index}")
+            }
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),

@@ -1,4 +1,5 @@
 use super::column::ColumnInfo;
+use super::index::IndexInfo;
 use super::job::{STATE_PUBLIC, SchemaState};
 use sealdb_parser::model::CIStr;
 use serde::{Deserialize, Serialize};
@@ -14,13 +15,15 @@ pub struct TableInfo {
     #[serde(rename = "cols")]
     pub columns: Vec<ColumnInfo>,
     #[serde(rename = "index_info", default, skip_serializing_if = "Vec::is_empty")]
-    pub indices: Vec<serde_json::Value>,
+    pub indices: Vec<IndexInfo>,
     pub state: SchemaState,
     pub pk_is_handle: bool,
     #[serde(default)]
     pub version: u16,
     #[serde(default)]
     pub max_col_id: i64,
+    #[serde(default)]
+    pub max_idx_id: i64,
 }
 
 impl TableInfo {
@@ -37,6 +40,14 @@ impl TableInfo {
             pk_is_handle: false,
             version: CURR_LATEST_TABLE_INFO_VERSION,
             max_col_id,
+            max_idx_id: 0,
         }
+    }
+
+    pub fn find_index_covering(&self, column: &str) -> Option<&IndexInfo> {
+        let name = column.to_ascii_lowercase();
+        self.indices
+            .iter()
+            .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
     }
 }

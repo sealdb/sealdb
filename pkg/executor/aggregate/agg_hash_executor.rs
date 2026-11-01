@@ -1,3 +1,6 @@
+// F08 core path: in-memory HashAgg for COUNT/SUM/AVG/MIN/MAX + GROUP BY columns.
+// Completeness wave / not this feature: HAVING, DISTINCT aggs, StreamAgg,
+// spill / parallel workers, GROUP BY expressions, ROLLUP/CUBE, AVG decimal scale.
 use crate::aggfuncs::{build_agg_func, is_agg_name};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};

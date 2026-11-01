@@ -9,7 +9,8 @@ pub mod misc;
 
 pub use ast::{Node, Statement, StmtNode};
 pub use ddl::{
-    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
+    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, IndexDef,
+    TableName,
 };
 pub use dml::{
     Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectStmt, UpdateStmt,

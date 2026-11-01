@@ -1,6 +1,7 @@
 use crate::aggregate::HashAggExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
+use crate::distsql::IndexLookUpExecutor;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::join::HashJoinV1Exec;
@@ -123,6 +124,24 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                 )))
             }
+            PhysicalPlan::IndexLookUpReader { index, .. } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("index lookup without select"))?;
+                let from = select
+                    .from
+                    .clone()
+                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
+                let lookup = eq_lookup_value(select.selection.as_ref())
+                    .ok_or_else(|| Error::unsupported("index lookup without equality"))?;
+                Ok(Box::new(IndexLookUpExecutor::new(
+                    domain,
+                    from,
+                    index.clone(),
+                    lookup,
+                    current_db.to_string(),
+                )))
+            }
             PhysicalPlan::PointGet { handle, .. } => {
                 let from = stmt
                     .as_select()
@@ -209,6 +228,21 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
         .from
         .clone()
         .ok_or_else(|| Error::unsupported("table reader without FROM"))
+}
+
+fn eq_lookup_value(selection: Option<&ExprNode>) -> Option<sealdb_types::Datum> {
+    let ExprNode::Binary(bin) = selection? else {
+        return None;
+    };
+    if !matches!(bin.op, sealdb_parser::opcode::Op::Eq) {
+        return None;
+    }
+    match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(_), ExprNode::Value(v)) | (ExprNode::Value(v), ExprNode::Column(_)) => {
+            Some(v.datum.clone())
+        }
+        _ => None,
+    }
 }
 
 fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {

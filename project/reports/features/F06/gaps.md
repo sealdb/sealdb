@@ -5,4 +5,4 @@ These stay out of the core-ported door. Pick them up in the completeness wave.
 - BatchPointGet
 - Clustered / non-clustered index PointGet
 - Locking PointGet (`FOR UPDATE`)
-- PointGet when the equality column is not the integer handle
+- PointGet when the equality column is not the integer handle (F10 uses IndexLookUp for indexed equality instead)

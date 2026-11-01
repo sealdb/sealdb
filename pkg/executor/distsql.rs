@@ -1,0 +1,120 @@
+// F10 core path: IndexLookUpExecutor (TiDB pkg/executor/distsql.go).
+// Completeness wave / not this feature: covering IndexReader, range scan,
+// IndexMerge, lookup push-down, parallel workers, unique index PointGet.
+use crate::internal::exec::Executor;
+use sealdb_domain::Domain;
+use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
+use sealdb_kv::Storage;
+use sealdb_parser::ast::TableName;
+use sealdb_tablecodec::{
+    decode_handle_from_index_key, decode_row, encode_index_seek_prefix, encode_row_key_with_handle,
+    next_prefix,
+};
+use sealdb_types::Datum;
+use sealdb_util::chunk::Chunk;
+use std::sync::Arc;
+
+pub struct IndexLookUpExecutor {
+    domain: Arc<Domain>,
+    table: TableName,
+    index: String,
+    lookup: Datum,
+    current_db: String,
+    schema: Vec<String>,
+    rows: Vec<Vec<Datum>>,
+    emitted: bool,
+}
+
+impl IndexLookUpExecutor {
+    pub fn new(
+        domain: Arc<Domain>,
+        table: TableName,
+        index: String,
+        lookup: Datum,
+        current_db: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain,
+            table,
+            index,
+            lookup,
+            current_db: current_db.into(),
+            schema: Vec::new(),
+            rows: Vec::new(),
+            emitted: false,
+        }
+    }
+}
+
+impl Executor for IndexLookUpExecutor {
+    fn open(&mut self) -> Result<()> {
+        let (schema, name) = self.table.qualified(&self.current_db);
+        if schema.is_empty() {
+            return Err(Error::new(ERR_NO_DB, "No database selected"));
+        }
+        let is = self.domain.infoschema();
+        let info = is.table_by_name(&schema, &name).cloned().ok_or_else(|| {
+            Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{schema}.{name}' doesn't exist"),
+            )
+        })?;
+        let index = info
+            .indices
+            .iter()
+            .find(|idx| idx.name.o().eq_ignore_ascii_case(&self.index))
+            .cloned()
+            .ok_or_else(|| Error::unsupported(format!("index {}", self.index)))?;
+        self.schema = info
+            .columns
+            .iter()
+            .map(|c| c.name.o().to_string())
+            .collect();
+        let start = encode_index_seek_prefix(info.id, index.id, std::slice::from_ref(&self.lookup));
+        let end = next_prefix(start.as_bytes());
+        let mut txn = self.domain.begin()?;
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        let mut rows = Vec::new();
+        for (key, _) in pairs {
+            let handle = decode_handle_from_index_key(&key)?;
+            let row_key = encode_row_key_with_handle(info.id, handle);
+            if let Some(raw) = txn.get(row_key.as_bytes())? {
+                let decoded = decode_row(&raw);
+                rows.push(
+                    info.columns
+                        .iter()
+                        .map(|col| {
+                            decoded
+                                .iter()
+                                .find(|(id, _)| *id == col.id)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Datum::Null)
+                        })
+                        .collect(),
+                );
+            }
+        }
+        self.rows = rows;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let mut chunk = Chunk::new(self.schema.len(), self.rows.len());
+        for row in self.rows.drain(..) {
+            chunk.append_row(row);
+        }
+        Ok(Some(chunk))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema(&self) -> &[String] {
+        &self.schema
+    }
+}

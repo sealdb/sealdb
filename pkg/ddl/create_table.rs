@@ -1,5 +1,5 @@
 use sealdb_errno::{Error, Result};
-use sealdb_meta::{ColumnInfo, TableInfo};
+use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, TableInfo};
 use sealdb_parser::ast::CreateTableStmt;
 use sealdb_types::field_type::{
     FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_FLOAT, TYPE_LONG,
@@ -19,7 +19,32 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             field_type_from_name(&col.type_name)?,
         ));
     }
-    Ok(TableInfo::new(table_id, stmt.table.name.clone(), columns))
+    let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
+    for (offset, index) in stmt.indices.iter().enumerate() {
+        let mut idx_cols = Vec::with_capacity(index.columns.len());
+        for col_name in &index.columns {
+            let col = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| {
+                    Error::new(
+                        sealdb_errno::ERR_BAD_FIELD,
+                        format!("Unknown column '{col_name}' in index '{}'", index.name),
+                    )
+                })?;
+            idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
+        }
+        let idx_id = (offset as i64) + 1;
+        info.indices.push(IndexInfo::new(
+            idx_id,
+            index.name.clone(),
+            info.name.o(),
+            idx_cols,
+        ));
+        info.max_idx_id = idx_id;
+    }
+    Ok(info)
 }
 
 fn field_type_from_name(type_name: &str) -> Result<FieldType> {
