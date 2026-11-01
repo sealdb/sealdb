@@ -10,12 +10,13 @@ pub fn build_agg_func(func: &FuncCallExpr) -> Result<Box<dyn AggFunc>> {
     match func.name.to_ascii_uppercase().as_str() {
         "COUNT" if func.distinct => Ok(Box::new(Count::distinct())),
         "COUNT" => Ok(Box::new(Count::new(func.args.is_empty()))),
-        "SUM" | "AVG" | "MAX" | "MIN" if func.distinct => {
-            Err(Error::unsupported(format!("DISTINCT {}", func.name)))
-        }
+        "SUM" if func.distinct => Ok(Box::new(Sum::distinct())),
         "SUM" => Ok(Box::new(Sum::default())),
+        "AVG" if func.distinct => Ok(Box::new(Avg::distinct())),
         "AVG" => Ok(Box::new(Avg::default())),
+        "MAX" if func.distinct => Ok(Box::new(Extremum::max_distinct())),
         "MAX" => Ok(Box::new(Extremum::max())),
+        "MIN" if func.distinct => Ok(Box::new(Extremum::min_distinct())),
         "MIN" => Ok(Box::new(Extremum::min())),
         other => Err(Error::new(
             ERR_UNKNOWN_FUNCTION,

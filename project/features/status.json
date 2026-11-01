@@ -13,7 +13,7 @@
     "F05": {"status": "core-ported", "phase": 5, "notes": "ORDER BY + LIMIT/OFFSET in-memory", "gaps": ["topn-spill", "parallel-sort"]},
     "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle PointGet", "gaps": ["batch-point-get", "index-point-get"]},
     "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE SET / DELETE over in-memory KV", "gaps": ["multi-table", "update-join", "order-limit", "returning"]},
-    "F08": {"status": "core-ported", "phase": 5, "notes": "COUNT/SUM/AVG/MIN/MAX + COUNT(DISTINCT) HashAgg GROUP BY/HAVING", "gaps": ["distinct-agg", "stream-agg", "spill"]},
+    "F08": {"status": "core-ported", "phase": 5, "notes": "COUNT/SUM/AVG/MIN/MAX including DISTINCT HashAgg GROUP BY/HAVING", "gaps": ["stream-agg", "spill"]},
     "F09": {"status": "core-ported", "phase": 5, "notes": "two-table Inner/Left/Right HashJoin on equality", "gaps": ["semi-anti", "cross-join", "n-table", "spill"]},
     "F10": {"status": "core-ported", "phase": 5, "notes": "CREATE TABLE INDEX/KEY + index KV maintenance + IndexLookUp on indexed equality", "gaps": ["unique-pk", "covering-reader", "range-scan"]},
     "F11": {"status": "core-ported", "phase": 3, "notes": "SHOW DATABASES/TABLES/CREATE + DESC + USE + information_schema SCHEMATA/TABLES/COLUMNS", "gaps": ["show-full-columns"]},

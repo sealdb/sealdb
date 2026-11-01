@@ -1065,6 +1065,25 @@ mod tests {
             .execute_stmt("SELECT COUNT(DISTINCT name) FROM db1.t")
             .unwrap();
         assert_eq!(distinct.display_rows(), vec![vec!["2".to_string()]]);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.d (name VARCHAR(20), id INT); INSERT INTO db1.d VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3)",
+            )
+            .unwrap();
+        let distinct_aggs = session
+            .execute_stmt(
+                "SELECT SUM(DISTINCT id), AVG(DISTINCT id), MIN(DISTINCT id), MAX(DISTINCT id) FROM db1.d",
+            )
+            .unwrap();
+        assert_eq!(
+            distinct_aggs.display_rows(),
+            vec![vec![
+                "6".to_string(),
+                "2.0".to_string(),
+                "1".to_string(),
+                "3".to_string()
+            ]]
+        );
         let having = session
             .execute_stmt(
                 "SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name",

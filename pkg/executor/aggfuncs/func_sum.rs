@@ -1,11 +1,23 @@
-use super::aggfuncs::AggFunc;
+use super::aggfuncs::{AggFunc, remember_distinct};
 use sealdb_errno::Result;
 use sealdb_types::Datum;
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct Sum {
     sum: f64,
     seen: bool,
+    distinct: bool,
+    distinct_seen: HashSet<String>,
+}
+
+impl Sum {
+    pub fn distinct() -> Self {
+        Self {
+            distinct: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl AggFunc for Sum {
@@ -14,6 +26,9 @@ impl AggFunc for Sum {
             return Ok(());
         };
         if v.is_null() {
+            return Ok(());
+        }
+        if self.distinct && !remember_distinct(&mut self.distinct_seen, v) {
             return Ok(());
         }
         self.sum += v.as_f64()?;
