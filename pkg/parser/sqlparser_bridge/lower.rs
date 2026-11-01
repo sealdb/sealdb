@@ -1,5 +1,4 @@
 use super::dialect::dialect;
-use crate::ast::Statement;
 use crate::ast::ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
@@ -17,23 +16,26 @@ use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem,
     PrivilegeType, RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
 };
+use crate::ast::{ExplainFormat, ExplainStmt, Statement};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    Action, AlterTableOperation, AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized,
-    DataType, Delete, DescribeAlias, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
-    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Update, Use, Value, Values, WindowType, With,
+    Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
+    BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias, Expr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Grant, GrantObjects, GranteeName,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NonBlock,
+    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, Revoke,
+    SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
+    Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     let rewritten = rewrite_show_grants(&rewritten)?;
+    let rewritten = rewrite_explain_format(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
@@ -284,6 +286,28 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         SqlStatement::Grant(grant) => lower_grant(grant),
         SqlStatement::Revoke(revoke) => lower_revoke(revoke),
         SqlStatement::Analyze(analyze) => lower_analyze(analyze),
+        SqlStatement::Explain {
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+            ..
+        } => {
+            if *analyze {
+                return Err(Error::unsupported("EXPLAIN ANALYZE"));
+            }
+            if *query_plan || *estimate || options.is_some() {
+                return Err(Error::unsupported("EXPLAIN QUERY PLAN / ESTIMATE"));
+            }
+            Ok(Statement::Explain(ExplainStmt {
+                analyze: false,
+                format: lower_explain_format(*verbose, format.as_ref())?,
+                stmt: Box::new(lower_statement(statement)?),
+            }))
+        }
         SqlStatement::Savepoint { .. } | SqlStatement::ReleaseSavepoint { .. } => {
             Err(Error::unsupported("SAVEPOINT"))
         }
@@ -613,6 +637,108 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// sqlparser-rs accepts `FORMAT JSON`, not TiDB `FORMAT = 'dot'`.
+fn rewrite_explain_format(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "EXPLAIN") {
+            out.push_str(&sql[i..i + "EXPLAIN".len()]);
+            i += "EXPLAIN".len();
+            let after = skip_ws(bytes, i);
+            if keyword_at(bytes, after, "ANALYZE") {
+                out.push_str(&sql[i..after + "ANALYZE".len()]);
+                i = after + "ANALYZE".len();
+            }
+            let fmt = skip_ws(bytes, i);
+            if keyword_at(bytes, fmt, "FORMAT") {
+                let after_fmt = skip_ws(bytes, fmt + "FORMAT".len());
+                let value_at = if after_fmt < bytes.len() && bytes[after_fmt] == b'=' {
+                    skip_ws(bytes, after_fmt + 1)
+                } else {
+                    after_fmt
+                };
+                let (value, end) = take_explain_format(bytes, value_at);
+                out.push_str(&sql[i..fmt]);
+                match map_explain_format_kw(&value) {
+                    ExplainFormatRewrite::Strip => {}
+                    ExplainFormatRewrite::Keyword(kw) => {
+                        out.push_str("FORMAT ");
+                        out.push_str(kw);
+                        out.push(' ');
+                    }
+                    ExplainFormatRewrite::Keep => {
+                        out.push_str(&sql[fmt..end]);
+                    }
+                }
+                i = end;
+                continue;
+            }
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn take_explain_format(bytes: &[u8], i: usize) -> (String, usize) {
+    if i >= bytes.len() {
+        return (String::new(), i);
+    }
+    let quote = bytes[i];
+    if quote == b'\'' || quote == b'"' {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != quote {
+            j += 1;
+        }
+        let value = String::from_utf8_lossy(&bytes[i + 1..j]).into_owned();
+        let end = if j < bytes.len() { j + 1 } else { j };
+        return (value, end);
+    }
+    let mut j = i;
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    (String::from_utf8_lossy(&bytes[i..j]).into_owned(), j)
+}
+
+enum ExplainFormatRewrite {
+    Strip,
+    Keyword(&'static str),
+    Keep,
+}
+
+fn map_explain_format_kw(value: &str) -> ExplainFormatRewrite {
+    match value.to_ascii_lowercase().as_str() {
+        "row" | "traditional" | "brief" | "text" | "tree" | "verbose" => {
+            ExplainFormatRewrite::Strip
+        }
+        "json" => ExplainFormatRewrite::Keyword("JSON"),
+        "dot" | "graphviz" => ExplainFormatRewrite::Keyword("GRAPHVIZ"),
+        _ => ExplainFormatRewrite::Keep,
+    }
+}
+
+fn lower_explain_format(
+    verbose: bool,
+    format: Option<&AnalyzeFormatKind>,
+) -> Result<ExplainFormat> {
+    let _ = verbose;
+    match format {
+        None => Ok(ExplainFormat::Row),
+        Some(AnalyzeFormatKind::Keyword(fmt) | AnalyzeFormatKind::Assignment(fmt)) => match fmt {
+            AnalyzeFormat::JSON => Ok(ExplainFormat::Json),
+            AnalyzeFormat::GRAPHVIZ => Ok(ExplainFormat::Dot),
+            AnalyzeFormat::TEXT | AnalyzeFormat::TRADITIONAL | AnalyzeFormat::TREE => {
+                Ok(ExplainFormat::Row)
+            }
+        },
+    }
 }
 
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.

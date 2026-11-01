@@ -3,6 +3,7 @@
   "baseline": "v8.5.8",
   "core_ported": [
     "C1",
+    "C2",
     "F01",
     "F02",
     "F03",

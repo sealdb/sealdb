@@ -7,7 +7,7 @@ pub mod dml;
 pub mod expressions;
 pub mod misc;
 
-pub use ast::{Node, Statement, StmtNode};
+pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,

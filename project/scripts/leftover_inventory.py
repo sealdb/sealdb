@@ -218,7 +218,7 @@ def render_markdown(inv: dict) -> str:
             "## Completeness wave notes",
             "",
             "- C1 is the frozen leftover denominator, not a pass-rate claim.",
-            "- C2 owns EXPLAIN / access-path / JoinReorder leftover suites.",
+            "- C2 core-ports EXPLAIN row/json/dot, costed skyline, and two-table JoinReorder; ANALYZE / n-table DP / IndexMerge stay open.",
             "- C3 owns isolation / SchemaChecker / `db_integration`.",
             "- C4 owns Prepare / Execute / Binding.",
             "- C5 owns SET / collation / charset leftover.",

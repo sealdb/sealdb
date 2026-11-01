@@ -1,3 +1,4 @@
+use sealdb_parser::ast::ExplainFormat;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +62,12 @@ pub enum PhysicalPlan {
         tp: JoinType,
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
+        left_table: String,
+        right_table: String,
+    },
+    Explain {
+        format: ExplainFormat,
+        child: Box<PhysicalPlan>,
     },
     Apply {
         child: Box<PhysicalPlan>,
@@ -137,8 +144,13 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
-            PhysicalPlan::HashJoin { tp, left, right } => {
+            PhysicalPlan::HashJoin {
+                tp, left, right, ..
+            } => {
                 format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
+            }
+            PhysicalPlan::Explain { format, child } => {
+                format!("Explain_{format:?} -> {}", child.explain())
             }
             PhysicalPlan::Apply { child } => format!("Apply -> {}", child.explain()),
             PhysicalPlan::Union {

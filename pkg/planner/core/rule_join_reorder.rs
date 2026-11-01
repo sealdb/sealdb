@@ -1,0 +1,77 @@
+use super::physical_plans::{JoinType, PhysicalPlan};
+
+/// Two-table greedy JoinReorder: Inner HashJoin builds the smaller side.
+/// Completeness wave: n-table DP/greedy, outer-join assoc, bushy trees.
+pub fn reorder_hash_join(
+    tp: JoinType,
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    left_table: String,
+    right_table: String,
+    left_rows: f64,
+    right_rows: f64,
+) -> PhysicalPlan {
+    let _ = super::plan_cost::hash_join_cost(left_rows, right_rows, left_rows, right_rows);
+    let _ = hash_join_probe_build(tp, left_rows, right_rows);
+    if matches!(tp, JoinType::Inner) && left_rows + f64::EPSILON < right_rows {
+        PhysicalPlan::HashJoin {
+            tp,
+            left: Box::new(right),
+            right: Box::new(left),
+            left_table: right_table,
+            right_table: left_table,
+        }
+    } else {
+        PhysicalPlan::HashJoin {
+            tp,
+            left: Box::new(left),
+            right: Box::new(right),
+            left_table,
+            right_table,
+        }
+    }
+}
+
+fn hash_join_probe_build(tp: JoinType, left_rows: f64, right_rows: f64) -> (f64, f64) {
+    if matches!(tp, JoinType::Inner) && left_rows < right_rows {
+        (right_rows, left_rows)
+    } else {
+        (left_rows, right_rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inner_builds_smaller_side() {
+        let left = PhysicalPlan::TableReader {
+            table: "small".to_string(),
+            partitions: Vec::new(),
+        };
+        let right = PhysicalPlan::TableReader {
+            table: "big".to_string(),
+            partitions: Vec::new(),
+        };
+        let plan = reorder_hash_join(
+            JoinType::Inner,
+            left,
+            right,
+            "small".to_string(),
+            "big".to_string(),
+            1.0,
+            100.0,
+        );
+        let PhysicalPlan::HashJoin {
+            left_table,
+            right_table,
+            ..
+        } = plan
+        else {
+            panic!("expected hash join");
+        };
+        assert_eq!(left_table, "big");
+        assert_eq!(right_table, "small");
+    }
+}

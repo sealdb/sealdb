@@ -63,7 +63,8 @@
 | F21 | `core-ported` | `project/reports/features/F21/` |
 | F22 | `core-ported` | `project/reports/features/F22/` |
 | C1 | `core-ported` | `project/reports/features/C1/` |
-| C2–C5 | `not-started` | — |
+| C2 | `core-ported` | `project/reports/features/C2/` |
+| C3–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
 ---
@@ -104,6 +105,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: C2 计划形状 / 代价 / JoinReorder
+- **完成**:
+  - `EXPLAIN` / `FORMAT='json'|'dot'` 输出 TiDB 五列树或 JSON/DOT
+  - ANALYZE 后按 scan/net 代价在 TableReader 与 IndexLookUp 之间做 skyline
+  - 两表 Inner HashJoin 把较小表放到 build 侧
+- **验证**:
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - C3 事务隔离边角、SchemaChecker、交叉读写
 
 ### 2026-11-01
 

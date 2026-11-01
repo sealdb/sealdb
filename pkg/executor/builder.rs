@@ -4,6 +4,7 @@ use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::distsql::IndexLookUpExecutor;
+use crate::explain::ExplainExec;
 use crate::grant::GrantExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
@@ -279,11 +280,19 @@ impl ExecutorBuilder {
                     Self::build(seed, &seed_stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::HashJoin { left, right, .. } => {
-                let join = stmt
+            PhysicalPlan::HashJoin {
+                left,
+                right,
+                left_table,
+                ..
+            } => {
+                let mut join = stmt
                     .as_select()
                     .and_then(|s| s.join.clone())
                     .ok_or_else(|| Error::unsupported("hash join without join"))?;
+                if !join.left.name.eq_ignore_ascii_case(left_table) {
+                    std::mem::swap(&mut join.left, &mut join.right);
+                }
                 Ok(Box::new(HashJoinV1Exec::new(
                     join,
                     Self::build(
@@ -295,6 +304,9 @@ impl ExecutorBuilder {
                     )?,
                     Self::build(right, stmt, domain, current_db, txn)?,
                 )))
+            }
+            PhysicalPlan::Explain { format, child } => {
+                Ok(Box::new(ExplainExec::new(*format, child.as_ref().clone())))
             }
         }
     }
