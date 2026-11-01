@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（DISTINCT agg）  
+> 最后更新：2026-11-01（SHOW FULL COLUMNS）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F11 leftover（SHOW FULL COLUMNS）
+- **完成**:
+  - `SHOW FULL COLUMNS FROM` 增加 Collation/Privileges/Comment
+- **验证**:
+  - parser / session / itest infoschema + F11 gate
+- **下一步**:
+  - leftover 其余 I_S 表
+  - C6 保持 deferred
 
 ### 2026-11-01
 

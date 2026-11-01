@@ -742,6 +742,25 @@ mod tests {
         assert_eq!(desc.columns[0], "Field");
         assert_eq!(desc.display_rows()[0][0], "id");
         assert_eq!(desc.display_rows()[1][0], "name");
+        let full = session.execute_stmt("SHOW FULL COLUMNS FROM t").unwrap();
+        assert_eq!(
+            full.columns,
+            vec![
+                "Field",
+                "Type",
+                "Collation",
+                "Null",
+                "Key",
+                "Default",
+                "Extra",
+                "Privileges",
+                "Comment"
+            ]
+        );
+        assert_eq!(full.display_rows()[0][0], "id");
+        assert_eq!(full.display_rows()[0][2], "NULL");
+        assert_eq!(full.display_rows()[1][2], "utf8mb4_bin");
+        assert!(full.display_rows()[0][7].contains("select"));
         let is_tables = session
             .execute_stmt(
                 "SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'db1'",

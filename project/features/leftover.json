@@ -73,9 +73,7 @@
       "covering-reader",
       "range-scan"
     ],
-    "F11": [
-      "show-full-columns"
-    ],
+    "F11": [],
     "F12": [
       "pessimistic",
       "savepoint",

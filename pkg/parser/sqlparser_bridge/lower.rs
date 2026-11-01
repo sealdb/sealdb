@@ -194,6 +194,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     db_name: Some(table.name),
                     table: None,
                     user: None,
+                    full: false,
                 }))
             } else {
                 Ok(Statement::Show(ShowStmt {
@@ -201,6 +202,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     db_name: None,
                     table: Some(table),
                     user: None,
+                    full: false,
                 }))
             }
         }
@@ -210,6 +212,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: None,
                 user: None,
+                full: false,
             }))
         }
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -222,8 +225,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .transpose()?,
             table: None,
             user: None,
+            full: false,
         })),
-        SqlStatement::ShowColumns { show_options, .. } => {
+        SqlStatement::ShowColumns {
+            full, show_options, ..
+        } => {
             let table = show_options
                 .show_in
                 .as_ref()
@@ -234,6 +240,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: Some(object_table_name(table)?),
                 user: None,
+                full: *full,
             }))
         }
         SqlStatement::ExplainTable {
@@ -252,6 +259,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 db_name: None,
                 table: Some(object_table_name(table_name)?),
                 user: None,
+                full: false,
             }))
         }
         SqlStatement::Insert(insert) => {

@@ -225,6 +225,7 @@ pub struct ShowStmt {
     pub db_name: Option<String>,
     pub table: Option<TableName>,
     pub user: Option<UserIdentity>,
+    pub full: bool,
 }
 
 impl ShowStmt {
@@ -239,7 +240,11 @@ impl ShowStmt {
                 }
             }
             ShowStmtKind::Columns => {
-                ctx.write_str("DESC ");
+                if self.full {
+                    ctx.write_str("SHOW FULL COLUMNS FROM ");
+                } else {
+                    ctx.write_str("DESC ");
+                }
                 if let Some(table) = &self.table {
                     table.restore(ctx)?;
                 }

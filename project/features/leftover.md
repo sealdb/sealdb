@@ -52,10 +52,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `covering-reader`
 - `range-scan`
 
-### F11
-
-- `show-full-columns`
-
 ### F12
 
 - `pessimistic`

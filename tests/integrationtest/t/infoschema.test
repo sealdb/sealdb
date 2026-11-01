@@ -6,3 +6,4 @@ SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = 'itest' 
 SELECT SCHEMA_NAME FROM information_schema.schemata WHERE SCHEMA_NAME = 'itest';
 SHOW CREATE DATABASE itest;
 SHOW CREATE TABLE itest.t;
+SHOW FULL COLUMNS FROM itest.t;
