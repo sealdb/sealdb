@@ -431,4 +431,44 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("UNION"));
     }
+
+    #[test]
+    fn test_parse_partition() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("range partition");
+                assert_eq!(part.tp, crate::ast::PartitionType::Range);
+                assert_eq!(part.column, "id");
+                assert_eq!(part.defs.len(), 2);
+                assert_eq!(part.defs[0].less_than, Some(10));
+                assert_eq!(part.defs[1].less_than, None);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (id INT, name VARCHAR(20)) PARTITION BY HASH (id) PARTITIONS 4",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("hash partition");
+                assert_eq!(part.tp, crate::ast::PartitionType::Hash);
+                assert_eq!(part.num, 4);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt(
+                "CREATE TABLE t (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+            )
+            .unwrap_err();
+        assert!(err.message.contains("LIST") || err.message.contains("partition"));
+    }
 }

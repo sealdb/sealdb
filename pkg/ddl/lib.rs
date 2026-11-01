@@ -5,6 +5,7 @@ pub mod alter;
 pub mod create_table;
 pub mod ddl;
 pub mod index;
+pub mod partition;
 pub mod schema;
 pub mod table;
 

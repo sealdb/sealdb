@@ -20,6 +20,7 @@ pub struct TableReaderExec {
     current_db: String,
     txn: Arc<TxnHandle>,
     for_update: bool,
+    partitions: Vec<i64>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -32,6 +33,7 @@ impl TableReaderExec {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         for_update: bool,
+        partitions: Vec<i64>,
     ) -> Self {
         Self {
             domain,
@@ -39,6 +41,7 @@ impl TableReaderExec {
             current_db: current_db.into(),
             txn,
             for_update,
+            partitions,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -64,7 +67,12 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        self.rows = scan_table(&self.txn, &info, self.for_update)?
+        let physical = if self.partitions.is_empty() {
+            info.physical_ids()
+        } else {
+            self.partitions.clone()
+        };
+        self.rows = scan_table(&self.txn, &info, self.for_update, &physical)?
             .into_iter()
             .map(|row| row.values)
             .collect();
@@ -94,6 +102,7 @@ impl Executor for TableReaderExec {
 
 pub(crate) struct ScannedRow {
     pub handle: i64,
+    pub physical_id: i64,
     pub values: Vec<Datum>,
 }
 
@@ -101,22 +110,28 @@ pub(crate) fn scan_table(
     handle: &TxnHandle,
     info: &TableInfo,
     for_update: bool,
+    physical_ids: &[i64],
 ) -> Result<Vec<ScannedRow>> {
-    let start = gen_table_record_prefix(info.id);
-    let end = next_prefix(start.as_bytes());
     handle.with_txn(|txn| {
-        let pairs = if for_update {
-            txn.scan_for_update(start.as_bytes(), &end)?
-        } else {
-            txn.scan(start.as_bytes(), &end)?
-        };
-        decode_scanned_rows(pairs, info)
+        let mut rows = Vec::new();
+        for physical_id in physical_ids {
+            let start = gen_table_record_prefix(*physical_id);
+            let end = next_prefix(start.as_bytes());
+            let pairs = if for_update {
+                txn.scan_for_update(start.as_bytes(), &end)?
+            } else {
+                txn.scan(start.as_bytes(), &end)?
+            };
+            rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
+        }
+        Ok(rows)
     })
 }
 
 fn decode_scanned_rows(
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
     info: &TableInfo,
+    physical_id: i64,
 ) -> Result<Vec<ScannedRow>> {
     pairs
         .into_iter()
@@ -124,6 +139,7 @@ fn decode_scanned_rows(
             let decoded = decode_row(&raw);
             Ok(ScannedRow {
                 handle: decode_handle_from_row_key(&key)?,
+                physical_id,
                 values: info
                     .columns
                     .iter()

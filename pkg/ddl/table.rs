@@ -24,7 +24,10 @@ pub fn create_table(
         .schema_by_name(&schema)
         .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
     let table_id = meta.gen_global_id()?;
-    let info = build_table_info(stmt, table_id)?;
+    let mut info = build_table_info(stmt, table_id)?;
+    if let Some(spec) = &stmt.partition {
+        crate::partition::attach_partitions(meta, &mut info, spec)?;
+    }
     meta.create_table_or_view(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(info)

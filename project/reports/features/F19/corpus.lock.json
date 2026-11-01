@@ -1,0 +1,23 @@
+{
+  "feature": "F19",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/planner/core/rule_partition_processor.go",
+    "TiDB pkg/table/tables/partition.go",
+    "TiDB pkg/ddl/partition.go"
+  ],
+  "cases": [
+    "CREATE TABLE t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE))",
+    "CREATE TABLE t (id INT, name VARCHAR(20)) PARTITION BY HASH (id) PARTITIONS 4",
+    "INSERT INTO t VALUES (1, 'a'), (15, 'b')",
+    "SELECT * FROM t WHERE id < 10",
+    "SELECT * FROM t WHERE id = 15",
+    "SELECT * FROM t WHERE id >= 20",
+    "SELECT * FROM t WHERE name = 'b'",
+    "SELECT * FROM h WHERE id = 5",
+    "INSERT INTO r VALUES (9)",
+    "CREATE TABLE t (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+    "CREATE TABLE t (id INT) PARTITION BY KEY (id) PARTITIONS 2",
+    "ALTER TABLE t ADD PARTITION (PARTITION p3 VALUES LESS THAN (40))"
+  ]
+}

@@ -37,9 +37,11 @@ impl PlanBuilder {
                         tp: map_join_type(join.tp),
                         left: Box::new(PhysicalPlan::TableReader {
                             table: join.left.name.clone(),
+                            partitions: Vec::new(),
                         }),
                         right: Box::new(PhysicalPlan::TableReader {
                             table: join.right.name.clone(),
+                            partitions: Vec::new(),
                         }),
                     }
                 } else if let Some(from) = &select.from
@@ -341,11 +343,13 @@ fn access_plan(
                 return PhysicalPlan::IndexLookUpReader {
                     table: from.name.clone(),
                     index: index.name.o().to_string(),
+                    partitions: info.prune_partitions(select.selection.as_ref()),
                 };
             }
         }
         return PhysicalPlan::TableReader {
             table: from.name.clone(),
+            partitions: info.prune_partitions(select.selection.as_ref()),
         };
     }
     if let Some(handle) = point_get_handle(select.selection.as_ref()) {
@@ -356,6 +360,7 @@ fn access_plan(
     } else {
         PhysicalPlan::TableReader {
             table: from.name.clone(),
+            partitions: Vec::new(),
         }
     }
 }

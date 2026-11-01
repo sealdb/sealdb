@@ -967,4 +967,82 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("ALTER TABLE"));
     }
+
+    #[test]
+    fn test_partition_prune() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (20), PARTITION p2 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.t VALUES (1, 'a'), (15, 'b'), (25, 'c')",
+            )
+            .unwrap();
+        let table = session
+            .infoschema()
+            .table_by_name("db1", "t")
+            .unwrap()
+            .clone();
+        assert_eq!(table.partition.as_ref().unwrap().definitions.len(), 3);
+        let low = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id < 10 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            low.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let mid = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 15")
+            .unwrap();
+        assert_eq!(
+            mid.display_rows(),
+            vec![vec!["15".to_string(), "b".to_string()]]
+        );
+        let high = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id >= 20 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            high.display_rows(),
+            vec![vec!["25".to_string(), "c".to_string()]]
+        );
+        let all = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(all.display_rows().len(), 3);
+        session
+            .execute_stmt("CREATE INDEX idx_name ON db1.t (name)")
+            .unwrap();
+        let named = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'b'")
+            .unwrap();
+        assert_eq!(
+            named.display_rows(),
+            vec![vec!["15".to_string(), "b".to_string()]]
+        );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.h (id INT, name VARCHAR(20)) PARTITION BY HASH (id) PARTITIONS 4; INSERT INTO db1.h VALUES (1, 'x'), (2, 'y'), (5, 'z')",
+            )
+            .unwrap();
+        let hashed = session
+            .execute_stmt("SELECT * FROM db1.h WHERE id = 5")
+            .unwrap();
+        assert_eq!(
+            hashed.display_rows(),
+            vec![vec!["5".to_string(), "z".to_string()]]
+        );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.r (id INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (5))",
+            )
+            .unwrap();
+        let err = session
+            .execute_stmt("INSERT INTO db1.r VALUES (9)")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_NO_PARTITION_FOR_GIVEN_VALUE);
+        let err = session
+            .execute_stmt(
+                "CREATE TABLE db1.l (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+            )
+            .unwrap_err();
+        assert!(err.message.contains("LIST") || err.message.contains("partition"));
+    }
 }

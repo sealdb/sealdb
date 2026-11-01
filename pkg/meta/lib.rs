@@ -8,4 +8,7 @@ pub use meta::{
     Mutator, db_key, encode_hash_data_key, encode_string_data_key, is_db_key, is_table_key,
     parse_db_key, parse_table_key, table_key,
 };
-pub use model::{ColumnInfo, DBInfo, IndexColumn, IndexInfo, SchemaState, TableInfo};
+pub use model::{
+    ColumnInfo, DBInfo, IndexColumn, IndexInfo, PartitionDefinition, PartitionInfo, PartitionType,
+    SchemaState, TableInfo,
+};

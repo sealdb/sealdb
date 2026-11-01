@@ -58,7 +58,8 @@ impl Executor for DeleteExec {
             .map(|c| c.name.o().to_string())
             .collect();
         let for_update = self.txn.with_txn(|txn| Ok(txn.is_pessimistic()))?;
-        let rows = scan_table(&self.txn, &info, for_update)?;
+        let physical = info.prune_partitions(self.stmt.selection.as_ref());
+        let rows = scan_table(&self.txn, &info, for_update, &physical)?;
         self.txn.with_txn(|txn| {
             for scanned in rows {
                 if let Some(filter) = &self.stmt.selection
@@ -66,8 +67,16 @@ impl Executor for DeleteExec {
                 {
                     continue;
                 }
-                delete_index_keys(txn, &info, scanned.handle, &scanned.values)?;
-                txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
+                delete_index_keys(
+                    txn,
+                    &info,
+                    scanned.handle,
+                    &scanned.values,
+                    scanned.physical_id,
+                )?;
+                txn.delete(
+                    encode_row_key_with_handle(scanned.physical_id, scanned.handle).as_bytes(),
+                )?;
             }
             Ok(())
         })

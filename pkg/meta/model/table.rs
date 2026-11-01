@@ -1,6 +1,7 @@
 use super::column::ColumnInfo;
 use super::index::IndexInfo;
 use super::job::{STATE_PUBLIC, SchemaState};
+use super::partition::PartitionInfo;
 use sealdb_parser::model::CIStr;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,8 @@ pub struct TableInfo {
     pub max_col_id: i64,
     #[serde(default)]
     pub max_idx_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<PartitionInfo>,
 }
 
 impl TableInfo {
@@ -41,6 +44,7 @@ impl TableInfo {
             version: CURR_LATEST_TABLE_INFO_VERSION,
             max_col_id,
             max_idx_id: 0,
+            partition: None,
         }
     }
 

@@ -31,6 +31,7 @@ pub enum PhysicalPlan {
     Delete,
     TableReader {
         table: String,
+        partitions: Vec<i64>,
     },
     PointGet {
         table: String,
@@ -39,6 +40,7 @@ pub enum PhysicalPlan {
     IndexLookUpReader {
         table: String,
         index: String,
+        partitions: Vec<i64>,
     },
     Selection {
         child: Box<PhysicalPlan>,
@@ -94,10 +96,38 @@ impl PhysicalPlan {
             PhysicalPlan::Insert => "Insert".to_string(),
             PhysicalPlan::Update => "Update".to_string(),
             PhysicalPlan::Delete => "Delete".to_string(),
-            PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
+            PhysicalPlan::TableReader { table, partitions } => {
+                if partitions.is_empty() {
+                    format!("TableReader_{table}")
+                } else {
+                    format!(
+                        "TableReader_{table}_{}",
+                        partitions
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+            }
             PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
-            PhysicalPlan::IndexLookUpReader { table, index } => {
-                format!("IndexLookUpReader_{table}_{index}")
+            PhysicalPlan::IndexLookUpReader {
+                table,
+                index,
+                partitions,
+            } => {
+                if partitions.is_empty() {
+                    format!("IndexLookUpReader_{table}_{index}")
+                } else {
+                    format!(
+                        "IndexLookUpReader_{table}_{index}_{}",
+                        partitions
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
             }
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),

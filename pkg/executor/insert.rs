@@ -84,9 +84,14 @@ impl Executor for InsertExec {
                         _ => None,
                     })
                     .unwrap_or_else(|| self.domain.next_handle(info.id));
-                let key = encode_row_key_with_handle(info.id, handle);
+                let part_val = info
+                    .partition_value(&values)
+                    .cloned()
+                    .unwrap_or(sealdb_types::Datum::Null);
+                let physical_id = info.locate_partition(&part_val)?;
+                let key = encode_row_key_with_handle(physical_id, handle);
                 txn.set(key.as_bytes(), &encode_row(&col_ids, &values))?;
-                write_index_keys(txn, info, handle, &values)?;
+                write_index_keys(txn, info, handle, &values, physical_id)?;
             }
             Ok(())
         })

@@ -31,6 +31,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_DUP_FIELDNAME => "ErrDupFieldName",
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
+        errcode::ERR_NO_PARTITION_FOR_GIVEN_VALUE => "ErrNoPartitionForGivenValue",
         _ => "ErrUnknown",
     }
 }

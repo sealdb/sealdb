@@ -105,12 +105,34 @@ impl IndexDef {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartitionType {
+    Range,
+    Hash,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionDef {
+    pub name: String,
+    /// RANGE bound; `None` means MAXVALUE. Unused for HASH.
+    pub less_than: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionOption {
+    pub tp: PartitionType,
+    pub column: String,
+    pub defs: Vec<PartitionDef>,
+    pub num: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateTableStmt {
     pub if_not_exists: bool,
     pub table: TableName,
     pub cols: Vec<ColumnDef>,
     pub indices: Vec<IndexDef>,
+    pub partition: Option<PartitionOption>,
 }
 
 impl CreateTableStmt {
@@ -132,6 +154,38 @@ impl CreateTableStmt {
             index.restore(ctx)?;
         }
         ctx.write_str(")");
+        if let Some(part) = &self.partition {
+            ctx.write_str(" PARTITION BY ");
+            match part.tp {
+                PartitionType::Range => ctx.write_str("RANGE"),
+                PartitionType::Hash => ctx.write_str("HASH"),
+            }
+            ctx.write_str(" (");
+            ctx.write_name(&part.column);
+            ctx.write_str(")");
+            if part.tp == PartitionType::Hash && part.defs.is_empty() {
+                ctx.write_str(" PARTITIONS ");
+                ctx.write_str(&part.num.to_string());
+            } else {
+                ctx.write_str(" (");
+                for (i, def) in part.defs.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_str("PARTITION ");
+                    ctx.write_name(&def.name);
+                    if part.tp == PartitionType::Range {
+                        ctx.write_str(" VALUES LESS THAN (");
+                        match def.less_than {
+                            Some(v) => ctx.write_str(&v.to_string()),
+                            None => ctx.write_str("MAXVALUE"),
+                        }
+                        ctx.write_str(")");
+                    }
+                }
+                ctx.write_str(")");
+            }
+        }
         Ok(())
     }
 }

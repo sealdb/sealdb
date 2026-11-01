@@ -10,7 +10,8 @@ pub mod misc;
 pub use ast::{Node, Statement, StmtNode};
 pub use ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
-    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, TableName,
+    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
+    PartitionOption, PartitionType, TableName,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
