@@ -1,0 +1,21 @@
+{
+  "feature": "F20",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/privilege/privilege.go",
+    "TiDB pkg/executor/grant.go",
+    "TiDB pkg/parser/ast/misc.go"
+  ],
+  "cases": [
+    "GRANT SELECT, INSERT ON db1.t TO 'u'@'%'",
+    "GRANT ALL ON *.* TO 'root'@'%'",
+    "REVOKE SELECT ON db1.t FROM 'u'@'%'",
+    "REVOKE SELECT ON *.* FROM 'u'@'%'",
+    "SHOW GRANTS FOR 'u'@'%'",
+    "SHOW GRANTS",
+    "GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION",
+    "GRANT r TO 'u'@'%'",
+    "CREATE USER 'u'@'%'",
+    "GRANT SELECT (id) ON db1.t TO 'u'@'%'"
+  ]
+}

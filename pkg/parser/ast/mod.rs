@@ -21,4 +21,7 @@ pub use expressions::{
     ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, ScalarSubqueryExpr, WindowFuncExpr,
     WindowSpec,
 };
-pub use misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};
+pub use misc::{
+    BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem, PrivilegeType,
+    RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+};

@@ -23,6 +23,8 @@ FEATURE_HINTS = {
     "DropIndexStmt": "F18",
     "ShowStmt": "F11",
     "UseStmt": "F11",
+    "GrantStmt": "F20",
+    "RevokeStmt": "F20",
     "AnalyzeTableStmt": "F21",
     "PrepareStmt": "C4",
     "ExecuteStmt": "C4",

@@ -471,4 +471,39 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("LIST") || err.message.contains("partition"));
     }
+
+    #[test]
+    fn test_parse_grant_revoke() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("GRANT SELECT, INSERT ON db1.t TO 'u'@'%'")
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => {
+                assert_eq!(grant.users[0].username, "u");
+                assert_eq!(grant.level.table_name, "t");
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("REVOKE SELECT ON *.* FROM 'u'@'%'")
+            .unwrap()
+        {
+            crate::ast::Statement::Revoke(revoke) => {
+                assert_eq!(revoke.level.level, crate::ast::GrantLevelType::Global);
+            }
+            other => panic!("expected RevokeStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::Grants);
+                assert_eq!(show.user.unwrap().username, "u");
+            }
+            other => panic!("expected ShowStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION")
+            .unwrap_err();
+        assert!(err.message.contains("GRANT OPTION"));
+    }
 }

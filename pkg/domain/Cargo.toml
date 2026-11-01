@@ -15,4 +15,5 @@ sealdb-infoschema.workspace = true
 sealdb-kv.workspace = true
 sealdb-meta.workspace = true
 sealdb-parser.workspace = true
+sealdb-privilege.workspace = true
 thiserror.workspace = true

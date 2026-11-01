@@ -32,12 +32,16 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
         errcode::ERR_NO_PARTITION_FOR_GIVEN_VALUE => "ErrNoPartitionForGivenValue",
+        errcode::ERR_DBACCESS_DENIED_ERROR => "ErrDBaccessDenied",
+        errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
         _ => "ErrUnknown",
     }
 }
 
 pub fn sqlstate_of(code: i32) -> &'static str {
     match code {
+        errcode::ERR_DBACCESS_DENIED_ERROR => "42000",
+        errcode::ERR_TABLEACCESS_DENIED_ERROR => "42000",
         errcode::ERR_NO_DB => "3D000",
         errcode::ERR_BAD_DB => "42000",
         errcode::ERR_TABLE_EXISTS => "42S01",

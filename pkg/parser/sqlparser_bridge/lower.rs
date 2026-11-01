@@ -13,23 +13,27 @@ use crate::ast::expressions::{
     BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
     ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
-use crate::ast::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};
+use crate::ast::misc::{
+    BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, PrivElem, PrivilegeType,
+    RevokeStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    AlterTableOperation, AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized, DataType,
-    Delete, DescribeAlias, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause,
-    LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Query,
-    SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
-    Values, WindowType, With,
+    Action, AlterTableOperation, AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized,
+    DataType, Delete, DescribeAlias, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, UnaryOperator, Update, Use, Value, Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    let rewritten = rewrite_show_grants(&rewritten)?;
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
@@ -47,6 +51,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 && flags.next() == Some(true)
             {
                 begin.pessimistic = true;
+            }
+            if let Statement::Show(show) = &mut lowered {
+                decode_show_grants(show);
             }
             if let Statement::CreateTable(create) = &mut lowered {
                 create.partition = partitions.next().flatten();
@@ -163,6 +170,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 kind: ShowStmtKind::Databases,
                 db_name: None,
                 table: None,
+                user: None,
             }))
         }
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -174,6 +182,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .map(object_name_last)
                 .transpose()?,
             table: None,
+            user: None,
         })),
         SqlStatement::ShowColumns { show_options, .. } => {
             let table = show_options
@@ -185,6 +194,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 kind: ShowStmtKind::Columns,
                 db_name: None,
                 table: Some(object_table_name(table)?),
+                user: None,
             }))
         }
         SqlStatement::ExplainTable {
@@ -202,6 +212,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 kind: ShowStmtKind::Columns,
                 db_name: None,
                 table: Some(object_table_name(table_name)?),
+                user: None,
             }))
         }
         SqlStatement::Insert(insert) => {
@@ -270,6 +281,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             }
             Ok(Statement::Rollback(RollbackStmt))
         }
+        SqlStatement::Grant(grant) => lower_grant(grant),
+        SqlStatement::Revoke(revoke) => lower_revoke(revoke),
         SqlStatement::Savepoint { .. } | SqlStatement::ReleaseSavepoint { .. } => {
             Err(Error::unsupported("SAVEPOINT"))
         }
@@ -278,6 +291,243 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             format!("statement {other} is not available in this phase"),
         )),
     }
+}
+
+const SHOW_GRANT_MARKER: &str = "__sealdb_grant__";
+const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
+
+fn rewrite_show_grants(sql: &str) -> Result<String> {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "GRANTS") {
+                let after_grants = skip_ws(bytes, after_show + "GRANTS".len());
+                let (marker, end) = if keyword_at(bytes, after_grants, "FOR") {
+                    let after_for = skip_ws(bytes, after_grants + "FOR".len());
+                    if keyword_at(bytes, after_for, "CURRENT_USER") {
+                        let after_user = after_for + "CURRENT_USER".len();
+                        let after_user = if after_user < bytes.len() && bytes[after_user] == b'(' {
+                            skip_ws(bytes, after_user + 1).max(after_user)
+                                + usize::from(
+                                    skip_ws(bytes, after_user + 1) < bytes.len()
+                                        && bytes[skip_ws(bytes, after_user + 1)] == b')',
+                                )
+                        } else {
+                            after_user
+                        };
+                        (SHOW_GRANT_MARKER.to_string(), after_user)
+                    } else {
+                        let (user, end) = parse_user_identity_bytes(bytes, after_for)?;
+                        (
+                            format!("{SHOW_GRANT_PREFIX}{}@{}__", user.username, user.hostname),
+                            end,
+                        )
+                    }
+                } else {
+                    (SHOW_GRANT_MARKER.to_string(), after_grants)
+                };
+                out.push_str("DESC `");
+                out.push_str(&marker);
+                out.push('`');
+                i = end;
+                continue;
+            }
+        }
+        out.push(sql[i..].chars().next().unwrap());
+        i += sql[i..].chars().next().unwrap().len_utf8();
+    }
+    Ok(out)
+}
+
+fn decode_show_grants(show: &mut ShowStmt) {
+    let Some(table) = show.table.as_ref() else {
+        return;
+    };
+    let name = table.name.clone();
+    if name == SHOW_GRANT_MARKER {
+        show.kind = ShowStmtKind::Grants;
+        show.table = None;
+        show.user = None;
+        return;
+    }
+    if let Some(rest) = name
+        .strip_prefix(SHOW_GRANT_PREFIX)
+        .and_then(|s| s.strip_suffix("__"))
+        && let Some((user, host)) = rest.split_once('@')
+    {
+        show.kind = ShowStmtKind::Grants;
+        show.table = None;
+        show.user = Some(UserIdentity::new(user, host));
+    }
+}
+
+fn parse_user_identity_bytes(bytes: &[u8], i: usize) -> Result<(UserIdentity, usize)> {
+    let (user, after_user) = parse_quoted_or_ident(bytes, i)?;
+    let i = skip_ws(bytes, after_user);
+    if i < bytes.len() && bytes[i] == b'@' {
+        let (host, end) = parse_quoted_or_ident(bytes, skip_ws(bytes, i + 1))?;
+        return Ok((UserIdentity::new(user, host), end));
+    }
+    Ok((UserIdentity::new(user, "%"), after_user))
+}
+
+fn parse_quoted_or_ident(bytes: &[u8], i: usize) -> Result<(String, usize)> {
+    if i >= bytes.len() {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing user identity"));
+    }
+    let quote = bytes[i];
+    if quote == b'\'' || quote == b'"' || quote == b'`' {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != quote {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            return Err(Error::new(ERR_PARSE_ERROR, "unclosed user identity"));
+        }
+        return Ok((
+            String::from_utf8_lossy(&bytes[i + 1..j]).into_owned(),
+            j + 1,
+        ));
+    }
+    let mut j = i;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    if j == i {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing user identity"));
+    }
+    Ok((String::from_utf8_lossy(&bytes[i..j]).into_owned(), j))
+}
+
+fn lower_grant(grant: &Grant) -> Result<Statement> {
+    // F20 gaps: WITH GRANT OPTION, GRANT ROLE, IDENTIFIED BY, column grants.
+    if grant.with_grant_option {
+        return Err(Error::unsupported("WITH GRANT OPTION"));
+    }
+    if grant.as_grantor.is_some() || grant.granted_by.is_some() || grant.current_grants.is_some() {
+        return Err(Error::unsupported("GRANT option"));
+    }
+    Ok(Statement::Grant(GrantStmt {
+        privs: lower_privileges(&grant.privileges)?,
+        level: lower_grant_objects(grant.objects.as_ref())?,
+        users: lower_grantees(&grant.grantees)?,
+    }))
+}
+
+fn lower_revoke(revoke: &Revoke) -> Result<Statement> {
+    if revoke.grant_option_for {
+        return Err(Error::unsupported("GRANT OPTION FOR"));
+    }
+    if revoke.granted_by.is_some() || revoke.cascade.is_some() {
+        return Err(Error::unsupported("REVOKE option"));
+    }
+    Ok(Statement::Revoke(RevokeStmt {
+        privs: lower_privileges(&revoke.privileges)?,
+        level: lower_grant_objects(revoke.objects.as_ref())?,
+        users: lower_grantees(&revoke.grantees)?,
+    }))
+}
+
+fn lower_privileges(privs: &Privileges) -> Result<Vec<PrivElem>> {
+    match privs {
+        Privileges::All { .. } => Ok(vec![PrivElem {
+            tp: PrivilegeType::ALL,
+        }]),
+        Privileges::Actions(actions) => {
+            let mut out = Vec::new();
+            for action in actions {
+                out.push(PrivElem {
+                    tp: lower_action(action)?,
+                });
+            }
+            if out.is_empty() {
+                return Err(Error::unsupported("GRANT without privilege"));
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn lower_action(action: &Action) -> Result<PrivilegeType> {
+    match action {
+        Action::Select { columns } if columns.is_none() => Ok(PrivilegeType::SELECT),
+        Action::Insert { columns } if columns.is_none() => Ok(PrivilegeType::INSERT),
+        Action::Update { columns } if columns.is_none() => Ok(PrivilegeType::UPDATE),
+        Action::Delete => Ok(PrivilegeType::DELETE),
+        Action::Create { obj_type } if obj_type.is_none() => Ok(PrivilegeType::CREATE),
+        Action::Drop => Ok(PrivilegeType::DROP),
+        Action::Select { .. } | Action::Insert { .. } | Action::Update { .. } => {
+            Err(Error::unsupported("column privilege"))
+        }
+        Action::Role { .. } => Err(Error::unsupported("GRANT ROLE")),
+        other => Err(Error::unsupported(format!("privilege {other}"))),
+    }
+}
+
+fn lower_grant_objects(objects: Option<&GrantObjects>) -> Result<GrantLevel> {
+    let Some(GrantObjects::Tables(names)) = objects else {
+        return Err(Error::unsupported("GRANT object type"));
+    };
+    if names.len() != 1 {
+        return Err(Error::unsupported("GRANT multiple objects"));
+    }
+    let parts = object_name_parts(&names[0])?;
+    match parts.as_slice() {
+        [a, b] if a == "*" && b == "*" => Ok(GrantLevel {
+            level: GrantLevelType::Global,
+            db_name: String::new(),
+            table_name: String::new(),
+        }),
+        [a, b] if b == "*" => Ok(GrantLevel {
+            level: GrantLevelType::DB,
+            db_name: a.clone(),
+            table_name: String::new(),
+        }),
+        [a, b] => Ok(GrantLevel {
+            level: GrantLevelType::Table,
+            db_name: a.clone(),
+            table_name: b.clone(),
+        }),
+        [a] if a == "*" => Ok(GrantLevel {
+            level: GrantLevelType::DB,
+            db_name: String::new(),
+            table_name: String::new(),
+        }),
+        [a] => Ok(GrantLevel {
+            level: GrantLevelType::Table,
+            db_name: String::new(),
+            table_name: a.clone(),
+        }),
+        _ => Err(Error::unsupported("GRANT level")),
+    }
+}
+
+fn lower_grantees(grantees: &[sqlparser::ast::Grantee]) -> Result<Vec<UserIdentity>> {
+    if grantees.is_empty() {
+        return Err(Error::unsupported("GRANT without user"));
+    }
+    let mut users = Vec::new();
+    for grantee in grantees {
+        if !matches!(
+            grantee.grantee_type,
+            sqlparser::ast::GranteesType::None | sqlparser::ast::GranteesType::User
+        ) {
+            return Err(Error::unsupported("GRANT ROLE"));
+        }
+        match &grantee.name {
+            Some(GranteeName::UserHost { user, host }) => {
+                users.push(UserIdentity::new(user.value.clone(), host.value.clone()));
+            }
+            Some(GranteeName::ObjectName(name)) => {
+                users.push(UserIdentity::new(object_name_last(name)?, "%"));
+            }
+            None => return Err(Error::unsupported("GRANT PUBLIC")),
+        }
+    }
+    Ok(users)
 }
 
 fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {

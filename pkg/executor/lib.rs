@@ -7,6 +7,7 @@ pub mod cte;
 pub mod ddl;
 pub mod delete;
 pub mod distsql;
+pub mod grant;
 pub mod index;
 pub mod insert;
 pub mod internal;

@@ -1,6 +1,6 @@
 # Leftover inventory
 
-Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, U0, U1, U2, U3
+Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, U0, U1, U2, U3
 
 ## PlanBuilder statement kinds still open
 
@@ -34,14 +34,12 @@ Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10,
 - `ast.FlushStmt` → unmapped
 - `ast.AlterInstanceStmt` → unmapped
 - `ast.RenameUserStmt` → unmapped
-- `ast.GrantStmt` → unmapped
 - `ast.BRIEStmt` → unmapped
 - `ast.CalibrateResourceStmt` → unmapped
 - `ast.AddQueryWatchStmt` → unmapped
 - `ast.DropQueryWatchStmt` → unmapped
 - `ast.GrantRoleStmt` → unmapped
 - `ast.RevokeRoleStmt` → unmapped
-- `ast.RevokeStmt` → unmapped
 - `ast.KillStmt` → unmapped
 - `ast.DropUserStmt` → unmapped
 - `ast.SetPwdStmt` → unmapped

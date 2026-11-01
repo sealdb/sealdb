@@ -4,12 +4,14 @@ use sealdb_infoschema::InfoSchema;
 use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::Mutator;
 use sealdb_parser::ast::Statement;
+use sealdb_privilege::Manager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub struct Domain {
     inner: Mutex<Inner>,
     storage: Arc<MemStorage>,
+    privilege: Arc<Manager>,
 }
 
 struct Inner {
@@ -20,6 +22,14 @@ struct Inner {
 
 impl Domain {
     pub fn new() -> Self {
+        Self::with_privilege(Manager::skip_with_grant())
+    }
+
+    pub fn with_grant_table() -> Self {
+        Self::with_privilege(Manager::with_grant_table())
+    }
+
+    fn with_privilege(privilege: Manager) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 meta: Mutator::new(),
@@ -27,7 +37,12 @@ impl Domain {
                 next_handle: HashMap::new(),
             }),
             storage: Arc::new(MemStorage::new()),
+            privilege: Arc::new(privilege),
         }
+    }
+
+    pub fn privilege(&self) -> Arc<Manager> {
+        Arc::clone(&self.privilege)
     }
 
     pub fn infoschema(&self) -> InfoSchema {

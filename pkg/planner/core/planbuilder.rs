@@ -173,6 +173,12 @@ impl PlanBuilder {
             Statement::Rollback(_) => Ok(PhysicalPlan::Show {
                 kind: "Rollback".to_string(),
             }),
+            Statement::Grant(_) => Ok(PhysicalPlan::Simple {
+                kind: "Grant".to_string(),
+            }),
+            Statement::Revoke(_) => Ok(PhysicalPlan::Simple {
+                kind: "Revoke".to_string(),
+            }),
             Statement::SetOpr(set) => {
                 let mut plan = self.build_with_schema(
                     &Statement::Select(with_inherited(set.first.clone(), set.with.as_ref())),

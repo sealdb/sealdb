@@ -31,7 +31,7 @@
 | 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT * 走内存 KV |
 | 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
 | 7 | CBO 与统计 | `not-started` | — | — | F21 | 依赖 Phase 5/6 |
-| 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F19 已通；F20 GRANT 未开始 |
+| 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F20 已通；F21 ANALYZE 未开始 |
 | 9 | MySQL 协议与运维 | `not-started` | — | — | F22 | 可提前做只读协议 |
 | 10 | 可选高级能力 | `deferred` | — | — | C6 | 完整性波不阻塞主线 |
 
@@ -59,7 +59,8 @@
 | F17 | `core-ported` | `project/reports/features/F17/` |
 | F18 | `core-ported` | `project/reports/features/F18/` |
 | F19 | `core-ported` | `project/reports/features/F19/` |
-| F20–F22 | `not-started` | — |
+| F20 | `core-ported` | `project/reports/features/F20/` |
+| F21–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -102,6 +103,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F20 GRANT/REVOKE
+- **完成**:
+  - `GRANT` / `REVOKE` SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALL
+  - 默认 SkipGrantTables；关闭后按内存授权检查
+  - `SHOW GRANTS`
+- **验证**:
+  - `./project/scripts/feature_gate.sh F20`
+- **下一步**:
+  - F21 ANALYZE
 
 ### 2026-11-01
 

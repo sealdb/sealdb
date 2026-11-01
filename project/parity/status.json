@@ -110,8 +110,26 @@
     },
     "pkg/parser/ast/misc.go": {
       "status": "partial",
-      "phase": 6,
-      "notes": "ShowStmt + UseStmt + Begin/Commit/Rollback"
+      "phase": 8,
+      "notes": "ShowStmt + UseStmt + Begin/Commit/Rollback + Grant/Revoke + SHOW GRANTS"
+    },
+    "pkg/privilege/privilege.go": {
+      "status": "partial",
+      "rust": "pkg/privilege/privilege.rs",
+      "phase": 8,
+      "notes": "in-memory Manager grant/revoke/verify; SkipGrantTables default"
+    },
+    "pkg/privilege/privileges/privileges.go": {
+      "status": "partial",
+      "rust": "pkg/privilege/privileges/mod.rs",
+      "phase": 8,
+      "notes": "SkipWithGrant default; mysql.* persist and auth deferred"
+    },
+    "pkg/executor/grant.go": {
+      "status": "partial",
+      "rust": "pkg/executor/grant.rs",
+      "phase": 8,
+      "notes": "GrantExec applies in-memory grants; roles deferred"
     },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
@@ -181,7 +199,7 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE, partition prune"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE, partition prune, Grant/Revoke"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
@@ -392,7 +410,7 @@
     "pkg/session/session.go": {
       "status": "partial",
       "phase": 6,
-      "notes": "ExecuteStmt plus explicit BEGIN/COMMIT/ROLLBACK and BEGIN PESSIMISTIC"
+      "notes": "ExecuteStmt plus txn + SkipGrant privilege checks for GRANT/REVOKE"
     },
     "pkg/sessiontxn/isolation/optimistic.go": {
       "status": "partial",
