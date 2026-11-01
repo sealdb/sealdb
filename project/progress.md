@@ -28,7 +28,7 @@
 | 2 | 解析器 + Mock 链路 | `in-progress` | 2026-11-01 | — | U2/U3/F01 | `SELECT 1` 与 F01 表达式已通；parser 全量 60% 留完整性波 |
 | 3 | 元数据与 Bootstrap | `done` | 2026-11-01 | 2026-11-01 | F02/F11 | SHOW/DESC 走内存 InfoSchema |
 | 4 | Planner v1（RBO） | `in-progress` | 2026-11-01 | — | F03–F10 | F03 TableReader 已通；WHERE 起才有规则 |
-| 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT * 走内存 KV |
+| 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT *；默认 MemStorage，`--store tikv` 可写真实集群 |
 | 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
 | 7 | CBO 与统计 | `in-progress` | 2026-11-01 | — | F21 | ANALYZE 行数/NDV 已通；直方图留完整性波 |
 | 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F20 已通 |
@@ -82,7 +82,7 @@
 | `pkg/types` | `sealdb-types` | ✅ | 核心 | 1 |
 | `pkg/kv` | `sealdb-kv` | ✅ | 0 | 1/6 |
 | `pkg/util` | `sealdb-util` | ✅ | 核心 | 1/5 |
-| `pkg/config` | `sealdb-config` | ✅ | 0 | 0/9 |
+| `pkg/config` | `sealdb-config` | ✅ | 核心 | 0/9 |
 | `pkg/errno` | `sealdb-errno` | ✅ | 核心 | 1 |
 | `pkg/meta` | `sealdb-meta` | ✅ | 核心 | 3 |
 | `pkg/infoschema` | `sealdb-infoschema` | ✅ | 核心 | 3 |
@@ -93,7 +93,7 @@
 | `pkg/session` | `sealdb-session` | ✅ | 0 | 2/6 |
 | `pkg/sessionctx` | `sealdb-sessionctx` | ✅ | 0 | 2/6 |
 | `pkg/sessiontxn` | `sealdb-sessiontxn` | ✅ | 0 | 6 |
-| `pkg/store` | `sealdb-store` | ✅ | 0 | 5/6 |
+| `pkg/store` | `sealdb-store` | ✅ | 核心 | 5/6 |
 | `pkg/distsql` | `sealdb-distsql` | ✅ | 0 | 5 |
 | `pkg/table` | `sealdb-table` | ✅ | 0 | 5 |
 | `pkg/tablecodec` | `sealdb-tablecodec` | ✅ | 0 | 1 |
@@ -107,6 +107,24 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: 存储后端（MemStorage + TiKV）
+- **完成**:
+  - 保留 `MemStorage` 为默认；`--store memory|tikv` / `SEALDB_STORE` 切换
+  - `--pd` / `SEALDB_PD_ENDPOINTS` 指向 PD；`pkg/store/driver` 封装 `tikv-client` 0.4
+  - `Domain` 持有 `Arc<dyn Storage>`；`Session::new()` / feature gate 仍走内存
+  - listen 连接共享同一个 Domain（同进程可见同一张表）
+- **验证**:
+  - `cargo test --workspace`（无集群时跳过 live TiKV）
+  - 本地 PD `127.0.0.1:2379` 上 `--store tikv` SQL 冒烟
+- **阻塞/风险**:
+  - schema / `next_handle` 仍在进程内存；重启后表定义丢失，行键可残留
+  - TiKV 上 RC `refresh_snapshot`、coprocessor、跨进程 schema 未做
+- **下一步**:
+  - SQL leftover（HAVING / INSERT SELECT / IN/BETWEEN/LIKE / information_schema）
+  - C6 保持 deferred
 
 ### 2026-11-01
 
@@ -486,7 +504,7 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 | D2 | ~~edition 2024 vs Cargo 1.80~~ | 已解决 | Rust 1.99.1 |
 | D3 | 本地 PD/TiKV 仍可能是 9.0 beta | 行为/协议风险 | 测试固定 8.5.8 |
 | D4 | sqlparser-rs 与目标语法差异 | Parser 覆盖不全 | bridge + 分批补齐（ADR-0003） |
-| D5 | tikv-client 能力待验证 | 事务/Cop 可能缺 API | Phase 0 spike（ADR-0004） |
+| D5 | tikv-client 乐观/悲观 KV 已封装；coprocessor 仍缺 | Cop 下推不可用 | 完整性波 / leftover |
 | D6 | workspace crate 边界 | 需显式依赖 | 按顶层包维护；循环依赖单独讨论 |
 | D7 | 源码不含来源标记 | 追溯依赖 manifest | 强制更新 `project/parity/status.json` |
 
