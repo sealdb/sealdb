@@ -107,10 +107,27 @@ go run ./cmd/tidb-oracle \
 
 ## 3. Rust 侧差分 Harness
 
-### 3.1 位置
+### 3.0 SQL 集成测试（已落地，对齐 TiDB `tests/integrationtest`）
+
+```text
+tests/integrationtest/
+├── t/*.test       # 输入脚本（mysql-tester 方言）
+├── r/*.result     # 金样：回显 SQL + TSV / Error code (sqlstate): msg
+├── src/lib.rs     # Session 进程内 runner
+├── src/main.rs    # sealdb-itest --record / --case
+└── run-tests.sh   # TiDB 同款 -t / -r 包装
+```
+
+- 每份 `.test` 使用独立 `Session` + `MemStorage`，`cargo test -p sealdb-integrationtest` 即可跑。
+- 指令：`#` 注释、`-- error N`、`-- sorted_result`。`connect`/`connection`、对 `--listen` 的 mysql-tester、`s/*.json` 延后。
+- 不要整棵导入 TiDB `t/`：未移植能力会把金样刷成 Error。
+- 记录：`./tests/integrationtest/run-tests.sh -r` 或 `SEALDB_ITEST_RECORD` 不用——用 `--record`。
+
+### 3.1 位置（Oracle JSON 差分，尚未落地）
 
 ```text
 tests/
+├── integrationtest/       # §3.0 SQL I/O 金样（已落地）
 ├── conformance/           # 金样测试
 │   ├── parser/
 │   ├── plan/
@@ -295,6 +312,7 @@ cargo +nightly fuzz run codec_roundtrip
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
+cargo test -p sealdb-integrationtest --lib
 python3 project/scripts/parity_check.py --strict
 ```
 

@@ -27,6 +27,7 @@ members = [
     "pkg/ddl",
     "pkg/server",
     "cmd/tidb-server",
+    "tests/integrationtest",
 ]
 
 [workspace.package]

@@ -1,0 +1,12 @@
+CREATE DATABASE itest;
+CREATE TABLE itest.t1 (id INT, name VARCHAR(20));
+CREATE TABLE itest.t2 (id INT, tag VARCHAR(20));
+INSERT INTO itest.t1 VALUES (1, 'a'), (2, 'b');
+INSERT INTO itest.t2 VALUES (1, 'x'), (3, 'y');
+SELECT t1.id, t1.name, t2.tag FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id;
+t1.id	t1.name	t2.tag
+1	a	x
+SELECT t1.id, t2.tag FROM itest.t1 LEFT JOIN itest.t2 ON t1.id = t2.id ORDER BY t1.id;
+t1.id	t2.tag
+1	x
+2	NULL

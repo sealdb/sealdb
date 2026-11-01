@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01  
+> 最后更新：2026-11-01（SQL 集成测试框架）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: SQL 集成测试（TiDB testdata）
+- **完成**:
+  - `tests/integrationtest`：`t/*.test` + `r/*.result` + `sealdb-itest`
+  - 进程内 `Session` 执行；`-- error N` / `-- sorted_result`
+  - 种子套件：basic / predicate / agg / dml / join / txn / infoschema / errors
+  - `connect`/`connection`、mysql-tester over `--listen` 延后
+- **验证**:
+  - `cargo test -p sealdb-integrationtest`
+  - `./tests/integrationtest/run-tests.sh`
+- **下一步**:
+  - leftover（PPD / DISTINCT agg / SHOW CREATE）或 C6 deferred
 
 ### 2026-11-01
 
