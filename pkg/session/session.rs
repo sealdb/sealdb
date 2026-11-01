@@ -4,9 +4,11 @@ use sealdb_executor::{ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
+use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity};
-use sealdb_planner::PlanBuilder;
+use sealdb_planner::{PhysicalPlan, PlanBuilder};
 use sealdb_sessiontxn::TxnManager;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub struct Session {
@@ -17,6 +19,9 @@ pub struct Session {
     current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
     isolation: Mutex<IsolationLevel>,
+    prepared: Mutex<HashMap<String, String>>,
+    plan_cache: Mutex<HashMap<String, (i64, PhysicalPlan)>>,
+    cache_plans: Mutex<bool>,
 }
 
 impl Session {
@@ -33,6 +38,9 @@ impl Session {
             current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
             isolation: Mutex::new(IsolationLevel::RepeatableRead),
+            prepared: Mutex::new(HashMap::new()),
+            plan_cache: Mutex::new(HashMap::new()),
+            cache_plans: Mutex::new(false),
         }
     }
 
@@ -100,6 +108,40 @@ impl Session {
                     map_isolation(set.isolation);
                 return Ok(empty_result());
             }
+            Statement::Prepare(prepare) => {
+                self.prepared
+                    .lock()
+                    .expect("session prepared lock")
+                    .insert(prepare.name.to_ascii_lowercase(), prepare.sql.clone());
+                return Ok(empty_result());
+            }
+            Statement::Deallocate(dealloc) => {
+                self.prepared
+                    .lock()
+                    .expect("session prepared lock")
+                    .remove(&dealloc.name.to_ascii_lowercase());
+                return Ok(empty_result());
+            }
+            Statement::Execute(exec) => {
+                let sql = self
+                    .prepared
+                    .lock()
+                    .expect("session prepared lock")
+                    .get(&exec.name.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_UNKNOWN_STMT_HANDLER,
+                            format!("Unknown prepared statement handler ({})", exec.name),
+                        )
+                    })?;
+                let bound = bind_sql(&sql, &exec.using)?;
+                let inner = self.parser.parse_one_stmt(&bound)?;
+                *self.cache_plans.lock().expect("session cache flag lock") = true;
+                let result = self.execute_one(&inner);
+                *self.cache_plans.lock().expect("session cache flag lock") = false;
+                return result;
+            }
             Statement::Begin(begin) => {
                 let isolation = if begin.isolation != AstIsolation::RepeatableRead {
                     map_isolation(begin.isolation)
@@ -161,9 +203,29 @@ impl Session {
             .clone();
         let is = self.domain.infoschema();
         let stats = self.domain.stats();
-        let plan =
+        let schema_ver = is.schema_meta_version();
+        let cache_key = restore_sql(stmt);
+        let use_cache = *self.cache_plans.lock().expect("session cache flag lock");
+        let plan = if use_cache {
+            let mut cache = self.plan_cache.lock().expect("session plan cache lock");
+            if let Some((ver, plan)) = cache.get(&cache_key)
+                && *ver == schema_ver
+            {
+                plan.clone()
+            } else {
+                let plan = self.planner.build_with_schema(
+                    stmt,
+                    Some(&is),
+                    &current_db,
+                    Some(stats.as_ref()),
+                )?;
+                cache.insert(cache_key, (schema_ver, plan.clone()));
+                plan
+            }
+        } else {
             self.planner
-                .build_with_schema(stmt, Some(&is), &current_db, Some(stats.as_ref()))?;
+                .build_with_schema(stmt, Some(&is), &current_db, Some(stats.as_ref()))?
+        };
         let txn = self
             .txn
             .lock()
@@ -342,6 +404,59 @@ fn empty_result() -> QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
     }
+}
+
+fn restore_sql(stmt: &Statement) -> String {
+    let mut ctx = sealdb_parser::format::RestoreCtx::new();
+    let _ = sealdb_parser::ast::Node::restore(stmt, &mut ctx);
+    ctx.into_string()
+}
+
+fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut next = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            out.push(b as char);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'?' {
+            let expr = params.get(next).ok_or_else(|| {
+                sealdb_errno::Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "Incorrect arguments to EXECUTE",
+                )
+            })?;
+            next += 1;
+            let mut ctx = sealdb_parser::format::RestoreCtx::new();
+            expr.restore(&mut ctx)?;
+            out.push_str(&ctx.into_string());
+            i += 1;
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    if next != params.len() {
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "Incorrect arguments to EXECUTE",
+        ));
+    }
+    Ok(out)
 }
 
 fn map_isolation(level: AstIsolation) -> IsolationLevel {
@@ -844,6 +959,28 @@ mod tests {
         let still = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
         assert_eq!(still.display_rows()[0][1], "c");
         a.execute_stmt("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_prepare_execute_and_plan_cache() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
+            .unwrap();
+        let first = session.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(first.display_rows()[0].last().unwrap(), "a");
+        let second = session.execute_stmt("EXECUTE s USING 2").unwrap();
+        assert_eq!(second.display_rows()[0].last().unwrap(), "b");
+        let again = session.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(again.display_rows()[0].last().unwrap(), "a");
+        session.execute_stmt("DEALLOCATE PREPARE s").unwrap();
+        let err = session.execute_stmt("EXECUTE s USING 1").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_UNKNOWN_STMT_HANDLER);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+{
+  "feature": "C4",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/session/session.go Prepare/Execute",
+    "TiDB pkg/planner/core/plan_cache.go"
+  ],
+  "cases": [
+    "prepare-from-string",
+    "execute-using-int",
+    "execute-using-string",
+    "execute-second-hit",
+    "deallocate-unknown",
+    "unknown-stmt-handler-1243",
+    "prepare-select-filter",
+    "wrong-execute-arity"
+  ]
+}

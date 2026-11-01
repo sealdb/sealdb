@@ -469,8 +469,8 @@
     },
     "pkg/session/session.go": {
       "status": "partial",
-      "phase": 6,
-      "notes": "ExecuteStmt plus txn + SkipGrant privilege checks for GRANT/REVOKE"
+      "phase": 10,
+      "notes": "ExecuteStmt plus txn, SchemaChecker, PREPARE/EXECUTE plan cache"
     },
     "pkg/sessiontxn/isolation/optimistic.go": {
       "status": "partial",

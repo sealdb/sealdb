@@ -1,4 +1,5 @@
 use super::ddl::TableName;
+use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -327,6 +328,59 @@ pub struct RollbackStmt;
 impl RollbackStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ROLLBACK");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PrepareStmt {
+    pub name: String,
+    pub sql: String,
+}
+
+impl PrepareStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("PREPARE ");
+        ctx.write_name(&self.name);
+        ctx.write_str(" FROM '");
+        ctx.write_str(&self.sql);
+        ctx.write_str("'");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecuteStmt {
+    pub name: String,
+    pub using: Vec<ExprNode>,
+}
+
+impl ExecuteStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("EXECUTE ");
+        ctx.write_name(&self.name);
+        if !self.using.is_empty() {
+            ctx.write_str(" USING ");
+            for (i, expr) in self.using.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                expr.restore(ctx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeallocateStmt {
+    pub name: String,
+}
+
+impl DeallocateStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DEALLOCATE PREPARE ");
+        ctx.write_name(&self.name);
         Ok(())
     }
 }

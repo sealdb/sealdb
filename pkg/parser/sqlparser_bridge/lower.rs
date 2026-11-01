@@ -13,11 +13,11 @@ use crate::ast::expressions::{
     ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantLevel, GrantLevelType, GrantStmt, IsolationLevel,
-    PrivElem, PrivilegeType, RevokeStmt, RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
-    UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
+    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, RevokeStmt,
+    RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
 };
-use crate::ast::{ExplainFormat, ExplainStmt, Statement};
+use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
@@ -37,6 +37,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_explain_format(&rewritten);
+    let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
@@ -46,6 +47,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     })?;
     let mut flags = pessimistic_flags.into_iter();
     let mut partitions = partitions.into_iter();
+    let mut prepares = prepares.into_iter();
     stmts
         .iter()
         .map(|stmt| {
@@ -60,6 +62,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             }
             if let Statement::CreateTable(create) = &mut lowered {
                 create.partition = partitions.next().flatten();
+            }
+            if let Statement::Prepare(prepare) = &mut lowered
+                && let Some(sql) = prepares.next().flatten()
+            {
+                prepare.sql = sql;
             }
             Ok(lowered)
         })
@@ -297,6 +304,38 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         SqlStatement::Grant(grant) => lower_grant(grant),
         SqlStatement::Revoke(revoke) => lower_revoke(revoke),
         SqlStatement::Analyze(analyze) => lower_analyze(analyze),
+        SqlStatement::Prepare {
+            name, statement, ..
+        } => {
+            let mut ctx = crate::format::RestoreCtx::new();
+            let lowered = lower_statement(statement)?;
+            lowered.restore(&mut ctx)?;
+            Ok(Statement::Prepare(PrepareStmt {
+                name: name.value.clone(),
+                sql: ctx.into_string(),
+            }))
+        }
+        SqlStatement::Execute {
+            name,
+            using,
+            parameters,
+            ..
+        } => {
+            let name = name
+                .as_ref()
+                .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing prepared statement name"))?;
+            let mut values = Vec::new();
+            for expr in using.iter().map(|e| &e.expr).chain(parameters.iter()) {
+                values.push(lower_expr(expr)?);
+            }
+            Ok(Statement::Execute(ExecuteStmt {
+                name: object_name_last(name)?,
+                using: values,
+            }))
+        }
+        SqlStatement::Deallocate { name, .. } => Ok(Statement::Deallocate(DeallocateStmt {
+            name: name.value.clone(),
+        })),
         SqlStatement::Explain {
             analyze,
             verbose,
@@ -648,6 +687,49 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn extract_prepare_from(sql: &str) -> (String, Vec<Option<String>>) {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut sqls = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "PREPARE") {
+            let after = skip_ws(bytes, i + "PREPARE".len());
+            let (name, name_end) = take_ident(bytes, after);
+            let after_name = skip_ws(bytes, name_end);
+            if !name.is_empty() && keyword_at(bytes, after_name, "FROM") {
+                let value_at = skip_ws(bytes, after_name + "FROM".len());
+                let (value, end) = take_explain_format(bytes, value_at);
+                out.push_str("PREPARE ");
+                out.push_str(&name);
+                out.push_str(" AS SELECT 1");
+                sqls.push(Some(value));
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, sqls)
+}
+
+fn take_ident(bytes: &[u8], i: usize) -> (String, usize) {
+    if i >= bytes.len() {
+        return (String::new(), i);
+    }
+    if bytes[i] == b'`' || bytes[i] == b'\'' || bytes[i] == b'"' {
+        let (value, end) = take_explain_format(bytes, i);
+        return (value, end);
+    }
+    let mut j = i;
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    (String::from_utf8_lossy(&bytes[i..j]).into_owned(), j)
 }
 
 fn isolation_from_modes(modes: &[TransactionMode]) -> Result<IsolationLevel> {

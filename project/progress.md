@@ -65,7 +65,8 @@
 | C1 | `core-ported` | `project/reports/features/C1/` |
 | C2 | `core-ported` | `project/reports/features/C2/` |
 | C3 | `core-ported` | `project/reports/features/C3/` |
-| C4–C5 | `not-started` | — |
+| C4 | `core-ported` | `project/reports/features/C4/` |
+| C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
 ---
@@ -106,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: C4 Prepared / Plan Cache
+- **完成**:
+  - `PREPARE name FROM 'sql'` / `EXECUTE ... USING` / `DEALLOCATE PREPARE`
+  - 按还原 SQL + schema version 做会话级 plan cache
+- **验证**:
+  - `./project/scripts/feature_gate.sh C4`
+- **下一步**:
+  - C5 错误码、SQL Mode、charset/collation
 
 ### 2026-11-01
 
