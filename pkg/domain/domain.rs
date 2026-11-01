@@ -5,6 +5,7 @@ use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::Mutator;
 use sealdb_parser::ast::Statement;
 use sealdb_privilege::Manager;
+use sealdb_statistics::Handle;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,7 @@ pub struct Domain {
     inner: Mutex<Inner>,
     storage: Arc<MemStorage>,
     privilege: Arc<Manager>,
+    stats: Arc<Handle>,
 }
 
 struct Inner {
@@ -38,11 +40,16 @@ impl Domain {
             }),
             storage: Arc::new(MemStorage::new()),
             privilege: Arc::new(privilege),
+            stats: Arc::new(Handle::new()),
         }
     }
 
     pub fn privilege(&self) -> Arc<Manager> {
         Arc::clone(&self.privilege)
+    }
+
+    pub fn stats(&self) -> Arc<Handle> {
+        Arc::clone(&self.stats)
     }
 
     pub fn infoschema(&self) -> InfoSchema {

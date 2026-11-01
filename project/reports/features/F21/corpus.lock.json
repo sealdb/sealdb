@@ -1,0 +1,17 @@
+{
+  "feature": "F21",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/executor/analyze.go",
+    "TiDB pkg/statistics/table.go",
+    "TiDB pkg/statistics/handle/handle.go"
+  ],
+  "cases": [
+    "ANALYZE TABLE t",
+    "ANALYZE TABLE db1.t",
+    "SELECT * FROM t WHERE name = 'a'",
+    "ANALYZE TABLE t (id)",
+    "ANALYZE TABLE t INDEX idx_name",
+    "ANALYZE TABLE t PARTITION (p0)"
+  ]
+}

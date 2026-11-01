@@ -6,6 +6,7 @@ use sealdb_parser::ast::{
     JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
 };
 use sealdb_parser::opcode::Op;
+use sealdb_statistics::Handle;
 use sealdb_types::Datum;
 
 pub struct PlanBuilder;
@@ -16,7 +17,7 @@ impl PlanBuilder {
     }
 
     pub fn build(&self, stmt: &Statement) -> Result<PhysicalPlan> {
-        self.build_with_schema(stmt, None, "")
+        self.build_with_schema(stmt, None, "", None)
     }
 
     pub fn build_with_schema(
@@ -24,6 +25,7 @@ impl PlanBuilder {
         stmt: &Statement,
         is: Option<&InfoSchema>,
         current_db: &str,
+        stats: Option<&Handle>,
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
@@ -47,10 +49,10 @@ impl PlanBuilder {
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    if let Some(plan) = self.build_cte_plan(select, from, is, current_db)? {
+                    if let Some(plan) = self.build_cte_plan(select, from, is, current_db, stats)? {
                         plan
                     } else {
-                        access_plan(select, from, is, current_db)
+                        access_plan(select, from, is, current_db, stats)
                     }
                 } else {
                     let exprs = select
@@ -179,11 +181,15 @@ impl PlanBuilder {
             Statement::Revoke(_) => Ok(PhysicalPlan::Simple {
                 kind: "Revoke".to_string(),
             }),
+            Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "Analyze".to_string(),
+            }),
             Statement::SetOpr(set) => {
                 let mut plan = self.build_with_schema(
                     &Statement::Select(with_inherited(set.first.clone(), set.with.as_ref())),
                     is,
                     current_db,
+                    stats,
                 )?;
                 for (op, select) in &set.rest {
                     plan = PhysicalPlan::Union {
@@ -193,6 +199,7 @@ impl PlanBuilder {
                             &Statement::Select(with_inherited(select.clone(), set.with.as_ref())),
                             is,
                             current_db,
+                            stats,
                         )?),
                     };
                 }
@@ -219,6 +226,7 @@ impl PlanBuilder {
         from: &TableName,
         is: Option<&InfoSchema>,
         current_db: &str,
+        stats: Option<&Handle>,
     ) -> Result<Option<PhysicalPlan>> {
         let Some(with) = select.with.as_ref() else {
             return Ok(None);
@@ -230,8 +238,12 @@ impl PlanBuilder {
             return Err(Error::unsupported("qualified CTE name"));
         }
         let seed_select = with.seed_select(&from.name)?;
-        let mut seed =
-            self.build_with_schema(&Statement::Select(seed_select.clone()), is, current_db)?;
+        let mut seed = self.build_with_schema(
+            &Statement::Select(seed_select.clone()),
+            is,
+            current_db,
+            stats,
+        )?;
         if !is_star_select(&seed_select)
             && !needs_hash_agg(&seed_select)
             && !needs_window(&seed_select)
@@ -326,6 +338,7 @@ fn access_plan(
     from: &TableName,
     is: Option<&InfoSchema>,
     current_db: &str,
+    stats: Option<&Handle>,
 ) -> PhysicalPlan {
     // F10 core: integer handle PointGet still wins; otherwise first-column
     // equality on a secondary INDEX/KEY becomes IndexLookUpReader.
@@ -346,6 +359,19 @@ fn access_plan(
                 };
             }
             if let Some(index) = info.find_index_covering(&column) {
+                // F21: after ANALYZE, a non-selective equality (NDV <= 1)
+                // prefers TableReader over IndexLookUp. Unanalyzed tables
+                // keep the F10 IndexLookUp path.
+                let (db, table) = from.qualified(current_db);
+                if stats
+                    .and_then(|h| h.table(&db, &table))
+                    .is_some_and(|t| t.column(&column).is_some_and(|c| c.ndv <= 1))
+                {
+                    return PhysicalPlan::TableReader {
+                        table: from.name.clone(),
+                        partitions: info.prune_partitions(select.selection.as_ref()),
+                    };
+                }
                 return PhysicalPlan::IndexLookUpReader {
                     table: from.name.clone(),
                     index: index.name.o().to_string(),

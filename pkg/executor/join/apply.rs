@@ -374,10 +374,12 @@ fn run_select(
         return Ok(hit.clone());
     }
     let stmt = Statement::Select(select.clone());
+    let stats = ctx.domain.stats();
     let plan = PlanBuilder::new().build_with_schema(
         &stmt,
         Some(&ctx.domain.infoschema()),
         &ctx.current_db,
+        Some(stats.as_ref()),
     )?;
     let exec = ExecutorBuilder::build(
         &plan,

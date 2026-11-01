@@ -26,7 +26,7 @@
     "F18": {"status": "core-ported", "phase": 8, "notes": "CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX with in-place backfill", "gaps": ["ddl-job-states", "reorg", "unique-index", "change-modify-rename", "after-first", "algorithm-lock"]},
     "F19": {"status": "core-ported", "phase": 8, "notes": "RANGE/HASH PARTITION BY + physical-id locate/prune", "gaps": ["list-key", "range-columns", "expr-keys", "add-drop-partition", "subpartition", "dynamic-prune"]},
     "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + SkipGrantTables default and in-memory checks", "gaps": ["roles", "with-grant-option", "mysql-user-persist", "column-grants", "dynamic-privs", "create-user"]},
-    "F21": {"status": "not-started", "phase": 7, "gaps": []},
+    "F21": {"status": "core-ported", "phase": 7, "notes": "ANALYZE TABLE count/NDV + IndexLookUp vs TableReader CBO", "gaps": ["histogram", "topn", "auto-analyze", "analyze-index", "persist-stats", "join-cost"]},
     "F22": {"status": "not-started", "phase": 9, "gaps": []},
     "C1": {"status": "in-progress", "phase": 10, "notes": "leftover inventory script ready"},
     "C2": {"status": "not-started", "phase": 10, "gaps": []},

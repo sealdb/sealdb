@@ -1,4 +1,5 @@
 use crate::aggregate::HashAggExec;
+use crate::analyze::AnalyzeExec;
 use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
@@ -80,6 +81,12 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
+            PhysicalPlan::Simple { kind } if kind == "Analyze" => Ok(Box::new(AnalyzeExec::new(
+                domain,
+                stmt.clone(),
+                current_db,
+                txn,
+            ))),
             PhysicalPlan::Simple { .. } => Ok(Box::new(GrantExec::new(domain, stmt.clone()))),
             PhysicalPlan::Show { .. } => {
                 let show = match stmt {
@@ -299,8 +306,13 @@ impl ExecutorBuilder {
         txn: Arc<TxnHandle>,
     ) -> Result<Box<dyn Executor>> {
         let stmt = Statement::Select(select.clone());
-        let plan =
-            PlanBuilder::new().build_with_schema(&stmt, Some(&domain.infoschema()), current_db)?;
+        let stats = domain.stats();
+        let plan = PlanBuilder::new().build_with_schema(
+            &stmt,
+            Some(&domain.infoschema()),
+            current_db,
+            Some(stats.as_ref()),
+        )?;
         Self::build(&plan, &stmt, domain, current_db, txn)
     }
 

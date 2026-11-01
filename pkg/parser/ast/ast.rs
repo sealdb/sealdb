@@ -4,7 +4,9 @@ use super::ddl::{
 };
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
-use super::misc::{BeginStmt, CommitStmt, GrantStmt, RevokeStmt, RollbackStmt, ShowStmt, UseStmt};
+use super::misc::{
+    AnalyzeTableStmt, BeginStmt, CommitStmt, GrantStmt, RevokeStmt, RollbackStmt, ShowStmt, UseStmt,
+};
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -38,6 +40,7 @@ pub enum Statement {
     SetOpr(SetOprStmt),
     Grant(GrantStmt),
     Revoke(RevokeStmt),
+    AnalyzeTable(AnalyzeTableStmt),
 }
 
 impl Node for Statement {
@@ -62,6 +65,7 @@ impl Node for Statement {
             Statement::SetOpr(s) => s.restore(ctx),
             Statement::Grant(s) => s.restore(ctx),
             Statement::Revoke(s) => s.restore(ctx),
+            Statement::AnalyzeTable(s) => s.restore(ctx),
         }
     }
 }
@@ -88,6 +92,7 @@ impl StmtNode for Statement {
             Statement::SetOpr(_) => "SetOprStmt",
             Statement::Grant(_) => "GrantStmt",
             Statement::Revoke(_) => "RevokeStmt",
+            Statement::AnalyzeTable(_) => "AnalyzeTableStmt",
         }
     }
 }

@@ -131,6 +131,24 @@
       "phase": 8,
       "notes": "GrantExec applies in-memory grants; roles deferred"
     },
+    "pkg/executor/analyze.go": {
+      "status": "partial",
+      "rust": "pkg/executor/analyze.rs",
+      "phase": 7,
+      "notes": "full-scan ANALYZE TABLE count/NDV; histogram deferred"
+    },
+    "pkg/statistics/table.go": {
+      "status": "partial",
+      "rust": "pkg/statistics/table.rs",
+      "phase": 7,
+      "notes": "Table count + column NDV; HistColl deferred"
+    },
+    "pkg/statistics/handle/handle.go": {
+      "status": "partial",
+      "rust": "pkg/statistics/handle/mod.rs",
+      "phase": 7,
+      "notes": "in-memory Handle; persist/auto-analyze deferred"
+    },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 5,
@@ -199,7 +217,7 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE, partition prune, Grant/Revoke"
+      "notes": "Build plus F21 stats-aware IndexLookUp vs TableReader"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",

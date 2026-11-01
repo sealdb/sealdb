@@ -127,9 +127,10 @@ impl Session {
             .expect("session current_db lock")
             .clone();
         let is = self.domain.infoschema();
-        let plan = self
-            .planner
-            .build_with_schema(stmt, Some(&is), &current_db)?;
+        let stats = self.domain.stats();
+        let plan =
+            self.planner
+                .build_with_schema(stmt, Some(&is), &current_db, Some(stats.as_ref()))?;
         let txn = self
             .txn
             .lock()
@@ -146,6 +147,10 @@ impl Session {
 
     pub fn infoschema(&self) -> InfoSchema {
         self.domain.infoschema()
+    }
+
+    pub fn stats(&self) -> Arc<sealdb_statistics::Handle> {
+        self.domain.stats()
     }
 
     fn check_privilege(&self, stmt: &Statement) -> Result<()> {
@@ -257,6 +262,15 @@ impl Session {
             }
             Statement::DropIndex(drop) => {
                 require(&mgr, &user, &drop.table, &current_db, PrivilegeType::DROP)?;
+            }
+            Statement::AnalyzeTable(analyze) => {
+                require(
+                    &mgr,
+                    &user,
+                    &analyze.table,
+                    &current_db,
+                    PrivilegeType::SELECT,
+                )?;
             }
             _ => {}
         }
@@ -1253,5 +1267,49 @@ mod tests {
             .execute_stmt("INSERT INTO db1.t VALUES (2, 'b')")
             .unwrap_err();
         assert_eq!(denied.code, sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR);
+    }
+
+    #[test]
+    fn test_analyze_stats() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'a')",
+            )
+            .unwrap();
+        let parser = sealdb_parser::Parser::new();
+        let select = parser
+            .parse_one_stmt("SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        let before = PlanBuilder::new()
+            .build_with_schema(
+                &select,
+                Some(&session.infoschema()),
+                "",
+                Some(session.stats().as_ref()),
+            )
+            .unwrap();
+        assert!(before.explain().contains("IndexLookUpReader"));
+        session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
+        let stats = session.stats().table("db1", "t").unwrap();
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.column("name").unwrap().ndv, 1);
+        let after = PlanBuilder::new()
+            .build_with_schema(
+                &select,
+                Some(&session.infoschema()),
+                "",
+                Some(session.stats().as_ref()),
+            )
+            .unwrap();
+        assert!(
+            after.explain().contains("TableReader"),
+            "{}",
+            after.explain()
+        );
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.display_rows().len(), 3);
     }
 }

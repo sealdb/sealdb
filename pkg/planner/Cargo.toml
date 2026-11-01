@@ -14,6 +14,7 @@ sealdb-expression.workspace = true
 sealdb-infoschema.workspace = true
 sealdb-meta.workspace = true
 sealdb-parser.workspace = true
+sealdb-statistics.workspace = true
 sealdb-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true

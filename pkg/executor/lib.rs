@@ -2,6 +2,7 @@
 
 pub mod aggfuncs;
 pub mod aggregate;
+pub mod analyze;
 pub mod builder;
 pub mod cte;
 pub mod ddl;
