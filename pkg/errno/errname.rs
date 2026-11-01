@@ -26,6 +26,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_INVALID_INDEX_KEY => "ErrInvalidIndexKey",
         errcode::ERR_WRITE_CONFLICT => "ErrWriteConflict",
         errcode::ERR_LOCK_WAIT_TIMEOUT => "ErrLockWaitTimeout",
+        errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
         _ => "ErrUnknown",
     }
 }
@@ -41,6 +42,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_DUP_ENTRY => "23000",
         errcode::ERR_DATA_OUT_OF_RANGE => "22003",
         errcode::ERR_DIVISION_BY_ZERO => "22012",
+        errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
         _ => "HY000",
     }
 }

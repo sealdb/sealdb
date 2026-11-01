@@ -54,6 +54,9 @@ pub enum PhysicalPlan {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
     },
+    Apply {
+        child: Box<PhysicalPlan>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -87,6 +90,7 @@ impl PhysicalPlan {
             PhysicalPlan::HashJoin { tp, left, right } => {
                 format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
             }
+            PhysicalPlan::Apply { child } => format!("Apply -> {}", child.explain()),
         }
     }
 }

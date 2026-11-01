@@ -9,7 +9,8 @@ use crate::ast::dml::{
     SelectStmt, UpdateStmt,
 };
 use crate::ast::expressions::{
-    BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
+    BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
+    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
 };
 use crate::ast::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};
 use crate::opcode::Op;
@@ -19,8 +20,8 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
     LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByKind, OrderBySort,
-    SchemaName, SelectItem, SetExpr, Statement as SqlStatement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
+    Query, SchemaName, SelectItem, SetExpr, Statement as SqlStatement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -49,40 +50,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
 
 fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
     match stmt {
-        SqlStatement::Query(query) => match query.body.as_ref() {
-            SetExpr::Select(select) => {
-                let fields = select
-                    .projection
-                    .iter()
-                    .map(lower_select_item)
-                    .collect::<Result<Vec<_>>>()?;
-                let (from, join) = lower_from(&select.from)?;
-                let selection = select.selection.as_ref().map(lower_expr).transpose()?;
-                // F08 gap / completeness wave: HAVING.
-                if select.having.is_some() {
-                    return Err(Error::unsupported("HAVING"));
-                }
-                let group_by = lower_group_by(&select.group_by)?;
-                let order_by = lower_order_by(query.order_by.as_ref())?;
-                let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
-                Ok(Statement::Select(SelectStmt {
-                    fields,
-                    from,
-                    join,
-                    selection,
-                    group_by,
-                    order_by,
-                    limit,
-                    offset,
-                    lock: lower_select_lock(&query.locks)?,
-                    text: query.to_string(),
-                }))
-            }
-            other => Err(Error::new(
-                ERR_UNSUPPORTED,
-                format!("query body {:?} is not available in this phase", other),
-            )),
-        },
+        SqlStatement::Query(query) => Ok(Statement::Select(lower_query(query)?)),
         SqlStatement::CreateDatabase {
             db_name,
             if_not_exists,
@@ -371,6 +339,43 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
     }
 }
 
+fn lower_query(query: &Query) -> Result<SelectStmt> {
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            let fields = select
+                .projection
+                .iter()
+                .map(lower_select_item)
+                .collect::<Result<Vec<_>>>()?;
+            let (from, join) = lower_from(&select.from)?;
+            let selection = select.selection.as_ref().map(lower_expr).transpose()?;
+            // F08 gap / completeness wave: HAVING.
+            if select.having.is_some() {
+                return Err(Error::unsupported("HAVING"));
+            }
+            let group_by = lower_group_by(&select.group_by)?;
+            let order_by = lower_order_by(query.order_by.as_ref())?;
+            let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
+            Ok(SelectStmt {
+                fields,
+                from,
+                join,
+                selection,
+                group_by,
+                order_by,
+                limit,
+                offset,
+                lock: lower_select_lock(&query.locks)?,
+                text: query.to_string(),
+            })
+        }
+        other => Err(Error::new(
+            ERR_UNSUPPORTED,
+            format!("query body {:?} is not available in this phase", other),
+        )),
+    }
+}
+
 fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {
     if from.is_empty() {
         return Ok((None, None));
@@ -655,6 +660,52 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 name,
             }))
         }
+        Expr::Exists { subquery, negated } => {
+            let query = lower_query(subquery)?;
+            if query.join.is_some() {
+                return Err(Error::unsupported("subquery JOIN"));
+            }
+            Ok(ExprNode::Exists(ExistsExpr {
+                not: *negated,
+                query: Box::new(query),
+            }))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let query = lower_query(subquery)?;
+            if query.join.is_some() {
+                return Err(Error::unsupported("subquery JOIN"));
+            }
+            Ok(ExprNode::InSubquery(InSubqueryExpr {
+                expr: Box::new(lower_expr(expr)?),
+                not: *negated,
+                query: Box::new(query),
+            }))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(ExprNode::InList(InListExpr {
+            expr: Box::new(lower_expr(expr)?),
+            not: *negated,
+            list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
+        })),
+        Expr::Subquery(subquery) => {
+            let query = lower_query(subquery)?;
+            if query.join.is_some() {
+                return Err(Error::unsupported("subquery JOIN"));
+            }
+            Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {
+                query: Box::new(query),
+            }))
+        }
+        // F14 gap / completeness wave: ANY / ALL / SOME, FROM derived tables.
+        Expr::AnyOp { .. } => Err(Error::unsupported("ANY / SOME subquery")),
+        Expr::AllOp { .. } => Err(Error::unsupported("ALL subquery")),
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("expression {other} is not available in this phase"),

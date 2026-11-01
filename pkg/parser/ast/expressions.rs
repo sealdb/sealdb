@@ -1,3 +1,4 @@
+use super::dml::SelectStmt;
 use crate::format::RestoreCtx;
 use crate::opcode::Op;
 use sealdb_errno::Result;
@@ -11,6 +12,10 @@ pub enum ExprNode {
     Unary(UnaryOpExpr),
     Func(FuncCallExpr),
     Cast(FuncCastExpr),
+    Exists(ExistsExpr),
+    InSubquery(InSubqueryExpr),
+    InList(InListExpr),
+    ScalarSubquery(ScalarSubqueryExpr),
 }
 
 impl ExprNode {
@@ -22,6 +27,22 @@ impl ExprNode {
             ExprNode::Unary(v) => v.restore(ctx),
             ExprNode::Func(v) => v.restore(ctx),
             ExprNode::Cast(v) => v.restore(ctx),
+            ExprNode::Exists(v) => v.restore(ctx),
+            ExprNode::InSubquery(v) => v.restore(ctx),
+            ExprNode::InList(v) => v.restore(ctx),
+            ExprNode::ScalarSubquery(v) => v.restore(ctx),
+        }
+    }
+
+    pub fn has_subquery(&self) -> bool {
+        match self {
+            ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => true,
+            ExprNode::Binary(b) => b.left.has_subquery() || b.right.has_subquery(),
+            ExprNode::Unary(u) => u.expr.has_subquery(),
+            ExprNode::Func(f) => f.args.iter().any(Self::has_subquery),
+            ExprNode::Cast(c) => c.expr.has_subquery(),
+            ExprNode::InList(i) => i.expr.has_subquery() || i.list.iter().any(Self::has_subquery),
+            ExprNode::Value(_) | ExprNode::Column(_) => false,
         }
     }
 }
@@ -144,6 +165,85 @@ impl FuncCastExpr {
         self.expr.restore(ctx)?;
         ctx.write_str(" AS ");
         ctx.write_str(&self.target);
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExistsExpr {
+    pub not: bool,
+    pub query: Box<SelectStmt>,
+}
+
+impl ExistsExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if self.not {
+            ctx.write_str("NOT ");
+        }
+        ctx.write_str("EXISTS (");
+        self.query.restore(ctx)?;
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InSubqueryExpr {
+    pub expr: Box<ExprNode>,
+    pub not: bool,
+    pub query: Box<SelectStmt>,
+}
+
+impl InSubqueryExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        if self.not {
+            ctx.write_str(" NOT IN (");
+        } else {
+            ctx.write_str(" IN (");
+        }
+        self.query.restore(ctx)?;
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InListExpr {
+    pub expr: Box<ExprNode>,
+    pub not: bool,
+    pub list: Vec<ExprNode>,
+}
+
+impl InListExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        if self.not {
+            ctx.write_str(" NOT IN (");
+        } else {
+            ctx.write_str(" IN (");
+        }
+        for (i, item) in self.list.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            item.restore(ctx)?;
+        }
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScalarSubqueryExpr {
+    pub query: Box<SelectStmt>,
+}
+
+impl ScalarSubqueryExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("(");
+        self.query.restore(ctx)?;
         ctx.write_str(")");
         Ok(())
     }

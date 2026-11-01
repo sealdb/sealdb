@@ -631,4 +631,65 @@ mod tests {
             vec![vec!["1".to_string(), "c".to_string()]]
         );
     }
+
+    #[test]
+    fn test_exists_in_and_apply() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (3, 'y')",
+            )
+            .unwrap();
+        let exists = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            exists.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let not_exists = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE NOT EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            not_exists.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let in_sub = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id IN (SELECT id FROM db1.t2) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            in_sub.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let in_list = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id IN (2, 9) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            in_list.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let scalar = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id = (SELECT id FROM db1.t2 WHERE tag = 'x')")
+            .unwrap();
+        assert_eq!(
+            scalar.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let dual = session
+            .execute_stmt("SELECT 1 WHERE EXISTS (SELECT * FROM db1.t2 WHERE id = 1)")
+            .unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let err = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id = (SELECT id FROM db1.t2)")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_SUBQUERY_NO_1_ROW);
+        let err = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id = ANY (SELECT id FROM db1.t2)")
+            .unwrap_err();
+        assert!(err.message.contains("ANY"));
+    }
 }

@@ -51,13 +51,17 @@ impl PlanBuilder {
                         child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                     }
                 };
-                if select.selection.is_some()
+                if let Some(filter) = &select.selection
                     && !matches!(
                         plan,
                         PhysicalPlan::PointGet { .. } | PhysicalPlan::IndexLookUpReader { .. }
                     )
                 {
-                    if matches!(plan, PhysicalPlan::Projection { .. }) {
+                    if filter.has_subquery() {
+                        plan = PhysicalPlan::Apply {
+                            child: Box::new(plan),
+                        };
+                    } else if matches!(plan, PhysicalPlan::Projection { .. }) {
                         if let PhysicalPlan::Projection { exprs, child } = plan {
                             plan = PhysicalPlan::Projection {
                                 exprs,
