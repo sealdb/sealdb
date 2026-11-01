@@ -22,6 +22,7 @@ pub struct IndexLookUpExecutor {
     current_db: String,
     txn: Arc<TxnHandle>,
     for_update: bool,
+    partitions: Vec<i64>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -37,6 +38,7 @@ impl IndexLookUpExecutor {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         for_update: bool,
+        partitions: Vec<i64>,
     ) -> Self {
         Self {
             domain,
@@ -46,6 +48,7 @@ impl IndexLookUpExecutor {
             current_db: current_db.into(),
             txn,
             for_update,
+            partitions,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -77,37 +80,48 @@ impl Executor for IndexLookUpExecutor {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let start = encode_index_seek_prefix(info.id, index.id, std::slice::from_ref(&self.lookup));
-        let end = next_prefix(start.as_bytes());
+        let physical = if self.partitions.is_empty() {
+            info.physical_ids()
+        } else {
+            self.partitions.clone()
+        };
         self.rows = self.txn.with_txn(|txn| {
-            let pairs = if self.for_update {
-                txn.scan_for_update(start.as_bytes(), &end)?
-            } else {
-                txn.scan(start.as_bytes(), &end)?
-            };
             let mut rows = Vec::new();
-            for (key, _) in pairs {
-                let handle = decode_handle_from_index_key(&key)?;
-                let row_key = encode_row_key_with_handle(info.id, handle);
-                let raw = if self.for_update {
-                    txn.get_for_update(row_key.as_bytes())?
+            for physical_id in physical {
+                let start = encode_index_seek_prefix(
+                    physical_id,
+                    index.id,
+                    std::slice::from_ref(&self.lookup),
+                );
+                let end = next_prefix(start.as_bytes());
+                let pairs = if self.for_update {
+                    txn.scan_for_update(start.as_bytes(), &end)?
                 } else {
-                    txn.get(row_key.as_bytes())?
+                    txn.scan(start.as_bytes(), &end)?
                 };
-                if let Some(raw) = raw {
-                    let decoded = decode_row(&raw);
-                    rows.push(
-                        info.columns
-                            .iter()
-                            .map(|col| {
-                                decoded
-                                    .iter()
-                                    .find(|(id, _)| *id == col.id)
-                                    .map(|(_, v)| v.clone())
-                                    .unwrap_or(Datum::Null)
-                            })
-                            .collect(),
-                    );
+                for (key, _) in pairs {
+                    let handle = decode_handle_from_index_key(&key)?;
+                    let row_key = encode_row_key_with_handle(physical_id, handle);
+                    let raw = if self.for_update {
+                        txn.get_for_update(row_key.as_bytes())?
+                    } else {
+                        txn.get(row_key.as_bytes())?
+                    };
+                    if let Some(raw) = raw {
+                        let decoded = decode_row(&raw);
+                        rows.push(
+                            info.columns
+                                .iter()
+                                .map(|col| {
+                                    decoded
+                                        .iter()
+                                        .find(|(id, _)| *id == col.id)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or(Datum::Null)
+                                })
+                                .collect(),
+                        );
+                    }
                 }
             }
             Ok(rows)

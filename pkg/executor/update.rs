@@ -60,7 +60,8 @@ impl Executor for UpdateExec {
             .collect();
         let col_ids: Vec<i64> = info.columns.iter().map(|c| c.id).collect();
         let for_update = self.txn.with_txn(|txn| Ok(txn.is_pessimistic()))?;
-        let rows = scan_table(&self.txn, &info, for_update)?;
+        let physical = info.prune_partitions(self.stmt.selection.as_ref());
+        let rows = scan_table(&self.txn, &info, for_update, &physical)?;
         self.txn.with_txn(|txn| {
             for scanned in rows {
                 if let Some(filter) = &self.stmt.selection
@@ -88,15 +89,28 @@ impl Executor for UpdateExec {
                         _ => None,
                     })
                     .unwrap_or(scanned.handle);
-                delete_index_keys(txn, &info, scanned.handle, &scanned.values)?;
-                if new_handle != scanned.handle {
-                    txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
+                let new_part = info
+                    .partition_value(&new_values)
+                    .cloned()
+                    .unwrap_or(Datum::Null);
+                let new_physical = info.locate_partition(&new_part)?;
+                delete_index_keys(
+                    txn,
+                    &info,
+                    scanned.handle,
+                    &scanned.values,
+                    scanned.physical_id,
+                )?;
+                if new_handle != scanned.handle || new_physical != scanned.physical_id {
+                    txn.delete(
+                        encode_row_key_with_handle(scanned.physical_id, scanned.handle).as_bytes(),
+                    )?;
                 }
                 txn.set(
-                    encode_row_key_with_handle(info.id, new_handle).as_bytes(),
+                    encode_row_key_with_handle(new_physical, new_handle).as_bytes(),
                     &encode_row(&col_ids, &new_values),
                 )?;
-                write_index_keys(txn, &info, new_handle, &new_values)?;
+                write_index_keys(txn, &info, new_handle, &new_values, new_physical)?;
             }
             Ok(())
         })

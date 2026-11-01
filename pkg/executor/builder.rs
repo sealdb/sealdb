@@ -129,7 +129,9 @@ impl ExecutorBuilder {
                     txn,
                 )))
             }
-            PhysicalPlan::IndexLookUpReader { index, .. } => {
+            PhysicalPlan::IndexLookUpReader {
+                index, partitions, ..
+            } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
@@ -147,6 +149,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select.lock == SelectLock::ForUpdate,
+                    partitions.clone(),
                 )))
             }
             PhysicalPlan::PointGet { handle, .. } => {
@@ -166,7 +169,7 @@ impl ExecutorBuilder {
                     select.lock == SelectLock::ForUpdate,
                 )))
             }
-            PhysicalPlan::TableReader { table } => {
+            PhysicalPlan::TableReader { table, partitions } => {
                 let from = resolve_reader_table(stmt, table)?;
                 let for_update = stmt
                     .as_select()
@@ -177,6 +180,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     for_update,
+                    partitions.clone(),
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),

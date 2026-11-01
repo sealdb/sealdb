@@ -106,7 +106,7 @@
     "pkg/parser/ast/ddl.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "CREATE/DROP DATABASE|TABLE + CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX"
+      "notes": "CREATE/DROP DATABASE|TABLE + CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX + RANGE/HASH PARTITION BY"
     },
     "pkg/parser/ast/misc.go": {
       "status": "partial",
@@ -181,12 +181,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply, Union, Window, CTE, partition prune"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE + partition ids"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -201,7 +201,7 @@
     "pkg/meta/model/table.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableInfo core JSON + typed IndexInfo list"
+      "notes": "TableInfo core JSON + typed IndexInfo list + optional PartitionInfo"
     },
     "pkg/meta/model/index.go": {
       "status": "partial",
@@ -255,6 +255,24 @@
       "phase": 8,
       "notes": "ALTER ADD/DROP COLUMN; CHANGE/MODIFY/AFTER deferred"
     },
+    "pkg/ddl/partition.go": {
+      "status": "partial",
+      "rust": "pkg/ddl/partition.rs",
+      "phase": 8,
+      "notes": "RANGE/HASH PartitionInfo attach; LIST/KEY/ADD/DROP PARTITION deferred"
+    },
+    "pkg/planner/core/rule_partition_processor.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/rule_partition_processor.rs",
+      "phase": 8,
+      "notes": "static RANGE/HASH prune into TableReader partition ids"
+    },
+    "pkg/table/tables/partition.go": {
+      "status": "partial",
+      "rust": "pkg/meta/model/partition.rs",
+      "phase": 8,
+      "notes": "locate/prune on PartitionInfo; LIST/KEY/dynamic prune deferred"
+    },
     "pkg/domain/domain.go": {
       "status": "partial",
       "phase": 5,
@@ -289,7 +307,7 @@
     "pkg/executor/insert.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "INSERT VALUES into mem KV"
+      "notes": "INSERT VALUES into mem KV; F19 locates RANGE/HASH physical id"
     },
     "pkg/executor/update.go": {
       "status": "partial",
@@ -304,7 +322,7 @@
     "pkg/executor/table_reader.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "scan table prefix for SELECT *"
+      "notes": "scan table prefix for SELECT *; F19 scans physical partition ids"
     },
     "pkg/executor/point_get.go": {
       "status": "partial",

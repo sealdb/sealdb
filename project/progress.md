@@ -31,7 +31,7 @@
 | 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT * 走内存 KV |
 | 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
 | 7 | CBO 与统计 | `not-started` | — | — | F21 | 依赖 Phase 5/6 |
-| 8 | DDL 与高级 SQL | `not-started` | — | — | F14–F20 | 依赖 Phase 6/7 |
+| 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F19 已通；F20 GRANT 未开始 |
 | 9 | MySQL 协议与运维 | `not-started` | — | — | F22 | 可提前做只读协议 |
 | 10 | 可选高级能力 | `deferred` | — | — | C6 | 完整性波不阻塞主线 |
 
@@ -58,7 +58,8 @@
 | F16 | `core-ported` | `project/reports/features/F16/` |
 | F17 | `core-ported` | `project/reports/features/F17/` |
 | F18 | `core-ported` | `project/reports/features/F18/` |
-| F19–F22 | `not-started` | — |
+| F19 | `core-ported` | `project/reports/features/F19/` |
+| F20–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -101,6 +102,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F19 分区裁剪
+- **完成**:
+  - `CREATE TABLE ... PARTITION BY RANGE/HASH`
+  - INSERT locate 到物理分区 id
+  - 等值/比较谓词静态裁剪 TableReader
+- **验证**:
+  - `./project/scripts/feature_gate.sh F19`
+- **下一步**:
+  - F20 GRANT/REVOKE
 
 ### 2026-11-01
 

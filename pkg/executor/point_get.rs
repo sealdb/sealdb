@@ -61,29 +61,43 @@ impl Executor for PointGetExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let key = encode_row_key_with_handle(info.id, self.handle);
-        self.row = self
-            .txn
-            .with_txn(|txn| {
-                if self.for_update {
-                    txn.get_for_update(key.as_bytes())
+        let physical_ids = if info.partition.as_ref().is_some_and(|p| {
+            p.column()
+                .eq_ignore_ascii_case(info.columns.first().map(|c| c.name.o()).unwrap_or(""))
+        }) {
+            match info.locate_partition(&Datum::I64(self.handle)) {
+                Ok(id) => vec![id],
+                Err(_) => Vec::new(),
+            }
+        } else {
+            info.physical_ids()
+        };
+        self.row = self.txn.with_txn(|txn| {
+            for physical_id in physical_ids {
+                let key = encode_row_key_with_handle(physical_id, self.handle);
+                let raw = if self.for_update {
+                    txn.get_for_update(key.as_bytes())?
                 } else {
-                    txn.get(key.as_bytes())
-                }
-            })?
-            .map(|raw| {
-                let decoded = decode_row(&raw);
-                info.columns
-                    .iter()
-                    .map(|col| {
-                        decoded
+                    txn.get(key.as_bytes())?
+                };
+                if let Some(raw) = raw {
+                    let decoded = decode_row(&raw);
+                    return Ok(Some(
+                        info.columns
                             .iter()
-                            .find(|(id, _)| *id == col.id)
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or(Datum::Null)
-                    })
-                    .collect()
-            });
+                            .map(|col| {
+                                decoded
+                                    .iter()
+                                    .find(|(id, _)| *id == col.id)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(Datum::Null)
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+            Ok(None)
+        })?;
         Ok(())
     }
 

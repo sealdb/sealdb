@@ -2,7 +2,8 @@ use super::dialect::dialect;
 use crate::ast::Statement;
 use crate::ast::ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
-    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, TableName,
+    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
+    PartitionOption, PartitionType, TableName,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
@@ -29,6 +30,7 @@ use sqlparser::parser::Parser;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -36,6 +38,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         )
     })?;
     let mut flags = pessimistic_flags.into_iter();
+    let mut partitions = partitions.into_iter();
     stmts
         .iter()
         .map(|stmt| {
@@ -44,6 +47,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 && flags.next() == Some(true)
             {
                 begin.pessimistic = true;
+            }
+            if let Statement::CreateTable(create) = &mut lowered {
+                create.partition = partitions.next().flatten();
             }
             Ok(lowered)
         })
@@ -95,6 +101,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 table: object_table_name(&create.name)?,
                 cols,
                 indices,
+                partition: None,
             }))
         }
         SqlStatement::CreateIndex(create) => lower_create_index(create),
@@ -335,6 +342,288 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.
+/// Strip the clause and re-attach it after lowering, same pattern as
+/// `BEGIN PESSIMISTIC`.
+fn extract_create_table_partitions(sql: &str) -> Result<(String, Vec<Option<PartitionOption>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut opts = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after_create, "TABLE") {
+                let after_table = skip_ws(bytes, after_create + "TABLE".len());
+                let after_name = skip_create_table_name(bytes, after_table);
+                let after_name = skip_ws(bytes, after_name);
+                if after_name < bytes.len()
+                    && bytes[after_name] == b'('
+                    && let Some(close) = matching_paren(bytes, after_name)
+                {
+                    let after_cols = skip_ws(bytes, close + 1);
+                    if keyword_at(bytes, after_cols, "PARTITION") {
+                        let after_part = skip_ws(bytes, after_cols + "PARTITION".len());
+                        if keyword_at(bytes, after_part, "BY") {
+                            let start = after_part + "BY".len();
+                            let (opt, end) = parse_partition_by(bytes, skip_ws(bytes, start))?;
+                            out.push_str(&sql[i..after_cols]);
+                            opts.push(Some(opt));
+                            i = end;
+                            continue;
+                        }
+                    }
+                    out.push_str(&sql[i..close + 1]);
+                    opts.push(None);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(sql[i..].chars().next().unwrap());
+        i += sql[i..].chars().next().unwrap().len_utf8();
+    }
+    Ok((out, opts))
+}
+
+fn skip_create_table_name(bytes: &[u8], mut i: usize) -> usize {
+    i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "IF") {
+        let after_if = skip_ws(bytes, i + 2);
+        if keyword_at(bytes, after_if, "NOT") {
+            let after_not = skip_ws(bytes, after_if + 3);
+            if keyword_at(bytes, after_not, "EXISTS") {
+                i = skip_ws(bytes, after_not + "EXISTS".len());
+            }
+        }
+    }
+    i = skip_ident_or_quoted(bytes, i);
+    i = skip_ws(bytes, i);
+    if i < bytes.len() && bytes[i] == b'.' {
+        i = skip_ident_or_quoted(bytes, skip_ws(bytes, i + 1));
+    }
+    i
+}
+
+fn skip_ident_or_quoted(bytes: &[u8], mut i: usize) -> usize {
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'`' | b'"' | b'\'' => {
+            let q = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            i
+        }
+        _ => {
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            i
+        }
+    }
+}
+
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
+    // F19 gap: LIST / KEY / RANGE COLUMNS / subpartition / expr keys.
+    if keyword_at(bytes, i, "LIST")
+        || keyword_at(bytes, i, "KEY")
+        || (keyword_at(bytes, i, "RANGE")
+            && keyword_at(bytes, skip_ws(bytes, i + "RANGE".len()), "COLUMNS"))
+    {
+        return Err(Error::unsupported("LIST/KEY/RANGE COLUMNS partition"));
+    }
+    let tp = if keyword_at(bytes, i, "RANGE") {
+        i = skip_ws(bytes, i + "RANGE".len());
+        PartitionType::Range
+    } else if keyword_at(bytes, i, "HASH") {
+        i = skip_ws(bytes, i + "HASH".len());
+        PartitionType::Hash
+    } else {
+        return Err(Error::unsupported("partition type"));
+    };
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::unsupported("PARTITION BY expression"));
+    }
+    let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("PARTITION BY"))?;
+    let column = std::str::from_utf8(&bytes[i + 1..close])
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid partition column"))?
+        .trim()
+        .trim_matches('`')
+        .to_string();
+    if column.is_empty() || column.contains('(') {
+        return Err(Error::unsupported("partition expression"));
+    }
+    i = skip_ws(bytes, close + 1);
+    match tp {
+        PartitionType::Hash => {
+            if !keyword_at(bytes, i, "PARTITIONS") {
+                return Err(Error::unsupported("HASH partition list"));
+            }
+            i = skip_ws(bytes, i + "PARTITIONS".len());
+            let (num, end) = parse_u64_at(bytes, i)?;
+            if num == 0 {
+                return Err(Error::unsupported("HASH PARTITIONS 0"));
+            }
+            Ok((
+                PartitionOption {
+                    tp,
+                    column,
+                    defs: Vec::new(),
+                    num,
+                },
+                end,
+            ))
+        }
+        PartitionType::Range => {
+            if i >= bytes.len() || bytes[i] != b'(' {
+                return Err(Error::unsupported("RANGE without partitions"));
+            }
+            let end = matching_paren(bytes, i)
+                .ok_or_else(|| Error::unsupported("RANGE partition list"))?;
+            let body = std::str::from_utf8(&bytes[i + 1..end])
+                .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid RANGE partitions"))?;
+            let defs = parse_range_defs(body)?;
+            Ok((
+                PartitionOption {
+                    tp,
+                    column,
+                    num: defs.len() as u64,
+                    defs,
+                },
+                end + 1,
+            ))
+        }
+    }
+}
+
+fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
+    let mut defs = Vec::new();
+    for raw in split_defs(body) {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let bytes = item.as_bytes();
+        let mut i = skip_ws(bytes, 0);
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Err(Error::unsupported("RANGE partition item"));
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let name_end = skip_ident_or_quoted(bytes, i);
+        let name = item[i..name_end].trim().trim_matches('`').to_string();
+        i = skip_ws(bytes, name_end);
+        if !keyword_at(bytes, i, "VALUES") {
+            return Err(Error::unsupported("VALUES LESS THAN"));
+        }
+        i = skip_ws(bytes, i + "VALUES".len());
+        if !keyword_at(bytes, i, "LESS") {
+            return Err(Error::unsupported("VALUES LESS THAN"));
+        }
+        i = skip_ws(bytes, i + "LESS".len());
+        if !keyword_at(bytes, i, "THAN") {
+            return Err(Error::unsupported("VALUES LESS THAN"));
+        }
+        i = skip_ws(bytes, i + "THAN".len());
+        let less_than = if keyword_at(bytes, i, "MAXVALUE") {
+            None
+        } else {
+            if i >= bytes.len() || bytes[i] != b'(' {
+                return Err(Error::unsupported("VALUES LESS THAN"));
+            }
+            let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
+            let bound = item[i + 1..close].trim();
+            if bound.eq_ignore_ascii_case("MAXVALUE") {
+                None
+            } else {
+                Some(
+                    bound
+                        .parse::<i64>()
+                        .map_err(|_| Error::unsupported("non-integer LESS THAN"))?,
+                )
+            }
+        };
+        defs.push(PartitionDef { name, less_than });
+    }
+    if defs.is_empty() {
+        return Err(Error::unsupported("RANGE without partitions"));
+    }
+    Ok(defs)
+}
+
+fn split_defs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0;
+    for ch in body.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn parse_u64_at(bytes: &[u8], i: usize) -> Result<(u64, usize)> {
+    let mut end = i;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == i {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing PARTITIONS count"));
+    }
+    let n = std::str::from_utf8(&bytes[i..end])
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid PARTITIONS count"))?
+        .parse::<u64>()
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid PARTITIONS count"))?;
+    Ok((n, end))
 }
 
 fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {

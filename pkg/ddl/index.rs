@@ -127,7 +127,7 @@ pub fn remove_index(
         ));
     };
     let idx_id = info.indices[pos].id;
-    drop_index_keys(storage, info.id, idx_id)?;
+    drop_index_keys(storage, &info, idx_id)?;
     info.indices.remove(pos);
     meta.update_table(db_id, &info)?;
     meta.gen_schema_version()?;
@@ -149,49 +149,53 @@ fn load_table(is: &InfoSchema, schema: &str, table: &str) -> Result<(i64, TableI
 
 fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) -> Result<()> {
     let mut txn = storage.begin()?;
-    let start = gen_table_record_prefix(info.id);
-    let end = next_prefix(start.as_bytes());
-    let pairs = txn.scan(start.as_bytes(), &end)?;
-    for (key, raw) in pairs {
-        let handle = decode_handle_from_row_key(&key)?;
-        let decoded = decode_row(&raw);
-        let values: Vec<Datum> = info
-            .columns
-            .iter()
-            .map(|col| {
-                decoded
-                    .iter()
-                    .find(|(id, _)| *id == col.id)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Datum::Null)
-            })
-            .collect();
-        let idx_vals: Vec<Datum> = index
-            .columns
-            .iter()
-            .map(|col| {
-                values
-                    .get(col.offset as usize)
-                    .cloned()
-                    .unwrap_or(Datum::Null)
-            })
-            .collect();
-        let ikey = encode_index_key(info.id, index.id, &idx_vals, handle);
-        txn.set(
-            ikey.as_bytes(),
-            encode_row_key_with_handle(info.id, handle).as_bytes(),
-        )?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, raw) in pairs {
+            let handle = decode_handle_from_row_key(&key)?;
+            let decoded = decode_row(&raw);
+            let values: Vec<Datum> = info
+                .columns
+                .iter()
+                .map(|col| {
+                    decoded
+                        .iter()
+                        .find(|(id, _)| *id == col.id)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            let idx_vals: Vec<Datum> = index
+                .columns
+                .iter()
+                .map(|col| {
+                    values
+                        .get(col.offset as usize)
+                        .cloned()
+                        .unwrap_or(Datum::Null)
+                })
+                .collect();
+            let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle);
+            txn.set(
+                ikey.as_bytes(),
+                encode_row_key_with_handle(physical_id, handle).as_bytes(),
+            )?;
+        }
     }
     txn.commit()
 }
 
-fn drop_index_keys(storage: &dyn Storage, table_id: i64, idx_id: i64) -> Result<()> {
-    let start = encode_index_seek_key(table_id, idx_id, &[]);
-    let end = next_prefix(start.as_bytes());
+fn drop_index_keys(storage: &dyn Storage, info: &TableInfo, idx_id: i64) -> Result<()> {
     let mut txn = storage.begin()?;
-    let pairs = txn.scan(start.as_bytes(), &end)?;
-    for (key, _) in pairs {
-        txn.delete(&key)?;
+    for physical_id in info.physical_ids() {
+        let start = encode_index_seek_key(physical_id, idx_id, &[]);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, _) in pairs {
+            txn.delete(&key)?;
+        }
     }
     txn.commit()
 }
