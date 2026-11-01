@@ -14,7 +14,16 @@ pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
     pub selection: Option<ExprNode>,
+    pub order_by: Vec<ByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub text: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ByItem {
+    pub expr: ExprNode,
+    pub desc: bool,
 }
 
 impl SelectStmt {
@@ -37,6 +46,29 @@ impl SelectStmt {
         if let Some(selection) = &self.selection {
             ctx.write_str(" WHERE ");
             selection.restore(ctx)?;
+        }
+        if !self.order_by.is_empty() {
+            ctx.write_str(" ORDER BY ");
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                item.expr.restore(ctx)?;
+                if item.desc {
+                    ctx.write_str(" DESC");
+                }
+            }
+        }
+        if let Some(limit) = self.limit {
+            ctx.write_str(" LIMIT ");
+            if let Some(offset) = self.offset {
+                ctx.write_str(&format!("{offset},"));
+            }
+            ctx.write_str(&limit.to_string());
+        } else if let Some(offset) = self.offset {
+            ctx.write_str(" LIMIT ");
+            ctx.write_str(&offset.to_string());
+            ctx.write_str(",18446744073709551615");
         }
         Ok(())
     }

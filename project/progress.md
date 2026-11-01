@@ -45,7 +45,8 @@
 | F11 | `core-ported` | `project/reports/features/F11/` |
 | F03 | `core-ported` | `project/reports/features/F03/` |
 | F04 | `core-ported` | `project/reports/features/F04/` |
-| F05–F10, F12–F22 | `not-started` | — |
+| F05 | `core-ported` | `project/reports/features/F05/` |
+| F06–F10, F12–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -88,6 +89,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F05 ORDER BY / LIMIT
+- **完成**:
+  - `ORDER BY` 内存排序
+  - `LIMIT` / `OFFSET`
+- **验证**:
+  - `./project/scripts/feature_gate.sh F05`
+- **下一步**:
+  - F06 PointGet
 
 ### 2026-11-01
 

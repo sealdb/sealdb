@@ -2,8 +2,9 @@ use crate::ddl::DDLExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::projection::ProjectionExec;
-use crate::select::{SelectionExec, TableDualExec};
+use crate::select::{LimitExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
+use crate::sortexec::SortExec;
 use crate::table_reader::TableReaderExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
@@ -39,6 +40,27 @@ impl ExecutorBuilder {
                 Ok(Box::new(ProjectionExec::new(
                     exprs,
                     names,
+                    Self::build(child, stmt, domain, current_db)?,
+                )))
+            }
+            PhysicalPlan::Sort { child } => {
+                let by = stmt
+                    .as_select()
+                    .map(|s| s.order_by.clone())
+                    .filter(|items| !items.is_empty())
+                    .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
+                Ok(Box::new(SortExec::new(
+                    by,
+                    Self::build(child, stmt, domain, current_db)?,
+                )))
+            }
+            PhysicalPlan::Limit { child } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("limit without select"))?;
+                Ok(Box::new(LimitExec::new(
+                    select.limit,
+                    select.offset.unwrap_or(0),
                     Self::build(child, stmt, domain, current_db)?,
                 )))
             }

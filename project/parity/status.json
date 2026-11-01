@@ -266,7 +266,12 @@
     "pkg/executor/select.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual + SelectionExec"
+      "notes": "TableDual + SelectionExec + LimitExec"
+    },
+    "pkg/executor/sortexec/sort.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "in-memory SortExec"
     },
     "pkg/executor/projection.go": {
       "status": "partial",

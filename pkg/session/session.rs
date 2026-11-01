@@ -214,4 +214,39 @@ mod tests {
         let keep = session.execute_stmt("SELECT 1 WHERE 1").unwrap();
         assert_eq!(keep.display_rows(), vec![vec!["1".to_string()]]);
     }
+
+    #[test]
+    fn test_order_by_and_limit() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (3, 'c'), (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        let ordered = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            ordered.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()]
+            ]
+        );
+        let desc = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id DESC LIMIT 1")
+            .unwrap();
+        assert_eq!(
+            desc.display_rows(),
+            vec![vec!["3".to_string(), "c".to_string()]]
+        );
+        let offset = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id LIMIT 1 OFFSET 1")
+            .unwrap();
+        assert_eq!(
+            offset.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+    }
 }

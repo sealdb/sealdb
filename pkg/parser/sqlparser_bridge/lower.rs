@@ -3,7 +3,7 @@ use crate::ast::Statement;
 use crate::ast::ddl::{
     ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
 };
-use crate::ast::dml::{InsertStmt, SelectField, SelectStmt};
+use crate::ast::dml::{ByItem, InsertStmt, SelectField, SelectStmt};
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
 };
@@ -13,8 +13,8 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     BinaryOperator, DataType, DescribeAlias, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, ObjectName, ObjectType, SchemaName, SelectItem, SetExpr,
-    Statement as SqlStatement, TableObject, UnaryOperator, Use, Value, Values,
+    FunctionArguments, LimitClause, ObjectName, ObjectType, OrderByKind, OrderBySort, SchemaName,
+    SelectItem, SetExpr, Statement as SqlStatement, TableObject, UnaryOperator, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -46,10 +46,15 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     })
                     .transpose()?;
                 let selection = select.selection.as_ref().map(lower_expr).transpose()?;
+                let order_by = lower_order_by(query.order_by.as_ref())?;
+                let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
                 Ok(Statement::Select(SelectStmt {
                     fields,
                     from,
                     selection,
+                    order_by,
+                    limit,
+                    offset,
                     text: query.to_string(),
                 }))
             }
@@ -215,6 +220,50 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             ERR_UNSUPPORTED,
             format!("statement {other} is not available in this phase"),
         )),
+    }
+}
+
+fn lower_order_by(order_by: Option<&sqlparser::ast::OrderBy>) -> Result<Vec<ByItem>> {
+    let Some(order_by) = order_by else {
+        return Ok(Vec::new());
+    };
+    match &order_by.kind {
+        OrderByKind::Expressions(items) => items
+            .iter()
+            .map(|item| {
+                Ok(ByItem {
+                    expr: lower_expr(&item.expr)?,
+                    desc: matches!(item.options.sort, Some(OrderBySort::Desc)),
+                })
+            })
+            .collect(),
+        other => Err(Error::unsupported(format!("ORDER BY {other:?}"))),
+    }
+}
+
+fn lower_limit(limit: Option<&LimitClause>) -> Result<(Option<u64>, Option<u64>)> {
+    match limit {
+        None => Ok((None, None)),
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+            let limit = limit.as_ref().map(expr_as_u64).transpose()?;
+            let offset = offset.as_ref().map(|o| expr_as_u64(&o.value)).transpose()?;
+            Ok((limit, offset))
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            Ok((Some(expr_as_u64(limit)?), Some(expr_as_u64(offset)?)))
+        }
+    }
+}
+
+fn expr_as_u64(expr: &Expr) -> Result<u64> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n
+                .parse::<u64>()
+                .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string())),
+            other => Err(Error::unsupported(format!("limit literal {other}"))),
+        },
+        other => Err(Error::unsupported(format!("limit expression {other}"))),
     }
 }
 

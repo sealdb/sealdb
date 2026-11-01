@@ -44,6 +44,16 @@ impl PlanBuilder {
                         };
                     }
                 }
+                if !select.order_by.is_empty() {
+                    plan = PhysicalPlan::Sort {
+                        child: Box::new(plan),
+                    };
+                }
+                if select.limit.is_some() || select.offset.is_some() {
+                    plan = PhysicalPlan::Limit {
+                        child: Box::new(plan),
+                    };
+                }
                 Ok(plan)
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),

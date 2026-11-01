@@ -30,6 +30,12 @@ pub enum PhysicalPlan {
     Selection {
         child: Box<PhysicalPlan>,
     },
+    Sort {
+        child: Box<PhysicalPlan>,
+    },
+    Limit {
+        child: Box<PhysicalPlan>,
+    },
 }
 
 impl PhysicalPlan {
@@ -44,6 +50,8 @@ impl PhysicalPlan {
             PhysicalPlan::Insert => "Insert".to_string(),
             PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
+            PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
+            PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
         }
     }
 }

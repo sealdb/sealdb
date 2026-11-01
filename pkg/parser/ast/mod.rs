@@ -11,6 +11,6 @@ pub use ast::{Node, Statement, StmtNode};
 pub use ddl::{
     ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
 };
-pub use dml::{InsertStmt, SelectField, SelectStmt};
+pub use dml::{ByItem, InsertStmt, SelectField, SelectStmt};
 pub use expressions::ExprNode;
 pub use misc::{ShowStmt, ShowStmtKind, UseStmt};

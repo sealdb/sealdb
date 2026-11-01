@@ -93,3 +93,71 @@ impl Executor for SelectionExec {
         self.child.schema()
     }
 }
+
+pub struct LimitExec {
+    limit: Option<u64>,
+    offset: u64,
+    skipped: u64,
+    emitted: u64,
+    child: Box<dyn Executor>,
+}
+
+impl LimitExec {
+    pub fn new(limit: Option<u64>, offset: u64, child: Box<dyn Executor>) -> Self {
+        Self {
+            limit,
+            offset,
+            skipped: 0,
+            emitted: 0,
+            child,
+        }
+    }
+}
+
+impl Executor for LimitExec {
+    fn open(&mut self) -> Result<()> {
+        self.skipped = 0;
+        self.emitted = 0;
+        self.child.open()
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.limit == Some(0) {
+            return Ok(None);
+        }
+        loop {
+            let Some(chunk) = self.child.next()? else {
+                return Ok(None);
+            };
+            let schema_len = chunk.num_cols();
+            let mut out = Chunk::new(schema_len, chunk.num_rows());
+            for i in 0..chunk.num_rows() {
+                if self.skipped < self.offset {
+                    self.skipped += 1;
+                    continue;
+                }
+                if let Some(limit) = self.limit
+                    && self.emitted >= limit
+                {
+                    break;
+                }
+                out.append_row(chunk.get_row(i));
+                self.emitted += 1;
+            }
+            if out.num_rows() > 0 {
+                return Ok(Some(out));
+            }
+            if self.limit.is_some_and(|limit| self.emitted >= limit) {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+
+    fn schema(&self) -> &[String] {
+        self.child.schema()
+    }
+}

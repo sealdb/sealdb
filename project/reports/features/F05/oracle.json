@@ -1,0 +1,28 @@
+{
+  "suite": "testdata/F05",
+  "cases": [
+    {
+      "name": "order_limit.sql",
+      "result": {
+        "sql": "SELECT * FROM db1.t ORDER BY id;\nSELECT * FROM db1.t ORDER BY id DESC LIMIT 1;\nSELECT * FROM db1.t ORDER BY id LIMIT 1 OFFSET 1;\n",
+        "statements": [
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` ORDER BY `id`",
+            "text": "SELECT * FROM db1.t ORDER BY id;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` ORDER BY `id` DESC LIMIT 1",
+            "text": "SELECT * FROM db1.t ORDER BY id DESC LIMIT 1;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` ORDER BY `id` LIMIT 1,1",
+            "text": "SELECT * FROM db1.t ORDER BY id LIMIT 1 OFFSET 1;"
+          }
+        ]
+      }
+    }
+  ]
+}
