@@ -211,6 +211,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_begin_commit_rollback() {
+        let parser = Parser::new();
+        assert_eq!(
+            parser.parse_one_stmt("BEGIN").unwrap().stmt_type(),
+            "BeginStmt"
+        );
+        assert_eq!(
+            parser
+                .parse_one_stmt("START TRANSACTION")
+                .unwrap()
+                .stmt_type(),
+            "BeginStmt"
+        );
+        assert_eq!(
+            parser.parse_one_stmt("COMMIT").unwrap().stmt_type(),
+            "CommitStmt"
+        );
+        assert_eq!(
+            parser.parse_one_stmt("ROLLBACK").unwrap().stmt_type(),
+            "RollbackStmt"
+        );
+        let err = parser.parse_one_stmt("ROLLBACK TO sp").unwrap_err();
+        assert!(err.message.contains("ROLLBACK TO SAVEPOINT"));
+    }
+
+    #[test]
     fn test_parse_create_table_index() {
         let parser = Parser::new();
         let stmt = parser

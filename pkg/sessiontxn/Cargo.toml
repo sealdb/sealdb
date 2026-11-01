@@ -7,3 +7,8 @@ license.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[dependencies]
+sealdb-errno.workspace = true
+sealdb-kv.workspace = true
+thiserror.workspace = true

@@ -50,3 +50,33 @@ impl UseStmt {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct BeginStmt;
+
+impl BeginStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("BEGIN");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommitStmt;
+
+impl CommitStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("COMMIT");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RollbackStmt;
+
+impl RollbackStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ROLLBACK");
+        Ok(())
+    }
+}
