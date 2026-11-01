@@ -1,8 +1,10 @@
 use crate::ddl::DDLExec;
+use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::projection::ProjectionExec;
 use crate::select::TableDualExec;
 use crate::show::ShowExec;
+use crate::table_reader::TableReaderExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_parser::ast::Statement;
@@ -51,6 +53,28 @@ impl ExecutorBuilder {
                 Ok(Box::new(ShowExec::new(
                     domain,
                     show,
+                    current_db.to_string(),
+                )))
+            }
+            PhysicalPlan::Insert => {
+                let insert = match stmt {
+                    Statement::Insert(s) => s.clone(),
+                    _ => return Err(Error::unsupported("insert without insert statement")),
+                };
+                Ok(Box::new(InsertExec::new(
+                    domain,
+                    insert,
+                    current_db.to_string(),
+                )))
+            }
+            PhysicalPlan::TableReader { .. } => {
+                let from = stmt
+                    .as_select()
+                    .and_then(|s| s.from.clone())
+                    .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
+                Ok(Box::new(TableReaderExec::new(
+                    domain,
+                    from,
                     current_db.to_string(),
                 )))
             }

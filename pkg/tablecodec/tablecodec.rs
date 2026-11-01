@@ -71,6 +71,96 @@ pub fn encode_int_handle(handle: i64) -> Vec<u8> {
     encode_int_to_cmp_uint(handle).to_be_bytes().to_vec()
 }
 
+pub fn next_prefix(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xFF {
+            end[i] += 1;
+            end.truncate(i + 1);
+            return end;
+        }
+    }
+    end.push(0);
+    end
+}
+
+const TAG_NULL: u8 = 0;
+const TAG_I64: u8 = 1;
+const TAG_F64: u8 = 2;
+const TAG_BYTES: u8 = 3;
+
+pub fn encode_row(col_ids: &[i64], values: &[sealdb_types::Datum]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(col_ids.len() as u32).to_le_bytes());
+    for (id, value) in col_ids.iter().zip(values.iter()) {
+        buf.extend_from_slice(&id.to_le_bytes());
+        match value {
+            sealdb_types::Datum::Null => buf.push(TAG_NULL),
+            sealdb_types::Datum::I64(v) => {
+                buf.push(TAG_I64);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            sealdb_types::Datum::U64(v) => {
+                buf.push(TAG_I64);
+                buf.extend_from_slice(&(*v as i64).to_le_bytes());
+            }
+            sealdb_types::Datum::F64(v) => {
+                buf.push(TAG_F64);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            other => {
+                let bytes = other.as_bytes();
+                buf.push(TAG_BYTES);
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+        }
+    }
+    buf
+}
+
+pub fn decode_row(raw: &[u8]) -> Vec<(i64, sealdb_types::Datum)> {
+    if raw.len() < 4 {
+        return Vec::new();
+    }
+    let n = u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let mut i = 4;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if i + 9 > raw.len() {
+            break;
+        }
+        let id = i64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or([0; 8]));
+        i += 8;
+        let tag = raw[i];
+        i += 1;
+        let value = match tag {
+            TAG_NULL => sealdb_types::Datum::Null,
+            TAG_I64 if i + 8 <= raw.len() => {
+                let v = i64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or([0; 8]));
+                i += 8;
+                sealdb_types::Datum::I64(v)
+            }
+            TAG_F64 if i + 8 <= raw.len() => {
+                let v = f64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or([0; 8]));
+                i += 8;
+                sealdb_types::Datum::F64(v)
+            }
+            TAG_BYTES if i + 4 <= raw.len() => {
+                let len = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
+                i += 4;
+                let end = (i + len).min(raw.len());
+                let bytes = raw[i..end].to_vec();
+                i = end;
+                sealdb_types::Datum::Bytes(bytes)
+            }
+            _ => sealdb_types::Datum::Null,
+        };
+        out.push((id, value));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

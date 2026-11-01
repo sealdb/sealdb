@@ -1,3 +1,4 @@
+use super::ddl::TableName;
 use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -11,7 +12,7 @@ pub struct SelectField {
 #[derive(Clone, Debug)]
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
-    pub from: Option<String>,
+    pub from: Option<TableName>,
     pub text: String,
 }
 
@@ -30,7 +31,46 @@ impl SelectStmt {
         }
         if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
-            ctx.write_str(from);
+            from.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InsertStmt {
+    pub table: TableName,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<ExprNode>>,
+}
+
+impl InsertStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("INSERT INTO ");
+        self.table.restore(ctx)?;
+        if !self.columns.is_empty() {
+            ctx.write_str(" (");
+            for (i, col) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        }
+        ctx.write_str(" VALUES ");
+        for (i, row) in self.rows.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            ctx.write_str("(");
+            for (j, expr) in row.iter().enumerate() {
+                if j > 0 {
+                    ctx.write_str(",");
+                }
+                expr.restore(ctx)?;
+            }
+            ctx.write_str(")");
         }
         Ok(())
     }

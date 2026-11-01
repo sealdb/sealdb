@@ -11,5 +11,6 @@ path = "lib.rs"
 [dependencies]
 sealdb-errno.workspace = true
 sealdb-kv.workspace = true
+sealdb-types.workspace = true
 sealdb-util.workspace = true
 thiserror.workspace = true

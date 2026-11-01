@@ -1,6 +1,6 @@
 # Leftover inventory
 
-Baseline features core-ported: F01, F02, F11, U0, U1, U2, U3
+Baseline features core-ported: F01, F02, F03, F11, U0, U1, U2, U3
 
 ## PlanBuilder statement kinds still open
 
@@ -11,7 +11,6 @@ Baseline features core-ported: F01, F02, F11, U0, U1, U2, U3
 - `ast.ExplainStmt` → unmapped
 - `ast.ExplainForStmt` → unmapped
 - `ast.TraceStmt` → unmapped
-- `ast.InsertStmt` → F03
 - `ast.ImportIntoStmt` → unmapped
 - `ast.LoadDataStmt` → unmapped
 - `ast.LoadStatsStmt` → unmapped

@@ -8,7 +8,7 @@
     "U3": {"status": "core-ported", "phase": 2, "notes": "CLI SELECT 1 via Dual/Projection"},
     "F01": {"status": "core-ported", "phase": 2, "notes": "arith/compare/logic/CAST/IF/IFNULL"},
     "F02": {"status": "core-ported", "phase": 3, "notes": "CREATE/DROP DATABASE|TABLE + compatible meta keys", "gaps": ["online-ddl-jobs", "create-like-as-select", "indexes", "tikv-persist"]},
-    "F03": {"status": "not-started", "phase": 5, "gaps": []},
+    "F03": {"status": "core-ported", "phase": 5, "notes": "INSERT VALUES + SELECT * via in-memory KV and TiDB row keys", "gaps": ["tikv-persist", "rowcodec", "insert-select"]},
     "F04": {"status": "not-started", "phase": 5, "gaps": []},
     "F05": {"status": "not-started", "phase": 5, "gaps": []},
     "F06": {"status": "not-started", "phase": 5, "gaps": []},

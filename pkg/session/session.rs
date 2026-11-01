@@ -24,8 +24,25 @@ impl Session {
     }
 
     pub fn execute_stmt(&self, sql: &str) -> Result<QueryResult> {
-        let stmt = self.parser.parse_one_stmt(sql)?;
-        if let sealdb_parser::ast::Statement::Use(use_stmt) = &stmt {
+        let stmts = self.parser.parse_sql(sql)?;
+        if stmts.is_empty() {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_PARSE_ERROR,
+                "empty SQL",
+            ));
+        }
+        let mut last = QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        };
+        for stmt in stmts {
+            last = self.execute_one(&stmt)?;
+        }
+        Ok(last)
+    }
+
+    fn execute_one(&self, stmt: &sealdb_parser::ast::Statement) -> Result<QueryResult> {
+        if let sealdb_parser::ast::Statement::Use(use_stmt) = stmt {
             let is = self.domain.infoschema();
             if is.schema_by_name(&use_stmt.db_name).is_none() {
                 return Err(sealdb_errno::Error::new(
@@ -39,13 +56,13 @@ impl Session {
                 rows: Vec::new(),
             });
         }
-        let plan = self.planner.build(&stmt)?;
+        let plan = self.planner.build(stmt)?;
         let current_db = self
             .current_db
             .lock()
             .expect("session current_db lock")
             .clone();
-        let exec = ExecutorBuilder::build(&plan, &stmt, Arc::clone(&self.domain), &current_db)?;
+        let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db)?;
         ExecutorBuilder::run(exec)
     }
 
@@ -143,5 +160,26 @@ mod tests {
         assert_eq!(desc.columns[0], "Field");
         assert_eq!(desc.display_rows()[0][0], "id");
         assert_eq!(desc.display_rows()[1][0], "name");
+    }
+
+    #[test]
+    fn test_insert_and_select_star() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let result = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(result.columns, vec!["id", "name"]);
+        assert_eq!(
+            result.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
     }
 }

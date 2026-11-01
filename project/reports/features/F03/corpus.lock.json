@@ -1,0 +1,19 @@
+{
+  "feature": "F03",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/executor/insert.go",
+    "TiDB pkg/executor/table_reader.go",
+    "TiDB pkg/tablecodec/tablecodec.go"
+  ],
+  "cases": [
+    "INSERT INTO db1.t VALUES (1, 'a')",
+    "INSERT INTO db1.t VALUES (2, 'b'), (3, 'c')",
+    "INSERT INTO db1.t (id, name) VALUES (4, 'd')",
+    "SELECT * FROM db1.t",
+    "SELECT * FROM t",
+    "CREATE TABLE db1.t (id INT, name VARCHAR(20))",
+    "CREATE DATABASE db1",
+    "SELECT 1"
+  ]
+}

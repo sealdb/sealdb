@@ -68,14 +68,20 @@
       "notes": "Key + IntHandle"
     },
     "pkg/kv/kv.go": {
-      "status": "stub",
-      "phase": 1,
-      "notes": "Storage/Transaction traits only"
+      "status": "partial",
+      "phase": 5,
+      "notes": "Storage/Transaction + scan"
+    },
+    "pkg/kv/cachedb.go": {
+      "status": "reimplemented",
+      "rust": "pkg/kv/mem.rs",
+      "phase": 5,
+      "notes": "in-memory KV for F03 unit tests; TiDB cachedb.go is the closest counterpart"
     },
     "pkg/tablecodec/tablecodec.go": {
       "status": "partial",
-      "phase": 1,
-      "notes": "row/index key layout"
+      "phase": 5,
+      "notes": "row/index key layout + compact row values"
     },
     "pkg/parser/parser.go": {
       "status": "reimplemented",
@@ -104,8 +110,8 @@
     },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "SelectStmt core"
+      "phase": 5,
+      "notes": "SelectStmt + InsertStmt"
     },
     "pkg/parser/model/model.go": {
       "status": "partial",
@@ -169,13 +175,13 @@
     },
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "Build constant SELECT and F02 DDL"
+      "phase": 5,
+      "notes": "Build constant SELECT, DDL, INSERT, TableReader"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "TableDual / Projection / DDL"
+      "phase": 5,
+      "notes": "TableDual / Projection / DDL / Insert / TableReader"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -229,13 +235,13 @@
     },
     "pkg/domain/domain.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "owns meta + infoschema reload"
+      "phase": 5,
+      "notes": "owns meta + infoschema + MemStorage"
     },
     "pkg/executor/builder.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "select + DDL builder"
+      "phase": 5,
+      "notes": "select + DDL + insert + table reader"
     },
     "pkg/executor/ddl.go": {
       "status": "partial",
@@ -246,6 +252,16 @@
       "status": "partial",
       "phase": 3,
       "notes": "SHOW DATABASES/TABLES and DESC"
+    },
+    "pkg/executor/insert.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "INSERT VALUES into mem KV"
+    },
+    "pkg/executor/table_reader.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "scan table prefix for SELECT *"
     },
     "pkg/executor/select.go": {
       "status": "partial",

@@ -4,12 +4,14 @@ pub mod aggfuncs;
 pub mod aggregate;
 pub mod builder;
 pub mod ddl;
+pub mod insert;
 pub mod internal;
 pub mod join;
 pub mod projection;
 pub mod select;
 pub mod show;
 pub mod sortexec;
+pub mod table_reader;
 pub mod unionexec;
 
 pub use builder::ExecutorBuilder;

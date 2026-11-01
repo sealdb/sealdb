@@ -1,5 +1,5 @@
 use super::physical_plans::{DdlKind, PhysicalPlan};
-use sealdb_errno::{Error, Result};
+use sealdb_errno::Result;
 use sealdb_parser::ast::{Statement, StmtNode};
 
 pub struct PlanBuilder;
@@ -13,9 +13,11 @@ impl PlanBuilder {
         match stmt {
             Statement::Select(select) => {
                 if let Some(from) = &select.from
-                    && !from.eq_ignore_ascii_case("dual")
+                    && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    return Err(Error::unsupported(format!("FROM {from}")));
+                    return Ok(PhysicalPlan::TableReader {
+                        table: from.name.clone(),
+                    });
                 }
                 let exprs = select
                     .fields
@@ -28,6 +30,7 @@ impl PlanBuilder {
                     child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                 })
             }
+            Statement::Insert(_) => Ok(PhysicalPlan::Insert),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateDatabase,
             }),

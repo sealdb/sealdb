@@ -1,17 +1,21 @@
 use sealdb_ddl::execute_ddl;
 use sealdb_errno::Result;
 use sealdb_infoschema::InfoSchema;
+use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::Mutator;
 use sealdb_parser::ast::Statement;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 pub struct Domain {
     inner: Mutex<Inner>,
+    storage: Arc<MemStorage>,
 }
 
 struct Inner {
     meta: Mutator,
     infoschema: InfoSchema,
+    next_handle: HashMap<i64, i64>,
 }
 
 impl Domain {
@@ -20,7 +24,9 @@ impl Domain {
             inner: Mutex::new(Inner {
                 meta: Mutator::new(),
                 infoschema: InfoSchema::empty(),
+                next_handle: HashMap::new(),
             }),
+            storage: Arc::new(MemStorage::new()),
         }
     }
 
@@ -30,6 +36,17 @@ impl Domain {
             .expect("domain infoschema lock")
             .infoschema
             .clone()
+    }
+
+    pub fn storage(&self) -> Arc<MemStorage> {
+        Arc::clone(&self.storage)
+    }
+
+    pub fn next_handle(&self, table_id: i64) -> i64 {
+        let mut inner = self.inner.lock().expect("domain handle lock");
+        let next = inner.next_handle.entry(table_id).or_insert(0);
+        *next += 1;
+        *next
     }
 
     pub fn execute_ddl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
@@ -44,5 +61,11 @@ impl Domain {
 impl Default for Domain {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Storage for Domain {
+    fn begin(&self) -> Result<Box<dyn sealdb_kv::Transaction>> {
+        self.storage.begin()
     }
 }

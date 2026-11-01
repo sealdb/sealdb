@@ -3,6 +3,8 @@
 
 pub mod key;
 pub mod kv;
+pub mod mem;
 
 pub use key::{IntHandle, Key};
 pub use kv::{IsolationLevel, Storage, Transaction, Version};
+pub use mem::MemStorage;

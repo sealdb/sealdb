@@ -138,4 +138,23 @@ mod tests {
             "UseStmt"
         );
     }
+
+    #[test]
+    fn test_parse_insert_and_select_star() {
+        let parser = Parser::new();
+        assert_eq!(
+            parser
+                .parse_one_stmt("INSERT INTO db1.t VALUES (1, 'a')")
+                .unwrap()
+                .stmt_type(),
+            "InsertStmt"
+        );
+        assert_eq!(
+            parser
+                .parse_one_stmt("SELECT * FROM db1.t")
+                .unwrap()
+                .stmt_type(),
+            "SelectStmt"
+        );
+    }
 }

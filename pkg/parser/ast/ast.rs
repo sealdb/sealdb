@@ -1,6 +1,7 @@
 use super::ddl::{CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt};
+use super::dml::{InsertStmt, SelectStmt};
+use super::expressions::ExprNode;
 use super::misc::{ShowStmt, UseStmt};
-use super::{dml::SelectStmt, expressions::ExprNode};
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -21,6 +22,7 @@ pub enum Statement {
     DropTable(DropTableStmt),
     Show(ShowStmt),
     Use(UseStmt),
+    Insert(InsertStmt),
 }
 
 impl Node for Statement {
@@ -33,6 +35,7 @@ impl Node for Statement {
             Statement::DropTable(s) => s.restore(ctx),
             Statement::Show(s) => s.restore(ctx),
             Statement::Use(s) => s.restore(ctx),
+            Statement::Insert(s) => s.restore(ctx),
         }
     }
 }
@@ -47,6 +50,7 @@ impl StmtNode for Statement {
             Statement::DropTable(_) => "DropTableStmt",
             Statement::Show(_) => "ShowStmt",
             Statement::Use(_) => "UseStmt",
+            Statement::Insert(_) => "InsertStmt",
         }
     }
 }

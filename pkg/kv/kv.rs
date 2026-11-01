@@ -18,6 +18,7 @@ pub trait Transaction {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&mut self, key: &[u8]) -> Result<()>;
+    fn scan(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
 }

@@ -23,6 +23,10 @@ pub enum PhysicalPlan {
     Show {
         kind: String,
     },
+    Insert,
+    TableReader {
+        table: String,
+    },
 }
 
 impl PhysicalPlan {
@@ -34,6 +38,8 @@ impl PhysicalPlan {
             }
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
+            PhysicalPlan::Insert => "Insert".to_string(),
+            PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
         }
     }
 }

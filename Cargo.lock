@@ -259,6 +259,7 @@ dependencies = [
  "sealdb-ddl",
  "sealdb-errno",
  "sealdb-infoschema",
+ "sealdb-kv",
  "sealdb-meta",
  "sealdb-parser",
  "thiserror",
@@ -278,8 +279,11 @@ dependencies = [
  "sealdb-domain",
  "sealdb-errno",
  "sealdb-expression",
+ "sealdb-kv",
+ "sealdb-meta",
  "sealdb-parser",
  "sealdb-planner",
+ "sealdb-tablecodec",
  "sealdb-types",
  "sealdb-util",
  "serde",
@@ -410,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "sealdb-errno",
  "sealdb-kv",
+ "sealdb-types",
  "sealdb-util",
  "thiserror",
 ]

@@ -3,7 +3,7 @@ use crate::ast::Statement;
 use crate::ast::ddl::{
     ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
 };
-use crate::ast::dml::{SelectField, SelectStmt};
+use crate::ast::dml::{InsertStmt, SelectField, SelectStmt};
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
 };
@@ -14,7 +14,7 @@ use sealdb_types::Datum;
 use sqlparser::ast::{
     BinaryOperator, DataType, DescribeAlias, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, ObjectName, ObjectType, SchemaName, SelectItem, SetExpr,
-    Statement as SqlStatement, UnaryOperator, Use, Value,
+    Statement as SqlStatement, TableObject, UnaryOperator, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
@@ -37,10 +37,14 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     .iter()
                     .map(lower_select_item)
                     .collect::<Result<Vec<_>>>()?;
-                let from = select.from.first().and_then(|t| match &t.relation {
-                    sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
-                    _ => None,
-                });
+                let from = select
+                    .from
+                    .first()
+                    .map(|t| match &t.relation {
+                        sqlparser::ast::TableFactor::Table { name, .. } => object_table_name(name),
+                        other => Err(Error::unsupported(format!("FROM {other}"))),
+                    })
+                    .transpose()?;
                 Ok(Statement::Select(SelectStmt {
                     fields,
                     from,
@@ -172,6 +176,29 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 table: Some(object_table_name(table_name)?),
             }))
         }
+        SqlStatement::Insert(insert) => {
+            let table = match &insert.table {
+                TableObject::TableName(name) => object_table_name(name)?,
+                other => return Err(Error::unsupported(format!("INSERT target {other}"))),
+            };
+            let columns = insert
+                .columns
+                .iter()
+                .map(object_name_last)
+                .collect::<Result<Vec<_>>>()?;
+            let rows = match insert.source.as_deref().map(|q| q.body.as_ref()) {
+                Some(SetExpr::Values(values)) => lower_values(values)?,
+                Some(other) => {
+                    return Err(Error::unsupported(format!("INSERT source {other}")));
+                }
+                None => return Err(Error::unsupported("INSERT without VALUES")),
+            };
+            Ok(Statement::Insert(InsertStmt {
+                table,
+                columns,
+                rows,
+            }))
+        }
         SqlStatement::Use(use_stmt) => {
             let name = match use_stmt {
                 Use::Catalog(name)
@@ -187,6 +214,14 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             format!("statement {other} is not available in this phase"),
         )),
     }
+}
+
+fn lower_values(values: &Values) -> Result<Vec<Vec<crate::ast::expressions::ExprNode>>> {
+    values
+        .rows
+        .iter()
+        .map(|row| row.iter().map(lower_expr).collect())
+        .collect()
 }
 
 fn object_table_name(name: &ObjectName) -> Result<TableName> {

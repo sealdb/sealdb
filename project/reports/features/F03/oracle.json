@@ -1,0 +1,28 @@
+{
+  "suite": "testdata/F03",
+  "cases": [
+    {
+      "name": "insert_select.sql",
+      "result": {
+        "sql": "INSERT INTO db1.t VALUES (1, 'a');\nINSERT INTO db1.t VALUES (2, 'b'), (3, 'c');\nSELECT * FROM db1.t;\n",
+        "statements": [
+          {
+            "type": "InsertStmt",
+            "restore": "INSERT INTO `db1`.`t` VALUES (1,_UTF8MB4'a')",
+            "text": "INSERT INTO db1.t VALUES (1, 'a');"
+          },
+          {
+            "type": "InsertStmt",
+            "restore": "INSERT INTO `db1`.`t` VALUES (2,_UTF8MB4'b'),(3,_UTF8MB4'c')",
+            "text": "INSERT INTO db1.t VALUES (2, 'b'), (3, 'c');"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t`",
+            "text": "SELECT * FROM db1.t;"
+          }
+        ]
+      }
+    }
+  ]
+}
