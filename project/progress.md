@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（SHOW CREATE / COUNT DISTINCT）  
+> 最后更新：2026-11-01（PPD / coprocessor-filter）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,21 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F04 leftover（PPD / coprocessor-filter）
+- **完成**:
+  - `rule_predicate_push_down` 把 CNF 谓词下推到 TableReader / IndexLookUp
+  - 扫描时 `coprocessor::filter_rows` 过滤（MemStorage 与 TiKV KV scan 共用）
+  - Inner join 单侧谓词下推；outer-join 内侧谓词保持 residual
+  - EXPLAIN `task: cop` + `pushed:`
+- **验证**:
+  - planner PPD 单测 + session WHERE/JOIN/IndexLookUp
+  - F04 feature gate
+- **下一步**:
+  - leftover 其余项（SUM DISTINCT / remaining I_S / show-full-columns）
+  - C6 保持 deferred
 
 ### 2026-11-01
 
@@ -583,7 +598,7 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 | D2 | ~~edition 2024 vs Cargo 1.80~~ | 已解决 | Rust 1.99.1 |
 | D3 | 本地 PD/TiKV 仍可能是 9.0 beta | 行为/协议风险 | 测试固定 8.5.8 |
 | D4 | sqlparser-rs 与目标语法差异 | Parser 覆盖不全 | bridge + 分批补齐（ADR-0003） |
-| D5 | tikv-client 乐观/悲观 KV 已封装；coprocessor 仍缺 | Cop 下推不可用 | 完整性波 / leftover |
+| D5 | 谓词已在 scan 时过滤；TiKV Coprocessor DAG 仍缺 | 远端 Cop 任务不可用 | 后续完整性波 |
 | D6 | workspace crate 边界 | 需显式依赖 | 按顶层包维护；循环依赖单独讨论 |
 | D7 | 源码不含来源标记 | 追溯依赖 manifest | 强制更新 `project/parity/status.json` |
 

@@ -1,11 +1,12 @@
 // F10 core path: IndexLookUpExecutor (TiDB pkg/executor/distsql.go).
 // Completeness wave / not this feature: covering IndexReader, range scan,
 // IndexMerge, lookup push-down, parallel workers, unique index PointGet.
+use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::TxnHandle;
-use sealdb_parser::ast::TableName;
+use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
     decode_handle_from_index_key, decode_row, encode_index_seek_prefix, encode_row_key_with_handle,
     next_prefix,
@@ -23,6 +24,7 @@ pub struct IndexLookUpExecutor {
     txn: Arc<TxnHandle>,
     for_update: bool,
     partitions: Vec<i64>,
+    pushed: Option<ExprNode>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -39,6 +41,7 @@ impl IndexLookUpExecutor {
         txn: Arc<TxnHandle>,
         for_update: bool,
         partitions: Vec<i64>,
+        pushed: Option<ExprNode>,
     ) -> Self {
         Self {
             domain,
@@ -49,6 +52,7 @@ impl IndexLookUpExecutor {
             txn,
             for_update,
             partitions,
+            pushed,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -126,6 +130,11 @@ impl Executor for IndexLookUpExecutor {
             }
             Ok(rows)
         })?;
+        self.rows = filter_rows(
+            std::mem::take(&mut self.rows),
+            &self.schema,
+            self.pushed.as_ref(),
+        )?;
         Ok(())
     }
 

@@ -1,4 +1,5 @@
 use sealdb_parser::ast::ExplainFormat;
+use sealdb_parser::ast::ExprNode;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -39,6 +40,8 @@ pub enum PhysicalPlan {
     TableReader {
         table: String,
         partitions: Vec<i64>,
+        #[serde(skip)]
+        pushed: Option<ExprNode>,
     },
     PointGet {
         table: String,
@@ -48,9 +51,13 @@ pub enum PhysicalPlan {
         table: String,
         index: String,
         partitions: Vec<i64>,
+        #[serde(skip)]
+        pushed: Option<ExprNode>,
     },
     Selection {
         child: Box<PhysicalPlan>,
+        #[serde(skip)]
+        filter: ExprNode,
     },
     Sort {
         child: Box<PhysicalPlan>,
@@ -74,6 +81,8 @@ pub enum PhysicalPlan {
     },
     Apply {
         child: Box<PhysicalPlan>,
+        #[serde(skip)]
+        filter: ExprNode,
     },
     Union {
         distinct: bool,
@@ -111,8 +120,12 @@ impl PhysicalPlan {
             PhysicalPlan::InfoSchema { table } => format!("InfoSchema_{table}"),
             PhysicalPlan::Update => "Update".to_string(),
             PhysicalPlan::Delete => "Delete".to_string(),
-            PhysicalPlan::TableReader { table, partitions } => {
-                if partitions.is_empty() {
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                pushed,
+            } => {
+                let mut name = if partitions.is_empty() {
                     format!("TableReader_{table}")
                 } else {
                     format!(
@@ -123,15 +136,20 @@ impl PhysicalPlan {
                             .collect::<Vec<_>>()
                             .join(",")
                     )
+                };
+                if let Some(filter) = pushed {
+                    name.push_str(&format!("[{}]", filter.restore_string()));
                 }
+                name
             }
             PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
             PhysicalPlan::IndexLookUpReader {
                 table,
                 index,
                 partitions,
+                pushed,
             } => {
-                if partitions.is_empty() {
+                let mut name = if partitions.is_empty() {
                     format!("IndexLookUpReader_{table}_{index}")
                 } else {
                     format!(
@@ -142,9 +160,13 @@ impl PhysicalPlan {
                             .collect::<Vec<_>>()
                             .join(",")
                     )
+                };
+                if let Some(filter) = pushed {
+                    name.push_str(&format!("[{}]", filter.restore_string()));
                 }
+                name
             }
-            PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
+            PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
@@ -156,7 +178,7 @@ impl PhysicalPlan {
             PhysicalPlan::Explain { format, child } => {
                 format!("Explain_{format:?} -> {}", child.explain())
             }
-            PhysicalPlan::Apply { child } => format!("Apply -> {}", child.explain()),
+            PhysicalPlan::Apply { child, .. } => format!("Apply -> {}", child.explain()),
             PhysicalPlan::Union {
                 distinct,
                 left,
@@ -169,6 +191,14 @@ impl PhysicalPlan {
             ),
             PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
             PhysicalPlan::CTE { name, seed, .. } => format!("CTE_{name} -> {}", seed.explain()),
+        }
+    }
+
+    pub fn table_reader(table: impl Into<String>, partitions: Vec<i64>) -> Self {
+        PhysicalPlan::TableReader {
+            table: table.into(),
+            partitions,
+            pushed: None,
         }
     }
 }

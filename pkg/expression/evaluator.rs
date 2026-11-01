@@ -95,7 +95,8 @@ fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
     match col.table.as_deref() {
         Some(wanted) => {
             name_ok
-                && (table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
+                && (table.is_none()
+                    || table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
                     || schema_name.eq_ignore_ascii_case(&format!("{wanted}.{}", col.name)))
         }
         None => name_ok,

@@ -1,7 +1,10 @@
 # F04 gaps
 
-These stay out of the core-ported door. Pick them up in the completeness wave.
+PPD and coprocessor-filter are in the core path: CNF conjuncts attach to
+TableReader / IndexLookUp and are evaluated at scan time (`task: cop`).
 
-- Predicate pushdown / ColumnPrune RBO rules (output Projection is wrapped; filters still run above TableReader)
-- Qualified column resolution across joins
-- Coprocessor-side filter
+These stay out of the core-ported door.
+
+- TiKV Coprocessor DAG / CopClient protobuf (local scan-time filter only)
+- ColumnPrune as a standalone RBO (output Projection is wrapped)
+- Outer-join inner-side predicates converting LEFT to Inner

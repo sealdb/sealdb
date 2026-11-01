@@ -305,7 +305,7 @@
       "status": "partial",
       "rust": "pkg/store/driver/mod.rs",
       "phase": 5,
-      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; coprocessor deferred"
+      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; Coprocessor DAG deferred"
     },
     "pkg/server/server.go": {
       "status": "partial",
@@ -369,6 +369,12 @@
       "phase": 8,
       "notes": "static RANGE/HASH prune into TableReader partition ids"
     },
+    "pkg/planner/core/rule_predicate_push_down.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/rule_predicate_push_down.rs",
+      "phase": 5,
+      "notes": "CNF push into TableReader/IndexLookUp and join sides; outer-join inner residual"
+    },
     "pkg/table/tables/partition.go": {
       "status": "partial",
       "rust": "pkg/meta/model/partition.rs",
@@ -395,6 +401,12 @@
       "status": "partial",
       "phase": 5,
       "notes": "IndexLookUpExecutor double-read for indexed equality"
+    },
+    "pkg/executor/coprocessor.go": {
+      "status": "partial",
+      "rust": "pkg/executor/coprocessor.rs",
+      "phase": 5,
+      "notes": "scan-time pushed filter; TiKV Coprocessor DAG / CopClient deferred"
     },
     "pkg/table/tables/index.go": {
       "status": "reimplemented",

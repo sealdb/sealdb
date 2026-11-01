@@ -1,12 +1,13 @@
 // F13: FOR UPDATE uses scan_for_update (latest + exclusive lock).
 // Completeness wave / not this feature: blocking lock wait, FOR SHARE,
 // NOWAIT / SKIP LOCKED / WAIT N, OF table list.
+use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::TxnHandle;
 use sealdb_meta::TableInfo;
-use sealdb_parser::ast::TableName;
+use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
     decode_handle_from_row_key, decode_row, gen_table_record_prefix, next_prefix,
 };
@@ -21,12 +22,14 @@ pub struct TableReaderExec {
     txn: Arc<TxnHandle>,
     for_update: bool,
     partitions: Vec<i64>,
+    pushed: Option<ExprNode>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
 }
 
 impl TableReaderExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: Arc<Domain>,
         table: TableName,
@@ -34,6 +37,7 @@ impl TableReaderExec {
         txn: Arc<TxnHandle>,
         for_update: bool,
         partitions: Vec<i64>,
+        pushed: Option<ExprNode>,
     ) -> Self {
         Self {
             domain,
@@ -42,6 +46,7 @@ impl TableReaderExec {
             txn,
             for_update,
             partitions,
+            pushed,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -72,10 +77,14 @@ impl Executor for TableReaderExec {
         } else {
             self.partitions.clone()
         };
-        self.rows = scan_table(&self.txn, &info, self.for_update, &physical)?
-            .into_iter()
-            .map(|row| row.values)
-            .collect();
+        self.rows = filter_rows(
+            scan_table(&self.txn, &info, self.for_update, &physical)?
+                .into_iter()
+                .map(|row| row.values)
+                .collect(),
+            &self.schema,
+            self.pushed.as_ref(),
+        )?;
         Ok(())
     }
 

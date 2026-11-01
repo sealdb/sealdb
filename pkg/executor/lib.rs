@@ -4,6 +4,7 @@ pub mod aggfuncs;
 pub mod aggregate;
 pub mod analyze;
 pub mod builder;
+pub mod coprocessor;
 pub mod cte;
 pub mod ddl;
 pub mod delete;

@@ -72,16 +72,10 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::Selection { child } => {
-                let filter = stmt
-                    .as_select()
-                    .and_then(|s| s.selection.clone())
-                    .ok_or_else(|| Error::unsupported("selection without WHERE"))?;
-                Ok(Box::new(SelectionExec::new(
-                    filter,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )))
-            }
+            PhysicalPlan::Selection { child, filter } => Ok(Box::new(SelectionExec::new(
+                filter.clone(),
+                Self::build(child, stmt, domain, current_db, txn)?,
+            ))),
             PhysicalPlan::Simple { kind } if kind == "Analyze" => Ok(Box::new(AnalyzeExec::new(
                 domain,
                 stmt.clone(),
@@ -158,7 +152,10 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::IndexLookUpReader {
-                index, partitions, ..
+                index,
+                partitions,
+                pushed,
+                ..
             } => {
                 let select = stmt
                     .as_select()
@@ -167,8 +164,9 @@ impl ExecutorBuilder {
                     .from
                     .clone()
                     .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
-                let lookup = eq_lookup_value(select.selection.as_ref())
-                    .ok_or_else(|| Error::unsupported("index lookup without equality"))?;
+                let lookup =
+                    eq_lookup_value(&domain, current_db, &from, index, select.selection.as_ref())
+                        .ok_or_else(|| Error::unsupported("index lookup without equality"))?;
                 Ok(Box::new(IndexLookUpExecutor::new(
                     domain,
                     from,
@@ -178,6 +176,7 @@ impl ExecutorBuilder {
                     txn,
                     select.lock == SelectLock::ForUpdate,
                     partitions.clone(),
+                    pushed.clone(),
                 )))
             }
             PhysicalPlan::PointGet { handle, .. } => {
@@ -197,7 +196,11 @@ impl ExecutorBuilder {
                     select.lock == SelectLock::ForUpdate,
                 )))
             }
-            PhysicalPlan::TableReader { table, partitions } => {
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                pushed,
+            } => {
                 let from = resolve_reader_table(stmt, table)?;
                 let for_update = stmt
                     .as_select()
@@ -209,6 +212,7 @@ impl ExecutorBuilder {
                     txn,
                     for_update,
                     partitions.clone(),
+                    pushed.clone(),
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
@@ -261,16 +265,12 @@ impl ExecutorBuilder {
                 }
                 Ok(exec)
             }
-            PhysicalPlan::Apply { child } => {
+            PhysicalPlan::Apply { child, filter } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("apply without select"))?;
-                let filter = select
-                    .selection
-                    .clone()
-                    .ok_or_else(|| Error::unsupported("apply without WHERE"))?;
                 Ok(Box::new(NestedLoopApplyExec::new(
-                    filter,
+                    filter.clone(),
                     Self::build(
                         child,
                         stmt,
@@ -407,19 +407,22 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
         .ok_or_else(|| Error::unsupported("table reader without FROM"))
 }
 
-fn eq_lookup_value(selection: Option<&ExprNode>) -> Option<sealdb_types::Datum> {
-    let ExprNode::Binary(bin) = selection? else {
-        return None;
-    };
-    if !matches!(bin.op, sealdb_parser::opcode::Op::Eq) {
-        return None;
-    }
-    match (bin.left.as_ref(), bin.right.as_ref()) {
-        (ExprNode::Column(_), ExprNode::Value(v)) | (ExprNode::Value(v), ExprNode::Column(_)) => {
-            Some(v.datum.clone())
-        }
-        _ => None,
-    }
+fn eq_lookup_value(
+    domain: &Domain,
+    current_db: &str,
+    table: &sealdb_parser::ast::TableName,
+    index_name: &str,
+    selection: Option<&ExprNode>,
+) -> Option<sealdb_types::Datum> {
+    let (schema, name) = table.qualified(current_db);
+    let is = domain.infoschema();
+    let info = is.table_by_name(&schema, &name)?;
+    let index = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+    let column = index.columns.first()?.name.o().to_string();
+    selection?.eq_const_on(&column)
 }
 
 fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {

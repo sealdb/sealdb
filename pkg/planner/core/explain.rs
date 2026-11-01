@@ -81,7 +81,7 @@ fn walk(
     rows.push(ExplainRow {
         id: format!("{prefix}{name}_{id}"),
         est_rows: format!("{:.2}", est_rows(plan)),
-        task: "root".to_string(),
+        task: task_of(plan).to_string(),
         access,
         info,
     });
@@ -114,11 +114,11 @@ fn collect_dot(
 fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
     match plan {
         PhysicalPlan::Projection { child, .. }
-        | PhysicalPlan::Selection { child }
+        | PhysicalPlan::Selection { child, .. }
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::Limit { child }
         | PhysicalPlan::HashAgg { child }
-        | PhysicalPlan::Apply { child }
+        | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. } => vec![child.as_ref()],
@@ -148,26 +148,38 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         ),
         PhysicalPlan::Update => ("Update".to_string(), String::new(), String::new()),
         PhysicalPlan::Delete => ("Delete".to_string(), String::new(), String::new()),
-        PhysicalPlan::TableReader { table, partitions } => (
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            pushed,
+        } => (
             "TableReader".to_string(),
             format!("table:{table}"),
-            if partitions.is_empty() {
-                String::new()
-            } else {
-                format!("partition:{partitions:?}")
-            },
+            cop_info(partitions, pushed.as_ref()),
         ),
         PhysicalPlan::PointGet { table, handle } => (
             "PointGet".to_string(),
             format!("table:{table}"),
             format!("handle:{handle}"),
         ),
-        PhysicalPlan::IndexLookUpReader { table, index, .. } => (
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            pushed,
+            ..
+        } => (
             "IndexLookUp".to_string(),
             format!("table:{table}, index:{index}"),
-            String::new(),
+            pushed
+                .as_ref()
+                .map(|filter| format!("pushed:{}", filter.restore_string()))
+                .unwrap_or_default(),
         ),
-        PhysicalPlan::Selection { .. } => ("Selection".to_string(), String::new(), String::new()),
+        PhysicalPlan::Selection { filter, .. } => (
+            "Selection".to_string(),
+            String::new(),
+            filter.restore_string(),
+        ),
         PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
         PhysicalPlan::Limit { .. } => ("Limit".to_string(), String::new(), String::new()),
         PhysicalPlan::HashAgg { .. } => ("HashAgg".to_string(), String::new(), String::new()),
@@ -181,7 +193,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("{tp:?}, equal:[{left_table} = {right_table}]"),
         ),
-        PhysicalPlan::Apply { .. } => ("Apply".to_string(), String::new(), String::new()),
+        PhysicalPlan::Apply { filter, .. } => {
+            ("Apply".to_string(), String::new(), filter.restore_string())
+        }
         PhysicalPlan::Union { distinct, .. } => (
             "Union".to_string(),
             String::new(),
@@ -199,19 +213,48 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
         PhysicalPlan::PointGet { .. } => 1.0,
-        PhysicalPlan::Selection { child } => est_rows(child) * 0.8,
+        PhysicalPlan::Selection { child, .. } => est_rows(child) * 0.8,
+        PhysicalPlan::TableReader {
+            pushed: Some(_), ..
+        }
+        | PhysicalPlan::IndexLookUpReader {
+            pushed: Some(_), ..
+        } => 8_000.0,
         PhysicalPlan::Limit { child } => est_rows(child).min(1.0),
         PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
         PhysicalPlan::Union { left, right, .. } => est_rows(left) + est_rows(right),
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::HashAgg { child }
-        | PhysicalPlan::Apply { child }
+        | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. } => est_rows(child),
         _ => 10_000.0,
     }
+}
+
+fn task_of(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::TableReader {
+            pushed: Some(_), ..
+        }
+        | PhysicalPlan::IndexLookUpReader {
+            pushed: Some(_), ..
+        } => "cop",
+        _ => "root",
+    }
+}
+
+fn cop_info(partitions: &[i64], pushed: Option<&sealdb_parser::ast::ExprNode>) -> String {
+    let mut parts = Vec::new();
+    if !partitions.is_empty() {
+        parts.push(format!("partition:{partitions:?}"));
+    }
+    if let Some(filter) = pushed {
+        parts.push(format!("pushed:{}", filter.restore_string()));
+    }
+    parts.join(", ")
 }
 
 fn tree_prefix(depth: usize, last: bool) -> String {

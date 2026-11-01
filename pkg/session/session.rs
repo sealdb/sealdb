@@ -871,6 +871,19 @@ mod tests {
             .unwrap();
         assert_eq!(is_null.columns, vec!["id"]);
         assert_eq!(is_null.display_rows(), vec![vec!["4".to_string()]]);
+        let explained = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE id > 1 AND name = 'c'")
+            .unwrap();
+        let text = explained
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("TableReader"), "{text}");
+        assert!(text.contains("pushed:"), "{text}");
+        assert!(text.contains("cop"), "{text}");
+        assert!(!text.contains("Selection"), "{text}");
     }
 
     #[test]
@@ -1082,6 +1095,19 @@ mod tests {
             inner.display_rows(),
             vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
         );
+        let filtered = session
+            .execute_stmt(
+                "SELECT t1.id, t1.name, t2.tag FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id WHERE t1.id = 1",
+            )
+            .unwrap();
+        assert_eq!(
+            filtered.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
+        );
+        let missed = session
+            .execute_stmt("SELECT t1.id FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id WHERE t1.id = 9")
+            .unwrap();
+        assert!(missed.display_rows().is_empty());
         let left = session
             .execute_stmt(
                 "SELECT t1.id, t2.tag FROM db1.t1 LEFT JOIN db1.t2 ON t1.id = t2.id ORDER BY t1.id",
@@ -1126,6 +1152,13 @@ mod tests {
         let hit = session
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' ORDER BY id")
             .unwrap();
+        let extra = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' AND id > 1 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            extra.display_rows(),
+            vec![vec!["3".to_string(), "a".to_string()]]
+        );
         assert_eq!(
             hit.display_rows(),
             vec![
