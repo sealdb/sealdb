@@ -34,17 +34,29 @@ impl Domain {
     }
 
     pub fn with_storage(storage: Arc<dyn Storage>) -> Self {
-        Self::with_storage_and_privilege(storage, Manager::skip_with_grant())
+        Self::with_storage_and_privilege(storage, Manager::skip_with_grant(), 0)
+    }
+
+    pub fn with_storage_id_base(storage: Arc<dyn Storage>, id_base: i64) -> Self {
+        Self::with_storage_and_privilege(storage, Manager::skip_with_grant(), id_base)
     }
 
     fn with_privilege(privilege: Manager) -> Self {
-        Self::with_storage_and_privilege(Arc::new(MemStorage::new()), privilege)
+        Self::with_storage_and_privilege(Arc::new(MemStorage::new()), privilege, 0)
     }
 
-    fn with_storage_and_privilege(storage: Arc<dyn Storage>, privilege: Manager) -> Self {
+    fn with_storage_and_privilege(
+        storage: Arc<dyn Storage>,
+        privilege: Manager,
+        id_base: i64,
+    ) -> Self {
+        let mut meta = Mutator::new();
+        if id_base > 0 {
+            meta.set_global_id(id_base);
+        }
         Self {
             inner: Mutex::new(Inner {
-                meta: Mutator::new(),
+                meta,
                 infoschema: InfoSchema::empty(),
                 next_handle: HashMap::new(),
             }),

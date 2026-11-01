@@ -1739,8 +1739,12 @@ name = "sealdb-integrationtest"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "sealdb-config",
+ "sealdb-domain",
  "sealdb-errno",
+ "sealdb-kv",
  "sealdb-session",
+ "sealdb-store",
 ]
 
 [[package]]

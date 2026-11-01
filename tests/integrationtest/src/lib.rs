@@ -4,13 +4,80 @@
 //! compares against `r/*.result` in mysql-tester form:
 //! echoed SQL, tab-separated header/rows, or `Error code (sqlstate): msg`.
 //!
+//! Each suite runs on MemStorage and, when PD is reachable, on TiKV.
 //! Completeness wave: `connect`/`connection` multi-session, stats `s/*.json`,
 //! live MySQL-protocol mysql-tester against `--listen`.
 
+use sealdb_config::Config;
+use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_session::Session;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreBackend {
+    Memory,
+    Tikv,
+}
+
+impl StoreBackend {
+    pub fn parse_list(raw: &str) -> Result<Vec<Self>> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "both" | "all" => Ok(vec![Self::Memory, Self::Tikv]),
+            "memory" | "mem" => Ok(vec![Self::Memory]),
+            "tikv" => Ok(vec![Self::Tikv]),
+            other => Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("unknown store {other:?}; expected memory, tikv, or both"),
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Tikv => "tikv",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    pub record: bool,
+    pub filter: Option<String>,
+    pub stores: Vec<StoreBackend>,
+    pub require_tikv: bool,
+    pub pd: Option<String>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            record: false,
+            filter: None,
+            stores: vec![StoreBackend::Memory, StoreBackend::Tikv],
+            require_tikv: require_tikv_from_env(),
+            pd: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RunReport {
+    pub memory: usize,
+    pub tikv: usize,
+    pub tikv_skipped: bool,
+}
+
+impl RunReport {
+    pub fn ran(&self) -> usize {
+        self.memory + self.tikv
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Step {
@@ -139,8 +206,42 @@ fn collect_tests(dir: &Path, t_root: &Path, root: &Path, out: &mut Vec<Suite>) -
     Ok(())
 }
 
-pub fn run_suite(suite: &Suite) -> Result<String> {
-    let session = Session::new();
+fn require_tikv_from_env() -> bool {
+    matches!(
+        std::env::var("SEALDB_ITEST_REQUIRE_TIKV")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+fn unique_id_base() -> i64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    ((nanos.wrapping_add(seq.wrapping_mul(1_000_003))) % 1_000_000_000_000) as i64
+}
+
+fn open_storage(backend: StoreBackend, pd: Option<&str>) -> Result<Arc<dyn sealdb_kv::Storage>> {
+    let cfg = Config::default()
+        .with_store_name(Some(backend.as_str()))?
+        .with_pd(pd);
+    sealdb_store::open(&cfg)
+}
+
+fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
+    Session::with_domain(Arc::new(Domain::with_storage_id_base(
+        storage,
+        unique_id_base(),
+    )))
+}
+
+pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<String> {
+    let session = new_session(storage);
     let mut chunks = Vec::new();
     for step in &suite.steps {
         chunks.push(run_step(&session, step)?);
@@ -187,8 +288,8 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
     }
 }
 
-pub fn compare_suite(suite: &Suite) -> Result<()> {
-    let actual = run_suite(suite)?;
+pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
+    let actual = run_suite(suite, storage)?;
     let expected = fs::read_to_string(&suite.result_path).map_err(|e| {
         Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
@@ -207,8 +308,8 @@ pub fn compare_suite(suite: &Suite) -> Result<()> {
     Ok(())
 }
 
-pub fn record_suite(suite: &Suite) -> Result<()> {
-    let actual = run_suite(suite)?;
+pub fn record_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
+    let actual = run_suite(suite, storage)?;
     if let Some(parent) = suite.result_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
@@ -225,29 +326,72 @@ fn normalize(text: &str) -> String {
     out
 }
 
-pub fn run_all(root: &Path, record: bool, filter: Option<&str>) -> Result<usize> {
-    let suites = load_suites(root)?;
+fn run_backend(
+    suites: &[Suite],
+    backend: StoreBackend,
+    opts: &RunOptions,
+    record: bool,
+) -> Result<(usize, bool)> {
+    let storage = match open_storage(backend, opts.pd.as_deref()) {
+        Ok(storage) => storage,
+        Err(err) if backend == StoreBackend::Tikv && !opts.require_tikv => {
+            eprintln!("skip tikv integrationtest: {err}");
+            return Ok((0, true));
+        }
+        Err(err) => return Err(err),
+    };
     let mut ran = 0;
-    for suite in &suites {
-        if let Some(filter) = filter
+    for suite in suites {
+        if let Some(filter) = opts.filter.as_deref()
             && !suite.name.contains(filter)
         {
             continue;
         }
         if record {
-            record_suite(suite)?;
+            record_suite(suite, Arc::clone(&storage))?;
         } else {
-            compare_suite(suite)?;
+            compare_suite(suite, Arc::clone(&storage))?;
         }
         ran += 1;
     }
     if ran == 0 {
         return Err(Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!("no integrationtest suites matched on {}", backend.as_str()),
+        ));
+    }
+    Ok((ran, false))
+}
+
+pub fn run_all(root: &Path, opts: &RunOptions) -> Result<RunReport> {
+    let suites = load_suites(root)?;
+    let stores = if opts.stores.is_empty() {
+        vec![StoreBackend::Memory, StoreBackend::Tikv]
+    } else {
+        opts.stores.clone()
+    };
+    let mut report = RunReport::default();
+    let mut recorded = false;
+    for backend in stores {
+        let (ran, skipped) = run_backend(&suites, backend, opts, opts.record && !recorded)?;
+        if opts.record && ran > 0 {
+            recorded = true;
+        }
+        match backend {
+            StoreBackend::Memory => report.memory = ran,
+            StoreBackend::Tikv => {
+                report.tikv = ran;
+                report.tikv_skipped = skipped;
+            }
+        }
+    }
+    if report.ran() == 0 && !report.tikv_skipped {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
             "no integrationtest suites matched",
         ));
     }
-    Ok(ran)
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -266,7 +410,35 @@ mod tests {
     }
 
     #[test]
-    fn test_all_suites() {
-        run_all(&testdata_root(), false, None).unwrap();
+    fn test_all_suites_memory() {
+        let report = run_all(
+            &testdata_root(),
+            &RunOptions {
+                stores: vec![StoreBackend::Memory],
+                require_tikv: false,
+                ..RunOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(report.memory > 0);
+        assert_eq!(report.tikv, 0);
+    }
+
+    #[test]
+    fn test_all_suites_tikv() {
+        let report = run_all(
+            &testdata_root(),
+            &RunOptions {
+                stores: vec![StoreBackend::Tikv],
+                require_tikv: false,
+                ..RunOptions::default()
+            },
+        )
+        .unwrap();
+        if report.tikv_skipped {
+            eprintln!("skip live tikv integrationtest (PD unreachable)");
+            return;
+        }
+        assert!(report.tikv > 0);
     }
 }

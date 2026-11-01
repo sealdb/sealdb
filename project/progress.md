@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（SQL 集成测试框架）  
+> 最后更新：2026-11-01（集成测试双存储）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: 集成测试双存储
+- **完成**:
+  - 同一 `t/*.test` 在 MemStorage 与 TiKV 上各跑一遍，共用 `r/*.result`
+  - `--store memory|tikv|both`；`--require-tikv` / `SEALDB_ITEST_REQUIRE_TIKV`
+  - TiKV 会话用独立 global id，避免残留行键污染
+- **验证**:
+  - `cargo test -p sealdb-integrationtest --lib`
+  - `./tests/integrationtest/run-tests.sh --require-tikv`
+- **下一步**:
+  - leftover（PPD / DISTINCT agg / SHOW CREATE）或 C6 deferred
 
 ### 2026-11-01
 

@@ -118,10 +118,11 @@ tests/integrationtest/
 └── run-tests.sh   # TiDB 同款 -t / -r 包装
 ```
 
-- 每份 `.test` 使用独立 `Session` + `MemStorage`，`cargo test -p sealdb-integrationtest` 即可跑。
+- 每份 `.test` 各跑 **MemStorage** 与 **TiKV**（同一金样）。`cargo test -p sealdb-integrationtest` 含 `test_all_suites_memory` / `test_all_suites_tikv`。
+- TiKV 连不上 PD 时跳过，除非 `--require-tikv` / `SEALDB_ITEST_REQUIRE_TIKV=1`。`--store memory|tikv|both`。
 - 指令：`#` 注释、`-- error N`、`-- sorted_result`。`connect`/`connection`、对 `--listen` 的 mysql-tester、`s/*.json` 延后。
 - 不要整棵导入 TiDB `t/`：未移植能力会把金样刷成 Error。
-- 记录：`./tests/integrationtest/run-tests.sh -r` 或 `SEALDB_ITEST_RECORD` 不用——用 `--record`。
+- 记录：`./tests/integrationtest/run-tests.sh -r`（金样只从 MemStorage 写；TiKV 只核对）。
 
 ### 3.1 位置（Oracle JSON 差分，尚未落地）
 
@@ -312,7 +313,7 @@ cargo +nightly fuzz run codec_roundtrip
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
-cargo test -p sealdb-integrationtest --lib
+cargo test -p sealdb-integrationtest --lib   # memory + tikv (tikv skips if PD down)
 python3 project/scripts/parity_check.py --strict
 ```
 

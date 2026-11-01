@@ -7,7 +7,7 @@ t/*.test     input scripts (mysql-tester dialect)
 r/*.result   golden output (echoed SQL + TSV / Error line)
 ```
 
-Each `.test` file gets a fresh in-process `Session` on `MemStorage`. No `--listen` and no live TiKV required.
+Each `.test` file runs twice: a fresh `Session` on **MemStorage**, then the same script on **TiKV** (PD `127.0.0.1:2379` by default). SQL I/O goldens are store-independent. TiKV sessions seed unique table IDs so leftover row keys from a previous process do not leak into `SELECT *`. If PD is down, TiKV is skipped unless `--require-tikv` / `SEALDB_ITEST_REQUIRE_TIKV=1`.
 
 ## Directives
 
@@ -33,22 +33,26 @@ Error 1146 (42S02): table missing.t does not exist
 ## Run
 
 ```bash
-# all suites (also `cargo test -p sealdb-integrationtest`)
+# both stores (also `cargo test -p sealdb-integrationtest`)
 ./tests/integrationtest/run-tests.sh
 
-# one suite
+# one backend
+./tests/integrationtest/run-tests.sh -s memory
+./tests/integrationtest/run-tests.sh -s tikv --require-tikv
+
+# one suite on both stores
 ./tests/integrationtest/run-tests.sh -t basic
 
-# rewrite goldens after an intentional behavior change
+# rewrite goldens from MemStorage, then verify on TiKV
 ./tests/integrationtest/run-tests.sh -r
-./tests/integrationtest/run-tests.sh -r -t basic
 ```
 
 Or:
 
 ```bash
-cargo run -p sealdb-integrationtest --
-cargo run -p sealdb-integrationtest -- --record --case predicate
+cargo run -p sealdb-integrationtest -- --store both
+cargo test -p sealdb-integrationtest --lib tests::test_all_suites_memory -- --exact
+cargo test -p sealdb-integrationtest --lib tests::test_all_suites_tikv -- --exact
 ```
 
 ## Adding a case

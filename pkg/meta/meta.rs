@@ -89,6 +89,14 @@ impl Mutator {
         self.inc_int(NEXT_GLOBAL_ID_KEY, 1)
     }
 
+    /// Seed the in-memory NextGlobalID so a `--store tikv` test session
+    /// does not reuse leftover table keys from a previous process.
+    pub fn set_global_id(&mut self, id: i64) {
+        let encoded = encode_string_data_key(NEXT_GLOBAL_ID_KEY);
+        self.kv
+            .insert(encoded.into_bytes(), id.to_string().into_bytes());
+    }
+
     pub fn get_global_id(&self) -> Result<i64> {
         self.get_int(NEXT_GLOBAL_ID_KEY)
     }
@@ -299,6 +307,13 @@ mod tests {
             key.as_bytes(),
             hex("6d4442730000000000fa000000000000006844423a3100000000fb")
         );
+    }
+
+    #[test]
+    fn test_set_global_id_seeds_allocator() {
+        let mut meta = Mutator::new();
+        meta.set_global_id(9_000);
+        assert_eq!(meta.gen_global_id().unwrap(), 9_001);
     }
 
     #[test]
