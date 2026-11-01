@@ -106,6 +106,9 @@ case "$FEATURE" in
   F19)
     run execute-partition cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.t VALUES (1, 'a'), (15, 'b'); SELECT * FROM db1.t WHERE id < 10"
     ;;
+  F20)
+    run execute-grant cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

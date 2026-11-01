@@ -26,6 +26,9 @@ pub enum PhysicalPlan {
     Show {
         kind: String,
     },
+    Simple {
+        kind: String,
+    },
     Insert,
     Update,
     Delete,
@@ -93,6 +96,7 @@ impl PhysicalPlan {
             }
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
+            PhysicalPlan::Simple { kind } => format!("Simple_{kind}"),
             PhysicalPlan::Insert => "Insert".to_string(),
             PhysicalPlan::Update => "Update".to_string(),
             PhysicalPlan::Delete => "Delete".to_string(),

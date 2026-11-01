@@ -3,6 +3,7 @@ use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::distsql::IndexLookUpExecutor;
+use crate::grant::GrantExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
@@ -79,6 +80,7 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
+            PhysicalPlan::Simple { .. } => Ok(Box::new(GrantExec::new(domain, stmt.clone()))),
             PhysicalPlan::Show { .. } => {
                 let show = match stmt {
                     Statement::Show(s) => s.clone(),

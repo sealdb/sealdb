@@ -3,7 +3,7 @@ use sealdb_errno::Result;
 use sealdb_executor::{ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::Parser;
-use sealdb_parser::ast::Statement;
+use sealdb_parser::ast::{PrivilegeType, Statement, UserIdentity};
 use sealdb_planner::PlanBuilder;
 use sealdb_sessiontxn::TxnManager;
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,7 @@ pub struct Session {
     planner: PlanBuilder,
     domain: Arc<Domain>,
     current_db: Mutex<String>,
+    current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
 }
 
@@ -27,8 +28,24 @@ impl Session {
             planner: PlanBuilder::new(),
             domain,
             current_db: Mutex::new(String::new()),
+            current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
         }
+    }
+
+    pub fn with_grant_table() -> Self {
+        Self::with_domain(Arc::new(Domain::with_grant_table()))
+    }
+
+    pub fn set_current_user(&self, user: UserIdentity) {
+        *self.current_user.lock().expect("session current_user lock") = user;
+    }
+
+    pub fn current_user(&self) -> UserIdentity {
+        self.current_user
+            .lock()
+            .expect("session current_user lock")
+            .clone()
     }
 
     pub fn execute_stmt(&self, sql: &str) -> Result<QueryResult> {
@@ -50,6 +67,18 @@ impl Session {
     }
 
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
+        let mut owned = None;
+        let stmt = if let Statement::Show(show) = stmt
+            && show.kind == sealdb_parser::ast::ShowStmtKind::Grants
+            && show.user.is_none()
+        {
+            let mut show = show.clone();
+            show.user = Some(self.current_user());
+            owned.insert(Statement::Show(show))
+        } else {
+            stmt
+        };
+        self.check_privilege(stmt)?;
         match stmt {
             Statement::Use(use_stmt) => {
                 let is = self.domain.infoschema();
@@ -118,6 +147,144 @@ impl Session {
     pub fn infoschema(&self) -> InfoSchema {
         self.domain.infoschema()
     }
+
+    fn check_privilege(&self, stmt: &Statement) -> Result<()> {
+        let mgr = self.domain.privilege();
+        if mgr.skip_grant_table() {
+            return Ok(());
+        }
+        let user = self.current_user();
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        match stmt {
+            Statement::Grant(_) | Statement::Revoke(_) => {
+                if !mgr.request_verification(&user, "", "", PrivilegeType::ALL) {
+                    return Err(access_denied("", "", PrivilegeType::ALL, &user));
+                }
+            }
+            Statement::Show(show)
+                if show.kind == sealdb_parser::ast::ShowStmtKind::Grants
+                    && show.user.as_ref().is_some_and(|u| u != &user)
+                    && !mgr.request_verification(&user, "", "", PrivilegeType::ALL) =>
+            {
+                return Err(access_denied("", "", PrivilegeType::ALL, &user));
+            }
+            Statement::Select(select) => {
+                if let Some(from) = &select.from {
+                    require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
+                }
+                if let Some(join) = &select.join {
+                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
+                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                }
+            }
+            Statement::Insert(insert) => {
+                require(
+                    &mgr,
+                    &user,
+                    &insert.table,
+                    &current_db,
+                    PrivilegeType::INSERT,
+                )?;
+            }
+            Statement::Update(update) => {
+                require(
+                    &mgr,
+                    &user,
+                    &update.table,
+                    &current_db,
+                    PrivilegeType::UPDATE,
+                )?;
+            }
+            Statement::Delete(delete) => {
+                require(
+                    &mgr,
+                    &user,
+                    &delete.table,
+                    &current_db,
+                    PrivilegeType::DELETE,
+                )?;
+            }
+            Statement::CreateDatabase(create) => {
+                if !mgr.request_verification(&user, &create.name, "", PrivilegeType::CREATE) {
+                    return Err(access_denied(
+                        &create.name,
+                        "",
+                        PrivilegeType::CREATE,
+                        &user,
+                    ));
+                }
+            }
+            Statement::CreateTable(create) => {
+                require(
+                    &mgr,
+                    &user,
+                    &create.table,
+                    &current_db,
+                    PrivilegeType::CREATE,
+                )?;
+            }
+            Statement::CreateIndex(create) => {
+                require(
+                    &mgr,
+                    &user,
+                    &create.table,
+                    &current_db,
+                    PrivilegeType::CREATE,
+                )?;
+            }
+            Statement::AlterTable(alter) => {
+                require(
+                    &mgr,
+                    &user,
+                    &alter.table,
+                    &current_db,
+                    PrivilegeType::CREATE,
+                )?;
+            }
+            Statement::DropDatabase(drop) => {
+                if !mgr.request_verification(&user, &drop.name, "", PrivilegeType::DROP) {
+                    return Err(access_denied(&drop.name, "", PrivilegeType::DROP, &user));
+                }
+            }
+            Statement::DropTable(drop) => {
+                for table in &drop.tables {
+                    require(&mgr, &user, table, &current_db, PrivilegeType::DROP)?;
+                }
+            }
+            Statement::DropIndex(drop) => {
+                require(&mgr, &user, &drop.table, &current_db, PrivilegeType::DROP)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn require(
+    mgr: &sealdb_privilege::Manager,
+    user: &UserIdentity,
+    table: &sealdb_parser::ast::TableName,
+    current_db: &str,
+    privs: PrivilegeType,
+) -> Result<()> {
+    let (db, name) = table.qualified(current_db);
+    if !mgr.request_verification(user, &db, &name, privs) {
+        return Err(access_denied(&db, &name, privs, user));
+    }
+    Ok(())
+}
+
+fn access_denied(
+    db: &str,
+    table: &str,
+    wanted: PrivilegeType,
+    user: &UserIdentity,
+) -> sealdb_errno::Error {
+    sealdb_privilege::Manager::access_denied(db, table, wanted, user)
 }
 
 fn empty_result() -> QueryResult {
@@ -1044,5 +1211,47 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.message.contains("LIST") || err.message.contains("partition"));
+    }
+
+    #[test]
+    fn test_grant_revoke() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); GRANT SELECT ON db1.t TO 'u'@'%'",
+            )
+            .unwrap();
+        let grants = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
+        assert!(
+            grants
+                .display_rows()
+                .iter()
+                .any(|row| row[0].contains("SELECT") && row[0].contains("u"))
+        );
+        session
+            .execute_stmt("REVOKE SELECT ON db1.t FROM 'u'@'%'")
+            .unwrap();
+        let empty = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
+        assert!(empty.display_rows().is_empty());
+        let err = session.execute_stmt("GRANT r TO 'u'@'%'").unwrap_err();
+        assert!(
+            err.message.contains("ROLE")
+                || err.message.contains("GRANT")
+                || err.message.contains("privilege")
+        );
+
+        let checked = Session::with_grant_table();
+        checked
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); GRANT SELECT ON db1.t TO 'u'@'%'",
+            )
+            .unwrap();
+        checked.set_current_user(sealdb_parser::ast::UserIdentity::new("u", "%"));
+        let ok = checked.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(ok.display_rows().len(), 1);
+        let denied = checked
+            .execute_stmt("INSERT INTO db1.t VALUES (2, 'b')")
+            .unwrap_err();
+        assert_eq!(denied.code, sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR);
     }
 }

@@ -60,6 +60,21 @@ impl Executor for ShowExec {
                     .map(|t| vec![Datum::Bytes(t.name.o().as_bytes().to_vec())])
                     .collect();
             }
+            ShowStmtKind::Grants => {
+                let user = self
+                    .stmt
+                    .user
+                    .clone()
+                    .unwrap_or_else(sealdb_parser::ast::UserIdentity::root);
+                self.schema = vec![format!("Grants for {}", user.display())];
+                self.rows = self
+                    .domain
+                    .privilege()
+                    .show_grants(&user)
+                    .into_iter()
+                    .map(|g| vec![Datum::Bytes(g.into_bytes())])
+                    .collect();
+            }
             ShowStmtKind::Columns => {
                 let table = self
                     .stmt

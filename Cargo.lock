@@ -264,6 +264,7 @@ dependencies = [
  "sealdb-kv",
  "sealdb-meta",
  "sealdb-parser",
+ "sealdb-privilege",
  "thiserror",
 ]
 
@@ -363,6 +364,10 @@ dependencies = [
 [[package]]
 name = "sealdb-privilege"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-parser",
+]
 
 [[package]]
 name = "sealdb-server"
@@ -389,6 +394,7 @@ dependencies = [
  "sealdb-kv",
  "sealdb-parser",
  "sealdb-planner",
+ "sealdb-privilege",
  "sealdb-sessiontxn",
  "sealdb-types",
  "thiserror",
