@@ -22,6 +22,7 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
         ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => {
             Err(Error::unsupported("subquery evaluation outside Apply"))
         }
+        ExprNode::Window(_) => Err(Error::unsupported("window evaluation outside WindowExec")),
     }
 }
 

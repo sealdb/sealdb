@@ -62,6 +62,9 @@ pub enum PhysicalPlan {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
     },
+    Window {
+        child: Box<PhysicalPlan>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -106,6 +109,7 @@ impl PhysicalPlan {
                 left.explain(),
                 right.explain()
             ),
+            PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
         }
     }
 }

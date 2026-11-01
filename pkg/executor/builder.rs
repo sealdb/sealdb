@@ -13,6 +13,7 @@ use crate::sortexec::SortExec;
 use crate::table_reader::TableReaderExec;
 use crate::unionexec::UnionExec;
 use crate::update::UpdateExec;
+use crate::window::WindowExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{Storage, TxnHandle};
@@ -186,6 +187,16 @@ impl ExecutorBuilder {
                     select,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )?))
+            }
+            PhysicalPlan::Window { child } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("window without select"))?
+                    .clone();
+                Ok(Box::new(WindowExec::new(
+                    select,
+                    Self::build(child, stmt, domain, current_db, txn)?,
+                )))
             }
             PhysicalPlan::Union { .. } => {
                 let set = match stmt {

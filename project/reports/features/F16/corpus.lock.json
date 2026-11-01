@@ -1,0 +1,21 @@
+{
+  "feature": "F16",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/executor/window.go",
+    "TiDB pkg/planner/core/operator/logicalop/logical_window.go",
+    "TiDB pkg/expression/aggregation/window_func.go"
+  ],
+  "cases": [
+    "SELECT ROW_NUMBER() OVER ()",
+    "SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM t",
+    "SELECT RANK() OVER (PARTITION BY name ORDER BY name) FROM t",
+    "SELECT DENSE_RANK() OVER (ORDER BY id) FROM t",
+    "SELECT SUM(id) OVER (PARTITION BY name) FROM t",
+    "SELECT COUNT(*) OVER (ORDER BY id) FROM t",
+    "SELECT LAG(id) OVER (ORDER BY id) FROM t",
+    "SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+    "SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY id)",
+    "SELECT FIRST_VALUE(id) OVER (ORDER BY id) FROM t"
+  ]
+}

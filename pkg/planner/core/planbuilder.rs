@@ -87,9 +87,20 @@ impl PlanBuilder {
                     };
                 }
                 if needs_hash_agg(select) {
+                    if needs_window(select) {
+                        return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
+                    }
                     plan = match plan {
                         PhysicalPlan::Projection { child, .. } => PhysicalPlan::HashAgg { child },
                         other => PhysicalPlan::HashAgg {
+                            child: Box::new(other),
+                        },
+                    };
+                }
+                if needs_window(select) {
+                    plan = match plan {
+                        PhysicalPlan::Projection { child, .. } => PhysicalPlan::Window { child },
+                        other => PhysicalPlan::Window {
                             child: Box::new(other),
                         },
                     };
@@ -196,6 +207,13 @@ fn is_star_select(select: &SelectStmt) -> bool {
 
 fn needs_hash_agg(select: &SelectStmt) -> bool {
     !select.group_by.is_empty() || select.fields.iter().any(|f| is_agg_expr(&f.expr))
+}
+
+fn needs_window(select: &SelectStmt) -> bool {
+    select
+        .fields
+        .iter()
+        .any(|f| matches!(f.expr, ExprNode::Window(_)))
 }
 
 fn is_agg_expr(expr: &ExprNode) -> bool {

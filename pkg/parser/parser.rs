@@ -351,4 +351,26 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("EXCEPT"));
     }
+
+    #[test]
+    fn test_parse_window() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM t")
+            .unwrap();
+        assert!(matches!(
+            stmt.as_select().unwrap().fields[1].expr,
+            crate::ast::ExprNode::Window(_)
+        ));
+        let err = parser
+            .parse_one_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM t")
+            .unwrap_err();
+        assert!(err.message.contains("window function"));
+        let err = parser
+            .parse_one_stmt(
+                "SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+            )
+            .unwrap_err();
+        assert!(err.message.contains("frame"));
+    }
 }
