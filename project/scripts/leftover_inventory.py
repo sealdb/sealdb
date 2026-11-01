@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 FEATURE_HINTS = {
-    "SelectStmt": "F01/F03/F04",  # F14 covers EXISTS/IN subquery predicates on SelectStmt
+    "SelectStmt": "F01/F03/F04",  # F14 subquery, F16 window, F17 WITH CTE on SelectStmt
     "InsertStmt": "F03",
     "UpdateStmt": "F07",
     "DeleteStmt": "F07",

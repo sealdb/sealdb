@@ -56,7 +56,8 @@
 | F14 | `core-ported` | `project/reports/features/F14/` |
 | F15 | `core-ported` | `project/reports/features/F15/` |
 | F16 | `core-ported` | `project/reports/features/F16/` |
-| F17–F22 | `not-started` | — |
+| F17 | `core-ported` | `project/reports/features/F17/` |
+| F18–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -99,6 +100,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F17 CTE
+- **完成**:
+  - 非递归 `WITH cte AS (SELECT ...)` / `WITH cte(cols) AS (...)`
+  - CTE 链式引用、列裁剪、与 `UNION` 外层组合
+- **验证**:
+  - `./project/scripts/feature_gate.sh F17`
+- **下一步**:
+  - F18 在线 DDL
 
 ### 2026-11-01
 

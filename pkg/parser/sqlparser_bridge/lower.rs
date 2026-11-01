@@ -5,8 +5,8 @@ use crate::ast::ddl::{
     TableName,
 };
 use crate::ast::dml::{
-    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
-    SelectStmt, SetOprStmt, SetOprType, UpdateStmt,
+    Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
+    SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
     BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
@@ -17,12 +17,12 @@ use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
-    OrderBySort, Query, SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Update, Use, Value, Values, WindowType,
+    AssignmentTarget, BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NonBlock, ObjectName,
+    ObjectType, OrderByExpr, OrderByKind, OrderBySort, Query, SchemaName, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement as SqlStatement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -341,10 +341,35 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
 }
 
 fn lower_query_stmt(query: &Query) -> Result<Statement> {
+    let with = lower_with(query.with.as_ref())?;
     match query.body.as_ref() {
-        SetExpr::Select(_) => Ok(Statement::Select(lower_query(query)?)),
-        SetExpr::SetOperation { .. } => Ok(Statement::SetOpr(lower_set_opr(query)?)),
-        SetExpr::Query(inner) => lower_query_stmt(inner),
+        SetExpr::Select(_) => {
+            let mut select = lower_query(query)?;
+            select.with = with;
+            Ok(Statement::Select(select))
+        }
+        SetExpr::SetOperation { .. } => {
+            let mut set = lower_set_opr(query)?;
+            set.with = with;
+            Ok(Statement::SetOpr(set))
+        }
+        SetExpr::Query(inner) => {
+            if with.is_some() && inner.with.is_some() {
+                return Err(Error::unsupported("nested WITH"));
+            }
+            let mut stmt = lower_query_stmt(inner)?;
+            if let Some(with) = with {
+                match &mut stmt {
+                    Statement::Select(select) if select.with.is_none() => select.with = Some(with),
+                    Statement::SetOpr(set) if set.with.is_none() => set.with = Some(with),
+                    Statement::Select(_) | Statement::SetOpr(_) => {
+                        return Err(Error::unsupported("nested WITH"));
+                    }
+                    _ => return Err(Error::unsupported("WITH on non-SELECT")),
+                }
+            }
+            Ok(stmt)
+        }
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
@@ -361,6 +386,65 @@ fn lower_set_opr(query: &Query) -> Result<SetOprStmt> {
         order_by: lower_order_by(query.order_by.as_ref())?,
         limit,
         offset,
+        with: None,
+    })
+}
+
+fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
+    let Some(with) = with else {
+        return Ok(None);
+    };
+    // F17 gap / completeness wave: recursive CTE, MATERIALIZED, UNION in CTE.
+    if with.recursive {
+        return Err(Error::unsupported("WITH RECURSIVE"));
+    }
+    let mut names = Vec::new();
+    let mut ctes = Vec::with_capacity(with.cte_tables.len());
+    for cte in &with.cte_tables {
+        let lowered = lower_cte(cte)?;
+        if names
+            .iter()
+            .any(|name: &String| name.eq_ignore_ascii_case(&lowered.name))
+        {
+            return Err(Error::unsupported("duplicate CTE name"));
+        }
+        names.push(lowered.name.clone());
+        ctes.push(lowered);
+    }
+    Ok(Some(WithClause {
+        is_recursive: false,
+        ctes,
+    }))
+}
+
+fn lower_cte(cte: &Cte) -> Result<CommonTableExpression> {
+    if cte.materialized.is_some() {
+        return Err(Error::unsupported(match cte.materialized {
+            Some(CteAsMaterialized::Materialized) => "MATERIALIZED CTE",
+            Some(CteAsMaterialized::NotMaterialized) => "NOT MATERIALIZED CTE",
+            None => "MATERIALIZED CTE",
+        }));
+    }
+    if cte.from.is_some() {
+        return Err(Error::unsupported("CTE FROM clause"));
+    }
+    if cte.query.with.is_some() {
+        return Err(Error::unsupported("nested WITH"));
+    }
+    let query = match cte.query.body.as_ref() {
+        SetExpr::Select(_) => lower_query(&cte.query)?,
+        SetExpr::SetOperation { .. } => return Err(Error::unsupported("UNION in CTE")),
+        other => return Err(Error::unsupported(format!("CTE body {other}"))),
+    };
+    Ok(CommonTableExpression {
+        name: cte.alias.name.value.clone(),
+        query: Box::new(query),
+        col_name_list: cte
+            .alias
+            .columns
+            .iter()
+            .map(|col| col.name.value.clone())
+            .collect(),
     })
 }
 
@@ -471,6 +555,7 @@ fn lower_select(
         limit,
         offset,
         lock,
+        with: None,
         text,
     })
 }

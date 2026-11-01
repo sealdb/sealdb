@@ -1,7 +1,7 @@
 use super::ddl::TableName;
 use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
-use sealdb_errno::Result;
+use sealdb_errno::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -42,6 +42,81 @@ pub enum SelectLock {
 }
 
 #[derive(Clone, Debug)]
+pub struct CommonTableExpression {
+    pub name: String,
+    pub query: Box<SelectStmt>,
+    pub col_name_list: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WithClause {
+    pub is_recursive: bool,
+    pub ctes: Vec<CommonTableExpression>,
+}
+
+impl WithClause {
+    pub fn find(&self, name: &str) -> Option<&CommonTableExpression> {
+        self.ctes
+            .iter()
+            .find(|cte| cte.name.eq_ignore_ascii_case(name))
+    }
+
+    pub fn preceding(&self, name: &str) -> Vec<CommonTableExpression> {
+        self.ctes
+            .iter()
+            .take_while(|cte| !cte.name.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn seed_select(&self, name: &str) -> Result<SelectStmt> {
+        let cte = self
+            .find(name)
+            .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
+        let mut select = (*cte.query).clone();
+        if select.with.is_some() {
+            return Err(Error::unsupported("nested WITH"));
+        }
+        let preceding = self.preceding(name);
+        if !preceding.is_empty() {
+            select.with = Some(WithClause {
+                is_recursive: false,
+                ctes: preceding,
+            });
+        }
+        Ok(select)
+    }
+
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("WITH ");
+        if self.is_recursive {
+            ctx.write_str("RECURSIVE ");
+        }
+        for (i, cte) in self.ctes.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            ctx.write_name(&cte.name);
+            if !cte.col_name_list.is_empty() {
+                ctx.write_str(" (");
+                for (j, col) in cte.col_name_list.iter().enumerate() {
+                    if j > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(col);
+                }
+                ctx.write_str(")");
+            }
+            ctx.write_str(" AS (");
+            cte.query.restore(ctx)?;
+            ctx.write_str(")");
+        }
+        ctx.write_str(" ");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
@@ -52,6 +127,7 @@ pub struct SelectStmt {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub lock: SelectLock,
+    pub with: Option<WithClause>,
     pub text: String,
 }
 
@@ -63,6 +139,9 @@ pub struct ByItem {
 
 impl SelectStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(with) = &self.with {
+            with.restore(ctx)?;
+        }
         ctx.write_str("SELECT ");
         for (i, field) in self.fields.iter().enumerate() {
             if i > 0 {
@@ -253,10 +332,14 @@ pub struct SetOprStmt {
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub with: Option<WithClause>,
 }
 
 impl SetOprStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(with) = &self.with {
+            with.restore(ctx)?;
+        }
         self.first.restore(ctx)?;
         for (op, select) in &self.rest {
             ctx.write_str(" ");

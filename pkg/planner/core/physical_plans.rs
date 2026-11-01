@@ -65,6 +65,11 @@ pub enum PhysicalPlan {
     Window {
         child: Box<PhysicalPlan>,
     },
+    CTE {
+        name: String,
+        columns: Vec<String>,
+        seed: Box<PhysicalPlan>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -110,6 +115,7 @@ impl PhysicalPlan {
                 right.explain()
             ),
             PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
+            PhysicalPlan::CTE { name, seed, .. } => format!("CTE_{name} -> {}", seed.explain()),
         }
     }
 }

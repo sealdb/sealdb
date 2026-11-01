@@ -13,8 +13,8 @@ pub use ddl::{
     TableName,
 };
 pub use dml::{
-    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
-    SelectStmt, SetOprStmt, SetOprType, UpdateStmt,
+    Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
+    SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 pub use expressions::{
     ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, ScalarSubqueryExpr, WindowFuncExpr,

@@ -81,6 +81,14 @@ impl Statement {
             _ => None,
         }
     }
+
+    pub fn with_clause(&self) -> Option<&super::dml::WithClause> {
+        match self {
+            Statement::Select(s) => s.with.as_ref(),
+            Statement::SetOpr(s) => s.with.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 pub fn restore_expr(expr: &ExprNode, ctx: &mut RestoreCtx) -> Result<()> {

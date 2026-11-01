@@ -1,4 +1,5 @@
 use crate::aggregate::HashAggExec;
+use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::distsql::IndexLookUpExecutor;
@@ -203,15 +204,23 @@ impl ExecutorBuilder {
                     Statement::SetOpr(s) => s,
                     _ => return Err(Error::unsupported("union without set opr")),
                 };
+                let mut first = set.first.clone();
+                if first.with.is_none() {
+                    first.with = set.with.clone();
+                }
                 let mut exec = Self::build_select_arm(
-                    &set.first,
+                    &first,
                     Arc::clone(&domain),
                     current_db,
                     Arc::clone(&txn),
                 )?;
                 for (op, select) in &set.rest {
+                    let mut select = select.clone();
+                    if select.with.is_none() {
+                        select.with = set.with.clone();
+                    }
                     let right = Self::build_select_arm(
-                        select,
+                        &select,
                         Arc::clone(&domain),
                         current_db,
                         Arc::clone(&txn),
@@ -241,6 +250,20 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select.from.as_ref().map(|t| t.name.clone()),
+                )))
+            }
+            PhysicalPlan::CTE {
+                name,
+                columns,
+                seed,
+            } => {
+                let with = stmt
+                    .with_clause()
+                    .ok_or_else(|| Error::unsupported("CTE without WITH"))?;
+                let seed_stmt = Statement::Select(with.seed_select(name)?);
+                Ok(Box::new(CTEExec::new(
+                    columns.clone(),
+                    Self::build(seed, &seed_stmt, domain, current_db, txn)?,
                 )))
             }
             PhysicalPlan::HashJoin { left, right, .. } => {
