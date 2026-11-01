@@ -5,6 +5,38 @@ use sealdb_parser::ast::expressions::{
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 use sealdb_types::field_type::FieldType;
+use std::cell::RefCell;
+
+thread_local! {
+    static COLLATION_CI: RefCell<bool> = const { RefCell::new(false) };
+}
+
+pub fn with_collation_ci<T>(ci: bool, f: impl FnOnce() -> T) -> T {
+    COLLATION_CI.with(|cell| {
+        let prev = *cell.borrow();
+        *cell.borrow_mut() = ci;
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
+    })
+}
+
+fn compare_datums(left: &Datum, right: &Datum) -> std::cmp::Ordering {
+    if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_)))
+        && COLLATION_CI.with(|c| *c.borrow())
+    {
+        let left_b = left.as_bytes();
+        let right_b = right.as_bytes();
+        return if left_b.eq_ignore_ascii_case(&right_b) {
+            std::cmp::Ordering::Equal
+        } else {
+            left_b
+                .to_ascii_lowercase()
+                .cmp(&right_b.to_ascii_lowercase())
+        };
+    }
+    left.compare(right)
+}
 
 pub fn eval_expr(expr: &ExprNode) -> Result<Datum> {
     eval_expr_with_row(expr, &[], &[])
@@ -122,12 +154,12 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                 }
             },
         ),
-        Op::Eq => Ok(bool_datum(left.compare(&right).is_eq())),
-        Op::Ne => Ok(bool_datum(!left.compare(&right).is_eq())),
-        Op::Lt => Ok(bool_datum(left.compare(&right).is_lt())),
-        Op::Le => Ok(bool_datum(left.compare(&right).is_le())),
-        Op::Gt => Ok(bool_datum(left.compare(&right).is_gt())),
-        Op::Ge => Ok(bool_datum(left.compare(&right).is_ge())),
+        Op::Eq => Ok(bool_datum(compare_datums(&left, &right).is_eq())),
+        Op::Ne => Ok(bool_datum(!compare_datums(&left, &right).is_eq())),
+        Op::Lt => Ok(bool_datum(compare_datums(&left, &right).is_lt())),
+        Op::Le => Ok(bool_datum(compare_datums(&left, &right).is_le())),
+        Op::Gt => Ok(bool_datum(compare_datums(&left, &right).is_gt())),
+        Op::Ge => Ok(bool_datum(compare_datums(&left, &right).is_ge())),
         _ => Err(Error::unsupported(format!("binary {}", expr.op.restore()))),
     }
 }

@@ -222,7 +222,7 @@ def render_markdown(inv: dict) -> str:
             "- C2 core-ports EXPLAIN row/json/dot, costed skyline, and two-table JoinReorder; ANALYZE / n-table DP / IndexMerge stay open.",
             "- C3 core-ports SchemaChecker 8028, READ COMMITTED statement snapshots, and same-Domain cross-session RW; TiKV cross-cluster and MDL stay open.",
             "- C4 core-ports PREPARE/EXECUTE/DEALLOCATE and a session plan cache; COM_STMT_* / CREATE BINDING stay open.",
-            "- C5 owns SET / collation / charset leftover.",
+            "- C5 core-ports SET NAMES/sql_mode/collation_connection and utf8mb4_general_ci compares; pad/weight/GBK stay open.",
             "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.",
             "",
         ]

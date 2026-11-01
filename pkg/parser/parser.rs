@@ -602,6 +602,12 @@ mod tests {
             }
             other => panic!("expected ExecuteStmt, got {other:?}"),
         }
+        match parser.parse_one_stmt("SET NAMES utf8mb4").unwrap() {
+            crate::ast::Statement::Set(set) => {
+                assert_eq!(set.assignments[0].name, "names");
+            }
+            other => panic!("expected SetStmt, got {other:?}"),
+        }
         match parser.parse_one_stmt("DEALLOCATE PREPARE stmt").unwrap() {
             crate::ast::Statement::Deallocate(dealloc) => {
                 assert_eq!(dealloc.name, "stmt");

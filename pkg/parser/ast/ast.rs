@@ -6,7 +6,7 @@ use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantStmt, PrepareStmt,
-    RevokeStmt, RollbackStmt, SetTxnStmt, ShowStmt, UseStmt,
+    RevokeStmt, RollbackStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -47,6 +47,7 @@ pub enum Statement {
     Prepare(PrepareStmt),
     Execute(ExecuteStmt),
     Deallocate(DeallocateStmt),
+    Set(SetStmt),
 }
 
 impl Node for Statement {
@@ -77,6 +78,7 @@ impl Node for Statement {
             Statement::Prepare(s) => s.restore(ctx),
             Statement::Execute(s) => s.restore(ctx),
             Statement::Deallocate(s) => s.restore(ctx),
+            Statement::Set(s) => s.restore(ctx),
         }
     }
 }
@@ -109,6 +111,7 @@ impl StmtNode for Statement {
             Statement::Prepare(_) => "PrepareStmt",
             Statement::Execute(_) => "ExecuteStmt",
             Statement::Deallocate(_) => "DeallocateStmt",
+            Statement::Set(_) => "SetStmt",
         }
     }
 }
