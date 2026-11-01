@@ -26,6 +26,9 @@ pub trait Transaction: Send {
     fn is_pessimistic(&self) -> bool;
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
+    fn refresh_snapshot(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn unsupported_storage() -> Error {

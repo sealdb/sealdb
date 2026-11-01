@@ -64,7 +64,8 @@
 | F22 | `core-ported` | `project/reports/features/F22/` |
 | C1 | `core-ported` | `project/reports/features/C1/` |
 | C2 | `core-ported` | `project/reports/features/C2/` |
-| C3–C5 | `not-started` | — |
+| C3 | `core-ported` | `project/reports/features/C3/` |
+| C4–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
 ---
@@ -105,6 +106,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: C3 SchemaChecker / 隔离 / 交叉读写
+- **完成**:
+  - 显式事务遇到并发 DDL 返回 8028
+  - `START TRANSACTION` / `SET TRANSACTION` 支持 READ COMMITTED 语句快照
+  - 同 Domain 两会话交叉读写（RR 看不见已提交更新，RC 看得见）
+- **验证**:
+  - `./project/scripts/feature_gate.sh C3`
+- **下一步**:
+  - C4 Prepared / Plan Cache / Binding
 
 ### 2026-11-01
 

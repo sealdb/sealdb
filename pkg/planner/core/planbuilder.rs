@@ -192,6 +192,9 @@ impl PlanBuilder {
             Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "Analyze".to_string(),
             }),
+            Statement::SetTxn(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetTxn".to_string(),
+            }),
             Statement::Explain(explain) => Ok(PhysicalPlan::Explain {
                 format: explain.format,
                 child: Box::new(self.build_with_schema(&explain.stmt, is, current_db, stats)?),

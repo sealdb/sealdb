@@ -1,0 +1,19 @@
+{
+  "feature": "C3",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/domain/schema_checker.go",
+    "TiDB pkg/sessiontxn/isolation/readcommitted.go",
+    "TiDB tests/integrationtest/t/db_integration.test"
+  ],
+  "cases": [
+    "schema-checker-select-after-alter",
+    "schema-checker-commit-after-alter",
+    "rr-cross-session-snapshot",
+    "rc-cross-session-sees-commit",
+    "set-transaction-isolation",
+    "start-transaction-read-committed",
+    "serializable-unsupported",
+    "write-conflict-still-9007"
+  ]
+}

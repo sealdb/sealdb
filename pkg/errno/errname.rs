@@ -34,6 +34,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_NO_PARTITION_FOR_GIVEN_VALUE => "ErrNoPartitionForGivenValue",
         errcode::ERR_DBACCESS_DENIED_ERROR => "ErrDBaccessDenied",
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
+        errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         _ => "ErrUnknown",
     }
 }
