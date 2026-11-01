@@ -20,3 +20,7 @@ t	CREATE TABLE `t` (
   `id` int,
   `name` varchar(20)
 )
+SHOW FULL COLUMNS FROM itest.t;
+Field	Type	Collation	Null	Key	Default	Extra	Privileges	Comment
+id	int	NULL	YES		NULL		select,insert,update,references	
+name	varchar(20)	utf8mb4_bin	YES		NULL		select,insert,update,references	

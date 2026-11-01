@@ -137,6 +137,17 @@ mod tests {
             parser.parse_one_stmt("USE db1").unwrap().stmt_type(),
             "UseStmt"
         );
+        match parser
+            .parse_one_stmt("SHOW FULL COLUMNS FROM db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::Columns);
+                assert!(show.full);
+                assert_eq!(show.table.unwrap().name, "t");
+            }
+            other => panic!("expected SHOW FULL COLUMNS, got {other:?}"),
+        }
         match parser.parse_one_stmt("SHOW CREATE TABLE db1.t").unwrap() {
             crate::ast::Statement::Show(show) => {
                 assert_eq!(show.kind, crate::ast::ShowStmtKind::CreateTable);

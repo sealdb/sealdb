@@ -1,7 +1,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_meta::TableInfo;
+use sealdb_meta::{ColumnInfo, TableInfo};
 use sealdb_parser::ast::{ShowStmt, ShowStmtKind, TableName};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -127,27 +127,33 @@ impl Executor for ShowExec {
                         format!("Table '{schema}.{name}' doesn't exist"),
                     )
                 })?;
-                self.schema = vec![
-                    "Field".to_string(),
-                    "Type".to_string(),
-                    "Null".to_string(),
-                    "Key".to_string(),
-                    "Default".to_string(),
-                    "Extra".to_string(),
-                ];
+                let full = self.stmt.full;
+                self.schema = if full {
+                    vec![
+                        "Field".to_string(),
+                        "Type".to_string(),
+                        "Collation".to_string(),
+                        "Null".to_string(),
+                        "Key".to_string(),
+                        "Default".to_string(),
+                        "Extra".to_string(),
+                        "Privileges".to_string(),
+                        "Comment".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "Field".to_string(),
+                        "Type".to_string(),
+                        "Null".to_string(),
+                        "Key".to_string(),
+                        "Default".to_string(),
+                        "Extra".to_string(),
+                    ]
+                };
                 self.rows = info
                     .columns
                     .iter()
-                    .map(|col| {
-                        vec![
-                            Datum::Bytes(col.name.o().as_bytes().to_vec()),
-                            Datum::Bytes(col.field_type.type_name().into_bytes()),
-                            Datum::Bytes(b"YES".to_vec()),
-                            Datum::Bytes(Vec::new()),
-                            Datum::Null,
-                            Datum::Bytes(Vec::new()),
-                        ]
-                    })
+                    .map(|col| column_row(col, full))
                     .collect();
             }
         }
@@ -173,6 +179,33 @@ impl Executor for ShowExec {
     fn schema(&self) -> &[String] {
         &self.schema
     }
+}
+
+fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
+    let type_name = col.field_type.type_name();
+    let mut row = vec![
+        Datum::Bytes(col.name.o().as_bytes().to_vec()),
+        Datum::Bytes(type_name.clone().into_bytes()),
+    ];
+    if full {
+        let collation = if type_name.starts_with("varchar") || type_name.starts_with("char") {
+            Datum::Bytes(b"utf8mb4_bin".to_vec())
+        } else {
+            Datum::Null
+        };
+        row.push(collation);
+    }
+    row.extend([
+        Datum::Bytes(b"YES".to_vec()),
+        Datum::Bytes(Vec::new()),
+        Datum::Null,
+        Datum::Bytes(Vec::new()),
+    ]);
+    if full {
+        row.push(Datum::Bytes(b"select,insert,update,references".to_vec()));
+        row.push(Datum::Bytes(Vec::new()));
+    }
+    row
 }
 
 fn render_create_table(info: &TableInfo) -> String {
