@@ -1,4 +1,5 @@
 use crate::ddl::DDLExec;
+use crate::delete::DeleteExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::point_get::PointGetExec;
@@ -7,6 +8,7 @@ use crate::select::{LimitExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
 use crate::sortexec::SortExec;
 use crate::table_reader::TableReaderExec;
+use crate::update::UpdateExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_parser::ast::Statement;
@@ -97,6 +99,28 @@ impl ExecutorBuilder {
                 Ok(Box::new(InsertExec::new(
                     domain,
                     insert,
+                    current_db.to_string(),
+                )))
+            }
+            PhysicalPlan::Update => {
+                let update = match stmt {
+                    Statement::Update(s) => s.clone(),
+                    _ => return Err(Error::unsupported("update without update statement")),
+                };
+                Ok(Box::new(UpdateExec::new(
+                    domain,
+                    update,
+                    current_db.to_string(),
+                )))
+            }
+            PhysicalPlan::Delete => {
+                let delete = match stmt {
+                    Statement::Delete(s) => s.clone(),
+                    _ => return Err(Error::unsupported("delete without delete statement")),
+                };
+                Ok(Box::new(DeleteExec::new(
+                    domain,
+                    delete,
                     current_db.to_string(),
                 )))
             }

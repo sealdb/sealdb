@@ -1,5 +1,5 @@
 use super::ddl::{CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt};
-use super::dml::{InsertStmt, SelectStmt};
+use super::dml::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{ShowStmt, UseStmt};
 use crate::format::RestoreCtx;
@@ -23,6 +23,8 @@ pub enum Statement {
     Show(ShowStmt),
     Use(UseStmt),
     Insert(InsertStmt),
+    Update(UpdateStmt),
+    Delete(DeleteStmt),
 }
 
 impl Node for Statement {
@@ -36,6 +38,8 @@ impl Node for Statement {
             Statement::Show(s) => s.restore(ctx),
             Statement::Use(s) => s.restore(ctx),
             Statement::Insert(s) => s.restore(ctx),
+            Statement::Update(s) => s.restore(ctx),
+            Statement::Delete(s) => s.restore(ctx),
         }
     }
 }
@@ -51,6 +55,8 @@ impl StmtNode for Statement {
             Statement::Show(_) => "ShowStmt",
             Statement::Use(_) => "UseStmt",
             Statement::Insert(_) => "InsertStmt",
+            Statement::Update(_) => "UpdateStmt",
+            Statement::Delete(_) => "DeleteStmt",
         }
     }
 }

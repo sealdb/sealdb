@@ -4,7 +4,9 @@ use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::Storage;
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::TableName;
-use sealdb_tablecodec::{decode_row, gen_table_record_prefix, next_prefix};
+use sealdb_tablecodec::{
+    decode_handle_from_row_key, decode_row, gen_table_record_prefix, next_prefix,
+};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
@@ -49,7 +51,10 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        self.rows = scan_table(self.domain.as_ref(), &info)?;
+        self.rows = scan_table(self.domain.as_ref(), &info)?
+            .into_iter()
+            .map(|row| row.values)
+            .collect();
         Ok(())
     }
 
@@ -74,25 +79,34 @@ impl Executor for TableReaderExec {
     }
 }
 
-fn scan_table(domain: &Domain, info: &TableInfo) -> Result<Vec<Vec<Datum>>> {
+pub(crate) struct ScannedRow {
+    pub handle: i64,
+    pub values: Vec<Datum>,
+}
+
+pub(crate) fn scan_table(domain: &Domain, info: &TableInfo) -> Result<Vec<ScannedRow>> {
     let start = gen_table_record_prefix(info.id);
     let end = next_prefix(start.as_bytes());
     let mut txn = domain.begin()?;
     let pairs = txn.scan(start.as_bytes(), &end)?;
-    Ok(pairs
+    pairs
         .into_iter()
-        .map(|(_, raw)| {
+        .map(|(key, raw)| {
             let decoded = decode_row(&raw);
-            info.columns
-                .iter()
-                .map(|col| {
-                    decoded
-                        .iter()
-                        .find(|(id, _)| *id == col.id)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(Datum::Null)
-                })
-                .collect()
+            Ok(ScannedRow {
+                handle: decode_handle_from_row_key(&key)?,
+                values: info
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        decoded
+                            .iter()
+                            .find(|(id, _)| *id == col.id)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Datum::Null)
+                    })
+                    .collect(),
+            })
         })
-        .collect())
+        .collect()
 }

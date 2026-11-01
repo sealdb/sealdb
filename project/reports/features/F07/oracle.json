@@ -1,0 +1,33 @@
+{
+  "suite": "testdata/F07",
+  "cases": [
+    {
+      "name": "update_delete.sql",
+      "result": {
+        "sql": "UPDATE db1.t SET name = 'x' WHERE id = 1;\nDELETE FROM db1.t WHERE id = 2;\nUPDATE t SET name = 'y';\nDELETE FROM t;\n",
+        "statements": [
+          {
+            "type": "UpdateStmt",
+            "restore": "UPDATE `db1`.`t` SET `name`=_UTF8MB4'x' WHERE `id`=1",
+            "text": "UPDATE db1.t SET name = 'x' WHERE id = 1;"
+          },
+          {
+            "type": "DeleteStmt",
+            "restore": "DELETE FROM `db1`.`t` WHERE `id`=2",
+            "text": "DELETE FROM db1.t WHERE id = 2;"
+          },
+          {
+            "type": "UpdateStmt",
+            "restore": "UPDATE `t` SET `name`=_UTF8MB4'y'",
+            "text": "UPDATE t SET name = 'y';"
+          },
+          {
+            "type": "DeleteStmt",
+            "restore": "DELETE FROM `t`",
+            "text": "DELETE FROM t;"
+          }
+        ]
+      }
+    }
+  ]
+}
