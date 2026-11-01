@@ -157,3 +157,127 @@ impl DropTableStmt {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct CreateIndexStmt {
+    pub if_not_exists: bool,
+    pub table: TableName,
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+impl CreateIndexStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE INDEX ");
+        if self.if_not_exists {
+            ctx.write_str("IF NOT EXISTS ");
+        }
+        ctx.write_name(&self.name);
+        ctx.write_str(" ON ");
+        self.table.restore(ctx)?;
+        ctx.write_str(" (");
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            ctx.write_name(col);
+        }
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DropIndexStmt {
+    pub if_exists: bool,
+    pub table: TableName,
+    pub name: String,
+}
+
+impl DropIndexStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP INDEX ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
+        ctx.write_name(&self.name);
+        ctx.write_str(" ON ");
+        self.table.restore(ctx)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AlterTableSpec {
+    AddColumn {
+        if_not_exists: bool,
+        column: ColumnDef,
+    },
+    DropColumn {
+        if_exists: bool,
+        name: String,
+    },
+    AddIndex(IndexDef),
+    DropIndex {
+        if_exists: bool,
+        name: String,
+    },
+}
+
+impl AlterTableSpec {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        match self {
+            AlterTableSpec::AddColumn {
+                if_not_exists,
+                column,
+            } => {
+                ctx.write_str("ADD COLUMN ");
+                if *if_not_exists {
+                    ctx.write_str("IF NOT EXISTS ");
+                }
+                column.restore(ctx)
+            }
+            AlterTableSpec::DropColumn { if_exists, name } => {
+                ctx.write_str("DROP COLUMN ");
+                if *if_exists {
+                    ctx.write_str("IF EXISTS ");
+                }
+                ctx.write_name(name);
+                Ok(())
+            }
+            AlterTableSpec::AddIndex(index) => {
+                ctx.write_str("ADD ");
+                index.restore(ctx)
+            }
+            AlterTableSpec::DropIndex { if_exists, name } => {
+                ctx.write_str("DROP INDEX ");
+                if *if_exists {
+                    ctx.write_str("IF EXISTS ");
+                }
+                ctx.write_name(name);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AlterTableStmt {
+    pub table: TableName,
+    pub specs: Vec<AlterTableSpec>,
+}
+
+impl AlterTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER TABLE ");
+        self.table.restore(ctx)?;
+        ctx.write_str(" ");
+        for (i, spec) in self.specs.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            spec.restore(ctx)?;
+        }
+        Ok(())
+    }
+}

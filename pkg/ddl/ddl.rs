@@ -1,6 +1,7 @@
-use crate::{schema, table};
+use crate::{alter, index, schema, table};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
+use sealdb_kv::Storage;
 use sealdb_meta::Mutator;
 use sealdb_parser::ast::{Statement, StmtNode};
 
@@ -9,6 +10,7 @@ pub fn execute_ddl(
     is: &InfoSchema,
     stmt: &Statement,
     current_db: &str,
+    storage: &dyn Storage,
 ) -> Result<()> {
     match stmt {
         Statement::CreateDatabase(s) => {
@@ -22,6 +24,15 @@ pub fn execute_ddl(
         }
         Statement::DropTable(s) => {
             table::drop_table(meta, is, s, current_db)?;
+        }
+        Statement::CreateIndex(s) => {
+            index::create_index(meta, is, s, current_db, storage)?;
+        }
+        Statement::DropIndex(s) => {
+            index::drop_index(meta, is, s, current_db, storage)?;
+        }
+        Statement::AlterTable(s) => {
+            alter::alter_table(meta, is, s, current_db, storage)?;
         }
         other => {
             return Err(Error::unsupported(format!("DDL {}", other.stmt_type())));

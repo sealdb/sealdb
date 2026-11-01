@@ -147,6 +147,15 @@ impl PlanBuilder {
             Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropTable,
             }),
+            Statement::CreateIndex(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::CreateIndex,
+            }),
+            Statement::DropIndex(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::DropIndex,
+            }),
+            Statement::AlterTable(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::AlterTable,
+            }),
             Statement::Show(show) => Ok(PhysicalPlan::Show {
                 kind: format!("{:?}", show.kind),
             }),

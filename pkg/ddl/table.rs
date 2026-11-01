@@ -68,7 +68,7 @@ pub fn drop_table(
     Ok(())
 }
 
-fn resolve_name(name: &TableName, current_db: &str) -> Result<(String, String)> {
+pub(crate) fn resolve_name(name: &TableName, current_db: &str) -> Result<(String, String)> {
     let (schema, table) = name.qualified(current_db);
     if schema.is_empty() {
         return Err(Error::new(ERR_NO_DB, "No database selected"));

@@ -47,7 +47,7 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     Ok(info)
 }
 
-fn field_type_from_name(type_name: &str) -> Result<FieldType> {
+pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
     let upper = type_name.to_ascii_uppercase();
     let (base, rest) = split_type(&upper);
     let unsigned = rest.contains("UNSIGNED") || base.ends_with("UNSIGNED");

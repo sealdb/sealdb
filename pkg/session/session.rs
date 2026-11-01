@@ -83,7 +83,10 @@ impl Session {
             Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
             | Statement::CreateTable(_)
-            | Statement::DropTable(_) => {
+            | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_) => {
                 // F12 gap: no transactional DDL. Implicit-commit then apply.
                 self.txn.lock().expect("session txn lock").commit()?;
             }
@@ -504,10 +507,18 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'missing'")
             .unwrap();
         assert!(miss.display_rows().is_empty());
-        let err = session
+        session
             .execute_stmt("CREATE INDEX idx_id ON db1.t (id)")
-            .unwrap_err();
-        assert!(err.message.contains("CREATE INDEX"));
+            .unwrap();
+        assert_eq!(
+            session
+                .infoschema()
+                .table_by_name("db1", "t")
+                .unwrap()
+                .indices
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -873,5 +884,87 @@ mod tests {
             err.code,
             sealdb_errno::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
         );
+    }
+
+    #[test]
+    fn test_online_ddl() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("CREATE INDEX idx_name ON db1.t (name)")
+            .unwrap();
+        let hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(
+            hit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        session
+            .execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT")
+            .unwrap();
+        let desc = session.execute_stmt("DESC db1.t").unwrap();
+        assert_eq!(desc.display_rows().len(), 3);
+        assert_eq!(desc.display_rows()[2][0], "age");
+        let existing = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            existing.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "NULL".to_string()]]
+        );
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (3, 'c', 10)")
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t ADD INDEX idx_age (age)")
+            .unwrap();
+        let aged = session
+            .execute_stmt("SELECT * FROM db1.t WHERE age = 10")
+            .unwrap();
+        assert_eq!(
+            aged.display_rows(),
+            vec![vec!["3".to_string(), "c".to_string(), "10".to_string()]]
+        );
+        session
+            .execute_stmt("DROP INDEX idx_name ON db1.t")
+            .unwrap();
+        assert_eq!(
+            session
+                .infoschema()
+                .table_by_name("db1", "t")
+                .unwrap()
+                .indices
+                .len(),
+            1
+        );
+        session
+            .execute_stmt("ALTER TABLE db1.t DROP COLUMN age")
+            .unwrap_err();
+        session
+            .execute_stmt("ALTER TABLE db1.t DROP INDEX idx_age")
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t DROP COLUMN age")
+            .unwrap();
+        let after_drop = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 3")
+            .unwrap();
+        assert_eq!(
+            after_drop.display_rows(),
+            vec![vec!["3".to_string(), "c".to_string()]]
+        );
+        let err = session
+            .execute_stmt("CREATE UNIQUE INDEX idx_id ON db1.t (id)")
+            .unwrap_err();
+        assert!(err.message.contains("UNIQUE"));
+        let err = session
+            .execute_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
+            .unwrap_err();
+        assert!(err.message.contains("ALTER TABLE"));
     }
 }

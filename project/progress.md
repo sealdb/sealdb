@@ -57,7 +57,8 @@
 | F15 | `core-ported` | `project/reports/features/F15/` |
 | F16 | `core-ported` | `project/reports/features/F16/` |
 | F17 | `core-ported` | `project/reports/features/F17/` |
-| F18–F22 | `not-started` | — |
+| F18 | `core-ported` | `project/reports/features/F18/` |
+| F19–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -100,6 +101,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F18 在线 DDL
+- **完成**:
+  - `CREATE INDEX` / `DROP INDEX`
+  - `ALTER TABLE ADD/DROP COLUMN` / `ADD/DROP INDEX`
+  - 存量行二级索引回填
+- **验证**:
+  - `./project/scripts/feature_gate.sh F18`
+- **下一步**:
+  - F19 分区裁剪
 
 ### 2026-11-01
 
