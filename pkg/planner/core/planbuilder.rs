@@ -1,4 +1,8 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
+use super::plan_cost::{
+    eq_row_count, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
+};
+use super::rule_join_reorder::reorder_hash_join;
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
@@ -35,17 +39,21 @@ impl PlanBuilder {
                     {
                         return Err(Error::unsupported("CTE in JOIN"));
                     }
-                    PhysicalPlan::HashJoin {
-                        tp: map_join_type(join.tp),
-                        left: Box::new(PhysicalPlan::TableReader {
+                    reorder_hash_join(
+                        map_join_type(join.tp),
+                        PhysicalPlan::TableReader {
                             table: join.left.name.clone(),
                             partitions: Vec::new(),
-                        }),
-                        right: Box::new(PhysicalPlan::TableReader {
+                        },
+                        PhysicalPlan::TableReader {
                             table: join.right.name.clone(),
                             partitions: Vec::new(),
-                        }),
-                    }
+                        },
+                        join.left.name.clone(),
+                        join.right.name.clone(),
+                        table_row_count(stats, &join.left, current_db),
+                        table_row_count(stats, &join.right, current_db),
+                    )
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
@@ -183,6 +191,10 @@ impl PlanBuilder {
             }),
             Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "Analyze".to_string(),
+            }),
+            Statement::Explain(explain) => Ok(PhysicalPlan::Explain {
+                format: explain.format,
+                child: Box::new(self.build_with_schema(&explain.stmt, is, current_db, stats)?),
             }),
             Statement::SetOpr(set) => {
                 let mut plan = self.build_with_schema(
@@ -353,24 +365,24 @@ fn access_plan(
             if let (Some(first), Datum::I64(handle)) = (first, &value)
                 && first.name.o().eq_ignore_ascii_case(&column)
             {
+                let _ = point_get_cost();
                 return PhysicalPlan::PointGet {
                     table: from.name.clone(),
                     handle: *handle,
                 };
             }
             if let Some(index) = info.find_index_covering(&column) {
-                // F21: after ANALYZE, a non-selective equality (NDV <= 1)
-                // prefers TableReader over IndexLookUp. Unanalyzed tables
-                // keep the F10 IndexLookUp path.
-                let (db, table) = from.qualified(current_db);
-                if stats
-                    .and_then(|h| h.table(&db, &table))
-                    .is_some_and(|t| t.column(&column).is_some_and(|c| c.ndv <= 1))
-                {
-                    return PhysicalPlan::TableReader {
-                        table: from.name.clone(),
-                        partitions: info.prune_partitions(select.selection.as_ref()),
-                    };
+                // F10: unanalyzed tables keep IndexLookUp.
+                // C2 skyline: after ANALYZE, pick the cheaper of TableReader
+                // vs IndexLookUp. F21 NDV<=1 is the same TableReader winner.
+                if let Some(eq_rows) = eq_row_count(stats, from, current_db, &column) {
+                    let scan_rows = table_row_count(stats, from, current_db);
+                    if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
+                        return PhysicalPlan::TableReader {
+                            table: from.name.clone(),
+                            partitions: info.prune_partitions(select.selection.as_ref()),
+                        };
+                    }
                 }
                 return PhysicalPlan::IndexLookUpReader {
                     table: from.name.clone(),

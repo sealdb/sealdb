@@ -1,0 +1,22 @@
+{
+  "feature": "C2",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/planner/core/explain.go",
+    "TiDB pkg/planner/core/rule_join_reorder.go",
+    "TiDB tests/integrationtest/t/explain.test"
+  ],
+  "cases": [
+    "explain-select-dual",
+    "explain-format-json",
+    "explain-format-dot",
+    "explain-analyze-unsupported",
+    "explain-table-reader",
+    "explain-index-lookup-unanalyzed",
+    "explain-skyline-table-reader",
+    "explain-point-get",
+    "explain-hash-join",
+    "explain-join-reorder-smaller-build",
+    "explain-join-result-unchanged"
+  ]
+}

@@ -164,6 +164,9 @@ impl Session {
             .lock()
             .expect("session current_db lock")
             .clone();
+        if let Statement::Explain(explain) = stmt {
+            return self.check_privilege(&explain.stmt);
+        }
         match stmt {
             Statement::Grant(_) | Statement::Revoke(_) => {
                 if !mgr.request_verification(&user, "", "", PrivilegeType::ALL) {
@@ -1311,5 +1314,88 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a' ORDER BY id")
             .unwrap();
         assert_eq!(rows.display_rows().len(), 3);
+    }
+
+    #[test]
+    fn test_explain_skyline_and_join_reorder() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'a'), (6, 'b'), (7, 'a'), (8, 'b'), (9, 'a'), (10, 'b')",
+            )
+            .unwrap();
+        let before = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(
+            before.columns,
+            vec!["id", "estRows", "task", "access object", "operator info"]
+        );
+        let before_text = before
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(before_text.contains("IndexLookUp"), "{before_text}");
+        session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
+        let after = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        let after_text = after
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(after_text.contains("TableReader"), "{after_text}");
+        assert!(!after_text.contains("IndexLookUp"), "{after_text}");
+
+        let dual = session.execute_stmt("EXPLAIN SELECT 1").unwrap();
+        let dual_text = dual
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dual_text.contains("TableDual"), "{dual_text}");
+        let json = session
+            .execute_stmt("EXPLAIN FORMAT='json' SELECT 1")
+            .unwrap();
+        assert_eq!(json.columns, vec!["json"]);
+        assert!(json.display_rows()[0][0].contains("TableDual"));
+        let dot = session
+            .execute_stmt("EXPLAIN FORMAT='dot' SELECT 1")
+            .unwrap();
+        assert!(dot.display_rows()[0][0].contains("digraph"));
+
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.small (id INT); CREATE TABLE db1.big (id INT); INSERT INTO db1.small VALUES (1); INSERT INTO db1.big VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10); ANALYZE TABLE db1.small; ANALYZE TABLE db1.big",
+            )
+            .unwrap();
+        let join = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.small JOIN db1.big ON small.id = big.id")
+            .unwrap();
+        let join_text = join
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big_pos = join_text.find("table:big").expect(&join_text);
+        let small_pos = join_text.find("table:small").expect(&join_text);
+        assert!(big_pos < small_pos, "{join_text}");
+        let rows = session
+            .execute_stmt(
+                "SELECT small.id, big.id FROM db1.small JOIN db1.big ON small.id = big.id",
+            )
+            .unwrap();
+        assert_eq!(rows.display_rows().len(), 1);
+
+        let err = session
+            .execute_stmt("EXPLAIN ANALYZE SELECT 1")
+            .unwrap_err();
+        assert!(err.message.contains("ANALYZE"));
     }
 }

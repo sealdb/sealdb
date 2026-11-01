@@ -123,6 +123,15 @@ case "$FEATURE" in
       --json "$ROOT/project/features/leftover.json" \
       --check
     ;;
+  C2)
+    run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
+      --tidb-root "$TIDB_ROOT" \
+      --rust-root "$ROOT" \
+      --out "$ROOT/project/features/leftover.md" \
+      --json "$ROOT/project/features/leftover.json" \
+      --check
+    run execute-explain cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); EXPLAIN SELECT * FROM db1.t WHERE id = 1"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

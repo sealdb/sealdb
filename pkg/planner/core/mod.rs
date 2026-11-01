@@ -1,7 +1,10 @@
 pub mod apply;
 pub mod cte;
+pub mod explain;
 pub mod physical_plans;
+pub mod plan_cost;
 pub mod planbuilder;
+pub mod rule_join_reorder;
 pub mod rule_partition_processor;
 pub mod union;
 pub mod window;

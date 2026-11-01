@@ -41,6 +41,7 @@ pub enum Statement {
     Grant(GrantStmt),
     Revoke(RevokeStmt),
     AnalyzeTable(AnalyzeTableStmt),
+    Explain(ExplainStmt),
 }
 
 impl Node for Statement {
@@ -66,6 +67,7 @@ impl Node for Statement {
             Statement::Grant(s) => s.restore(ctx),
             Statement::Revoke(s) => s.restore(ctx),
             Statement::AnalyzeTable(s) => s.restore(ctx),
+            Statement::Explain(s) => s.restore(ctx),
         }
     }
 }
@@ -93,6 +95,7 @@ impl StmtNode for Statement {
             Statement::Grant(_) => "GrantStmt",
             Statement::Revoke(_) => "RevokeStmt",
             Statement::AnalyzeTable(_) => "AnalyzeTableStmt",
+            Statement::Explain(_) => "ExplainStmt",
         }
     }
 }
@@ -109,8 +112,39 @@ impl Statement {
         match self {
             Statement::Select(s) => s.with.as_ref(),
             Statement::SetOpr(s) => s.with.as_ref(),
+            Statement::Explain(s) => s.stmt.with_clause(),
             _ => None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub enum ExplainFormat {
+    #[default]
+    Row,
+    Dot,
+    Json,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExplainStmt {
+    pub analyze: bool,
+    pub format: ExplainFormat,
+    pub stmt: Box<Statement>,
+}
+
+impl ExplainStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("EXPLAIN ");
+        if self.analyze {
+            ctx.write_str("ANALYZE ");
+        }
+        match self.format {
+            ExplainFormat::Row => {}
+            ExplainFormat::Dot => ctx.write_str("FORMAT = 'dot' "),
+            ExplainFormat::Json => ctx.write_str("FORMAT = 'json' "),
+        }
+        self.stmt.restore(ctx)
     }
 }
 

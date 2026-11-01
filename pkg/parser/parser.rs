@@ -519,4 +519,39 @@ mod tests {
         let err = parser.parse_one_stmt("ANALYZE TABLE t (id)").unwrap_err();
         assert!(err.message.contains("column") || err.message.contains("ANALYZE"));
     }
+
+    #[test]
+    fn test_parse_explain() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("EXPLAIN SELECT 1").unwrap() {
+            crate::ast::Statement::Explain(explain) => {
+                assert!(!explain.analyze);
+                assert_eq!(explain.format, crate::ast::ExplainFormat::Row);
+                assert!(matches!(*explain.stmt, crate::ast::Statement::Select(_)));
+            }
+            other => panic!("expected ExplainStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("EXPLAIN FORMAT = 'dot' SELECT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Explain(explain) => {
+                assert_eq!(explain.format, crate::ast::ExplainFormat::Dot);
+            }
+            other => panic!("expected ExplainStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("EXPLAIN FORMAT='json' SELECT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Explain(explain) => {
+                assert_eq!(explain.format, crate::ast::ExplainFormat::Json);
+            }
+            other => panic!("expected ExplainStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("EXPLAIN ANALYZE SELECT 1")
+            .unwrap_err();
+        assert!(err.message.contains("ANALYZE"));
+    }
 }
