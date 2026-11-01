@@ -25,6 +25,20 @@ impl Session {
 
     pub fn execute_stmt(&self, sql: &str) -> Result<QueryResult> {
         let stmt = self.parser.parse_one_stmt(sql)?;
+        if let sealdb_parser::ast::Statement::Use(use_stmt) = &stmt {
+            let is = self.domain.infoschema();
+            if is.schema_by_name(&use_stmt.db_name).is_none() {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_BAD_DB,
+                    format!("Unknown database '{}'", use_stmt.db_name),
+                ));
+            }
+            *self.current_db.lock().expect("session current_db lock") = use_stmt.db_name.clone();
+            return Ok(QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            });
+        }
         let plan = self.planner.build(&stmt)?;
         let current_db = self
             .current_db
@@ -106,5 +120,28 @@ mod tests {
         session
             .execute_stmt("DROP DATABASE IF EXISTS missing_db")
             .unwrap();
+    }
+
+    #[test]
+    fn test_show_and_desc() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        let dbs = session.execute_stmt("SHOW DATABASES").unwrap();
+        assert!(
+            dbs.display_rows()
+                .iter()
+                .any(|row| row.first().map(String::as_str) == Some("db1"))
+        );
+        let tables = session.execute_stmt("SHOW TABLES FROM db1").unwrap();
+        assert_eq!(tables.columns, vec!["Tables_in_db1"]);
+        assert_eq!(tables.display_rows(), vec![vec!["t".to_string()]]);
+        session.execute_stmt("USE db1").unwrap();
+        let desc = session.execute_stmt("DESC t").unwrap();
+        assert_eq!(desc.columns[0], "Field");
+        assert_eq!(desc.display_rows()[0][0], "id");
+        assert_eq!(desc.display_rows()[1][0], "name");
     }
 }

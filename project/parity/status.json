@@ -97,6 +97,11 @@
       "phase": 3,
       "notes": "CREATE/DROP DATABASE|TABLE"
     },
+    "pkg/parser/ast/misc.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "ShowStmt + UseStmt"
+    },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 2,
@@ -236,6 +241,11 @@
       "status": "partial",
       "phase": 3,
       "notes": "DDLExec apply via Domain"
+    },
+    "pkg/executor/show.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "SHOW DATABASES/TABLES and DESC"
     },
     "pkg/executor/select.go": {
       "status": "partial",

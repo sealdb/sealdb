@@ -1,0 +1,18 @@
+{
+  "feature": "F11",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/parser/ast/misc.go",
+    "TiDB pkg/executor/show.go"
+  ],
+  "cases": [
+    "SHOW DATABASES",
+    "SHOW TABLES FROM db1",
+    "SHOW TABLES",
+    "DESC db1.t",
+    "DESCRIBE db1.t",
+    "DESC t",
+    "USE db1",
+    "SHOW COLUMNS FROM db1.t"
+  ]
+}

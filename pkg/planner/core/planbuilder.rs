@@ -40,6 +40,12 @@ impl PlanBuilder {
             Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropTable,
             }),
+            Statement::Show(show) => Ok(PhysicalPlan::Show {
+                kind: format!("{:?}", show.kind),
+            }),
+            Statement::Use(_) => Ok(PhysicalPlan::Show {
+                kind: "Use".to_string(),
+            }),
         }
     }
 }

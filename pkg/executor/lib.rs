@@ -8,6 +8,7 @@ pub mod internal;
 pub mod join;
 pub mod projection;
 pub mod select;
+pub mod show;
 pub mod sortexec;
 pub mod unionexec;
 

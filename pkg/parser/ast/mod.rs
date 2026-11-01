@@ -5,6 +5,7 @@ pub mod base;
 pub mod ddl;
 pub mod dml;
 pub mod expressions;
+pub mod misc;
 
 pub use ast::{Node, Statement, StmtNode};
 pub use ddl::{
@@ -12,3 +13,4 @@ pub use ddl::{
 };
 pub use dml::{SelectField, SelectStmt};
 pub use expressions::ExprNode;
+pub use misc::{ShowStmt, ShowStmtKind, UseStmt};

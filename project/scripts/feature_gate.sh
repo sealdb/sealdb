@@ -55,6 +55,9 @@ case "$FEATURE" in
   F02)
     run execute-createdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1"
     ;;
+  F11)
+    run execute-showdb cargo run -q -p sealdb-server-bin -- --execute "SHOW DATABASES"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

@@ -2,6 +2,7 @@ use crate::ddl::DDLExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::projection::ProjectionExec;
 use crate::select::TableDualExec;
+use crate::show::ShowExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_parser::ast::Statement;
@@ -37,6 +38,20 @@ impl ExecutorBuilder {
                     exprs,
                     names,
                     Box::new(TableDualExec::new()),
+                )))
+            }
+            PhysicalPlan::Show { .. } => {
+                let show = match stmt {
+                    Statement::Show(s) => s.clone(),
+                    Statement::Use(_) => {
+                        return Err(Error::unsupported("USE should be handled by session"));
+                    }
+                    _ => return Err(Error::unsupported("show without show statement")),
+                };
+                Ok(Box::new(ShowExec::new(
+                    domain,
+                    show,
+                    current_db.to_string(),
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),

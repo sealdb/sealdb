@@ -26,7 +26,7 @@
 | 0 | 地基与规范 | `done` | 2026-10-19 | 2026-11-01 | U0 | workspace/CI/parity/spike 书面结论 |
 | 1 | 核心类型与编码 | `done` | 2026-11-01 | 2026-11-01 | U1 | int/uint/float/bytes + row/index key；Decimal/Time 核心路径 |
 | 2 | 解析器 + Mock 链路 | `in-progress` | 2026-11-01 | — | U2/U3/F01 | `SELECT 1` 与 F01 表达式已通；parser 全量 60% 留完整性波 |
-| 3 | 元数据与 Bootstrap | `in-progress` | 2026-11-01 | — | F02/F11 | F02 CREATE/DROP 已通；F11 SHOW 未做 |
+| 3 | 元数据与 Bootstrap | `done` | 2026-11-01 | 2026-11-01 | F02/F11 | SHOW/DESC 走内存 InfoSchema |
 | 4 | Planner v1（RBO） | `not-started` | — | — | F03–F10 | 规则随功能走 |
 | 5 | Executor v1 | `not-started` | — | — | F03–F10 | Dual/Projection 已作为 U3 骨架 |
 | 6 | 事务与 Session | `not-started` | — | — | F12/F13 | 可与 Phase 5 并行 |
@@ -42,7 +42,8 @@
 | U0–U3 | `core-ported` | workspace / codec tests / `--parse` / `SELECT 1` |
 | F01 | `core-ported` | `project/reports/features/F01/` |
 | F02 | `core-ported` | `project/reports/features/F02/` |
-| F03–F22 | `not-started` | — |
+| F11 | `core-ported` | `project/reports/features/F11/` |
+| F03–F10, F12–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |

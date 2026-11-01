@@ -49,4 +49,15 @@ impl InfoSchema {
         dbs.sort_by(|a, b| a.name.l().cmp(b.name.l()));
         dbs
     }
+
+    pub fn schema_tables(&self, schema: &str) -> Vec<&TableInfo> {
+        let schema_l = schema.to_ascii_lowercase();
+        let mut tables: Vec<_> = self
+            .tables
+            .iter()
+            .filter_map(|((db, _), table)| (db == &schema_l).then_some(table))
+            .collect();
+        tables.sort_by(|a, b| a.name.l().cmp(b.name.l()));
+        tables
+    }
 }

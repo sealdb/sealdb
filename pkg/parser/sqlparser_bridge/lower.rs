@@ -7,13 +7,14 @@ use crate::ast::dml::{SelectField, SelectStmt};
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
 };
+use crate::ast::misc::{ShowStmt, ShowStmtKind, UseStmt};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
-    BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectName, ObjectType, SchemaName, SelectItem, SetExpr, Statement as SqlStatement,
-    UnaryOperator, Value,
+    BinaryOperator, DataType, DescribeAlias, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, ObjectName, ObjectType, SchemaName, SelectItem, SetExpr,
+    Statement as SqlStatement, UnaryOperator, Use, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -124,6 +125,62 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 })),
                 other => Err(Error::unsupported(format!("DROP {other}"))),
             }
+        }
+        SqlStatement::ShowDatabases { .. } | SqlStatement::ShowSchemas { .. } => {
+            Ok(Statement::Show(ShowStmt {
+                kind: ShowStmtKind::Databases,
+                db_name: None,
+                table: None,
+            }))
+        }
+        SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::Tables,
+            db_name: show_options
+                .show_in
+                .as_ref()
+                .and_then(|inn| inn.parent_name.as_ref())
+                .map(object_name_last)
+                .transpose()?,
+            table: None,
+        })),
+        SqlStatement::ShowColumns { show_options, .. } => {
+            let table = show_options
+                .show_in
+                .as_ref()
+                .and_then(|inn| inn.parent_name.as_ref())
+                .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing table name"))?;
+            Ok(Statement::Show(ShowStmt {
+                kind: ShowStmtKind::Columns,
+                db_name: None,
+                table: Some(object_table_name(table)?),
+            }))
+        }
+        SqlStatement::ExplainTable {
+            describe_alias,
+            table_name,
+            ..
+        } => {
+            if !matches!(
+                describe_alias,
+                DescribeAlias::Desc | DescribeAlias::Describe
+            ) {
+                return Err(Error::unsupported(format!("EXPLAIN {describe_alias}")));
+            }
+            Ok(Statement::Show(ShowStmt {
+                kind: ShowStmtKind::Columns,
+                db_name: None,
+                table: Some(object_table_name(table_name)?),
+            }))
+        }
+        SqlStatement::Use(use_stmt) => {
+            let name = match use_stmt {
+                Use::Catalog(name)
+                | Use::Schema(name)
+                | Use::Database(name)
+                | Use::Object(name) => object_name_last(name)?,
+                other => return Err(Error::unsupported(format!("USE {other}"))),
+            };
+            Ok(Statement::Use(UseStmt { db_name: name }))
         }
         other => Err(Error::new(
             ERR_UNSUPPORTED,

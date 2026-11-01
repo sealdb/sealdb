@@ -1,0 +1,53 @@
+{
+  "suite": "testdata/F11",
+  "cases": [
+    {
+      "name": "show_desc.sql",
+      "result": {
+        "sql": "SHOW DATABASES;\nSHOW TABLES FROM db1;\nDESC db1.t;\nDESCRIBE db1.t;\nUSE db1;\nSHOW TABLES;\nDESC t;\nSHOW COLUMNS FROM db1.t;\n",
+        "statements": [
+          {
+            "type": "ShowStmt",
+            "restore": "SHOW DATABASES",
+            "text": "SHOW DATABASES;"
+          },
+          {
+            "type": "ShowStmt",
+            "restore": "SHOW TABLES IN `db1`",
+            "text": "SHOW TABLES FROM db1;"
+          },
+          {
+            "type": "ExplainStmt",
+            "restore": "DESC `db1`.`t`",
+            "text": "DESC db1.t;"
+          },
+          {
+            "type": "ExplainStmt",
+            "restore": "DESC `db1`.`t`",
+            "text": "DESCRIBE db1.t;"
+          },
+          {
+            "type": "UseStmt",
+            "restore": "USE `db1`",
+            "text": "USE db1;"
+          },
+          {
+            "type": "ShowStmt",
+            "restore": "SHOW TABLES",
+            "text": "SHOW TABLES;"
+          },
+          {
+            "type": "ExplainStmt",
+            "restore": "DESC `t`",
+            "text": "DESC t;"
+          },
+          {
+            "type": "ShowStmt",
+            "restore": "SHOW COLUMNS IN `db1`.`t`",
+            "text": "SHOW COLUMNS FROM db1.t;"
+          }
+        ]
+      }
+    }
+  ]
+}

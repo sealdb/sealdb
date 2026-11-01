@@ -20,6 +20,9 @@ pub enum PhysicalPlan {
     DDL {
         kind: DdlKind,
     },
+    Show {
+        kind: String,
+    },
 }
 
 impl PhysicalPlan {
@@ -30,6 +33,7 @@ impl PhysicalPlan {
                 format!("Projection({}) -> {}", exprs.join(","), child.explain())
             }
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
+            PhysicalPlan::Show { kind } => format!("Show_{kind}"),
         }
     }
 }

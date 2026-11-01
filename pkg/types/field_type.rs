@@ -74,6 +74,34 @@ impl FieldType {
         }
     }
 
+    pub fn type_name(&self) -> String {
+        let base = match self.tp {
+            TYPE_TINY => "tinyint",
+            TYPE_SHORT => "smallint",
+            TYPE_LONG | TYPE_INT24 => "int",
+            TYPE_LONG_LONG => "bigint",
+            TYPE_FLOAT => "float",
+            TYPE_DOUBLE => "double",
+            TYPE_NEW_DECIMAL | TYPE_DECIMAL => "decimal",
+            TYPE_VAR_STRING | TYPE_VARCHAR | TYPE_STRING => {
+                if self.flen > 0 {
+                    return format!("varchar({})", self.flen);
+                }
+                "varchar"
+            }
+            TYPE_BLOB | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => "blob",
+            TYPE_DATE => "date",
+            TYPE_DATETIME => "datetime",
+            TYPE_TIMESTAMP => "timestamp",
+            _ => "varchar",
+        };
+        if self.unsigned {
+            format!("{base} unsigned")
+        } else {
+            base.to_string()
+        }
+    }
+
     pub fn eval_type(&self) -> EvalType {
         match self.tp {
             TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_LONG_LONG | TYPE_INT24 | TYPE_YEAR => {

@@ -114,4 +114,28 @@ mod tests {
             .unwrap();
         assert_eq!(db.stmt_type(), "CreateDatabaseStmt");
     }
+
+    #[test]
+    fn test_parse_show_and_use() {
+        let parser = Parser::new();
+        assert_eq!(
+            parser.parse_one_stmt("SHOW DATABASES").unwrap().stmt_type(),
+            "ShowStmt"
+        );
+        assert_eq!(
+            parser
+                .parse_one_stmt("SHOW TABLES FROM db1")
+                .unwrap()
+                .stmt_type(),
+            "ShowStmt"
+        );
+        assert_eq!(
+            parser.parse_one_stmt("DESC db1.t").unwrap().stmt_type(),
+            "ShowStmt"
+        );
+        assert_eq!(
+            parser.parse_one_stmt("USE db1").unwrap().stmt_type(),
+            "UseStmt"
+        );
+    }
 }

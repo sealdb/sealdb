@@ -21,6 +21,7 @@ FEATURE_HINTS = {
     "AlterTableStmt": "F18",
     "CreateIndexStmt": "F18",
     "ShowStmt": "F11",
+    "UseStmt": "F11",
     "AnalyzeTableStmt": "F21",
     "PrepareStmt": "C4",
     "ExecuteStmt": "C4",
