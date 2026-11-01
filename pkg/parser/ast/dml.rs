@@ -14,6 +14,7 @@ pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
     pub selection: Option<ExprNode>,
+    pub group_by: Vec<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -46,6 +47,15 @@ impl SelectStmt {
         if let Some(selection) = &self.selection {
             ctx.write_str(" WHERE ");
             selection.restore(ctx)?;
+        }
+        if !self.group_by.is_empty() {
+            ctx.write_str(" GROUP BY ");
+            for (i, expr) in self.group_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                expr.restore(ctx)?;
+            }
         }
         if !self.order_by.is_empty() {
             ctx.write_str(" ORDER BY ");

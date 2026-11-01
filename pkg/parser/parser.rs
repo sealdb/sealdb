@@ -180,4 +180,21 @@ mod tests {
             "DeleteStmt"
         );
     }
+
+    #[test]
+    fn test_parse_group_by_and_count() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("SELECT name, COUNT(*) FROM db1.t GROUP BY name")
+            .unwrap();
+        let select = stmt.as_select().unwrap();
+        assert_eq!(select.group_by.len(), 1);
+        match &select.fields[1].expr {
+            crate::ast::expressions::ExprNode::Func(func) => {
+                assert!(func.name.eq_ignore_ascii_case("COUNT"));
+                assert!(func.args.is_empty());
+            }
+            other => panic!("expected COUNT(*), got {other:?}"),
+        }
+    }
 }

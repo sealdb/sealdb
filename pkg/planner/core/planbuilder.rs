@@ -1,7 +1,7 @@
 use super::physical_plans::{DdlKind, PhysicalPlan};
 use sealdb_errno::Result;
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{Statement, StmtNode};
+use sealdb_parser::ast::{SelectStmt, Statement, StmtNode};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 
@@ -54,6 +54,14 @@ impl PlanBuilder {
                         };
                     }
                 }
+                if needs_hash_agg(select) {
+                    plan = match plan {
+                        PhysicalPlan::Projection { child, .. } => PhysicalPlan::HashAgg { child },
+                        other => PhysicalPlan::HashAgg {
+                            child: Box::new(other),
+                        },
+                    };
+                }
                 if !select.order_by.is_empty() {
                     plan = PhysicalPlan::Sort {
                         child: Box::new(plan),
@@ -99,6 +107,21 @@ impl Default for PlanBuilder {
 
 pub fn stmt_kind(stmt: &Statement) -> &'static str {
     stmt.stmt_type()
+}
+
+fn needs_hash_agg(select: &SelectStmt) -> bool {
+    !select.group_by.is_empty() || select.fields.iter().any(|f| is_agg_expr(&f.expr))
+}
+
+fn is_agg_expr(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_uppercase().as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+            )
+    )
 }
 
 fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {

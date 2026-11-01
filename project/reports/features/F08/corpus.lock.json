@@ -1,0 +1,16 @@
+{
+  "feature": "F08",
+  "frozen": "2026-11-01",
+  "source": ["TiDB pkg/executor/aggregate/agg_hash_executor.go", "TiDB pkg/executor/aggfuncs"],
+  "cases": [
+    "SELECT COUNT(*) FROM db1.t",
+    "SELECT COUNT(id) FROM db1.t",
+    "SELECT SUM(id), MIN(id), MAX(id) FROM db1.t",
+    "SELECT AVG(id) FROM db1.t",
+    "SELECT name, COUNT(*) FROM db1.t GROUP BY name",
+    "SELECT COUNT(*) FROM db1.t WHERE id = 9",
+    "SELECT COUNT(*)",
+    "CREATE TABLE db1.t (id INT, name VARCHAR(20))",
+    "CREATE DATABASE db1"
+  ]
+}

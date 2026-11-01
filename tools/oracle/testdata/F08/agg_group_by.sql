@@ -1,0 +1,6 @@
+SELECT COUNT(*) FROM db1.t;
+SELECT name, COUNT(*) FROM db1.t GROUP BY name;
+SELECT SUM(id) FROM db1.t;
+SELECT MIN(id), MAX(id) FROM db1.t;
+SELECT AVG(id) FROM db1.t;
+SELECT COUNT(*);
