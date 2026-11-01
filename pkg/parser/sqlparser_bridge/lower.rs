@@ -4,7 +4,7 @@ use crate::ast::ddl::{
     ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
 };
 use crate::ast::dml::{
-    Assignment, ByItem, DeleteStmt, InsertStmt, SelectField, SelectStmt, UpdateStmt,
+    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectStmt, UpdateStmt,
 };
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
@@ -15,8 +15,8 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, LimitClause, ObjectName,
-    ObjectType, OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectType, OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
     Use, Value, Values,
 };
@@ -41,14 +41,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     .iter()
                     .map(lower_select_item)
                     .collect::<Result<Vec<_>>>()?;
-                let from = select
-                    .from
-                    .first()
-                    .map(|t| match &t.relation {
-                        sqlparser::ast::TableFactor::Table { name, .. } => object_table_name(name),
-                        other => Err(Error::unsupported(format!("FROM {other}"))),
-                    })
-                    .transpose()?;
+                let (from, join) = lower_from(&select.from)?;
                 let selection = select.selection.as_ref().map(lower_expr).transpose()?;
                 if select.having.is_some() {
                     return Err(Error::unsupported("HAVING"));
@@ -59,6 +52,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 Ok(Statement::Select(SelectStmt {
                     fields,
                     from,
+                    join,
                     selection,
                     group_by,
                     order_by,
@@ -231,6 +225,54 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             ERR_UNSUPPORTED,
             format!("statement {other} is not available in this phase"),
         )),
+    }
+}
+
+fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {
+    if from.is_empty() {
+        return Ok((None, None));
+    }
+    if from.len() > 1 {
+        return Err(Error::unsupported("comma joins"));
+    }
+    let table = &from[0];
+    let left = table_factor_name(&table.relation)?;
+    if table.joins.is_empty() {
+        return Ok((Some(left), None));
+    }
+    if table.joins.len() != 1 {
+        return Err(Error::unsupported("more than two tables in JOIN"));
+    }
+    let join = &table.joins[0];
+    let right = table_factor_name(&join.relation)?;
+    let (tp, on) = match &join.join_operator {
+        JoinOperator::Join(JoinConstraint::On(expr))
+        | JoinOperator::Inner(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
+        JoinOperator::Left(JoinConstraint::On(expr))
+        | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+            (JoinType::LeftOuter, lower_expr(expr)?)
+        }
+        JoinOperator::Right(JoinConstraint::On(expr))
+        | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+            (JoinType::RightOuter, lower_expr(expr)?)
+        }
+        other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
+    };
+    Ok((
+        Some(left.clone()),
+        Some(Join {
+            left,
+            right,
+            tp,
+            on,
+        }),
+    ))
+}
+
+fn table_factor_name(factor: &TableFactor) -> Result<TableName> {
+    match factor {
+        TableFactor::Table { name, .. } => object_table_name(name),
+        other => Err(Error::unsupported(format!("FROM {other}"))),
     }
 }
 

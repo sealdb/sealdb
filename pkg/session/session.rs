@@ -356,4 +356,45 @@ mod tests {
         let dual = session.execute_stmt("SELECT COUNT(*)").unwrap();
         assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
     }
+
+    #[test]
+    fn test_hash_join() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (3, 'y')",
+            )
+            .unwrap();
+        let inner = session
+            .execute_stmt("SELECT t1.id, t1.name, t2.tag FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id")
+            .unwrap();
+        assert_eq!(
+            inner.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
+        );
+        let left = session
+            .execute_stmt(
+                "SELECT t1.id, t2.tag FROM db1.t1 LEFT JOIN db1.t2 ON t1.id = t2.id ORDER BY t1.id",
+            )
+            .unwrap();
+        assert_eq!(
+            left.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "NULL".to_string()]
+            ]
+        );
+        let right = session
+            .execute_stmt(
+                "SELECT t1.name, t2.tag FROM db1.t1 RIGHT JOIN db1.t2 ON t1.id = t2.id ORDER BY t2.tag",
+            )
+            .unwrap();
+        assert_eq!(
+            right.display_rows(),
+            vec![
+                vec!["a".to_string(), "x".to_string()],
+                vec!["NULL".to_string(), "y".to_string()]
+            ]
+        );
+    }
 }

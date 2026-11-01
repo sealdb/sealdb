@@ -3,6 +3,31 @@ use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    RightOuter,
+}
+
+impl JoinType {
+    pub fn restore(self) -> &'static str {
+        match self {
+            JoinType::Inner => "JOIN",
+            JoinType::LeftOuter => "LEFT JOIN",
+            JoinType::RightOuter => "RIGHT JOIN",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Join {
+    pub left: TableName,
+    pub right: TableName,
+    pub tp: JoinType,
+    pub on: ExprNode,
+}
+
 #[derive(Clone, Debug)]
 pub struct SelectField {
     pub expr: ExprNode,
@@ -13,6 +38,7 @@ pub struct SelectField {
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
+    pub join: Option<Join>,
     pub selection: Option<ExprNode>,
     pub group_by: Vec<ExprNode>,
     pub order_by: Vec<ByItem>,
@@ -40,7 +66,16 @@ impl SelectStmt {
                 ctx.write_str(name);
             }
         }
-        if let Some(from) = &self.from {
+        if let Some(join) = &self.join {
+            ctx.write_str(" FROM ");
+            join.left.restore(ctx)?;
+            ctx.write_str(" ");
+            ctx.write_str(join.tp.restore());
+            ctx.write_str(" ");
+            join.right.restore(ctx)?;
+            ctx.write_str(" ON ");
+            join.on.restore(ctx)?;
+        } else if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
             from.restore(ctx)?;
         }

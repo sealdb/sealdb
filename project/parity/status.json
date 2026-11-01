@@ -111,7 +111,7 @@
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "SelectStmt + InsertStmt + UpdateStmt + DeleteStmt + GROUP BY"
+      "notes": "SelectStmt + InsertStmt + UpdateStmt + DeleteStmt + GROUP BY + JOIN"
     },
     "pkg/parser/model/model.go": {
       "status": "partial",
@@ -121,7 +121,7 @@
     "pkg/parser/ast/expressions.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "value/column/binary/unary/func/cast"
+      "notes": "value/column/binary/unary/func/cast; qualified columns for JOIN"
     },
     "pkg/parser/format/format.go": {
       "status": "partial",
@@ -176,12 +176,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "Build constant SELECT, DDL, INSERT, UPDATE, DELETE, TableReader, Selection, HashAgg"
+      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "TableDual / Projection / DDL / Insert / Update / Delete / TableReader / Selection / HashAgg"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
@@ -241,7 +241,7 @@
     "pkg/executor/builder.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "select + DDL + insert + update + delete + table reader + hash agg"
+      "notes": "select + DDL + DML + table reader + hash agg + hash join"
     },
     "pkg/executor/ddl.go": {
       "status": "partial",
@@ -332,6 +332,11 @@
       "status": "partial",
       "phase": 5,
       "notes": "MIN/MAX via Datum compare"
+    },
+    "pkg/executor/join/hash_join_v1.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "in-memory two-table HashJoinV1Exec"
     },
     "pkg/session/session.go": {
       "status": "partial",

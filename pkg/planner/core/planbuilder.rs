@@ -1,7 +1,7 @@
-use super::physical_plans::{DdlKind, PhysicalPlan};
+use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
 use sealdb_errno::Result;
-use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{SelectStmt, Statement, StmtNode};
+use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+use sealdb_parser::ast::{JoinType as AstJoinType, SelectStmt, Statement, StmtNode};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 
@@ -15,7 +15,17 @@ impl PlanBuilder {
     pub fn build(&self, stmt: &Statement) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
-                let mut plan = if let Some(from) = &select.from
+                let mut plan = if let Some(join) = &select.join {
+                    PhysicalPlan::HashJoin {
+                        tp: map_join_type(join.tp),
+                        left: Box::new(PhysicalPlan::TableReader {
+                            table: join.left.name.clone(),
+                        }),
+                        right: Box::new(PhysicalPlan::TableReader {
+                            table: join.right.name.clone(),
+                        }),
+                    }
+                } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
                     if let Some(handle) = point_get_handle(select.selection.as_ref()) {
@@ -53,6 +63,18 @@ impl PlanBuilder {
                             child: Box::new(plan),
                         };
                     }
+                }
+                if select.join.is_some() && !is_star_select(select) {
+                    let exprs = select
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("col{i}"))
+                        .collect();
+                    plan = PhysicalPlan::Projection {
+                        exprs,
+                        child: Box::new(plan),
+                    };
                 }
                 if needs_hash_agg(select) {
                     plan = match plan {
@@ -107,6 +129,24 @@ impl Default for PlanBuilder {
 
 pub fn stmt_kind(stmt: &Statement) -> &'static str {
     stmt.stmt_type()
+}
+
+fn map_join_type(tp: AstJoinType) -> JoinType {
+    match tp {
+        AstJoinType::Inner => JoinType::Inner,
+        AstJoinType::LeftOuter => JoinType::LeftOuter,
+        AstJoinType::RightOuter => JoinType::RightOuter,
+    }
+}
+
+fn is_star_select(select: &SelectStmt) -> bool {
+    matches!(
+        select.fields.as_slice(),
+        [field] if matches!(
+            &field.expr,
+            ExprNode::Value(ValueExpr { datum: Datum::Bytes(b) }) if b == b"*"
+        )
+    )
 }
 
 fn needs_hash_agg(select: &SelectStmt) -> bool {

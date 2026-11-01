@@ -45,6 +45,18 @@ pub enum PhysicalPlan {
     HashAgg {
         child: Box<PhysicalPlan>,
     },
+    HashJoin {
+        tp: JoinType,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    RightOuter,
 }
 
 impl PhysicalPlan {
@@ -65,6 +77,9 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
+            PhysicalPlan::HashJoin { tp, left, right } => {
+                format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
+            }
         }
     }
 }
