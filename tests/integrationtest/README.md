@@ -64,4 +64,4 @@ cargo test -p sealdb-integrationtest --lib tests::test_all_suites_tikv -- --exac
 
 Do not dump the full TiDB `tests/integrationtest/t` tree: most suites use protocol/stats/features SealDB has not ported.
 
-Table-scan column prune is not wrapped yet: `SELECT id FROM t` still emits every column. Prefer `SELECT *` (or Dual `SELECT 1 AS n`) until that leftover lands. Goldens must match current I/O, not hoped-for I/O.
+Goldens must match current I/O, not hoped-for I/O. Table-scan Projection is in: `SELECT id AS i FROM t` emits one column.

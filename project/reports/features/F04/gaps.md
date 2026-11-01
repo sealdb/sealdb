@@ -2,7 +2,6 @@
 
 These stay out of the core-ported door. Pick them up in the completeness wave.
 
-- Predicate pushdown / ColumnPrune RBO rules
+- Predicate pushdown / ColumnPrune RBO rules (output Projection is wrapped; filters still run above TableReader)
 - Qualified column resolution across joins
-- Selection over projected column lists other than `SELECT *`
 - Coprocessor-side filter
