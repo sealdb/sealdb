@@ -5,7 +5,7 @@
       "status": "partial",
       "rust": "cmd/tidb-server/main.rs",
       "phase": 2,
-      "notes": "CLI --parse/--execute; no MySQL protocol yet"
+      "notes": "CLI --parse/--execute/--listen MySQL protocol"
     },
     "pkg/errno/errcode.go": {
       "status": "partial",
@@ -258,6 +258,24 @@
       "status": "partial",
       "phase": 3,
       "notes": "in-memory schema snapshot"
+    },
+    "pkg/server/server.go": {
+      "status": "partial",
+      "rust": "pkg/server/server.rs",
+      "phase": 9,
+      "notes": "TCP listen/accept; TLS and status HTTP deferred"
+    },
+    "pkg/server/conn.go": {
+      "status": "partial",
+      "rust": "pkg/server/conn.rs",
+      "phase": 9,
+      "notes": "handshake + COM_QUERY/PING/INIT_DB/QUIT; prepared/SSL deferred"
+    },
+    "pkg/server/internal/packetio.go": {
+      "status": "partial",
+      "rust": "pkg/server/internal/packetio.rs",
+      "phase": 9,
+      "notes": "uncompressed MySQL packet read/write"
     },
     "pkg/ddl/ddl.go": {
       "status": "partial",

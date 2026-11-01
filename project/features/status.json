@@ -27,7 +27,7 @@
     "F19": {"status": "core-ported", "phase": 8, "notes": "RANGE/HASH PARTITION BY + physical-id locate/prune", "gaps": ["list-key", "range-columns", "expr-keys", "add-drop-partition", "subpartition", "dynamic-prune"]},
     "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + SkipGrantTables default and in-memory checks", "gaps": ["roles", "with-grant-option", "mysql-user-persist", "column-grants", "dynamic-privs", "create-user"]},
     "F21": {"status": "core-ported", "phase": 7, "notes": "ANALYZE TABLE count/NDV + IndexLookUp vs TableReader CBO", "gaps": ["histogram", "topn", "auto-analyze", "analyze-index", "persist-stats", "join-cost"]},
-    "F22": {"status": "not-started", "phase": 9, "gaps": []},
+    "F22": {"status": "core-ported", "phase": 9, "notes": "MySQL handshake + COM_QUERY/COM_PING/COM_INIT_DB/COM_QUIT", "gaps": ["ssl", "compression", "prepared-stmt", "auth-plugin", "binary-protocol", "multi-resultset"]},
     "C1": {"status": "in-progress", "phase": 10, "notes": "leftover inventory script ready"},
     "C2": {"status": "not-started", "phase": 10, "gaps": []},
     "C3": {"status": "not-started", "phase": 10, "gaps": []},

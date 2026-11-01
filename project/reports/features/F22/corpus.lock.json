@@ -1,0 +1,20 @@
+{
+  "feature": "F22",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/server/conn.go",
+    "TiDB pkg/server/server.go",
+    "TiDB pkg/server/internal/packetio.go"
+  ],
+  "cases": [
+    "handshake + mysql_native_password skip-auth",
+    "COM_QUERY SELECT 1",
+    "COM_QUERY CREATE/INSERT/SELECT",
+    "COM_QUERY unknown table -> ERR",
+    "COM_PING",
+    "COM_QUIT",
+    "COM_INIT_DB",
+    "COM_STMT_PREPARE",
+    "COM_STMT_EXECUTE"
+  ]
+}
