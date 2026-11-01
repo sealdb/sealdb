@@ -6,6 +6,7 @@ use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity};
+use sealdb_parser::charset::Collation;
 use sealdb_planner::{PhysicalPlan, PlanBuilder};
 use sealdb_sessiontxn::TxnManager;
 use std::collections::HashMap;
@@ -22,6 +23,8 @@ pub struct Session {
     prepared: Mutex<HashMap<String, String>>,
     plan_cache: Mutex<HashMap<String, (i64, PhysicalPlan)>>,
     cache_plans: Mutex<bool>,
+    collation: Mutex<Collation>,
+    sql_mode: Mutex<String>,
 }
 
 impl Session {
@@ -41,6 +44,8 @@ impl Session {
             prepared: Mutex::new(HashMap::new()),
             plan_cache: Mutex::new(HashMap::new()),
             cache_plans: Mutex::new(false),
+            collation: Mutex::new(Collation::bin()),
+            sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
         }
     }
 
@@ -101,6 +106,10 @@ impl Session {
                 }
                 *self.current_db.lock().expect("session current_db lock") =
                     use_stmt.db_name.clone();
+                return Ok(empty_result());
+            }
+            Statement::Set(set) => {
+                apply_set(self, set)?;
                 return Ok(empty_result());
             }
             Statement::SetTxn(set) => {
@@ -231,8 +240,12 @@ impl Session {
             .lock()
             .expect("session txn lock")
             .ensure(self.domain.as_ref())?;
+        if let Some(result) = system_var_result(self, stmt) {
+            return Ok(result);
+        }
         let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?;
-        let result = ExecutorBuilder::run(exec);
+        let ci = self.collation.lock().expect("session collation lock").ci;
+        let result = sealdb_expression::with_collation_ci(ci, || ExecutorBuilder::run(exec));
         self.txn
             .lock()
             .expect("session txn lock")
@@ -404,6 +417,86 @@ fn empty_result() -> QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
     }
+}
+
+fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
+    for a in &stmt.assignments {
+        let name = a.name.trim_start_matches('@').to_ascii_lowercase();
+        let value = a.value.trim_matches(|c| c == '\'' || c == '"').to_string();
+        match name.as_str() {
+            "names"
+            | "character_set_client"
+            | "character_set_connection"
+            | "character_set_results" => {
+                let mut collation = session.collation.lock().expect("session collation lock");
+                collation.charset = value.to_ascii_lowercase();
+                if collation.name == "utf8mb4_bin" && collation.charset != "utf8mb4" {
+                    collation.name = format!("{}_bin", collation.charset);
+                }
+            }
+            "collation_connection" | "collation_database" => {
+                *session.collation.lock().expect("session collation lock") =
+                    Collation::parse(&value);
+            }
+            "sql_mode" => {
+                *session.sql_mode.lock().expect("session sql_mode lock") = value;
+            }
+            "autocommit" | "unique_checks" | "foreign_key_checks" => {}
+            other => {
+                return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult> {
+    let Statement::Select(select) = stmt else {
+        return None;
+    };
+    if select.from.is_some() || select.join.is_some() {
+        return None;
+    }
+    let mut columns = Vec::new();
+    let mut row = Vec::new();
+    for field in &select.fields {
+        let ExprNode::Column(col) = &field.expr else {
+            return None;
+        };
+        let name = col.name.trim_start_matches('@').to_ascii_lowercase();
+        let value = match name.as_str() {
+            "sql_mode" => session
+                .sql_mode
+                .lock()
+                .expect("session sql_mode lock")
+                .clone(),
+            "collation_connection" => session
+                .collation
+                .lock()
+                .expect("session collation lock")
+                .name
+                .clone(),
+            "character_set_client"
+            | "character_set_connection"
+            | "character_set_results"
+            | "character_set_database" => session
+                .collation
+                .lock()
+                .expect("session collation lock")
+                .charset
+                .clone(),
+            _ => return None,
+        };
+        columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
+        row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(QueryResult {
+        columns,
+        rows: vec![row],
+    })
 }
 
 fn restore_sql(stmt: &Statement) -> String {
@@ -981,6 +1074,34 @@ mod tests {
         session.execute_stmt("DEALLOCATE PREPARE s").unwrap();
         let err = session.execute_stmt("EXECUTE s USING 1").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_UNKNOWN_STMT_HANDLER);
+    }
+
+    #[test]
+    fn test_set_names_and_ci_collation() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'A')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")
+            .unwrap();
+        let vars = session
+            .execute_stmt("SELECT @@collation_connection, @@sql_mode")
+            .unwrap();
+        assert!(vars.display_rows()[0][0].contains("general_ci"));
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(rows.display_rows().len(), 1);
+        session
+            .execute_stmt("SET collation_connection = utf8mb4_bin")
+            .unwrap();
+        let miss = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert!(miss.display_rows().is_empty());
     }
 
     #[test]

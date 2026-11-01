@@ -403,6 +403,7 @@ dependencies = [
  "sealdb-domain",
  "sealdb-errno",
  "sealdb-executor",
+ "sealdb-expression",
  "sealdb-infoschema",
  "sealdb-kv",
  "sealdb-parser",

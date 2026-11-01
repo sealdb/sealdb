@@ -66,7 +66,7 @@
 | C2 | `core-ported` | `project/reports/features/C2/` |
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
-| C5 | `not-started` | — |
+| C5 | `core-ported` | `project/reports/features/C5/` |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
 ---
@@ -107,6 +107,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: C5 SET / SQL Mode / collation
+- **完成**:
+  - `SET NAMES` / `sql_mode` / `collation_connection` 会话变量
+  - `SELECT @@collation_connection` / `@@sql_mode`
+  - `*_ci` 校对下 ASCII 大小写不敏感比较
+- **验证**:
+  - `./project/scripts/feature_gate.sh C5`
+- **下一步**:
+  - C6 保持 deferred
 
 ### 2026-11-01
 

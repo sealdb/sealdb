@@ -384,3 +384,29 @@ impl DeallocateStmt {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct SetAssignment {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SetStmt {
+    pub assignments: Vec<SetAssignment>,
+}
+
+impl SetStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET ");
+        for (i, a) in self.assignments.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            ctx.write_str(&a.name);
+            ctx.write_str(" = ");
+            ctx.write_str(&a.value);
+        }
+        Ok(())
+    }
+}

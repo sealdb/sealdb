@@ -24,5 +24,6 @@ pub use expressions::{
 pub use misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
     GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, RevokeStmt,
-    RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    RollbackStmt, SetAssignment, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
+    UserIdentity,
 };

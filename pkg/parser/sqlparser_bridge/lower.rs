@@ -15,7 +15,8 @@ use crate::ast::expressions::{
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
     GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, RevokeStmt,
-    RollbackStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    RollbackStmt, SetAssignment, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
+    UserIdentity,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -276,16 +277,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 isolation: isolation_from_modes(modes)?,
             }))
         }
-        SqlStatement::Set(Set::SetTransaction {
-            modes, snapshot, ..
-        }) => {
-            if snapshot.is_some() {
-                return Err(Error::unsupported("SET TRANSACTION SNAPSHOT"));
-            }
-            Ok(Statement::SetTxn(SetTxnStmt {
-                isolation: isolation_from_modes(modes)?,
-            }))
-        }
+        SqlStatement::Set(set) => lower_set(set),
         SqlStatement::Commit {
             chain, modifier, ..
         } => {
@@ -730,6 +722,63 @@ fn take_ident(bytes: &[u8], i: usize) -> (String, usize) {
         j += 1;
     }
     (String::from_utf8_lossy(&bytes[i..j]).into_owned(), j)
+}
+
+fn lower_set(set: &Set) -> Result<Statement> {
+    match set {
+        Set::SetTransaction {
+            modes, snapshot, ..
+        } => {
+            if snapshot.is_some() {
+                return Err(Error::unsupported("SET TRANSACTION SNAPSHOT"));
+            }
+            Ok(Statement::SetTxn(SetTxnStmt {
+                isolation: isolation_from_modes(modes)?,
+            }))
+        }
+        Set::SetNames {
+            charset_name,
+            collation_name,
+        } => {
+            let mut assignments = vec![SetAssignment {
+                name: "names".to_string(),
+                value: charset_name.value.clone(),
+            }];
+            if let Some(collation) = collation_name {
+                assignments.push(SetAssignment {
+                    name: "collation_connection".to_string(),
+                    value: collation.clone(),
+                });
+            }
+            Ok(Statement::Set(SetStmt { assignments }))
+        }
+        Set::SetNamesDefault {} => Ok(Statement::Set(SetStmt {
+            assignments: vec![SetAssignment {
+                name: "names".to_string(),
+                value: "utf8mb4".to_string(),
+            }],
+        })),
+        Set::SingleAssignment {
+            variable, values, ..
+        } => Ok(Statement::Set(SetStmt {
+            assignments: vec![SetAssignment {
+                name: object_name_last(variable)?,
+                value: values.first().map(|v| v.to_string()).unwrap_or_default(),
+            }],
+        })),
+        Set::MultipleAssignments { assignments } => Ok(Statement::Set(SetStmt {
+            assignments: assignments
+                .iter()
+                .map(|a| {
+                    Ok(SetAssignment {
+                        name: object_name_last(&a.name)?,
+                        value: a.value.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })),
+        other => Err(Error::unsupported(format!("SET {other}"))),
+    }
 }
 
 fn isolation_from_modes(modes: &[TransactionMode]) -> Result<IsolationLevel> {

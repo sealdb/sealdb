@@ -12,6 +12,7 @@ path = "lib.rs"
 sealdb-domain.workspace = true
 sealdb-errno.workspace = true
 sealdb-executor.workspace = true
+sealdb-expression.workspace = true
 sealdb-infoschema.workspace = true
 sealdb-kv.workspace = true
 sealdb-parser.workspace = true

@@ -1,0 +1,17 @@
+{
+  "feature": "C5",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/sessionctx/variable",
+    "TiDB tests/integrationtest/t/collation_misc.test"
+  ],
+  "cases": [
+    "set-names-utf8mb4",
+    "set-collation-general-ci",
+    "select-collation-connection",
+    "select-sql-mode",
+    "ci-equality-match",
+    "bin-equality-miss",
+    "set-unknown-unsupported"
+  ]
+}
