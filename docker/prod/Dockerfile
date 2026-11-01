@@ -1,6 +1,6 @@
 # 生产环境 Dockerfile
 # 使用官方 Rust 镜像作为构建阶段
-FROM rust:1.75-slim as builder
+FROM rust:1.99.1-slim AS builder
 
 # 安装系统依赖
 RUN apt-get update && apt-get install -y \
@@ -35,7 +35,7 @@ RUN useradd -r -s /bin/false sealdb
 WORKDIR /app
 
 # 从构建阶段复制二进制文件
-COPY --from=builder /app/target/release/sealdb /app/sealdb
+COPY --from=builder /app/target/release/sealdb-server /app/sealdb-server
 
 # 创建必要的目录
 RUN mkdir -p /app/logs /app/data && \
@@ -53,7 +53,7 @@ ENV SEALDB_CONFIG=/app/config.toml
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/sealdb", "--health-check"] || exit 1
+    CMD ["/app/sealdb-server", "--help"] || exit 1
 
 # 启动命令
-CMD ["/app/sealdb"] 
+CMD ["/app/sealdb-server"] 

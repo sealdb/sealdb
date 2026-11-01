@@ -2,10 +2,190 @@
   "baseline": "v8.5.8",
   "files": {
     "cmd/tidb-server/main.go": {
-      "status": "stub",
+      "status": "partial",
       "rust": "cmd/tidb-server/main.rs",
       "phase": 2,
-      "notes": "process entry skeleton; CLI only"
+      "notes": "CLI --parse/--execute; no MySQL protocol yet"
+    },
+    "pkg/errno/errcode.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "core compute-layer codes"
+    },
+    "pkg/errno/errname.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "name/sqlstate for ported codes"
+    },
+    "pkg/types/datum.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "Null/int/uint/float/bytes/decimal/time"
+    },
+    "pkg/types/field_type.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "EvalType + common MySQL type codes"
+    },
+    "pkg/types/mydecimal.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "string/int shaped decimal; ToBin later"
+    },
+    "pkg/types/time.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "packed u64 roundtrip"
+    },
+    "pkg/util/codec/bytes.go": {
+      "status": "ported",
+      "phase": 1,
+      "notes": "memcomparable bytes vectors"
+    },
+    "pkg/util/codec/number.go": {
+      "status": "ported",
+      "phase": 1,
+      "notes": "int/uint/varint"
+    },
+    "pkg/util/codec/float.go": {
+      "status": "ported",
+      "phase": 1,
+      "notes": "float memcomparable"
+    },
+    "pkg/util/chunk/chunk.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "row-oriented first cut"
+    },
+    "pkg/util/chunk/column.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "datum column"
+    },
+    "pkg/kv/key.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "Key + IntHandle"
+    },
+    "pkg/kv/kv.go": {
+      "status": "stub",
+      "phase": 1,
+      "notes": "Storage/Transaction traits only"
+    },
+    "pkg/tablecodec/tablecodec.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "row/index key layout"
+    },
+    "pkg/parser/parser.go": {
+      "status": "reimplemented",
+      "phase": 2,
+      "notes": "sqlparser-rs public API"
+    },
+    "pkg/parser/ast/ast.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "Statement/Node"
+    },
+    "pkg/parser/ast/base.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "NodeBase"
+    },
+    "pkg/parser/ast/dml.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "SelectStmt core"
+    },
+    "pkg/parser/ast/expressions.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "value/binary/unary/func/cast"
+    },
+    "pkg/parser/format/format.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "RestoreCtx"
+    },
+    "pkg/parser/mysql/const.go": {
+      "status": "partial",
+      "phase": 1,
+      "notes": "charset defaults"
+    },
+    "pkg/parser/opcode/opcode.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "F01 operators"
+    },
+    "pkg/expression/constant.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "constant wrapper"
+    },
+    "pkg/expression/evaluator.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "scalar eval for F01"
+    },
+    "pkg/expression/builtin_arithmetic.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "F01 arith"
+    },
+    "pkg/expression/builtin_compare.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "F01 compare"
+    },
+    "pkg/expression/builtin_op.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "F01 logic"
+    },
+    "pkg/expression/builtin_cast.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "F01 CAST"
+    },
+    "pkg/expression/builtin_control.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "IF/IFNULL"
+    },
+    "pkg/planner/core/planbuilder.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "Build constant SELECT"
+    },
+    "pkg/planner/core/physical_plans.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "TableDual / Projection"
+    },
+    "pkg/executor/builder.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "select builder"
+    },
+    "pkg/executor/select.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "TableDual"
+    },
+    "pkg/executor/projection.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "constant projection"
+    },
+    "pkg/executor/internal/exec/executor.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "Open/Next/Close + QueryResult"
+    },
+    "pkg/session/session.go": {
+      "status": "partial",
+      "phase": 2,
+      "notes": "ExecuteStmt for constant SELECT"
     }
   }
 }

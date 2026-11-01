@@ -37,9 +37,10 @@
 
 - 旧 `src/`、`tests/`、`docs/`、`Cargo.toml`、`Makefile` 已移动到 `legacy-rust-scaffold/`。
 - 新 workspace 已建立：`pkg/` 下按 TiDB 顶层包粒度拆 crate，`cmd/tidb-server` 为入口。
-- `cargo metadata` / `cargo check --workspace` 已通过（Rust 1.99.1）。
-- `tools/oracle` 的 `parse` 模式已可运行（Go 1.25.12 + 本地 TiDB parser）。
-- `project/scripts/parity_check.py` 已可运行；状态来源为 `project/parity/status.json`。
+- `cargo check --workspace` / `cargo test --workspace` / clippy `-D warnings` 通过（Rust 1.99.1）。
+- U0–U3 与 F01 已 `core-ported`：codec 向量、`--parse --ast-json`、`SELECT 1`、算术/比较/逻辑/`CAST`/`IF`。
+- `tools/oracle` 的 `parse` 模式可运行；功能清单在 `project/features.md`。
+- `project/scripts/parity_check.py` 与 `feature_gate.sh` 已可运行。
 
 ---
 
@@ -51,6 +52,7 @@
 | [architecture.md](./architecture.md) | 目标架构、模块划分、目录/文件对齐规则 | 所有人 |
 | [conventions.md](./conventions.md) | 编码、移植、错误处理、日志、提交规范 | 所有编码者 |
 | [roadmap.md](./roadmap.md) | 阶段拆分、依赖、交付物、Gate | 所有人 |
+| [features.md](./features.md) | **功能级 backlog**（日常迭代单位） | 所有人 |
 | [progress.md](./progress.md) | **唯一进度看板** | 每次开工/收工 |
 | [testing.md](./testing.md) | Oracle、一致性、差分、集成测试 | 编码 + QA |
 | [debugging.md](./debugging.md) | 分层排障、EXPLAIN、Trace、故障手册 | 编码 + on-call |
@@ -68,8 +70,8 @@
 1. **上游对齐**：移植前必须读上游实现、调用方与测试；禁止凭记忆重写。来源与状态记录在 `project/parity/status.json`，不写进源码。
 2. **行为优先于形式**：目录/文件名对齐是硬要求，但真正验收靠 Oracle 差分结果，不靠“看起来像”。
 3. **禁止静默空缺**：暂不实现的文件/函数必须在 parity manifest 标 `stub|omitted` 并说明原因；源码中只保留通用 `todo!()`/错误返回，不写来源说明。
-4. **先竖切、再铺开**：每个阶段交付一条可运行的 SQL 竖切链路，禁止“全部类型先写完再联调”。
-5. **Gate 不过不进入下一阶段**：验收证据写入 `progress.md`；没有证据 = 未完成。
+4. **先功能竖切、再完整性波**：一次迭代只交付一条 SQL 能力的核心路径；边角记 `gaps[]`，全部功能 `core-ported` 后再查漏补缺。
+5. **功能 Gate 不过不宣称完成**：`core-ported` 证据写入 `progress.md` 与 `project/reports/features/`；没有证据 = 未完成。基础设施 U0/U1 仍是硬门。
 
 ---
 
@@ -77,7 +79,7 @@
 
 ```text
 README → requirements → architecture → conventions
-      → roadmap → progress
+      → roadmap → features → progress
       → testing ⇄ debugging
       → decisions（按需）
       → skills（开工时）

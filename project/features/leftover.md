@@ -1,0 +1,135 @@
+# Leftover inventory
+
+Baseline features core-ported: F01, U0, U1, U2, U3
+
+## PlanBuilder statement kinds still open
+
+- `ast.AdminStmt` → unmapped
+- `ast.DeallocateStmt` → unmapped
+- `ast.DeleteStmt` → F07
+- `ast.ExecuteStmt` → C4
+- `ast.ExplainStmt` → unmapped
+- `ast.ExplainForStmt` → unmapped
+- `ast.TraceStmt` → unmapped
+- `ast.InsertStmt` → F03
+- `ast.ImportIntoStmt` → unmapped
+- `ast.LoadDataStmt` → unmapped
+- `ast.LoadStatsStmt` → unmapped
+- `ast.LockStatsStmt` → unmapped
+- `ast.UnlockStatsStmt` → unmapped
+- `ast.PlanReplayerStmt` → unmapped
+- `ast.PrepareStmt` → C4
+- `ast.SelectStmt` → F01/F03/F04
+- `ast.SetOprStmt` → F15
+- `ast.UpdateStmt` → F07
+- `ast.ShowStmt` → F11
+- `ast.DoStmt` → unmapped
+- `ast.SetStmt` → unmapped
+- `ast.SetConfigStmt` → unmapped
+- `ast.AnalyzeTableStmt` → F21
+- `ast.BinlogStmt` → unmapped
+- `ast.CreateBindingStmt` → unmapped
+- `ast.DropBindingStmt` → unmapped
+- `ast.SetBindingStmt` → unmapped
+- `ast.ChangeStmt` → unmapped
+- `ast.SplitRegionStmt` → unmapped
+- `ast.DistributeTableStmt` → unmapped
+- `ast.CompactTableStmt` → unmapped
+- `ast.RecommendIndexStmt` → unmapped
+- `ast.FlushStmt` → unmapped
+- `ast.AlterInstanceStmt` → unmapped
+- `ast.RenameUserStmt` → unmapped
+- `ast.GrantStmt` → unmapped
+- `ast.BRIEStmt` → unmapped
+- `ast.CalibrateResourceStmt` → unmapped
+- `ast.AddQueryWatchStmt` → unmapped
+- `ast.DropQueryWatchStmt` → unmapped
+- `ast.GrantRoleStmt` → unmapped
+- `ast.RevokeRoleStmt` → unmapped
+- `ast.RevokeStmt` → unmapped
+- `ast.KillStmt` → unmapped
+- `ast.UseStmt` → unmapped
+- `ast.DropUserStmt` → unmapped
+- `ast.SetPwdStmt` → unmapped
+- `ast.ShutdownStmt` → unmapped
+- `ast.BeginStmt` → unmapped
+- `ast.SetResourceGroupStmt` → unmapped
+- `ast.SelectStmt` → F01/F03/F04
+- `ast.AlterDatabaseStmt` → unmapped
+- `ast.AlterTableStmt` → F18
+- `ast.AlterSequenceStmt` → unmapped
+- `ast.CreateDatabaseStmt` → unmapped
+- `ast.CreateIndexStmt` → F18
+- `ast.CreateTableStmt` → F02
+- `ast.CreateViewStmt` → unmapped
+- `ast.CreateSequenceStmt` → unmapped
+- `ast.DropDatabaseStmt` → unmapped
+- `ast.DropIndexStmt` → unmapped
+- `ast.DropTableStmt` → F02
+- `ast.DropSequenceStmt` → unmapped
+- `ast.TruncateTableStmt` → unmapped
+- `ast.RenameTableStmt` → unmapped
+- `ast.RecoverTableStmt` → unmapped
+- `ast.FlashBackTableStmt` → unmapped
+- `ast.FlashBackDatabaseStmt` → unmapped
+- `ast.FlashBackToTimestampStmt` → unmapped
+- `ast.LockTablesStmt` → unmapped
+- `ast.CleanupTableLockStmt` → unmapped
+- `ast.RepairTableStmt` → unmapped
+- `ast.DropPlacementPolicyStmt` → unmapped
+- `ast.CreateResourceGroupStmt` → unmapped
+- `ast.OptimizeTableStmt` → unmapped
+- `ast.CreateViewStmt` → unmapped
+- `ast.SetOprStmt` → F15
+- `ast.SelectStmt` → F01/F03/F04
+
+## integrationtest suites
+
+- `access_path_selection`
+- `agg_predicate_pushdown`
+- `black_list`
+- `clustered_index`
+- `collation_agg_func`
+- `collation_check_use_collation`
+- `collation_misc`
+- `collation_pointget`
+- `common_collation`
+- `cte`
+- `db_integration`
+- `explain`
+- `explain-non-select-stmt`
+- `explain_complex`
+- `explain_complex_stats`
+- `explain_cte`
+- `explain_easy`
+- `explain_easy_stats`
+- `explain_foreign_key`
+- `explain_generate_column_substitute`
+- `explain_indexmerge_stats`
+- `explain_join_stats`
+- `explain_shard_index`
+- `explain_stats`
+- `explain_union_scan`
+- `generated_columns`
+- `imdbload`
+- `index_join`
+- `index_merge`
+- `naaj`
+- `new_character_set`
+- `new_character_set_builtin`
+- `new_character_set_invalid`
+- `null_rejected`
+- `partition`
+- `select`
+- `show`
+- `subquery`
+- `topn_push_down`
+- `topn_pushdown`
+- `tpch`
+- `window_function`
+
+## Completeness wave notes
+
+- C1 uses this file as the starting leftover denominator.
+- Do not claim pass rates until a corpus.lock.json freezes the selected leftover subset.
+- Cross-cluster checks (TiDB write / SealDB read and reverse) start after F03.

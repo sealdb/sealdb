@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TIDB_ROOT="${TIDB_ROOT:-/home/wslu/work/github/db/pingcap/tidb}"
 PHASE="${1:-}"
+if [[ "${1:-}" == "--feature" ]]; then
+  exec "$ROOT/project/scripts/feature_gate.sh" "${2:-}"
+fi
 REPORT_DIR="$ROOT/project/reports/phase-${PHASE}"
 
 usage() {

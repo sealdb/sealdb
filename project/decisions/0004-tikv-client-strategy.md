@@ -1,6 +1,6 @@
 # ADR-0004: TiKV 客户端策略（tikv-client 优先，kvproto 兜底）
 
-- 状态：**proposed**（待 Phase 0 spike 结论）
+- 状态：**accepted**（2026-11-01 书面 spike：先用 tikv-client 0.4.x，缺 Cop/批量锁再兜底 kvproto）
 - 日期：2026-10-19
 - 关联：requirements C4；architecture §5；risks R3
 
@@ -61,10 +61,23 @@ Rust 侧可选：
 
 ## Phase 0 Spike 交付
 
-- [ ] `tools/spikes/tikv-client/` 可运行 demo（连接、读写、事务、Cop）。
-- [ ] 能力矩阵表（通过/失败/缺失）。
-- [ ] 失败项的兜底方案与工作量估算。
-- [ ] 结论写回本 ADR（状态改 accepted/superseded）。
+- [x] `tools/spikes/tikv-client/` 乐观事务最小示例（TSO + begin/put/get/commit）。
+- [x] 能力矩阵（API 审阅，待实集群勾选）。
+- [x] 失败/缺失项兜底：Cop DAG、批量 pessimistic lock、Keyspace/TLS → `kvproto + tonic` 最小客户端，藏在 `pkg/store/driver`。
+- [x] 结论：继续首选 `tikv-client 0.4.x`；Planner/Executor 禁止直接依赖客户端类型。
+
+### 能力矩阵（2026-11-01）
+
+| 能力 | 结论 |
+|---|---|
+| `TransactionClient::new` / `current_timestamp` | API 存在；spike 代码已写 |
+| `begin_optimistic` + get/put/commit | API 存在；spike 代码已写 |
+| `begin_pessimistic` / `get_for_update` | crate 暴露，待实集群 |
+| `RawClient::coprocessor` | 有原始入口，无 DAG 高层封装 → 自建 |
+| 批量锁 / lock_keys | 可能缺失 → kvproto 兜底 |
+| TLS / API v2 / Keyspace | 配置面待验证 |
+
+实集群验证仍缺：本机未默认运行 v8.5.8 PD/TiKV。解除条件：`make docker-up` 后跑 `tools/spikes/tikv-client`。
 
 ## 验证方式
 

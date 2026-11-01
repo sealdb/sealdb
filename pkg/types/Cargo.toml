@@ -7,3 +7,9 @@ license.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[dependencies]
+sealdb-errno.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

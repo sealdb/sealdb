@@ -179,7 +179,13 @@ pub fn assert_error_equal(expected: &SqlError, actual: &SqlError);
 | `ddl-basic` | CREATE/ALTER/DROP/索引 | Phase 8 |
 | `protocol` | 握手/查询/结果集 | Phase 9 |
 
-> 每个 Stage 的分母在 `project/reports/phase-XX/corpus.lock.json` 冻结，避免“通过率”被动态稀释。
+> 功能波的分母冻结在 `project/reports/features/<ID>/corpus.lock.json`。  
+> 阶段 Gate 改为“该阶段声明的功能全部 `core-ported`”，不再用未冻结的全量 testdata 稀释通过率。  
+> 完整性波再用 TiDB leftover testdata / `tidb-test` 作为新分母，见 `project/scripts/leftover_inventory.py`。
+
+```bash
+./project/scripts/feature_gate.sh F01
+```
 
 ---
 
@@ -214,7 +220,7 @@ pub fn assert_error_equal(expected: &SqlError, actual: &SqlError);
 # docker/test/docker-compose.yml（Phase 0 固定版本）
 services:
   pd:
-    image: pingcap/pd:v8.5.0
+    image: pingcap/pd:v8.5.8
   tikv:
     image: pingcap/tikv:v8.5.0
   # 可选：tidb 作为 Oracle

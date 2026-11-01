@@ -13,9 +13,11 @@ reports/
 └── ...
 ```
 
+功能 Gate 报告放在 `reports/features/<ID>/`，含 `corpus.lock.json` 与 `gaps.md`。
+
 规则：
 
-- 每个阶段 Gate 必须生成 `summary.md` 与机器可读 JSON。
+- 每个阶段 / 功能 Gate 必须生成 `summary.md` 与机器可读 JSON。
 - 报告中的环境版本（Rust/PD/TiKV/TiDB）必须写清楚。
 - 失败报告也要保留，便于追溯。
 - 不要把密钥、连接串、用户数据写入报告。

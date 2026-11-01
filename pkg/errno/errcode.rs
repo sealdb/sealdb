@@ -1,0 +1,16 @@
+pub const ERR_PARSE_ERROR: i32 = 1064;
+pub const ERR_UNKNOWN_TABLE: i32 = 1109;
+pub const ERR_NO_SUCH_TABLE: i32 = 1146;
+pub const ERR_UNKNOWN_ERROR: i32 = 1105;
+pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
+pub const ERR_BAD_NULL: i32 = 1048;
+pub const ERR_DUP_ENTRY: i32 = 1062;
+pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
+pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
+pub const ERR_UNKNOWN_FUNCTION: i32 = 1305;
+pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
+pub const ERR_UNSUPPORTED: i32 = 1235;
+pub const ERR_DIVISION_BY_ZERO: i32 = 1365;
+pub const ERR_INVALID_KEY: i32 = 6100;
+pub const ERR_INVALID_RECORD_KEY: i32 = 6101;
+pub const ERR_INVALID_INDEX_KEY: i32 = 6102;

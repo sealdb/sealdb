@@ -1,8 +1,22 @@
 # 路线图与阶段 Gate（Roadmap）
 
-> 原则：**每个阶段交付一条可运行的 SQL 竖切链路**；Gate 未通过不得进入下一阶段。  
-> 工期为“1 名熟悉 TiDB 的资深工程师”的相对估算；多人可并行压缩。  
-> 进度看板见 [progress.md](./progress.md)。
+> 原则：**日常单位是功能，不是包。** Phase 只表达依赖与基础设施硬门；功能出门标准是 `core-ported`，边角留给完整性波。  
+> 功能清单见 [features.md](./features.md)。进度看板见 [progress.md](./progress.md)。  
+> 工期为“1 名熟悉 TiDB 的资深工程师”的相对估算；多人可并行压缩。
+
+### 功能波如何对应 Phase
+
+| Phase | 何时算过 |
+|---|---|
+| 0 / 1 | U0 / U1 硬门通过 |
+| 2 | U2 / U3 / F01 `core-ported`（不再要求 parser 60%） |
+| 3 | F02 + F11 读 Schema 部分 `core-ported` |
+| 4 / 5 | F03–F10 `core-ported` |
+| 6 | F12 / F13 `core-ported` |
+| 7 | F21 `core-ported` |
+| 8 | F14–F20 `core-ported` |
+| 9 | F22 `core-ported`（F03 之后可并行） |
+| 10 | 完整性波 C1–C5；C6 保持 deferred |
 
 ---
 

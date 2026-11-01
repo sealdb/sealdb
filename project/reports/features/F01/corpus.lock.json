@@ -1,0 +1,23 @@
+{
+  "feature": "F01",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/expression/builtin_arithmetic.go",
+    "TiDB pkg/expression/builtin_compare.go",
+    "TiDB pkg/expression/builtin_op.go",
+    "TiDB pkg/expression/builtin_cast.go",
+    "TiDB pkg/expression/builtin_control.go"
+  ],
+  "cases": [
+    "SELECT 1",
+    "SELECT 1 + 2",
+    "SELECT 6 / 2",
+    "SELECT 1 = 1",
+    "SELECT 1 < 2",
+    "SELECT 1 AND 0",
+    "SELECT 0 OR 1",
+    "SELECT CAST(1 AS CHAR)",
+    "SELECT IF(1, 10, 20)",
+    "SELECT IFNULL(NULL, 7)"
+  ]
+}

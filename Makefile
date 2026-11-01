@@ -1,7 +1,8 @@
 SHELL := /bin/bash
-TIDB_ROOT ?= /home/wslu/work/github/db/pingcap/tidb
+TIDB_ROOT ?= $(shell if [ -d /Users/wslu/work/github/db/pingcap/tidb ]; then echo /Users/wslu/work/github/db/pingcap/tidb; else echo /home/wslu/work/github/db/pingcap/tidb; fi)
+CARGO ?= $(HOME)/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/cargo
 
-.PHONY: help check build test fmt clippy parity oracle clean docker-up docker-down
+.PHONY: help check build test fmt clippy parity oracle clean docker-up docker-down feature-gate leftover
 
 help:
 	@echo "check     cargo check --workspace"
@@ -16,19 +17,25 @@ help:
 	@echo "docker-down stop local cluster"
 
 check:
-	cargo check --workspace
+	$(CARGO) check --workspace
 
 build:
-	cargo build --workspace
+	$(CARGO) build --workspace
 
 test:
-	cargo test --workspace
+	$(CARGO) test --workspace
 
 fmt:
-	cargo fmt --all --check
+	$(CARGO) fmt --all --check
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
+
+feature-gate:
+	./project/scripts/feature_gate.sh $(FEATURE)
+
+leftover:
+	python3 project/scripts/leftover_inventory.py --tidb-root "$(TIDB_ROOT)" --rust-root . --out project/features/leftover.md
 
 parity:
 	python3 project/scripts/parity_check.py --tidb-root "$(TIDB_ROOT)" --rust-root . --strict

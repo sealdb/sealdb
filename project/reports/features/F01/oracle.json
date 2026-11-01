@@ -1,0 +1,63 @@
+{
+  "suite": "testdata/F01",
+  "cases": [
+    {
+      "name": "select_const.sql",
+      "result": {
+        "sql": "SELECT 1;\nSELECT 1 + 2;\nSELECT 6 / 2;\nSELECT 1 = 1;\nSELECT 1 \u003c 2;\nSELECT 1 AND 0;\nSELECT 0 OR 1;\nSELECT CAST(1 AS CHAR);\nSELECT IF(1, 10, 20);\nSELECT IFNULL(NULL, 7);\n",
+        "statements": [
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1",
+            "text": "SELECT 1;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1+2",
+            "text": "SELECT 1 + 2;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 6/2",
+            "text": "SELECT 6 / 2;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1=1",
+            "text": "SELECT 1 = 1;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1\u003c2",
+            "text": "SELECT 1 \u003c 2;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 1 AND 0",
+            "text": "SELECT 1 AND 0;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT 0 OR 1",
+            "text": "SELECT 0 OR 1;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT CAST(1 AS CHAR)",
+            "text": "SELECT CAST(1 AS CHAR);"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT IF(1, 10, 20)",
+            "text": "SELECT IF(1, 10, 20);"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT IFNULL(NULL, 7)",
+            "text": "SELECT IFNULL(NULL, 7);"
+          }
+        ]
+      }
+    }
+  ]
+}

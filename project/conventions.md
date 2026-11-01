@@ -109,6 +109,8 @@ pub fn analyze_table() -> Result<()> {
 
 ## 4. 目录/文件对齐规范
 
+功能切分只决定**先实现哪条 SQL 能力**，不决定文件放哪里。类型、函数、文件仍落到 TiDB 的对应路径；一次功能迭代可以同时改 parser / planner / executor 里该功能用到的那些 `.go` 同名文件。
+
 | 场景 | 做法 |
 |---|---|
 | 新增 TiDB 文件 | 先建同名 `.rs`（即使 `omitted`），再逐步实现 |
@@ -118,6 +120,10 @@ pub fn analyze_table() -> Result<()> {
 | 拆分文件 | 不允许新增 TiDB 树内文件；桥接代码放 `sqlparser_bridge/` 或 `tools/` |
 | 测试文件 | 默认内联；独立文件用 `foo_test.rs` 并在 `mod.rs` 声明 |
 | 生成文件 | 用 `reimplemented` + 说明生成方式；禁止提交无法维护的巨型生成代码 |
+| 功能竖切 | 代码仍写入上游同名文件；禁止为了“功能包好看”另起目录或改文件名 |
+| Rust 强制例外 | 仅当上游命名/结构违反 Rust 硬约束（关键字、模块系统）时才调整；先记偏差再改，不静默改名 |
+
+`pkg/parser/ast/ast.go` → `pkg/parser/ast/ast.rs` 这类“目录名=文件名”保持 1:1。因此产生的 `ast::ast` 模块路径用 `#![allow(clippy::module_inception)]`，不要把内容合并进 `mod.rs` 来“更 Rust”。
 
 ---
 

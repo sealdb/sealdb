@@ -37,3 +37,39 @@ license = "Apache-2.0"
 authors = ["SealDB Authors"]
 
 [workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = "0.63"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+sealdb-bindinfo = { path = "pkg/bindinfo" }
+sealdb-config = { path = "pkg/config" }
+sealdb-ddl = { path = "pkg/ddl" }
+sealdb-distsql = { path = "pkg/distsql" }
+sealdb-domain = { path = "pkg/domain" }
+sealdb-errno = { path = "pkg/errno" }
+sealdb-executor = { path = "pkg/executor" }
+sealdb-expression = { path = "pkg/expression" }
+sealdb-infoschema = { path = "pkg/infoschema" }
+sealdb-kv = { path = "pkg/kv" }
+sealdb-meta = { path = "pkg/meta" }
+sealdb-parser = { path = "pkg/parser" }
+sealdb-planner = { path = "pkg/planner" }
+sealdb-privilege = { path = "pkg/privilege" }
+sealdb-server = { path = "pkg/server" }
+sealdb-session = { path = "pkg/session" }
+sealdb-sessionctx = { path = "pkg/sessionctx" }
+sealdb-sessiontxn = { path = "pkg/sessiontxn" }
+sealdb-statistics = { path = "pkg/statistics" }
+sealdb-store = { path = "pkg/store" }
+sealdb-table = { path = "pkg/table" }
+sealdb-tablecodec = { path = "pkg/tablecodec" }
+sealdb-types = { path = "pkg/types" }
+sealdb-util = { path = "pkg/util" }

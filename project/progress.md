@@ -1,7 +1,8 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-10-19
+> 最后更新：2026-11-01  
+> 功能级状态：[features/status.json](./features/status.json)
 
 ---
 
@@ -22,23 +23,34 @@
 
 | Phase | 名称 | 状态 | 开始 | 完成 | Gate 证据 | 备注 |
 |---|---|---|---|---|---|---|
-| 0 | 地基与规范 | `in-progress` | 2026-10-19 | — | 见 §4 | workspace/oracle/parity 已就绪；待 TiKV spike/CI |
-| 1 | 核心类型与编码 | `not-started` | — | — | — | 依赖 Phase 0 |
-| 2 | 解析器 + Mock 链路 | `not-started` | — | — | — | 依赖 Phase 1 |
-| 3 | 元数据与 Bootstrap | `not-started` | — | — | — | 依赖 Phase 2 |
-| 4 | Planner v1（RBO） | `not-started` | — | — | — | 依赖 Phase 3（可用 Mock InfoSchema 并行） |
-| 5 | Executor v1 | `not-started` | — | — | — | 依赖 Phase 4 |
-| 6 | 事务与 Session | `not-started` | — | — | — | 可与 Phase 5 并行 |
-| 7 | CBO 与统计 | `not-started` | — | — | — | 依赖 Phase 5/6 |
-| 8 | DDL 与高级 SQL | `not-started` | — | — | — | 依赖 Phase 6/7 |
-| 9 | MySQL 协议与运维 | `not-started` | — | — | — | 可提前做只读协议 |
-| 10 | 可选高级能力 | `deferred` | — | — | — | 不阻塞主线 |
+| 0 | 地基与规范 | `done` | 2026-10-19 | 2026-11-01 | U0 | workspace/CI/parity/spike 书面结论 |
+| 1 | 核心类型与编码 | `done` | 2026-11-01 | 2026-11-01 | U1 | int/uint/float/bytes + row/index key；Decimal/Time 核心路径 |
+| 2 | 解析器 + Mock 链路 | `in-progress` | 2026-11-01 | — | U2/U3/F01 | `SELECT 1` 与 F01 表达式已通；parser 全量 60% 留完整性波 |
+| 3 | 元数据与 Bootstrap | `not-started` | — | — | F02/F11 | 依赖功能波 |
+| 4 | Planner v1（RBO） | `not-started` | — | — | F03–F10 | 规则随功能走 |
+| 5 | Executor v1 | `not-started` | — | — | F03–F10 | Dual/Projection 已作为 U3 骨架 |
+| 6 | 事务与 Session | `not-started` | — | — | F12/F13 | 可与 Phase 5 并行 |
+| 7 | CBO 与统计 | `not-started` | — | — | F21 | 依赖 Phase 5/6 |
+| 8 | DDL 与高级 SQL | `not-started` | — | — | F14–F20 | 依赖 Phase 6/7 |
+| 9 | MySQL 协议与运维 | `not-started` | — | — | F22 | 可提前做只读协议 |
+| 10 | 可选高级能力 | `deferred` | — | — | C6 | 完整性波不阻塞主线 |
+
+### 2.1 功能波进度
+
+| ID | 状态 | 证据 |
+|---|---|---|
+| U0–U3 | `core-ported` | workspace / codec tests / `--parse` / `SELECT 1` |
+| F01 | `core-ported` | `project/reports/features/F01/` |
+| F02–F22 | `not-started` | — |
+| C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
+| C2–C5 | `not-started` | — |
+| C6 | `deferred` | Cascades/TiFlash/MPP/BR |
 
 ---
 
 ## 3. 包级状态（Phase 0 基线）
 
-> 当前所有 crate 只有空骨架（`Cargo.toml` + `lib.rs`），尚未登记任何源文件移植。  
+> U1/U2/U3/F01 相关 crate 已有核心路径实现；其余 crate 仍是可编译骨架。  
 > 精确文件级状态由 `project/parity/status.json` + `parity_check.py` 生成。
 
 | 顶层包 | crate | 骨架 | 文件移植 | 目标阶段 |
@@ -72,6 +84,25 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: 功能波 Unlock + F01
+- **完成**:
+  - workspace 空 crate 可编译；`[workspace.dependencies]` 落地
+  - U1 codec/tablecodec 核心向量与 row/index key
+  - U2 sqlparser_bridge + `--parse --ast-json`
+  - U3 `sealdb-server --execute "SELECT 1"`
+  - F01 算术/比较/逻辑/`CAST`/`IF`/`IFNULL`
+  - 功能清单 `project/features.md` + leftover 脚本 + CI
+- **验证**:
+  - `cargo test --workspace` / `cargo clippy --workspace --all-targets -- -D warnings`
+  - 见 `project/reports/features/F01/`
+- **阻塞/风险**:
+  - 本机 Homebrew cargo 是 1.97；需 `rustup` 1.99.1
+  - TiKV spike 仍缺实集群；结论见 ADR-0004
+- **下一步**:
+  - F02 `CREATE/DROP TABLE` 写兼容 meta key
 
 ### 2026-10-19
 
@@ -112,9 +143,9 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 | Gate | 报告/命令 | 状态 |
 |---|---|---|
-| Gate 0 | `project/reports/phase-00/`（待建） | 进行中 |
-| Gate 1 | `project/reports/phase-01/`（待建） | 未开始 |
-| Gate 2 | `project/reports/phase-02/`（待建） | 未开始 |
+| Gate 0 | U0 + CI | 通过（功能波口径） |
+| Gate 1 | U1 codec 单测 | 通过（核心类型） |
+| Gate 2 | U2/U3/F01 | 进行中（核心路径已通，parser 60% 留完整性波） |
 | Gate 3 | `project/reports/phase-03/`（待建） | 未开始 |
 | Gate 4 | `project/reports/phase-04/`（待建） | 未开始 |
 | Gate 5 | `project/reports/phase-05/`（待建） | 未开始 |

@@ -31,7 +31,7 @@
 | [0001](./0001-rust-rewrite-reuse-pd-tikv.md) | Rust 重写计算层并复用 PD/TiKV | accepted |
 | [0002](./0002-single-crate-first.md) | Workspace 按顶层包粒度拆分 | accepted |
 | [0003](./0003-sqlparser-bridge.md) | sqlparser-rs + AST lowering | accepted |
-| [0004](./0004-tikv-client-strategy.md) | TiKV 客户端：tikv-client 优先，kvproto 兜底 | proposed |
+| [0004](./0004-tikv-client-strategy.md) | TiKV 客户端：tikv-client 优先，kvproto 兜底 | accepted |
 | [0005](./0005-oracle-differential-testing.md) | 以参考实现为 Oracle 的差分测试 | accepted |
 | [0006](./0006-toolchain-edition-msrv.md) | Rust 1.99.1 / Edition 2024 | accepted |
 | [0007](./0007-legacy-code-disposition.md) | 旧 Rust 代码归档到 legacy-rust-scaffold | accepted |

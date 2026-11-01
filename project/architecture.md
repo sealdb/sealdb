@@ -138,6 +138,7 @@ sealdb/
 | R9 | `pkg/parser/sqlparser_bridge/` 是显式允许的扩展模块；原因：sqlparser-rs 与目标 AST 的桥接不属于参考源码树。 |
 | R10 | 暂不使用的文件在 manifest 标 `omitted` 并说明原因与计划阶段；不要求创建空 `.rs`。进入当前阶段的包必须文件齐全（可 `stub`）。 |
 | R11 | **源码中不写来源/移植标记**；状态、来源路径、偏差统一维护在 `project/parity/status.json`。 |
+| R12 | **功能切分不改路径**。按 SQL 功能迭代时，代码仍写入 TiDB 同名目录/文件；只有 Rust 硬约束（`lib.rs`/`mod.rs`、关键字、sqlparser 桥）允许例外，且必须登记偏差。 |
 
 ### 2.3 对齐状态（机器可读）
 

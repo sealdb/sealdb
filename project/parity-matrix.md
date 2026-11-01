@@ -23,17 +23,17 @@
 
 | TiDB 目录 | Rust 目录 | 状态 | 阶段 | 说明 |
 |---|---|---|---|---|
-| `cmd/tidb-server` | `cmd/tidb-server` | `not-started` | 2/9 | 先 CLI，后协议 |
-| `pkg/parser` | `pkg/parser` | `not-started` | 2 | sqlparser bridge |
-| `pkg/types` | `pkg/types` | `not-started` | 1 | Datum/Decimal/Time |
-| `pkg/kv` | `pkg/kv` | `not-started` | 1/6 | 接口先行 |
+| `cmd/tidb-server` | `cmd/tidb-server` | `partial` | 2/9 | CLI `--parse/--execute` |
+| `pkg/parser` | `pkg/parser` | `partial` | 2 | sqlparser bridge + SELECT AST |
+| `pkg/types` | `pkg/types` | `partial` | 1 | Datum/Decimal/Time 核心 |
+| `pkg/kv` | `pkg/kv` | `stub` | 1/6 | 接口先行 |
 | `pkg/meta` | `pkg/meta` | `not-started` | 3 | 元数据 |
 | `pkg/infoschema` | `pkg/infoschema` | `not-started` | 3 | Schema 缓存 |
 | `pkg/domain` | `pkg/domain` | `not-started` | 3/6 | Domain |
-| `pkg/expression` | `pkg/expression` | `not-started` | 2/5 | 表达式 |
-| `pkg/planner` | `pkg/planner` | `not-started` | 4/7 | RBO/CBO |
-| `pkg/executor` | `pkg/executor` | `not-started` | 5/8 | 执行器 |
-| `pkg/session` | `pkg/session` | `not-started` | 2/6 | Session |
+| `pkg/expression` | `pkg/expression` | `partial` | 2/5 | F01 标量 |
+| `pkg/planner` | `pkg/planner` | `partial` | 4/7 | Dual/Projection |
+| `pkg/executor` | `pkg/executor` | `partial` | 5/8 | Dual/Projection |
+| `pkg/session` | `pkg/session` | `partial` | 2/6 | ExecuteStmt 常量 SELECT |
 | `pkg/sessionctx` | `pkg/sessionctx` | `not-started` | 2/6 | 上下文 |
 | `pkg/sessiontxn` | `pkg/sessiontxn` | `not-started` | 6 | 事务 Provider |
 | `pkg/store` | `pkg/store` | `not-started` | 5/6 | driver/copr |
@@ -41,13 +41,13 @@
 | `pkg/ddl` | `pkg/ddl` | `not-started` | 8 | DDL |
 | `pkg/statistics` | `pkg/statistics` | `not-started` | 7 | 统计 |
 | `pkg/table` | `pkg/table` | `not-started` | 5 | 表抽象 |
-| `pkg/tablecodec` | `pkg/tablecodec` | `not-started` | 1 | Key 编码 |
+| `pkg/tablecodec` | `pkg/tablecodec` | `partial` | 1 | row/index key |
+| `pkg/errno` | `pkg/errno` | `partial` | 1 | 核心错误码 |
+| `pkg/util/chunk` | `pkg/util/chunk` | `partial` | 1/5 | Chunk |
+| `pkg/util/codec` | `pkg/util/codec` | `ported` | 1 | int/uint/float/bytes |
 | `pkg/privilege` | `pkg/privilege` | `not-started` | 8 | 权限 |
 | `pkg/bindinfo` | `pkg/bindinfo` | `not-started` | 8 | Binding |
 | `pkg/config` | `pkg/config` | `not-started` | 0/9 | 配置 |
-| `pkg/errno` | `pkg/errno` | `not-started` | 1 | 错误码 |
-| `pkg/util/chunk` | `pkg/util/chunk` | `not-started` | 1/5 | Chunk |
-| `pkg/util/codec` | `pkg/util/codec` | `not-started` | 1 | 编码 |
 | `pkg/server` | `pkg/server` | `not-started` | 9 | MySQL 协议 |
 | `br/` | `br/` | `n/a` | — | 占位 README |
 | `dumpling/` | `dumpling/` | `n/a` | — | 占位 README |
@@ -113,6 +113,8 @@ python3 project/scripts/parity_check.py \
 | K9 | 暂不移植 `br/`、`dumpling/`、`lightning/`、`tiflash/`、`tispark/` | 非计算层主链路 | 目录占位 | n/a |
 | K10 | 源码不含来源标记 | 用户要求 | 追溯依赖 manifest | `status.json` |
 | K11 | `legacy-rust-scaffold/` | 归档旧代码 | 不参与构建 | ADR-0007 |
+| K12 | `pkg/parser/mysql/const.rs` 模块名为 `r#const` | `const` 是 Rust 关键字 | 文件名仍是 `const.rs` | 允许；`pub use r#const::*` |
+| K13 | `foo/foo.rs` 触发 `module_inception` | 对齐 `foo/foo.go` | 模块路径多一层 | 允许 clippy；禁止并进 `mod.rs` |
 
 > 新增偏差必须同时更新：本表 + ADR + `requirements.md` §3（如涉及硬约束）。
 
