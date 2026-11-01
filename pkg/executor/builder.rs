@@ -1,6 +1,7 @@
 use crate::ddl::DDLExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
+use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
 use crate::select::{LimitExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
@@ -96,6 +97,18 @@ impl ExecutorBuilder {
                 Ok(Box::new(InsertExec::new(
                     domain,
                     insert,
+                    current_db.to_string(),
+                )))
+            }
+            PhysicalPlan::PointGet { handle, .. } => {
+                let from = stmt
+                    .as_select()
+                    .and_then(|s| s.from.clone())
+                    .ok_or_else(|| Error::unsupported("point get without FROM"))?;
+                Ok(Box::new(PointGetExec::new(
+                    domain,
+                    from,
+                    *handle,
                     current_db.to_string(),
                 )))
             }

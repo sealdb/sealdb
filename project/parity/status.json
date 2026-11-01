@@ -263,6 +263,11 @@
       "phase": 5,
       "notes": "scan table prefix for SELECT *"
     },
+    "pkg/executor/point_get.go": {
+      "status": "partial",
+      "phase": 5,
+      "notes": "integer handle PointGet"
+    },
     "pkg/executor/select.go": {
       "status": "partial",
       "phase": 5,

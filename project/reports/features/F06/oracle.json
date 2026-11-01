@@ -1,0 +1,23 @@
+{
+  "suite": "testdata/F06",
+  "cases": [
+    {
+      "name": "point_get.sql",
+      "result": {
+        "sql": "SELECT * FROM db1.t WHERE id = 2;\nSELECT * FROM db1.t WHERE id = 9;\n",
+        "statements": [
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` WHERE `id`=2",
+            "text": "SELECT * FROM db1.t WHERE id = 2;"
+          },
+          {
+            "type": "SelectStmt",
+            "restore": "SELECT * FROM `db1`.`t` WHERE `id`=9",
+            "text": "SELECT * FROM db1.t WHERE id = 9;"
+          }
+        ]
+      }
+    }
+  ]
+}

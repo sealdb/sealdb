@@ -1,6 +1,9 @@
 use super::physical_plans::{DdlKind, PhysicalPlan};
 use sealdb_errno::Result;
+use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{Statement, StmtNode};
+use sealdb_parser::opcode::Op;
+use sealdb_types::Datum;
 
 pub struct PlanBuilder;
 
@@ -15,8 +18,15 @@ impl PlanBuilder {
                 let mut plan = if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    PhysicalPlan::TableReader {
-                        table: from.name.clone(),
+                    if let Some(handle) = point_get_handle(select.selection.as_ref()) {
+                        PhysicalPlan::PointGet {
+                            table: from.name.clone(),
+                            handle,
+                        }
+                    } else {
+                        PhysicalPlan::TableReader {
+                            table: from.name.clone(),
+                        }
                     }
                 } else {
                     let exprs = select
@@ -30,7 +40,7 @@ impl PlanBuilder {
                         child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                     }
                 };
-                if select.selection.is_some() {
+                if select.selection.is_some() && !matches!(plan, PhysicalPlan::PointGet { .. }) {
                     if matches!(plan, PhysicalPlan::Projection { .. }) {
                         if let PhysicalPlan::Projection { exprs, child } = plan {
                             plan = PhysicalPlan::Projection {
@@ -87,4 +97,22 @@ impl Default for PlanBuilder {
 
 pub fn stmt_kind(stmt: &Statement) -> &'static str {
     stmt.stmt_type()
+}
+
+fn point_get_handle(selection: Option<&ExprNode>) -> Option<i64> {
+    let ExprNode::Binary(bin) = selection? else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(_), ExprNode::Value(v)) | (ExprNode::Value(v), ExprNode::Column(_)) => {
+            match v.datum {
+                Datum::I64(handle) => Some(handle),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }

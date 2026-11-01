@@ -69,7 +69,13 @@ impl Executor for InsertExec {
                     }
                 }
             }
-            let handle = self.domain.next_handle(info.id);
+            let handle = values
+                .first()
+                .and_then(|d| match d {
+                    sealdb_types::Datum::I64(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or_else(|| self.domain.next_handle(info.id));
             let key = encode_row_key_with_handle(info.id, handle);
             txn.set(key.as_bytes(), &encode_row(&col_ids, &values))?;
         }

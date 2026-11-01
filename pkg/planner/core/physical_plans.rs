@@ -27,6 +27,10 @@ pub enum PhysicalPlan {
     TableReader {
         table: String,
     },
+    PointGet {
+        table: String,
+        handle: i64,
+    },
     Selection {
         child: Box<PhysicalPlan>,
     },
@@ -49,6 +53,7 @@ impl PhysicalPlan {
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Insert => "Insert".to_string(),
             PhysicalPlan::TableReader { table } => format!("TableReader_{table}"),
+            PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
             PhysicalPlan::Selection { child } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),

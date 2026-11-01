@@ -249,4 +249,25 @@ mod tests {
             vec![vec!["2".to_string(), "b".to_string()]]
         );
     }
+
+    #[test]
+    fn test_point_get() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        let hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            hit.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let miss = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 9")
+            .unwrap();
+        assert!(miss.display_rows().is_empty());
+    }
 }

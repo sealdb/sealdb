@@ -11,7 +11,7 @@
     "F03": {"status": "core-ported", "phase": 5, "notes": "INSERT VALUES + SELECT * via in-memory KV and TiDB row keys", "gaps": ["tikv-persist", "rowcodec", "insert-select"]},
     "F04": {"status": "core-ported", "phase": 5, "notes": "WHERE filters rows via SelectionExec", "gaps": ["ppd", "in-between-like", "coprocessor-filter"]},
     "F05": {"status": "core-ported", "phase": 5, "notes": "ORDER BY + LIMIT/OFFSET in-memory", "gaps": ["topn-spill", "parallel-sort"]},
-    "F06": {"status": "not-started", "phase": 5, "gaps": []},
+    "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle PointGet", "gaps": ["batch-point-get", "index-point-get"]},
     "F07": {"status": "not-started", "phase": 5, "gaps": []},
     "F08": {"status": "not-started", "phase": 5, "gaps": []},
     "F09": {"status": "not-started", "phase": 5, "gaps": []},

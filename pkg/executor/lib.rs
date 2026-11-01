@@ -7,6 +7,7 @@ pub mod ddl;
 pub mod insert;
 pub mod internal;
 pub mod join;
+pub mod point_get;
 pub mod projection;
 pub mod select;
 pub mod show;

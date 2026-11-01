@@ -46,7 +46,8 @@
 | F03 | `core-ported` | `project/reports/features/F03/` |
 | F04 | `core-ported` | `project/reports/features/F04/` |
 | F05 | `core-ported` | `project/reports/features/F05/` |
-| F06–F10, F12–F22 | `not-started` | — |
+| F06 | `core-ported` | `project/reports/features/F06/` |
+| F07–F10, F12–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -89,6 +90,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F06 PointGet
+- **完成**:
+  - `WHERE id = const` 走 handle PointGet
+  - INSERT 用第一列整数当 handle
+- **验证**:
+  - `./project/scripts/feature_gate.sh F06`
+- **下一步**:
+  - F07 UPDATE / DELETE
 
 ### 2026-11-01
 
