@@ -21,7 +21,7 @@
     "F13": {"status": "core-ported", "phase": 6, "notes": "SELECT FOR UPDATE + BEGIN PESSIMISTIC exclusive lock and latest read", "gaps": ["for-share", "nowait-skip-locked", "blocking-wait", "deadlock", "tikv-pessimistic"]},
     "F14": {"status": "core-ported", "phase": 8, "notes": "EXISTS/IN/scalar subquery via NestedLoopApply plus IN list", "gaps": ["any-all", "from-derived-table", "select-list-subquery", "parallel-apply", "semi-anti-rewrite"]},
     "F15": {"status": "core-ported", "phase": 8, "notes": "UNION / UNION ALL with outer ORDER BY/LIMIT", "gaps": ["except-intersect", "nested-paren-union", "union-in-subquery", "parallel-union"]},
-    "F16": {"status": "not-started", "phase": 8, "gaps": []},
+    "F16": {"status": "core-ported", "phase": 8, "notes": "ROW_NUMBER/RANK/DENSE_RANK and window COUNT/SUM/AVG/MIN/MAX", "gaps": ["frame-clause", "named-window", "lag-lead", "ignore-nulls", "pipelined-window"]},
     "F17": {"status": "not-started", "phase": 8, "gaps": []},
     "F18": {"status": "not-started", "phase": 8, "gaps": []},
     "F19": {"status": "not-started", "phase": 8, "gaps": []},

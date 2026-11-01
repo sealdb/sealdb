@@ -94,6 +94,9 @@ case "$FEATURE" in
   F15)
     run execute-union cargo run -q -p sealdb-server-bin -- --execute "SELECT 1 UNION SELECT 1 UNION ALL SELECT 2"
     ;;
+  F16)
+    run execute-window cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM db1.t ORDER BY id"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

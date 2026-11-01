@@ -18,6 +18,7 @@ pub mod sortexec;
 pub mod table_reader;
 pub mod unionexec;
 pub mod update;
+pub mod window;
 
 pub use builder::ExecutorBuilder;
 pub use internal::QueryResult;

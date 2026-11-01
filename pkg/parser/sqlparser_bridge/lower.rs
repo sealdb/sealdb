@@ -10,7 +10,7 @@ use crate::ast::dml::{
 };
 use crate::ast::expressions::{
     BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
-    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
+    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};
 use crate::opcode::Op;
@@ -19,10 +19,10 @@ use sealdb_types::Datum;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByKind, OrderBySort,
-    Query, SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
-    Values,
+    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    OrderBySort, Query, SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Update, Use, Value, Values, WindowType,
 };
 use sqlparser::parser::Parser;
 
@@ -813,6 +813,9 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
 }
 
 fn lower_function(func: &Function) -> Result<ExprNode> {
+    if let Some(over) = &func.over {
+        return lower_window_func(func, over);
+    }
     let name = func.name.to_string();
     let args = match &func.args {
         FunctionArguments::List(list) => list
@@ -848,6 +851,81 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         args
     };
     Ok(ExprNode::Func(FuncCallExpr { name, args }))
+}
+
+fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
+    // F16 gap / completeness wave: named windows, frame clauses, LAG/LEAD.
+    if func.null_treatment.is_some() {
+        return Err(Error::unsupported("IGNORE/RESPECT NULLS"));
+    }
+    let WindowType::WindowSpec(spec) = over else {
+        return Err(Error::unsupported("named window"));
+    };
+    if spec.window_name.is_some() || spec.window_frame.is_some() {
+        return Err(Error::unsupported("window name / frame clause"));
+    }
+    let name = func.name.to_string();
+    match name.to_ascii_uppercase().as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {}
+        other => return Err(Error::unsupported(format!("window function {other}"))),
+    }
+    let args = match &func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                | FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(expr),
+                    ..
+                } => lower_expr(expr),
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                | FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
+                    Ok(ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(b"*".to_vec()),
+                    }))
+                }
+                _ => Err(Error::unsupported("window function argument form")),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => {
+            return Err(Error::unsupported("window function subquery argument"));
+        }
+    };
+    let args = if name.eq_ignore_ascii_case("COUNT")
+        && matches!(
+            args.as_slice(),
+            [ExprNode::Value(v)] if matches!(&v.datum, Datum::Bytes(b) if b == b"*")
+        ) {
+        Vec::new()
+    } else {
+        args
+    };
+    Ok(ExprNode::Window(WindowFuncExpr {
+        name,
+        args,
+        spec: WindowSpec {
+            partition_by: spec
+                .partition_by
+                .iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?,
+            order_by: lower_order_by_exprs(&spec.order_by)?,
+        },
+    }))
+}
+
+fn lower_order_by_exprs(items: &[OrderByExpr]) -> Result<Vec<ByItem>> {
+    items
+        .iter()
+        .map(|item| {
+            Ok(ByItem {
+                expr: lower_expr(&item.expr)?,
+                desc: matches!(item.options.sort, Some(OrderBySort::Desc)),
+            })
+        })
+        .collect()
 }
 
 fn lower_value(value: &Value) -> Result<Datum> {

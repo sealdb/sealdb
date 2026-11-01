@@ -1,4 +1,4 @@
-use super::dml::SelectStmt;
+use super::dml::{ByItem, SelectStmt};
 use crate::format::RestoreCtx;
 use crate::opcode::Op;
 use sealdb_errno::Result;
@@ -16,6 +16,7 @@ pub enum ExprNode {
     InSubquery(InSubqueryExpr),
     InList(InListExpr),
     ScalarSubquery(ScalarSubqueryExpr),
+    Window(WindowFuncExpr),
 }
 
 impl ExprNode {
@@ -31,6 +32,7 @@ impl ExprNode {
             ExprNode::InSubquery(v) => v.restore(ctx),
             ExprNode::InList(v) => v.restore(ctx),
             ExprNode::ScalarSubquery(v) => v.restore(ctx),
+            ExprNode::Window(v) => v.restore(ctx),
         }
     }
 
@@ -42,6 +44,11 @@ impl ExprNode {
             ExprNode::Func(f) => f.args.iter().any(Self::has_subquery),
             ExprNode::Cast(c) => c.expr.has_subquery(),
             ExprNode::InList(i) => i.expr.has_subquery() || i.list.iter().any(Self::has_subquery),
+            ExprNode::Window(w) => {
+                w.args.iter().any(Self::has_subquery)
+                    || w.spec.partition_by.iter().any(Self::has_subquery)
+                    || w.spec.order_by.iter().any(|item| item.expr.has_subquery())
+            }
             ExprNode::Value(_) | ExprNode::Column(_) => false,
         }
     }
@@ -244,6 +251,72 @@ impl ScalarSubqueryExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("(");
         self.query.restore(ctx)?;
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WindowSpec {
+    pub partition_by: Vec<ExprNode>,
+    pub order_by: Vec<ByItem>,
+}
+
+impl WindowSpec {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        let mut first = true;
+        if !self.partition_by.is_empty() {
+            ctx.write_str("PARTITION BY ");
+            for (i, expr) in self.partition_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                expr.restore(ctx)?;
+            }
+            first = false;
+        }
+        if !self.order_by.is_empty() {
+            if !first {
+                ctx.write_str(" ");
+            }
+            ctx.write_str("ORDER BY ");
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                item.expr.restore(ctx)?;
+                if item.desc {
+                    ctx.write_str(" DESC");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowFuncExpr {
+    pub name: String,
+    pub args: Vec<ExprNode>,
+    pub spec: WindowSpec,
+}
+
+impl WindowFuncExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.name);
+        ctx.write_str("(");
+        if self.name.eq_ignore_ascii_case("COUNT") && self.args.is_empty() {
+            ctx.write_str("*");
+        } else {
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                arg.restore(ctx)?;
+            }
+        }
+        ctx.write_str(") OVER (");
+        self.spec.restore(ctx)?;
         ctx.write_str(")");
         Ok(())
     }

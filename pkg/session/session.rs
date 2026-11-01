@@ -740,4 +740,62 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("EXCEPT"));
     }
+
+    #[test]
+    fn test_window_functions() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'a')",
+            )
+            .unwrap();
+        let numbered = session
+            .execute_stmt(
+                "SELECT id, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM db1.t ORDER BY name, id",
+            )
+            .unwrap();
+        assert_eq!(
+            numbered.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string(), "1".to_string()],
+                vec!["2".to_string(), "a".to_string(), "2".to_string()],
+                vec!["4".to_string(), "a".to_string(), "3".to_string()],
+                vec!["3".to_string(), "b".to_string(), "1".to_string()]
+            ]
+        );
+        let ranked = session
+            .execute_stmt(
+                "SELECT id, RANK() OVER (PARTITION BY name ORDER BY name), DENSE_RANK() OVER (PARTITION BY name ORDER BY name) FROM db1.t ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            ranked.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "1".to_string(), "1".to_string()],
+                vec!["3".to_string(), "1".to_string(), "1".to_string()],
+                vec!["4".to_string(), "1".to_string(), "1".to_string()]
+            ]
+        );
+        let summed = session
+            .execute_stmt(
+                "SELECT id, name, SUM(id) OVER (PARTITION BY name) FROM db1.t ORDER BY name, id",
+            )
+            .unwrap();
+        assert_eq!(
+            summed.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string(), "7".to_string()],
+                vec!["2".to_string(), "a".to_string(), "7".to_string()],
+                vec!["4".to_string(), "a".to_string(), "7".to_string()],
+                vec!["3".to_string(), "b".to_string(), "3".to_string()]
+            ]
+        );
+        let dual = session.execute_stmt("SELECT ROW_NUMBER() OVER ()").unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let err = session
+            .execute_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM db1.t")
+            .unwrap_err();
+        assert!(err.message.contains("window function"));
+    }
 }
