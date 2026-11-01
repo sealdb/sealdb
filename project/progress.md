@@ -29,7 +29,7 @@
 | 3 | 元数据与 Bootstrap | `done` | 2026-11-01 | 2026-11-01 | F02/F11 | SHOW/DESC 走内存 InfoSchema |
 | 4 | Planner v1（RBO） | `in-progress` | 2026-11-01 | — | F03–F10 | F03 TableReader 已通；WHERE 起才有规则 |
 | 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT * 走内存 KV |
-| 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR 已通 |
+| 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
 | 7 | CBO 与统计 | `not-started` | — | — | F21 | 依赖 Phase 5/6 |
 | 8 | DDL 与高级 SQL | `not-started` | — | — | F14–F20 | 依赖 Phase 6/7 |
 | 9 | MySQL 协议与运维 | `not-started` | — | — | F22 | 可提前做只读协议 |
@@ -52,7 +52,8 @@
 | F09 | `core-ported` | `project/reports/features/F09/` |
 | F10 | `core-ported` | `project/reports/features/F10/` |
 | F12 | `core-ported` | `project/reports/features/F12/` |
-| F13–F22 | `not-started` | — |
+| F13 | `core-ported` | `project/reports/features/F13/` |
+| F14–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -95,6 +96,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F13 `SELECT ... FOR UPDATE` + 悲观 RR
+- **完成**:
+  - `FOR UPDATE` 读最新并加排他锁
+  - `BEGIN PESSIMISTIC` 下 UPDATE/DELETE 加锁读最新
+  - 锁冲突立即 1205，不阻塞等待
+- **验证**:
+  - `./project/scripts/feature_gate.sh F13`
+- **下一步**:
+  - F14 子查询 / Apply / EXISTS / IN
 
 ### 2026-11-01
 

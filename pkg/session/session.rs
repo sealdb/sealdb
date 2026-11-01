@@ -63,11 +63,13 @@ impl Session {
                     use_stmt.db_name.clone();
                 return Ok(empty_result());
             }
-            Statement::Begin(_) => {
-                self.txn
-                    .lock()
-                    .expect("session txn lock")
-                    .enter_begin(self.domain.as_ref())?;
+            Statement::Begin(begin) => {
+                let mut txn = self.txn.lock().expect("session txn lock");
+                if begin.pessimistic {
+                    txn.enter_begin_pessimistic(self.domain.as_ref())?;
+                } else {
+                    txn.enter_begin(self.domain.as_ref())?;
+                }
                 return Ok(empty_result());
             }
             Statement::Commit(_) => {
@@ -566,6 +568,67 @@ mod tests {
         assert_eq!(
             committed.display_rows(),
             vec![vec!["1".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_select_for_update_lock() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        let snap = a.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            snap.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        b.execute_stmt("UPDATE db1.t SET name = 'b' WHERE id = 1")
+            .unwrap();
+        let locked = a.execute_stmt("SELECT * FROM db1.t FOR UPDATE").unwrap();
+        assert_eq!(
+            locked.display_rows(),
+            vec![vec!["1".to_string(), "b".to_string()]]
+        );
+        let err = b
+            .execute_stmt("SELECT * FROM db1.t FOR UPDATE")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_LOCK_WAIT_TIMEOUT);
+        a.execute_stmt("COMMIT").unwrap();
+        let after = b.execute_stmt("SELECT * FROM db1.t FOR UPDATE").unwrap();
+        assert_eq!(
+            after.display_rows(),
+            vec![vec!["1".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_pessimistic_update_latest_and_lock() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN PESSIMISTIC").unwrap();
+        b.execute_stmt("UPDATE db1.t SET name = 'b' WHERE id = 1")
+            .unwrap();
+        a.execute_stmt("UPDATE db1.t SET name = 'c' WHERE id = 1")
+            .unwrap();
+        let err = b
+            .execute_stmt("BEGIN PESSIMISTIC; UPDATE db1.t SET name = 'd' WHERE id = 1")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_LOCK_WAIT_TIMEOUT);
+        b.execute_stmt("ROLLBACK").unwrap();
+        a.execute_stmt("COMMIT").unwrap();
+        let committed = b.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            committed.display_rows(),
+            vec![vec!["1".to_string(), "c".to_string()]]
         );
     }
 }

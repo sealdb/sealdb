@@ -1,0 +1,21 @@
+{
+  "feature": "F13",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/sessiontxn/isolation/repeatable_read.go",
+    "TiDB pkg/parser/ast/dml.go SelectLockType",
+    "TiDB pkg/parser/ast/misc.go BeginStmt.Pessimistic"
+  ],
+  "cases": [
+    "SELECT * FROM t FOR UPDATE",
+    "BEGIN PESSIMISTIC",
+    "START TRANSACTION PESSIMISTIC",
+    "BEGIN; SELECT * FROM t FOR UPDATE; COMMIT",
+    "BEGIN PESSIMISTIC; UPDATE t SET name = 'b' WHERE id = 1; COMMIT",
+    "SELECT * FROM t FOR SHARE",
+    "SELECT * FROM t FOR UPDATE NOWAIT",
+    "SELECT * FROM t FOR UPDATE SKIP LOCKED",
+    "SELECT * FROM t FOR UPDATE OF t",
+    "SELECT * FROM t FOR UPDATE WAIT 1"
+  ]
+}

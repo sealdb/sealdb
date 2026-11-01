@@ -12,6 +12,7 @@ pub struct Version(pub u64);
 
 pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
+    fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>>;
 }
 
 pub trait Transaction: Send {
@@ -19,6 +20,10 @@ pub trait Transaction: Send {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&mut self, key: &[u8]) -> Result<()>;
     fn scan(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn set_pessimistic(&mut self);
+    fn is_pessimistic(&self) -> bool;
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
 }

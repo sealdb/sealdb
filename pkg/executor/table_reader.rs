@@ -1,3 +1,6 @@
+// F13: FOR UPDATE uses scan_for_update (latest + exclusive lock).
+// Completeness wave / not this feature: blocking lock wait, FOR SHARE,
+// NOWAIT / SKIP LOCKED / WAIT N, OF table list.
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
@@ -16,6 +19,7 @@ pub struct TableReaderExec {
     table: TableName,
     current_db: String,
     txn: Arc<TxnHandle>,
+    for_update: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -27,12 +31,14 @@ impl TableReaderExec {
         table: TableName,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
+        for_update: bool,
     ) -> Self {
         Self {
             domain,
             table,
             current_db: current_db.into(),
             txn,
+            for_update,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -58,7 +64,7 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        self.rows = scan_table(&self.txn, &info)?
+        self.rows = scan_table(&self.txn, &info, self.for_update)?
             .into_iter()
             .map(|row| row.values)
             .collect();
@@ -91,10 +97,21 @@ pub(crate) struct ScannedRow {
     pub values: Vec<Datum>,
 }
 
-pub(crate) fn scan_table(handle: &TxnHandle, info: &TableInfo) -> Result<Vec<ScannedRow>> {
+pub(crate) fn scan_table(
+    handle: &TxnHandle,
+    info: &TableInfo,
+    for_update: bool,
+) -> Result<Vec<ScannedRow>> {
     let start = gen_table_record_prefix(info.id);
     let end = next_prefix(start.as_bytes());
-    handle.with_txn(|txn| decode_scanned_rows(txn.scan(start.as_bytes(), &end)?, info))
+    handle.with_txn(|txn| {
+        let pairs = if for_update {
+            txn.scan_for_update(start.as_bytes(), &end)?
+        } else {
+            txn.scan(start.as_bytes(), &end)?
+        };
+        decode_scanned_rows(pairs, info)
+    })
 }
 
 fn decode_scanned_rows(

@@ -13,7 +13,8 @@ pub use ddl::{
     TableName,
 };
 pub use dml::{
-    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectStmt, UpdateStmt,
+    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
+    SelectStmt, UpdateStmt,
 };
 pub use expressions::ExprNode;
 pub use misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};

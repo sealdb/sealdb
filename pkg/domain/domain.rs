@@ -68,4 +68,8 @@ impl Storage for Domain {
     fn begin(&self) -> Result<Box<dyn sealdb_kv::Transaction>> {
         self.storage.begin()
     }
+
+    fn begin_pessimistic(&self) -> Result<Box<dyn sealdb_kv::Transaction>> {
+        self.storage.begin_pessimistic()
+    }
 }

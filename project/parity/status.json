@@ -362,12 +362,18 @@
     "pkg/session/session.go": {
       "status": "partial",
       "phase": 6,
-      "notes": "ExecuteStmt plus explicit BEGIN/COMMIT/ROLLBACK"
+      "notes": "ExecuteStmt plus explicit BEGIN/COMMIT/ROLLBACK and BEGIN PESSIMISTIC"
     },
     "pkg/sessiontxn/isolation/optimistic.go": {
       "status": "partial",
       "phase": 6,
       "notes": "OptimisticTxnContextProvider marker for F12 RR"
+    },
+    "pkg/sessiontxn/isolation/repeatable_read.go": {
+      "status": "partial",
+      "rust": "pkg/sessiontxn/isolation/pessimistic.rs",
+      "phase": 6,
+      "notes": "PessimisticRRTxnContextProvider marker for F13 RR"
     },
     "pkg/sessiontxn/interface.go": {
       "status": "reimplemented",
