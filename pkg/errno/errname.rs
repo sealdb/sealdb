@@ -27,6 +27,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_WRITE_CONFLICT => "ErrWriteConflict",
         errcode::ERR_LOCK_WAIT_TIMEOUT => "ErrLockWaitTimeout",
         errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
+        errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "ErrWrongNumberOfColumnsInSelect",
         _ => "ErrUnknown",
     }
 }

@@ -57,6 +57,11 @@ pub enum PhysicalPlan {
     Apply {
         child: Box<PhysicalPlan>,
     },
+    Union {
+        distinct: bool,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -91,6 +96,16 @@ impl PhysicalPlan {
                 format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
             }
             PhysicalPlan::Apply { child } => format!("Apply -> {}", child.explain()),
+            PhysicalPlan::Union {
+                distinct,
+                left,
+                right,
+            } => format!(
+                "Union_{}({}, {})",
+                if *distinct { "Distinct" } else { "All" },
+                left.explain(),
+                right.explain()
+            ),
         }
     }
 }

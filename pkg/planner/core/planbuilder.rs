@@ -136,6 +136,32 @@ impl PlanBuilder {
             Statement::Rollback(_) => Ok(PhysicalPlan::Show {
                 kind: "Rollback".to_string(),
             }),
+            Statement::SetOpr(set) => {
+                let mut plan =
+                    self.build_with_schema(&Statement::Select(set.first.clone()), is, current_db)?;
+                for (op, select) in &set.rest {
+                    plan = PhysicalPlan::Union {
+                        distinct: op.is_distinct(),
+                        left: Box::new(plan),
+                        right: Box::new(self.build_with_schema(
+                            &Statement::Select(select.clone()),
+                            is,
+                            current_db,
+                        )?),
+                    };
+                }
+                if !set.order_by.is_empty() {
+                    plan = PhysicalPlan::Sort {
+                        child: Box::new(plan),
+                    };
+                }
+                if set.limit.is_some() || set.offset.is_some() {
+                    plan = PhysicalPlan::Limit {
+                        child: Box::new(plan),
+                    };
+                }
+                Ok(plan)
+            }
         }
     }
 }

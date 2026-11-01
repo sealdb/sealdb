@@ -6,7 +6,7 @@ use crate::ast::ddl::{
 };
 use crate::ast::dml::{
     Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
-    SelectStmt, UpdateStmt,
+    SelectStmt, SetOprStmt, SetOprType, UpdateStmt,
 };
 use crate::ast::expressions::{
     BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr, InSubqueryExpr,
@@ -20,8 +20,9 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
     LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByKind, OrderBySort,
-    Query, SchemaName, SelectItem, SetExpr, Statement as SqlStatement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
+    Query, SchemaName, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update, Use, Value,
+    Values,
 };
 use sqlparser::parser::Parser;
 
@@ -50,7 +51,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
 
 fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
     match stmt {
-        SqlStatement::Query(query) => Ok(Statement::Select(lower_query(query)?)),
+        SqlStatement::Query(query) => lower_query_stmt(query),
         SqlStatement::CreateDatabase {
             db_name,
             if_not_exists,
@@ -339,41 +340,139 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
     }
 }
 
-fn lower_query(query: &Query) -> Result<SelectStmt> {
+fn lower_query_stmt(query: &Query) -> Result<Statement> {
     match query.body.as_ref() {
-        SetExpr::Select(select) => {
-            let fields = select
-                .projection
-                .iter()
-                .map(lower_select_item)
-                .collect::<Result<Vec<_>>>()?;
-            let (from, join) = lower_from(&select.from)?;
-            let selection = select.selection.as_ref().map(lower_expr).transpose()?;
-            // F08 gap / completeness wave: HAVING.
-            if select.having.is_some() {
-                return Err(Error::unsupported("HAVING"));
-            }
-            let group_by = lower_group_by(&select.group_by)?;
-            let order_by = lower_order_by(query.order_by.as_ref())?;
-            let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
-            Ok(SelectStmt {
-                fields,
-                from,
-                join,
-                selection,
-                group_by,
-                order_by,
-                limit,
-                offset,
-                lock: lower_select_lock(&query.locks)?,
-                text: query.to_string(),
-            })
-        }
+        SetExpr::Select(_) => Ok(Statement::Select(lower_query(query)?)),
+        SetExpr::SetOperation { .. } => Ok(Statement::SetOpr(lower_set_opr(query)?)),
+        SetExpr::Query(inner) => lower_query_stmt(inner),
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
         )),
     }
+}
+
+fn lower_set_opr(query: &Query) -> Result<SetOprStmt> {
+    let (first, rest) = flatten_set_expr(query.body.as_ref())?;
+    let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
+    Ok(SetOprStmt {
+        first,
+        rest,
+        order_by: lower_order_by(query.order_by.as_ref())?,
+        limit,
+        offset,
+    })
+}
+
+fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, SelectStmt)>)> {
+    match expr {
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => {
+            let tp = map_set_opr(*op, *set_quantifier)?;
+            match left.as_ref() {
+                SetExpr::SetOperation { .. } => {
+                    let (first, mut rest) = flatten_set_expr(left)?;
+                    rest.push((tp, lower_set_operand(right)?));
+                    Ok((first, rest))
+                }
+                _ => Ok((
+                    lower_set_operand(left)?,
+                    vec![(tp, lower_set_operand(right)?)],
+                )),
+            }
+        }
+        other => Err(Error::unsupported(format!("set operand {other}"))),
+    }
+}
+
+fn lower_set_operand(expr: &SetExpr) -> Result<SelectStmt> {
+    match expr {
+        SetExpr::Select(select) => lower_select(
+            select,
+            None,
+            None,
+            None,
+            SelectLock::None,
+            select.to_string(),
+        ),
+        SetExpr::Query(query) => lower_query(query),
+        // F15 gap: parenthesized nested UNION as a single operand.
+        SetExpr::SetOperation { .. } => Err(Error::unsupported("nested parenthesized UNION")),
+        other => Err(Error::unsupported(format!("UNION operand {other}"))),
+    }
+}
+
+fn map_set_opr(op: SetOperator, quantifier: SetQuantifier) -> Result<SetOprType> {
+    match (op, quantifier) {
+        (SetOperator::Union, SetQuantifier::All) => Ok(SetOprType::UnionAll),
+        (SetOperator::Union, SetQuantifier::None | SetQuantifier::Distinct) => {
+            Ok(SetOprType::Union)
+        }
+        (SetOperator::Except, _) => Err(Error::unsupported("EXCEPT")),
+        (SetOperator::Intersect, _) => Err(Error::unsupported("INTERSECT")),
+        (SetOperator::Minus, _) => Err(Error::unsupported("MINUS")),
+        (_, other) => Err(Error::unsupported(format!("UNION {other}"))),
+    }
+}
+
+fn lower_query(query: &Query) -> Result<SelectStmt> {
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
+            lower_select(
+                select,
+                query.order_by.as_ref(),
+                limit,
+                offset,
+                lower_select_lock(&query.locks)?,
+                query.to_string(),
+            )
+        }
+        // F15 gap / completeness wave: UNION inside scalar/EXISTS/IN subquery.
+        other => Err(Error::new(
+            ERR_UNSUPPORTED,
+            format!("query body {:?} is not available in this phase", other),
+        )),
+    }
+}
+
+fn lower_select(
+    select: &sqlparser::ast::Select,
+    order_by: Option<&sqlparser::ast::OrderBy>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    lock: SelectLock,
+    text: String,
+) -> Result<SelectStmt> {
+    let fields = select
+        .projection
+        .iter()
+        .map(lower_select_item)
+        .collect::<Result<Vec<_>>>()?;
+    let (from, join) = lower_from(&select.from)?;
+    let selection = select.selection.as_ref().map(lower_expr).transpose()?;
+    // F08 gap / completeness wave: HAVING.
+    if select.having.is_some() {
+        return Err(Error::unsupported("HAVING"));
+    }
+    let group_by = lower_group_by(&select.group_by)?;
+    let order_by = lower_order_by(order_by)?;
+    Ok(SelectStmt {
+        fields,
+        from,
+        join,
+        selection,
+        group_by,
+        order_by,
+        limit,
+        offset,
+        lock,
+        text,
+    })
 }
 
 fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {

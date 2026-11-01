@@ -54,7 +54,8 @@
 | F12 | `core-ported` | `project/reports/features/F12/` |
 | F13 | `core-ported` | `project/reports/features/F13/` |
 | F14 | `core-ported` | `project/reports/features/F14/` |
-| F15–F22 | `not-started` | — |
+| F15 | `core-ported` | `project/reports/features/F15/` |
+| F16–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -97,6 +98,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F15 `UNION` / `UNION ALL`
+- **完成**:
+  - 左结合 `UNION` 去重与 `UNION ALL` 追加
+  - 外层 `ORDER BY` / `LIMIT`
+  - 列数不一致返回 1222
+- **验证**:
+  - `./project/scripts/feature_gate.sh F15`
+- **下一步**:
+  - F16 Window
 
 ### 2026-11-01
 

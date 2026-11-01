@@ -692,4 +692,52 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("ANY"));
     }
+
+    #[test]
+    fn test_union_and_union_all() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, name VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let distinct = session
+            .execute_stmt("SELECT 1 UNION SELECT 1 UNION SELECT 2")
+            .unwrap();
+        assert_eq!(
+            distinct.display_rows(),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+        let all = session.execute_stmt("SELECT 1 UNION ALL SELECT 1").unwrap();
+        assert_eq!(
+            all.display_rows(),
+            vec![vec!["1".to_string()], vec!["1".to_string()]]
+        );
+        let tables = session
+            .execute_stmt("SELECT * FROM db1.t1 UNION SELECT * FROM db1.t2 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            tables.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "c".to_string()]
+            ]
+        );
+        let limited = session
+            .execute_stmt("SELECT * FROM db1.t1 UNION ALL SELECT * FROM db1.t2 ORDER BY id LIMIT 2")
+            .unwrap();
+        assert_eq!(limited.display_rows().len(), 2);
+        let err = session
+            .execute_stmt("SELECT 1 UNION SELECT 1, 2")
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            sealdb_errno::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
+        );
+        let err = session
+            .execute_stmt("SELECT 1 EXCEPT SELECT 2")
+            .unwrap_err();
+        assert!(err.message.contains("EXCEPT"));
+    }
 }

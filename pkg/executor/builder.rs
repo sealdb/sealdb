@@ -11,13 +11,15 @@ use crate::select::{LimitExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
 use crate::sortexec::SortExec;
 use crate::table_reader::TableReaderExec;
+use crate::unionexec::UnionExec;
 use crate::update::UpdateExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{SelectLock, Statement};
+use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement};
 use sealdb_planner::PhysicalPlan;
+use sealdb_planner::PlanBuilder;
 use std::sync::Arc;
 
 pub struct ExecutorBuilder;
@@ -49,10 +51,7 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::Sort { child } => {
-                let by = stmt
-                    .as_select()
-                    .map(|s| s.order_by.clone())
-                    .filter(|items| !items.is_empty())
+                let by = stmt_order_by(stmt)
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 Ok(Box::new(SortExec::new(
                     by,
@@ -60,12 +59,11 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::Limit { child } => {
-                let select = stmt
-                    .as_select()
-                    .ok_or_else(|| Error::unsupported("limit without select"))?;
+                let (limit, offset) =
+                    stmt_limit(stmt).ok_or_else(|| Error::unsupported("limit without select"))?;
                 Ok(Box::new(LimitExec::new(
-                    select.limit,
-                    select.offset.unwrap_or(0),
+                    limit,
+                    offset,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
@@ -189,6 +187,28 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )?))
             }
+            PhysicalPlan::Union { .. } => {
+                let set = match stmt {
+                    Statement::SetOpr(s) => s,
+                    _ => return Err(Error::unsupported("union without set opr")),
+                };
+                let mut exec = Self::build_select_arm(
+                    &set.first,
+                    Arc::clone(&domain),
+                    current_db,
+                    Arc::clone(&txn),
+                )?;
+                for (op, select) in &set.rest {
+                    let right = Self::build_select_arm(
+                        select,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?;
+                    exec = Box::new(UnionExec::new(exec, right, op.is_distinct()));
+                }
+                Ok(exec)
+            }
             PhysicalPlan::Apply { child } => {
                 let select = stmt
                     .as_select()
@@ -232,6 +252,18 @@ impl ExecutorBuilder {
         }
     }
 
+    fn build_select_arm(
+        select: &SelectStmt,
+        domain: Arc<Domain>,
+        current_db: &str,
+        txn: Arc<TxnHandle>,
+    ) -> Result<Box<dyn Executor>> {
+        let stmt = Statement::Select(select.clone());
+        let plan =
+            PlanBuilder::new().build_with_schema(&stmt, Some(&domain.infoschema()), current_db)?;
+        Self::build(&plan, &stmt, domain, current_db, txn)
+    }
+
     pub fn build_select(
         plan: &PhysicalPlan,
         select: &sealdb_parser::ast::SelectStmt,
@@ -252,6 +284,26 @@ impl ExecutorBuilder {
         }
         exec.close()?;
         Ok(QueryResult { columns, rows })
+    }
+}
+
+fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {
+    match stmt {
+        Statement::Select(select) if !select.order_by.is_empty() => Some(select.order_by.clone()),
+        Statement::SetOpr(set) if !set.order_by.is_empty() => Some(set.order_by.clone()),
+        _ => None,
+    }
+}
+
+fn stmt_limit(stmt: &Statement) -> Option<(Option<u64>, u64)> {
+    match stmt {
+        Statement::Select(select) if select.limit.is_some() || select.offset.is_some() => {
+            Some((select.limit, select.offset.unwrap_or(0)))
+        }
+        Statement::SetOpr(set) if set.limit.is_some() || set.offset.is_some() => {
+            Some((set.limit, set.offset.unwrap_or(0)))
+        }
+        _ => None,
     }
 }
 

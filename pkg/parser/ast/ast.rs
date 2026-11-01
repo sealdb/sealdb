@@ -1,5 +1,5 @@
 use super::ddl::{CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt};
-use super::dml::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
+use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, UseStmt};
 use crate::format::RestoreCtx;
@@ -29,6 +29,7 @@ pub enum Statement {
     Begin(BeginStmt),
     Commit(CommitStmt),
     Rollback(RollbackStmt),
+    SetOpr(SetOprStmt),
 }
 
 impl Node for Statement {
@@ -47,6 +48,7 @@ impl Node for Statement {
             Statement::Begin(s) => s.restore(ctx),
             Statement::Commit(s) => s.restore(ctx),
             Statement::Rollback(s) => s.restore(ctx),
+            Statement::SetOpr(s) => s.restore(ctx),
         }
     }
 }
@@ -67,6 +69,7 @@ impl StmtNode for Statement {
             Statement::Begin(_) => "BeginStmt",
             Statement::Commit(_) => "CommitStmt",
             Statement::Rollback(_) => "RollbackStmt",
+            Statement::SetOpr(_) => "SetOprStmt",
         }
     }
 }

@@ -1,6 +1,6 @@
 # Leftover inventory
 
-Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, U0, U1, U2, U3
+Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10, F11, F12, F13, F14, F15, U0, U1, U2, U3
 
 ## PlanBuilder statement kinds still open
 
@@ -18,7 +18,6 @@ Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10,
 - `ast.PlanReplayerStmt` → unmapped
 - `ast.PrepareStmt` → C4
 - `ast.SelectStmt` → F01/F03/F04
-- `ast.SetOprStmt` → F15
 - `ast.DoStmt` → unmapped
 - `ast.SetStmt` → unmapped
 - `ast.SetConfigStmt` → unmapped
@@ -70,7 +69,6 @@ Baseline features core-ported: F01, F02, F03, F04, F05, F06, F07, F08, F09, F10,
 - `ast.CreateResourceGroupStmt` → unmapped
 - `ast.OptimizeTableStmt` → unmapped
 - `ast.CreateViewStmt` → unmapped
-- `ast.SetOprStmt` → F15
 - `ast.SelectStmt` → F01/F03/F04
 
 ## integrationtest suites
