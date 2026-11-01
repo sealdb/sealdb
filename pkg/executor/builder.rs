@@ -14,6 +14,7 @@ use crate::table_reader::TableReaderExec;
 use crate::update::UpdateExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
+use sealdb_kv::{Storage, TxnHandle};
 use sealdb_parser::ast::Statement;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_planner::PhysicalPlan;
@@ -27,6 +28,7 @@ impl ExecutorBuilder {
         stmt: &Statement,
         domain: Arc<Domain>,
         current_db: &str,
+        txn: Arc<TxnHandle>,
     ) -> Result<Box<dyn Executor>> {
         match plan {
             PhysicalPlan::DDL { .. } => Ok(Box::new(DDLExec::new(
@@ -43,7 +45,7 @@ impl ExecutorBuilder {
                 Ok(Box::new(ProjectionExec::new(
                     exprs,
                     names,
-                    Self::build(child, stmt, domain, current_db)?,
+                    Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
             PhysicalPlan::Sort { child } => {
@@ -54,7 +56,7 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 Ok(Box::new(SortExec::new(
                     by,
-                    Self::build(child, stmt, domain, current_db)?,
+                    Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
             PhysicalPlan::Limit { child } => {
@@ -64,7 +66,7 @@ impl ExecutorBuilder {
                 Ok(Box::new(LimitExec::new(
                     select.limit,
                     select.offset.unwrap_or(0),
-                    Self::build(child, stmt, domain, current_db)?,
+                    Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
             PhysicalPlan::Selection { child } => {
@@ -74,7 +76,7 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("selection without WHERE"))?;
                 Ok(Box::new(SelectionExec::new(
                     filter,
-                    Self::build(child, stmt, domain, current_db)?,
+                    Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
             PhysicalPlan::Show { .. } => {
@@ -100,6 +102,7 @@ impl ExecutorBuilder {
                     domain,
                     insert,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::Update => {
@@ -111,6 +114,7 @@ impl ExecutorBuilder {
                     domain,
                     update,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::Delete => {
@@ -122,6 +126,7 @@ impl ExecutorBuilder {
                     domain,
                     delete,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::IndexLookUpReader { index, .. } => {
@@ -140,6 +145,7 @@ impl ExecutorBuilder {
                     index.clone(),
                     lookup,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::PointGet { handle, .. } => {
@@ -152,6 +158,7 @@ impl ExecutorBuilder {
                     from,
                     *handle,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::TableReader { table } => {
@@ -160,6 +167,7 @@ impl ExecutorBuilder {
                     domain,
                     from,
                     current_db.to_string(),
+                    txn,
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
@@ -169,7 +177,7 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("hash agg without select"))?;
                 Ok(Box::new(HashAggExec::new(
                     select,
-                    Self::build(child, stmt, domain, current_db)?,
+                    Self::build(child, stmt, domain, current_db, txn)?,
                 )?))
             }
             PhysicalPlan::HashJoin { left, right, .. } => {
@@ -179,8 +187,14 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("hash join without join"))?;
                 Ok(Box::new(HashJoinV1Exec::new(
                     join,
-                    Self::build(left, stmt, Arc::clone(&domain), current_db)?,
-                    Self::build(right, stmt, domain, current_db)?,
+                    Self::build(
+                        left,
+                        stmt,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?,
+                    Self::build(right, stmt, domain, current_db, txn)?,
                 )))
             }
         }
@@ -190,12 +204,9 @@ impl ExecutorBuilder {
         plan: &PhysicalPlan,
         select: &sealdb_parser::ast::SelectStmt,
     ) -> Result<Box<dyn Executor>> {
-        Self::build(
-            plan,
-            &Statement::Select(select.clone()),
-            Arc::new(Domain::new()),
-            "",
-        )
+        let domain = Arc::new(Domain::new());
+        let txn = Arc::new(TxnHandle::new(domain.begin()?));
+        Self::build(plan, &Statement::Select(select.clone()), domain, "", txn)
     }
 
     pub fn run(mut exec: Box<dyn Executor>) -> Result<QueryResult> {

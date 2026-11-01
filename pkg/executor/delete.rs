@@ -7,7 +7,7 @@ use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_expression::eval_filter;
-use sealdb_kv::Storage;
+use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::DeleteStmt;
 use sealdb_tablecodec::encode_row_key_with_handle;
 use sealdb_util::chunk::Chunk;
@@ -17,15 +17,22 @@ pub struct DeleteExec {
     domain: Arc<Domain>,
     stmt: DeleteStmt,
     current_db: String,
+    txn: Arc<TxnHandle>,
     done: bool,
 }
 
 impl DeleteExec {
-    pub fn new(domain: Arc<Domain>, stmt: DeleteStmt, current_db: impl Into<String>) -> Self {
+    pub fn new(
+        domain: Arc<Domain>,
+        stmt: DeleteStmt,
+        current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
+    ) -> Self {
         Self {
             domain,
             stmt,
             current_db: current_db.into(),
+            txn,
             done: false,
         }
     }
@@ -49,19 +56,19 @@ impl Executor for DeleteExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let rows = scan_table(self.domain.as_ref(), &info)?;
-        let mut txn = self.domain.begin()?;
-        for scanned in rows {
-            if let Some(filter) = &self.stmt.selection
-                && !eval_filter(filter, &col_names, &scanned.values)?
-            {
-                continue;
+        let rows = scan_table(&self.txn, &info)?;
+        self.txn.with_txn(|txn| {
+            for scanned in rows {
+                if let Some(filter) = &self.stmt.selection
+                    && !eval_filter(filter, &col_names, &scanned.values)?
+                {
+                    continue;
+                }
+                delete_index_keys(txn, &info, scanned.handle, &scanned.values)?;
+                txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
             }
-            delete_index_keys(&mut *txn, &info, scanned.handle, &scanned.values)?;
-            txn.delete(encode_row_key_with_handle(info.id, scanned.handle).as_bytes())?;
-        }
-        txn.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {

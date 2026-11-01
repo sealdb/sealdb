@@ -1,7 +1,7 @@
 use super::ddl::{CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt};
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, UpdateStmt};
 use super::expressions::ExprNode;
-use super::misc::{ShowStmt, UseStmt};
+use super::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, UseStmt};
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -26,6 +26,9 @@ pub enum Statement {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    Begin(BeginStmt),
+    Commit(CommitStmt),
+    Rollback(RollbackStmt),
 }
 
 impl Node for Statement {
@@ -41,6 +44,9 @@ impl Node for Statement {
             Statement::Insert(s) => s.restore(ctx),
             Statement::Update(s) => s.restore(ctx),
             Statement::Delete(s) => s.restore(ctx),
+            Statement::Begin(s) => s.restore(ctx),
+            Statement::Commit(s) => s.restore(ctx),
+            Statement::Rollback(s) => s.restore(ctx),
         }
     }
 }
@@ -58,6 +64,9 @@ impl StmtNode for Statement {
             Statement::Insert(_) => "InsertStmt",
             Statement::Update(_) => "UpdateStmt",
             Statement::Delete(_) => "DeleteStmt",
+            Statement::Begin(_) => "BeginStmt",
+            Statement::Commit(_) => "CommitStmt",
+            Statement::Rollback(_) => "RollbackStmt",
         }
     }
 }

@@ -4,7 +4,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::Storage;
+use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{
     decode_handle_from_index_key, decode_row, encode_index_seek_prefix, encode_row_key_with_handle,
@@ -20,6 +20,7 @@ pub struct IndexLookUpExecutor {
     index: String,
     lookup: Datum,
     current_db: String,
+    txn: Arc<TxnHandle>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -32,6 +33,7 @@ impl IndexLookUpExecutor {
         index: String,
         lookup: Datum,
         current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
     ) -> Self {
         Self {
             domain,
@@ -39,6 +41,7 @@ impl IndexLookUpExecutor {
             index,
             lookup,
             current_db: current_db.into(),
+            txn,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -72,29 +75,30 @@ impl Executor for IndexLookUpExecutor {
             .collect();
         let start = encode_index_seek_prefix(info.id, index.id, std::slice::from_ref(&self.lookup));
         let end = next_prefix(start.as_bytes());
-        let mut txn = self.domain.begin()?;
-        let pairs = txn.scan(start.as_bytes(), &end)?;
-        let mut rows = Vec::new();
-        for (key, _) in pairs {
-            let handle = decode_handle_from_index_key(&key)?;
-            let row_key = encode_row_key_with_handle(info.id, handle);
-            if let Some(raw) = txn.get(row_key.as_bytes())? {
-                let decoded = decode_row(&raw);
-                rows.push(
-                    info.columns
-                        .iter()
-                        .map(|col| {
-                            decoded
-                                .iter()
-                                .find(|(id, _)| *id == col.id)
-                                .map(|(_, v)| v.clone())
-                                .unwrap_or(Datum::Null)
-                        })
-                        .collect(),
-                );
+        self.rows = self.txn.with_txn(|txn| {
+            let pairs = txn.scan(start.as_bytes(), &end)?;
+            let mut rows = Vec::new();
+            for (key, _) in pairs {
+                let handle = decode_handle_from_index_key(&key)?;
+                let row_key = encode_row_key_with_handle(info.id, handle);
+                if let Some(raw) = txn.get(row_key.as_bytes())? {
+                    let decoded = decode_row(&raw);
+                    rows.push(
+                        info.columns
+                            .iter()
+                            .map(|col| {
+                                decoded
+                                    .iter()
+                                    .find(|(id, _)| *id == col.id)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(Datum::Null)
+                            })
+                            .collect(),
+                    );
+                }
             }
-        }
-        self.rows = rows;
+            Ok(rows)
+        })?;
         Ok(())
     }
 

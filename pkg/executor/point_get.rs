@@ -1,7 +1,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::Storage;
+use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{decode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
@@ -13,6 +13,7 @@ pub struct PointGetExec {
     table: TableName,
     handle: i64,
     current_db: String,
+    txn: Arc<TxnHandle>,
     schema: Vec<String>,
     row: Option<Vec<Datum>>,
     emitted: bool,
@@ -24,12 +25,14 @@ impl PointGetExec {
         table: TableName,
         handle: i64,
         current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
     ) -> Self {
         Self {
             domain,
             table,
             handle,
             current_db: current_db.into(),
+            txn,
             schema: Vec::new(),
             row: None,
             emitted: false,
@@ -56,20 +59,22 @@ impl Executor for PointGetExec {
             .map(|c| c.name.o().to_string())
             .collect();
         let key = encode_row_key_with_handle(info.id, self.handle);
-        let mut txn = self.domain.begin()?;
-        self.row = txn.get(key.as_bytes())?.map(|raw| {
-            let decoded = decode_row(&raw);
-            info.columns
-                .iter()
-                .map(|col| {
-                    decoded
-                        .iter()
-                        .find(|(id, _)| *id == col.id)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(Datum::Null)
-                })
-                .collect()
-        });
+        self.row = self
+            .txn
+            .with_txn(|txn| txn.get(key.as_bytes()))?
+            .map(|raw| {
+                let decoded = decode_row(&raw);
+                info.columns
+                    .iter()
+                    .map(|col| {
+                        decoded
+                            .iter()
+                            .find(|(id, _)| *id == col.id)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Datum::Null)
+                    })
+                    .collect()
+            });
         Ok(())
     }
 

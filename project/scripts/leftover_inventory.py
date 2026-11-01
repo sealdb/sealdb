@@ -25,6 +25,9 @@ FEATURE_HINTS = {
     "AnalyzeTableStmt": "F21",
     "PrepareStmt": "C4",
     "ExecuteStmt": "C4",
+    "BeginStmt": "F12",
+    "CommitStmt": "F12",
+    "RollbackStmt": "F12",
 }
 
 

@@ -20,3 +20,4 @@ pub const ERR_DIVISION_BY_ZERO: i32 = 1365;
 pub const ERR_INVALID_KEY: i32 = 6100;
 pub const ERR_INVALID_RECORD_KEY: i32 = 6101;
 pub const ERR_INVALID_INDEX_KEY: i32 = 6102;
+pub const ERR_WRITE_CONFLICT: i32 = 9007;

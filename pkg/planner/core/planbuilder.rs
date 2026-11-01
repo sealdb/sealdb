@@ -123,6 +123,15 @@ impl PlanBuilder {
             Statement::Use(_) => Ok(PhysicalPlan::Show {
                 kind: "Use".to_string(),
             }),
+            Statement::Begin(_) => Ok(PhysicalPlan::Show {
+                kind: "Begin".to_string(),
+            }),
+            Statement::Commit(_) => Ok(PhysicalPlan::Show {
+                kind: "Commit".to_string(),
+            }),
+            Statement::Rollback(_) => Ok(PhysicalPlan::Show {
+                kind: "Rollback".to_string(),
+            }),
         }
     }
 }

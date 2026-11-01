@@ -384,8 +384,10 @@ dependencies = [
  "sealdb-errno",
  "sealdb-executor",
  "sealdb-infoschema",
+ "sealdb-kv",
  "sealdb-parser",
  "sealdb-planner",
+ "sealdb-sessiontxn",
  "sealdb-types",
  "thiserror",
 ]
@@ -397,6 +399,11 @@ version = "0.1.0"
 [[package]]
 name = "sealdb-sessiontxn"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-kv",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-statistics"

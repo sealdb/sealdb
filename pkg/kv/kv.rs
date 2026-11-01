@@ -14,7 +14,7 @@ pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
 }
 
-pub trait Transaction {
+pub trait Transaction: Send {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&mut self, key: &[u8]) -> Result<()>;

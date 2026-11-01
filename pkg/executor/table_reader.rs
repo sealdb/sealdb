@@ -1,7 +1,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::Storage;
+use sealdb_kv::TxnHandle;
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{
@@ -15,17 +15,24 @@ pub struct TableReaderExec {
     domain: Arc<Domain>,
     table: TableName,
     current_db: String,
+    txn: Arc<TxnHandle>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
 }
 
 impl TableReaderExec {
-    pub fn new(domain: Arc<Domain>, table: TableName, current_db: impl Into<String>) -> Self {
+    pub fn new(
+        domain: Arc<Domain>,
+        table: TableName,
+        current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
+    ) -> Self {
         Self {
             domain,
             table,
             current_db: current_db.into(),
+            txn,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -51,7 +58,7 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        self.rows = scan_table(self.domain.as_ref(), &info)?
+        self.rows = scan_table(&self.txn, &info)?
             .into_iter()
             .map(|row| row.values)
             .collect();
@@ -84,11 +91,16 @@ pub(crate) struct ScannedRow {
     pub values: Vec<Datum>,
 }
 
-pub(crate) fn scan_table(domain: &Domain, info: &TableInfo) -> Result<Vec<ScannedRow>> {
+pub(crate) fn scan_table(handle: &TxnHandle, info: &TableInfo) -> Result<Vec<ScannedRow>> {
     let start = gen_table_record_prefix(info.id);
     let end = next_prefix(start.as_bytes());
-    let mut txn = domain.begin()?;
-    let pairs = txn.scan(start.as_bytes(), &end)?;
+    handle.with_txn(|txn| decode_scanned_rows(txn.scan(start.as_bytes(), &end)?, info))
+}
+
+fn decode_scanned_rows(
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    info: &TableInfo,
+) -> Result<Vec<ScannedRow>> {
     pairs
         .into_iter()
         .map(|(key, raw)| {

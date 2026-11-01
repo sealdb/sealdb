@@ -69,8 +69,13 @@
     },
     "pkg/kv/kv.go": {
       "status": "partial",
-      "phase": 5,
-      "notes": "Storage/Transaction + scan"
+      "phase": 6,
+      "notes": "Storage/Transaction + scan + optimistic RR snapshot"
+    },
+    "pkg/kv/txn.go": {
+      "status": "partial",
+      "phase": 6,
+      "notes": "TxnHandle for session-owned transactions"
     },
     "pkg/kv/cachedb.go": {
       "status": "reimplemented",
@@ -105,8 +110,8 @@
     },
     "pkg/parser/ast/misc.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "ShowStmt + UseStmt"
+      "phase": 6,
+      "notes": "ShowStmt + UseStmt + Begin/Commit/Rollback"
     },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
@@ -356,8 +361,19 @@
     },
     "pkg/session/session.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "ExecuteStmt for constant SELECT and F02 DDL"
+      "phase": 6,
+      "notes": "ExecuteStmt plus explicit BEGIN/COMMIT/ROLLBACK"
+    },
+    "pkg/sessiontxn/isolation/optimistic.go": {
+      "status": "partial",
+      "phase": 6,
+      "notes": "OptimisticTxnContextProvider marker for F12 RR"
+    },
+    "pkg/sessiontxn/interface.go": {
+      "status": "reimplemented",
+      "rust": "pkg/sessiontxn/txn_manager.rs",
+      "phase": 6,
+      "notes": "session-owned enter/commit/rollback; TiDB interface.go is the closest counterpart"
     }
   }
 }

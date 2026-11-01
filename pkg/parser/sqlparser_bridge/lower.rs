@@ -10,7 +10,7 @@ use crate::ast::dml::{
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
 };
-use crate::ast::misc::{ShowStmt, ShowStmtKind, UseStmt};
+use crate::ast::misc::{BeginStmt, CommitStmt, RollbackStmt, ShowStmt, ShowStmtKind, UseStmt};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
@@ -228,6 +228,40 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 other => return Err(Error::unsupported(format!("USE {other}"))),
             };
             Ok(Statement::Use(UseStmt { db_name: name }))
+        }
+        SqlStatement::StartTransaction {
+            modes,
+            statements,
+            exception,
+            ..
+        } => {
+            // F12 gap / F13 leftover: pessimistic, isolation modes, read-only,
+            // causal consistency, BEGIN ... END blocks.
+            if !modes.is_empty() {
+                return Err(Error::unsupported("START TRANSACTION modes"));
+            }
+            if !statements.is_empty() || exception.is_some() {
+                return Err(Error::unsupported("BEGIN block"));
+            }
+            Ok(Statement::Begin(BeginStmt))
+        }
+        SqlStatement::Commit {
+            chain, modifier, ..
+        } => {
+            if *chain || modifier.is_some() {
+                return Err(Error::unsupported("COMMIT AND CHAIN"));
+            }
+            Ok(Statement::Commit(CommitStmt))
+        }
+        SqlStatement::Rollback { chain, savepoint } => {
+            // F12 gap / completeness wave: SAVEPOINT and AND CHAIN.
+            if *chain || savepoint.is_some() {
+                return Err(Error::unsupported("ROLLBACK TO SAVEPOINT"));
+            }
+            Ok(Statement::Rollback(RollbackStmt))
+        }
+        SqlStatement::Savepoint { .. } | SqlStatement::ReleaseSavepoint { .. } => {
+            Err(Error::unsupported("SAVEPOINT"))
         }
         other => Err(Error::new(
             ERR_UNSUPPORTED,

@@ -3,7 +3,9 @@ use sealdb_errno::Result;
 use sealdb_executor::{ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::Parser;
+use sealdb_parser::ast::Statement;
 use sealdb_planner::PlanBuilder;
+use sealdb_sessiontxn::TxnManager;
 use std::sync::{Arc, Mutex};
 
 pub struct Session {
@@ -11,15 +13,21 @@ pub struct Session {
     planner: PlanBuilder,
     domain: Arc<Domain>,
     current_db: Mutex<String>,
+    txn: Mutex<TxnManager>,
 }
 
 impl Session {
     pub fn new() -> Self {
+        Self::with_domain(Arc::new(Domain::new()))
+    }
+
+    pub fn with_domain(domain: Arc<Domain>) -> Self {
         Self {
             parser: Parser::new(),
             planner: PlanBuilder::new(),
-            domain: Arc::new(Domain::new()),
+            domain,
             current_db: Mutex::new(String::new()),
+            txn: Mutex::new(TxnManager::new()),
         }
     }
 
@@ -41,20 +49,43 @@ impl Session {
         Ok(last)
     }
 
-    fn execute_one(&self, stmt: &sealdb_parser::ast::Statement) -> Result<QueryResult> {
-        if let sealdb_parser::ast::Statement::Use(use_stmt) = stmt {
-            let is = self.domain.infoschema();
-            if is.schema_by_name(&use_stmt.db_name).is_none() {
-                return Err(sealdb_errno::Error::new(
-                    sealdb_errno::ERR_BAD_DB,
-                    format!("Unknown database '{}'", use_stmt.db_name),
-                ));
+    fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
+        match stmt {
+            Statement::Use(use_stmt) => {
+                let is = self.domain.infoschema();
+                if is.schema_by_name(&use_stmt.db_name).is_none() {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_BAD_DB,
+                        format!("Unknown database '{}'", use_stmt.db_name),
+                    ));
+                }
+                *self.current_db.lock().expect("session current_db lock") =
+                    use_stmt.db_name.clone();
+                return Ok(empty_result());
             }
-            *self.current_db.lock().expect("session current_db lock") = use_stmt.db_name.clone();
-            return Ok(QueryResult {
-                columns: Vec::new(),
-                rows: Vec::new(),
-            });
+            Statement::Begin(_) => {
+                self.txn
+                    .lock()
+                    .expect("session txn lock")
+                    .enter_begin(self.domain.as_ref())?;
+                return Ok(empty_result());
+            }
+            Statement::Commit(_) => {
+                self.txn.lock().expect("session txn lock").commit()?;
+                return Ok(empty_result());
+            }
+            Statement::Rollback(_) => {
+                self.txn.lock().expect("session txn lock").rollback()?;
+                return Ok(empty_result());
+            }
+            Statement::CreateDatabase(_)
+            | Statement::DropDatabase(_)
+            | Statement::CreateTable(_)
+            | Statement::DropTable(_) => {
+                // F12 gap: no transactional DDL. Implicit-commit then apply.
+                self.txn.lock().expect("session txn lock").commit()?;
+            }
+            _ => {}
         }
         let current_db = self
             .current_db
@@ -65,12 +96,29 @@ impl Session {
         let plan = self
             .planner
             .build_with_schema(stmt, Some(&is), &current_db)?;
-        let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db)?;
-        ExecutorBuilder::run(exec)
+        let txn = self
+            .txn
+            .lock()
+            .expect("session txn lock")
+            .ensure(self.domain.as_ref())?;
+        let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?;
+        let result = ExecutorBuilder::run(exec);
+        self.txn
+            .lock()
+            .expect("session txn lock")
+            .finish_autocommit(result.is_ok())?;
+        result
     }
 
     pub fn infoschema(&self) -> InfoSchema {
         self.domain.infoschema()
+    }
+}
+
+fn empty_result() -> QueryResult {
+    QueryResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
     }
 }
 
@@ -458,5 +506,66 @@ mod tests {
             .execute_stmt("CREATE INDEX idx_id ON db1.t (id)")
             .unwrap_err();
         assert!(err.message.contains("CREATE INDEX"));
+    }
+
+    #[test]
+    fn test_begin_commit_rollback() {
+        let session = Session::new();
+        session
+            .execute_stmt("CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("BEGIN; INSERT INTO db1.t VALUES (1, 'a'); SELECT * FROM db1.t")
+            .unwrap();
+        session.execute_stmt("ROLLBACK").unwrap();
+        let after_rollback = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert!(after_rollback.display_rows().is_empty());
+        session
+            .execute_stmt("START TRANSACTION; INSERT INTO db1.t VALUES (1, 'a'); COMMIT")
+            .unwrap();
+        let after_commit = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            after_commit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        session.execute_stmt("COMMIT").unwrap();
+        session.execute_stmt("ROLLBACK").unwrap();
+        let err = session
+            .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .unwrap_err();
+        assert!(err.message.contains("START TRANSACTION modes"));
+    }
+
+    #[test]
+    fn test_optimistic_rr_snapshot_and_conflict() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        let snap = a.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            snap.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        b.execute_stmt("UPDATE db1.t SET name = 'b' WHERE id = 1")
+            .unwrap();
+        let still = a.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            still.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        a.execute_stmt("UPDATE db1.t SET name = 'c' WHERE id = 1")
+            .unwrap();
+        let err = a.execute_stmt("COMMIT").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_WRITE_CONFLICT);
+        let committed = b.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            committed.display_rows(),
+            vec![vec!["1".to_string(), "b".to_string()]]
+        );
     }
 }

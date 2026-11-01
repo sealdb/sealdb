@@ -24,6 +24,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_INVALID_KEY => "ErrInvalidKey",
         errcode::ERR_INVALID_RECORD_KEY => "ErrInvalidRecordKey",
         errcode::ERR_INVALID_INDEX_KEY => "ErrInvalidIndexKey",
+        errcode::ERR_WRITE_CONFLICT => "ErrWriteConflict",
         _ => "ErrUnknown",
     }
 }
