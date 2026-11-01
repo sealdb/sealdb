@@ -7,7 +7,7 @@
     "U2": {"status": "core-ported", "phase": 2, "notes": "sqlparser bridge + SELECT AST oracle JSON"},
     "U3": {"status": "core-ported", "phase": 2, "notes": "CLI SELECT 1 via Dual/Projection"},
     "F01": {"status": "core-ported", "phase": 2, "notes": "arith/compare/logic/CAST/IF/IFNULL"},
-    "F02": {"status": "not-started", "phase": 3, "gaps": []},
+    "F02": {"status": "core-ported", "phase": 3, "notes": "CREATE/DROP DATABASE|TABLE + compatible meta keys", "gaps": ["online-ddl-jobs", "create-like-as-select", "indexes", "tikv-persist"]},
     "F03": {"status": "not-started", "phase": 5, "gaps": []},
     "F04": {"status": "not-started", "phase": 5, "gaps": []},
     "F05": {"status": "not-started", "phase": 5, "gaps": []},

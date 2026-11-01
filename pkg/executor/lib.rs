@@ -3,6 +3,7 @@
 pub mod aggfuncs;
 pub mod aggregate;
 pub mod builder;
+pub mod ddl;
 pub mod internal;
 pub mod join;
 pub mod projection;

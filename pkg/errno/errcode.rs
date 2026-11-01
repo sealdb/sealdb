@@ -1,3 +1,8 @@
+pub const ERR_DB_CREATE_EXISTS: i32 = 1007;
+pub const ERR_DB_DROP_EXISTS: i32 = 1008;
+pub const ERR_NO_DB: i32 = 1046;
+pub const ERR_BAD_DB: i32 = 1049;
+pub const ERR_TABLE_EXISTS: i32 = 1050;
 pub const ERR_PARSE_ERROR: i32 = 1064;
 pub const ERR_UNKNOWN_TABLE: i32 = 1109;
 pub const ERR_NO_SUCH_TABLE: i32 = 1146;

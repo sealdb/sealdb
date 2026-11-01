@@ -26,7 +26,7 @@
 | 0 | 地基与规范 | `done` | 2026-10-19 | 2026-11-01 | U0 | workspace/CI/parity/spike 书面结论 |
 | 1 | 核心类型与编码 | `done` | 2026-11-01 | 2026-11-01 | U1 | int/uint/float/bytes + row/index key；Decimal/Time 核心路径 |
 | 2 | 解析器 + Mock 链路 | `in-progress` | 2026-11-01 | — | U2/U3/F01 | `SELECT 1` 与 F01 表达式已通；parser 全量 60% 留完整性波 |
-| 3 | 元数据与 Bootstrap | `not-started` | — | — | F02/F11 | 依赖功能波 |
+| 3 | 元数据与 Bootstrap | `in-progress` | 2026-11-01 | — | F02/F11 | F02 CREATE/DROP 已通；F11 SHOW 未做 |
 | 4 | Planner v1（RBO） | `not-started` | — | — | F03–F10 | 规则随功能走 |
 | 5 | Executor v1 | `not-started` | — | — | F03–F10 | Dual/Projection 已作为 U3 骨架 |
 | 6 | 事务与 Session | `not-started` | — | — | F12/F13 | 可与 Phase 5 并行 |
@@ -41,7 +41,8 @@
 |---|---|---|
 | U0–U3 | `core-ported` | workspace / codec tests / `--parse` / `SELECT 1` |
 | F01 | `core-ported` | `project/reports/features/F01/` |
-| F02–F22 | `not-started` | — |
+| F02 | `core-ported` | `project/reports/features/F02/` |
+| F03–F22 | `not-started` | — |
 | C1 | `in-progress` | `project/scripts/leftover_inventory.py` |
 | C2–C5 | `not-started` | — |
 | C6 | `deferred` | Cascades/TiFlash/MPP/BR |
@@ -55,15 +56,15 @@
 
 | 顶层包 | crate | 骨架 | 文件移植 | 目标阶段 |
 |---|---|---|---|---|
-| `pkg/parser` | `sealdb-parser` | ✅ | 0 | 2 |
-| `pkg/types` | `sealdb-types` | ✅ | 0 | 1 |
+| `pkg/parser` | `sealdb-parser` | ✅ | 核心 | 2/3 |
+| `pkg/types` | `sealdb-types` | ✅ | 核心 | 1 |
 | `pkg/kv` | `sealdb-kv` | ✅ | 0 | 1/6 |
-| `pkg/util` | `sealdb-util` | ✅ | 0 | 1/5 |
+| `pkg/util` | `sealdb-util` | ✅ | 核心 | 1/5 |
 | `pkg/config` | `sealdb-config` | ✅ | 0 | 0/9 |
-| `pkg/errno` | `sealdb-errno` | ✅ | 0 | 1 |
-| `pkg/meta` | `sealdb-meta` | ✅ | 0 | 3 |
-| `pkg/infoschema` | `sealdb-infoschema` | ✅ | 0 | 3 |
-| `pkg/domain` | `sealdb-domain` | ✅ | 0 | 3/6 |
+| `pkg/errno` | `sealdb-errno` | ✅ | 核心 | 1 |
+| `pkg/meta` | `sealdb-meta` | ✅ | 核心 | 3 |
+| `pkg/infoschema` | `sealdb-infoschema` | ✅ | 核心 | 3 |
+| `pkg/domain` | `sealdb-domain` | ✅ | 核心 | 3/6 |
 | `pkg/expression` | `sealdb-expression` | ✅ | 0 | 2/5 |
 | `pkg/planner` | `sealdb-planner` | ✅ | 0 | 4/7 |
 | `pkg/executor` | `sealdb-executor` | ✅ | 0 | 5/8 |
@@ -77,13 +78,28 @@
 | `pkg/statistics` | `sealdb-statistics` | ✅ | 0 | 7 |
 | `pkg/privilege` | `sealdb-privilege` | ✅ | 0 | 8 |
 | `pkg/bindinfo` | `sealdb-bindinfo` | ✅ | 0 | 8 |
-| `pkg/ddl` | `sealdb-ddl` | ✅ | 0 | 8 |
+| `pkg/ddl` | `sealdb-ddl` | ✅ | 核心 | 3/8 |
 | `pkg/server` | `sealdb-server` | ✅ | 0 | 9 |
 | `cmd/tidb-server` | `sealdb-server-bin` | ✅ | 0 | 2/9 |
 
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-01
+
+- **Phase**: F02 元数据
+- **完成**:
+  - `CREATE/DROP DATABASE|TABLE` 核心路径
+  - TiDB 兼容 meta key（`m` + hash/string encoding，`DB:{id}` / `Table:{id}`）
+  - InfoSchema 内存快照 + Domain reload
+- **验证**:
+  - `./project/scripts/feature_gate.sh F02`
+  - 见 `project/reports/features/F02/`
+- **阻塞/风险**:
+  - 仍是内存 meta，未写入真实 TiKV
+- **下一步**:
+  - F11 `SHOW` / `DESC`，或 F03 `INSERT` + `SELECT *`
 
 ### 2026-11-01
 

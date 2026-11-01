@@ -1,6 +1,14 @@
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
+pub enum DdlKind {
+    CreateDatabase,
+    DropDatabase,
+    CreateTable,
+    DropTable,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub enum PhysicalPlan {
     TableDual {
         row_count: usize,
@@ -8,6 +16,9 @@ pub enum PhysicalPlan {
     Projection {
         exprs: Vec<String>,
         child: Box<PhysicalPlan>,
+    },
+    DDL {
+        kind: DdlKind,
     },
 }
 
@@ -18,6 +29,7 @@ impl PhysicalPlan {
             PhysicalPlan::Projection { exprs, child } => {
                 format!("Projection({}) -> {}", exprs.join(","), child.explain())
             }
+            PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
         }
     }
 }

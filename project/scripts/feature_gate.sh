@@ -52,6 +52,9 @@ case "$FEATURE" in
   U3|F01)
     run execute-select1 cargo run -q -p sealdb-server-bin -- --execute "SELECT 1"
     ;;
+  F02)
+    run execute-createdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1"
+    ;;
 esac
 
 if [[ ! -f "$REPORT_DIR/corpus.lock.json" ]]; then

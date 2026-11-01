@@ -1,5 +1,8 @@
 use super::dialect::dialect;
 use crate::ast::Statement;
+use crate::ast::ddl::{
+    ColumnDef, CreateDatabaseStmt, CreateTableStmt, DropDatabaseStmt, DropTableStmt, TableName,
+};
 use crate::ast::dml::{SelectField, SelectStmt};
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
@@ -9,7 +12,8 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    SelectItem, SetExpr, Statement as SqlStatement, UnaryOperator, Value,
+    ObjectName, ObjectType, SchemaName, SelectItem, SetExpr, Statement as SqlStatement,
+    UnaryOperator, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -47,11 +51,118 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 format!("query body {:?} is not available in this phase", other),
             )),
         },
+        SqlStatement::CreateDatabase {
+            db_name,
+            if_not_exists,
+            ..
+        } => Ok(Statement::CreateDatabase(CreateDatabaseStmt {
+            if_not_exists: *if_not_exists,
+            name: object_name_last(db_name)?,
+        })),
+        SqlStatement::CreateSchema {
+            schema_name,
+            if_not_exists,
+            ..
+        } => Ok(Statement::CreateDatabase(CreateDatabaseStmt {
+            if_not_exists: *if_not_exists,
+            name: schema_name_last(schema_name)?,
+        })),
+        SqlStatement::CreateTable(create) => {
+            if create.temporary || create.query.is_some() || create.like.is_some() {
+                return Err(Error::unsupported(
+                    "TEMPORARY / LIKE / AS SELECT CREATE TABLE",
+                ));
+            }
+            if !create.constraints.is_empty() {
+                return Err(Error::unsupported("CREATE TABLE constraints"));
+            }
+            let cols = create
+                .columns
+                .iter()
+                .map(|col| {
+                    Ok(ColumnDef {
+                        name: col.name.value.clone(),
+                        type_name: col.data_type.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if cols.is_empty() {
+                return Err(Error::unsupported("CREATE TABLE without columns"));
+            }
+            Ok(Statement::CreateTable(CreateTableStmt {
+                if_not_exists: create.if_not_exists,
+                table: object_table_name(&create.name)?,
+                cols,
+            }))
+        }
+        SqlStatement::Drop {
+            object_type,
+            if_exists,
+            names,
+            temporary,
+            ..
+        } => {
+            if *temporary {
+                return Err(Error::unsupported("DROP TEMPORARY"));
+            }
+            match object_type {
+                ObjectType::Database | ObjectType::Schema => {
+                    let name = names
+                        .first()
+                        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing database name"))?;
+                    Ok(Statement::DropDatabase(DropDatabaseStmt {
+                        if_exists: *if_exists,
+                        name: object_name_last(name)?,
+                    }))
+                }
+                ObjectType::Table => Ok(Statement::DropTable(DropTableStmt {
+                    if_exists: *if_exists,
+                    tables: names
+                        .iter()
+                        .map(object_table_name)
+                        .collect::<Result<Vec<_>>>()?,
+                })),
+                other => Err(Error::unsupported(format!("DROP {other}"))),
+            }
+        }
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("statement {other} is not available in this phase"),
         )),
     }
+}
+
+fn object_table_name(name: &ObjectName) -> Result<TableName> {
+    let parts = object_name_parts(name)?;
+    match parts.as_slice() {
+        [table] => Ok(TableName::new(None, table.clone())),
+        [schema, table] => Ok(TableName::new(Some(schema.clone()), table.clone())),
+        _ => Err(Error::unsupported(format!("object name {name}"))),
+    }
+}
+
+fn object_name_last(name: &ObjectName) -> Result<String> {
+    object_name_parts(name)?
+        .pop()
+        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "empty object name"))
+}
+
+fn schema_name_last(name: &SchemaName) -> Result<String> {
+    match name {
+        SchemaName::Simple(name) => object_name_last(name),
+        other => Err(Error::unsupported(format!("schema name {other}"))),
+    }
+}
+
+fn object_name_parts(name: &ObjectName) -> Result<Vec<String>> {
+    name.0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.clone())
+                .ok_or_else(|| Error::unsupported(format!("object name part {part}")))
+        })
+        .collect()
 }
 
 fn lower_select_item(item: &SelectItem) -> Result<SelectField> {

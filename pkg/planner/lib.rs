@@ -6,4 +6,4 @@ pub mod implementation;
 pub mod property;
 pub mod util;
 
-pub use core::{PhysicalPlan, PlanBuilder};
+pub use core::{DdlKind, PhysicalPlan, PlanBuilder};

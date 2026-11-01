@@ -92,10 +92,20 @@
       "phase": 2,
       "notes": "NodeBase"
     },
+    "pkg/parser/ast/ddl.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "CREATE/DROP DATABASE|TABLE"
+    },
     "pkg/parser/ast/dml.go": {
       "status": "partial",
       "phase": 2,
       "notes": "SelectStmt core"
+    },
+    "pkg/parser/model/model.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "CIStr"
     },
     "pkg/parser/ast/expressions.go": {
       "status": "partial",
@@ -154,18 +164,78 @@
     },
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "Build constant SELECT"
+      "phase": 3,
+      "notes": "Build constant SELECT and F02 DDL"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "TableDual / Projection"
+      "phase": 3,
+      "notes": "TableDual / Projection / DDL"
+    },
+    "pkg/meta/meta.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "DBkey/TableKey + in-memory hash/string keys"
+    },
+    "pkg/meta/model/db.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "DBInfo core JSON"
+    },
+    "pkg/meta/model/table.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "TableInfo core JSON"
+    },
+    "pkg/meta/model/column.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "ColumnInfo core JSON"
+    },
+    "pkg/meta/model/job.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "SchemaState only"
+    },
+    "pkg/infoschema/infoschema.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "in-memory schema snapshot"
+    },
+    "pkg/ddl/ddl.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "immediate CREATE/DROP apply; no job queue"
+    },
+    "pkg/ddl/schema.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "create/drop database"
+    },
+    "pkg/ddl/table.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "create/drop table"
+    },
+    "pkg/ddl/create_table.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "BuildTableInfo columns only"
+    },
+    "pkg/domain/domain.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "owns meta + infoschema reload"
     },
     "pkg/executor/builder.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "select builder"
+      "phase": 3,
+      "notes": "select + DDL builder"
+    },
+    "pkg/executor/ddl.go": {
+      "status": "partial",
+      "phase": 3,
+      "notes": "DDLExec apply via Domain"
     },
     "pkg/executor/select.go": {
       "status": "partial",
@@ -184,8 +254,8 @@
     },
     "pkg/session/session.go": {
       "status": "partial",
-      "phase": 2,
-      "notes": "ExecuteStmt for constant SELECT"
+      "phase": 3,
+      "notes": "ExecuteStmt for constant SELECT and F02 DDL"
     }
   }
 }

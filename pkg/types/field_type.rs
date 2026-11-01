@@ -7,14 +7,21 @@ pub enum EvalType {
     Datetime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FieldType {
+    #[serde(rename = "Tp")]
     pub tp: u8,
+    #[serde(rename = "Flag")]
     pub flag: u32,
+    #[serde(rename = "Flen")]
     pub flen: i32,
+    #[serde(rename = "Decimal")]
     pub decimal: i32,
+    #[serde(rename = "Charset")]
     pub charset: String,
+    #[serde(rename = "Collate")]
     pub collate: String,
+    #[serde(skip)]
     pub unsigned: bool,
 }
 

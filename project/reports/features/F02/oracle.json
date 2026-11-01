@@ -1,0 +1,63 @@
+{
+  "suite": "testdata/F02",
+  "cases": [
+    {
+      "name": "ddl_core.sql",
+      "result": {
+        "sql": "CREATE DATABASE db1;\nCREATE DATABASE IF NOT EXISTS db1;\nCREATE TABLE db1.t (id INT, name VARCHAR(20));\nCREATE TABLE IF NOT EXISTS db1.t (id INT, name VARCHAR(20));\nCREATE TABLE db1.t2 (id BIGINT);\nDROP TABLE db1.t2;\nDROP TABLE IF EXISTS db1.missing;\nDROP TABLE db1.t;\nDROP DATABASE db1;\nDROP DATABASE IF EXISTS missing_db;\n",
+        "statements": [
+          {
+            "type": "CreateDatabaseStmt",
+            "restore": "CREATE DATABASE `db1`",
+            "text": "CREATE DATABASE db1;"
+          },
+          {
+            "type": "CreateDatabaseStmt",
+            "restore": "CREATE DATABASE IF NOT EXISTS `db1`",
+            "text": "CREATE DATABASE IF NOT EXISTS db1;"
+          },
+          {
+            "type": "CreateTableStmt",
+            "restore": "CREATE TABLE `db1`.`t` (`id` INT,`name` VARCHAR(20))",
+            "text": "CREATE TABLE db1.t (id INT, name VARCHAR(20));"
+          },
+          {
+            "type": "CreateTableStmt",
+            "restore": "CREATE TABLE IF NOT EXISTS `db1`.`t` (`id` INT,`name` VARCHAR(20))",
+            "text": "CREATE TABLE IF NOT EXISTS db1.t (id INT, name VARCHAR(20));"
+          },
+          {
+            "type": "CreateTableStmt",
+            "restore": "CREATE TABLE `db1`.`t2` (`id` BIGINT)",
+            "text": "CREATE TABLE db1.t2 (id BIGINT);"
+          },
+          {
+            "type": "DropTableStmt",
+            "restore": "DROP TABLE `db1`.`t2`",
+            "text": "DROP TABLE db1.t2;"
+          },
+          {
+            "type": "DropTableStmt",
+            "restore": "DROP TABLE IF EXISTS `db1`.`missing`",
+            "text": "DROP TABLE IF EXISTS db1.missing;"
+          },
+          {
+            "type": "DropTableStmt",
+            "restore": "DROP TABLE `db1`.`t`",
+            "text": "DROP TABLE db1.t;"
+          },
+          {
+            "type": "DropDatabaseStmt",
+            "restore": "DROP DATABASE `db1`",
+            "text": "DROP DATABASE db1;"
+          },
+          {
+            "type": "DropDatabaseStmt",
+            "restore": "DROP DATABASE IF EXISTS `missing_db`",
+            "text": "DROP DATABASE IF EXISTS missing_db;"
+          }
+        ]
+      }
+    }
+  ]
+}

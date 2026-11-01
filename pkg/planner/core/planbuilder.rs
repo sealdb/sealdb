@@ -1,4 +1,4 @@
-use super::physical_plans::PhysicalPlan;
+use super::physical_plans::{DdlKind, PhysicalPlan};
 use sealdb_errno::{Error, Result};
 use sealdb_parser::ast::{Statement, StmtNode};
 
@@ -28,6 +28,18 @@ impl PlanBuilder {
                     child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                 })
             }
+            Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::CreateDatabase,
+            }),
+            Statement::DropDatabase(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::DropDatabase,
+            }),
+            Statement::CreateTable(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::CreateTable,
+            }),
+            Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::DropTable,
+            }),
         }
     }
 }

@@ -16,6 +16,8 @@ FEATURE_HINTS = {
     "SetOprStmt": "F15",
     "CreateTableStmt": "F02",
     "DropTableStmt": "F02",
+    "CreateDatabaseStmt": "F02",
+    "DropDatabaseStmt": "F02",
     "AlterTableStmt": "F18",
     "CreateIndexStmt": "F18",
     "ShowStmt": "F11",

@@ -239,6 +239,14 @@ version = "0.1.0"
 [[package]]
 name = "sealdb-ddl"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-infoschema",
+ "sealdb-meta",
+ "sealdb-parser",
+ "sealdb-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-distsql"
@@ -247,6 +255,14 @@ version = "0.1.0"
 [[package]]
 name = "sealdb-domain"
 version = "0.1.0"
+dependencies = [
+ "sealdb-ddl",
+ "sealdb-errno",
+ "sealdb-infoschema",
+ "sealdb-meta",
+ "sealdb-parser",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-errno"
@@ -259,6 +275,7 @@ dependencies = [
 name = "sealdb-executor"
 version = "0.1.0"
 dependencies = [
+ "sealdb-domain",
  "sealdb-errno",
  "sealdb-expression",
  "sealdb-parser",
@@ -283,6 +300,11 @@ dependencies = [
 [[package]]
 name = "sealdb-infoschema"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-meta",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-kv"
@@ -295,6 +317,16 @@ dependencies = [
 [[package]]
 name = "sealdb-meta"
 version = "0.1.0"
+dependencies = [
+ "sealdb-errno",
+ "sealdb-kv",
+ "sealdb-parser",
+ "sealdb-types",
+ "sealdb-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "sealdb-parser"
@@ -342,8 +374,10 @@ dependencies = [
 name = "sealdb-session"
 version = "0.1.0"
 dependencies = [
+ "sealdb-domain",
  "sealdb-errno",
  "sealdb-executor",
+ "sealdb-infoschema",
  "sealdb-parser",
  "sealdb-planner",
  "sealdb-types",

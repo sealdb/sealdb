@@ -24,21 +24,21 @@
 | TiDB 目录 | Rust 目录 | 状态 | 阶段 | 说明 |
 |---|---|---|---|---|
 | `cmd/tidb-server` | `cmd/tidb-server` | `partial` | 2/9 | CLI `--parse/--execute` |
-| `pkg/parser` | `pkg/parser` | `partial` | 2 | sqlparser bridge + SELECT AST |
+| `pkg/parser` | `pkg/parser` | `partial` | 2/3 | sqlparser bridge + SELECT/DDL AST |
 | `pkg/types` | `pkg/types` | `partial` | 1 | Datum/Decimal/Time 核心 |
 | `pkg/kv` | `pkg/kv` | `stub` | 1/6 | 接口先行 |
-| `pkg/meta` | `pkg/meta` | `not-started` | 3 | 元数据 |
-| `pkg/infoschema` | `pkg/infoschema` | `not-started` | 3 | Schema 缓存 |
-| `pkg/domain` | `pkg/domain` | `not-started` | 3/6 | Domain |
+| `pkg/meta` | `pkg/meta` | `partial` | 3 | 兼容 meta key + DB/Table JSON |
+| `pkg/infoschema` | `pkg/infoschema` | `partial` | 3 | 内存 Schema 快照 |
+| `pkg/domain` | `pkg/domain` | `partial` | 3/6 | Domain reload |
 | `pkg/expression` | `pkg/expression` | `partial` | 2/5 | F01 标量 |
 | `pkg/planner` | `pkg/planner` | `partial` | 4/7 | Dual/Projection |
 | `pkg/executor` | `pkg/executor` | `partial` | 5/8 | Dual/Projection |
-| `pkg/session` | `pkg/session` | `partial` | 2/6 | ExecuteStmt 常量 SELECT |
+| `pkg/session` | `pkg/session` | `partial` | 2/3/6 | ExecuteStmt 常量 SELECT + DDL |
 | `pkg/sessionctx` | `pkg/sessionctx` | `not-started` | 2/6 | 上下文 |
 | `pkg/sessiontxn` | `pkg/sessiontxn` | `not-started` | 6 | 事务 Provider |
 | `pkg/store` | `pkg/store` | `not-started` | 5/6 | driver/copr |
 | `pkg/distsql` | `pkg/distsql` | `not-started` | 5 | Cop 请求 |
-| `pkg/ddl` | `pkg/ddl` | `not-started` | 8 | DDL |
+| `pkg/ddl` | `pkg/ddl` | `partial` | 3/8 | CREATE/DROP 立即生效，无 job 队列 |
 | `pkg/statistics` | `pkg/statistics` | `not-started` | 7 | 统计 |
 | `pkg/table` | `pkg/table` | `not-started` | 5 | 表抽象 |
 | `pkg/tablecodec` | `pkg/tablecodec` | `partial` | 1 | row/index key |

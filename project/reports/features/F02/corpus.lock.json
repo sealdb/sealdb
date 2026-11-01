@@ -1,0 +1,23 @@
+{
+  "feature": "F02",
+  "frozen": "2026-11-01",
+  "source": [
+    "TiDB pkg/parser/ast/ddl.go",
+    "TiDB pkg/meta/meta.go",
+    "TiDB pkg/ddl/schema.go",
+    "TiDB pkg/ddl/table.go",
+    "TiDB pkg/ddl/create_table.go"
+  ],
+  "cases": [
+    "CREATE DATABASE db1",
+    "CREATE DATABASE IF NOT EXISTS db1",
+    "CREATE TABLE db1.t (id INT, name VARCHAR(20))",
+    "CREATE TABLE IF NOT EXISTS db1.t (id INT, name VARCHAR(20))",
+    "CREATE TABLE db1.t2 (id BIGINT)",
+    "DROP TABLE db1.t2",
+    "DROP TABLE IF EXISTS db1.missing",
+    "DROP TABLE db1.t",
+    "DROP DATABASE db1",
+    "DROP DATABASE IF EXISTS missing_db"
+  ]
+}

@@ -99,4 +99,19 @@ mod tests {
         assert_eq!(out.statements[0].stmt_type, "SelectStmt");
         assert_eq!(out.statements[0].restore.as_deref(), Some("SELECT 1"));
     }
+
+    #[test]
+    fn test_parse_create_drop_table() {
+        let parser = Parser::new();
+        let create = parser
+            .parse_one_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        assert_eq!(create.stmt_type(), "CreateTableStmt");
+        let drop = parser.parse_one_stmt("DROP TABLE IF EXISTS db1.t").unwrap();
+        assert_eq!(drop.stmt_type(), "DropTableStmt");
+        let db = parser
+            .parse_one_stmt("CREATE DATABASE IF NOT EXISTS db1")
+            .unwrap();
+        assert_eq!(db.stmt_type(), "CreateDatabaseStmt");
+    }
 }

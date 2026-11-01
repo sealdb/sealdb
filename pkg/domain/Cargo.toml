@@ -7,3 +7,11 @@ license.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[dependencies]
+sealdb-ddl.workspace = true
+sealdb-errno.workspace = true
+sealdb-infoschema.workspace = true
+sealdb-meta.workspace = true
+sealdb-parser.workspace = true
+thiserror.workspace = true

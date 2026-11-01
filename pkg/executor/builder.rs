@@ -1,16 +1,32 @@
+use crate::ddl::DDLExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::projection::ProjectionExec;
 use crate::select::TableDualExec;
-use sealdb_errno::Result;
-use sealdb_parser::ast::SelectStmt;
+use sealdb_domain::Domain;
+use sealdb_errno::{Error, Result};
+use sealdb_parser::ast::Statement;
 use sealdb_planner::PhysicalPlan;
+use std::sync::Arc;
 
 pub struct ExecutorBuilder;
 
 impl ExecutorBuilder {
-    pub fn build_select(plan: &PhysicalPlan, select: &SelectStmt) -> Result<Box<dyn Executor>> {
+    pub fn build(
+        plan: &PhysicalPlan,
+        stmt: &Statement,
+        domain: Arc<Domain>,
+        current_db: &str,
+    ) -> Result<Box<dyn Executor>> {
         match plan {
+            PhysicalPlan::DDL { .. } => Ok(Box::new(DDLExec::new(
+                domain,
+                stmt.clone(),
+                current_db.to_string(),
+            ))),
             PhysicalPlan::Projection { .. } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("projection without select"))?;
                 let exprs = select.fields.iter().map(|f| f.expr.clone()).collect();
                 let names = select
                     .fields
@@ -25,6 +41,18 @@ impl ExecutorBuilder {
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
         }
+    }
+
+    pub fn build_select(
+        plan: &PhysicalPlan,
+        select: &sealdb_parser::ast::SelectStmt,
+    ) -> Result<Box<dyn Executor>> {
+        Self::build(
+            plan,
+            &Statement::Select(select.clone()),
+            Arc::new(Domain::new()),
+            "",
+        )
     }
 
     pub fn run(mut exec: Box<dyn Executor>) -> Result<QueryResult> {

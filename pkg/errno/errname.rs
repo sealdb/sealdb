@@ -2,6 +2,11 @@ use crate::errcode;
 
 pub fn name_of(code: i32) -> &'static str {
     match code {
+        errcode::ERR_DB_CREATE_EXISTS => "ErrDBCreateExists",
+        errcode::ERR_DB_DROP_EXISTS => "ErrDBDropExists",
+        errcode::ERR_NO_DB => "ErrNoDB",
+        errcode::ERR_BAD_DB => "ErrBadDB",
+        errcode::ERR_TABLE_EXISTS => "ErrTableExists",
         errcode::ERR_PARSE_ERROR => "ErrParseError",
         errcode::ERR_UNKNOWN_TABLE => "ErrUnknownTable",
         errcode::ERR_NO_SUCH_TABLE => "ErrNoSuchTable",
@@ -24,6 +29,9 @@ pub fn name_of(code: i32) -> &'static str {
 
 pub fn sqlstate_of(code: i32) -> &'static str {
     match code {
+        errcode::ERR_NO_DB => "3D000",
+        errcode::ERR_BAD_DB => "42000",
+        errcode::ERR_TABLE_EXISTS => "42S01",
         errcode::ERR_PARSE_ERROR => "42000",
         errcode::ERR_NO_SUCH_TABLE => "42S02",
         errcode::ERR_DUP_ENTRY => "23000",
