@@ -18,7 +18,7 @@
     "F10": {"status": "core-ported", "phase": 5, "notes": "CREATE TABLE INDEX/KEY + index KV maintenance + IndexLookUp on indexed equality", "gaps": ["create-index-ddl", "unique-pk", "covering-reader", "range-scan"]},
     "F11": {"status": "core-ported", "phase": 3, "notes": "SHOW DATABASES/TABLES + DESC + USE", "gaps": ["information_schema-tables", "show-create", "show-full-columns"]},
     "F12": {"status": "core-ported", "phase": 6, "notes": "BEGIN/COMMIT/ROLLBACK + optimistic RR snapshot and write-conflict", "gaps": ["pessimistic", "savepoint", "isolation-modes", "transactional-ddl"]},
-    "F13": {"status": "not-started", "phase": 6, "gaps": []},
+    "F13": {"status": "core-ported", "phase": 6, "notes": "SELECT FOR UPDATE + BEGIN PESSIMISTIC exclusive lock and latest read", "gaps": ["for-share", "nowait-skip-locked", "blocking-wait", "deadlock", "tikv-pessimistic"]},
     "F14": {"status": "not-started", "phase": 8, "gaps": []},
     "F15": {"status": "not-started", "phase": 8, "gaps": []},
     "F16": {"status": "not-started", "phase": 8, "gaps": []},

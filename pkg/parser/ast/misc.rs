@@ -52,11 +52,16 @@ impl UseStmt {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct BeginStmt;
+pub struct BeginStmt {
+    pub pessimistic: bool,
+}
 
 impl BeginStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("BEGIN");
+        if self.pessimistic {
+            ctx.write_str(" PESSIMISTIC");
+        }
         Ok(())
     }
 }

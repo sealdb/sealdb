@@ -21,12 +21,14 @@ pub struct IndexLookUpExecutor {
     lookup: Datum,
     current_db: String,
     txn: Arc<TxnHandle>,
+    for_update: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
 }
 
 impl IndexLookUpExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: Arc<Domain>,
         table: TableName,
@@ -34,6 +36,7 @@ impl IndexLookUpExecutor {
         lookup: Datum,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
+        for_update: bool,
     ) -> Self {
         Self {
             domain,
@@ -42,6 +45,7 @@ impl IndexLookUpExecutor {
             lookup,
             current_db: current_db.into(),
             txn,
+            for_update,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -76,12 +80,21 @@ impl Executor for IndexLookUpExecutor {
         let start = encode_index_seek_prefix(info.id, index.id, std::slice::from_ref(&self.lookup));
         let end = next_prefix(start.as_bytes());
         self.rows = self.txn.with_txn(|txn| {
-            let pairs = txn.scan(start.as_bytes(), &end)?;
+            let pairs = if self.for_update {
+                txn.scan_for_update(start.as_bytes(), &end)?
+            } else {
+                txn.scan(start.as_bytes(), &end)?
+            };
             let mut rows = Vec::new();
             for (key, _) in pairs {
                 let handle = decode_handle_from_index_key(&key)?;
                 let row_key = encode_row_key_with_handle(info.id, handle);
-                if let Some(raw) = txn.get(row_key.as_bytes())? {
+                let raw = if self.for_update {
+                    txn.get_for_update(row_key.as_bytes())?
+                } else {
+                    txn.get(row_key.as_bytes())?
+                };
+                if let Some(raw) = raw {
                     let decoded = decode_row(&raw);
                     rows.push(
                         info.columns

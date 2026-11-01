@@ -5,7 +5,8 @@ use crate::ast::ddl::{
     TableName,
 };
 use crate::ast::dml::{
-    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectStmt, UpdateStmt,
+    Assignment, ByItem, DeleteStmt, InsertStmt, Join, JoinType, SelectField, SelectLock,
+    SelectStmt, UpdateStmt,
 };
 use crate::ast::expressions::{
     BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
@@ -17,20 +18,33 @@ use sealdb_types::Datum;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, DataType, Delete, DescribeAlias, Expr, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, ObjectName, ObjectType, OrderByKind, OrderBySort, SchemaName, SelectItem, SetExpr,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Update, Use, Value, Values,
+    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByKind, OrderBySort,
+    SchemaName, SelectItem, SetExpr, Statement as SqlStatement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Update, Use, Value, Values,
 };
 use sqlparser::parser::Parser;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
-    let stmts = Parser::parse_sql(&dialect(), sql).map_err(|e| {
+    let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
             format!("You have an error in your SQL syntax: {e}"),
         )
     })?;
-    stmts.iter().map(lower_statement).collect()
+    let mut flags = pessimistic_flags.into_iter();
+    stmts
+        .iter()
+        .map(|stmt| {
+            let mut lowered = lower_statement(stmt)?;
+            if let Statement::Begin(begin) = &mut lowered
+                && flags.next() == Some(true)
+            {
+                begin.pessimistic = true;
+            }
+            Ok(lowered)
+        })
+        .collect()
 }
 
 fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
@@ -60,6 +74,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     order_by,
                     limit,
                     offset,
+                    lock: lower_select_lock(&query.locks)?,
                     text: query.to_string(),
                 }))
             }
@@ -235,15 +250,15 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             exception,
             ..
         } => {
-            // F12 gap / F13 leftover: pessimistic, isolation modes, read-only,
-            // causal consistency, BEGIN ... END blocks.
+            // F12/F13 gap: isolation modes, read-only, causal consistency,
+            // BEGIN ... END blocks. BEGIN PESSIMISTIC is rewritten before parse.
             if !modes.is_empty() {
                 return Err(Error::unsupported("START TRANSACTION modes"));
             }
             if !statements.is_empty() || exception.is_some() {
                 return Err(Error::unsupported("BEGIN block"));
             }
-            Ok(Statement::Begin(BeginStmt))
+            Ok(Statement::Begin(BeginStmt { pessimistic: false }))
         }
         SqlStatement::Commit {
             chain, modifier, ..
@@ -267,6 +282,92 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             ERR_UNSUPPORTED,
             format!("statement {other} is not available in this phase"),
         )),
+    }
+}
+
+fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {
+    let mut out = String::with_capacity(sql.len());
+    let mut flags = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "START") {
+            let after_start = skip_ws(bytes, i + 5);
+            if keyword_at(bytes, after_start, "TRANSACTION") {
+                let after_txn = skip_ws(bytes, after_start + "TRANSACTION".len());
+                let pessimistic = keyword_at(bytes, after_txn, "PESSIMISTIC");
+                flags.push(pessimistic);
+                out.push_str(&sql[i..after_start + "TRANSACTION".len()]);
+                i = if pessimistic {
+                    after_txn + "PESSIMISTIC".len()
+                } else {
+                    after_start + "TRANSACTION".len()
+                };
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "BEGIN") {
+            let after = skip_ws(bytes, i + 5);
+            let pessimistic = keyword_at(bytes, after, "PESSIMISTIC");
+            flags.push(pessimistic);
+            out.push_str("BEGIN");
+            i = if pessimistic {
+                after + "PESSIMISTIC".len()
+            } else {
+                i + 5
+            };
+            continue;
+        }
+        out.push(sql[i..].chars().next().unwrap());
+        i += sql[i..].chars().next().unwrap().len_utf8();
+    }
+    (out, flags)
+}
+
+fn keyword_at(bytes: &[u8], i: usize, keyword: &str) -> bool {
+    let end = i + keyword.len();
+    if end > bytes.len() {
+        return false;
+    }
+    if i > 0 && is_ident_byte(bytes[i - 1]) {
+        return false;
+    }
+    if end < bytes.len() && is_ident_byte(bytes[end]) {
+        return false;
+    }
+    bytes[i..end].eq_ignore_ascii_case(keyword.as_bytes())
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
+    if locks.is_empty() {
+        return Ok(SelectLock::None);
+    }
+    if locks.len() != 1 {
+        return Err(Error::unsupported("multiple SELECT lock clauses"));
+    }
+    let lock = &locks[0];
+    if lock.of.is_some() {
+        return Err(Error::unsupported("FOR UPDATE OF"));
+    }
+    match lock.nonblock {
+        Some(NonBlock::Nowait) => return Err(Error::unsupported("FOR UPDATE NOWAIT")),
+        Some(NonBlock::SkipLocked) => return Err(Error::unsupported("FOR UPDATE SKIP LOCKED")),
+        None => {}
+    }
+    match lock.lock_type {
+        LockType::Update => Ok(SelectLock::ForUpdate),
+        LockType::Share => Err(Error::unsupported("FOR SHARE")),
     }
 }
 

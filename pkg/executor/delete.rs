@@ -1,4 +1,5 @@
 // F07 core path: single-table DELETE.
+// F13: pessimistic DELETE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: multi-table DELETE, JOIN / USING,
 // ORDER BY / LIMIT, RETURNING, MySQL-protocol affected-row counts.
 use crate::index::delete_index_keys;
@@ -56,7 +57,8 @@ impl Executor for DeleteExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let rows = scan_table(&self.txn, &info)?;
+        let for_update = self.txn.with_txn(|txn| Ok(txn.is_pessimistic()))?;
+        let rows = scan_table(&self.txn, &info, for_update)?;
         self.txn.with_txn(|txn| {
             for scanned in rows {
                 if let Some(filter) = &self.stmt.selection

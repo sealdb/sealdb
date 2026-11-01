@@ -14,6 +14,7 @@ pub struct PointGetExec {
     handle: i64,
     current_db: String,
     txn: Arc<TxnHandle>,
+    for_update: bool,
     schema: Vec<String>,
     row: Option<Vec<Datum>>,
     emitted: bool,
@@ -26,6 +27,7 @@ impl PointGetExec {
         handle: i64,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
+        for_update: bool,
     ) -> Self {
         Self {
             domain,
@@ -33,6 +35,7 @@ impl PointGetExec {
             handle,
             current_db: current_db.into(),
             txn,
+            for_update,
             schema: Vec::new(),
             row: None,
             emitted: false,
@@ -61,7 +64,13 @@ impl Executor for PointGetExec {
         let key = encode_row_key_with_handle(info.id, self.handle);
         self.row = self
             .txn
-            .with_txn(|txn| txn.get(key.as_bytes()))?
+            .with_txn(|txn| {
+                if self.for_update {
+                    txn.get_for_update(key.as_bytes())
+                } else {
+                    txn.get(key.as_bytes())
+                }
+            })?
             .map(|raw| {
                 let decoded = decode_row(&raw);
                 info.columns

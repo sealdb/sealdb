@@ -34,6 +34,13 @@ pub struct SelectField {
     pub as_name: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SelectLock {
+    #[default]
+    None,
+    ForUpdate,
+}
+
 #[derive(Clone, Debug)]
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
@@ -44,6 +51,7 @@ pub struct SelectStmt {
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    pub lock: SelectLock,
     pub text: String,
 }
 
@@ -114,6 +122,9 @@ impl SelectStmt {
             ctx.write_str(" LIMIT ");
             ctx.write_str(&offset.to_string());
             ctx.write_str(",18446744073709551615");
+        }
+        if self.lock == SelectLock::ForUpdate {
+            ctx.write_str(" FOR UPDATE");
         }
         Ok(())
     }

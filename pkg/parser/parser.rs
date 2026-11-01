@@ -237,6 +237,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_for_update_and_begin_pessimistic() {
+        let parser = Parser::new();
+        let select = parser.parse_one_stmt("SELECT * FROM t FOR UPDATE").unwrap();
+        assert_eq!(
+            select.as_select().unwrap().lock,
+            crate::ast::SelectLock::ForUpdate
+        );
+        match parser.parse_one_stmt("BEGIN PESSIMISTIC").unwrap() {
+            crate::ast::Statement::Begin(begin) => assert!(begin.pessimistic),
+            other => panic!("expected BeginStmt, got {other:?}"),
+        }
+        let mixed = parser.parse_sql("BEGIN; BEGIN PESSIMISTIC").unwrap();
+        match (&mixed[0], &mixed[1]) {
+            (crate::ast::Statement::Begin(first), crate::ast::Statement::Begin(second)) => {
+                assert!(!first.pessimistic);
+                assert!(second.pessimistic);
+            }
+            other => panic!("expected two BeginStmts, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("START TRANSACTION PESSIMISTIC")
+            .unwrap()
+        {
+            crate::ast::Statement::Begin(begin) => assert!(begin.pessimistic),
+            other => panic!("expected BeginStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("SELECT * FROM t FOR SHARE")
+            .unwrap_err();
+        assert!(err.message.contains("FOR SHARE"));
+        let err = parser
+            .parse_one_stmt("SELECT * FROM t FOR UPDATE NOWAIT")
+            .unwrap_err();
+        assert!(err.message.contains("FOR UPDATE NOWAIT"));
+        let err = parser
+            .parse_one_stmt("SELECT * FROM t FOR UPDATE SKIP LOCKED")
+            .unwrap_err();
+        assert!(err.message.contains("FOR UPDATE SKIP LOCKED"));
+    }
+
+    #[test]
     fn test_parse_create_table_index() {
         let parser = Parser::new();
         let stmt = parser

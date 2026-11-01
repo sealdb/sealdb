@@ -15,8 +15,8 @@ use crate::update::UpdateExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{Storage, TxnHandle};
-use sealdb_parser::ast::Statement;
 use sealdb_parser::ast::expressions::ExprNode;
+use sealdb_parser::ast::{SelectLock, Statement};
 use sealdb_planner::PhysicalPlan;
 use std::sync::Arc;
 
@@ -146,12 +146,16 @@ impl ExecutorBuilder {
                     lookup,
                     current_db.to_string(),
                     txn,
+                    select.lock == SelectLock::ForUpdate,
                 )))
             }
             PhysicalPlan::PointGet { handle, .. } => {
-                let from = stmt
+                let select = stmt
                     .as_select()
-                    .and_then(|s| s.from.clone())
+                    .ok_or_else(|| Error::unsupported("point get without FROM"))?;
+                let from = select
+                    .from
+                    .clone()
                     .ok_or_else(|| Error::unsupported("point get without FROM"))?;
                 Ok(Box::new(PointGetExec::new(
                     domain,
@@ -159,15 +163,20 @@ impl ExecutorBuilder {
                     *handle,
                     current_db.to_string(),
                     txn,
+                    select.lock == SelectLock::ForUpdate,
                 )))
             }
             PhysicalPlan::TableReader { table } => {
                 let from = resolve_reader_table(stmt, table)?;
+                let for_update = stmt
+                    .as_select()
+                    .is_some_and(|s| s.lock == SelectLock::ForUpdate);
                 Ok(Box::new(TableReaderExec::new(
                     domain,
                     from,
                     current_db.to_string(),
                     txn,
+                    for_update,
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),

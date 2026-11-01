@@ -2,9 +2,9 @@ use sealdb_errno::Result;
 use sealdb_kv::{Storage, TxnHandle};
 use std::sync::Arc;
 
-/// Session-owned transaction lifecycle for F12.
+/// Session-owned transaction lifecycle for F12/F13.
 /// Completeness wave / not this feature: SAVEPOINT, AND CHAIN, XA,
-/// transactional DDL, isolation switching, pessimistic enter (F13).
+/// transactional DDL, isolation switching, blocking lock wait.
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,
@@ -23,10 +23,23 @@ impl TxnManager {
     }
 
     pub fn enter_begin(&mut self, storage: &dyn Storage) -> Result<()> {
+        self.enter(storage, false)
+    }
+
+    pub fn enter_begin_pessimistic(&mut self, storage: &dyn Storage) -> Result<()> {
+        self.enter(storage, true)
+    }
+
+    fn enter(&mut self, storage: &dyn Storage, pessimistic: bool) -> Result<()> {
         if self.handle.is_some() {
             self.commit()?;
         }
-        self.handle = Some(Arc::new(TxnHandle::new(storage.begin()?)));
+        let txn = if pessimistic {
+            storage.begin_pessimistic()?
+        } else {
+            storage.begin()?
+        };
+        self.handle = Some(Arc::new(TxnHandle::new(txn)));
         self.explicit = true;
         Ok(())
     }
