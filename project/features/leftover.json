@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F16": [
-      "frame-clause",
       "named-window",
       "lag-lead",
       "ignore-nulls",

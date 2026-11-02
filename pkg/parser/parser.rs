@@ -802,12 +802,27 @@ mod tests {
             .parse_one_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM t")
             .unwrap_err();
         assert!(err.message.contains("window function"));
-        let err = parser
+        match &parser
             .parse_one_stmt(
                 "SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
             )
-            .unwrap_err();
-        assert!(err.message.contains("frame"));
+            .unwrap()
+            .as_select()
+            .unwrap()
+            .fields[0]
+            .expr
+        {
+            crate::ast::ExprNode::Window(w) => {
+                let frame = w.spec.frame.as_ref().expect("frame");
+                assert_eq!(frame.units, crate::ast::WindowFrameUnits::Rows);
+                assert_eq!(
+                    frame.start,
+                    crate::ast::WindowFrameBound::UnboundedPreceding
+                );
+                assert_eq!(frame.end, crate::ast::WindowFrameBound::CurrentRow);
+            }
+            other => panic!("expected Window, got {other:?}"),
+        }
     }
 
     #[test]
