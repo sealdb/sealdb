@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F16
 
-- `named-window`
 - `lag-lead`
 - `ignore-nulls`
 - `pipelined-window`

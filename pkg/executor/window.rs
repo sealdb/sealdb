@@ -1,6 +1,6 @@
 // F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
 // COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
-// Completeness wave / not this feature: named windows, LAG/LEAD/FIRST_VALUE/NTILE,
+// Completeness wave / not this feature: LAG/LEAD/FIRST_VALUE/NTILE,
 // IGNORE NULLS, pipelined window.
 use crate::aggfuncs::{AggFunc, build_agg_func};
 use crate::internal::exec::Executor;

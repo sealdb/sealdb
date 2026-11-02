@@ -2793,6 +2793,20 @@ mod tests {
                 vec!["4".to_string(), "10".to_string()]
             ]
         );
+        let named = session
+            .execute_stmt(
+                "SELECT id, name, ROW_NUMBER() OVER w FROM db1.t WINDOW w AS (PARTITION BY name ORDER BY id) ORDER BY name, id",
+            )
+            .unwrap();
+        assert_eq!(
+            named.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string(), "1".to_string()],
+                vec!["2".to_string(), "a".to_string(), "2".to_string()],
+                vec!["4".to_string(), "a".to_string(), "3".to_string()],
+                vec!["3".to_string(), "b".to_string(), "1".to_string()]
+            ]
+        );
         let sliding = session
             .execute_stmt(
                 "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM db1.t ORDER BY id",

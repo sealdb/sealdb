@@ -746,6 +746,8 @@ pub struct WindowFuncExpr {
     pub name: String,
     pub args: Vec<ExprNode>,
     pub spec: WindowSpec,
+    /// `OVER w` / `OVER (w ...)` until the SELECT `WINDOW` clause is applied.
+    pub window_ref: Option<String>,
 }
 
 impl WindowFuncExpr {
