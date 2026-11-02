@@ -349,7 +349,7 @@
     "pkg/ddl/create_table.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY"
+      "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY + LIKE / AS SELECT"
     },
     "pkg/ddl/index.go": {
       "status": "partial",

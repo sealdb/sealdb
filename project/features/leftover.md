@@ -10,7 +10,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ### F02
 
 - `online-ddl-jobs`
-- `create-like-as-select`
 - `indexes`
 
 ### F03

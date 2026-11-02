@@ -55,6 +55,7 @@ case "$FEATURE" in
     ;;
   F02)
     run execute-createdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1"
+    run execute-create-like-as-select cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.src (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.src VALUES (1, 'a'), (2, 'b'); CREATE TABLE db1.like_t LIKE db1.src; CREATE TABLE db1.ctas AS SELECT * FROM db1.src; SELECT * FROM db1.like_t; SELECT * FROM db1.ctas ORDER BY id"
     ;;
   F11)
     run execute-showdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'db1'"

@@ -1,3 +1,4 @@
+use super::dml::SelectStmt;
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -143,6 +144,10 @@ pub struct CreateTableStmt {
     pub cols: Vec<ColumnDef>,
     pub indices: Vec<IndexDef>,
     pub partition: Option<PartitionOption>,
+    /// TiDB `ReferTable` (`CREATE TABLE t LIKE src`).
+    pub refer_table: Option<TableName>,
+    /// TiDB `Select` (`CREATE TABLE t AS SELECT ...`).
+    pub select: Option<Box<SelectStmt>>,
 }
 
 impl CreateTableStmt {
@@ -152,18 +157,23 @@ impl CreateTableStmt {
             ctx.write_str("IF NOT EXISTS ");
         }
         self.table.restore(ctx)?;
-        ctx.write_str(" (");
-        for (i, col) in self.cols.iter().enumerate() {
-            if i > 0 {
-                ctx.write_str(",");
+        if let Some(refer) = &self.refer_table {
+            ctx.write_str(" LIKE ");
+            refer.restore(ctx)?;
+        } else if !self.cols.is_empty() || !self.indices.is_empty() {
+            ctx.write_str(" (");
+            for (i, col) in self.cols.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                col.restore(ctx)?;
             }
-            col.restore(ctx)?;
+            for index in &self.indices {
+                ctx.write_str(",");
+                index.restore(ctx)?;
+            }
+            ctx.write_str(")");
         }
-        for index in &self.indices {
-            ctx.write_str(",");
-            index.restore(ctx)?;
-        }
-        ctx.write_str(")");
         if let Some(part) = &self.partition {
             ctx.write_str(" PARTITION BY ");
             match part.tp {
@@ -195,6 +205,10 @@ impl CreateTableStmt {
                 }
                 ctx.write_str(")");
             }
+        }
+        if let Some(select) = &self.select {
+            ctx.write_str(" AS ");
+            select.restore(ctx)?;
         }
         Ok(())
     }

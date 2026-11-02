@@ -25,14 +25,14 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
-    BinaryOperator, Cte, CteAsMaterialized, DataType, Delete, DescribeAlias, DuplicateTreatment,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Grant,
-    GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause,
-    LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges,
-    Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier,
-    ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use, Value,
-    Values, WindowType, With,
+    BinaryOperator, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized, DataType, Delete,
+    DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
+    SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update,
+    Use, Value, Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -98,35 +98,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             if_not_exists: *if_not_exists,
             name: schema_name_last(schema_name)?,
         })),
-        SqlStatement::CreateTable(create) => {
-            // F02/F18 gaps: TEMPORARY, LIKE, AS SELECT stay deferred.
-            if create.temporary || create.query.is_some() || create.like.is_some() {
-                return Err(Error::unsupported(
-                    "TEMPORARY / LIKE / AS SELECT CREATE TABLE",
-                ));
-            }
-            let cols = create
-                .columns
-                .iter()
-                .map(|col| {
-                    Ok(ColumnDef {
-                        name: col.name.value.clone(),
-                        type_name: col.data_type.to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if cols.is_empty() {
-                return Err(Error::unsupported("CREATE TABLE without columns"));
-            }
-            let indices = lower_table_indices(&create.constraints)?;
-            Ok(Statement::CreateTable(CreateTableStmt {
-                if_not_exists: create.if_not_exists,
-                table: object_table_name(&create.name)?,
-                cols,
-                indices,
-                partition: None,
-            }))
-        }
+        SqlStatement::CreateTable(create) => lower_create_table(create),
         SqlStatement::CreateIndex(create) => lower_create_index(create),
         SqlStatement::Drop {
             object_type: ObjectType::Index,
@@ -1784,6 +1756,57 @@ fn table_from_relation(table: &TableWithJoins) -> Result<TableName> {
         TableFactor::Table { name, .. } => object_table_name(name),
         other => Err(Error::unsupported(format!("DML target {other}"))),
     }
+}
+
+fn lower_create_table(create: &CreateTable) -> Result<Statement> {
+    // F02 leftover: LIKE / AS SELECT. TEMPORARY stays deferred (F02 gaps).
+    if create.temporary {
+        return Err(Error::unsupported("TEMPORARY CREATE TABLE"));
+    }
+    let refer_table = match &create.like {
+        Some(CreateTableLikeKind::Plain(like) | CreateTableLikeKind::Parenthesized(like)) => {
+            if like.defaults.is_some() {
+                return Err(Error::unsupported(
+                    "CREATE TABLE LIKE INCLUDING/EXCLUDING DEFAULTS",
+                ));
+            }
+            Some(object_table_name(&like.name)?)
+        }
+        None => None,
+    };
+    let select = match create.query.as_deref() {
+        Some(query) => Some(Box::new(lower_query(query)?)),
+        None => None,
+    };
+    if refer_table.is_some() && select.is_some() {
+        return Err(Error::unsupported("CREATE TABLE LIKE ... AS SELECT"));
+    }
+    if refer_table.is_some() && (!create.columns.is_empty() || !create.constraints.is_empty()) {
+        return Err(Error::unsupported("CREATE TABLE LIKE with column list"));
+    }
+    let cols = create
+        .columns
+        .iter()
+        .map(|col| {
+            Ok(ColumnDef {
+                name: col.name.value.clone(),
+                type_name: col.data_type.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if cols.is_empty() && refer_table.is_none() && select.is_none() {
+        return Err(Error::unsupported("CREATE TABLE without columns"));
+    }
+    let indices = lower_table_indices(&create.constraints)?;
+    Ok(Statement::CreateTable(CreateTableStmt {
+        if_not_exists: create.if_not_exists,
+        table: object_table_name(&create.name)?,
+        cols,
+        indices,
+        partition: None,
+        refer_table,
+        select,
+    }))
 }
 
 fn lower_values(values: &Values) -> Result<Vec<Vec<crate::ast::expressions::ExprNode>>> {

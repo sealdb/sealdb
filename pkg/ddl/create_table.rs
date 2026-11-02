@@ -1,6 +1,10 @@
-use sealdb_errno::{Error, Result};
-use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, TableInfo};
-use sealdb_parser::ast::CreateTableStmt;
+use sealdb_errno::{ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_NO_SUCH_TABLE, Error, Result};
+use sealdb_infoschema::InfoSchema;
+use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
+use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt, TableName};
+use sealdb_parser::model::CIStr;
+use sealdb_types::Datum;
 use sealdb_types::field_type::{
     FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_FLOAT, TYPE_LONG,
     TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY, TYPE_VAR_STRING,
@@ -43,6 +47,185 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         info.max_idx_id = idx_id;
     }
     Ok(info)
+}
+
+/// TiDB `BuildTableInfoWithLike`: clone columns/indexes/partitions, new table
+/// and partition IDs so row keys do not collide with the source.
+pub(crate) fn build_table_info_with_like(
+    name: &str,
+    refer: &TableInfo,
+    table_id: i64,
+    meta: &mut Mutator,
+) -> Result<TableInfo> {
+    let mut info = refer.clone();
+    info.id = table_id;
+    info.name = CIStr::new(name);
+    for idx in &mut info.indices {
+        idx.table = CIStr::new(name);
+    }
+    if let Some(part) = &mut info.partition {
+        for def in &mut part.definitions {
+            def.id = meta.gen_global_id()?;
+        }
+    }
+    Ok(info)
+}
+
+pub(crate) fn columns_from_select(
+    is: &InfoSchema,
+    select: &SelectStmt,
+    current_db: &str,
+) -> Result<Vec<ColumnDef>> {
+    let sources = select_source_tables(is, select, current_db)?;
+    let mut cols = Vec::new();
+    for (i, field) in select.fields.iter().enumerate() {
+        if is_star_expr(&field.expr) {
+            if sources.is_empty() {
+                return Err(Error::unsupported("CREATE TABLE AS SELECT * without FROM"));
+            }
+            for table in &sources {
+                for col in &table.columns {
+                    push_select_column(&mut cols, col.name.o(), col.field_type.type_name())?;
+                }
+            }
+            continue;
+        }
+        let name = field_column_name(field, i);
+        let type_name = type_name_from_expr(&field.expr, &sources)?;
+        push_select_column(&mut cols, &name, type_name)?;
+    }
+    if cols.is_empty() {
+        return Err(Error::unsupported("CREATE TABLE AS SELECT without columns"));
+    }
+    Ok(cols)
+}
+
+fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) -> Result<()> {
+    if cols.iter().any(|col| col.name.eq_ignore_ascii_case(name)) {
+        return Err(Error::new(
+            ERR_DUP_FIELDNAME,
+            format!("Duplicate column name '{name}'"),
+        ));
+    }
+    cols.push(ColumnDef {
+        name: name.to_string(),
+        type_name,
+    });
+    Ok(())
+}
+
+fn select_source_tables<'a>(
+    is: &'a InfoSchema,
+    select: &SelectStmt,
+    current_db: &str,
+) -> Result<Vec<&'a TableInfo>> {
+    let mut tables = Vec::new();
+    if let Some(join) = &select.join {
+        tables.push(lookup_table(is, &join.left, current_db)?);
+        tables.push(lookup_table(is, &join.right, current_db)?);
+    } else if let Some(from) = &select.from {
+        tables.push(lookup_table(is, from, current_db)?);
+    }
+    Ok(tables)
+}
+
+fn lookup_table<'a>(
+    is: &'a InfoSchema,
+    name: &TableName,
+    current_db: &str,
+) -> Result<&'a TableInfo> {
+    let (schema, table) = name.qualified(current_db);
+    is.table_by_name(&schema, &table).ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })
+}
+
+fn field_column_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> String {
+    if let Some(name) = &field.as_name
+        && !name.is_empty()
+    {
+        return name.clone();
+    }
+    match &field.expr {
+        ExprNode::Column(col) => col.name.clone(),
+        other => {
+            let restored = other.restore_string();
+            if restored.is_empty() {
+                format!("_{offset}")
+            } else {
+                restored
+            }
+        }
+    }
+}
+
+fn type_name_from_expr(expr: &ExprNode, sources: &[&TableInfo]) -> Result<String> {
+    match expr {
+        ExprNode::Column(col) => Ok(lookup_select_column(col, sources)?.field_type.type_name()),
+        ExprNode::Cast(cast) => Ok(cast.target.clone()),
+        ExprNode::Value(ValueExpr { datum }) => Ok(type_name_from_datum(datum).to_string()),
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("COUNT") => Ok("bigint".to_string()),
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("SUM") => Ok("decimal".to_string()),
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("AVG") => Ok("double".to_string()),
+        ExprNode::Window(_) => Ok("bigint".to_string()),
+        _ => Ok("varchar".to_string()),
+    }
+}
+
+fn lookup_select_column<'a>(
+    col: &ColumnNameExpr,
+    sources: &[&'a TableInfo],
+) -> Result<&'a ColumnInfo> {
+    let hinted = col.table.as_deref();
+    let mut found = None;
+    for table in sources {
+        if let Some(hint) = hinted
+            && !table.name.o().eq_ignore_ascii_case(hint)
+        {
+            continue;
+        }
+        if let Some(column) = table
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        {
+            if found.is_some() && hinted.is_none() {
+                return Err(Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Column '{0}' in field list is ambiguous", col.name),
+                ));
+            }
+            found = Some(column);
+        }
+    }
+    found.ok_or_else(|| {
+        Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column '{}' in 'field list'", col.name),
+        )
+    })
+}
+
+fn type_name_from_datum(datum: &Datum) -> &'static str {
+    match datum {
+        Datum::I64(_) | Datum::U64(_) => "int",
+        Datum::F64(_) => "double",
+        Datum::Decimal(_) => "decimal",
+        Datum::Time(_) => "datetime",
+        Datum::Bytes(_) | Datum::Null => "varchar",
+    }
+}
+
+fn is_star_expr(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b)
+        }) if b == b"*"
+    )
 }
 
 pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
