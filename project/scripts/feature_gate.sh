@@ -144,6 +144,7 @@ case "$FEATURE" in
     run execute-named-window cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'); SELECT id, name, ROW_NUMBER() OVER w FROM db1.t WINDOW w AS (PARTITION BY name ORDER BY id) ORDER BY name, id"
     run execute-lag-lead cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'a'); SELECT id, LAG(id) OVER (ORDER BY id), LEAD(id) OVER (ORDER BY id), FIRST_VALUE(id) OVER (ORDER BY id) FROM db1.t ORDER BY id"
     run execute-ignore-nulls cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, NULL), (2, 'a'), (3, NULL); SELECT id, FIRST_VALUE(name) IGNORE NULLS OVER (ORDER BY id) FROM db1.t ORDER BY id"
+    run execute-pipelined-window cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'a'); SELECT id, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM db1.t ORDER BY name, id"
     ;;
   F17)
     run execute-cte cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT * FROM c"

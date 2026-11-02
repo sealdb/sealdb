@@ -1,6 +1,7 @@
 // F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
 // COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
-// Completeness wave / not this feature: pipelined window.
+// Pipelined window: emit one chunk per partition when all windows share
+// the same PARTITION BY (TiDB pipelined window shape).
 use crate::aggfuncs::{AggFunc, build_agg_func};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
@@ -13,13 +14,13 @@ use sealdb_parser::ast::expressions::{
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
+use std::collections::VecDeque;
 
 pub struct WindowExec {
     child: Box<dyn Executor>,
     select: SelectStmt,
     schema: Vec<String>,
-    rows: Vec<Vec<Datum>>,
-    emitted: bool,
+    pending: VecDeque<Chunk>,
 }
 
 impl WindowExec {
@@ -29,8 +30,7 @@ impl WindowExec {
             child,
             select,
             schema,
-            rows: Vec::new(),
-            emitted: false,
+            pending: VecDeque::new(),
         }
     }
 }
@@ -45,36 +45,19 @@ impl Executor for WindowExec {
                 input.push(chunk.get_row(i));
             }
         }
-        let mut computed: Vec<Option<Vec<Datum>>> = vec![None; self.select.fields.len()];
-        for (i, field) in self.select.fields.iter().enumerate() {
-            if let ExprNode::Window(window) = &field.expr {
-                computed[i] = Some(eval_window(window, &input_schema, &input)?);
-            }
-        }
-        for (idx, row) in input.iter().enumerate() {
-            let mut out = Vec::with_capacity(self.select.fields.len());
-            for (i, field) in self.select.fields.iter().enumerate() {
-                if let Some(values) = &computed[i] {
-                    out.push(values[idx].clone());
-                } else {
-                    out.push(eval_expr_with_row(&field.expr, &input_schema, row)?);
-                }
-            }
-            self.rows.push(out);
+        for subset in partition_subsets(&self.select, &input_schema, &input)? {
+            self.pending.push_back(eval_window_chunk(
+                &self.select,
+                &self.schema,
+                &input_schema,
+                &subset,
+            )?);
         }
         Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        if self.emitted {
-            return Ok(None);
-        }
-        self.emitted = true;
-        let mut chunk = Chunk::new(self.schema.len(), self.rows.len());
-        for row in self.rows.drain(..) {
-            chunk.append_row(row);
-        }
-        Ok(Some(chunk))
+        Ok(self.pending.pop_front())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -84,6 +67,90 @@ impl Executor for WindowExec {
     fn schema(&self) -> &[String] {
         &self.schema
     }
+}
+
+fn eval_window_chunk(
+    select: &SelectStmt,
+    schema: &[String],
+    input_schema: &[String],
+    input: &[Vec<Datum>],
+) -> Result<Chunk> {
+    let mut computed: Vec<Option<Vec<Datum>>> = vec![None; select.fields.len()];
+    for (i, field) in select.fields.iter().enumerate() {
+        if let ExprNode::Window(window) = &field.expr {
+            computed[i] = Some(eval_window(window, input_schema, input)?);
+        }
+    }
+    let mut chunk = Chunk::new(schema.len(), input.len());
+    for (idx, row) in input.iter().enumerate() {
+        let mut out = Vec::with_capacity(select.fields.len());
+        for (i, field) in select.fields.iter().enumerate() {
+            if let Some(values) = &computed[i] {
+                out.push(values[idx].clone());
+            } else {
+                out.push(eval_expr_with_row(&field.expr, input_schema, row)?);
+            }
+        }
+        chunk.append_row(out);
+    }
+    Ok(chunk)
+}
+
+/// Split input into partition subsets when every window shares PARTITION BY.
+/// Mixed partitions stay a single subset so we do not mis-group.
+fn partition_subsets(
+    select: &SelectStmt,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+) -> Result<Vec<Vec<Vec<Datum>>>> {
+    let keys = shared_partition_keys(select);
+    if keys.is_empty() || rows.is_empty() {
+        return Ok(vec![rows.to_vec()]);
+    }
+    let mut groups: Vec<Vec<Vec<Datum>>> = Vec::new();
+    let mut index: std::collections::HashMap<Vec<String>, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let key = keys
+            .iter()
+            .map(|expr| Ok(eval_expr_with_row(expr, schema, row)?.display()))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(pos) = index.get(&key) {
+            groups[*pos].push(row.clone());
+        } else {
+            index.insert(key, groups.len());
+            groups.push(vec![row.clone()]);
+        }
+    }
+    Ok(groups)
+}
+
+fn shared_partition_keys(select: &SelectStmt) -> Vec<ExprNode> {
+    let mut keys: Option<Vec<String>> = None;
+    let mut exprs: Vec<ExprNode> = Vec::new();
+    for field in &select.fields {
+        let ExprNode::Window(window) = &field.expr else {
+            continue;
+        };
+        let restored: Vec<String> = window
+            .spec
+            .partition_by
+            .iter()
+            .map(|expr| {
+                let mut ctx = RestoreCtx::new();
+                let _ = expr.restore(&mut ctx);
+                ctx.into_string()
+            })
+            .collect();
+        match &keys {
+            None => {
+                keys = Some(restored);
+                exprs = window.spec.partition_by.clone();
+            }
+            Some(existing) if existing == &restored => {}
+            Some(_) => return Vec::new(),
+        }
+    }
+    exprs
 }
 
 fn eval_window(
