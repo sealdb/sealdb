@@ -57,6 +57,12 @@
       "phase": 1,
       "notes": "row-oriented first cut"
     },
+    "pkg/util/chunk/row_in_disk.go": {
+      "status": "partial",
+      "rust": "pkg/util/chunk/row_in_disk.rs",
+      "phase": 5,
+      "notes": "row-encoded temp spill files; disk tracker / offset index deferred"
+    },
     "pkg/util/chunk/column.go": {
       "status": "partial",
       "phase": 1,
@@ -457,7 +463,13 @@
     "pkg/executor/sortexec/sort.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory SortExec"
+      "notes": "SortExec with sorted-run spill and k-way merge"
+    },
+    "pkg/executor/sortexec/sort_spill.go": {
+      "status": "partial",
+      "rust": "pkg/executor/sortexec/sort_spill.rs",
+      "phase": 5,
+      "notes": "sorted run files plus k-way merge; parallel sort deferred"
     },
     "pkg/executor/projection.go": {
       "status": "partial",
@@ -472,7 +484,13 @@
     "pkg/executor/aggregate/agg_hash_executor.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory HashAggExec without parallel workers"
+      "notes": "HashAggExec with group-key partition spill; parallel workers deferred"
+    },
+    "pkg/executor/aggregate/agg_spill.go": {
+      "status": "partial",
+      "rust": "pkg/executor/aggregate/agg_spill.rs",
+      "phase": 5,
+      "notes": "partition input rows by group key; recursive/partial-agg serialize deferred"
     },
     "pkg/executor/aggregate/agg_stream_executor.go": {
       "status": "partial",
@@ -513,7 +531,13 @@
     "pkg/executor/join/hash_join_v1.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory two-table HashJoinV1Exec"
+      "notes": "two-table HashJoinV1Exec with join-key partition spill"
+    },
+    "pkg/executor/join/hash_join_spill.go": {
+      "status": "partial",
+      "rust": "pkg/executor/join/hash_join_spill.rs",
+      "phase": 5,
+      "notes": "partition both join sides by key; parallel workers deferred"
     },
     "pkg/session/session.go": {
       "status": "partial",

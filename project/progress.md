@@ -110,6 +110,19 @@
 
 ### 2026-11-02
 
+- **Phase**: leftover spill（HashAgg / Sort / HashJoin）
+- **完成**:
+  - `DataInDiskByRows` 行编码落盘
+  - HashAgg 按 group key 分区 spill；Sort 有序 run + k-way merge；HashJoin 两侧按 join key 分区
+  - `SEALDB_SPILL_MEM_ROWS` 控制内存行阈值（默认不 spill）
+- **验证**:
+  - executor 单元测试 spill vs in-memory；F05/F08/F09 gate
+- **下一步**:
+  - leftover unique-pk / covering-reader / remaining SHOW
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F08 leftover（StreamAgg）
 - **完成**:
   - 无 GROUP BY 的标量聚合走 StreamAgg；GROUP BY 仍 HashAgg

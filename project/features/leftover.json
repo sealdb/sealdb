@@ -43,7 +43,6 @@
     "F03": [
       "rowcodec"
     ],
-    "F04": [],
     "F05": [
       "topn-spill",
       "parallel-sort"
@@ -58,21 +57,16 @@
       "order-limit",
       "returning"
     ],
-    "F08": [
-      "spill"
-    ],
     "F09": [
       "semi-anti",
       "cross-join",
-      "n-table",
-      "spill"
+      "n-table"
     ],
     "F10": [
       "unique-pk",
       "covering-reader",
       "range-scan"
     ],
-    "F11": [],
     "F12": [
       "pessimistic",
       "savepoint",
