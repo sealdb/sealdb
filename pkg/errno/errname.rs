@@ -27,6 +27,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_WRITE_CONFLICT => "ErrWriteConflict",
         errcode::ERR_LOCK_WAIT_TIMEOUT => "ErrLockWaitTimeout",
         errcode::ERR_LOCK_NOWAIT => "ErrLockNoWait",
+        errcode::ERR_LOCK_DEADLOCK => "ErrLockDeadlock",
         errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "ErrWrongNumberOfColumnsInSelect",
         errcode::ERR_DUP_FIELDNAME => "ErrDupFieldName",
@@ -60,6 +61,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_DIVISION_BY_ZERO => "22012",
         errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "25006",
+        errcode::ERR_LOCK_DEADLOCK => "40001",
         _ => "HY000",
     }
 }
