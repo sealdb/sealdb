@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C2 EXPLAIN ANALYZE MVB；完整性波 C4=[] → C2→C5）  
+> 最后更新：2026-11-03（C2 cop-task-rows MVB；完整性波 C4=[] → C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C2（cop-task-rows）
+- **完成**:
+  - DistSQL `TableReader` / `IndexReader` / `IndexLookUp` EXPLAIN 展开 TiDB 风格 cop 子树（`TableFullScan` / `IndexRangeScan` / `TableRowIDScan`），`task=cop` + 非空 `estRows` / access object
+  - Reader 本身为 `root`；pushed filter 时插入 cop `Selection`
+  - C2 gate `execute-cop-task-rows`；`status.json` 去掉 `cop-task-rows`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_explain_cop_task_rows`
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - C2 `n-table-dp` → `index-merge-join` → `cost-model-v2`
 
 ### 2026-11-03
 

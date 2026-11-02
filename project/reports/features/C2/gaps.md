@@ -1,10 +1,10 @@
 # C2 gaps
 
-C2 ports EXPLAIN row/json/dot/ANALYZE, costed access-path skyline, and
-two-table Inner JoinReorder. These stay out of this door:
+C2 ports EXPLAIN row/json/dot/ANALYZE, DistSQL cop-task rows
+(`TableFullScan` / `IndexRangeScan` under readers), costed access-path
+skyline, and two-table Inner JoinReorder. These stay out of this door:
 
 - `EXPLAIN FOR CONNECTION`
-- Coprocessor task rows (`TableFullScan` under `TableReader`)
 - FORMAT=brief/verbose extra columns and per-operator RuntimeStats
 - n-table DP / greedy JoinReorder, bushy trees, outer-join assoc
 - IndexMerge / IndexJoin / MergeJoin skyline

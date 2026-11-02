@@ -19,7 +19,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### C2
 
-- `cop-task-rows`
 - `n-table-dp`
 - `index-merge-join`
 - `cost-model-v2`
@@ -148,7 +147,7 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
 - Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).
-- C2: cop-task rows / n-table DP / IndexMerge / cost-model-v2 stay open (EXPLAIN ANALYZE MVB done).
+- C2: n-table DP / IndexMerge / cost-model-v2 stay open (EXPLAIN ANALYZE + cop-task-rows MVB done).
 - C3: TiKV cross-cluster and MDL stay open.
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.

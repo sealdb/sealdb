@@ -42,7 +42,6 @@
       "leftover-suite-execution"
     ],
     "C2": [
-      "cop-task-rows",
       "n-table-dp",
       "index-merge-join",
       "cost-model-v2"
