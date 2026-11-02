@@ -2821,10 +2821,32 @@ mod tests {
                 vec!["4".to_string(), "7".to_string()]
             ]
         );
-        let err = session
-            .execute_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM db1.t")
-            .unwrap_err();
-        assert!(err.message.contains("window function"));
+        let lag = session
+            .execute_stmt("SELECT id, LAG(id) OVER (ORDER BY id), LEAD(id, 1, 0) OVER (ORDER BY id) FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            lag.display_rows(),
+            vec![
+                vec!["1".to_string(), "NULL".to_string(), "2".to_string()],
+                vec!["2".to_string(), "1".to_string(), "3".to_string()],
+                vec!["3".to_string(), "2".to_string(), "4".to_string()],
+                vec!["4".to_string(), "3".to_string(), "0".to_string()]
+            ]
+        );
+        let first = session
+            .execute_stmt(
+                "SELECT id, FIRST_VALUE(id) OVER (ORDER BY id), LAST_VALUE(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM db1.t ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            first.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string(), "4".to_string()],
+                vec!["2".to_string(), "1".to_string(), "4".to_string()],
+                vec!["3".to_string(), "1".to_string(), "4".to_string()],
+                vec!["4".to_string(), "1".to_string(), "4".to_string()]
+            ]
+        );
     }
 
     #[test]

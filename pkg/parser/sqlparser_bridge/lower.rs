@@ -2375,7 +2375,8 @@ fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
     }
     let name = func.name.to_string();
     match name.to_ascii_uppercase().as_str() {
-        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {}
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LAG"
+        | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "NTILE" => {}
         other => return Err(Error::unsupported(format!("window function {other}"))),
     }
     let args = match &func.args {
