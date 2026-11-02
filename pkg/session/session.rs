@@ -23,6 +23,7 @@ pub struct Session {
     current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
     isolation: Mutex<IsolationLevel>,
+    read_only: Mutex<bool>,
     prepared: Mutex<HashMap<String, String>>,
     plan_cache: Mutex<HashMap<String, (i64, PhysicalPlan)>>,
     cache_plans: Mutex<bool>,
@@ -49,6 +50,7 @@ impl Session {
             current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
             isolation: Mutex::new(IsolationLevel::RepeatableRead),
+            read_only: Mutex::new(false),
             prepared: Mutex::new(HashMap::new()),
             plan_cache: Mutex::new(HashMap::new()),
             cache_plans: Mutex::new(false),
@@ -103,6 +105,12 @@ impl Session {
             stmt
         };
         self.check_privilege(stmt)?;
+        if is_write_stmt(stmt) && self.in_read_only() {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION,
+                "Cannot execute statement in a READ ONLY transaction.",
+            ));
+        }
         match stmt {
             Statement::Use(use_stmt) => {
                 let is = self.domain.infoschema();
@@ -121,8 +129,13 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::SetTxn(set) => {
-                *self.isolation.lock().expect("session isolation lock") =
-                    map_isolation(set.isolation);
+                if let Some(isolation) = set.isolation {
+                    *self.isolation.lock().expect("session isolation lock") =
+                        map_isolation(isolation);
+                }
+                if let Some(read_only) = set.read_only {
+                    *self.read_only.lock().expect("session read_only lock") = read_only;
+                }
                 return Ok(empty_result());
             }
             Statement::Prepare(prepare) => {
@@ -160,35 +173,47 @@ impl Session {
                 return result;
             }
             Statement::Begin(begin) => {
-                let isolation = if begin.isolation != AstIsolation::RepeatableRead {
-                    map_isolation(begin.isolation)
-                } else {
-                    *self.isolation.lock().expect("session isolation lock")
-                };
+                let isolation = begin
+                    .isolation
+                    .map(map_isolation)
+                    .unwrap_or_else(|| *self.isolation.lock().expect("session isolation lock"));
+                let read_only = begin
+                    .read_only
+                    .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
                 let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
-                    txn.enter_begin_pessimistic(self.domain.as_ref(), schema_ver, isolation)?;
+                    txn.enter_begin_pessimistic(
+                        self.domain.as_ref(),
+                        schema_ver,
+                        isolation,
+                        read_only,
+                    )?;
                 } else {
-                    txn.enter_begin(self.domain.as_ref(), schema_ver, isolation)?;
+                    txn.enter_begin(self.domain.as_ref(), schema_ver, isolation, read_only)?;
                 }
                 return Ok(empty_result());
             }
-            Statement::Commit(_) => {
+            Statement::Commit(commit) => {
+                let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if txn.is_explicit() {
-                    sealdb_domain::schema_checker::check(
-                        txn.schema_ver(),
-                        self.domain.infoschema().schema_meta_version(),
-                    )?;
+                    sealdb_domain::schema_checker::check(txn.schema_ver(), schema_ver)?;
                 }
-                txn.commit()?;
+                if commit.chain {
+                    txn.chain(self.domain.as_ref(), schema_ver, true)?;
+                } else {
+                    txn.commit()?;
+                }
                 return Ok(empty_result());
             }
             Statement::Rollback(rb) => {
+                let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if let Some(name) = &rb.savepoint {
                     txn.rollback_to(name)?;
+                } else if rb.chain {
+                    txn.chain(self.domain.as_ref(), schema_ver, false)?;
                 } else {
                     txn.rollback()?;
                 }
@@ -629,6 +654,38 @@ fn map_isolation(level: AstIsolation) -> IsolationLevel {
     match level {
         AstIsolation::ReadCommitted => IsolationLevel::ReadCommitted,
         AstIsolation::RepeatableRead => IsolationLevel::RepeatableRead,
+    }
+}
+
+fn is_write_stmt(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateDatabase(_)
+            | Statement::DropDatabase(_)
+            | Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::Grant(_)
+            | Statement::Revoke(_)
+    )
+}
+
+impl Session {
+    fn in_read_only(&self) -> bool {
+        let (explicit, txn_ro) = {
+            let txn = self.txn.lock().expect("session txn lock");
+            (txn.is_explicit(), txn.is_read_only())
+        };
+        if explicit {
+            txn_ro
+        } else {
+            *self.read_only.lock().expect("session read_only lock")
+        }
     }
 }
 
@@ -1938,6 +1995,37 @@ mod tests {
             .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap_err();
         assert!(err.message.contains("SERIALIZABLE"));
+        session.execute_stmt("START TRANSACTION READ ONLY").unwrap();
+        let ro = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            ro.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let err = session
+            .execute_stmt("INSERT INTO db1.t VALUES (4, 'd')")
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            sealdb_errno::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
+        );
+        session.execute_stmt("ROLLBACK").unwrap();
+        session
+            .execute_stmt(
+                "START TRANSACTION READ WRITE; INSERT INTO db1.t VALUES (4, 'd'); COMMIT AND CHAIN",
+            )
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (5, 'e'); COMMIT")
+            .unwrap();
+        let chained = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(chained.display_rows().len(), 4);
     }
 
     #[test]

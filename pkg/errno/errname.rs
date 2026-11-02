@@ -36,6 +36,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
         errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
+        errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         _ => "ErrUnknown",
     }
 }
@@ -57,6 +58,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_DATA_OUT_OF_RANGE => "22003",
         errcode::ERR_DIVISION_BY_ZERO => "22012",
         errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
+        errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "25006",
         _ => "HY000",
     }
 }

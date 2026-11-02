@@ -15,7 +15,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ### F12
 
 - `pessimistic`
-- `isolation-modes`
 - `transactional-ddl`
 
 ### F13

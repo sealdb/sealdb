@@ -3,13 +3,14 @@ use sealdb_kv::{IsolationLevel, Storage, TxnHandle};
 use std::sync::Arc;
 
 /// Session-owned transaction lifecycle for F12/F13/C3.
-/// Completeness wave / not this feature: AND CHAIN, XA, transactional DDL,
-/// blocking lock wait.
+/// Completeness wave / not this feature: XA, transactional DDL, blocking lock wait.
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,
     schema_ver: i64,
     isolation: IsolationLevel,
+    read_only: bool,
+    pessimistic: bool,
 }
 
 impl TxnManager {
@@ -19,6 +20,8 @@ impl TxnManager {
             explicit: false,
             schema_ver: 0,
             isolation: IsolationLevel::RepeatableRead,
+            read_only: false,
+            pessimistic: false,
         }
     }
 
@@ -34,13 +37,19 @@ impl TxnManager {
         self.isolation
     }
 
+    /// True when the current explicit txn was started `READ ONLY`.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn enter_begin(
         &mut self,
         storage: &dyn Storage,
         schema_ver: i64,
         isolation: IsolationLevel,
+        read_only: bool,
     ) -> Result<()> {
-        self.enter(storage, false, schema_ver, isolation)
+        self.enter(storage, false, schema_ver, isolation, read_only)
     }
 
     pub fn enter_begin_pessimistic(
@@ -48,8 +57,9 @@ impl TxnManager {
         storage: &dyn Storage,
         schema_ver: i64,
         isolation: IsolationLevel,
+        read_only: bool,
     ) -> Result<()> {
-        self.enter(storage, true, schema_ver, isolation)
+        self.enter(storage, true, schema_ver, isolation, read_only)
     }
 
     fn enter(
@@ -58,6 +68,7 @@ impl TxnManager {
         pessimistic: bool,
         schema_ver: i64,
         isolation: IsolationLevel,
+        read_only: bool,
     ) -> Result<()> {
         if self.handle.is_some() {
             self.commit()?;
@@ -71,6 +82,8 @@ impl TxnManager {
         self.explicit = true;
         self.schema_ver = schema_ver;
         self.isolation = isolation;
+        self.read_only = read_only;
+        self.pessimistic = pessimistic;
         Ok(())
     }
 
@@ -94,11 +107,25 @@ impl TxnManager {
         result
     }
 
+    /// Commit (or roll back) then open a new explicit txn with the same
+    /// isolation, access mode, and pessimistic flag (`AND CHAIN`).
+    pub fn chain(&mut self, storage: &dyn Storage, schema_ver: i64, commit: bool) -> Result<()> {
+        let isolation = self.isolation;
+        let read_only = self.read_only;
+        let pessimistic = self.pessimistic;
+        if commit {
+            self.commit()?;
+        } else {
+            self.rollback()?;
+        }
+        self.enter(storage, pessimistic, schema_ver, isolation, read_only)
+    }
+
     /// Open an explicit transaction if the session has none, then record
     /// `name` on the KV txn (MySQL SAVEPOINT starts a transaction).
     pub fn savepoint(&mut self, storage: &dyn Storage, schema_ver: i64, name: &str) -> Result<()> {
         if self.handle.is_none() {
-            self.enter(storage, false, schema_ver, self.isolation)?;
+            self.enter(storage, false, schema_ver, self.isolation, self.read_only)?;
         }
         self.handle
             .as_ref()

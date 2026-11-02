@@ -31,8 +31,8 @@ use sqlparser::ast::{
     LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
     OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
     SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update,
-    Use, Value, Values, WindowType, With,
+    TableObject, TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
+    UnaryOperator, Update, Use, Value, Values, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -292,31 +292,33 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             exception,
             ..
         } => {
-            // F12 gap: READ ONLY / causal consistency / BEGIN ... END.
-            // C3: READ COMMITTED / REPEATABLE READ; SERIALIZABLE stays out.
+            // Completeness wave: causal consistency / BEGIN ... END / SERIALIZABLE.
             if !statements.is_empty() || exception.is_some() {
                 return Err(Error::unsupported("BEGIN block"));
             }
+            let chars = txn_chars(modes)?;
             Ok(Statement::Begin(BeginStmt {
                 pessimistic: false,
-                isolation: isolation_from_modes(modes)?,
+                isolation: chars.isolation,
+                read_only: chars.read_only,
             }))
         }
         SqlStatement::Set(set) => lower_set(set),
         SqlStatement::Commit {
             chain, modifier, ..
         } => {
-            if *chain || modifier.is_some() {
-                return Err(Error::unsupported("COMMIT AND CHAIN"));
+            if modifier.is_some() {
+                return Err(Error::unsupported("COMMIT modifier"));
             }
-            Ok(Statement::Commit(CommitStmt))
+            Ok(Statement::Commit(CommitStmt { chain: *chain }))
         }
         SqlStatement::Rollback { chain, savepoint } => {
-            if *chain {
-                return Err(Error::unsupported("ROLLBACK AND CHAIN"));
+            if *chain && savepoint.is_some() {
+                return Err(Error::unsupported("ROLLBACK AND CHAIN TO SAVEPOINT"));
             }
             Ok(Statement::Rollback(RollbackStmt {
                 savepoint: savepoint.as_ref().map(|name| name.value.clone()),
+                chain: *chain,
             }))
         }
         SqlStatement::Savepoint { name } => Ok(Statement::Savepoint(SavepointStmt {
@@ -896,8 +898,10 @@ fn lower_set(set: &Set) -> Result<Statement> {
             if snapshot.is_some() {
                 return Err(Error::unsupported("SET TRANSACTION SNAPSHOT"));
             }
+            let chars = txn_chars(modes)?;
             Ok(Statement::SetTxn(SetTxnStmt {
-                isolation: isolation_from_modes(modes)?,
+                isolation: chars.isolation,
+                read_only: chars.read_only,
             }))
         }
         Set::SetNames {
@@ -945,23 +949,38 @@ fn lower_set(set: &Set) -> Result<Statement> {
     }
 }
 
-fn isolation_from_modes(modes: &[TransactionMode]) -> Result<IsolationLevel> {
-    let mut isolation = IsolationLevel::RepeatableRead;
+/// Isolation and access mode parsed from `START` / `SET TRANSACTION`.
+struct TxnChars {
+    isolation: Option<IsolationLevel>,
+    read_only: Option<bool>,
+}
+
+fn txn_chars(modes: &[TransactionMode]) -> Result<TxnChars> {
+    let mut isolation = None;
+    let mut read_only = None;
     for mode in modes {
         match mode {
             TransactionMode::IsolationLevel(TransactionIsolationLevel::ReadCommitted) => {
-                isolation = IsolationLevel::ReadCommitted;
+                isolation = Some(IsolationLevel::ReadCommitted);
             }
             TransactionMode::IsolationLevel(TransactionIsolationLevel::RepeatableRead) => {
-                isolation = IsolationLevel::RepeatableRead;
+                isolation = Some(IsolationLevel::RepeatableRead);
             }
             TransactionMode::IsolationLevel(other) => {
                 return Err(Error::unsupported(format!("ISOLATION LEVEL {other}")));
             }
-            other => return Err(Error::unsupported(format!("START TRANSACTION {other}"))),
+            TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
+                read_only = Some(true);
+            }
+            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {
+                read_only = Some(false);
+            }
         }
     }
-    Ok(isolation)
+    Ok(TxnChars {
+        isolation,
+        read_only,
+    })
 }
 
 /// sqlparser-rs accepts `FORMAT JSON`, not TiDB `FORMAT = 'dot'`.
