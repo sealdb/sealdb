@@ -2,7 +2,7 @@ use sealdb_errno::Result;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 
-pub trait Executor {
+pub trait Executor: Send {
     fn open(&mut self) -> Result<()>;
     fn next(&mut self) -> Result<Option<Chunk>>;
     fn close(&mut self) -> Result<()>;

@@ -1,13 +1,15 @@
 // F15 core path: UnionExec for UNION / EXCEPT / INTERSECT
 // (TiDB pkg/executor/unionexec/union.go). Parenthesized set operands flatten
 // left-to-right. EXISTS / IN / scalar subqueries may hold a ResultSetNode set
-// op. Completeness wave / not this feature: parallel workers.
+// op. Parallel child drain: SEALDB_UNION_CONCURRENCY (default 1).
 use crate::internal::exec::Executor;
-use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_errno::{ERR_UNKNOWN_ERROR, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_expression::{collation_ci, with_collation_ci};
 use sealdb_parser::ast::SetOprType;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::collections::{HashMap, HashSet};
+use std::thread;
 
 pub struct UnionExec {
     left: Box<dyn Executor>,
@@ -33,25 +35,23 @@ impl UnionExec {
 
 impl Executor for UnionExec {
     fn open(&mut self) -> Result<()> {
-        self.left.open()?;
-        self.right.open()?;
-        self.schema = self.left.schema().to_vec();
+        let (left, right) = collect_pair(&mut self.left, &mut self.right, union_concurrency())?;
+        self.schema = left.schema;
         if self.schema.is_empty() {
-            self.schema = self.right.schema().to_vec();
+            self.schema = right.schema;
         }
-        let left_rows = collect_rows(&mut self.left)?;
-        let right_rows = collect_rows(&mut self.right)?;
-        let width = left_rows
+        let width = left
+            .rows
             .first()
-            .or(right_rows.first())
+            .or(right.rows.first())
             .map(|row| row.len())
             .unwrap_or(self.schema.len());
-        for row in left_rows.iter().chain(right_rows.iter()) {
+        for row in left.rows.iter().chain(right.rows.iter()) {
             if row.len() != width {
                 return Err(column_mismatch());
             }
         }
-        self.rows = apply_set_op(self.op, left_rows, right_rows);
+        self.rows = apply_set_op(self.op, left.rows, right.rows);
         Ok(())
     }
 
@@ -75,6 +75,69 @@ impl Executor for UnionExec {
     fn schema(&self) -> &[String] {
         &self.schema
     }
+}
+
+/// Worker count for draining UNION children. Default 1 (serial); set
+/// `SEALDB_UNION_CONCURRENCY` >= 2 to open and collect both sides together.
+fn union_concurrency() -> usize {
+    std::env::var("SEALDB_UNION_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1)
+}
+
+struct ChildRows {
+    schema: Vec<String>,
+    rows: Vec<Vec<Datum>>,
+}
+
+fn collect_pair(
+    left: &mut Box<dyn Executor>,
+    right: &mut Box<dyn Executor>,
+    workers: usize,
+) -> Result<(ChildRows, ChildRows)> {
+    if workers <= 1 {
+        return drain_serial(left, right);
+    }
+    let ci = collation_ci();
+    thread::scope(|s| {
+        let left_h = s.spawn(|| with_collation_ci(ci, || drain_child(left)));
+        let right_h = s.spawn(|| with_collation_ci(ci, || drain_child(right)));
+        let left = left_h
+            .join()
+            .map_err(|_| Error::new(ERR_UNKNOWN_ERROR, "parallel union worker panicked"))??;
+        let right = right_h
+            .join()
+            .map_err(|_| Error::new(ERR_UNKNOWN_ERROR, "parallel union worker panicked"))??;
+        Ok((left, right))
+    })
+}
+
+fn drain_serial(
+    left: &mut Box<dyn Executor>,
+    right: &mut Box<dyn Executor>,
+) -> Result<(ChildRows, ChildRows)> {
+    left.open()?;
+    right.open()?;
+    Ok((
+        ChildRows {
+            schema: left.schema().to_vec(),
+            rows: collect_rows(left)?,
+        },
+        ChildRows {
+            schema: right.schema().to_vec(),
+            rows: collect_rows(right)?,
+        },
+    ))
+}
+
+fn drain_child(exec: &mut Box<dyn Executor>) -> Result<ChildRows> {
+    exec.open()?;
+    Ok(ChildRows {
+        schema: exec.schema().to_vec(),
+        rows: collect_rows(exec)?,
+    })
 }
 
 fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {
@@ -184,4 +247,44 @@ fn column_mismatch() -> Error {
         ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
         "The used SELECT statements have a different number of columns",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internal::exec::VecExec;
+
+    fn run_union(op: SetOprType, workers: usize) -> Vec<Vec<String>> {
+        let left = Box::new(VecExec::new(
+            vec!["n".to_string()],
+            vec![vec![Datum::I64(1)], vec![Datum::I64(2)]],
+        ));
+        let right = Box::new(VecExec::new(
+            vec!["n".to_string()],
+            vec![vec![Datum::I64(2)], vec![Datum::I64(3)]],
+        ));
+        let mut exec = UnionExec::new(left, right, op);
+        let (left, right) = collect_pair(&mut exec.left, &mut exec.right, workers).unwrap();
+        apply_set_op(op, left.rows, right.rows)
+            .into_iter()
+            .map(|row| row.iter().map(Datum::display).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_parallel_union_matches_serial() {
+        let serial = run_union(SetOprType::Union, 1);
+        let parallel = run_union(SetOprType::Union, 2);
+        assert_eq!(serial, parallel);
+        assert_eq!(
+            serial,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let all = run_union(SetOprType::UnionAll, 2);
+        assert_eq!(all.len(), 4);
+    }
 }
