@@ -1422,11 +1422,7 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<(SelectLock, SelectLockWait
 fn lower_query_stmt(query: &Query) -> Result<Statement> {
     let with = lower_with(query.with.as_ref())?;
     match query.body.as_ref() {
-        SetExpr::Select(_) => {
-            let mut select = lower_query(query)?;
-            select.with = with;
-            Ok(Statement::Select(select))
-        }
+        SetExpr::Select(_) => Ok(Statement::Select(lower_query(query)?)),
         SetExpr::SetOperation { .. } => {
             let mut set = lower_set_opr(query)?;
             set.with = with;
@@ -1588,7 +1584,7 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
         SetExpr::Select(select) => {
             let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
             let (lock, lock_wait) = lower_select_lock(&query.locks)?;
-            lower_select(
+            let mut stmt = lower_select(
                 select,
                 query.order_by.as_ref(),
                 limit,
@@ -1596,7 +1592,10 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
                 lock,
                 lock_wait,
                 query.to_string(),
-            )
+            )?;
+            let derived = stmt.with.take().map(|with| with.ctes).unwrap_or_default();
+            stmt.with = merge_with_ctes(lower_with(query.with.as_ref())?, derived)?;
+            Ok(stmt)
         }
         // F15 gap / completeness wave: UNION inside scalar/EXISTS/IN subquery.
         other => Err(Error::new(
@@ -1620,7 +1619,10 @@ fn lower_select(
         .iter()
         .map(lower_select_item)
         .collect::<Result<Vec<_>>>()?;
-    let (from, joins) = lower_from(&select.from)?;
+    let (from, joins, derived) = lower_from(&select.from)?;
+    if !joins.is_empty() && !derived.is_empty() {
+        return Err(Error::unsupported("subquery JOIN"));
+    }
     let selection = select.selection.as_ref().map(lower_expr).transpose()?;
     let having = select.having.as_ref().map(lower_expr).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
@@ -1637,9 +1639,42 @@ fn lower_select(
         offset,
         lock,
         lock_wait,
-        with: None,
+        with: with_from_derived(derived),
         text,
     })
+}
+
+/// Turn flattened FROM-subquery CTEs into a WITH clause (empty → None).
+fn with_from_derived(ctes: Vec<CommonTableExpression>) -> Option<WithClause> {
+    if ctes.is_empty() {
+        None
+    } else {
+        Some(WithClause {
+            is_recursive: false,
+            ctes,
+        })
+    }
+}
+
+/// Append derived-table CTEs after an existing WITH list.
+fn merge_with_ctes(
+    with: Option<WithClause>,
+    extra: Vec<CommonTableExpression>,
+) -> Result<Option<WithClause>> {
+    if extra.is_empty() {
+        return Ok(with);
+    }
+    let mut with = with.unwrap_or(WithClause {
+        is_recursive: false,
+        ctes: Vec::new(),
+    });
+    for cte in extra {
+        if with.find(&cte.name).is_some() {
+            return Err(Error::unsupported("duplicate CTE name"));
+        }
+        with.ctes.push(cte);
+    }
+    Ok(Some(with))
 }
 
 /// Dummy `ON 1` for CROSS JOIN / comma join, which have no real join predicate.
@@ -1651,17 +1686,26 @@ fn true_expr() -> ExprNode {
 
 /// Lower FROM into the leftmost table plus a left-deep join chain.
 /// Comma-separated table lists become CROSS JOIN steps.
-fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Vec<Join>)> {
+/// Derived tables (`FROM (SELECT ...) alias`) flatten into CTEs.
+fn lower_from(
+    from: &[TableWithJoins],
+) -> Result<(Option<TableName>, Vec<Join>, Vec<CommonTableExpression>)> {
     if from.is_empty() {
-        return Ok((None, Vec::new()));
+        return Ok((None, Vec::new(), Vec::new()));
     }
-    let (first, mut joins) = lower_table_with_joins(&from[0])?;
+    let (first, mut joins, ctes) = lower_table_with_joins(&from[0])?;
+    if from.len() > 1 && !ctes.is_empty() {
+        return Err(Error::unsupported("subquery JOIN"));
+    }
     let mut prev = joins
         .last()
         .map(|j| j.right.clone())
         .unwrap_or_else(|| first.clone());
     for extra in &from[1..] {
-        let (right, extra_joins) = lower_table_with_joins(extra)?;
+        let (right, extra_joins, extra_ctes) = lower_table_with_joins(extra)?;
+        if !extra_ctes.is_empty() {
+            return Err(Error::unsupported("subquery JOIN"));
+        }
         joins.push(Join {
             left: prev,
             right: right.clone(),
@@ -1671,19 +1715,27 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Vec<Join>)>
         joins.extend(extra_joins);
         prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
     }
-    Ok((Some(first), joins))
+    Ok((Some(first), joins, ctes))
 }
 
 /// Lower `t` or `t1 JOIN t2 ON ... JOIN t3 ON ...` into a left-deep `Join` list.
-fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Vec<Join>)> {
-    let left = table_factor_name(&table.relation)?;
+fn lower_table_with_joins(
+    table: &TableWithJoins,
+) -> Result<(TableName, Vec<Join>, Vec<CommonTableExpression>)> {
+    let (left, ctes) = table_factor(&table.relation)?;
     if table.joins.is_empty() {
-        return Ok((left, Vec::new()));
+        return Ok((left, Vec::new(), ctes));
+    }
+    if !ctes.is_empty() {
+        return Err(Error::unsupported("subquery JOIN"));
     }
     let mut out = Vec::new();
     let mut prev = left.clone();
     for join in &table.joins {
-        let right = table_factor_name(&join.relation)?;
+        let (right, right_ctes) = table_factor(&join.relation)?;
+        if !right_ctes.is_empty() {
+            return Err(Error::unsupported("subquery JOIN"));
+        }
         let (tp, on) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
             | JoinOperator::Inner(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
@@ -1718,12 +1770,15 @@ fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Vec<Join
         });
         prev = right;
     }
-    Ok((left, out))
+    Ok((left, out, Vec::new()))
 }
 
 /// Two-table DML only: reject n-table JOIN chains on UPDATE / DELETE.
 fn lower_dml_table(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> {
-    let (name, mut joins) = lower_table_with_joins(table)?;
+    let (name, mut joins, ctes) = lower_table_with_joins(table)?;
+    if !ctes.is_empty() {
+        return Err(Error::unsupported("derived table in UPDATE/DELETE"));
+    }
     match joins.len() {
         0 => Ok((name, None)),
         1 => {
@@ -1737,9 +1792,42 @@ fn lower_dml_table(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> 
     }
 }
 
-fn table_factor_name(factor: &TableFactor) -> Result<TableName> {
+/// Resolve a FROM item. Derived tables flatten to synthetic CTEs named by alias.
+fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpression>)> {
     match factor {
-        TableFactor::Table { name, .. } => object_table_name(name),
+        TableFactor::Table { name, .. } => Ok((object_table_name(name)?, Vec::new())),
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            sample,
+        } => {
+            if *lateral {
+                return Err(Error::unsupported("LATERAL"));
+            }
+            if sample.is_some() {
+                return Err(Error::unsupported("TABLESAMPLE"));
+            }
+            let alias = alias
+                .as_ref()
+                .ok_or_else(|| Error::unsupported("derived table without alias"))?;
+            let mut query = lower_query(subquery)?;
+            let mut ctes = query.with.take().map(|with| with.ctes).unwrap_or_default();
+            let name = alias.name.value.clone();
+            if ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(&name)) {
+                return Err(Error::unsupported("duplicate CTE name"));
+            }
+            ctes.push(CommonTableExpression {
+                name: name.clone(),
+                query: Box::new(query),
+                col_name_list: alias
+                    .columns
+                    .iter()
+                    .map(|col| col.name.value.clone())
+                    .collect(),
+            });
+            Ok((TableName::new(None, name), ctes))
+        }
         other => Err(Error::unsupported(format!("FROM {other}"))),
     }
 }
@@ -1869,7 +1957,11 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
                     if !twj.joins.is_empty() {
                         return Err(Error::unsupported("JOIN in DELETE FROM list"));
                     }
-                    table_factor_name(&twj.relation)
+                    let (name, ctes) = table_factor(&twj.relation)?;
+                    if !ctes.is_empty() {
+                        return Err(Error::unsupported("derived table in UPDATE/DELETE"));
+                    }
+                    Ok(name)
                 })
                 .collect::<Result<Vec<_>>>()?
         };

@@ -2792,6 +2792,66 @@ mod tests {
     }
 
     #[test]
+    fn test_derived_table() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let dual = session
+            .execute_stmt("SELECT * FROM (SELECT 1 AS id) d")
+            .unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let filtered = session
+            .execute_stmt("SELECT * FROM (SELECT * FROM db1.t WHERE id < 3) d ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            filtered.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let projected = session
+            .execute_stmt("SELECT id FROM (SELECT id, name FROM db1.t) d ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            projected.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let nested = session
+            .execute_stmt("SELECT * FROM (SELECT * FROM (SELECT id FROM db1.t WHERE id = 1) a) b")
+            .unwrap();
+        assert_eq!(nested.display_rows(), vec![vec!["1".to_string()]]);
+        let aliased = session
+            .execute_stmt("SELECT x FROM (SELECT 2) AS d(x)")
+            .unwrap();
+        assert_eq!(aliased.display_rows(), vec![vec!["2".to_string()]]);
+        let counted = session
+            .execute_stmt("SELECT COUNT(*) FROM (SELECT * FROM db1.t) d")
+            .unwrap();
+        assert_eq!(counted.display_rows(), vec![vec!["3".to_string()]]);
+        let with_outer = session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT * FROM (SELECT * FROM c) d",
+            )
+            .unwrap();
+        assert_eq!(
+            with_outer.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let err = session
+            .execute_stmt("SELECT * FROM db1.t JOIN (SELECT 1 AS id) d ON t.id = d.id")
+            .unwrap_err();
+        assert!(err.message.contains("subquery JOIN"));
+    }
+
+    #[test]
     fn test_online_ddl() {
         let session = Session::new();
         session

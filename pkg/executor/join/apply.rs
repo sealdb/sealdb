@@ -1,6 +1,6 @@
 // F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
 // Completeness wave / not this feature: parallel apply, semi/anti rewrite,
-// FROM derived tables, subquery JOIN, SELECT-list subquery.
+// subquery JOIN, SELECT-list subquery. Derived tables flatten to CTEs.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
