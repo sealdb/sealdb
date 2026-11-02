@@ -25,7 +25,7 @@ use sealdb_errno::{Error, Result};
 use sealdb_kv::{LockWait, RowLock, Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{
-    ByItem, ResultSetNode, SelectLock, SelectLockWait, SelectStmt, Statement, TableName,
+    ByItem, ResultSetNode, SelectLock, SelectLockWait, SelectStmt, SetOprStmt, Statement, TableName,
 };
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
 use std::sync::Arc;
@@ -381,7 +381,20 @@ impl ExecutorBuilder {
                 let with = stmt
                     .with_clause()
                     .ok_or_else(|| Error::unsupported("CTE without WITH"))?;
-                let seed_stmt = Statement::Select(with.seed_select(name)?);
+                let first = with.seed_select(name)?;
+                let rest = with.set_rest(name)?;
+                let seed_stmt = if rest.is_empty() {
+                    Statement::Select(first)
+                } else {
+                    Statement::SetOpr(SetOprStmt {
+                        first,
+                        rest,
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        with: None,
+                    })
+                };
                 let recursive = with.find(name).and_then(|cte| cte.recursive.clone());
                 Ok(Box::new(CTEExec::new(
                     columns.clone(),

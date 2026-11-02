@@ -106,6 +106,8 @@ pub struct CommonTableExpression {
     pub col_name_list: Vec<String>,
     /// Recursive `UNION` / `UNION ALL` arm for `WITH RECURSIVE`.
     pub recursive: Option<(SetOprType, SelectStmt)>,
+    /// Non-recursive set-op rest (`UNION` / `EXCEPT` / `INTERSECT`) of the CTE body.
+    pub set_rest: Vec<(SetOprType, SelectStmt)>,
     /// `AS MATERIALIZED` / `AS NOT MATERIALIZED`; default leaves planner choice.
     pub materialize: CteMaterialize,
 }
@@ -149,6 +151,28 @@ impl WithClause {
         Ok(select)
     }
 
+    /// Set-operator arms of a non-recursive CTE body, with preceding CTEs attached.
+    pub fn set_rest(&self, name: &str) -> Result<Vec<(SetOprType, SelectStmt)>> {
+        let cte = self
+            .find(name)
+            .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
+        let preceding = self.preceding(name);
+        Ok(cte
+            .set_rest
+            .iter()
+            .map(|(op, select)| {
+                let mut select = select.clone();
+                if select.with.is_none() && !preceding.is_empty() {
+                    select.with = Some(WithClause {
+                        is_recursive: false,
+                        ctes: preceding.clone(),
+                    });
+                }
+                (*op, select)
+            })
+            .collect())
+    }
+
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("WITH ");
         if self.is_recursive {
@@ -175,6 +199,12 @@ impl WithClause {
                 CteMaterialize::Default => " AS (",
             });
             cte.query.restore(ctx)?;
+            for (op, select) in &cte.set_rest {
+                ctx.write_str(" ");
+                ctx.write_str(op.restore());
+                ctx.write_str(" ");
+                select.restore(ctx)?;
+            }
             if let Some((op, rec)) = &cte.recursive {
                 ctx.write_str(" ");
                 ctx.write_str(op.restore());

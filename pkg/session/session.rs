@@ -2963,10 +2963,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!inline_text.contains("CTE"), "{inline_text}");
-        let err = session
-            .execute_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
-            .unwrap_err();
-        assert!(err.message.contains("UNION"));
+        let union_cte = session
+            .execute_stmt("WITH c AS (SELECT 1 AS n UNION SELECT 2) SELECT * FROM c ORDER BY n")
+            .unwrap();
+        assert_eq!(
+            union_cte.display_rows(),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
         let err = session
             .execute_stmt("WITH c(a, b) AS (SELECT 1) SELECT * FROM c")
             .unwrap_err();

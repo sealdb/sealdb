@@ -1601,7 +1601,7 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     let Some(with) = with else {
         return Ok(None);
     };
-    // F17 leftover: UNION in non-recursive CTE.
+    // F17 leftover: CTE FROM clause / nested WITH.
     let mut names = Vec::new();
     let mut ctes = Vec::with_capacity(with.cte_tables.len());
     for cte in &with.cte_tables {
@@ -1621,8 +1621,7 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     }))
 }
 
-/// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`;
-/// non-recursive `UNION` in a CTE body stays a later leftover.
+/// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`.
 fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     if cte.from.is_some() {
         return Err(Error::unsupported("CTE FROM clause"));
@@ -1630,8 +1629,8 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     if cte.query.with.is_some() {
         return Err(Error::unsupported("nested WITH"));
     }
-    let (query, recursive_arm) = match cte.query.body.as_ref() {
-        SetExpr::Select(_) => (lower_query(&cte.query)?, None),
+    let (query, recursive_arm, set_rest) = match cte.query.body.as_ref() {
+        SetExpr::Select(_) => (lower_query(&cte.query)?, None, Vec::new()),
         SetExpr::SetOperation { .. } if recursive => {
             let set = lower_set_opr(&cte.query)?;
             if set.rest.len() != 1
@@ -1641,9 +1640,12 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
                     "recursive CTE requires a single UNION / UNION ALL",
                 ));
             }
-            (set.first, Some(set.rest[0].clone()))
+            (set.first, Some(set.rest[0].clone()), Vec::new())
         }
-        SetExpr::SetOperation { .. } => return Err(Error::unsupported("UNION in CTE")),
+        SetExpr::SetOperation { .. } => {
+            let set = lower_set_opr(&cte.query)?;
+            (set.first, None, set.rest)
+        }
         other => return Err(Error::unsupported(format!("CTE body {other}"))),
     };
     Ok(CommonTableExpression {
@@ -1656,6 +1658,7 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             .map(|col| col.name.value.clone())
             .collect(),
         recursive: recursive_arm,
+        set_rest,
         materialize: match cte.materialized {
             Some(CteAsMaterialized::Materialized) => CteMaterialize::Materialized,
             Some(CteAsMaterialized::NotMaterialized) => CteMaterialize::NotMaterialized,
@@ -1752,7 +1755,7 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
             stmt.with = merge_with_ctes(lower_with(query.with.as_ref())?, derived)?;
             Ok(stmt)
         }
-        // F17 leftover: UNION in CTE / FROM derived table still uses this path.
+        // F17 leftover: UNION in FROM derived table still uses this path.
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
@@ -1999,6 +2002,7 @@ fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpre
                     .map(|col| col.name.value.clone())
                     .collect(),
                 recursive: None,
+                set_rest: Vec::new(),
                 materialize: CteMaterialize::Default,
             });
             Ok((TableName::new(None, name), ctes))
