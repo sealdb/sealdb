@@ -347,7 +347,7 @@
       "status": "partial",
       "rust": "pkg/server/conn.rs",
       "phase": 9,
-      "notes": "handshake + SSL/compress + COM_QUERY/PING/INIT_DB/QUIT + COM_STMT_PREPARE/EXECUTE/CLOSE binary"
+      "notes": "handshake + SSL/compress + COM_STMT_* + mysql_native_password / grant-table auth"
     },
     "pkg/server/internal/packetio.go": {
       "status": "partial",

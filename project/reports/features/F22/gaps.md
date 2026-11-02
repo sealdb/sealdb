@@ -5,7 +5,7 @@ wave. Rejected via `Error::unsupported` in `pkg/server/conn.rs` and marked
 on `pkg/server/internal/packetio.rs` / `pkg/server/server.rs`.
 
 - zstd compression algorithm negotiation
-- Auth plugins, `mysql.user` password verify (SkipGrant handshake)
+- Password hash verify beyond empty/native skip (`caching_sha2_password`)
 - `COM_FIELD_LIST` / `COM_CHANGE_USER` / `COM_RESET_CONNECTION`
 - Multi-result-set (`SERVER_MORE_RESULTS_EXISTS`)
 - Connection limits, status HTTP, graceful drain

@@ -89,6 +89,11 @@ impl Session {
             .clone()
     }
 
+    /// Privilege manager for MySQL handshake auth (F22).
+    pub fn privilege_manager(&self) -> Arc<sealdb_privilege::Manager> {
+        self.domain.privilege()
+    }
+
     pub fn execute_stmt(&self, sql: &str) -> Result<QueryResult> {
         let stmts = self.parser.parse_sql(sql)?;
         if stmts.is_empty() {

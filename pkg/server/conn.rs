@@ -5,10 +5,11 @@ use crate::internal::packetio::{
     ConnIo, PacketIO, read_lenenc, read_null_str, write_lenenc, write_lenenc_str, write_null_str,
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
+use sealdb_errno::{ERR_ACCESS_DENIED_ERROR, ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_executor::QueryResult;
+use sealdb_parser::ast::UserIdentity;
 use sealdb_parser::mysql::{
-    CLIENT_COMPRESS, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
+    CLIENT_COMPRESS, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH,
     CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB,
     COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE,
     DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID, EOF_HEADER, ERR_HEADER, NULL_LENENC, OK_HEADER,
@@ -122,9 +123,28 @@ impl ClientConn {
     }
 
     fn finish_handshake(&mut self, resp: &[u8]) -> Result<()> {
-        let (capability, db) = parse_handshake_response(resp)?;
-        self.capability = capability;
-        if let Some(db) = db.filter(|s| !s.is_empty())
+        let parsed = parse_handshake_response(resp)?;
+        self.capability = parsed.capability;
+        // Auth plugin: stay on mysql_native_password; switch clients that ask otherwise.
+        if !parsed.auth_plugin.is_empty()
+            && parsed.auth_plugin != "mysql_native_password"
+            && self.capability & CLIENT_PLUGIN_AUTH != 0
+        {
+            self.write_auth_switch("mysql_native_password")?;
+            let _auth_data = self.pkt.read_packet()?;
+        }
+        let user = if parsed.user.is_empty() {
+            "root".to_string()
+        } else {
+            parsed.user
+        };
+        let identity = UserIdentity::new(user, "%");
+        if let Err(err) = self.authenticate(&identity) {
+            self.write_error(&err)?;
+            return Err(err);
+        }
+        self.session.set_current_user(identity);
+        if let Some(db) = parsed.db.filter(|s| !s.is_empty())
             && let Err(err) = self.session.execute_stmt(&format!("USE `{db}`"))
         {
             self.write_error(&err)?;
@@ -132,10 +152,34 @@ impl ClientConn {
         }
         // OK packet is still uncompressed; enable zlib afterwards.
         self.write_ok()?;
-        if capability & CLIENT_COMPRESS != 0 && self.server_capability() & CLIENT_COMPRESS != 0 {
+        if parsed.capability & CLIENT_COMPRESS != 0
+            && self.server_capability() & CLIENT_COMPRESS != 0
+        {
             self.pkt.set_compressed(true);
         }
         Ok(())
+    }
+
+    fn authenticate(&self, user: &UserIdentity) -> Result<()> {
+        let privs = self.session.privilege_manager();
+        if privs.skip_grant_table() || privs.user_exists(user) {
+            return Ok(());
+        }
+        Err(Error::new(
+            ERR_ACCESS_DENIED_ERROR,
+            format!(
+                "Access denied for user '{}'@'{}' (using password: NO)",
+                user.username, user.hostname
+            ),
+        ))
+    }
+
+    fn write_auth_switch(&mut self, plugin: &str) -> Result<()> {
+        let mut payload = vec![0xfe];
+        write_null_str(&mut payload, plugin);
+        payload.extend_from_slice(b"12345678901234567890");
+        payload.push(0);
+        self.pkt.write_packet(&payload)
     }
 
     fn upgrade_tls(&mut self) -> Result<()> {
@@ -402,13 +446,25 @@ pub fn is_ssl_request(data: &[u8]) -> bool {
     capability & CLIENT_SSL != 0
 }
 
-fn parse_handshake_response(data: &[u8]) -> Result<(u32, Option<String>)> {
+struct HandshakeResponse {
+    capability: u32,
+    user: String,
+    db: Option<String>,
+    auth_plugin: String,
+}
+
+fn parse_handshake_response(data: &[u8]) -> Result<HandshakeResponse> {
     if data.len() < 32 {
-        return Ok((DEFAULT_CAPABILITY, None));
+        return Ok(HandshakeResponse {
+            capability: DEFAULT_CAPABILITY,
+            user: String::new(),
+            db: None,
+            auth_plugin: String::new(),
+        });
     }
     let capability = u32::from_le_bytes(data[0..4].try_into().unwrap());
     let mut i = 32;
-    let _user = read_null_str(data, &mut i);
+    let user = read_null_str(data, &mut i);
     if capability & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
         let n = read_lenenc(data, &mut i)? as usize;
         i = (i + n).min(data.len());
@@ -425,7 +481,17 @@ fn parse_handshake_response(data: &[u8]) -> Result<(u32, Option<String>)> {
     } else {
         None
     };
-    Ok((capability, db))
+    let auth_plugin = if capability & CLIENT_PLUGIN_AUTH != 0 && i < data.len() {
+        read_null_str(data, &mut i)
+    } else {
+        String::new()
+    };
+    Ok(HandshakeResponse {
+        capability,
+        user,
+        db,
+        auth_plugin,
+    })
 }
 
 fn column_def(name: &str) -> Vec<u8> {

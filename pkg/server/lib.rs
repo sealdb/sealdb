@@ -352,6 +352,64 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_plugin_access_denied() {
+        let server = Server::bind_with_grant_table("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+        let mut client = TestClient::connect(addr);
+        let hello = client.pkt.read_packet().unwrap();
+        assert_eq!(hello[0], 10);
+        let mut resp = Vec::new();
+        let cap = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_DEPRECATE_EOF;
+        resp.extend_from_slice(&cap.to_le_bytes());
+        resp.extend_from_slice(&0x1000000u32.to_le_bytes());
+        resp.push(45);
+        resp.extend_from_slice(&[0u8; 23]);
+        write_null_str(&mut resp, "nobody");
+        resp.push(0); // empty auth
+        write_null_str(&mut resp, "mysql_native_password");
+        client.pkt.write_packet(&resp).unwrap();
+        let err = client.pkt.read_packet().unwrap();
+        assert_eq!(err.first(), Some(&ERR_HEADER));
+        assert!(String::from_utf8_lossy(&err).contains("Access denied"));
+    }
+
+    #[test]
+    fn test_auth_plugin_root_ok() {
+        let server = Server::bind_with_grant_table("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+        let mut client = TestClient::connect(addr);
+        let hello = client.pkt.read_packet().unwrap();
+        assert_eq!(hello[0], 10);
+        let mut resp = Vec::new();
+        let cap = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_DEPRECATE_EOF;
+        resp.extend_from_slice(&cap.to_le_bytes());
+        resp.extend_from_slice(&0x1000000u32.to_le_bytes());
+        resp.push(45);
+        resp.extend_from_slice(&[0u8; 23]);
+        write_null_str(&mut resp, "root");
+        resp.push(0);
+        write_null_str(&mut resp, "mysql_native_password");
+        client.pkt.write_packet(&resp).unwrap();
+        let ok = client.pkt.read_packet().unwrap();
+        assert_eq!(ok.first(), Some(&OK_HEADER));
+        let rows = client.query("SELECT 1").unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+        client.quit();
+    }
+
+    #[test]
     fn test_compress_capability_advertised() {
         let addr = start_server();
         let mut client = TestClient::connect(addr);
