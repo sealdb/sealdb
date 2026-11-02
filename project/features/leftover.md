@@ -9,9 +9,7 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F22
 
-- `prepared-stmt`
 - `auth-plugin`
-- `binary-protocol`
 - `multi-resultset`
 
 ## PlanBuilder statement kinds still open

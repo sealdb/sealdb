@@ -16,7 +16,8 @@ mod tests {
     };
     use sealdb_parser::mysql::{
         CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
-        CLIENT_SSL, COM_PING, COM_QUERY, COM_QUIT, ERR_HEADER, OK_HEADER,
+        CLIENT_SSL, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
+        COM_STMT_PREPARE, ERR_HEADER, OK_HEADER, TYPE_LONGLONG,
     };
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -287,6 +288,67 @@ mod tests {
         let mut i = 0;
         let cols = read_lenenc(&first, &mut i).unwrap();
         assert_eq!(cols, 1);
+    }
+
+    #[test]
+    fn test_com_stmt_prepare_execute() {
+        let addr = start_server();
+        let mut client = TestClient::connect(addr);
+        client.handshake();
+        assert!(client.query("CREATE DATABASE db1").unwrap().is_empty());
+        assert!(
+            client
+                .query("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .query("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+                .unwrap()
+                .is_empty()
+        );
+
+        client.pkt.reset_sequence();
+        let mut prep = vec![COM_STMT_PREPARE];
+        prep.extend_from_slice(b"SELECT name FROM db1.t WHERE id = ?");
+        client.pkt.write_packet(&prep).unwrap();
+        let ok = client.pkt.read_packet().unwrap();
+        assert_eq!(ok[0], 0x00);
+        let stmt_id = u32::from_le_bytes(ok[1..5].try_into().unwrap());
+        let num_params = u16::from_le_bytes(ok[7..9].try_into().unwrap());
+        assert_eq!(num_params, 1);
+        // CLIENT_DEPRECATE_EOF: param column def only, no EOF.
+        let _param_def = client.pkt.read_packet().unwrap();
+
+        client.pkt.reset_sequence();
+        let mut exec = vec![COM_STMT_EXECUTE];
+        exec.extend_from_slice(&stmt_id.to_le_bytes());
+        exec.push(0); // flags
+        exec.extend_from_slice(&1u32.to_le_bytes()); // iteration
+        exec.push(0); // null bitmap
+        exec.push(1); // new-params-bound-flag
+        exec.push(TYPE_LONGLONG);
+        exec.push(0); // unsigned flag
+        exec.extend_from_slice(&1i64.to_le_bytes());
+        client.pkt.write_packet(&exec).unwrap();
+        let first = client.pkt.read_packet().unwrap();
+        assert_ne!(first.first(), Some(&ERR_HEADER), "{first:?}");
+        let mut i = 0;
+        let cols = read_lenenc(&first, &mut i).unwrap();
+        assert_eq!(cols, 1);
+        let _coldef = client.pkt.read_packet().unwrap();
+        // CLIENT_DEPRECATE_EOF: no EOF between defs and rows.
+        let row = client.pkt.read_packet().unwrap();
+        assert_eq!(row.first(), Some(&0x00), "{row:?}"); // binary row
+        let ok = client.pkt.read_packet().unwrap();
+        assert_eq!(ok.first(), Some(&OK_HEADER));
+
+        client.pkt.reset_sequence();
+        let mut close = vec![COM_STMT_CLOSE];
+        close.extend_from_slice(&stmt_id.to_le_bytes());
+        client.pkt.write_packet(&close).unwrap();
+        client.quit();
     }
 
     #[test]
