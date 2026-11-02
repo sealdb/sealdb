@@ -41,7 +41,6 @@
     ],
     "F12": [
       "pessimistic",
-      "isolation-modes",
       "transactional-ddl"
     ],
     "F13": [

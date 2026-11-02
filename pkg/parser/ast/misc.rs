@@ -307,7 +307,11 @@ pub enum IsolationLevel {
 #[derive(Clone, Debug, Default)]
 pub struct BeginStmt {
     pub pessimistic: bool,
-    pub isolation: IsolationLevel,
+    /// Isolation from `START TRANSACTION ISOLATION LEVEL ...`. `None` inherits
+    /// the session default set by `SET TRANSACTION`.
+    pub isolation: Option<IsolationLevel>,
+    /// Access mode from `READ ONLY` / `READ WRITE`. `None` inherits the session default.
+    pub read_only: Option<bool>,
 }
 
 impl BeginStmt {
@@ -316,38 +320,61 @@ impl BeginStmt {
         if self.pessimistic {
             ctx.write_str(" PESSIMISTIC");
         }
-        match self.isolation {
-            IsolationLevel::RepeatableRead => {}
-            IsolationLevel::ReadCommitted => {
-                ctx.write_str(" ISOLATION LEVEL READ COMMITTED");
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SetTxnStmt {
-    pub isolation: IsolationLevel,
-}
-
-impl SetTxnStmt {
-    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("SET TRANSACTION ISOLATION LEVEL ");
-        ctx.write_str(match self.isolation {
-            IsolationLevel::ReadCommitted => "READ COMMITTED",
-            IsolationLevel::RepeatableRead => "REPEATABLE READ",
-        });
+        restore_txn_chars(ctx, self.isolation, self.read_only)?;
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct CommitStmt;
+pub struct SetTxnStmt {
+    /// `SET TRANSACTION ISOLATION LEVEL ...`. `None` leaves the session isolation unchanged.
+    pub isolation: Option<IsolationLevel>,
+    /// `SET TRANSACTION READ ONLY` / `READ WRITE`. `None` leaves the access mode unchanged.
+    pub read_only: Option<bool>,
+}
+
+impl SetTxnStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET TRANSACTION");
+        restore_txn_chars(ctx, self.isolation, self.read_only)?;
+        Ok(())
+    }
+}
+
+fn restore_txn_chars(
+    ctx: &mut RestoreCtx,
+    isolation: Option<IsolationLevel>,
+    read_only: Option<bool>,
+) -> Result<()> {
+    if let Some(isolation) = isolation {
+        ctx.write_str(" ISOLATION LEVEL ");
+        ctx.write_str(match isolation {
+            IsolationLevel::ReadCommitted => "READ COMMITTED",
+            IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        });
+    }
+    if let Some(read_only) = read_only {
+        ctx.write_str(if read_only {
+            " READ ONLY"
+        } else {
+            " READ WRITE"
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommitStmt {
+    /// `COMMIT AND CHAIN` starts a new transaction with the same characteristics.
+    pub chain: bool,
+}
 
 impl CommitStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("COMMIT");
+        if self.chain {
+            ctx.write_str(" AND CHAIN");
+        }
         Ok(())
     }
 }
@@ -356,11 +383,16 @@ impl CommitStmt {
 pub struct RollbackStmt {
     /// `ROLLBACK TO SAVEPOINT name`. Full rollback when `None`.
     pub savepoint: Option<String>,
+    /// `ROLLBACK AND CHAIN` starts a new transaction with the same characteristics.
+    pub chain: bool,
 }
 
 impl RollbackStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ROLLBACK");
+        if self.chain {
+            ctx.write_str(" AND CHAIN");
+        }
         if let Some(name) = &self.savepoint {
             ctx.write_str(" TO ");
             ctx.write_name(name);

@@ -430,6 +430,18 @@ mod tests {
         match to_sp {
             crate::ast::Statement::Rollback(rb) => {
                 assert_eq!(rb.savepoint.as_deref(), Some("sp"));
+                assert!(!rb.chain);
+            }
+            other => panic!("expected RollbackStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("COMMIT AND CHAIN").unwrap() {
+            crate::ast::Statement::Commit(c) => assert!(c.chain),
+            other => panic!("expected CommitStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("ROLLBACK AND CHAIN").unwrap() {
+            crate::ast::Statement::Rollback(rb) => {
+                assert!(rb.chain);
+                assert!(rb.savepoint.is_none());
             }
             other => panic!("expected RollbackStmt, got {other:?}"),
         }
@@ -821,7 +833,11 @@ mod tests {
             .unwrap()
         {
             crate::ast::Statement::Begin(begin) => {
-                assert_eq!(begin.isolation, crate::ast::IsolationLevel::ReadCommitted);
+                assert_eq!(
+                    begin.isolation,
+                    Some(crate::ast::IsolationLevel::ReadCommitted)
+                );
+                assert_eq!(begin.read_only, None);
             }
             other => panic!("expected BeginStmt, got {other:?}"),
         }
@@ -830,7 +846,11 @@ mod tests {
             .unwrap()
         {
             crate::ast::Statement::SetTxn(set) => {
-                assert_eq!(set.isolation, crate::ast::IsolationLevel::RepeatableRead);
+                assert_eq!(
+                    set.isolation,
+                    Some(crate::ast::IsolationLevel::RepeatableRead)
+                );
+                assert_eq!(set.read_only, None);
             }
             other => panic!("expected SetTxnStmt, got {other:?}"),
         }
@@ -838,6 +858,23 @@ mod tests {
             .parse_one_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap_err();
         assert!(err.message.contains("SERIALIZABLE"));
+        match parser
+            .parse_one_stmt("START TRANSACTION READ ONLY")
+            .unwrap()
+        {
+            crate::ast::Statement::Begin(begin) => {
+                assert_eq!(begin.read_only, Some(true));
+                assert!(begin.isolation.is_none());
+            }
+            other => panic!("expected BeginStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SET TRANSACTION READ WRITE").unwrap() {
+            crate::ast::Statement::SetTxn(set) => {
+                assert_eq!(set.read_only, Some(false));
+                assert!(set.isolation.is_none());
+            }
+            other => panic!("expected SetTxnStmt, got {other:?}"),
+        }
     }
 
     #[test]
