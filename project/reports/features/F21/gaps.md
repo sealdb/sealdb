@@ -8,6 +8,6 @@ wave. Rejected via `Error::unsupported` in
 - CMSketch / correlation
 - `ANALYZE TABLE t (cols)`
 - Partition analyze / incremental / sampling
-- Auto-analyze
 - Join / Sort / Limit cost model beyond IndexLookUp vs TableReader
 - Pseudo-stats versioning (`PseudoRowCount` is documented, not wired)
+- Background auto-analyze job queue / time window (SealDB runs sync on DML)

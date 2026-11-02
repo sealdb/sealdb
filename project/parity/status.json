@@ -165,19 +165,19 @@
       "status": "partial",
       "rust": "pkg/executor/analyze.rs",
       "phase": 7,
-      "notes": "ANALYZE TABLE + INDEX; histogram/TopN; auto-analyze deferred"
+      "notes": "ANALYZE TABLE + INDEX; histogram/TopN; auto-analyze on DML ratio"
     },
     "pkg/statistics/table.go": {
       "status": "partial",
       "rust": "pkg/statistics/table.rs",
       "phase": 7,
-      "notes": "Table count + column NDV + histogram/TopN"
+      "notes": "Table count + modify_count + column NDV + histogram/TopN"
     },
     "pkg/statistics/handle/handle.go": {
       "status": "partial",
       "rust": "pkg/statistics/handle/mod.rs",
       "phase": 7,
-      "notes": "Handle encode/decode to mstats; auto-analyze deferred"
+      "notes": "Handle encode/decode to mstats + auto-analyze delta"
     },
     "pkg/parser/ast/dml.go": {
       "status": "partial",

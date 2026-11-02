@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F21": [
-      "auto-analyze",
       "join-cost"
     ],
     "F22": [

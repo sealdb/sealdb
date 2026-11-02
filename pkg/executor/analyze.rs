@@ -80,6 +80,7 @@ impl Executor for AnalyzeExec {
             } else {
                 Table {
                     count: rows.len() as u64,
+                    modify_count: 0,
                     columns,
                     version: prev.version + 1,
                 }
@@ -87,6 +88,7 @@ impl Executor for AnalyzeExec {
         } else {
             Table {
                 count: rows.len() as u64,
+                modify_count: 0,
                 columns,
                 version: 1,
             }
