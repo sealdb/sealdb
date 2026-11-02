@@ -3449,12 +3449,34 @@ mod tests {
             .execute_stmt("INSERT INTO db1.r VALUES (9)")
             .unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_NO_PARTITION_FOR_GIVEN_VALUE);
-        let err = session
+        session
             .execute_stmt(
-                "CREATE TABLE db1.l (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+                "CREATE TABLE db1.l (id INT, name VARCHAR(20)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (10)); INSERT INTO db1.l VALUES (1, 'a'), (10, 'b')",
             )
+            .unwrap();
+        let listed = session
+            .execute_stmt("SELECT * FROM db1.l WHERE id = 10")
+            .unwrap();
+        assert_eq!(
+            listed.display_rows(),
+            vec![vec!["10".to_string(), "b".to_string()]]
+        );
+        let miss = session
+            .execute_stmt("INSERT INTO db1.l VALUES (3, 'c')")
             .unwrap_err();
-        assert!(err.message.contains("LIST") || err.message.contains("partition"));
+        assert_eq!(miss.code, sealdb_errno::ERR_NO_PARTITION_FOR_GIVEN_VALUE);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.k (id INT, name VARCHAR(20)) PARTITION BY KEY (id) PARTITIONS 4; INSERT INTO db1.k VALUES (1, 'x'), (5, 'z')",
+            )
+            .unwrap();
+        let keyed = session
+            .execute_stmt("SELECT * FROM db1.k WHERE id = 5")
+            .unwrap();
+        assert_eq!(
+            keyed.display_rows(),
+            vec![vec!["5".to_string(), "z".to_string()]]
+        );
     }
 
     #[test]

@@ -1460,13 +1460,11 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
-    // F19 gap: LIST / KEY / RANGE COLUMNS / subpartition / expr keys.
-    if keyword_at(bytes, i, "LIST")
-        || keyword_at(bytes, i, "KEY")
-        || (keyword_at(bytes, i, "RANGE")
-            && keyword_at(bytes, skip_ws(bytes, i + "RANGE".len()), "COLUMNS"))
+    // F19 gap: RANGE COLUMNS / subpartition / expr keys.
+    if keyword_at(bytes, i, "RANGE")
+        && keyword_at(bytes, skip_ws(bytes, i + "RANGE".len()), "COLUMNS")
     {
-        return Err(Error::unsupported("LIST/KEY/RANGE COLUMNS partition"));
+        return Err(Error::unsupported("RANGE COLUMNS partition"));
     }
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
@@ -1474,6 +1472,12 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     } else if keyword_at(bytes, i, "HASH") {
         i = skip_ws(bytes, i + "HASH".len());
         PartitionType::Hash
+    } else if keyword_at(bytes, i, "LIST") {
+        i = skip_ws(bytes, i + "LIST".len());
+        PartitionType::List
+    } else if keyword_at(bytes, i, "KEY") {
+        i = skip_ws(bytes, i + "KEY".len());
+        PartitionType::Key
     } else {
         return Err(Error::unsupported("partition type"));
     };
@@ -1491,14 +1495,14 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     }
     i = skip_ws(bytes, close + 1);
     match tp {
-        PartitionType::Hash => {
+        PartitionType::Hash | PartitionType::Key => {
             if !keyword_at(bytes, i, "PARTITIONS") {
-                return Err(Error::unsupported("HASH partition list"));
+                return Err(Error::unsupported("HASH/KEY partition list"));
             }
             i = skip_ws(bytes, i + "PARTITIONS".len());
             let (num, end) = parse_u64_at(bytes, i)?;
             if num == 0 {
-                return Err(Error::unsupported("HASH PARTITIONS 0"));
+                return Err(Error::unsupported("HASH/KEY PARTITIONS 0"));
             }
             Ok((
                 PartitionOption {
@@ -1519,6 +1523,25 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
             let body = std::str::from_utf8(&bytes[i + 1..end])
                 .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid RANGE partitions"))?;
             let defs = parse_range_defs(body)?;
+            Ok((
+                PartitionOption {
+                    tp,
+                    column,
+                    num: defs.len() as u64,
+                    defs,
+                },
+                end + 1,
+            ))
+        }
+        PartitionType::List => {
+            if i >= bytes.len() || bytes[i] != b'(' {
+                return Err(Error::unsupported("LIST without partitions"));
+            }
+            let end = matching_paren(bytes, i)
+                .ok_or_else(|| Error::unsupported("LIST partition list"))?;
+            let body = std::str::from_utf8(&bytes[i + 1..end])
+                .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid LIST partitions"))?;
+            let defs = parse_list_defs(body)?;
             Ok((
                 PartitionOption {
                     tp,
@@ -1578,10 +1601,68 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
                 )
             }
         };
-        defs.push(PartitionDef { name, less_than });
+        defs.push(PartitionDef {
+            name,
+            less_than,
+            in_values: Vec::new(),
+        });
     }
     if defs.is_empty() {
         return Err(Error::unsupported("RANGE without partitions"));
+    }
+    Ok(defs)
+}
+
+fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
+    let mut defs = Vec::new();
+    for raw in split_defs(body) {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let bytes = item.as_bytes();
+        let mut i = skip_ws(bytes, 0);
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Err(Error::unsupported("LIST partition item"));
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let name_end = skip_ident_or_quoted(bytes, i);
+        let name = item[i..name_end].trim().trim_matches('`').to_string();
+        i = skip_ws(bytes, name_end);
+        if !keyword_at(bytes, i, "VALUES") {
+            return Err(Error::unsupported("VALUES IN"));
+        }
+        i = skip_ws(bytes, i + "VALUES".len());
+        if !keyword_at(bytes, i, "IN") {
+            return Err(Error::unsupported("VALUES IN"));
+        }
+        i = skip_ws(bytes, i + "IN".len());
+        if i >= bytes.len() || bytes[i] != b'(' {
+            return Err(Error::unsupported("VALUES IN"));
+        }
+        let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("VALUES IN"))?;
+        let mut in_values = Vec::new();
+        for raw_v in item[i + 1..close].split(',') {
+            let v = raw_v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            in_values.push(
+                v.parse::<i64>()
+                    .map_err(|_| Error::unsupported("non-integer LIST value"))?,
+            );
+        }
+        if in_values.is_empty() {
+            return Err(Error::unsupported("LIST VALUES IN empty"));
+        }
+        defs.push(PartitionDef {
+            name,
+            less_than: None,
+            in_values,
+        });
+    }
+    if defs.is_empty() {
+        return Err(Error::unsupported("LIST without partitions"));
     }
     Ok(defs)
 }

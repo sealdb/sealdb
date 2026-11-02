@@ -270,9 +270,19 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         let method = match part.tp {
             PartitionType::Range => "RANGE",
             PartitionType::Hash => "HASH",
+            PartitionType::List => "LIST",
+            PartitionType::Key => "KEY",
         };
         for (i, def) in part.definitions.iter().enumerate() {
-            let desc = def.less_than.join(",");
+            let desc = if def.in_values.is_empty() {
+                def.less_than.join(",")
+            } else {
+                def.in_values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
             rows.push(vec![
                 bytes("def"),
                 bytes(db),
