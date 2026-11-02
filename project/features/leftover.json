@@ -39,12 +39,6 @@
       "online-ddl-jobs",
       "indexes"
     ],
-    "F12": [
-      "pessimistic"
-    ],
-    "F13": [
-      "tikv-pessimistic"
-    ],
     "F14": [
       "any-all",
       "from-derived-table",
