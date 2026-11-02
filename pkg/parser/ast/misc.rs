@@ -146,6 +146,8 @@ pub struct GrantStmt {
     pub privs: Vec<PrivElem>,
     pub level: GrantLevel,
     pub users: Vec<UserIdentity>,
+    /// TiDB/MySQL `WITH GRANT OPTION`.
+    pub with_grant: bool,
 }
 
 impl GrantStmt {
@@ -155,7 +157,11 @@ impl GrantStmt {
         ctx.write_str(" ON ");
         self.level.restore(ctx)?;
         ctx.write_str(" TO ");
-        restore_users(&self.users, ctx)
+        restore_users(&self.users, ctx)?;
+        if self.with_grant {
+            ctx.write_str(" WITH GRANT OPTION");
+        }
+        Ok(())
     }
 }
 
@@ -164,11 +170,16 @@ pub struct RevokeStmt {
     pub privs: Vec<PrivElem>,
     pub level: GrantLevel,
     pub users: Vec<UserIdentity>,
+    /// `REVOKE GRANT OPTION FOR ...` clears only the grant option bit.
+    pub grant_option: bool,
 }
 
 impl RevokeStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("REVOKE ");
+        if self.grant_option {
+            ctx.write_str("GRANT OPTION FOR ");
+        }
         restore_privs(&self.privs, ctx)?;
         ctx.write_str(" ON ");
         self.level.restore(ctx)?;

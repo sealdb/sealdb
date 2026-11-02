@@ -15,6 +15,8 @@ struct GrantEntry {
     db: String,
     table: String,
     privs: PrivilegeType,
+    /// MySQL GRANT OPTION — required to GRANT the same privileges onward.
+    with_grant: bool,
 }
 
 struct Store {
@@ -60,6 +62,7 @@ impl Manager {
                 table_name: String::new(),
             },
             PrivilegeType::ALL,
+            true,
         );
         mgr
     }
@@ -71,7 +74,7 @@ impl Manager {
     pub fn grant(&self, stmt: &GrantStmt) -> Result<()> {
         let bits = merge_privs(&stmt.privs);
         for user in &stmt.users {
-            self.grant_bits(user, &stmt.level, bits);
+            self.grant_bits(user, &stmt.level, bits, stmt.with_grant);
         }
         Ok(())
     }
@@ -84,10 +87,17 @@ impl Manager {
             if let Some(entries) = inner.grants.get_mut(&key) {
                 for entry in entries.iter_mut() {
                     if same_level(entry, &stmt.level) {
-                        entry.privs = entry.privs.difference(bits);
+                        if stmt.grant_option {
+                            entry.with_grant = false;
+                        } else {
+                            entry.privs = entry.privs.difference(bits);
+                            if bits.contains(PrivilegeType::ALL) || entry.privs.is_empty() {
+                                entry.with_grant = false;
+                            }
+                        }
                     }
                 }
-                entries.retain(|e| !e.privs.is_empty());
+                entries.retain(|e| !e.privs.is_empty() || e.with_grant);
                 if entries.is_empty() {
                     inner.grants.remove(&key);
                 }
@@ -297,17 +307,25 @@ impl Manager {
         }
     }
 
-    fn grant_bits(&self, user: &UserIdentity, level: &GrantLevel, bits: PrivilegeType) {
+    fn grant_bits(
+        &self,
+        user: &UserIdentity,
+        level: &GrantLevel,
+        bits: PrivilegeType,
+        with_grant: bool,
+    ) {
         let mut inner = self.inner.lock().expect("privilege lock");
         let entries = inner.grants.entry(user_key(user)).or_default();
         if let Some(entry) = entries.iter_mut().find(|e| same_level(e, level)) {
             entry.privs = entry.privs.union(bits);
+            entry.with_grant = entry.with_grant || with_grant;
             return;
         }
         entries.push(GrantEntry {
             db: level.db_name.clone(),
             table: level.table_name.clone(),
             privs: bits,
+            with_grant,
         });
     }
 }
@@ -365,11 +383,15 @@ fn format_grant(user: &UserIdentity, entry: &GrantEntry) -> String {
     } else {
         format!("`{}`.`{}`", entry.db, entry.table)
     };
-    format!(
+    let mut s = format!(
         "GRANT {} ON {} TO '{}'@'{}'",
         entry.privs.names().join(", "),
         level,
         user.username,
         user.hostname
-    )
+    );
+    if entry.with_grant {
+        s.push_str(" WITH GRANT OPTION");
+    }
+    s
 }

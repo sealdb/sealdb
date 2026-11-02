@@ -1288,10 +1288,20 @@ mod tests {
             }
             other => panic!("expected ShowStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt("GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION")
-            .unwrap_err();
-        assert!(err.message.contains("GRANT OPTION"));
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => assert!(grant.with_grant),
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("REVOKE GRANT OPTION FOR SELECT ON db1.t FROM 'u'@'%'")
+            .unwrap()
+        {
+            crate::ast::Statement::Revoke(revoke) => assert!(revoke.grant_option),
+            other => panic!("expected RevokeStmt, got {other:?}"),
+        }
     }
 
     #[test]

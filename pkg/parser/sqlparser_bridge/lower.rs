@@ -812,10 +812,8 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
 }
 
 fn lower_grant(grant: &Grant) -> Result<Statement> {
-    // F20 gaps: WITH GRANT OPTION, GRANT ROLE, IDENTIFIED BY, column grants.
-    if grant.with_grant_option {
-        return Err(Error::unsupported("WITH GRANT OPTION"));
-    }
+    // F20: WITH GRANT OPTION stored on the grant entry. Gaps: IDENTIFIED BY,
+    // column grants.
     if grant.as_grantor.is_some() || grant.granted_by.is_some() || grant.current_grants.is_some() {
         return Err(Error::unsupported("GRANT option"));
     }
@@ -823,13 +821,11 @@ fn lower_grant(grant: &Grant) -> Result<Statement> {
         privs: lower_privileges(&grant.privileges)?,
         level: lower_grant_objects(grant.objects.as_ref())?,
         users: lower_grantees(&grant.grantees)?,
+        with_grant: grant.with_grant_option,
     }))
 }
 
 fn lower_revoke(revoke: &Revoke) -> Result<Statement> {
-    if revoke.grant_option_for {
-        return Err(Error::unsupported("GRANT OPTION FOR"));
-    }
     if revoke.granted_by.is_some() || revoke.cascade.is_some() {
         return Err(Error::unsupported("REVOKE option"));
     }
@@ -837,6 +833,7 @@ fn lower_revoke(revoke: &Revoke) -> Result<Statement> {
         privs: lower_privileges(&revoke.privileges)?,
         level: lower_grant_objects(revoke.objects.as_ref())?,
         users: lower_grantees(&revoke.grantees)?,
+        grant_option: revoke.grant_option_for,
     }))
 }
 
