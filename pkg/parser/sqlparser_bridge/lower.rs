@@ -5,9 +5,9 @@ use crate::ast::ddl::{
     PartitionOption, PartitionType, TableName,
 };
 use crate::ast::dml::{
-    Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType,
-    ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprStmt, SetOprType,
-    UpdateStmt, WithClause,
+    Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
+    JoinType, ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprStmt,
+    SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
@@ -48,6 +48,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
+    let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
@@ -59,6 +60,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut flags = pessimistic_flags.into_iter();
     let mut partitions = partitions.into_iter();
     let mut prepares = prepares.into_iter();
+    let mut materialize_hints = materialize_hints;
     stmts
         .iter()
         .map(|stmt| {
@@ -80,6 +82,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             {
                 prepare.sql = sql;
             }
+            apply_cte_materialize(&mut lowered, &mut materialize_hints);
             Ok(lowered)
         })
         .collect()
@@ -791,6 +794,130 @@ fn lower_grantees(grantees: &[sqlparser::ast::Grantee]) -> Result<Vec<UserIdenti
 
 /// sqlparser MySQL dialect does not accept `LOCK IN SHARE MODE`; rewrite
 /// it to `FOR SHARE` (same InnoDB shared lock) before parse.
+/// sqlparser's MySQL dialect rejects `AS MATERIALIZED`; strip it like
+/// PostgreSQL CTE hints and reattach the hint after lowering.
+fn rewrite_cte_materialized(sql: &str) -> (String, Vec<(String, CteMaterialize)>) {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut hints = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "AS") {
+            let after_as = skip_ws(bytes, i + 2);
+            if let Some((hint, paren)) = cte_materialize_at(bytes, after_as) {
+                if let Some(name) = cte_name_before(bytes, i) {
+                    hints.push((name, hint));
+                }
+                out.push_str("AS ");
+                i = paren;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    (out, hints)
+}
+
+fn cte_materialize_at(bytes: &[u8], i: usize) -> Option<(CteMaterialize, usize)> {
+    if keyword_at(bytes, i, "NOT") {
+        let after_not = skip_ws(bytes, i + 3);
+        if keyword_at(bytes, after_not, "MATERIALIZED") {
+            let paren = skip_ws(bytes, after_not + "MATERIALIZED".len());
+            if paren < bytes.len() && bytes[paren] == b'(' {
+                return Some((CteMaterialize::NotMaterialized, paren));
+            }
+        }
+        return None;
+    }
+    if keyword_at(bytes, i, "MATERIALIZED") {
+        let paren = skip_ws(bytes, i + "MATERIALIZED".len());
+        if paren < bytes.len() && bytes[paren] == b'(' {
+            return Some((CteMaterialize::Materialized, paren));
+        }
+    }
+    None
+}
+
+fn cte_name_before(bytes: &[u8], mut i: usize) -> Option<String> {
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    if bytes[i - 1] == b')' {
+        let mut depth = 0;
+        while i > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    if matches!(bytes[i - 1], b'`' | b'"' | b'\'') {
+        let q = bytes[i - 1];
+        i -= 1;
+        let end = i;
+        while i > 0 && bytes[i - 1] != q {
+            i -= 1;
+        }
+        let start = i;
+        return Some(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+    }
+    let end = i;
+    while i > 0 && is_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    let name = String::from_utf8_lossy(&bytes[i..end]).into_owned();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn apply_cte_materialize(stmt: &mut Statement, hints: &mut Vec<(String, CteMaterialize)>) {
+    match stmt {
+        Statement::Select(select) => apply_with_materialize(&mut select.with, hints),
+        Statement::SetOpr(set) => {
+            apply_with_materialize(&mut set.with, hints);
+            apply_with_materialize(&mut set.first.with, hints);
+            for (_, select) in &mut set.rest {
+                apply_with_materialize(&mut select.with, hints);
+            }
+        }
+        Statement::Explain(explain) => apply_cte_materialize(&mut explain.stmt, hints),
+        _ => {}
+    }
+}
+
+fn apply_with_materialize(
+    with: &mut Option<WithClause>,
+    hints: &mut Vec<(String, CteMaterialize)>,
+) {
+    let Some(with) = with else {
+        return;
+    };
+    for cte in &mut with.ctes {
+        if let Some(i) = hints
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(&cte.name))
+        {
+            cte.materialize = hints.remove(i).1;
+        }
+    }
+}
+
 fn rewrite_lock_in_share_mode(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -1474,7 +1601,7 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     let Some(with) = with else {
         return Ok(None);
     };
-    // F17 leftover: MATERIALIZED, UNION in non-recursive CTE.
+    // F17 leftover: UNION in non-recursive CTE.
     let mut names = Vec::new();
     let mut ctes = Vec::with_capacity(with.cte_tables.len());
     for cte in &with.cte_tables {
@@ -1497,13 +1624,6 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
 /// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`;
 /// non-recursive `UNION` in a CTE body stays a later leftover.
 fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
-    if cte.materialized.is_some() {
-        return Err(Error::unsupported(match cte.materialized {
-            Some(CteAsMaterialized::Materialized) => "MATERIALIZED CTE",
-            Some(CteAsMaterialized::NotMaterialized) => "NOT MATERIALIZED CTE",
-            None => "MATERIALIZED CTE",
-        }));
-    }
     if cte.from.is_some() {
         return Err(Error::unsupported("CTE FROM clause"));
     }
@@ -1536,6 +1656,11 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             .map(|col| col.name.value.clone())
             .collect(),
         recursive: recursive_arm,
+        materialize: match cte.materialized {
+            Some(CteAsMaterialized::Materialized) => CteMaterialize::Materialized,
+            Some(CteAsMaterialized::NotMaterialized) => CteMaterialize::NotMaterialized,
+            None => CteMaterialize::Default,
+        },
     })
 }
 
@@ -1874,6 +1999,7 @@ fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpre
                     .map(|col| col.name.value.clone())
                     .collect(),
                 recursive: None,
+                materialize: CteMaterialize::Default,
             });
             Ok((TableName::new(None, name), ctes))
         }

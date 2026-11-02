@@ -882,6 +882,20 @@ mod tests {
         let cte = &rec.as_select().unwrap().with.as_ref().unwrap().ctes[0];
         assert!(cte.recursive.is_some());
         assert!(rec.as_select().unwrap().with.as_ref().unwrap().is_recursive);
+        let mat = parser
+            .parse_one_stmt("WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c")
+            .unwrap();
+        assert_eq!(
+            mat.as_select().unwrap().with.as_ref().unwrap().ctes[0].materialize,
+            crate::ast::CteMaterialize::Materialized
+        );
+        let inline = parser
+            .parse_one_stmt("WITH c AS NOT MATERIALIZED (SELECT 1) SELECT * FROM c")
+            .unwrap();
+        assert_eq!(
+            inline.as_select().unwrap().with.as_ref().unwrap().ctes[0].materialize,
+            crate::ast::CteMaterialize::NotMaterialized
+        );
         let err = parser
             .parse_one_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
             .unwrap_err();
