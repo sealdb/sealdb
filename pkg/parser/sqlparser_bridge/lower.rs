@@ -841,13 +841,12 @@ fn lower_privileges(privs: &Privileges) -> Result<Vec<PrivElem>> {
     match privs {
         Privileges::All { .. } => Ok(vec![PrivElem {
             tp: PrivilegeType::ALL,
+            cols: Vec::new(),
         }]),
         Privileges::Actions(actions) => {
             let mut out = Vec::new();
             for action in actions {
-                out.push(PrivElem {
-                    tp: lower_action(action)?,
-                });
+                out.push(lower_priv_elem(action)?);
             }
             if out.is_empty() {
                 return Err(Error::unsupported("GRANT without privilege"));
@@ -857,20 +856,42 @@ fn lower_privileges(privs: &Privileges) -> Result<Vec<PrivElem>> {
     }
 }
 
-fn lower_action(action: &Action) -> Result<PrivilegeType> {
+fn lower_priv_elem(action: &Action) -> Result<PrivElem> {
     match action {
-        Action::Select { columns } if columns.is_none() => Ok(PrivilegeType::SELECT),
-        Action::Insert { columns } if columns.is_none() => Ok(PrivilegeType::INSERT),
-        Action::Update { columns } if columns.is_none() => Ok(PrivilegeType::UPDATE),
-        Action::Delete => Ok(PrivilegeType::DELETE),
-        Action::Create { obj_type } if obj_type.is_none() => Ok(PrivilegeType::CREATE),
-        Action::Drop => Ok(PrivilegeType::DROP),
-        Action::Select { .. } | Action::Insert { .. } | Action::Update { .. } => {
-            Err(Error::unsupported("column privilege"))
-        }
+        Action::Select { columns } => Ok(PrivElem {
+            tp: PrivilegeType::SELECT,
+            cols: lower_priv_columns(columns.as_ref())?,
+        }),
+        Action::Insert { columns } => Ok(PrivElem {
+            tp: PrivilegeType::INSERT,
+            cols: lower_priv_columns(columns.as_ref())?,
+        }),
+        Action::Update { columns } => Ok(PrivElem {
+            tp: PrivilegeType::UPDATE,
+            cols: lower_priv_columns(columns.as_ref())?,
+        }),
+        Action::Delete => Ok(PrivElem {
+            tp: PrivilegeType::DELETE,
+            cols: Vec::new(),
+        }),
+        Action::Create { obj_type } if obj_type.is_none() => Ok(PrivElem {
+            tp: PrivilegeType::CREATE,
+            cols: Vec::new(),
+        }),
+        Action::Drop => Ok(PrivElem {
+            tp: PrivilegeType::DROP,
+            cols: Vec::new(),
+        }),
         Action::Role { .. } => Err(Error::unsupported("GRANT ROLE")),
         other => Err(Error::unsupported(format!("privilege {other}"))),
     }
+}
+
+fn lower_priv_columns(columns: Option<&Vec<sqlparser::ast::Ident>>) -> Result<Vec<String>> {
+    let Some(cols) = columns else {
+        return Ok(Vec::new());
+    };
+    Ok(cols.iter().map(|c| c.value.clone()).collect())
 }
 
 fn lower_grant_objects(objects: Option<&GrantObjects>) -> Result<GrantLevel> {

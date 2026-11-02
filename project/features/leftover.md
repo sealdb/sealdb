@@ -9,7 +9,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F20
 
-- `column-grants`
 - `dynamic-privs`
 - `create-user`
 

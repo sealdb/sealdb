@@ -22,6 +22,8 @@ struct GrantEntry {
     privs: PrivilegeType,
     /// MySQL GRANT OPTION — required to GRANT the same privileges onward.
     with_grant: bool,
+    /// Column grants (`GRANT SELECT (id) ON t`); empty means table-level.
+    columns: Vec<String>,
 }
 
 struct Store {
@@ -68,6 +70,7 @@ impl Manager {
             },
             PrivilegeType::ALL,
             true,
+            &[],
         );
         mgr
     }
@@ -77,28 +80,45 @@ impl Manager {
     }
 
     pub fn grant(&self, stmt: &GrantStmt) -> Result<()> {
-        let bits = merge_privs(&stmt.privs);
-        for user in &stmt.users {
-            self.grant_bits(user, &stmt.level, bits, stmt.with_grant);
+        for elem in &stmt.privs {
+            for user in &stmt.users {
+                self.grant_bits(user, &stmt.level, elem.tp, stmt.with_grant, &elem.cols);
+            }
         }
         Ok(())
     }
 
     pub fn revoke(&self, stmt: &RevokeStmt) -> Result<()> {
-        let bits = merge_privs(&stmt.privs);
         let mut inner = self.inner.lock().expect("privilege lock");
         for user in &stmt.users {
             let key = user_key(user);
             if let Some(entries) = inner.grants.get_mut(&key) {
                 for entry in entries.iter_mut() {
-                    if same_level(entry, &stmt.level) {
-                        if stmt.grant_option {
-                            entry.with_grant = false;
+                    if !same_level(entry, &stmt.level) {
+                        continue;
+                    }
+                    if stmt.grant_option {
+                        entry.with_grant = false;
+                        continue;
+                    }
+                    for elem in &stmt.privs {
+                        if !entry.privs.contains(elem.tp) && !elem.tp.is_all() {
+                            continue;
+                        }
+                        if elem.cols.is_empty() {
+                            entry.privs = entry.privs.difference(elem.tp);
+                            entry.columns.clear();
                         } else {
-                            entry.privs = entry.privs.difference(bits);
-                            if bits.contains(PrivilegeType::ALL) || entry.privs.is_empty() {
-                                entry.with_grant = false;
+                            entry
+                                .columns
+                                .retain(|c| !elem.cols.iter().any(|x| x.eq_ignore_ascii_case(c)));
+                            if entry.columns.is_empty() && !entry.privs.is_all() {
+                                // Column-only revoke emptied the list — drop that priv bit.
+                                entry.privs = entry.privs.difference(elem.tp);
                             }
+                        }
+                        if elem.tp.is_all() || entry.privs.is_empty() {
+                            entry.with_grant = false;
                         }
                     }
                 }
@@ -318,12 +338,26 @@ impl Manager {
         level: &GrantLevel,
         bits: PrivilegeType,
         with_grant: bool,
+        columns: &[String],
     ) {
         let mut inner = self.inner.lock().expect("privilege lock");
         let entries = inner.grants.entry(user_key(user)).or_default();
         if let Some(entry) = entries.iter_mut().find(|e| same_level(e, level)) {
             entry.privs = entry.privs.union(bits);
             entry.with_grant = entry.with_grant || with_grant;
+            if columns.is_empty() {
+                entry.columns.clear();
+            } else if !entry.columns.is_empty() {
+                for col in columns {
+                    if !entry
+                        .columns
+                        .iter()
+                        .any(|have| have.eq_ignore_ascii_case(col))
+                    {
+                        entry.columns.push(col.clone());
+                    }
+                }
+            }
             return;
         }
         entries.push(GrantEntry {
@@ -331,6 +365,7 @@ impl Manager {
             table: level.table_name.clone(),
             privs: bits,
             with_grant,
+            columns: columns.to_vec(),
         });
     }
 
@@ -351,6 +386,7 @@ impl Manager {
                             table: e.table.clone(),
                             privs: e.privs.bits(),
                             with_grant: e.with_grant,
+                            columns: e.columns.clone(),
                         })
                         .collect(),
                 })
@@ -396,6 +432,7 @@ impl Manager {
                         table: e.table,
                         privs: PrivilegeType::from_bits(e.privs),
                         with_grant: e.with_grant,
+                        columns: e.columns,
                     })
                     .collect(),
             );
@@ -433,6 +470,8 @@ struct PersistGrantEntry {
     table: String,
     privs: u64,
     with_grant: bool,
+    #[serde(default)]
+    columns: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -455,12 +494,6 @@ fn has_priv(
     entries
         .iter()
         .any(|e| matches_scope(e, db, table) && e.privs.contains(wanted))
-}
-
-fn merge_privs(privs: &[sealdb_parser::ast::PrivElem]) -> PrivilegeType {
-    privs
-        .iter()
-        .fold(PrivilegeType::default(), |acc, p| acc.union(p.tp))
 }
 
 fn user_key(user: &UserIdentity) -> (String, String) {
@@ -495,12 +528,18 @@ fn format_grant(user: &UserIdentity, entry: &GrantEntry) -> String {
     } else {
         format!("`{}`.`{}`", entry.db, entry.table)
     };
+    let priv_names = if entry.columns.is_empty() {
+        entry.privs.names().join(", ")
+    } else {
+        format!(
+            "{} ({})",
+            entry.privs.names().join(", "),
+            entry.columns.join(", ")
+        )
+    };
     let mut s = format!(
         "GRANT {} ON {} TO '{}'@'{}'",
-        entry.privs.names().join(", "),
-        level,
-        user.username,
-        user.hostname
+        priv_names, level, user.username, user.hostname
     );
     if entry.with_grant {
         s.push_str(" WITH GRANT OPTION");
