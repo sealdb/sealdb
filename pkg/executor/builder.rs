@@ -1,4 +1,4 @@
-use crate::aggregate::HashAggExec;
+use crate::aggregate::{HashAggExec, StreamAggExec};
 use crate::analyze::AnalyzeExec;
 use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
@@ -221,6 +221,15 @@ impl ExecutorBuilder {
                     .as_select()
                     .ok_or_else(|| Error::unsupported("hash agg without select"))?;
                 Ok(Box::new(HashAggExec::new(
+                    select,
+                    Self::build(child, stmt, domain, current_db, txn)?,
+                )?))
+            }
+            PhysicalPlan::StreamAgg { child } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("stream agg without select"))?;
+                Ok(Box::new(StreamAggExec::new(
                     select,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )?))

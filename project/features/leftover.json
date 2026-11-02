@@ -59,7 +59,6 @@
       "returning"
     ],
     "F08": [
-      "stream-agg",
       "spill"
     ],
     "F09": [

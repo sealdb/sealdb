@@ -83,6 +83,7 @@ case "$FEATURE" in
     run execute-agg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'); SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name"
     run execute-count-distinct cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'); SELECT COUNT(DISTINCT name) FROM db1.t"
     run execute-distinct-agg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.d (name VARCHAR(20), id INT); INSERT INTO db1.d VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 3); SELECT SUM(DISTINCT id), AVG(DISTINCT id), MIN(DISTINCT id), MAX(DISTINCT id) FROM db1.d"
+    run execute-stream-agg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); INSERT INTO db1.t VALUES (1), (2); EXPLAIN SELECT COUNT(*) FROM db1.t"
     ;;
   F09)
     run execute-join cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (3, 'y'); SELECT t1.id, t1.name, t2.tag FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id"

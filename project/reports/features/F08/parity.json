@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 162,
-  "manifest_entries": 112,
+  "rs_files": 163,
+  "manifest_entries": 113,
   "status_counts": {
-    "not-started": 1569,
-    "partial": 105,
+    "not-started": 1568,
+    "partial": 106,
     "reimplemented": 4,
     "ported": 3
   },
@@ -155,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 30,
-      "missing": 155,
+      "rs": 31,
+      "missing": 154,
       "status": {
-        "not-started": 155,
-        "partial": 30
+        "not-started": 154,
+        "partial": 31
       }
     },
     "pkg/expression": {
@@ -2340,10 +2340,10 @@
     },
     {
       "go_path": "pkg/executor/aggregate/agg_stream_executor.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/aggregate/agg_stream_executor.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "scalar StreamAgg; sorted GROUP BY StreamAgg deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_util.go",
@@ -4247,7 +4247,7 @@
       "rs_path": "pkg/infoschema/infoschema.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "in-memory schema snapshot + information_schema SCHEMATA/TABLES/COLUMNS"
+      "notes": "in-memory schema snapshot + I_S SCHEMATA/TABLES/COLUMNS/STATISTICS/constraints/partitions/charset"
     },
     {
       "go_path": "pkg/infoschema/infoschema_v2.go",
@@ -4345,7 +4345,7 @@
       "rs_path": "pkg/infoschema/tables.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "virtual SCHEMATA/TABLES/COLUMNS; remaining I_S tables deferred"
+      "notes": "virtual I_S tables for schema/index/partition/charset; cluster/TiKV tables deferred"
     },
     {
       "go_path": "pkg/keyspace/keyspace.go",
