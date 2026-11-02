@@ -8,4 +8,4 @@ pub mod builtin_op;
 pub mod constant;
 pub mod evaluator;
 
-pub use evaluator::{eval_expr, eval_expr_with_row, eval_filter, with_collation_ci};
+pub use evaluator::{collation_ci, eval_expr, eval_expr_with_row, eval_filter, with_collation_ci};

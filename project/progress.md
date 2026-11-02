@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F05 leftover（parallel-sort）
+- **完成**:
+  - ORDER BY 将行切成 worker 分区并行排序后 k-way merge
+  - `SEALDB_SORT_CONCURRENCY` 控制 worker 数（默认 CPU 数，上限 8）
+- **验证**:
+  - executor serial vs parallel；F05 gate execute-parallel-sort
+- **下一步**:
+  - leftover F07 / F09 / F02
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F05 leftover（topn-spill）
 - **完成**:
   - ORDER BY + LIMIT 走 TopN 堆；LIMIT 大于内存行阈值时 spill 有序 run 并只 merge 前 N 行

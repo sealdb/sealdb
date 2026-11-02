@@ -17,10 +17,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - `rowcodec`
 
-### F05
-
-- `parallel-sort`
-
 ### F07
 
 - `multi-table`

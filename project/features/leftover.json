@@ -43,9 +43,6 @@
     "F03": [
       "rowcodec"
     ],
-    "F05": [
-      "parallel-sort"
-    ],
     "F07": [
       "multi-table",
       "update-join",
