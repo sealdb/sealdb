@@ -12,7 +12,7 @@
     "F04": {"status": "core-ported", "phase": 5, "notes": "WHERE + IN/BETWEEN/LIKE/IS NULL; PPD into TableReader/IndexLookUp coprocessor-filter", "gaps": []},
     "F05": {"status": "core-ported", "phase": 5, "notes": "ORDER BY + LIMIT/OFFSET with sort-run spill, TopN heap spill, and parallel sort workers", "gaps": []},
     "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle / unique-index PointGet and BatchPointGet", "gaps": []},
-    "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE SET / DELETE with ORDER BY LIMIT", "gaps": ["multi-table", "update-join", "returning"]},
+    "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE/DELETE with ORDER BY LIMIT; two-table UPDATE JOIN and multi-table DELETE; RETURNING out of scope (not in TiDB v8.5.8)", "gaps": []},
     "F08": {"status": "core-ported", "phase": 5, "notes": "HashAgg GROUP BY + StreamAgg scalar COUNT/SUM/AVG/MIN/MAX DISTINCT/HAVING + partition spill", "gaps": []},
     "F09": {"status": "core-ported", "phase": 5, "notes": "two-table Inner/Left/Right HashJoin on equality + partition spill", "gaps": ["semi-anti", "cross-join", "n-table"]},
     "F10": {"status": "core-ported", "phase": 5, "notes": "CREATE TABLE INDEX/KEY + unique/PK + IndexLookUp / covering IndexReader + first-column range scan", "gaps": []},

@@ -1590,10 +1590,14 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join
     if from.len() > 1 {
         return Err(Error::unsupported("comma joins"));
     }
-    let table = &from[0];
+    let (left, join) = lower_table_with_joins(&from[0])?;
+    Ok((Some(left), join))
+}
+
+fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> {
     let left = table_factor_name(&table.relation)?;
     if table.joins.is_empty() {
-        return Ok((Some(left), None));
+        return Ok((left, None));
     }
     if table.joins.len() != 1 {
         return Err(Error::unsupported("more than two tables in JOIN"));
@@ -1615,7 +1619,7 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join
         other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
     };
     Ok((
-        Some(left.clone()),
+        left.clone(),
         Some(Join {
             left,
             right,
@@ -1690,22 +1694,28 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
 }
 
 fn lower_update(update: &Update) -> Result<Statement> {
-    // F07 leftover: ORDER BY / LIMIT. Completeness: UPDATE FROM, RETURNING, multi-table.
+    // F07 leftover: two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
     }
-    let table = table_from_relation(&update.table)?;
+    let (table, join) = lower_table_with_joins(&update.table)?;
+    let order_by = lower_order_by_exprs(&update.order_by)?;
+    let limit = update.limit.as_ref().map(expr_as_u64).transpose()?;
+    if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
+        return Err(Error::unsupported("ORDER BY / LIMIT on multi-table UPDATE"));
+    }
     let list = update
         .assignments
         .iter()
         .map(|item| {
-            let column = match &item.target {
-                AssignmentTarget::ColumnName(name) => object_name_last(name)?,
+            let (table, column) = match &item.target {
+                AssignmentTarget::ColumnName(name) => assignment_column(name)?,
                 AssignmentTarget::Tuple(_) => {
                     return Err(Error::unsupported("tuple UPDATE assignment"));
                 }
             };
             Ok(Assignment {
+                table,
                 column,
                 expr: lower_expr(&item.value)?,
             })
@@ -1716,43 +1726,81 @@ fn lower_update(update: &Update) -> Result<Statement> {
     }
     Ok(Statement::Update(UpdateStmt {
         table,
+        join,
         list,
         selection: update.selection.as_ref().map(lower_expr).transpose()?,
-        order_by: lower_order_by_exprs(&update.order_by)?,
-        limit: update.limit.as_ref().map(expr_as_u64).transpose()?,
+        order_by,
+        limit,
     }))
 }
 
 fn lower_delete(delete: &Delete) -> Result<Statement> {
-    // F07 leftover: ORDER BY / LIMIT. Completeness: multi-table, USING, RETURNING.
-    if delete.using.is_some()
-        || delete.returning.is_some()
-        || delete.output.is_some()
-        || !delete.tables.is_empty()
-    {
-        return Err(Error::unsupported("multi-table / RETURNING DELETE"));
+    // F07 leftover: two-table DELETE. TiDB v8.5.8 has no DELETE RETURNING.
+    if delete.returning.is_some() || delete.output.is_some() {
+        return Err(Error::unsupported("DELETE RETURNING"));
     }
-    let tables = match &delete.from {
+    let from = match &delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
-    if tables.len() != 1 {
-        return Err(Error::unsupported("multi-table DELETE"));
+    let ((table, join), tables) = if let Some(using) = &delete.using {
+        if using.len() != 1 {
+            return Err(Error::unsupported("comma joins"));
+        }
+        let rel = lower_table_with_joins(&using[0])?;
+        let tables = if !delete.tables.is_empty() {
+            delete
+                .tables
+                .iter()
+                .map(object_table_name)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            from.iter()
+                .map(|twj| {
+                    if !twj.joins.is_empty() {
+                        return Err(Error::unsupported("JOIN in DELETE FROM list"));
+                    }
+                    table_factor_name(&twj.relation)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        (rel, tables)
+    } else {
+        if from.len() != 1 {
+            return Err(Error::unsupported("multi-table DELETE"));
+        }
+        let rel = lower_table_with_joins(&from[0])?;
+        let tables = delete
+            .tables
+            .iter()
+            .map(object_table_name)
+            .collect::<Result<Vec<_>>>()?;
+        (rel, tables)
+    };
+    let order_by = lower_order_by_exprs(&delete.order_by)?;
+    let limit = delete.limit.as_ref().map(expr_as_u64).transpose()?;
+    if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
+        return Err(Error::unsupported("ORDER BY / LIMIT on multi-table DELETE"));
+    }
+    if join.is_some() && tables.is_empty() {
+        return Err(Error::unsupported("multi-table DELETE without table list"));
     }
     Ok(Statement::Delete(DeleteStmt {
-        table: table_from_relation(&tables[0])?,
+        table,
+        tables,
+        join,
         selection: delete.selection.as_ref().map(lower_expr).transpose()?,
-        order_by: lower_order_by_exprs(&delete.order_by)?,
-        limit: delete.limit.as_ref().map(expr_as_u64).transpose()?,
+        order_by,
+        limit,
     }))
 }
 
-fn table_from_relation(table: &TableWithJoins) -> Result<TableName> {
-    if !table.joins.is_empty() {
-        return Err(Error::unsupported("JOIN in DML"));
-    }
-    match &table.relation {
-        TableFactor::Table { name, .. } => object_table_name(name),
-        other => Err(Error::unsupported(format!("DML target {other}"))),
+fn assignment_column(name: &ObjectName) -> Result<(Option<String>, String)> {
+    let parts = object_name_parts(name)?;
+    match parts.as_slice() {
+        [column] => Ok((None, column.clone())),
+        [table, column] => Ok((Some(table.clone()), column.clone())),
+        [_, table, column] => Ok((Some(table.clone()), column.clone())),
+        _ => Err(Error::unsupported(format!("UPDATE column {name}"))),
     }
 }
 

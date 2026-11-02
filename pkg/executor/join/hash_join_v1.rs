@@ -319,6 +319,107 @@ fn key_text(value: &Datum) -> String {
     format!("{value:?}")
 }
 
+pub(crate) fn hash_join_pairs(
+    join: &Join,
+    left_schema: &[String],
+    right_schema: &[String],
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+) -> Result<Vec<(Option<usize>, Option<usize>)>> {
+    let left_q = qualify_schema(left_schema, &join.left.name);
+    let right_q = qualify_schema(right_schema, &join.right.name);
+    let (left_key, right_key) = split_join_eq(&join.on, &join.left.name, &join.right.name)?;
+    match join.tp {
+        JoinType::Inner => probe_inner_pairs(
+            left_rows, right_rows, &left_q, &right_q, &left_key, &right_key,
+        )
+        .map(|pairs| pairs.into_iter().map(|(l, r)| (Some(l), Some(r))).collect()),
+        JoinType::LeftOuter => probe_outer_pairs(
+            left_rows, right_rows, &left_q, &right_q, &left_key, &right_key, true,
+        ),
+        JoinType::RightOuter => probe_outer_pairs(
+            right_rows, left_rows, &right_q, &left_q, &right_key, &left_key, false,
+        ),
+    }
+}
+
+fn probe_inner_pairs(
+    probe_rows: &[Vec<Datum>],
+    build_rows: &[Vec<Datum>],
+    probe_schema: &[String],
+    build_schema: &[String],
+    probe_key: &ExprNode,
+    build_key: &ExprNode,
+) -> Result<Vec<(usize, usize)>> {
+    let index = build_index_ids(build_rows, build_schema, build_key)?;
+    let mut out = Vec::new();
+    for (probe_i, probe) in probe_rows.iter().enumerate() {
+        let key = eval_expr_with_row(probe_key, probe_schema, probe)?;
+        if key.is_null() {
+            continue;
+        }
+        if let Some(matches) = index.get(&key_text(&key)) {
+            for &build_i in matches {
+                out.push((probe_i, build_i));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn probe_outer_pairs(
+    outer_rows: &[Vec<Datum>],
+    inner_rows: &[Vec<Datum>],
+    outer_schema: &[String],
+    inner_schema: &[String],
+    outer_key: &ExprNode,
+    inner_key: &ExprNode,
+    outer_is_left: bool,
+) -> Result<Vec<(Option<usize>, Option<usize>)>> {
+    let index = build_index_ids(inner_rows, inner_schema, inner_key)?;
+    let mut out = Vec::new();
+    for (outer_i, outer) in outer_rows.iter().enumerate() {
+        let key = eval_expr_with_row(outer_key, outer_schema, outer)?;
+        let mut matched = false;
+        if !key.is_null()
+            && let Some(matches) = index.get(&key_text(&key))
+        {
+            for &inner_i in matches {
+                matched = true;
+                out.push(if outer_is_left {
+                    (Some(outer_i), Some(inner_i))
+                } else {
+                    (Some(inner_i), Some(outer_i))
+                });
+            }
+        }
+        if !matched {
+            out.push(if outer_is_left {
+                (Some(outer_i), None)
+            } else {
+                (None, Some(outer_i))
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn build_index_ids(
+    rows: &[Vec<Datum>],
+    schema: &[String],
+    key: &ExprNode,
+) -> Result<HashMap<String, Vec<usize>>> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let value = eval_expr_with_row(key, schema, row)?;
+        if value.is_null() {
+            continue;
+        }
+        index.entry(key_text(&value)).or_default().push(i);
+    }
+    Ok(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

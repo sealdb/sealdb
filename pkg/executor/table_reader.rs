@@ -109,6 +109,7 @@ impl Executor for TableReaderExec {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ScannedRow {
     pub handle: i64,
     pub physical_id: i64,

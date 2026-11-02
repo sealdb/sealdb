@@ -462,12 +462,12 @@
     "pkg/executor/update.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "single-table UPDATE SET + ORDER BY / LIMIT"
+      "notes": "single-table UPDATE SET + ORDER BY / LIMIT + two-table UPDATE JOIN"
     },
     "pkg/executor/delete.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "single-table DELETE + ORDER BY / LIMIT"
+      "notes": "single-table DELETE + ORDER BY / LIMIT + two-table DELETE JOIN"
     },
     "pkg/executor/table_reader.go": {
       "status": "partial",
