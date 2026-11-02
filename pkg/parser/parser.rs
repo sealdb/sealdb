@@ -674,6 +674,33 @@ mod tests {
             },
             other => panic!("expected AlterTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t ADD COLUMN age INT AFTER name")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::AddColumn { position, .. } => {
+                    assert!(matches!(
+                        position,
+                        crate::ast::ColumnPosition::After(name) if name == "name"
+                    ));
+                }
+                other => panic!("expected ADD COLUMN AFTER, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t ADD COLUMN z INT FIRST")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::AddColumn { position, .. } => {
+                    assert_eq!(*position, crate::ast::ColumnPosition::First);
+                }
+                other => panic!("expected ADD COLUMN FIRST, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

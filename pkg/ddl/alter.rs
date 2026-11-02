@@ -1,6 +1,6 @@
-// F18 core: ALTER TABLE ADD/DROP COLUMN|INDEX, CHANGE/MODIFY/RENAME.
-// Completeness wave / not this feature: AFTER/FIRST, ALGORITHM/LOCK,
-// generated columns, partitions, multi-schema-state jobs.
+// F18 core: ALTER TABLE ADD/DROP COLUMN|INDEX, CHANGE/MODIFY/RENAME, AFTER/FIRST.
+// Completeness wave / not this feature: ALGORITHM/LOCK, generated columns,
+// partitions, multi-schema-state jobs.
 use crate::create_table::field_type_from_name;
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::table::resolve_name;
@@ -11,7 +11,7 @@ use sealdb_errno::{
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
 use sealdb_meta::{ColumnInfo, Mutator, TableInfo};
-use sealdb_parser::ast::{AlterTableSpec, AlterTableStmt, TableName};
+use sealdb_parser::ast::{AlterTableSpec, AlterTableStmt, ColumnPosition, TableName};
 use sealdb_parser::model::CIStr;
 use sealdb_tablecodec::{decode_row, encode_row, gen_table_record_prefix, next_prefix};
 use sealdb_types::{EvalType, FieldType};
@@ -29,7 +29,16 @@ pub fn alter_table(
             AlterTableSpec::AddColumn {
                 if_not_exists,
                 column,
-            } => add_column(meta, &snapshot, stmt, column, *if_not_exists, current_db)?,
+                position,
+            } => add_column(
+                meta,
+                &snapshot,
+                stmt,
+                column,
+                position,
+                *if_not_exists,
+                current_db,
+            )?,
             AlterTableSpec::DropColumn { if_exists, name } => {
                 drop_column(meta, &snapshot, stmt, name, *if_exists, current_db)?;
             }
@@ -59,6 +68,7 @@ pub fn alter_table(
                 old_name,
                 new_name,
                 type_name,
+                position,
             } => change_column(
                 meta,
                 &snapshot,
@@ -66,21 +76,35 @@ pub fn alter_table(
                 old_name,
                 new_name,
                 Some(type_name),
+                position,
                 current_db,
                 storage,
             )?,
-            AlterTableSpec::ModifyColumn { name, type_name } => change_column(
+            AlterTableSpec::ModifyColumn {
+                name,
+                type_name,
+                position,
+            } => change_column(
                 meta,
                 &snapshot,
                 stmt,
                 name,
                 name,
                 Some(type_name),
+                position,
                 current_db,
                 storage,
             )?,
             AlterTableSpec::RenameColumn { old_name, new_name } => change_column(
-                meta, &snapshot, stmt, old_name, new_name, None, current_db, storage,
+                meta,
+                &snapshot,
+                stmt,
+                old_name,
+                new_name,
+                None,
+                &ColumnPosition::None,
+                current_db,
+                storage,
             )?,
             AlterTableSpec::RenameTable { new_name } => {
                 rename_table(meta, &snapshot, stmt, new_name, current_db)?;
@@ -99,6 +123,7 @@ fn add_column(
     is: &InfoSchema,
     stmt: &AlterTableStmt,
     column: &sealdb_parser::ast::ColumnDef,
+    position: &ColumnPosition,
     if_not_exists: bool,
     current_db: &str,
 ) -> Result<()> {
@@ -126,13 +151,17 @@ fn add_column(
         ));
     }
     info.max_col_id += 1;
-    let offset = info.columns.len() as i32;
-    info.columns.push(ColumnInfo::new(
-        info.max_col_id,
-        offset,
-        column.name.clone(),
-        field_type_from_name(&column.type_name)?,
-    ));
+    let insert_at = column_insert_index(&info, position)?;
+    info.columns.insert(
+        insert_at,
+        ColumnInfo::new(
+            info.max_col_id,
+            insert_at as i32,
+            column.name.clone(),
+            field_type_from_name(&column.type_name)?,
+        ),
+    );
+    recompute_column_offsets(&mut info);
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
@@ -169,7 +198,10 @@ fn drop_column(
             format!("Can't DROP '{name}'; check that column/key exists"),
         ));
     };
-    if pos == 0 {
+    if info
+        .handle_column()
+        .is_some_and(|handle| handle.id == info.columns[pos].id)
+    {
         return Err(Error::unsupported("DROP handle column"));
     }
     if info.indices.iter().any(|idx| {
@@ -183,20 +215,7 @@ fn drop_column(
         return Err(Error::unsupported("DROP last column"));
     }
     info.columns.remove(pos);
-    for (offset, col) in info.columns.iter_mut().enumerate() {
-        col.offset = offset as i32;
-    }
-    for idx in &mut info.indices {
-        for ic in &mut idx.columns {
-            if let Some(col) = info
-                .columns
-                .iter()
-                .find(|c| c.name.o().eq_ignore_ascii_case(ic.name.o()))
-            {
-                ic.offset = col.offset;
-            }
-        }
-    }
+    recompute_column_offsets(&mut info);
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
@@ -212,6 +231,7 @@ fn change_column(
     old_name: &str,
     new_name: &str,
     type_name: Option<&str>,
+    position: &ColumnPosition,
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
@@ -250,7 +270,11 @@ fn change_column(
         Some(name) => field_type_from_name(name)?,
         None => info.columns[pos].field_type.clone(),
     };
-    if pos == 0 && new_ft.eval_type() != EvalType::Int {
+    if info
+        .handle_column()
+        .is_some_and(|handle| handle.id == info.columns[pos].id)
+        && new_ft.eval_type() != EvalType::Int
+    {
         return Err(Error::unsupported("MODIFY handle column type"));
     }
     let changed = field_type_changed(&info.columns[pos].field_type, &new_ft);
@@ -284,6 +308,12 @@ fn change_column(
                 backfill_index(storage, &info, &idx)?;
             }
         }
+    }
+    if needs_column_move(position, new_name) {
+        let col = info.columns.remove(pos);
+        let insert_at = column_insert_index(&info, position)?;
+        info.columns.insert(insert_at, col);
+        recompute_column_offsets(&mut info);
     }
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
@@ -435,4 +465,46 @@ fn rename_index(
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
+}
+
+fn column_insert_index(info: &TableInfo, position: &ColumnPosition) -> Result<usize> {
+    match position {
+        ColumnPosition::None => Ok(info.columns.len()),
+        ColumnPosition::First => Ok(0),
+        ColumnPosition::After(name) => {
+            let pos = info
+                .columns
+                .iter()
+                .position(|c| c.name.o().eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    Error::new(ERR_BAD_FIELD, format!("Unknown column '{name}' in 'AFTER'"))
+                })?;
+            Ok(pos + 1)
+        }
+    }
+}
+
+fn needs_column_move(position: &ColumnPosition, col_name: &str) -> bool {
+    match position {
+        ColumnPosition::None => false,
+        ColumnPosition::First => true,
+        ColumnPosition::After(name) => !name.eq_ignore_ascii_case(col_name),
+    }
+}
+
+fn recompute_column_offsets(info: &mut TableInfo) {
+    for (offset, col) in info.columns.iter_mut().enumerate() {
+        col.offset = offset as i32;
+    }
+    for idx in &mut info.indices {
+        for ic in &mut idx.columns {
+            if let Some(col) = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(ic.name.o()))
+            {
+                ic.offset = col.offset;
+            }
+        }
+    }
 }

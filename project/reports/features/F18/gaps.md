@@ -8,6 +8,5 @@ wave. Rejected via `Error::unsupported` in
 - Async DDL job queue / coprocessor reorg workers / concurrent ingest
 - `ALGORITHM` / `LOCK`
 - `FULLTEXT` / prefix indexes
-- `ADD COLUMN AFTER` / `FIRST`
 - Generated columns, partitions, multi-table ALTER
 - Transactional DDL

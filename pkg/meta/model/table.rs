@@ -64,10 +64,12 @@ impl TableInfo {
             .collect()
     }
 
+    /// Integer handle column is the original first INT (id == 1), so AFTER/FIRST
+    /// reordering does not steal the row key.
     pub fn handle_column(&self) -> Option<&ColumnInfo> {
         self.columns
-            .first()
-            .filter(|col| col.field_type.eval_type() == EvalType::Int)
+            .iter()
+            .find(|col| col.id == 1 && col.field_type.eval_type() == EvalType::Int)
     }
 
     pub fn covering_column_names(&self, index: &IndexInfo) -> Vec<String> {

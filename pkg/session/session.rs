@@ -3318,6 +3318,42 @@ mod tests {
     }
 
     #[test]
+    fn test_after_first() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t ADD COLUMN extra INT AFTER id")
+            .unwrap();
+        let after = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(after.columns, vec!["id", "extra", "name"]);
+        assert_eq!(
+            after.display_rows(),
+            vec![vec!["1".to_string(), "NULL".to_string(), "a".to_string()]]
+        );
+        session
+            .execute_stmt("ALTER TABLE db1.t ADD COLUMN z INT FIRST")
+            .unwrap();
+        let first = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(first.columns, vec!["z", "id", "extra", "name"]);
+        session
+            .execute_stmt("ALTER TABLE db1.t MODIFY extra VARCHAR(8) AFTER name")
+            .unwrap();
+        let moved = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(moved.columns, vec!["z", "id", "name", "extra"]);
+        let hit = session
+            .execute_stmt("SELECT id, name FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            hit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+    }
+
+    #[test]
     fn test_partition_prune() {
         let session = Session::new();
         session

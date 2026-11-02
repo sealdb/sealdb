@@ -1,6 +1,6 @@
 use super::dialect::dialect;
 use crate::ast::ddl::{
-    AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
+    AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
     PartitionOption, PartitionType, TableName,
 };
@@ -30,13 +30,13 @@ use sqlparser::ast::{
     BinaryOperator, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized, DataType, Delete,
     DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NamedWindowDefinition,
-    NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
-    OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
-    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
-    Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, MySQLColumnPosition,
+    NamedWindowDefinition, NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType,
+    OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, RenameTable as SqlRenameTable,
+    RenameTableNameKind, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier,
+    ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
+    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
@@ -2996,9 +2996,17 @@ fn lower_rename_tables(renames: &[SqlRenameTable]) -> Result<Statement> {
     }))
 }
 
+fn lower_column_position(pos: &Option<MySQLColumnPosition>) -> ColumnPosition {
+    match pos {
+        None => ColumnPosition::None,
+        Some(MySQLColumnPosition::First) => ColumnPosition::First,
+        Some(MySQLColumnPosition::After(ident)) => ColumnPosition::After(ident.value.clone()),
+    }
+}
+
 fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<Statement> {
-    // F18 gap / completeness wave: AFTER/FIRST, ALGORITHM/LOCK, generated
-    // columns, partitions beyond ADD/DROP COLUMN|INDEX.
+    // F18 gap / completeness wave: ALGORITHM/LOCK, generated columns,
+    // partitions beyond ADD/DROP COLUMN|INDEX.
     if alter.if_exists || alter.only || alter.location.is_some() || alter.on_cluster.is_some() {
         return Err(Error::unsupported("ALTER TABLE option"));
     }
@@ -3023,18 +3031,14 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             column_def,
             column_position,
             ..
-        } => {
-            if column_position.is_some() {
-                return Err(Error::unsupported("ALTER TABLE ADD COLUMN AFTER/FIRST"));
-            }
-            Ok(AlterTableSpec::AddColumn {
-                if_not_exists: *if_not_exists,
-                column: ColumnDef {
-                    name: column_def.name.value.clone(),
-                    type_name: column_def.data_type.to_string(),
-                },
-            })
-        }
+        } => Ok(AlterTableSpec::AddColumn {
+            if_not_exists: *if_not_exists,
+            column: ColumnDef {
+                name: column_def.name.value.clone(),
+                type_name: column_def.data_type.to_string(),
+            },
+            position: lower_column_position(column_position),
+        }),
         AlterTableOperation::DropColumn {
             column_names,
             if_exists,
@@ -3059,9 +3063,6 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             options,
             column_position,
         } => {
-            if column_position.is_some() {
-                return Err(Error::unsupported("ALTER TABLE CHANGE COLUMN AFTER/FIRST"));
-            }
             if !options.is_empty() {
                 return Err(Error::unsupported("CHANGE COLUMN option"));
             }
@@ -3069,6 +3070,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 old_name: old_name.value.clone(),
                 new_name: new_name.value.clone(),
                 type_name: data_type.to_string(),
+                position: lower_column_position(column_position),
             })
         }
         AlterTableOperation::ModifyColumn {
@@ -3077,15 +3079,13 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             options,
             column_position,
         } => {
-            if column_position.is_some() {
-                return Err(Error::unsupported("ALTER TABLE MODIFY COLUMN AFTER/FIRST"));
-            }
             if !options.is_empty() {
                 return Err(Error::unsupported("MODIFY COLUMN option"));
             }
             Ok(AlterTableSpec::ModifyColumn {
                 name: col_name.value.clone(),
                 type_name: data_type.to_string(),
+                position: lower_column_position(column_position),
             })
         }
         AlterTableOperation::RenameColumn {
