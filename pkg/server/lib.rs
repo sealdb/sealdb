@@ -38,6 +38,10 @@ mod tests {
         fn handshake(&mut self) {
             let hello = self.pkt.read_packet().unwrap();
             assert_eq!(hello[0], 10);
+            self.handshake_from_hello_done();
+        }
+
+        fn handshake_from_hello_done(&mut self) {
             let mut resp = Vec::new();
             let cap = CLIENT_PROTOCOL_41
                 | CLIENT_SECURE_CONNECTION
@@ -283,6 +287,33 @@ mod tests {
         let mut i = 0;
         let cols = read_lenenc(&first, &mut i).unwrap();
         assert_eq!(cols, 1);
+    }
+
+    #[test]
+    fn test_compress_capability_advertised() {
+        let addr = start_server();
+        let mut client = TestClient::connect(addr);
+        let hello = client.pkt.read_packet().unwrap();
+        assert_eq!(hello[0], 10);
+        let mut i = 1;
+        while i < hello.len() && hello[i] != 0 {
+            i += 1;
+        }
+        i += 1 + 4 + 8 + 1;
+        let cap_lo = u16::from_le_bytes([hello[i], hello[i + 1]]);
+        i += 2 + 1 + 2;
+        let cap_hi = u16::from_le_bytes([hello[i], hello[i + 1]]);
+        let cap = u32::from(cap_lo) | (u32::from(cap_hi) << 16);
+        assert_ne!(
+            cap & sealdb_parser::mysql::CLIENT_COMPRESS,
+            0,
+            "server should advertise CLIENT_COMPRESS"
+        );
+        // Clients that omit CLIENT_COMPRESS stay on plain packets.
+        client.handshake_from_hello_done();
+        let rows = client.query("SELECT 1").unwrap();
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
+        client.quit();
     }
 
     #[test]

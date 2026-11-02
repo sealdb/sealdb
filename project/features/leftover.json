@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F22": [
-      "compression",
       "prepared-stmt",
       "auth-plugin",
       "binary-protocol",

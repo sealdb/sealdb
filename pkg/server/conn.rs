@@ -8,10 +8,11 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_executor::QueryResult;
 use sealdb_parser::mysql::{
-    CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
-    CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT,
-    COM_STMT_EXECUTE, COM_STMT_PREPARE, DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID, EOF_HEADER,
-    ERR_HEADER, NULL_LENENC, OK_HEADER, SERVER_STATUS_AUTOCOMMIT, SERVER_VERSION, TYPE_VAR_STRING,
+    CLIENT_COMPRESS, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
+    CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB,
+    COM_PING, COM_QUERY, COM_QUIT, COM_STMT_EXECUTE, COM_STMT_PREPARE, DEFAULT_CAPABILITY,
+    DEFAULT_CHARSET_ID, EOF_HEADER, ERR_HEADER, NULL_LENENC, OK_HEADER, SERVER_STATUS_AUTOCOMMIT,
+    SERVER_VERSION, TYPE_VAR_STRING,
 };
 use sealdb_session::Session;
 use sealdb_types::Datum;
@@ -118,7 +119,12 @@ impl ClientConn {
             self.write_error(&err)?;
             return Err(err);
         }
-        self.write_ok()
+        // OK packet is still uncompressed; enable zlib afterwards.
+        self.write_ok()?;
+        if capability & CLIENT_COMPRESS != 0 && self.server_capability() & CLIENT_COMPRESS != 0 {
+            self.pkt.set_compressed(true);
+        }
+        Ok(())
     }
 
     fn upgrade_tls(&mut self) -> Result<()> {

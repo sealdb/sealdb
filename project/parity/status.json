@@ -353,7 +353,7 @@
       "status": "partial",
       "rust": "pkg/server/internal/packetio.rs",
       "phase": 9,
-      "notes": "MySQL packet I/O with stream swap for TLS; compression deferred"
+      "notes": "MySQL packet I/O with TLS stream swap + zlib CLIENT_COMPRESS; zstd deferred"
     },
     "pkg/ddl/ddl.go": {
       "status": "partial",

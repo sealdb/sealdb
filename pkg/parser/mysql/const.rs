@@ -28,6 +28,8 @@ pub const CLIENT_CONNECT_WITH_DB: u32 = 1 << 3;
 pub const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 /// Client may switch to TLS after the initial handshake (TiDB/MySQL `CLIENT_SSL`).
 pub const CLIENT_SSL: u32 = 1 << 11;
+/// zlib-compressed MySQL packets after handshake (`CLIENT_COMPRESS`).
+pub const CLIENT_COMPRESS: u32 = 1 << 5;
 pub const CLIENT_TRANSACTIONS: u32 = 1 << 13;
 pub const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 pub const CLIENT_MULTI_STATEMENTS: u32 = 1 << 16;
@@ -48,6 +50,7 @@ pub const DEFAULT_CAPABILITY: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
     | CLIENT_CONNECT_WITH_DB
+    | CLIENT_COMPRESS
     | CLIENT_PROTOCOL_41
     | CLIENT_TRANSACTIONS
     | CLIENT_SECURE_CONNECTION
