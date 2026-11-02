@@ -1302,6 +1302,18 @@ mod tests {
             crate::ast::Statement::Revoke(revoke) => assert!(revoke.grant_option),
             other => panic!("expected RevokeStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("GRANT SELECT (id, name) ON db1.t TO 'u'@'%'")
+            .unwrap()
+        {
+            crate::ast::Statement::Grant(grant) => {
+                assert_eq!(
+                    grant.privs[0].cols,
+                    vec!["id".to_string(), "name".to_string()]
+                );
+            }
+            other => panic!("expected GrantStmt, got {other:?}"),
+        }
     }
 
     #[test]

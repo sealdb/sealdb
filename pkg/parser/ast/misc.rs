@@ -141,11 +141,23 @@ impl UserIdentity {
 #[derive(Clone, Debug)]
 pub struct PrivElem {
     pub tp: PrivilegeType,
+    /// Column list for `GRANT SELECT (c1, c2) ON t` (empty = table-level).
+    pub cols: Vec<String>,
 }
 
 impl PrivElem {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str(&self.tp.names().join(", "));
+        if !self.cols.is_empty() {
+            ctx.write_str(" (");
+            for (i, col) in self.cols.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        }
         Ok(())
     }
 }

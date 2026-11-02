@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F20": [
-      "column-grants",
       "dynamic-privs",
       "create-user"
     ],
