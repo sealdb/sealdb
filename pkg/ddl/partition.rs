@@ -1,6 +1,7 @@
 // F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS
 // and scalar expression keys (`id % 4`, `ABS(id)`), plus ADD/DROP PARTITION.
-// Completeness wave / not this feature: reorganize, job states, subpartition.
+// SUBPARTITION BY under RANGE/LIST is accepted then stripped (TiDB parity);
+// under HASH/KEY it is rejected. Completeness wave: reorganize, job states.
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_NO_SUCH_TABLE, Error, Result,
@@ -53,6 +54,13 @@ pub fn attach_partitions(
     };
     if matches!(tp, PartitionType::Key) && spec.expr.is_some() {
         return Err(Error::unsupported("KEY partition expression"));
+    }
+    // TiDB strips SUBPARTITION under RANGE/LIST; HASH/KEY + SUBPARTITION is illegal.
+    if spec.subpartition_ignored && matches!(tp, PartitionType::Hash | PartitionType::Key) {
+        return Err(Error::new(
+            1500,
+            "It is only possible to mix RANGE/LIST partitioning with HASH/KEY partitioning for subpartitioning",
+        ));
     }
     let defs = match tp {
         PartitionType::Hash | PartitionType::Key => {

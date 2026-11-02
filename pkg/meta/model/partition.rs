@@ -59,7 +59,7 @@ impl PartitionDefinition {
 }
 
 /// TiDB `model.PartitionInfo` core fields used by F19.
-/// Completeness wave: RANGE COLUMNS, subpartition, reorg states.
+/// Completeness wave: nested subpartition storage, reorg states.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionInfo {
     #[serde(rename = "type")]

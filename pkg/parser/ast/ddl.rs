@@ -171,6 +171,9 @@ pub struct PartitionOption {
     pub expr: Option<String>,
     pub defs: Vec<PartitionDef>,
     pub num: u64,
+    /// TiDB accepts `SUBPARTITION BY` under RANGE/LIST then strips it; true when
+    /// that clause was present so DDL can ignore it (HASH/KEY reject instead).
+    pub subpartition_ignored: bool,
 }
 
 #[derive(Clone, Debug)]

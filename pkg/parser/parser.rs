@@ -1191,6 +1191,42 @@ mod tests {
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
         match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (a INT) PARTITION BY RANGE (a) SUBPARTITION BY HASH (a) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (100), PARTITION p1 VALUES LESS THAN (MAXVALUE))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("subpartition stripped");
+                assert_eq!(part.tp, crate::ast::PartitionType::Range);
+                assert!(part.subpartition_ignored);
+                assert_eq!(part.defs.len(), 2);
+                assert_eq!(part.defs[0].less_than, Some(100));
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (a INT, b INT) PARTITION BY RANGE (a) SUBPARTITION BY HASH (b) SUBPARTITIONS 2 (PARTITION x VALUES LESS THAN (10) (SUBPARTITION y, SUBPARTITION z), PARTITION a VALUES LESS THAN (20) (SUBPARTITION b, SUBPARTITION c))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("named subpartitions stripped");
+                assert!(part.subpartition_ignored);
+                assert_eq!(part.defs.len(), 2);
+                assert_eq!(part.defs[0].name, "x");
+                assert_eq!(part.defs[1].less_than, Some(20));
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt(
+                "CREATE TABLE t (a INT) PARTITION BY HASH (a) PARTITIONS 2 SUBPARTITION BY KEY (a) SUBPARTITIONS 2",
+            )
+            .unwrap_err();
+        assert_eq!(err.code, 1500);
+        match parser
             .parse_one_stmt("ALTER TABLE t ADD PARTITION (PARTITION p2 VALUES LESS THAN (30))")
             .unwrap()
         {

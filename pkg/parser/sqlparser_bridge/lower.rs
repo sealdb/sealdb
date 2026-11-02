@@ -1640,7 +1640,8 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
-    // F19 gap: subpartition / expr keys.
+    // F19: SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
+    // rejected under HASH/KEY with ErrSubpartition.
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
         PartitionType::Range
@@ -1678,6 +1679,10 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
             if num == 0 {
                 return Err(Error::unsupported("HASH/KEY PARTITIONS 0"));
             }
+            let (has_sub, end) = parse_optional_subpartition(bytes, skip_ws(bytes, end))?;
+            if has_sub {
+                return Err(subpartition_mix_error());
+            }
             Ok((
                 PartitionOption {
                     tp,
@@ -1686,11 +1691,14 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     expr,
                     defs: Vec::new(),
                     num,
+                    subpartition_ignored: false,
                 },
                 end,
             ))
         }
         PartitionType::Range => {
+            let (has_sub, next) = parse_optional_subpartition(bytes, i)?;
+            i = next;
             if i >= bytes.len() || bytes[i] != b'(' {
                 return Err(Error::unsupported("RANGE without partitions"));
             }
@@ -1707,11 +1715,14 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     expr,
                     num: defs.len() as u64,
                     defs,
+                    subpartition_ignored: has_sub,
                 },
                 end + 1,
             ))
         }
         PartitionType::List => {
+            let (has_sub, next) = parse_optional_subpartition(bytes, i)?;
+            i = next;
             if i >= bytes.len() || bytes[i] != b'(' {
                 return Err(Error::unsupported("LIST without partitions"));
             }
@@ -1728,11 +1739,55 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     expr,
                     num: defs.len() as u64,
                     defs,
+                    subpartition_ignored: has_sub,
                 },
                 end + 1,
             ))
         }
     }
+}
+
+/// Consume `SUBPARTITION BY HASH|KEY (...) [SUBPARTITIONS n]`.
+fn parse_optional_subpartition(bytes: &[u8], mut i: usize) -> Result<(bool, usize)> {
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "SUBPARTITION") {
+        return Ok((false, i));
+    }
+    i = skip_ws(bytes, i + "SUBPARTITION".len());
+    if !keyword_at(bytes, i, "BY") {
+        return Err(Error::unsupported("SUBPARTITION without BY"));
+    }
+    i = skip_ws(bytes, i + "BY".len());
+    if keyword_at(bytes, i, "HASH") {
+        i = skip_ws(bytes, i + "HASH".len());
+    } else if keyword_at(bytes, i, "KEY") {
+        i = skip_ws(bytes, i + "KEY".len());
+    } else {
+        return Err(Error::unsupported("SUBPARTITION type"));
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::unsupported("SUBPARTITION BY expression"));
+    }
+    let close =
+        matching_paren(bytes, i).ok_or_else(|| Error::unsupported("SUBPARTITION BY expression"))?;
+    i = skip_ws(bytes, close + 1);
+    if keyword_at(bytes, i, "SUBPARTITIONS") {
+        i = skip_ws(bytes, i + "SUBPARTITIONS".len());
+        let (n, end) = parse_u64_at(bytes, i)?;
+        if n == 0 {
+            return Err(Error::unsupported("SUBPARTITIONS 0"));
+        }
+        i = skip_ws(bytes, end);
+    }
+    Ok((true, i))
+}
+
+fn subpartition_mix_error() -> Error {
+    // TiDB `ast.ErrSubpartition` / MySQL 1500.
+    Error::new(
+        1500,
+        "It is only possible to mix RANGE/LIST partitioning with HASH/KEY partitioning for subpartitioning",
+    )
 }
 
 /// Parse a column list or a scalar partition expression (`id % 4`, `ABS(id)`).
@@ -1904,6 +1959,8 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
         } else {
             Vec::new()
         };
+        // Named SUBPARTITION lists under a PARTITION are stripped with the clause.
+        let _ = skip_named_subpartitions(bytes, after_less_than(bytes, i)?);
         defs.push(PartitionDef {
             name,
             less_than,
@@ -1915,6 +1972,26 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
         return Err(Error::unsupported("RANGE without partitions"));
     }
     Ok(defs)
+}
+
+fn after_less_than(bytes: &[u8], i: usize) -> Result<usize> {
+    if keyword_at(bytes, i, "MAXVALUE") {
+        return Ok(skip_ws(bytes, i + "MAXVALUE".len()));
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::unsupported("VALUES LESS THAN"));
+    }
+    let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
+    Ok(skip_ws(bytes, close + 1))
+}
+
+/// Skip optional `(SUBPARTITION name, ...)` trailing a PARTITION definition.
+fn skip_named_subpartitions(bytes: &[u8], i: usize) -> usize {
+    let i = skip_ws(bytes, i);
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return i;
+    }
+    matching_paren(bytes, i).map(|end| end + 1).unwrap_or(i)
 }
 
 fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Option<i64>>> {
@@ -1986,6 +2063,7 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
                     .map_err(|_| Error::unsupported("non-integer LIST value"))?,
             );
         }
+        let _ = skip_named_subpartitions(bytes, close + 1);
         if in_values.is_empty() {
             return Err(Error::unsupported("LIST VALUES IN empty"));
         }
