@@ -323,6 +323,30 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     }
 }
 
+fn index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+) -> PhysicalPlan {
+    let partitions = info.prune_partitions(select.selection.as_ref());
+    if select_covers_index(select, info, index) {
+        PhysicalPlan::IndexReader {
+            table: from.name.clone(),
+            index: index.name.o().to_string(),
+            partitions,
+            pushed: None,
+        }
+    } else {
+        PhysicalPlan::IndexLookUpReader {
+            table: from.name.clone(),
+            index: index.name.o().to_string(),
+            partitions,
+            pushed: None,
+        }
+    }
+}
+
 fn select_covers_index(
     select: &SelectStmt,
     info: &sealdb_meta::TableInfo,
@@ -411,9 +435,9 @@ fn access_plan(
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
     // F10 core: integer handle PointGet still wins; otherwise first-column
-    // equality on a secondary INDEX/KEY becomes IndexReader when covering,
-    // else IndexLookUpReader.
-    // Completeness wave: range, composite prefix, unique PointGet, costed
+    // equality or range on a secondary INDEX/KEY becomes IndexReader when
+    // covering, else IndexLookUpReader.
+    // Completeness wave: composite prefix, unique PointGet, costed
     // index path enumeration / skyline.
     if is_information_schema(from, current_db) {
         return PhysicalPlan::InfoSchema {
@@ -448,20 +472,23 @@ fn access_plan(
                         return PhysicalPlan::table_reader(from.name.clone(), partitions);
                     }
                 }
-                if select_covers_index(select, info, index) {
-                    return PhysicalPlan::IndexReader {
-                        table: from.name.clone(),
-                        index: index.name.o().to_string(),
-                        partitions,
-                        pushed: None,
-                    };
-                }
-                return PhysicalPlan::IndexLookUpReader {
-                    table: from.name.clone(),
-                    index: index.name.o().to_string(),
-                    partitions,
-                    pushed: None,
-                };
+                return index_plan(select, from, info, index);
+            }
+        }
+        for range in select
+            .selection
+            .as_ref()
+            .map(|expr| expr.column_ranges())
+            .unwrap_or_default()
+        {
+            if eqs
+                .iter()
+                .any(|(column, _)| column.eq_ignore_ascii_case(&range.column))
+            {
+                continue;
+            }
+            if let Some(index) = info.find_index_covering(&range.column) {
+                return index_plan(select, from, info, index);
             }
         }
         return PhysicalPlan::table_reader(

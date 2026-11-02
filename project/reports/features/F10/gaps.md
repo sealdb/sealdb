@@ -9,7 +9,6 @@ or F18. Rejected via `Error::unsupported` in
 - Standalone `CREATE INDEX` / `DROP INDEX` / `ALTER TABLE ADD INDEX` (F18)
 - FOREIGN KEY / CHECK / FULLTEXT / SPATIAL
 - Unique-index PointGet
-- Index range scan (`>`, `<`, `BETWEEN`, prefix)
 - Composite lookup beyond first-column equality
 - Prefix-length / functional indexes
 - IndexMerge / lookup push-down / parallel workers

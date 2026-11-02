@@ -1439,6 +1439,90 @@ mod tests {
     }
 
     #[test]
+    fn test_index_range_scan() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), extra VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')",
+            )
+            .unwrap();
+        let lookup = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name > 'a'")
+            .unwrap();
+        let lookup_text = lookup
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lookup_text.contains("IndexLookUp"), "{lookup_text}");
+        let covering = session
+            .execute_stmt("EXPLAIN SELECT name FROM db1.t WHERE name > 'a'")
+            .unwrap();
+        let covering_text = covering
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(covering_text.contains("IndexReader"), "{covering_text}");
+        let gt = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name > 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            gt.display_rows(),
+            vec![
+                vec!["2".to_string(), "b".to_string(), "y".to_string()],
+                vec!["3".to_string(), "c".to_string(), "z".to_string()]
+            ]
+        );
+        let ge = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name >= 'b' ORDER BY id")
+            .unwrap();
+        assert_eq!(ge.display_rows(), gt.display_rows());
+        let lt = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name < 'b' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            lt.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
+        );
+        let flipped = session
+            .execute_stmt("SELECT * FROM db1.t WHERE 'a' < name ORDER BY id")
+            .unwrap();
+        assert_eq!(flipped.display_rows(), gt.display_rows());
+        let between = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name BETWEEN 'a' AND 'b' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            between.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string(), "x".to_string()],
+                vec!["2".to_string(), "b".to_string(), "y".to_string()]
+            ]
+        );
+        let closed = session
+            .execute_stmt("SELECT name FROM db1.t WHERE name >= 'a' AND name < 'c' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            closed.display_rows(),
+            vec![vec!["a".to_string()], vec!["b".to_string()]]
+        );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20), extra VARCHAR(20), UNIQUE INDEX idx_u_name (name)); INSERT INTO db1.u VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')",
+            )
+            .unwrap();
+        let unique_range = session
+            .execute_stmt("SELECT extra FROM db1.u WHERE name > 'a' ORDER BY extra")
+            .unwrap();
+        assert_eq!(
+            unique_range.display_rows(),
+            vec![vec!["y".to_string()], vec!["z".to_string()]]
+        );
+    }
+
+    #[test]
     fn test_begin_commit_rollback() {
         let session = Session::new();
         session

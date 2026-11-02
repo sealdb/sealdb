@@ -1,27 +1,38 @@
 // F10 core path: IndexLookUpExecutor / covering IndexReader
 // (TiDB pkg/executor/distsql.go).
-// Completeness wave / not this feature: range scan, IndexMerge,
-// lookup push-down, parallel workers, unique index PointGet.
+// Completeness wave / not this feature: IndexMerge, lookup push-down,
+// parallel workers, unique index PointGet, composite prefix ranges.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{Key, TxnHandle};
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
     decode_handle_from_index_key, decode_handle_from_row_key, decode_index_key_values, decode_row,
-    encode_index_seek_prefix, encode_row_key_with_handle, next_prefix,
+    encode_index_seek_key, encode_index_seek_prefix, encode_row_key_with_handle, next_prefix,
 };
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
+pub enum IndexAccess {
+    Equal(Datum),
+    Range {
+        low: Option<Datum>,
+        low_inclusive: bool,
+        high: Option<Datum>,
+        high_inclusive: bool,
+    },
+}
+
 pub struct IndexLookUpExecutor {
     domain: Arc<Domain>,
     table: TableName,
     index: String,
-    lookup: Datum,
+    access: IndexAccess,
     current_db: String,
     txn: Arc<TxnHandle>,
     for_update: bool,
@@ -39,7 +50,7 @@ impl IndexLookUpExecutor {
         domain: Arc<Domain>,
         table: TableName,
         index: String,
-        lookup: Datum,
+        access: IndexAccess,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         for_update: bool,
@@ -51,7 +62,7 @@ impl IndexLookUpExecutor {
             domain,
             table,
             index,
-            lookup,
+            access,
             current_db: current_db.into(),
             txn,
             for_update,
@@ -97,12 +108,10 @@ impl Executor for IndexLookUpExecutor {
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
             for physical_id in physical {
-                let start = encode_index_seek_prefix(
-                    physical_id,
-                    index.id,
-                    std::slice::from_ref(&self.lookup),
-                );
-                let end = next_prefix(start.as_bytes());
+                let (start, end) = scan_bounds(physical_id, index.id, &self.access);
+                if start.as_bytes() >= end.as_slice() {
+                    continue;
+                }
                 let pairs = if self.for_update {
                     txn.scan_for_update(start.as_bytes(), &end)?
                 } else {
@@ -165,6 +174,55 @@ impl Executor for IndexLookUpExecutor {
 
     fn schema(&self) -> &[String] {
         &self.schema
+    }
+}
+
+fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, Vec<u8>) {
+    match access {
+        IndexAccess::Equal(value) => {
+            let start =
+                encode_index_seek_prefix(physical_id, index_id, std::slice::from_ref(value));
+            let end = next_prefix(start.as_bytes());
+            (start, end)
+        }
+        IndexAccess::Range {
+            low,
+            low_inclusive,
+            high,
+            high_inclusive,
+        } => {
+            let start = match low {
+                None => encode_index_seek_key(physical_id, index_id, &[]),
+                Some(value) => {
+                    let prefix = encode_index_seek_prefix(
+                        physical_id,
+                        index_id,
+                        std::slice::from_ref(value),
+                    );
+                    if *low_inclusive {
+                        prefix
+                    } else {
+                        Key::from_raw(next_prefix(prefix.as_bytes()))
+                    }
+                }
+            };
+            let end = match high {
+                None => next_prefix(encode_index_seek_key(physical_id, index_id, &[]).as_bytes()),
+                Some(value) => {
+                    let prefix = encode_index_seek_prefix(
+                        physical_id,
+                        index_id,
+                        std::slice::from_ref(value),
+                    );
+                    if *high_inclusive {
+                        next_prefix(prefix.as_bytes())
+                    } else {
+                        prefix.as_bytes().to_vec()
+                    }
+                }
+            };
+            (start, end)
+        }
     }
 }
 

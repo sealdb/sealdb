@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F10 leftover（range-scan）
+- **完成**:
+  - first-column index range (`>`, `>=`, `<`, `<=`, `BETWEEN`) on IndexLookUp / covering IndexReader
+  - unique index range uses handle from the row-key value
+- **验证**:
+  - session range + unique range; F10 gate execute-range-scan
+- **下一步**:
+  - leftover F06 index-point-get / F05 topn-spill
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F10 leftover（covering-reader）
 - **完成**:
   - covering `IndexReader` when SELECT/WHERE/ORDER BY/GROUP BY/HAVING columns ⊆ index ∪ integer handle

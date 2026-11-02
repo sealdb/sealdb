@@ -40,10 +40,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `cross-join`
 - `n-table`
 
-### F10
-
-- `range-scan`
-
 ### F12
 
 - `pessimistic`
