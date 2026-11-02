@@ -103,10 +103,12 @@ impl Executor for IndexLookUpExecutor {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let physical = if self.partitions.is_empty() {
-            info.physical_ids()
-        } else {
+        let physical = if !self.partitions.is_empty() {
             self.partitions.clone()
+        } else if let Some(filter) = self.pushed.as_ref() {
+            info.prune_partitions(Some(filter))
+        } else {
+            info.physical_ids()
         };
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();

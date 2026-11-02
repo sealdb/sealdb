@@ -10,7 +10,7 @@ use sealdb_parser::ast::{
     InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity,
 };
 use sealdb_parser::charset::Collation;
-use sealdb_planner::{PhysicalPlan, PlanBuilder};
+use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder};
 use sealdb_sessiontxn::TxnManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,8 @@ pub struct Session {
     cache_plans: Mutex<bool>,
     collation: Mutex<Collation>,
     sql_mode: Mutex<String>,
+    /// TiDB `tidb_partition_prune_mode` (default dynamic).
+    partition_prune_mode: Mutex<PartitionPruneMode>,
 }
 
 impl Session {
@@ -59,6 +61,7 @@ impl Session {
             cache_plans: Mutex::new(false),
             collation: Mutex::new(Collation::bin()),
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
+            partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
         }
     }
 
@@ -308,18 +311,32 @@ impl Session {
             {
                 plan.clone()
             } else {
+                let prune_mode = *self
+                    .partition_prune_mode
+                    .lock()
+                    .expect("session partition prune mode lock");
                 let plan = self.planner.build_with_schema(
                     stmt,
                     Some(&is),
                     &current_db,
                     Some(stats.as_ref()),
+                    prune_mode,
                 )?;
                 cache.insert(cache_key, (schema_ver, plan.clone()));
                 plan
             }
         } else {
-            self.planner
-                .build_with_schema(stmt, Some(&is), &current_db, Some(stats.as_ref()))?
+            let prune_mode = *self
+                .partition_prune_mode
+                .lock()
+                .expect("session partition prune mode lock");
+            self.planner.build_with_schema(
+                stmt,
+                Some(&is),
+                &current_db,
+                Some(stats.as_ref()),
+                prune_mode,
+            )?
         };
         if let Some(result) = system_var_result(self, stmt) {
             return Ok(result);
@@ -594,6 +611,24 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
             "sql_mode" => {
                 *session.sql_mode.lock().expect("session sql_mode lock") = value;
             }
+            "tidb_partition_prune_mode" => {
+                let mode = PartitionPruneMode::parse(&value).ok_or_else(|| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!("Variable 'tidb_partition_prune_mode' can't be set to the value of '{value}'"),
+                    )
+                })?;
+                *session
+                    .partition_prune_mode
+                    .lock()
+                    .expect("session partition prune mode lock") = mode;
+                // Prune mode changes plan shape; drop cached plans.
+                session
+                    .plan_cache
+                    .lock()
+                    .expect("session plan cache lock")
+                    .clear();
+            }
             "autocommit" | "unique_checks" | "foreign_key_checks" => {}
             other => {
                 return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
@@ -638,6 +673,12 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                 .expect("session collation lock")
                 .charset
                 .clone(),
+            "tidb_partition_prune_mode" => session
+                .partition_prune_mode
+                .lock()
+                .expect("session partition prune mode lock")
+                .as_str()
+                .to_string(),
             _ => return None,
         };
         columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
@@ -3440,6 +3481,31 @@ mod tests {
             hashed.display_rows(),
             vec![vec!["5".to_string(), "z".to_string()]]
         );
+        // Dynamic (default) defers prune to execute; static prunes at plan time.
+        let mode = session
+            .execute_stmt("SELECT @@tidb_partition_prune_mode")
+            .unwrap();
+        assert_eq!(mode.display_rows(), vec![vec!["dynamic".to_string()]]);
+        session
+            .execute_stmt("SET tidb_partition_prune_mode = 'static'")
+            .unwrap();
+        let static_hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id < 10 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            static_hit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        session
+            .execute_stmt("SET tidb_partition_prune_mode = 'dynamic'")
+            .unwrap();
+        let dyn_hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 15")
+            .unwrap();
+        assert_eq!(
+            dyn_hit.display_rows(),
+            vec![vec!["15".to_string(), "b".to_string()]]
+        );
         session
             .execute_stmt(
                 "CREATE TABLE db1.r (id INT) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (5))",
@@ -3616,6 +3682,7 @@ mod tests {
                 Some(&session.infoschema()),
                 "",
                 Some(session.stats().as_ref()),
+                PartitionPruneMode::Dynamic,
             )
             .unwrap();
         assert!(
@@ -3638,6 +3705,7 @@ mod tests {
                 Some(&session.infoschema()),
                 "",
                 Some(session.stats().as_ref()),
+                PartitionPruneMode::Dynamic,
             )
             .unwrap();
         assert!(

@@ -35,9 +35,6 @@
     "U3"
   ],
   "feature_gaps": {
-    "F19": [
-      "dynamic-prune"
-    ],
     "F20": [
       "roles",
       "with-grant-option",

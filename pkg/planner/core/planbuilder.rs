@@ -3,6 +3,7 @@ use super::plan_cost::{
     eq_row_count, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
+use super::rule_partition_processor::{PartitionPruneMode, plan_partitions};
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
@@ -22,7 +23,7 @@ impl PlanBuilder {
     }
 
     pub fn build(&self, stmt: &Statement) -> Result<PhysicalPlan> {
-        self.build_with_schema(stmt, None, "", None)
+        self.build_with_schema(stmt, None, "", None, PartitionPruneMode::Dynamic)
     }
 
     pub fn build_with_schema(
@@ -31,18 +32,21 @@ impl PlanBuilder {
         is: Option<&InfoSchema>,
         current_db: &str,
         stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
                 let mut plan = if !select.joins.is_empty() {
-                    self.build_join_plan(select, is, current_db, stats)?
+                    self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    if let Some(plan) = self.build_cte_plan(select, from, is, current_db, stats)? {
+                    if let Some(plan) =
+                        self.build_cte_plan(select, from, is, current_db, stats, prune_mode)?
+                    {
                         plan
                     } else {
-                        access_plan(select, from, is, current_db, stats)
+                        access_plan(select, from, is, current_db, stats, prune_mode)
                     }
                 } else {
                     let exprs = select
@@ -167,7 +171,13 @@ impl PlanBuilder {
             }),
             Statement::Explain(explain) => Ok(PhysicalPlan::Explain {
                 format: explain.format,
-                child: Box::new(self.build_with_schema(&explain.stmt, is, current_db, stats)?),
+                child: Box::new(self.build_with_schema(
+                    &explain.stmt,
+                    is,
+                    current_db,
+                    stats,
+                    prune_mode,
+                )?),
             }),
             Statement::SetOpr(set) => {
                 let mut plan = self.build_with_schema(
@@ -175,6 +185,7 @@ impl PlanBuilder {
                     is,
                     current_db,
                     stats,
+                    prune_mode,
                 )?;
                 for (op, select) in &set.rest {
                     plan = PhysicalPlan::Union {
@@ -185,6 +196,7 @@ impl PlanBuilder {
                             is,
                             current_db,
                             stats,
+                            prune_mode,
                         )?),
                     };
                 }
@@ -203,6 +215,7 @@ impl PlanBuilder {
         is: Option<&InfoSchema>,
         current_db: &str,
         stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
     ) -> Result<Option<PhysicalPlan>> {
         let Some(with) = select.with.as_ref() else {
             return Ok(None);
@@ -219,6 +232,7 @@ impl PlanBuilder {
             is,
             current_db,
             stats,
+            prune_mode,
         )?;
         if !is_star_select(&seed_select)
             && !needs_hash_agg(&seed_select)
@@ -245,6 +259,7 @@ impl PlanBuilder {
                     is,
                     current_db,
                     stats,
+                    prune_mode,
                 )?),
             };
         }
@@ -269,12 +284,13 @@ impl PlanBuilder {
         is: Option<&InfoSchema>,
         current_db: &str,
         stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
         let first = &select.joins[0];
         let mut plan = reorder_hash_join(
             map_join_type(first.tp),
-            self.join_side(select, &first.left, is, current_db, stats)?,
-            self.join_side(select, &first.right, is, current_db, stats)?,
+            self.join_side(select, &first.left, is, current_db, stats, prune_mode)?,
+            self.join_side(select, &first.right, is, current_db, stats, prune_mode)?,
             first.left.name.clone(),
             first.right.name.clone(),
             table_row_count(stats, &first.left, current_db),
@@ -285,7 +301,14 @@ impl PlanBuilder {
             plan = PhysicalPlan::HashJoin {
                 tp: map_join_type(join.tp),
                 left: Box::new(plan),
-                right: Box::new(self.join_side(select, &join.right, is, current_db, stats)?),
+                right: Box::new(self.join_side(
+                    select,
+                    &join.right,
+                    is,
+                    current_db,
+                    stats,
+                    prune_mode,
+                )?),
                 left_table: join.left.name.clone(),
                 right_table: join.right.name.clone(),
                 on: join.on.clone(),
@@ -301,9 +324,10 @@ impl PlanBuilder {
         is: Option<&InfoSchema>,
         current_db: &str,
         stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
         if named_cte(select.with.as_ref(), &table.name) {
-            self.build_cte_plan(select, table, is, current_db, stats)?
+            self.build_cte_plan(select, table, is, current_db, stats, prune_mode)?
                 .ok_or_else(|| Error::unsupported(format!("unknown CTE {}", table.name)))
         } else {
             Ok(PhysicalPlan::table_reader(table.name.clone(), Vec::new()))
@@ -478,8 +502,9 @@ fn index_plan(
     from: &TableName,
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
+    prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
-    let partitions = info.prune_partitions(select.selection.as_ref());
+    let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
     if select_covers_index(select, info, index) {
         PhysicalPlan::IndexReader {
             table: from.name.clone(),
@@ -583,6 +608,7 @@ fn access_plan(
     is: Option<&InfoSchema>,
     current_db: &str,
     stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
     // F10 core: integer handle PointGet still wins; unique-index equality
     // is PointGet; handle/unique IN lists are BatchPointGet; otherwise
@@ -623,7 +649,7 @@ fn access_plan(
                         index: Some(index.name.o().to_string()),
                     };
                 }
-                let partitions = info.prune_partitions(select.selection.as_ref());
+                let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
                 // F10: unanalyzed tables keep the index path.
                 // C2 skyline: after ANALYZE, pick the cheaper of TableReader
                 // vs index. F21 NDV<=1 is the same TableReader winner.
@@ -633,7 +659,7 @@ fn access_plan(
                         return PhysicalPlan::table_reader(from.name.clone(), partitions);
                     }
                 }
-                return index_plan(select, from, info, index);
+                return index_plan(select, from, info, index, prune_mode);
             }
         }
         for range in select
@@ -649,12 +675,12 @@ fn access_plan(
                 continue;
             }
             if let Some(index) = info.find_index_covering(&range.column) {
-                return index_plan(select, from, info, index);
+                return index_plan(select, from, info, index, prune_mode);
             }
         }
         return PhysicalPlan::table_reader(
             from.name.clone(),
-            info.prune_partitions(select.selection.as_ref()),
+            plan_partitions(info, select.selection.as_ref(), prune_mode),
         );
     }
     if let Some((_, Datum::I64(handle))) = eq_column_consts(select.selection.as_ref())
