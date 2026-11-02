@@ -3036,7 +3036,7 @@
       "rs_path": "pkg/executor/join/apply.rs",
       "status": "partial",
       "phase": 8,
-      "notes": "serial NestedLoopApplyExec; parallel apply deferred"
+      "notes": "NestedLoopApplyExec plus SEALDB_APPLY_CONCURRENCY workers"
     },
     {
       "go_path": "pkg/executor/pipelined_window.go",

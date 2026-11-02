@@ -6,6 +6,5 @@ wave. Rejected via `Error::unsupported` in
 `pkg/executor/join/apply.rs` / `pkg/planner/core/apply.rs`.
 
 - Subquery `JOIN`
-- Parallel apply
 - Semi / anti join rewrite
 - Decorrelated HashJoin rewrite of Apply
