@@ -102,6 +102,14 @@ impl Session {
         }))
     }
 
+    /// Execute SQL with the session plan cache enabled (text EXECUTE / COM_STMT_EXECUTE).
+    pub fn execute_cached_stmt(&self, sql: &str) -> Result<QueryResult> {
+        *self.cache_plans.lock().expect("session cache flag lock") = true;
+        let result = self.execute_stmt(sql);
+        *self.cache_plans.lock().expect("session cache flag lock") = false;
+        result
+    }
+
     /// Execute every statement in `sql` and return each result (F22 multi-resultset).
     pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
         let stmts = self.parser.parse_sql(sql)?;

@@ -148,6 +148,11 @@ def collect_inventory(tidb: Path, rust: Path) -> dict:
         for k, v in items.items()
         if v.get("status") == "core-ported" and v.get("gaps") and not k.startswith("C")
     }
+    completeness_gaps = {
+        k: list(v.get("gaps") or [])
+        for k, v in items.items()
+        if v.get("status") == "core-ported" and v.get("gaps") and k.startswith("C")
+    }
 
     planbuilder = tidb / "pkg/planner/core/planbuilder.go"
     stmts = []
@@ -177,6 +182,7 @@ def collect_inventory(tidb: Path, rust: Path) -> dict:
         "baseline": features.get("baseline", "v8.5.8"),
         "core_ported": core_ported,
         "feature_gaps": feature_gaps,
+        "completeness_gaps": completeness_gaps,
         "open_stmts": open_stmts,
         "suites": suites,
     }
@@ -204,6 +210,17 @@ def render_markdown(inv: dict) -> str:
     else:
         lines.extend(["- none", ""])
 
+    lines.extend(["## Completeness gaps still open", ""])
+    if inv.get("completeness_gaps"):
+        for feature, gaps in inv["completeness_gaps"].items():
+            lines.append(f"### {feature}")
+            lines.append("")
+            for gap in gaps:
+                lines.append(f"- `{gap}`")
+            lines.append("")
+    else:
+        lines.extend(["- none", ""])
+
     lines.extend(["## PlanBuilder statement kinds still open", ""])
     if inv["open_stmts"]:
         for item in inv["open_stmts"]:
@@ -219,10 +236,11 @@ def render_markdown(inv: dict) -> str:
             "## Completeness wave notes",
             "",
             "- C1 is the frozen leftover denominator, not a pass-rate claim.",
-            "- C2 core-ports EXPLAIN row/json/dot, costed skyline, and two-table JoinReorder; ANALYZE / n-table DP / IndexMerge stay open.",
-            "- C3 core-ports SchemaChecker 8028, READ COMMITTED statement snapshots, and same-Domain cross-session RW; TiKV cross-cluster and MDL stay open.",
-            "- C4 core-ports PREPARE/EXECUTE/DEALLOCATE and a session plan cache; COM_STMT_* / CREATE BINDING stay open.",
-            "- C5 core-ports SET NAMES/sql_mode/collation_connection and utf8mb4_general_ci compares; pad/weight/GBK stay open.",
+            "- Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).",
+            "- C2: EXPLAIN ANALYZE / cop-task rows / n-table DP / IndexMerge / cost-model-v2 stay open.",
+            "- C3: TiKV cross-cluster and MDL stay open.",
+            "- C4: user-vars / CREATE BINDING / shared plan cache / typed `?` stay open (COM_STMT_* closed).",
+            "- C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.",
             "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.",
             "",
         ]
@@ -246,9 +264,16 @@ def check_inventory(inv: dict, rust: Path) -> list[str]:
     errors = []
     features = json.loads((rust / "project/features/status.json").read_text())
     for key, item in features.get("items", {}).items():
-        if item.get("status") != "core-ported" or key.startswith("C"):
+        if item.get("status") != "core-ported":
             continue
         expected = list(item.get("gaps") or [])
+        if key.startswith("C"):
+            got = inv.get("completeness_gaps", {}).get(key, [])
+            if expected != got:
+                errors.append(
+                    f"completeness gaps mismatch for {key}: status={expected} leftover={got}"
+                )
+            continue
         got = inv["feature_gaps"].get(key, [])
         if expected != got:
             errors.append(f"gaps mismatch for {key}: status={expected} leftover={got}")
@@ -256,8 +281,9 @@ def check_inventory(inv: dict, rust: Path) -> list[str]:
         errors.append("expected open PlanBuilder statement kinds")
     if not inv["suites"]:
         errors.append("expected integrationtest leftover suites")
-    if not inv["feature_gaps"]:
-        errors.append("expected feature gaps in the C1 denominator")
+    # F* feature gaps may be empty after leftover close; C* completeness gaps remain.
+    if not inv["feature_gaps"] and not inv.get("completeness_gaps"):
+        errors.append("expected feature or completeness gaps in the C1 denominator")
     return errors
 
 

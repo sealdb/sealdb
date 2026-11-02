@@ -9,6 +9,45 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - none
 
+## Completeness gaps still open
+
+### C1
+
+- `unmapped-stmts`
+- `stale-gap-labels`
+- `leftover-suite-execution`
+
+### C2
+
+- `explain-analyze`
+- `cop-task-rows`
+- `n-table-dp`
+- `index-merge-join`
+- `cost-model-v2`
+
+### C3
+
+- `tikv-cross-cluster`
+- `mdl`
+- `schema-lease`
+- `serializable`
+- `savepoint`
+
+### C4
+
+- `user-vars`
+- `create-binding`
+- `shared-plan-cache`
+- `typed-placeholders`
+
+### C5
+
+- `unicode-weights`
+- `gbk-latin1`
+- `only-full-group-by`
+- `set-global`
+- `leftover-collation-suites`
+
 ## PlanBuilder statement kinds still open
 
 - `ast.AdminStmt` → unmapped
@@ -116,8 +155,9 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ## Completeness wave notes
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
-- C2 core-ports EXPLAIN row/json/dot, costed skyline, and two-table JoinReorder; ANALYZE / n-table DP / IndexMerge stay open.
-- C3 core-ports SchemaChecker 8028, READ COMMITTED statement snapshots, and same-Domain cross-session RW; TiKV cross-cluster and MDL stay open.
-- C4 core-ports PREPARE/EXECUTE/DEALLOCATE and a session plan cache; COM_STMT_* / CREATE BINDING stay open.
-- C5 core-ports SET NAMES/sql_mode/collation_connection and utf8mb4_general_ci compares; pad/weight/GBK stay open.
+- Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).
+- C2: EXPLAIN ANALYZE / cop-task rows / n-table DP / IndexMerge / cost-model-v2 stay open.
+- C3: TiKV cross-cluster and MDL stay open.
+- C4: user-vars / CREATE BINDING / shared plan cache / typed `?` stay open (COM_STMT_* closed).
+- C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.
 - C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.

@@ -35,6 +35,40 @@
     "U3"
   ],
   "feature_gaps": {},
+  "completeness_gaps": {
+    "C1": [
+      "unmapped-stmts",
+      "stale-gap-labels",
+      "leftover-suite-execution"
+    ],
+    "C2": [
+      "explain-analyze",
+      "cop-task-rows",
+      "n-table-dp",
+      "index-merge-join",
+      "cost-model-v2"
+    ],
+    "C3": [
+      "tikv-cross-cluster",
+      "mdl",
+      "schema-lease",
+      "serializable",
+      "savepoint"
+    ],
+    "C4": [
+      "user-vars",
+      "create-binding",
+      "shared-plan-cache",
+      "typed-placeholders"
+    ],
+    "C5": [
+      "unicode-weights",
+      "gbk-latin1",
+      "only-full-group-by",
+      "set-global",
+      "leftover-collation-suites"
+    ]
+  },
   "open_stmts": [
     {
       "stmt": "ast.AdminStmt",

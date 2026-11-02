@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-02（StreamAgg）  
+> 最后更新：2026-11-03（F21/F22 leftover 收口；完整性波 C4→C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -25,15 +25,15 @@
 |---|---|---|---|---|---|---|
 | 0 | 地基与规范 | `done` | 2026-10-19 | 2026-11-01 | U0 | workspace/CI/parity/spike 书面结论 |
 | 1 | 核心类型与编码 | `done` | 2026-11-01 | 2026-11-01 | U1 | int/uint/float/bytes + row/index key；Decimal/Time 核心路径 |
-| 2 | 解析器 + Mock 链路 | `in-progress` | 2026-11-01 | — | U2/U3/F01 | `SELECT 1` 与 F01 表达式已通；parser 全量 60% 留完整性波 |
+| 2 | 解析器 + Mock 链路 | `done` | 2026-11-01 | 2026-11-01 | U2/U3/F01 | 核心路径 `core-ported`；parser 全量边角留完整性波 |
 | 3 | 元数据与 Bootstrap | `done` | 2026-11-01 | 2026-11-01 | F02/F11 | SHOW/DESC 走内存 InfoSchema |
-| 4 | Planner v1（RBO） | `in-progress` | 2026-11-01 | — | F03–F10 | F03 TableReader 已通；WHERE 起才有规则 |
-| 5 | Executor v1 | `in-progress` | 2026-11-01 | — | F03–F10 | INSERT + SELECT *；默认 MemStorage，`--store tikv` 可写真实集群 |
-| 6 | 事务与 Session | `in-progress` | 2026-11-01 | — | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
-| 7 | CBO 与统计 | `in-progress` | 2026-11-01 | — | F21 | ANALYZE 行数/NDV 已通；直方图留完整性波 |
-| 8 | DDL 与高级 SQL | `in-progress` | 2026-11-01 | — | F14–F20 | F14–F20 已通 |
-| 9 | MySQL 协议与运维 | `in-progress` | 2026-11-01 | — | F22 | handshake + COM_QUERY 已通；SSL/预处理留完整性波 |
-| 10 | 可选高级能力 | `deferred` | — | — | C6 | 完整性波不阻塞主线 |
+| 4 | Planner v1（RBO） | `done` | 2026-11-01 | 2026-11-02 | F03–F10 | F03–F10 `core-ported` |
+| 5 | Executor v1 | `done` | 2026-11-01 | 2026-11-02 | F03–F10 | 默认 MemStorage，`--store tikv` 可写真实集群 |
+| 6 | 事务与 Session | `done` | 2026-11-01 | 2026-11-02 | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
+| 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
+| 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
+| 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
+| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；收 C4→C2→C5；C6 deferred |
 
 ### 2.1 功能波进度
 
@@ -107,6 +107,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C4（com-stmt-prepare）
+- **完成**:
+  - F21/F22 leftover 收口后进入 C4→C2→C5
+  - COM_STMT_EXECUTE 走 `execute_cached_stmt`（session plan cache）
+  - C4 gate 增加 `execute-com-stmt`；`status.json` 去掉 `com-stmt-prepare`
+- **验证**:
+  - `./project/scripts/feature_gate.sh C4`
+- **下一步**:
+  - C4 `user-vars` → `create-binding` → `shared-plan-cache` → `typed-placeholders`
 
 ### 2026-11-02
 
@@ -421,6 +433,19 @@
 - **下一步**:
   - C2 计划形状 / 代价 / Skyline / JoinReorder
 
+### 2026-11-03
+
+- **Phase**: F21/F22 leftover 收口；进入完整性波
+- **完成**:
+  - F21：ANALYZE INDEX、mstats persist、auto-analyze、HashJoin/TopN cost；`gaps: []`
+  - F22：SSL、CLIENT_COMPRESS、COM_STMT_* 二进制、mysql_native_password、multi-resultset；`gaps: []`
+  - `project/features/leftover.md` Feature gaps → `none`
+- **验证**:
+  - `./project/scripts/feature_gate.sh F21`
+  - `./project/scripts/feature_gate.sh F22`
+- **下一步**:
+  - 完整性波按 C4 → C2 → C5 收 gaps（C6 仍 deferred）
+
 ### 2026-11-01
 
 - **Phase**: F22 MySQL 协议 COM_QUERY
@@ -431,7 +456,7 @@
 - **验证**:
   - `./project/scripts/feature_gate.sh F22`
 - **下一步**:
-  - 完整性波 C1 leftover 收口
+  - F22 leftover：SSL / compress / COM_STMT / auth / multi-resultset
 
 ### 2026-11-01
 
@@ -442,7 +467,7 @@
 - **验证**:
   - `./project/scripts/feature_gate.sh F21`
 - **下一步**:
-  - F22 MySQL 协议 COM_QUERY
+  - F21 leftover：histogram/TopN / persist / auto-analyze / join-cost
 
 ### 2026-11-01
 

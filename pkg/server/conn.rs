@@ -313,7 +313,7 @@ impl ClientConn {
             .clone();
         let params = parse_binary_params(payload, stmt.num_params)?;
         let sql = bind_placeholders(&stmt.sql, &params)?;
-        match self.session.execute_stmt(&sql) {
+        match self.session.execute_cached_stmt(&sql) {
             Ok(result) => {
                 if result.columns.is_empty() {
                     self.write_ok()
