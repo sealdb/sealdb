@@ -35,6 +35,8 @@ impl Executor for GrantExec {
             Statement::RevokeRole(revoke) => self.domain.privilege().revoke_role(revoke)?,
             _ => {}
         }
+        // Flush mysql.user-equivalent snapshot after privilege DDL.
+        self.domain.persist_privileges()?;
         self.done = true;
         Ok(())
     }

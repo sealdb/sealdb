@@ -3825,6 +3825,30 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_user_persist() {
+        // Grant tables survive Storage reload (mysql.user equivalent).
+        let storage: std::sync::Arc<dyn sealdb_kv::Storage> =
+            std::sync::Arc::new(sealdb_kv::MemStorage::new());
+        let first = Session::with_domain(std::sync::Arc::new(
+            sealdb_domain::Domain::with_storage_and_grant_table(std::sync::Arc::clone(&storage))
+                .unwrap(),
+        ));
+        first
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); GRANT SELECT ON db1.t TO 'u'@'%'",
+            )
+            .unwrap();
+        let before = first.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
+        assert!(!before.display_rows().is_empty());
+
+        let second = Session::with_domain(std::sync::Arc::new(
+            sealdb_domain::Domain::with_storage_and_grant_table(storage).unwrap(),
+        ));
+        let after = second.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
+        assert_eq!(before.display_rows(), after.display_rows());
+    }
+
+    #[test]
     fn test_analyze_stats() {
         let session = Session::new();
         session

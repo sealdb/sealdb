@@ -42,6 +42,15 @@ impl PrivilegeType {
         self == Self::ALL
     }
 
+    /// Bitmask for persistence (mysql.user-style grant bits).
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
     pub fn names(self) -> Vec<&'static str> {
         if self.is_all() {
             return vec!["ALL"];

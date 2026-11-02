@@ -1,14 +1,19 @@
 /// F20: in-memory privilege Manager (TiDB `pkg/privilege/privilege.go`).
 /// Roles: CREATE/DROP ROLE, GRANT/REVOKE role, SET ROLE, and active-role
-/// privilege checks. Completeness wave: mysql.user persistence, dynamic
-/// privileges, column grants, LDAP, auth plugins.
+/// privilege checks. Grant state persists to Storage under `mprivilege`
+/// (mysql.user / mysql.db / mysql.tables_priv equivalent for SealDB).
+/// Completeness wave: dynamic privileges, column grants, LDAP, auth plugins.
 use sealdb_errno::{ERR_DBACCESS_DENIED_ERROR, ERR_TABLEACCESS_DENIED_ERROR, Error, Result};
 use sealdb_parser::ast::{
     CreateRoleStmt, DropRoleStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt,
     PrivilegeType, RevokeRoleStmt, RevokeStmt, SetRoleKind, UserIdentity,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+
+/// Storage key for the privilege snapshot (alongside schema meta under `m`).
+pub const PRIVILEGE_STORAGE_KEY: &[u8] = b"mprivilege";
 
 #[derive(Clone, Debug)]
 struct GrantEntry {
@@ -328,6 +333,113 @@ impl Manager {
             with_grant,
         });
     }
+
+    /// Serialize grant tables for Storage (TiDB mysql.user / db / tables_priv).
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let inner = self.inner.lock().expect("privilege lock");
+        let snap = PersistSnapshot {
+            grants: inner
+                .grants
+                .iter()
+                .map(|((u, h), entries)| PersistUserGrants {
+                    user: u.clone(),
+                    host: h.clone(),
+                    entries: entries
+                        .iter()
+                        .map(|e| PersistGrantEntry {
+                            db: e.db.clone(),
+                            table: e.table.clone(),
+                            privs: e.privs.bits(),
+                            with_grant: e.with_grant,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            roles: inner.roles.iter().cloned().collect(),
+            role_graph: inner
+                .role_graph
+                .iter()
+                .map(|((u, h), roles)| PersistRoleEdge {
+                    user: u.clone(),
+                    host: h.clone(),
+                    roles: roles.iter().cloned().collect(),
+                })
+                .collect(),
+        };
+        serde_json::to_vec(&snap).map_err(|e| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("encode privileges: {e}"),
+            )
+        })
+    }
+
+    /// Replace in-memory grant tables from a Storage snapshot.
+    pub fn decode(&self, raw: &[u8]) -> Result<()> {
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let snap: PersistSnapshot = serde_json::from_slice(raw).map_err(|e| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("decode privileges: {e}"),
+            )
+        })?;
+        let mut grants = HashMap::new();
+        for user in snap.grants {
+            grants.insert(
+                (user.user, user.host),
+                user.entries
+                    .into_iter()
+                    .map(|e| GrantEntry {
+                        db: e.db,
+                        table: e.table,
+                        privs: PrivilegeType::from_bits(e.privs),
+                        with_grant: e.with_grant,
+                    })
+                    .collect(),
+            );
+        }
+        let roles = snap.roles.into_iter().collect();
+        let mut role_graph = HashMap::new();
+        for edge in snap.role_graph {
+            role_graph.insert((edge.user, edge.host), edge.roles.into_iter().collect());
+        }
+        let mut inner = self.inner.lock().expect("privilege lock");
+        inner.grants = grants;
+        inner.roles = roles;
+        inner.role_graph = role_graph;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistSnapshot {
+    grants: Vec<PersistUserGrants>,
+    roles: Vec<(String, String)>,
+    role_graph: Vec<PersistRoleEdge>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistUserGrants {
+    user: String,
+    host: String,
+    entries: Vec<PersistGrantEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistGrantEntry {
+    db: String,
+    table: String,
+    privs: u64,
+    with_grant: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistRoleEdge {
+    user: String,
+    host: String,
+    roles: Vec<(String, String)>,
 }
 
 fn has_priv(

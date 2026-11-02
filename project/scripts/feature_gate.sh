@@ -179,6 +179,7 @@ case "$FEATURE" in
     run execute-grant cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
     run execute-roles cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE ROLE r; GRANT SELECT ON db1.t TO r; GRANT r TO 'root'@'%'; SHOW GRANTS FOR 'root'@'%'; SET ROLE r; SELECT * FROM db1.t; SET ROLE NONE; SET ROLE ALL; SELECT * FROM db1.t"
     run execute-with-grant-option cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION; SHOW GRANTS FOR 'u'@'%'; REVOKE GRANT OPTION FOR SELECT ON db1.t FROM 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
+    run execute-mysql-user-persist cargo test -q -p sealdb-session --lib test_mysql_user_persist -- --exact
     ;;
   F21)
     run execute-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t; SELECT * FROM db1.t WHERE name = 'a'"
