@@ -116,6 +116,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_table_like_as_select() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("CREATE TABLE db1.t2 LIKE db1.t1")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                assert_eq!(create.table.name, "t2");
+                let refer = create.refer_table.as_ref().expect("LIKE source");
+                assert_eq!(refer.name, "t1");
+                assert!(create.cols.is_empty());
+                assert!(create.select.is_none());
+                let mut ctx = crate::format::RestoreCtx::new();
+                create.restore(&mut ctx).unwrap();
+                assert_eq!(ctx.into_string(), "CREATE TABLE `db1`.`t2` LIKE `db1`.`t1`");
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE TABLE db1.t2 AS SELECT id, name FROM db1.t1")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                assert!(create.refer_table.is_none());
+                let select = create.select.expect("AS SELECT");
+                assert_eq!(select.fields.len(), 2);
+                assert_eq!(select.from.as_ref().unwrap().name, "t1");
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        let err = parser
+            .parse_one_stmt("CREATE TEMPORARY TABLE db1.t (id INT)")
+            .unwrap_err();
+        assert!(err.message.contains("TEMPORARY"));
+    }
+
+    #[test]
     fn test_parse_show_and_use() {
         let parser = Parser::new();
         assert_eq!(

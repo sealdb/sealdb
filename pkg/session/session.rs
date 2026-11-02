@@ -6,7 +6,9 @@ use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity};
+use sealdb_parser::ast::{
+    InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity,
+};
 use sealdb_parser::charset::Collation;
 use sealdb_planner::{PhysicalPlan, PlanBuilder};
 use sealdb_sessiontxn::TxnManager;
@@ -217,6 +219,21 @@ impl Session {
             .expect("session current_db lock")
             .clone();
         let is = self.domain.infoschema();
+        let ctas_insert = match stmt {
+            Statement::CreateTable(create) => create.select.as_ref().and_then(|select| {
+                let (schema, table) = create.table.qualified(&current_db);
+                if create.if_not_exists && is.table_by_name(&schema, &table).is_some() {
+                    return None;
+                }
+                Some(InsertStmt {
+                    table: create.table.clone(),
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    select: Some(select.clone()),
+                })
+            }),
+            _ => None,
+        };
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         let cache_key = restore_sql(stmt);
@@ -256,6 +273,11 @@ impl Session {
             .lock()
             .expect("session txn lock")
             .finish_autocommit(result.is_ok())?;
+        if result.is_ok()
+            && let Some(insert) = ctas_insert
+        {
+            return self.execute_one(&Statement::Insert(insert));
+        }
         result
     }
 
@@ -348,6 +370,18 @@ impl Session {
                     &current_db,
                     PrivilegeType::CREATE,
                 )?;
+                if let Some(refer) = &create.refer_table {
+                    require(&mgr, &user, refer, &current_db, PrivilegeType::SELECT)?;
+                }
+                if let Some(select) = &create.select {
+                    if let Some(from) = &select.from {
+                        require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
+                    }
+                    if let Some(join) = &select.join {
+                        require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
+                        require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                    }
+                }
             }
             Statement::CreateIndex(create) => {
                 require(
@@ -688,6 +722,61 @@ mod tests {
         session.execute_stmt("DROP TABLE db1.t").unwrap();
         session.execute_stmt("DROP DATABASE db1").unwrap();
         assert!(session.infoschema().schema_by_name("db1").is_none());
+    }
+
+    #[test]
+    fn test_create_table_like_and_as_select() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.src (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.src VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.like_t LIKE db1.src")
+            .unwrap();
+        let like_info = session
+            .infoschema()
+            .table_by_name("db1", "like_t")
+            .unwrap()
+            .clone();
+        assert_eq!(like_info.columns.len(), 2);
+        assert_eq!(like_info.columns[0].name.o(), "id");
+        assert_eq!(like_info.columns[1].name.o(), "name");
+        assert_eq!(like_info.indices.len(), 1);
+        assert_eq!(like_info.indices[0].name.o(), "idx_name");
+        let like_rows = session.execute_stmt("SELECT * FROM db1.like_t").unwrap();
+        assert!(like_rows.display_rows().is_empty());
+        session
+            .execute_stmt("CREATE TABLE db1.ctas AS SELECT * FROM db1.src")
+            .unwrap();
+        let copied = session
+            .execute_stmt("SELECT * FROM db1.ctas ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            copied.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("CREATE TABLE db1.proj AS SELECT id FROM db1.src WHERE id = 2")
+            .unwrap();
+        let proj = session.execute_stmt("SELECT * FROM db1.proj").unwrap();
+        assert_eq!(proj.columns, vec!["id"]);
+        assert_eq!(proj.display_rows(), vec![vec!["2".to_string()]]);
+        session
+            .execute_stmt("CREATE TABLE IF NOT EXISTS db1.ctas AS SELECT * FROM db1.src")
+            .unwrap();
+        let again = session
+            .execute_stmt("SELECT COUNT(*) FROM db1.ctas")
+            .unwrap();
+        assert_eq!(again.display_rows()[0][0], "2");
+        let err = session
+            .execute_stmt("CREATE TABLE db1.missing_like LIKE db1.nope")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_NO_SUCH_TABLE);
     }
 
     #[test]

@@ -37,7 +37,6 @@
   "feature_gaps": {
     "F02": [
       "online-ddl-jobs",
-      "create-like-as-select",
       "indexes"
     ],
     "F03": [

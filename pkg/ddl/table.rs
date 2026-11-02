@@ -1,4 +1,4 @@
-use crate::create_table::build_table_info;
+use crate::create_table::{build_table_info, build_table_info_with_like, columns_from_select};
 use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{Mutator, TableInfo};
@@ -24,10 +24,28 @@ pub fn create_table(
         .schema_by_name(&schema)
         .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
     let table_id = meta.gen_global_id()?;
-    let mut info = build_table_info(stmt, table_id)?;
-    if let Some(spec) = &stmt.partition {
-        crate::partition::attach_partitions(meta, &mut info, spec)?;
-    }
+    let info = if let Some(refer) = &stmt.refer_table {
+        let (ref_schema, ref_table) = resolve_name(refer, current_db)?;
+        let refer_info = is.table_by_name(&ref_schema, &ref_table).ok_or_else(|| {
+            Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{ref_schema}.{ref_table}' doesn't exist"),
+            )
+        })?;
+        build_table_info_with_like(&table, refer_info, table_id, meta)?
+    } else {
+        let mut built = stmt.clone();
+        if built.cols.is_empty()
+            && let Some(select) = built.select.as_deref()
+        {
+            built.cols = columns_from_select(is, select, current_db)?;
+        }
+        let mut info = build_table_info(&built, table_id)?;
+        if let Some(spec) = &built.partition {
+            crate::partition::attach_partitions(meta, &mut info, spec)?;
+        }
+        info
+    };
     meta.create_table_or_view(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(info)
