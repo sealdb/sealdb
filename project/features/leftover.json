@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F19": [
-      "add-drop-partition",
       "subpartition",
       "dynamic-prune"
     ],

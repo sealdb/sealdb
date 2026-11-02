@@ -6,7 +6,7 @@ wave. Rejected via `Error::unsupported` in
 `pkg/ddl/partition.rs` / `pkg/planner/core/rule_partition_processor.rs`.
 
 - Subpartition
-- `ADD` / `DROP` / `REORGANIZE PARTITION`
+- `REORGANIZE PARTITION`
 - Dynamic prune / partition-name FROM (`t PARTITION (p0)`)
 - First-column-as-handle still means duplicate ids overwrite within one physical id
 - sqlparser-rs MySQL dialect cannot parse MySQL `PARTITION BY`; F19 strips it before lower

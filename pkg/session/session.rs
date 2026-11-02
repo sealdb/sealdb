@@ -3512,6 +3512,48 @@ mod tests {
         let part = table.partition.as_ref().unwrap();
         assert!(part.is_expr_key());
         assert_eq!(part.expr, "id % 4");
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.ap (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.ap VALUES (1, 'a'), (15, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.ap ADD PARTITION (PARTITION p2 VALUES LESS THAN (20))")
+            .unwrap();
+        assert_eq!(
+            session
+                .infoschema()
+                .table_by_name("db1", "ap")
+                .unwrap()
+                .partition
+                .as_ref()
+                .unwrap()
+                .definitions
+                .len(),
+            3
+        );
+        session
+            .execute_stmt("ALTER TABLE db1.ap DROP PARTITION p0")
+            .unwrap();
+        let after_drop = session
+            .execute_stmt("SELECT * FROM db1.ap ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_drop.display_rows(),
+            vec![vec!["15".to_string(), "b".to_string()]]
+        );
+        assert_eq!(
+            session
+                .infoschema()
+                .table_by_name("db1", "ap")
+                .unwrap()
+                .partition
+                .as_ref()
+                .unwrap()
+                .definitions
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -397,7 +397,7 @@
       "status": "partial",
       "rust": "pkg/ddl/partition.rs",
       "phase": 8,
-      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys; ADD/DROP PARTITION deferred"
+      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys + ADD/DROP PARTITION"
     },
     "pkg/planner/core/rule_partition_processor.go": {
       "status": "partial",

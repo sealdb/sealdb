@@ -1118,7 +1118,7 @@
       "rs_path": "pkg/ddl/partition.rs",
       "status": "partial",
       "phase": 8,
-      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys; ADD/DROP PARTITION deferred"
+      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys + ADD/DROP PARTITION"
     },
     {
       "go_path": "pkg/ddl/placement/bundle.go",

@@ -403,6 +403,15 @@ pub enum AlterTableSpec {
     Algorithm(String),
     /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
     Lock(String),
+    /// `ADD PARTITION (PARTITION ...)` for RANGE/LIST tables.
+    AddPartition {
+        defs: Vec<PartitionDef>,
+    },
+    /// `DROP PARTITION p0 [, p1 ...]`.
+    DropPartition {
+        if_exists: bool,
+        names: Vec<String>,
+    },
 }
 
 impl AlterTableSpec {
@@ -491,6 +500,55 @@ impl AlterTableSpec {
             AlterTableSpec::Lock(name) => {
                 ctx.write_str("LOCK=");
                 ctx.write_str(name);
+                Ok(())
+            }
+            AlterTableSpec::AddPartition { defs } => {
+                ctx.write_str("ADD PARTITION (");
+                for (i, def) in defs.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_str("PARTITION ");
+                    ctx.write_name(&def.name);
+                    if !def.in_values.is_empty() {
+                        ctx.write_str(" VALUES IN (");
+                        for (j, v) in def.in_values.iter().enumerate() {
+                            if j > 0 {
+                                ctx.write_str(", ");
+                            }
+                            ctx.write_str(&v.to_string());
+                        }
+                        ctx.write_str(")");
+                    } else {
+                        ctx.write_str(" VALUES LESS THAN (");
+                        match def.less_than {
+                            Some(v) => ctx.write_str(&v.to_string()),
+                            None => ctx.write_str("MAXVALUE"),
+                        }
+                        for bound in &def.extra_bounds {
+                            ctx.write_str(", ");
+                            match bound {
+                                Some(v) => ctx.write_str(&v.to_string()),
+                                None => ctx.write_str("MAXVALUE"),
+                            }
+                        }
+                        ctx.write_str(")");
+                    }
+                }
+                ctx.write_str(")");
+                Ok(())
+            }
+            AlterTableSpec::DropPartition { if_exists, names } => {
+                ctx.write_str("DROP PARTITION ");
+                if *if_exists {
+                    ctx.write_str("IF EXISTS ");
+                }
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(name);
+                }
                 Ok(())
             }
         }
