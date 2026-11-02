@@ -9,6 +9,6 @@ pub use meta::{
     parse_db_key, parse_table_key, table_key,
 };
 pub use model::{
-    ColumnInfo, DBInfo, IndexColumn, IndexInfo, PartitionDefinition, PartitionInfo, PartitionType,
-    SchemaState, TableInfo,
+    ColumnInfo, DBInfo, IndexColumn, IndexInfo, Job, JobState, PartitionDefinition, PartitionInfo,
+    PartitionType, SchemaState, TableInfo,
 };

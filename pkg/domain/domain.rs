@@ -2,7 +2,7 @@ use sealdb_ddl::execute_ddl;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::{MemStorage, Storage};
-use sealdb_meta::Mutator;
+use sealdb_meta::{Job, JobState, Mutator};
 use sealdb_parser::ast::Statement;
 use sealdb_privilege::Manager;
 use sealdb_statistics::Handle;
@@ -26,6 +26,7 @@ struct Inner {
     infoschema: InfoSchema,
     /// Skip Storage writes of Mutator until COMMIT after in-txn DDL.
     defer_persist: bool,
+    jobs: Vec<Job>,
 }
 
 /// Mutator + InfoSchema captured before the first DDL in an explicit
@@ -76,6 +77,7 @@ impl Domain {
                 meta,
                 infoschema,
                 defer_persist: false,
+                jobs: Vec::new(),
             }),
             storage,
             privilege: Arc::new(privilege),
@@ -125,14 +127,24 @@ impl Domain {
     /// an explicit txn leaves meta in memory until [`persist_schema`].
     pub fn execute_ddl(&self, stmt: &Statement, current_db: &str, persist: bool) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain ddl lock");
+        let id = inner.jobs.last().map(|job| job.id + 1).unwrap_or(1);
+        inner.jobs.push(Job::from_stmt(id, stmt, current_db));
         let snapshot = inner.infoschema.clone();
-        execute_ddl(
+        let result = execute_ddl(
             &mut inner.meta,
             &snapshot,
             stmt,
             current_db,
             self.storage.as_ref(),
-        )?;
+        );
+        if let Some(job) = inner.jobs.last_mut() {
+            job.state = if result.is_ok() {
+                JobState::Synced
+            } else {
+                JobState::Cancelled
+            };
+        }
+        result?;
         inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
         if persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;
@@ -141,6 +153,12 @@ impl Domain {
             inner.defer_persist = true;
         }
         Ok(())
+    }
+
+    /// Newest-first snapshot for `ADMIN SHOW DDL JOBS`.
+    pub fn ddl_jobs(&self) -> Vec<Job> {
+        let inner = self.inner.lock().expect("domain ddl jobs lock");
+        inner.jobs.iter().rev().cloned().collect()
     }
 
     /// Flush in-memory Mutator after COMMIT of a txn that ran DDL.

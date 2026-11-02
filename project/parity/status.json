@@ -305,8 +305,8 @@
     },
     "pkg/meta/model/job.go": {
       "status": "partial",
-      "phase": 3,
-      "notes": "SchemaState only"
+      "phase": 8,
+      "notes": "SchemaState + JobState + Job; ADMIN SHOW DDL JOBS; async queue deferred"
     },
     "pkg/infoschema/infoschema.go": {
       "status": "partial",

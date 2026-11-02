@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F18
 
-- `ddl-job-states`
 - `reorg`
 - `unique-index`
 - `change-modify-rename`

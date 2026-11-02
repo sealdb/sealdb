@@ -46,6 +46,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
+    let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
@@ -73,6 +74,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             if let Statement::Show(show) = &mut lowered {
                 decode_show_grants(show);
                 decode_show_index(show);
+                decode_show_ddl_jobs(show);
             }
             if let Statement::CreateTable(create) = &mut lowered {
                 create.partition = partitions.next().flatten();
@@ -407,6 +409,50 @@ const SHOW_GRANT_MARKER: &str = "__sealdb_grant__";
 const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
 const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
 const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
+const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
+
+/// sqlparser has no `ADMIN SHOW DDL JOBS`; rewrite to SHOW TABLES FROM a marker schema.
+fn rewrite_admin_show_ddl(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "ADMIN") {
+            let after_admin = skip_ws(bytes, i + "ADMIN".len());
+            if keyword_at(bytes, after_admin, "SHOW") {
+                let after_show = skip_ws(bytes, after_admin + "SHOW".len());
+                if keyword_at(bytes, after_show, "DDL") {
+                    let after_ddl = skip_ws(bytes, after_show + "DDL".len());
+                    let end = if keyword_at(bytes, after_ddl, "JOBS") {
+                        after_ddl + "JOBS".len()
+                    } else {
+                        after_show + "DDL".len()
+                    };
+                    out.push_str("SHOW TABLES FROM `");
+                    out.push_str(SHOW_DDL_JOBS_SCHEMA);
+                    out.push('`');
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn decode_show_ddl_jobs(show: &mut ShowStmt) {
+    if show.kind == ShowStmtKind::Tables
+        && show
+            .db_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_DDL_JOBS_SCHEMA))
+    {
+        show.kind = ShowStmtKind::DdlJobs;
+        show.db_name = None;
+    }
+}
 
 fn rewrite_show_create_database(sql: &str) -> String {
     let bytes = sql.as_bytes();

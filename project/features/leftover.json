@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F18": [
-      "ddl-job-states",
       "reorg",
       "unique-index",
       "change-modify-rename",
