@@ -9,7 +9,7 @@ use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
 use sealdb_parser::ast::{
-    JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
+    CteMaterialize, JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
 };
 use sealdb_statistics::Handle;
 use sealdb_types::Datum;
@@ -236,14 +236,16 @@ impl PlanBuilder {
                 child: Box::new(seed),
             };
         }
-        let columns = with
-            .find(&from.name)
-            .map(|cte| cte.col_name_list.clone())
-            .unwrap_or_default();
+        let cte = with.find(&from.name);
+        let columns = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
+        let inline = cte.is_some_and(|cte| {
+            cte.materialize == CteMaterialize::NotMaterialized && cte.recursive.is_none()
+        });
         Ok(Some(PhysicalPlan::CTE {
             name: from.name.clone(),
             columns,
             seed: Box::new(seed),
+            inline,
         }))
     }
 }

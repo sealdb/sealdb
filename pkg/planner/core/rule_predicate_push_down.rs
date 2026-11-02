@@ -175,6 +175,17 @@ fn push_into(
                 residual,
             )
         }
+        PhysicalPlan::CTE {
+            name,
+            columns,
+            seed,
+            inline,
+        } if inline => PhysicalPlan::CTE {
+            name,
+            columns,
+            seed: Box::new(push_into(*seed, conjuncts, is, current_db)),
+            inline,
+        },
         other => wrap_residual(other, conjuncts),
     }
 }

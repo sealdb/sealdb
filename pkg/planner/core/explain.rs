@@ -74,6 +74,12 @@ fn walk(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) {
+    if let PhysicalPlan::CTE {
+        seed, inline: true, ..
+    } = plan
+    {
+        return walk(seed, depth, last, next_id, rows);
+    }
     let id = *next_id;
     *next_id += 1;
     let (name, access, info) = node_meta(plan);
@@ -97,6 +103,12 @@ fn collect_dot(
     nodes: &mut Vec<String>,
     edges: &mut Vec<String>,
 ) -> usize {
+    if let PhysicalPlan::CTE {
+        seed, inline: true, ..
+    } = plan
+    {
+        return collect_dot(seed, next_id, nodes, edges);
+    }
     let id = *next_id;
     *next_id += 1;
     let (name, access, info) = node_meta(plan);

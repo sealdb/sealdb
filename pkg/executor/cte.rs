@@ -1,6 +1,6 @@
 // F17 core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
 // (TiDB pkg/executor/cte.go). Completeness wave / not this feature:
-// CTETableReader shared storage, MATERIALIZED, UNION in non-recursive CTE,
+// CTETableReader shared storage, UNION in non-recursive CTE,
 // CTE in JOIN/DML.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};

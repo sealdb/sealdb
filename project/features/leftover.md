@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F17
 
-- `materialized-hint`
 - `union-in-cte`
 - `cte-in-join`
 - `cte-in-dml`

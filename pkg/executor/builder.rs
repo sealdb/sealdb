@@ -376,6 +376,7 @@ impl ExecutorBuilder {
                 name,
                 columns,
                 seed,
+                ..
             } => {
                 let with = stmt
                     .with_clause()

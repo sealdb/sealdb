@@ -2935,6 +2935,34 @@ mod tests {
                 vec!["3".to_string()]
             ]
         );
+        let mat = session
+            .execute_stmt("WITH c AS MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
+            .unwrap();
+        assert_eq!(mat.display_rows(), vec![vec!["1".to_string()]]);
+        let inline = session
+            .execute_stmt("WITH c AS NOT MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
+            .unwrap();
+        assert_eq!(inline.display_rows(), vec![vec!["1".to_string()]]);
+        let mat_plan = session
+            .execute_stmt("EXPLAIN WITH c AS MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
+            .unwrap();
+        let mat_text = mat_plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(mat_text.contains("CTE"), "{mat_text}");
+        let inline_plan = session
+            .execute_stmt("EXPLAIN WITH c AS NOT MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
+            .unwrap();
+        let inline_text = inline_plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!inline_text.contains("CTE"), "{inline_text}");
         let err = session
             .execute_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
             .unwrap_err();

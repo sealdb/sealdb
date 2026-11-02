@@ -5,7 +5,6 @@ wave. Rejected via `Error::unsupported` in
 `pkg/parser/sqlparser_bridge/lower.rs` and marked on
 `pkg/executor/cte.rs` / `pkg/planner/core/cte.rs`.
 
-- `AS MATERIALIZED` / `AS NOT MATERIALIZED`
 - `UNION` / `UNION ALL` inside a non-recursive CTE body
 - Nested `WITH` inside a CTE query
 - CTE referenced from `JOIN` / `INSERT` / `UPDATE` / `DELETE`

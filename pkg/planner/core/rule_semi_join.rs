@@ -64,10 +64,12 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             name,
             columns,
             seed,
+            inline,
         } => PhysicalPlan::CTE {
             name,
             columns,
             seed: Box::new(rewrite_semi_join(*seed)),
+            inline,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,
@@ -394,10 +396,12 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             name,
             columns,
             seed,
+            inline,
         } => PhysicalPlan::CTE {
             name,
             columns,
             seed: Box::new(rewrite_semi_join_agg(*seed)),
+            inline,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,

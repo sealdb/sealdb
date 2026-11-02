@@ -90,6 +90,15 @@ pub enum SelectLockWait {
     SkipLocked,
 }
 
+/// TiDB `ast.CTE` materialize hint (`AS MATERIALIZED` / `AS NOT MATERIALIZED`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CteMaterialize {
+    #[default]
+    Default,
+    Materialized,
+    NotMaterialized,
+}
+
 #[derive(Clone, Debug)]
 pub struct CommonTableExpression {
     pub name: String,
@@ -97,6 +106,8 @@ pub struct CommonTableExpression {
     pub col_name_list: Vec<String>,
     /// Recursive `UNION` / `UNION ALL` arm for `WITH RECURSIVE`.
     pub recursive: Option<(SetOprType, SelectStmt)>,
+    /// `AS MATERIALIZED` / `AS NOT MATERIALIZED`; default leaves planner choice.
+    pub materialize: CteMaterialize,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +169,11 @@ impl WithClause {
                 }
                 ctx.write_str(")");
             }
-            ctx.write_str(" AS (");
+            ctx.write_str(match cte.materialize {
+                CteMaterialize::Materialized => " AS MATERIALIZED (",
+                CteMaterialize::NotMaterialized => " AS NOT MATERIALIZED (",
+                CteMaterialize::Default => " AS (",
+            });
             cte.query.restore(ctx)?;
             if let Some((op, rec)) = &cte.recursive {
                 ctx.write_str(" ");
