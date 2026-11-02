@@ -1523,7 +1523,11 @@ fn lower_cte(cte: &Cte) -> Result<CommonTableExpression> {
     })
 }
 
+/// Flatten a set-operation tree, including parenthesized operands, into a
+/// left-deep `(first, rest)` list. Mixed-operator parentheses are evaluated
+/// left-to-right (INTERSECT-tighter-than-UNION stays a later leftover).
 fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, SelectStmt)>)> {
+    let expr = unwrap_set_query(expr);
     match expr {
         SetExpr::SetOperation {
             left,
@@ -1532,24 +1536,27 @@ fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, Sele
             right,
         } => {
             let tp = map_set_opr(*op, *set_quantifier)?;
-            match left.as_ref() {
-                SetExpr::SetOperation { .. } => {
-                    let (first, mut rest) = flatten_set_expr(left)?;
-                    rest.push((tp, lower_set_operand(right)?));
-                    Ok((first, rest))
-                }
-                _ => Ok((
-                    lower_set_operand(left)?,
-                    vec![(tp, lower_set_operand(right)?)],
-                )),
-            }
+            let (first, mut rest) = flatten_set_expr(left)?;
+            let (right_first, right_rest) = flatten_set_expr(right)?;
+            rest.push((tp, right_first));
+            rest.extend(right_rest);
+            Ok((first, rest))
         }
-        other => Err(Error::unsupported(format!("set operand {other}"))),
+        _ => Ok((lower_set_operand(expr)?, Vec::new())),
+    }
+}
+
+/// Peel parenthesized `Query` wrappers so `(SELECT …)` and
+/// `(SELECT … UNION SELECT …)` flatten as ordinary set operands.
+fn unwrap_set_query(expr: &SetExpr) -> &SetExpr {
+    match expr {
+        SetExpr::Query(query) => unwrap_set_query(query.body.as_ref()),
+        other => other,
     }
 }
 
 fn lower_set_operand(expr: &SetExpr) -> Result<SelectStmt> {
-    match expr {
+    match unwrap_set_query(expr) {
         SetExpr::Select(select) => lower_select(
             select,
             None,
@@ -1560,8 +1567,6 @@ fn lower_set_operand(expr: &SetExpr) -> Result<SelectStmt> {
             select.to_string(),
         ),
         SetExpr::Query(query) => lower_query(query),
-        // F15 gap: parenthesized nested UNION as a single operand.
-        SetExpr::SetOperation { .. } => Err(Error::unsupported("nested parenthesized UNION")),
         other => Err(Error::unsupported(format!("UNION operand {other}"))),
     }
 }

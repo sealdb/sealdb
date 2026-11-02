@@ -733,6 +733,27 @@ mod tests {
             }
             other => panic!("expected SetOprStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("SELECT 1 UNION (SELECT 2 UNION SELECT 3)")
+            .unwrap()
+        {
+            crate::ast::Statement::SetOpr(set) => {
+                assert_eq!(set.rest.len(), 2);
+                assert_eq!(set.rest[0].0, crate::ast::SetOprType::Union);
+                assert_eq!(set.rest[1].0, crate::ast::SetOprType::Union);
+            }
+            other => panic!("expected SetOprStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("(SELECT 1) UNION (SELECT 2)")
+            .unwrap()
+        {
+            crate::ast::Statement::SetOpr(set) => {
+                assert_eq!(set.rest.len(), 1);
+                assert_eq!(set.rest[0].0, crate::ast::SetOprType::Union);
+            }
+            other => panic!("expected SetOprStmt, got {other:?}"),
+        }
     }
 
     #[test]
