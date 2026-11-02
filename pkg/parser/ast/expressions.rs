@@ -631,10 +631,75 @@ impl ScalarSubqueryExpr {
     }
 }
 
+/// `ROWS` / `RANGE` / `GROUPS` frame unit (TiDB `FrameType`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+impl WindowFrameUnits {
+    pub fn restore(self) -> &'static str {
+        match self {
+            WindowFrameUnits::Rows => "ROWS",
+            WindowFrameUnits::Range => "RANGE",
+            WindowFrameUnits::Groups => "GROUPS",
+        }
+    }
+}
+
+/// One side of `BETWEEN start AND end`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl WindowFrameBound {
+    pub fn restore(&self, ctx: &mut RestoreCtx) {
+        match self {
+            WindowFrameBound::UnboundedPreceding => ctx.write_str("UNBOUNDED PRECEDING"),
+            WindowFrameBound::Preceding(n) => {
+                ctx.write_str(&n.to_string());
+                ctx.write_str(" PRECEDING");
+            }
+            WindowFrameBound::CurrentRow => ctx.write_str("CURRENT ROW"),
+            WindowFrameBound::Following(n) => {
+                ctx.write_str(&n.to_string());
+                ctx.write_str(" FOLLOWING");
+            }
+            WindowFrameBound::UnboundedFollowing => ctx.write_str("UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+/// Explicit `OVER (... ROWS|RANGE|GROUPS BETWEEN ... AND ...)`.
+#[derive(Clone, Debug)]
+pub struct WindowFrameSpec {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+impl WindowFrameSpec {
+    pub fn restore(&self, ctx: &mut RestoreCtx) {
+        ctx.write_str(self.units.restore());
+        ctx.write_str(" BETWEEN ");
+        self.start.restore(ctx);
+        ctx.write_str(" AND ");
+        self.end.restore(ctx);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WindowSpec {
     pub partition_by: Vec<ExprNode>,
     pub order_by: Vec<ByItem>,
+    pub frame: Option<WindowFrameSpec>,
 }
 
 impl WindowSpec {
@@ -664,6 +729,13 @@ impl WindowSpec {
                     ctx.write_str(" DESC");
                 }
             }
+            first = false;
+        }
+        if let Some(frame) = &self.frame {
+            if !first {
+                ctx.write_str(" ");
+            }
+            frame.restore(ctx);
         }
         Ok(())
     }

@@ -2779,6 +2779,34 @@ mod tests {
         );
         let dual = session.execute_stmt("SELECT ROW_NUMBER() OVER ()").unwrap();
         assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let running = session
+            .execute_stmt(
+                "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM db1.t ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            running.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "3".to_string()],
+                vec!["3".to_string(), "6".to_string()],
+                vec!["4".to_string(), "10".to_string()]
+            ]
+        );
+        let sliding = session
+            .execute_stmt(
+                "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM db1.t ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            sliding.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "3".to_string()],
+                vec!["3".to_string(), "5".to_string()],
+                vec!["4".to_string(), "7".to_string()]
+            ]
+        );
         let err = session
             .execute_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM db1.t")
             .unwrap_err();

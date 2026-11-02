@@ -1,13 +1,16 @@
 // F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
-// COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ...).
-// Completeness wave / not this feature: frame clauses, named windows,
-// LAG/LEAD/FIRST_VALUE/NTILE, IGNORE NULLS, pipelined window.
+// COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
+// Completeness wave / not this feature: named windows, LAG/LEAD/FIRST_VALUE/NTILE,
+// IGNORE NULLS, pipelined window.
 use crate::aggfuncs::{AggFunc, build_agg_func};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
 use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::SelectStmt;
-use sealdb_parser::ast::expressions::{ExprNode, FuncCallExpr, WindowFuncExpr};
+use sealdb_parser::ast::expressions::{
+    ExprNode, FuncCallExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFuncExpr,
+    WindowSpec,
+};
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -181,7 +184,7 @@ fn fill_window_agg(
         args: window.args.clone(),
         distinct: false,
     };
-    if window.spec.order_by.is_empty() {
+    if window.spec.frame.is_none() && window.spec.order_by.is_empty() {
         let mut agg = build_agg_func(&spec)?;
         for idx in ordered {
             update_agg(agg.as_mut(), schema, &rows[*idx], &window.args)?;
@@ -193,13 +196,192 @@ fn fill_window_agg(
         return Ok(());
     }
     for (i, idx) in ordered.iter().enumerate() {
-        let mut agg = build_agg_func(&spec)?;
-        for seen in &ordered[..=i] {
-            update_agg(agg.as_mut(), schema, &rows[*seen], &window.args)?;
+        match frame_span(&window.spec, schema, rows, ordered, i)? {
+            None => out[*idx] = empty_frame_value(&window.name),
+            Some((start, end)) => {
+                let mut agg = build_agg_func(&spec)?;
+                for seen in &ordered[start..=end] {
+                    update_agg(agg.as_mut(), schema, &rows[*seen], &window.args)?;
+                }
+                out[*idx] = agg.finalize()?;
+            }
         }
-        out[*idx] = agg.finalize()?;
     }
     Ok(())
+}
+
+fn empty_frame_value(name: &str) -> Datum {
+    if name.eq_ignore_ascii_case("COUNT") {
+        Datum::I64(0)
+    } else {
+        Datum::Null
+    }
+}
+
+/// Inclusive `[start, end]` into `ordered`, or `None` when the frame is empty.
+fn frame_span(
+    spec: &WindowSpec,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    i: usize,
+) -> Result<Option<(usize, usize)>> {
+    let len = ordered.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let (units, start_bound, end_bound) = match &spec.frame {
+        None => {
+            return Ok(Some((0, i)));
+        }
+        Some(WindowFrameSpec { units, start, end }) => (*units, start, end),
+    };
+    let start = bound_index(
+        units,
+        start_bound,
+        true,
+        i,
+        ordered,
+        rows,
+        schema,
+        &spec.order_by,
+    )?;
+    let end = bound_index(
+        units,
+        end_bound,
+        false,
+        i,
+        ordered,
+        rows,
+        schema,
+        &spec.order_by,
+    )?;
+    if start > end {
+        Ok(None)
+    } else {
+        Ok(Some((start, end)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bound_index(
+    units: WindowFrameUnits,
+    bound: &WindowFrameBound,
+    is_start: bool,
+    i: usize,
+    ordered: &[usize],
+    rows: &[Vec<Datum>],
+    schema: &[String],
+    order_by: &[sealdb_parser::ast::ByItem],
+) -> Result<usize> {
+    let last = ordered.len().saturating_sub(1);
+    match (units, bound) {
+        (_, WindowFrameBound::UnboundedPreceding) => Ok(0),
+        (_, WindowFrameBound::UnboundedFollowing) => Ok(last),
+        (WindowFrameUnits::Rows, WindowFrameBound::CurrentRow) => Ok(i),
+        (WindowFrameUnits::Rows, WindowFrameBound::Preceding(n)) => {
+            Ok(i.saturating_sub(*n as usize))
+        }
+        (WindowFrameUnits::Rows, WindowFrameBound::Following(n)) => {
+            Ok(i.saturating_add(*n as usize).min(last))
+        }
+        (WindowFrameUnits::Range | WindowFrameUnits::Groups, WindowFrameBound::CurrentRow) => {
+            Ok(if is_start {
+                peer_start(ordered, rows, schema, order_by, i)
+            } else {
+                peer_end(ordered, rows, schema, order_by, i)
+            })
+        }
+        (WindowFrameUnits::Groups, WindowFrameBound::Preceding(n)) => Ok(group_shift(
+            ordered,
+            rows,
+            schema,
+            order_by,
+            i,
+            -(*n as i64),
+            is_start,
+        )),
+        (WindowFrameUnits::Groups, WindowFrameBound::Following(n)) => Ok(group_shift(
+            ordered, rows, schema, order_by, i, *n as i64, is_start,
+        )),
+        (
+            WindowFrameUnits::Range,
+            WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_),
+        ) => Err(Error::unsupported("RANGE offset frame")),
+    }
+}
+
+fn peer_start(
+    ordered: &[usize],
+    rows: &[Vec<Datum>],
+    schema: &[String],
+    order_by: &[sealdb_parser::ast::ByItem],
+    i: usize,
+) -> usize {
+    let mut s = i;
+    while s > 0
+        && compare_order(&rows[ordered[s - 1]], &rows[ordered[i]], schema, order_by)
+            == std::cmp::Ordering::Equal
+    {
+        s -= 1;
+    }
+    s
+}
+
+fn peer_end(
+    ordered: &[usize],
+    rows: &[Vec<Datum>],
+    schema: &[String],
+    order_by: &[sealdb_parser::ast::ByItem],
+    i: usize,
+) -> usize {
+    let mut e = i;
+    while e + 1 < ordered.len()
+        && compare_order(&rows[ordered[e + 1]], &rows[ordered[i]], schema, order_by)
+            == std::cmp::Ordering::Equal
+    {
+        e += 1;
+    }
+    e
+}
+
+fn group_shift(
+    ordered: &[usize],
+    rows: &[Vec<Datum>],
+    schema: &[String],
+    order_by: &[sealdb_parser::ast::ByItem],
+    i: usize,
+    delta: i64,
+    is_start: bool,
+) -> usize {
+    let last = ordered.len().saturating_sub(1);
+    let mut pos = if is_start {
+        peer_start(ordered, rows, schema, order_by, i)
+    } else {
+        peer_end(ordered, rows, schema, order_by, i)
+    };
+    let mut remaining = delta.unsigned_abs() as usize;
+    if delta <= 0 {
+        while remaining > 0 && pos > 0 {
+            pos = peer_start(ordered, rows, schema, order_by, pos - 1);
+            remaining -= 1;
+        }
+        if is_start {
+            pos
+        } else {
+            peer_end(ordered, rows, schema, order_by, pos)
+        }
+    } else {
+        while remaining > 0 && pos < last {
+            pos = peer_end(ordered, rows, schema, order_by, pos + 1);
+            remaining -= 1;
+        }
+        if is_start {
+            peer_start(ordered, rows, schema, order_by, pos)
+        } else {
+            pos
+        }
+    }
 }
 
 fn update_agg(

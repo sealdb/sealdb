@@ -12,7 +12,8 @@ use crate::ast::dml::{
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
     InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
-    UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
+    UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFuncExpr,
+    WindowSpec,
 };
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
@@ -33,7 +34,8 @@ use sqlparser::ast::{
     OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
     SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
     TableObject, TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
-    UnaryOperator, Update, Use, Value, Values, WindowType, With,
+    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
 
@@ -2361,15 +2363,15 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
 }
 
 fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
-    // F16 gap / completeness wave: named windows, frame clauses, LAG/LEAD.
+    // F16 leftover: named windows, LAG/LEAD, IGNORE NULLS.
     if func.null_treatment.is_some() {
         return Err(Error::unsupported("IGNORE/RESPECT NULLS"));
     }
     let WindowType::WindowSpec(spec) = over else {
         return Err(Error::unsupported("named window"));
     };
-    if spec.window_name.is_some() || spec.window_frame.is_some() {
-        return Err(Error::unsupported("window name / frame clause"));
+    if spec.window_name.is_some() {
+        return Err(Error::unsupported("named window"));
     }
     let name = func.name.to_string();
     match name.to_ascii_uppercase().as_str() {
@@ -2419,8 +2421,69 @@ fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
                 .map(lower_expr)
                 .collect::<Result<Vec<_>>>()?,
             order_by: lower_order_by_exprs(&spec.order_by)?,
+            frame: spec
+                .window_frame
+                .as_ref()
+                .map(lower_window_frame)
+                .transpose()?,
         },
     }))
+}
+
+/// Lower `ROWS|RANGE|GROUPS BETWEEN start AND end`. RANGE offsets stay
+/// unsupported (value-based); GROUPS offsets count peer groups.
+fn lower_window_frame(frame: &sqlparser::ast::WindowFrame) -> Result<WindowFrameSpec> {
+    let units = match frame.units {
+        SqlWindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        SqlWindowFrameUnits::Range => WindowFrameUnits::Range,
+        SqlWindowFrameUnits::Groups => WindowFrameUnits::Groups,
+    };
+    let start = lower_frame_bound(&frame.start_bound)?;
+    let end = match &frame.end_bound {
+        Some(bound) => lower_frame_bound(bound)?,
+        None => WindowFrameBound::CurrentRow,
+    };
+    if units == WindowFrameUnits::Range
+        && matches!(
+            (&start, &end),
+            (
+                WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_),
+                _
+            ) | (
+                _,
+                WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
+            )
+        )
+    {
+        return Err(Error::unsupported("RANGE offset frame"));
+    }
+    Ok(WindowFrameSpec { units, start, end })
+}
+
+fn lower_frame_bound(bound: &SqlWindowFrameBound) -> Result<WindowFrameBound> {
+    match bound {
+        SqlWindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        SqlWindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
+        SqlWindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
+        SqlWindowFrameBound::Preceding(Some(expr)) => {
+            Ok(WindowFrameBound::Preceding(literal_frame_offset(expr)?))
+        }
+        SqlWindowFrameBound::Following(Some(expr)) => {
+            Ok(WindowFrameBound::Following(literal_frame_offset(expr)?))
+        }
+    }
+}
+
+fn literal_frame_offset(expr: &Expr) -> Result<u64> {
+    match lower_expr(expr)? {
+        ExprNode::Value(ValueExpr {
+            datum: Datum::I64(n),
+        }) if n >= 0 => Ok(n as u64),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::U64(n),
+        }) => Ok(n),
+        other => Err(Error::unsupported(format!("frame offset {other:?}"))),
+    }
 }
 
 fn lower_order_by_exprs(items: &[OrderByExpr]) -> Result<Vec<ByItem>> {
