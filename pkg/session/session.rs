@@ -2673,6 +2673,28 @@ mod tests {
             .execute_stmt("SELECT 1 UNION ALL SELECT 1 EXCEPT ALL SELECT 1")
             .unwrap();
         assert_eq!(except_all.display_rows(), vec![vec!["1".to_string()]]);
+        let nested = session
+            .execute_stmt("SELECT 1 UNION (SELECT 2 UNION SELECT 3)")
+            .unwrap();
+        assert_eq!(
+            nested.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+        let paren = session
+            .execute_stmt("(SELECT 1 UNION SELECT 2) UNION SELECT 3")
+            .unwrap();
+        assert_eq!(
+            paren.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // F15 core path: UnionExec for UNION / EXCEPT / INTERSECT
-// (TiDB pkg/executor/unionexec/union.go). Completeness wave / not this
-// feature: parenthesized nested set ops, UNION in subquery, parallel workers.
+// (TiDB pkg/executor/unionexec/union.go). Parenthesized set operands flatten
+// left-to-right. Completeness wave / not this feature: UNION in subquery,
+// parallel workers.
 use crate::internal::exec::Executor;
 use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
 use sealdb_parser::ast::SetOprType;
