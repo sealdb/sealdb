@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F20": [
-      "dynamic-privs",
       "create-user"
     ],
     "F21": [
