@@ -2953,15 +2953,20 @@ fn lower_unary_op(op: &UnaryOperator) -> Result<Op> {
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement> {
-    // F18 gap / completeness wave: USING, partial, invisible, ALGORITHM/LOCK.
+    // Completeness wave / not this feature: USING, partial, invisible.
     if create.using.is_some()
         || !create.include.is_empty()
         || create.predicate.is_some()
         || !create.with.is_empty()
-        || !create.alter_options.is_empty()
         || create.concurrently
     {
         return Err(Error::unsupported("CREATE INDEX option"));
+    }
+    for opt in &create.alter_options {
+        match opt {
+            AlterTableOperation::Algorithm { .. } | AlterTableOperation::Lock { .. } => {}
+            other => return Err(Error::unsupported(format!("CREATE INDEX option {other}"))),
+        }
     }
     let columns = create
         .columns
@@ -3005,8 +3010,8 @@ fn lower_column_position(pos: &Option<MySQLColumnPosition>) -> ColumnPosition {
 }
 
 fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<Statement> {
-    // F18 gap / completeness wave: ALGORITHM/LOCK, generated columns,
-    // partitions beyond ADD/DROP COLUMN|INDEX.
+    // Completeness wave / not this feature: generated columns, partitions
+    // beyond ADD/DROP COLUMN|INDEX.
     if alter.if_exists || alter.only || alter.location.is_some() || alter.on_cluster.is_some() {
         return Err(Error::unsupported("ALTER TABLE option"));
     }
@@ -3102,6 +3107,10 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 })
             }
         }
+        AlterTableOperation::Algorithm { algorithm, .. } => {
+            Ok(AlterTableSpec::Algorithm(algorithm.to_string()))
+        }
+        AlterTableOperation::Lock { lock, .. } => Ok(AlterTableSpec::Lock(lock.to_string())),
         AlterTableOperation::RenameTable { table_name } => {
             let name = match table_name {
                 RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,

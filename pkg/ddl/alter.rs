@@ -1,6 +1,7 @@
-// F18 core: ALTER TABLE ADD/DROP COLUMN|INDEX, CHANGE/MODIFY/RENAME, AFTER/FIRST.
-// Completeness wave / not this feature: ALGORITHM/LOCK, generated columns,
-// partitions, multi-schema-state jobs.
+// F18 core: ALTER TABLE ADD/DROP COLUMN|INDEX, CHANGE/MODIFY/RENAME,
+// AFTER/FIRST, ALGORITHM/LOCK (accepted, in-place).
+// Completeness wave / not this feature: generated columns, partitions,
+// multi-schema-state jobs.
 use crate::create_table::field_type_from_name;
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::table::resolve_name;
@@ -112,6 +113,8 @@ pub fn alter_table(
             AlterTableSpec::RenameIndex { old_name, new_name } => {
                 rename_index(meta, &snapshot, stmt, old_name, new_name, current_db)?
             }
+            // ALGORITHM/LOCK are accepted and ignored; SealDB DDL is in-place.
+            AlterTableSpec::Algorithm(_) | AlterTableSpec::Lock(_) => {}
         }
         snapshot = InfoSchema::from_meta(meta)?;
     }

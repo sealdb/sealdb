@@ -701,6 +701,29 @@ mod tests {
             },
             other => panic!("expected AlterTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t ADD COLUMN age INT, ALGORITHM=INPLACE, LOCK=NONE")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => {
+                assert!(matches!(
+                    &alter.specs[1],
+                    crate::ast::AlterTableSpec::Algorithm(name) if name == "INPLACE"
+                ));
+                assert!(matches!(
+                    &alter.specs[2],
+                    crate::ast::AlterTableSpec::Lock(name) if name == "NONE"
+                ));
+            }
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE INDEX idx_age ON db1.t (age) ALGORITHM=INPLACE LOCK=NONE")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateIndex(create) => assert_eq!(create.name, "idx_age"),
+            other => panic!("expected CreateIndexStmt, got {other:?}"),
+        }
     }
 
     #[test]
