@@ -136,6 +136,7 @@ case "$FEATURE" in
     run execute-except-intersect cargo run -q -p sealdb-server-bin -- --execute "SELECT 1 EXCEPT SELECT 2; SELECT 1 INTERSECT SELECT 1; SELECT 1 EXCEPT SELECT 1; SELECT 1 UNION ALL SELECT 1 EXCEPT ALL SELECT 1"
     run execute-nested-paren-union cargo run -q -p sealdb-server-bin -- --execute "SELECT 1 UNION (SELECT 2 UNION SELECT 3); (SELECT 1) UNION (SELECT 2); (SELECT 1 UNION SELECT 2) UNION SELECT 3"
     run execute-union-in-subquery cargo run -q -p sealdb-server-bin -- --execute "SELECT (SELECT 1 UNION SELECT 1); SELECT 1 WHERE EXISTS (SELECT 2 UNION SELECT 3); SELECT 1 WHERE 1 IN (SELECT 1 UNION SELECT 2); SELECT 1 WHERE 1 IN (SELECT 2 UNION SELECT 3)"
+    run execute-parallel-union env SEALDB_UNION_CONCURRENCY=2 cargo run -q -p sealdb-server-bin -- --execute "SELECT 1 UNION SELECT 2 UNION SELECT 3; SELECT 1 UNION ALL SELECT 1; SELECT 1 EXCEPT SELECT 2; SELECT 1 INTERSECT SELECT 1"
     ;;
   F16)
     run execute-window cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) FROM db1.t ORDER BY id"

@@ -39,9 +39,6 @@
       "online-ddl-jobs",
       "indexes"
     ],
-    "F15": [
-      "parallel-union"
-    ],
     "F16": [
       "frame-clause",
       "named-window",

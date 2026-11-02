@@ -2712,6 +2712,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_union() {
+        let session = Session::new();
+        let rows = session
+            .execute_stmt("SELECT 1 UNION SELECT 2 UNION SELECT 3")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+    }
+
+    #[test]
     fn test_window_functions() {
         let session = Session::new();
         session
