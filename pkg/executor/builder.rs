@@ -453,6 +453,7 @@ impl ExecutorBuilder {
             Some(&domain.infoschema()),
             current_db,
             Some(stats.as_ref()),
+            sealdb_planner::PartitionPruneMode::Dynamic,
         )?;
         Self::build(&plan, &stmt, domain, current_db, txn)
     }

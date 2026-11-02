@@ -290,6 +290,7 @@ fn run_select(
         Some(&domain.infoschema()),
         current_db,
         Some(stats.as_ref()),
+        sealdb_planner::PartitionPruneMode::Dynamic,
     )?;
     let exec = ExecutorBuilder::build(
         &plan,

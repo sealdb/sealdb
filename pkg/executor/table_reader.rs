@@ -82,10 +82,13 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        let physical = if self.partitions.is_empty() {
-            info.physical_ids()
-        } else {
+        // Empty partitions + pushed filter = dynamic prune at execute (F19).
+        let physical = if !self.partitions.is_empty() {
             self.partitions.clone()
+        } else if let Some(filter) = self.pushed.as_ref() {
+            info.prune_partitions(Some(filter))
+        } else {
+            info.physical_ids()
         };
         self.rows = filter_rows(
             scan_table(&self.txn, &info, self.lock, self.wait, &physical)?

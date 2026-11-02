@@ -654,6 +654,7 @@ fn run_result_set(
         Some(&ctx.domain.infoschema()),
         &ctx.current_db,
         Some(stats.as_ref()),
+        sealdb_planner::PartitionPruneMode::Dynamic,
     )?;
     let exec = ExecutorBuilder::build(
         &plan,

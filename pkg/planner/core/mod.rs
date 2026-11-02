@@ -13,3 +13,4 @@ pub mod window;
 
 pub use physical_plans::{DdlKind, JoinType, PhysicalPlan};
 pub use planbuilder::PlanBuilder;
+pub use rule_partition_processor::PartitionPruneMode;

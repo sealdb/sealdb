@@ -415,7 +415,7 @@
       "status": "partial",
       "rust": "pkg/meta/model/partition.rs",
       "phase": 8,
-      "notes": "locate/prune on PartitionInfo; expression keys + dynamic prune deferred"
+      "notes": "locate/prune on PartitionInfo; expression keys + tidb_partition_prune_mode static/dynamic"
     },
     "pkg/domain/domain.go": {
       "status": "partial",

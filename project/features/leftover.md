@@ -7,10 +7,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ## Feature gaps still open
 
-### F19
-
-- `dynamic-prune`
-
 ### F20
 
 - `roles`
