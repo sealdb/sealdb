@@ -177,6 +177,111 @@ impl RevokeStmt {
     }
 }
 
+/// `CREATE ROLE r1 [, r2 ...]` (TiDB `CreateRoleStmt`).
+#[derive(Clone, Debug)]
+pub struct CreateRoleStmt {
+    pub if_not_exists: bool,
+    pub roles: Vec<UserIdentity>,
+}
+
+impl CreateRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE ROLE ");
+        if self.if_not_exists {
+            ctx.write_str("IF NOT EXISTS ");
+        }
+        restore_role_names(&self.roles, ctx)
+    }
+}
+
+/// `DROP ROLE r1 [, r2 ...]`.
+#[derive(Clone, Debug)]
+pub struct DropRoleStmt {
+    pub if_exists: bool,
+    pub roles: Vec<UserIdentity>,
+}
+
+impl DropRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP ROLE ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
+        restore_role_names(&self.roles, ctx)
+    }
+}
+
+/// `GRANT r1 [, r2 ...] TO user` (no ON clause).
+#[derive(Clone, Debug)]
+pub struct GrantRoleStmt {
+    pub roles: Vec<UserIdentity>,
+    pub users: Vec<UserIdentity>,
+}
+
+impl GrantRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("GRANT ");
+        restore_role_names(&self.roles, ctx)?;
+        ctx.write_str(" TO ");
+        restore_users(&self.users, ctx)
+    }
+}
+
+/// `REVOKE r1 [, r2 ...] FROM user`.
+#[derive(Clone, Debug)]
+pub struct RevokeRoleStmt {
+    pub roles: Vec<UserIdentity>,
+    pub users: Vec<UserIdentity>,
+}
+
+impl RevokeRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("REVOKE ");
+        restore_role_names(&self.roles, ctx)?;
+        ctx.write_str(" FROM ");
+        restore_users(&self.users, ctx)
+    }
+}
+
+/// `SET ROLE` target (TiDB `SetRoleStmt`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetRoleKind {
+    None,
+    All,
+    Roles(Vec<UserIdentity>),
+}
+
+#[derive(Clone, Debug)]
+pub struct SetRoleStmt {
+    pub kind: SetRoleKind,
+}
+
+impl SetRoleStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET ROLE ");
+        match &self.kind {
+            SetRoleKind::None => ctx.write_str("NONE"),
+            SetRoleKind::All => ctx.write_str("ALL"),
+            SetRoleKind::Roles(roles) => restore_role_names(roles, ctx)?,
+        }
+        Ok(())
+    }
+}
+
+fn restore_role_names(roles: &[UserIdentity], ctx: &mut RestoreCtx) -> Result<()> {
+    for (i, role) in roles.iter().enumerate() {
+        if i > 0 {
+            ctx.write_str(", ");
+        }
+        if role.hostname == "%" {
+            ctx.write_name(&role.username);
+        } else {
+            role.restore(ctx)?;
+        }
+    }
+    Ok(())
+}
+
 fn restore_privs(privs: &[PrivElem], ctx: &mut RestoreCtx) -> Result<()> {
     for (i, elem) in privs.iter().enumerate() {
         if i > 0 {

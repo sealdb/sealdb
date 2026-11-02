@@ -16,10 +16,11 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
-    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
-    ReleaseSavepointStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetStmt,
-    SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, DeallocateStmt, DropRoleStmt,
+    ExecuteStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt,
+    PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt,
+    SavepointStmt, SetAssignment, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt,
+    ShowStmtKind, UseStmt, UserIdentity,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -55,6 +56,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
+    // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
+    let (rewritten, role_ops) = extract_role_grants(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -65,47 +68,61 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut partitions = partitions.into_iter();
     let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
+    let mut role_ops = role_ops.into_iter();
     let mut materialize_hints = materialize_hints;
-    stmts
-        .iter()
-        .map(|stmt| {
-            let mut lowered = lower_statement(stmt)?;
-            if let Statement::Begin(begin) = &mut lowered
-                && flags.next() == Some(true)
-            {
-                begin.pessimistic = true;
-            }
-            if let Statement::Show(show) = &mut lowered {
-                decode_show_grants(show);
-                decode_show_index(show);
-                decode_show_ddl_jobs(show);
-            }
-            if let Statement::CreateTable(create) = &mut lowered {
-                create.partition = partitions.next().flatten();
-            }
-            if let Statement::AlterTable(alter) = &mut lowered
-                && let Some(op) = alter_parts.next().flatten()
-            {
-                match op {
-                    AlterPartOp::Add(defs) => {
-                        alter.specs.push(AlterTableSpec::AddPartition { defs });
-                    }
-                    AlterPartOp::Drop { if_exists, names } => {
-                        alter
-                            .specs
-                            .push(AlterTableSpec::DropPartition { if_exists, names });
-                    }
+    let mut out = Vec::new();
+    for stmt in &stmts {
+        let mut lowered = lower_statement(stmt)?;
+        if let Statement::Begin(begin) = &mut lowered
+            && flags.next() == Some(true)
+        {
+            begin.pessimistic = true;
+        }
+        if let Statement::Show(show) = &mut lowered {
+            decode_show_grants(show);
+            decode_show_index(show);
+            decode_show_ddl_jobs(show);
+        }
+        if let Statement::CreateTable(create) = &mut lowered {
+            create.partition = partitions.next().flatten();
+        }
+        if let Statement::AlterTable(alter) = &mut lowered
+            && let Some(op) = alter_parts.next().flatten()
+        {
+            match op {
+                AlterPartOp::Add(defs) => {
+                    alter.specs.push(AlterTableSpec::AddPartition { defs });
+                }
+                AlterPartOp::Drop { if_exists, names } => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::DropPartition { if_exists, names });
                 }
             }
-            if let Statement::Prepare(prepare) = &mut lowered
-                && let Some(sql) = prepares.next().flatten()
-            {
-                prepare.sql = sql;
-            }
-            apply_cte_materialize(&mut lowered, &mut materialize_hints);
-            Ok(lowered)
-        })
-        .collect()
+        }
+        if let Statement::Prepare(prepare) = &mut lowered
+            && let Some(sql) = prepares.next().flatten()
+        {
+            prepare.sql = sql;
+        }
+        // Placeholders from extract_role_grants become Set NAMES; swap for role ops.
+        if matches!(&lowered, Statement::Set(s) if is_role_placeholder(s))
+            && let Some(op) = role_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        apply_cte_materialize(&mut lowered, &mut materialize_hints);
+        out.push(lowered);
+    }
+    Ok(out)
+}
+
+fn is_role_placeholder(stmt: &SetStmt) -> bool {
+    matches!(
+        stmt.assignments.as_slice(),
+        [SetAssignment { name, value }]
+            if name.eq_ignore_ascii_case("names") && value.eq_ignore_ascii_case("__sealdb_role__")
+    )
 }
 
 fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
@@ -180,9 +197,24 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         .map(object_table_name)
                         .collect::<Result<Vec<_>>>()?,
                 })),
+                ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
+                    if_exists: *if_exists,
+                    roles: names
+                        .iter()
+                        .map(role_from_object_name)
+                        .collect::<Result<Vec<_>>>()?,
+                })),
                 other => Err(Error::unsupported(format!("DROP {other}"))),
             }
         }
+        SqlStatement::CreateRole(create) => Ok(Statement::CreateRole(CreateRoleStmt {
+            if_not_exists: create.if_not_exists,
+            roles: create
+                .names
+                .iter()
+                .map(role_from_object_name)
+                .collect::<Result<Vec<_>>>()?,
+        })),
         SqlStatement::ShowCreate {
             obj_type: ShowCreateObject::Table,
             obj_name,
@@ -1123,6 +1155,207 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// sqlparser rejects MySQL `GRANT role TO user` / `REVOKE role FROM user`.
+/// Replace each with `SET NAMES '__sealdb_role__'` and re-attach after lower.
+fn extract_role_grants(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "GRANT")
+            && let Some((stmt, end)) = try_parse_grant_role(bytes, i)?
+        {
+            out.push_str("SET NAMES '__sealdb_role__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "REVOKE")
+            && let Some((stmt, end)) = try_parse_revoke_role(bytes, i)?
+        {
+            out.push_str("SET NAMES '__sealdb_role__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, ops))
+}
+
+fn try_parse_grant_role(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "GRANT".len());
+    // Privilege GRANT has ON before TO; role GRANT has TO without a prior ON.
+    let roles_start = i;
+    let mut saw_on = false;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            _ if depth == 0 && keyword_at(bytes, i, "ON") => {
+                saw_on = true;
+                break;
+            }
+            _ if depth == 0 && keyword_at(bytes, i, "TO") => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    if saw_on || !keyword_at(bytes, i, "TO") {
+        return Ok(None);
+    }
+    let roles = parse_role_list(&bytes[roles_start..i])?;
+    i = skip_ws(bytes, i + "TO".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    if roles.is_empty() || users.is_empty() {
+        return Err(Error::unsupported("GRANT ROLE without roles/users"));
+    }
+    Ok(Some((
+        Statement::GrantRole(GrantRoleStmt { roles, users }),
+        end,
+    )))
+}
+
+fn try_parse_revoke_role(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "REVOKE".len());
+    let roles_start = i;
+    let mut saw_on = false;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            _ if depth == 0 && keyword_at(bytes, i, "ON") => {
+                saw_on = true;
+                break;
+            }
+            _ if depth == 0 && keyword_at(bytes, i, "FROM") => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    if saw_on || !keyword_at(bytes, i, "FROM") {
+        return Ok(None);
+    }
+    let roles = parse_role_list(&bytes[roles_start..i])?;
+    i = skip_ws(bytes, i + "FROM".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    if roles.is_empty() || users.is_empty() {
+        return Err(Error::unsupported("REVOKE ROLE without roles/users"));
+    }
+    Ok(Some((
+        Statement::RevokeRole(RevokeRoleStmt { roles, users }),
+        end,
+    )))
+}
+
+fn parse_role_list(raw: &[u8]) -> Result<Vec<UserIdentity>> {
+    let text = std::str::from_utf8(raw).map_err(|_| Error::new(ERR_PARSE_ERROR, "role list"))?;
+    let mut roles = Vec::new();
+    for part in text.split(',') {
+        let name = part.trim().trim_matches('`').trim_matches('\'').trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.contains('@') {
+            let (u, h) = name.split_once('@').unwrap();
+            roles.push(UserIdentity::new(
+                u.trim().trim_matches('\'').trim_matches('`'),
+                h.trim().trim_matches('\'').trim_matches('`'),
+            ));
+        } else {
+            roles.push(UserIdentity::new(name, "%"));
+        }
+    }
+    Ok(roles)
+}
+
+fn parse_user_list(bytes: &[u8], mut i: usize) -> Result<(Vec<UserIdentity>, usize)> {
+    let mut users = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b';' {
+            break;
+        }
+        let (user, next) = read_user_identity(bytes, i)?;
+        users.push(user);
+        i = skip_ws(bytes, next);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok((users, i))
+}
+
+fn read_user_identity(bytes: &[u8], mut i: usize) -> Result<(UserIdentity, usize)> {
+    i = skip_ws(bytes, i);
+    let (user, after_user) = read_quoted_or_ident(bytes, i);
+    if user.is_empty() {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing user"));
+    }
+    let mut j = skip_ws(bytes, after_user);
+    if j < bytes.len() && bytes[j] == b'@' {
+        j = skip_ws(bytes, j + 1);
+        let (host, after_host) = read_quoted_or_ident(bytes, j);
+        return Ok((UserIdentity::new(user, host), after_host));
+    }
+    Ok((UserIdentity::new(user, "%"), after_user))
+}
+
+fn read_quoted_or_ident(bytes: &[u8], i: usize) -> (String, usize) {
+    if i >= bytes.len() {
+        return (String::new(), i);
+    }
+    match bytes[i] {
+        b'\'' | b'"' | b'`' => {
+            let q = bytes[i];
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != q {
+                j += 1;
+            }
+            let s = String::from_utf8_lossy(&bytes[i + 1..j]).into_owned();
+            let end = if j < bytes.len() { j + 1 } else { j };
+            (s, end)
+        }
+        _ => {
+            let mut j = i;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            (String::from_utf8_lossy(&bytes[i..j]).into_owned(), j)
+        }
+    }
+}
+
+fn role_from_object_name(name: &ObjectName) -> Result<UserIdentity> {
+    let parts = object_name_parts(name)?;
+    match parts.as_slice() {
+        [user] => Ok(UserIdentity::new(user.clone(), "%")),
+        [user, host] => Ok(UserIdentity::new(user.clone(), host.clone())),
+        _ => Err(Error::unsupported("role name")),
+    }
+}
+
 fn extract_prepare_from(sql: &str) -> (String, Vec<Option<String>>) {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -1221,6 +1454,17 @@ fn lower_set(set: &Set) -> Result<Statement> {
                 })
                 .collect::<Result<Vec<_>>>()?,
         })),
+        Set::SetRole { role_name, .. } => {
+            let kind = match role_name {
+                None => SetRoleKind::None,
+                Some(ident) if ident.value.eq_ignore_ascii_case("NONE") => SetRoleKind::None,
+                Some(ident) if ident.value.eq_ignore_ascii_case("ALL") => SetRoleKind::All,
+                Some(ident) => {
+                    SetRoleKind::Roles(vec![UserIdentity::new(ident.value.clone(), "%")])
+                }
+            };
+            Ok(Statement::SetRole(SetRoleStmt { kind }))
+        }
         other => Err(Error::unsupported(format!("SET {other}"))),
     }
 }

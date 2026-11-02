@@ -1,5 +1,6 @@
-/// F20 core: GrantExec / revoke via privilege Manager (TiDB `executor/grant.go`).
-/// Completeness wave: mysql.* tables, WITH GRANT OPTION, roles.
+/// F20: GrantExec — GRANT/REVOKE privileges and roles, CREATE/DROP ROLE
+/// (TiDB `executor/grant.go` / `role.go`). Completeness wave: mysql.* tables,
+/// WITH GRANT OPTION.
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::Result;
@@ -28,6 +29,10 @@ impl Executor for GrantExec {
         match &self.stmt {
             Statement::Grant(grant) => self.domain.privilege().grant(grant)?,
             Statement::Revoke(revoke) => self.domain.privilege().revoke(revoke)?,
+            Statement::CreateRole(create) => self.domain.privilege().create_role(create)?,
+            Statement::DropRole(drop) => self.domain.privilege().drop_role(drop)?,
+            Statement::GrantRole(grant) => self.domain.privilege().grant_role(grant)?,
+            Statement::RevokeRole(revoke) => self.domain.privilege().revoke_role(revoke)?,
             _ => {}
         }
         self.done = true;

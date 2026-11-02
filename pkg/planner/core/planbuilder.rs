@@ -151,6 +151,21 @@ impl PlanBuilder {
             Statement::Revoke(_) => Ok(PhysicalPlan::Simple {
                 kind: "Revoke".to_string(),
             }),
+            Statement::CreateRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "CreateRole".to_string(),
+            }),
+            Statement::DropRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropRole".to_string(),
+            }),
+            Statement::GrantRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "GrantRole".to_string(),
+            }),
+            Statement::RevokeRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "RevokeRole".to_string(),
+            }),
+            Statement::SetRole(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetRole".to_string(),
+            }),
             Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "Analyze".to_string(),
             }),
