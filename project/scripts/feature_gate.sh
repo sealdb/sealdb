@@ -189,6 +189,7 @@ case "$FEATURE" in
     run execute-histogram-topn cargo test -q -p sealdb-statistics --lib -- histogram
     run execute-analyze-index cargo test -q -p sealdb-session --lib session::tests::test_analyze_index -- --exact
     run execute-persist-stats cargo test -q -p sealdb-session --lib session::tests::test_stats_persist -- --exact
+    run execute-auto-analyze cargo test -q -p sealdb-session --lib session::tests::test_auto_analyze -- --exact
     ;;
   F22)
     run execute-com-query cargo test -q -p sealdb-server --lib test_com_query -- --exact

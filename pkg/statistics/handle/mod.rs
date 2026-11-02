@@ -20,6 +20,9 @@ impl Handle {
     }
 
     pub fn update(&self, db: impl Into<String>, table: impl Into<String>, stats: Table) {
+        let mut stats = stats;
+        // ANALYZE refreshes count/histograms and clears the modify delta.
+        stats.modify_count = 0;
         self.inner.lock().expect("stats lock").insert(
             (
                 db.into().to_ascii_lowercase(),
@@ -37,6 +40,23 @@ impl Handle {
             .cloned()
     }
 
+    /// Accumulate DML delta (TiDB stats_meta.modify_count).
+    pub fn add_modify(&self, db: &str, table: &str, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        let mut inner = self.inner.lock().expect("stats lock");
+        let entry = inner.entry(key).or_default();
+        entry.modify_count = entry.modify_count.saturating_add(delta);
+    }
+
+    pub fn needs_auto_analyze(&self, db: &str, table: &str, ratio: f64) -> bool {
+        self.table(db, table)
+            .map(|t| t.needs_auto_analyze(ratio))
+            .unwrap_or(false)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let inner = self.inner.lock().expect("stats lock");
         let snap: Vec<PersistTable> = inner
@@ -45,6 +65,7 @@ impl Handle {
                 db: db.clone(),
                 table: table.clone(),
                 count: stats.count,
+                modify_count: stats.modify_count,
                 version: stats.version,
                 columns: stats
                     .columns
@@ -114,6 +135,7 @@ impl Handle {
                 (t.db, t.table),
                 Table {
                     count: t.count,
+                    modify_count: t.modify_count,
                     columns,
                     version: t.version,
                 },
@@ -135,6 +157,8 @@ struct PersistTable {
     db: String,
     table: String,
     count: u64,
+    #[serde(default)]
+    modify_count: u64,
     version: u64,
     columns: Vec<PersistColumn>,
 }

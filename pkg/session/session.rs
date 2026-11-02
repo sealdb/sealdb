@@ -35,6 +35,10 @@ pub struct Session {
     partition_prune_mode: Mutex<PartitionPruneMode>,
     /// Active roles for the session (`SET ROLE`).
     active_roles: Mutex<Vec<UserIdentity>>,
+    /// TiDB `tidb_enable_auto_analyze` (default ON).
+    enable_auto_analyze: Mutex<bool>,
+    /// TiDB `tidb_auto_analyze_ratio` (default 0.5).
+    auto_analyze_ratio: Mutex<f64>,
 }
 
 impl Session {
@@ -65,6 +69,8 @@ impl Session {
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
             partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
             active_roles: Mutex::new(Vec::new()),
+            enable_auto_analyze: Mutex::new(true),
+            auto_analyze_ratio: Mutex::new(0.5),
         }
     }
 
@@ -385,6 +391,9 @@ impl Session {
             && let Some(insert) = ctas_insert
         {
             return self.execute_one(&Statement::Insert(insert));
+        }
+        if result.is_ok() {
+            maybe_auto_analyze(self, stmt)?;
         }
         result
     }
@@ -716,6 +725,74 @@ fn empty_result() -> QueryResult {
     }
 }
 
+/// Record DML delta and run ANALYZE when modify/count exceeds the ratio
+/// (TiDB auto-analyze refresher, synchronous for MemStorage tests).
+fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
+    let current_db = session
+        .current_db
+        .lock()
+        .expect("session current_db lock")
+        .clone();
+    let targets: Vec<(String, String, u64)> = match stmt {
+        Statement::Insert(insert) => {
+            let (schema, name) = insert.table.qualified(&current_db);
+            let delta = if insert.select.is_some() {
+                1
+            } else {
+                insert.rows.len().max(1) as u64
+            };
+            vec![(schema, name, delta)]
+        }
+        Statement::Update(update) => {
+            let (schema, name) = update.table.qualified(&current_db);
+            vec![(schema, name, 1)]
+        }
+        Statement::Delete(delete) => {
+            if delete.tables.is_empty() {
+                let (schema, name) = delete.table.qualified(&current_db);
+                vec![(schema, name, 1)]
+            } else {
+                delete
+                    .tables
+                    .iter()
+                    .map(|t| {
+                        let (schema, name) = t.qualified(&current_db);
+                        (schema, name, 1u64)
+                    })
+                    .collect()
+            }
+        }
+        _ => return Ok(()),
+    };
+    let enable = *session
+        .enable_auto_analyze
+        .lock()
+        .expect("session auto analyze lock");
+    let ratio = *session
+        .auto_analyze_ratio
+        .lock()
+        .expect("session auto analyze ratio lock");
+    let stats = session.domain.stats();
+    let mut due = Vec::new();
+    for (schema, name, delta) in targets {
+        if schema.is_empty() {
+            continue;
+        }
+        stats.add_modify(&schema, &name, delta);
+        if enable && stats.needs_auto_analyze(&schema, &name, ratio) {
+            due.push((schema, name));
+        }
+    }
+    for (schema, name) in due {
+        let analyze = Statement::AnalyzeTable(sealdb_parser::ast::AnalyzeTableStmt {
+            table: sealdb_parser::ast::TableName::new(Some(schema), name),
+            indexes: Vec::new(),
+        });
+        session.execute_one(&analyze)?;
+    }
+    Ok(())
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
     for a in &stmt.assignments {
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
@@ -755,6 +832,27 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .lock()
                     .expect("session plan cache lock")
                     .clear();
+            }
+            "tidb_enable_auto_analyze" => {
+                let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+                *session
+                    .enable_auto_analyze
+                    .lock()
+                    .expect("session auto analyze lock") = on;
+            }
+            "tidb_auto_analyze_ratio" => {
+                let ratio: f64 = value.parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_auto_analyze_ratio' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                *session
+                    .auto_analyze_ratio
+                    .lock()
+                    .expect("session auto analyze ratio lock") = ratio;
             }
             "autocommit" | "unique_checks" | "foreign_key_checks" => {}
             other => {
@@ -805,6 +903,22 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                 .lock()
                 .expect("session partition prune mode lock")
                 .as_str()
+                .to_string(),
+            "tidb_enable_auto_analyze" => {
+                if *session
+                    .enable_auto_analyze
+                    .lock()
+                    .expect("session auto analyze lock")
+                {
+                    "ON".into()
+                } else {
+                    "OFF".into()
+                }
+            }
+            "tidb_auto_analyze_ratio" => session
+                .auto_analyze_ratio
+                .lock()
+                .expect("session auto analyze ratio lock")
                 .to_string(),
             _ => return None,
         };
@@ -3927,6 +4041,34 @@ mod tests {
         let full = session.stats().table("db1", "t").unwrap();
         assert!(full.column("id").is_some());
         assert!(full.column("name").is_some());
+    }
+
+    #[test]
+    fn test_auto_analyze() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t",
+            )
+            .unwrap();
+        assert_eq!(session.stats().table("db1", "t").unwrap().count, 2);
+        assert_eq!(session.stats().table("db1", "t").unwrap().modify_count, 0);
+        // modify/count = 2/2 > 0.5 → synchronous auto-analyze refreshes count.
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (3, 'b'), (4, 'b')")
+            .unwrap();
+        let stats = session.stats().table("db1", "t").unwrap();
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.modify_count, 0);
+        session
+            .execute_stmt("SET tidb_enable_auto_analyze = OFF")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (5, 'c'), (6, 'c'), (7, 'c')")
+            .unwrap();
+        let disabled = session.stats().table("db1", "t").unwrap();
+        assert_eq!(disabled.count, 4);
+        assert_eq!(disabled.modify_count, 3);
     }
 
     #[test]

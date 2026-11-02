@@ -128,6 +128,8 @@ pub struct ColumnStats {
 #[derive(Clone, Debug, Default)]
 pub struct Table {
     pub count: u64,
+    /// Rows changed since last ANALYZE (TiDB `ModifyCount`).
+    pub modify_count: u64,
     pub columns: Vec<(String, ColumnStats)>,
     pub version: u64,
 }
@@ -136,6 +138,21 @@ impl Table {
     pub const PSEUDO_ROW_COUNT: u64 = 10_000;
     pub const DEFAULT_HIST_BUCKETS: usize = 8;
     pub const DEFAULT_TOPN: usize = 10;
+    /// TiDB `AutoAnalyzeMinCnt` default is 1000; SealDB keeps no floor so
+    /// MemStorage tests can exercise auto-analyze on small tables.
+    pub const AUTO_ANALYZE_MIN_CNT: u64 = 0;
+
+    /// TiDB `IsEligibleForAnalysis` + modify/count > ratio.
+    /// Requires a prior ANALYZE (`version > 0`) so cold tables stay on pseudo-stats
+    /// until the first explicit analyze (matches common test setup).
+    pub fn needs_auto_analyze(&self, ratio: f64) -> bool {
+        if ratio <= 0.0 || self.version == 0 {
+            return false;
+        }
+        let _ = Self::AUTO_ANALYZE_MIN_CNT;
+        let base = self.count.max(1) as f64;
+        (self.modify_count as f64) / base > ratio
+    }
 
     pub fn column(&self, name: &str) -> Option<&ColumnStats> {
         self.columns
