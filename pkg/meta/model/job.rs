@@ -12,6 +12,19 @@ pub const STATE_WRITE_REORGANIZATION: SchemaState = SchemaState(3);
 pub const STATE_DELETE_REORGANIZATION: SchemaState = SchemaState(4);
 pub const STATE_PUBLIC: SchemaState = SchemaState(5);
 
+impl SchemaState {
+    pub fn as_str(self) -> &'static str {
+        match self.0 {
+            1 => "delete only",
+            2 => "write only",
+            3 => "write reorganization",
+            4 => "delete reorganization",
+            5 => "public",
+            _ => "none",
+        }
+    }
+}
+
 /// TiDB `model.JobState` for `ADMIN SHOW DDL JOBS`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum JobState {

@@ -254,6 +254,7 @@ impl Executor for ShowExec {
                     "TABLE_NAME".to_string(),
                     "JOB_TYPE".to_string(),
                     "STATE".to_string(),
+                    "SCHEMA_STATE".to_string(),
                 ];
                 self.rows = self
                     .domain
@@ -266,6 +267,7 @@ impl Executor for ShowExec {
                             Datum::Bytes(job.table_name.into_bytes()),
                             Datum::Bytes(job.tp.into_bytes()),
                             Datum::Bytes(job.state.as_str().as_bytes().to_vec()),
+                            Datum::Bytes(job.schema_state.as_str().as_bytes().to_vec()),
                         ]
                     })
                     .collect();

@@ -1,6 +1,7 @@
 // F18 core: CREATE/DROP INDEX schema + in-place backfill.
-// Completeness wave / not this feature: async job queue, Reorg,
+// Completeness wave / not this feature: async job queue, concurrent ingest,
 // invisible, concurrent ingest, ALGORITHM/LOCK.
+use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME,
@@ -96,12 +97,21 @@ pub fn add_index(
         idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
     }
     info.max_idx_id += 1;
-    let built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)
+    let mut built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)
         .with_flags(index.unique, index.primary);
-    backfill_index(storage, &info, &built)?;
-    info.indices.push(built);
-    meta.update_table(db_id, &info)?;
-    meta.gen_schema_version()?;
+    for state in INDEX_REORG_STATES {
+        built.state = state;
+        if is_write_reorg(state) {
+            backfill_index(storage, &info, &built)?;
+        }
+        if let Some(existing) = info.indices.iter_mut().find(|idx| idx.id == built.id) {
+            existing.state = state;
+        } else {
+            info.indices.push(built.clone());
+        }
+        meta.update_table(db_id, &info)?;
+        meta.gen_schema_version()?;
+    }
     Ok(())
 }
 
