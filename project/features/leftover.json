@@ -49,7 +49,6 @@
       "savepoint"
     ],
     "C5": [
-      "set-global",
       "leftover-collation-suites"
     ]
   },

@@ -7,7 +7,7 @@ use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{
-    InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity,
+    InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, SetVarScope, Statement, UserIdentity,
 };
 use sealdb_parser::charset::Collation;
 use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
@@ -56,6 +56,7 @@ impl Session {
     }
 
     pub fn with_domain(domain: Arc<Domain>) -> Self {
+        let globals = domain.global_vars();
         Self {
             parser: Parser::new(),
             planner: PlanBuilder::new(),
@@ -69,12 +70,14 @@ impl Session {
             prepared: Mutex::new(HashMap::new()),
             cache_plans: Mutex::new(false),
             plan_cache_key: Mutex::new(None),
-            collation: Mutex::new(Collation::bin()),
-            sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
+            collation: Mutex::new(Collation::default_for_charset(
+                &globals.character_set_connection,
+            )),
+            sql_mode: Mutex::new(globals.sql_mode),
             user_vars: Mutex::new(HashMap::new()),
             partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
             active_roles: Mutex::new(Vec::new()),
-            enable_auto_analyze: Mutex::new(true),
+            enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
         }
     }
@@ -993,6 +996,11 @@ fn resolve_exec_params(session: &Session, params: &[ExprNode]) -> Result<Vec<Exp
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
     for a in &stmt.assignments {
         if is_user_var_name(&a.name) {
+            if a.scope == SetVarScope::Global {
+                return Err(sealdb_errno::Error::unsupported(
+                    "SET GLOBAL user variables",
+                ));
+            }
             let key = user_var_key(&a.name);
             let datum = parse_set_literal(&a.value);
             session
@@ -1004,6 +1012,9 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
         }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
         let value = a.value.trim_matches(|c| c == '\'' || c == '"').to_string();
+        if a.scope == SetVarScope::Global {
+            return apply_set_global(session, &name, &value);
+        }
         match name.as_str() {
             "names"
             | "character_set_client"
@@ -1066,6 +1077,30 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
     Ok(())
 }
 
+/// Domain-shared `SET GLOBAL` for the C5 MVB variable set.
+fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
+    match name {
+        "sql_mode" => {
+            session.domain.set_global_sql_mode(value.to_string());
+        }
+        "tidb_enable_auto_analyze" => {
+            let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+            session.domain.set_global_enable_auto_analyze(on);
+        }
+        "names" | "character_set_client" | "character_set_connection" | "character_set_results" => {
+            session
+                .domain
+                .set_global_character_set_connection(value.to_string());
+        }
+        other => {
+            return Err(sealdb_errno::Error::unsupported(format!(
+                "SET GLOBAL {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult> {
     let Statement::Select(select) = stmt else {
         return None;
@@ -1092,51 +1127,16 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
             row.push(datum);
             continue;
         }
+        let global = col
+            .table
+            .as_deref()
+            .map(|t| t.trim_start_matches('@').eq_ignore_ascii_case("global"))
+            .unwrap_or(false);
         let name = col.name.trim_start_matches('@').to_ascii_lowercase();
-        let value = match name.as_str() {
-            "sql_mode" => session
-                .sql_mode
-                .lock()
-                .expect("session sql_mode lock")
-                .clone(),
-            "collation_connection" => session
-                .collation
-                .lock()
-                .expect("session collation lock")
-                .name
-                .clone(),
-            "character_set_client"
-            | "character_set_connection"
-            | "character_set_results"
-            | "character_set_database" => session
-                .collation
-                .lock()
-                .expect("session collation lock")
-                .charset
-                .clone(),
-            "tidb_partition_prune_mode" => session
-                .partition_prune_mode
-                .lock()
-                .expect("session partition prune mode lock")
-                .as_str()
-                .to_string(),
-            "tidb_enable_auto_analyze" => {
-                if *session
-                    .enable_auto_analyze
-                    .lock()
-                    .expect("session auto analyze lock")
-                {
-                    "ON".into()
-                } else {
-                    "OFF".into()
-                }
-            }
-            "tidb_auto_analyze_ratio" => session
-                .auto_analyze_ratio
-                .lock()
-                .expect("session auto analyze ratio lock")
-                .to_string(),
-            _ => return None,
+        let value = if global {
+            read_global_sysvar(session, &name)?
+        } else {
+            read_session_sysvar(session, &name)?
         };
         row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
     }
@@ -1146,6 +1146,74 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     Some(QueryResult {
         columns,
         rows: vec![row],
+    })
+}
+
+fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
+    Some(match name {
+        "sql_mode" => session
+            .sql_mode
+            .lock()
+            .expect("session sql_mode lock")
+            .clone(),
+        "collation_connection" => session
+            .collation
+            .lock()
+            .expect("session collation lock")
+            .name
+            .clone(),
+        "character_set_client"
+        | "character_set_connection"
+        | "character_set_results"
+        | "character_set_database" => session
+            .collation
+            .lock()
+            .expect("session collation lock")
+            .charset
+            .clone(),
+        "tidb_partition_prune_mode" => session
+            .partition_prune_mode
+            .lock()
+            .expect("session partition prune mode lock")
+            .as_str()
+            .to_string(),
+        "tidb_enable_auto_analyze" => {
+            if *session
+                .enable_auto_analyze
+                .lock()
+                .expect("session auto analyze lock")
+            {
+                "ON".into()
+            } else {
+                "OFF".into()
+            }
+        }
+        "tidb_auto_analyze_ratio" => session
+            .auto_analyze_ratio
+            .lock()
+            .expect("session auto analyze ratio lock")
+            .to_string(),
+        _ => return None,
+    })
+}
+
+fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
+    let globals = session.domain.global_vars();
+    Some(match name {
+        "sql_mode" => globals.sql_mode,
+        "tidb_enable_auto_analyze" => {
+            if globals.enable_auto_analyze {
+                "ON".into()
+            } else {
+                "OFF".into()
+            }
+        }
+        "character_set_client"
+        | "character_set_connection"
+        | "character_set_results"
+        | "character_set_database"
+        | "character_set_server" => globals.character_set_connection,
+        _ => return None,
     })
 }
 
@@ -2976,6 +3044,111 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
             .unwrap();
         assert!(miss.display_rows().is_empty());
+    }
+
+    #[test]
+    fn test_set_global_sysvars_shared_domain() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+
+        // Defaults match on session and global.
+        let before = a
+            .execute_stmt("SELECT @@sql_mode, @@GLOBAL.sql_mode")
+            .unwrap();
+        assert!(before.display_rows()[0][0].contains("ONLY_FULL_GROUP_BY"));
+        assert_eq!(before.display_rows()[0][0], before.display_rows()[0][1]);
+
+        // SET GLOBAL updates Domain; current session stays unchanged.
+        a.execute_stmt("SET GLOBAL sql_mode = 'STRICT_TRANS_TABLES'")
+            .unwrap();
+        let a_sess = a
+            .execute_stmt("SELECT @@sql_mode, @@SESSION.sql_mode")
+            .unwrap();
+        assert!(
+            a_sess.display_rows()[0][0].contains("ONLY_FULL_GROUP_BY"),
+            "{:?}",
+            a_sess.display_rows()
+        );
+        assert_eq!(a_sess.display_rows()[0][0], a_sess.display_rows()[0][1]);
+        let a_glob = a.execute_stmt("SELECT @@GLOBAL.sql_mode").unwrap();
+        assert_eq!(a_glob.display_rows()[0][0], "STRICT_TRANS_TABLES");
+
+        // Plain / SESSION SET stays session-local.
+        a.execute_stmt("SET sql_mode = 'ONLY_FULL_GROUP_BY'")
+            .unwrap();
+        a.execute_stmt("SET SESSION tidb_enable_auto_analyze = OFF")
+            .unwrap();
+        assert_eq!(
+            a.execute_stmt("SELECT @@sql_mode").unwrap().display_rows()[0][0],
+            "ONLY_FULL_GROUP_BY"
+        );
+        assert_eq!(
+            a.execute_stmt("SELECT @@GLOBAL.sql_mode")
+                .unwrap()
+                .display_rows()[0][0],
+            "STRICT_TRANS_TABLES"
+        );
+        assert_eq!(
+            a.execute_stmt("SELECT @@tidb_enable_auto_analyze")
+                .unwrap()
+                .display_rows()[0][0],
+            "OFF"
+        );
+        assert_eq!(
+            a.execute_stmt("SELECT @@GLOBAL.tidb_enable_auto_analyze")
+                .unwrap()
+                .display_rows()[0][0],
+            "ON"
+        );
+
+        a.execute_stmt("SET GLOBAL tidb_enable_auto_analyze = OFF")
+            .unwrap();
+        a.execute_stmt("SET GLOBAL character_set_connection = gbk")
+            .unwrap();
+        assert_eq!(
+            a.execute_stmt("SELECT @@GLOBAL.tidb_enable_auto_analyze")
+                .unwrap()
+                .display_rows()[0][0],
+            "OFF"
+        );
+        assert_eq!(
+            a.execute_stmt("SELECT @@GLOBAL.character_set_connection")
+                .unwrap()
+                .display_rows()[0][0],
+            "gbk"
+        );
+        // Current session charset unchanged by SET GLOBAL.
+        assert_eq!(
+            a.execute_stmt("SELECT @@character_set_connection")
+                .unwrap()
+                .display_rows()[0][0],
+            "utf8mb4"
+        );
+
+        // New session on the same Domain inherits GLOBAL defaults.
+        let b = Session::with_domain(domain);
+        assert_eq!(
+            b.execute_stmt("SELECT @@sql_mode").unwrap().display_rows()[0][0],
+            "STRICT_TRANS_TABLES"
+        );
+        assert_eq!(
+            b.execute_stmt("SELECT @@GLOBAL.sql_mode")
+                .unwrap()
+                .display_rows()[0][0],
+            "STRICT_TRANS_TABLES"
+        );
+        assert_eq!(
+            b.execute_stmt("SELECT @@tidb_enable_auto_analyze")
+                .unwrap()
+                .display_rows()[0][0],
+            "OFF"
+        );
+        assert_eq!(
+            b.execute_stmt("SELECT @@character_set_connection")
+                .unwrap()
+                .display_rows()[0][0],
+            "gbk"
+        );
     }
 
     #[test]

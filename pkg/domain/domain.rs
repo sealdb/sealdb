@@ -14,6 +14,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Domain-default system variables for `SET GLOBAL` / `@@GLOBAL.*` (C5 MVB).
+/// New sessions copy these into session-local state at construction.
+#[derive(Clone, Debug)]
+pub struct GlobalSysVars {
+    pub sql_mode: String,
+    pub enable_auto_analyze: bool,
+    /// Default connection charset (`character_set_connection` / SET NAMES default).
+    pub character_set_connection: String,
+}
+
+impl Default for GlobalSysVars {
+    fn default() -> Self {
+        Self {
+            sql_mode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string(),
+            enable_auto_analyze: true,
+            character_set_connection: "utf8mb4".to_string(),
+        }
+    }
+}
+
 /// Schema and NextGlobalID / NextHandle live in the `m` prefix of Storage
 /// so `--store tikv` can reload tables after process restart.
 pub struct Domain {
@@ -25,6 +45,8 @@ pub struct Domain {
     bind_handle: SessionBindingHandle,
     /// Domain-shared prepared plan cache (TiDB instance plan cache, MVB).
     plan_cache: Arc<InstancePlanCache>,
+    /// `SET GLOBAL` defaults visible to new sessions and `@@GLOBAL.*`.
+    global_vars: Mutex<GlobalSysVars>,
 }
 
 struct Inner {
@@ -101,7 +123,37 @@ impl Domain {
             stats,
             bind_handle: SessionBindingHandle::new(),
             plan_cache: Arc::new(InstancePlanCache::new()),
+            global_vars: Mutex::new(GlobalSysVars::default()),
         })
+    }
+
+    /// Snapshot of Domain-default sysvars (`SET GLOBAL` / new-session defaults).
+    pub fn global_vars(&self) -> GlobalSysVars {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .clone()
+    }
+
+    pub fn set_global_sql_mode(&self, mode: String) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .sql_mode = mode;
+    }
+
+    pub fn set_global_enable_auto_analyze(&self, on: bool) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .enable_auto_analyze = on;
+    }
+
+    pub fn set_global_character_set_connection(&self, charset: String) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .character_set_connection = charset;
     }
 
     pub fn privilege(&self) -> Arc<Manager> {

@@ -28,6 +28,6 @@ pub use misc::{
     DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
     ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
-    UserSpec,
+    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, UseStmt,
+    UserIdentity, UserSpec,
 };
