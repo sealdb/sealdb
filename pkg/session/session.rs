@@ -400,6 +400,7 @@ impl Session {
         // Apply CREATE BINDING rewrite before plan build (MVB: substitute bind SQL).
         let rebound = self.apply_sql_binding(stmt)?;
         let stmt = rebound.as_ref().unwrap_or(stmt);
+        check_only_full_group_by(self, stmt)?;
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         // Prepared EXECUTE may override with the unbound `?` template key.
@@ -817,6 +818,68 @@ fn empty_result() -> QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
     }
+}
+
+/// MySQL/TiDB ONLY_FULL_GROUP_BY: when the mode is set and the query has
+/// GROUP BY, every SELECT item must be an aggregate, a constant, or appear
+/// in the GROUP BY list (exact restore match). Functional-dependency
+/// exceptions are out of scope for this MVB.
+fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
+    let select = match stmt {
+        Statement::Select(s) => s,
+        Statement::Explain(e) => match e.stmt.as_ref() {
+            Statement::Select(s) => s,
+            _ => return Ok(()),
+        },
+        Statement::Insert(insert) => match insert.select.as_ref() {
+            Some(s) => s,
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let mode = session
+        .sql_mode
+        .lock()
+        .expect("session sql_mode lock")
+        .clone();
+    if !sql_mode_has(&mode, "ONLY_FULL_GROUP_BY") || select.group_by.is_empty() {
+        return Ok(());
+    }
+    for (i, field) in select.fields.iter().enumerate() {
+        if select_field_ok_for_group_by(&field.expr, &select.group_by) {
+            continue;
+        }
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP,
+            format!(
+                "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+                i + 1
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sql_mode_has(mode: &str, flag: &str) -> bool {
+    mode.split(',')
+        .map(|p| p.trim())
+        .any(|p| p.eq_ignore_ascii_case(flag))
+}
+
+fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
+    if matches!(expr, ExprNode::Value(_)) {
+        return true;
+    }
+    if let ExprNode::Func(func) = expr {
+        let upper = func.name.to_ascii_uppercase();
+        if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+            return true;
+        }
+    }
+    let restored = expr.restore_string();
+    group_by
+        .iter()
+        .any(|g| g.restore_string().eq_ignore_ascii_case(&restored))
 }
 
 /// Record DML delta and run ANALYZE when modify/count exceeds the ratio
@@ -2913,6 +2976,64 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
             .unwrap();
         assert!(miss.display_rows().is_empty());
+    }
+
+    #[test]
+    fn test_only_full_group_by() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); \
+                 INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+            )
+            .unwrap();
+        // Default sql_mode includes ONLY_FULL_GROUP_BY.
+        let mode = session.execute_stmt("SELECT @@sql_mode").unwrap();
+        assert!(
+            mode.display_rows()[0][0].contains("ONLY_FULL_GROUP_BY"),
+            "{:?}",
+            mode.display_rows()
+        );
+        let err = session
+            .execute_stmt("SELECT id, name, COUNT(*) FROM db1.t GROUP BY name")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP);
+        assert!(
+            err.message.contains("only_full_group_by"),
+            "{}",
+            err.message
+        );
+        // Legal under the mode: grouped column + aggregate + constant.
+        let ok = session
+            .execute_stmt("SELECT name, COUNT(*), 1 FROM db1.t GROUP BY name ORDER BY name")
+            .unwrap();
+        assert_eq!(
+            ok.display_rows(),
+            vec![
+                vec!["a".to_string(), "2".to_string(), "1".to_string()],
+                vec!["b".to_string(), "1".to_string(), "1".to_string()]
+            ]
+        );
+        // Turning the mode off allows the previously rejected query (any-value id).
+        session
+            .execute_stmt("SET sql_mode = 'STRICT_TRANS_TABLES'")
+            .unwrap();
+        let loose = session
+            .execute_stmt("SELECT id, name, COUNT(*) FROM db1.t GROUP BY name ORDER BY name")
+            .unwrap();
+        assert_eq!(loose.display_rows().len(), 2);
+        assert_eq!(loose.display_rows()[0][1], "a");
+        assert_eq!(loose.display_rows()[0][2], "2");
+        assert_eq!(loose.display_rows()[1][1], "b");
+        assert_eq!(loose.display_rows()[1][2], "1");
+        // Re-enable and confirm rejection returns.
+        session
+            .execute_stmt("SET sql_mode = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES'")
+            .unwrap();
+        let err2 = session
+            .execute_stmt("SELECT id, COUNT(*) FROM db1.t GROUP BY name")
+            .unwrap_err();
+        assert_eq!(err2.code, sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP);
     }
 
     #[test]
