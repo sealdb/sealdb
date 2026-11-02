@@ -747,10 +747,20 @@ impl DeallocateStmt {
     }
 }
 
+/// `SET` / `SET SESSION` / `SET GLOBAL` scope (from sqlparser `ContextModifier`
+/// or `@@GLOBAL.` / `@@SESSION.` object-name prefixes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SetVarScope {
+    #[default]
+    Session,
+    Global,
+}
+
 #[derive(Clone, Debug)]
 pub struct SetAssignment {
     pub name: String,
     pub value: String,
+    pub scope: SetVarScope,
 }
 
 #[derive(Clone, Debug)]
@@ -764,6 +774,10 @@ impl SetStmt {
         for (i, a) in self.assignments.iter().enumerate() {
             if i > 0 {
                 ctx.write_str(", ");
+            }
+            match a.scope {
+                SetVarScope::Global => ctx.write_str("GLOBAL "),
+                SetVarScope::Session => {}
             }
             ctx.write_str(&a.name);
             ctx.write_str(" = ");

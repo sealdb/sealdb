@@ -20,8 +20,8 @@ use crate::ast::misc::{
     DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
     ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
-    UserSpec,
+    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, UseStmt,
+    UserIdentity, UserSpec,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -29,17 +29,18 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
-    BinaryOperator, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized, DataType, Delete,
-    DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, MySQLColumnPosition,
-    NamedWindowDefinition, NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType,
-    OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, RenameTable as SqlRenameTable,
-    RenameTableNameKind, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier,
-    ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
-    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
-    WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
+    BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized,
+    DataType, Delete, DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
+    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType,
+    MySQLColumnPosition, NamedWindowDefinition, NamedWindowExpr, NonBlock, NullTreatment,
+    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query,
+    RenameTable as SqlRenameTable, RenameTableNameKind, Revoke, SchemaName, SelectItem, Set,
+    SetExpr, SetOperator, SetQuantifier, ShowCreateObject, Statement as SqlStatement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionAccessMode,
+    TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use, Value, Values,
+    WindowFrameBound as SqlWindowFrameBound, WindowFrameUnits as SqlWindowFrameUnits, WindowType,
+    With,
 };
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -145,7 +146,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
 fn is_placeholder(stmt: &SetStmt, marker: &str) -> bool {
     matches!(
         stmt.assignments.as_slice(),
-        [SetAssignment { name, value }]
+        [SetAssignment { name, value, .. }]
             if name.eq_ignore_ascii_case("names") && value.eq_ignore_ascii_case(marker)
     )
 }
@@ -1929,11 +1930,13 @@ fn lower_set(set: &Set) -> Result<Statement> {
             let mut assignments = vec![SetAssignment {
                 name: "names".to_string(),
                 value: charset_name.value.clone(),
+                scope: SetVarScope::Session,
             }];
             if let Some(collation) = collation_name {
                 assignments.push(SetAssignment {
                     name: "collation_connection".to_string(),
                     value: collation.clone(),
+                    scope: SetVarScope::Session,
                 });
             }
             Ok(Statement::Set(SetStmt { assignments }))
@@ -1942,23 +1945,33 @@ fn lower_set(set: &Set) -> Result<Statement> {
             assignments: vec![SetAssignment {
                 name: "names".to_string(),
                 value: "utf8mb4".to_string(),
+                scope: SetVarScope::Session,
             }],
         })),
         Set::SingleAssignment {
-            variable, values, ..
-        } => Ok(Statement::Set(SetStmt {
-            assignments: vec![SetAssignment {
-                name: object_name_last(variable)?,
-                value: values.first().map(|v| v.to_string()).unwrap_or_default(),
-            }],
-        })),
+            scope,
+            variable,
+            values,
+            ..
+        } => {
+            let (name, var_scope) = set_var_name_and_scope(variable, *scope)?;
+            Ok(Statement::Set(SetStmt {
+                assignments: vec![SetAssignment {
+                    name,
+                    value: values.first().map(|v| v.to_string()).unwrap_or_default(),
+                    scope: var_scope,
+                }],
+            }))
+        }
         Set::MultipleAssignments { assignments } => Ok(Statement::Set(SetStmt {
             assignments: assignments
                 .iter()
                 .map(|a| {
+                    let (name, scope) = set_var_name_and_scope(&a.name, a.scope)?;
                     Ok(SetAssignment {
-                        name: object_name_last(&a.name)?,
+                        name,
                         value: a.value.to_string(),
+                        scope,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -3631,6 +3644,40 @@ fn object_name_last(name: &ObjectName) -> Result<String> {
     object_name_parts(name)?
         .pop()
         .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "empty object name"))
+}
+
+/// Resolve SET target name + scope from sqlparser `ContextModifier` and/or
+/// `@@GLOBAL.` / `@@SESSION.` object-name prefixes.
+fn set_var_name_and_scope(
+    name: &ObjectName,
+    modifier: Option<ContextModifier>,
+) -> Result<(String, SetVarScope)> {
+    let mut parts = object_name_parts(name)?;
+    if parts.is_empty() {
+        return Err(Error::new(ERR_PARSE_ERROR, "empty SET variable name"));
+    }
+    let mut scope = match modifier {
+        Some(ContextModifier::Global) => SetVarScope::Global,
+        Some(ContextModifier::Session) | Some(ContextModifier::Local) | None => {
+            SetVarScope::Session
+        }
+    };
+    if parts.len() >= 2 {
+        let head = parts[0].trim_start_matches('@').to_ascii_lowercase();
+        if head == "global" {
+            scope = SetVarScope::Global;
+            parts.remove(0);
+        } else if head == "session" || head == "local" {
+            scope = SetVarScope::Session;
+            parts.remove(0);
+        }
+    }
+    // Keep leading `@` for user vars (`SET @a = 1`); `apply_set` strips
+    // `@`/`@@` when matching system variable names.
+    let raw = parts
+        .pop()
+        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "empty SET variable name"))?;
+    Ok((raw, scope))
 }
 
 fn schema_name_last(name: &SchemaName) -> Result<String> {

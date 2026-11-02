@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C5 only-full-group-by MVB；完整性波 C4=[] → C2=[] → C5）  
+> 最后更新：2026-11-03（C5 set-global MVB；完整性波 C4=[] → C2=[] → C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C5（set-global）
+- **完成**:
+  - sqlparser `Set::SingleAssignment.scope` / `@@GLOBAL.` → AST `SetVarScope`
+  - Domain `GlobalSysVars`：`sql_mode` / `tidb_enable_auto_analyze` / `character_set_connection`
+  - `SET GLOBAL` 写 Domain；`SET SESSION` / plain SET 仍会话局部；新 `Session::with_domain` 继承 Domain 默认
+  - `SELECT @@GLOBAL.*` 读 Domain；C5 gate `execute-set-global`；`status.json` / leftover 去掉 `set-global`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_set_global_sysvars_shared_domain -- --exact`
+  - `./project/scripts/feature_gate.sh C5`
+- **下一步**:
+  - C5 leftover collation suites
 
 ### 2026-11-03
 
