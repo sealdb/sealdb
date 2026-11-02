@@ -10,6 +10,15 @@ pub enum IsolationLevel {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Version(pub u64);
 
+/// Row lock taken by `SELECT FOR UPDATE` / `FOR SHARE` and pessimistic writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RowLock {
+    #[default]
+    None,
+    Share,
+    Exclusive,
+}
+
 pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>>;
@@ -22,6 +31,32 @@ pub trait Transaction: Send {
     fn scan(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Shared lock (`FOR SHARE`). Default is exclusive; MemStorage overrides.
+    fn get_for_share(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_for_update(key)
+    }
+    fn scan_for_share(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_for_update(start, end)
+    }
+    fn get_locked(&mut self, key: &[u8], lock: RowLock) -> Result<Option<Vec<u8>>> {
+        match lock {
+            RowLock::Exclusive => self.get_for_update(key),
+            RowLock::Share => self.get_for_share(key),
+            RowLock::None => self.get(key),
+        }
+    }
+    fn scan_locked(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        lock: RowLock,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match lock {
+            RowLock::Exclusive => self.scan_for_update(start, end),
+            RowLock::Share => self.scan_for_share(start, end),
+            RowLock::None => self.scan(start, end),
+        }
+    }
     fn set_pessimistic(&mut self);
     fn is_pessimistic(&self) -> bool;
     fn commit(&mut self) -> Result<()>;

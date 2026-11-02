@@ -6,7 +6,7 @@ use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::{Key, TxnHandle};
+use sealdb_kv::{Key, RowLock, TxnHandle};
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
@@ -35,7 +35,7 @@ pub struct IndexLookUpExecutor {
     access: IndexAccess,
     current_db: String,
     txn: Arc<TxnHandle>,
-    for_update: bool,
+    lock: RowLock,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     covering: bool,
@@ -53,7 +53,7 @@ impl IndexLookUpExecutor {
         access: IndexAccess,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
-        for_update: bool,
+        lock: RowLock,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
         covering: bool,
@@ -65,7 +65,7 @@ impl IndexLookUpExecutor {
             access,
             current_db: current_db.into(),
             txn,
-            for_update,
+            lock,
             partitions,
             pushed,
             covering,
@@ -112,11 +112,7 @@ impl Executor for IndexLookUpExecutor {
                 if start.as_bytes() >= end.as_slice() {
                     continue;
                 }
-                let pairs = if self.for_update {
-                    txn.scan_for_update(start.as_bytes(), &end)?
-                } else {
-                    txn.scan(start.as_bytes(), &end)?
-                };
+                let pairs = txn.scan_locked(start.as_bytes(), &end, self.lock)?;
                 for (key, value) in pairs {
                     let handle = index_handle(&index, &key, &value)?;
                     if self.covering {
@@ -124,11 +120,7 @@ impl Executor for IndexLookUpExecutor {
                         continue;
                     }
                     let row_key = encode_row_key_with_handle(physical_id, handle);
-                    let raw = if self.for_update {
-                        txn.get_for_update(row_key.as_bytes())?
-                    } else {
-                        txn.get(row_key.as_bytes())?
-                    };
+                    let raw = txn.get_locked(row_key.as_bytes(), self.lock)?;
                     if let Some(raw) = raw {
                         let decoded = decode_row(&raw, &info.col_field_types());
                         rows.push(

@@ -7,6 +7,6 @@ pub mod mem;
 pub mod txn;
 
 pub use key::{IntHandle, Key};
-pub use kv::{IsolationLevel, Storage, Transaction, Version};
+pub use kv::{IsolationLevel, RowLock, Storage, Transaction, Version};
 pub use mem::MemStorage;
 pub use txn::TxnHandle;

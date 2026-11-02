@@ -42,6 +42,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
+    let rewritten = rewrite_lock_in_share_mode(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
@@ -783,6 +784,34 @@ fn lower_grantees(grantees: &[sqlparser::ast::Grantee]) -> Result<Vec<UserIdenti
     Ok(users)
 }
 
+/// sqlparser MySQL dialect does not accept `LOCK IN SHARE MODE`; rewrite
+/// it to `FOR SHARE` (same InnoDB shared lock) before parse.
+fn rewrite_lock_in_share_mode(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "LOCK") {
+            let after_lock = skip_ws(bytes, i + 4);
+            if keyword_at(bytes, after_lock, "IN") {
+                let after_in = skip_ws(bytes, after_lock + 2);
+                if keyword_at(bytes, after_in, "SHARE") {
+                    let after_share = skip_ws(bytes, after_in + 5);
+                    if keyword_at(bytes, after_share, "MODE") {
+                        out.push_str("FOR SHARE");
+                        i = after_share + 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {
     let mut out = String::with_capacity(sql.len());
     let mut flags = Vec::new();
@@ -1385,7 +1414,7 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
     }
     match lock.lock_type {
         LockType::Update => Ok(SelectLock::ForUpdate),
-        LockType::Share => Err(Error::unsupported("FOR SHARE")),
+        LockType::Share => Ok(SelectLock::ForShare),
     }
 }
 

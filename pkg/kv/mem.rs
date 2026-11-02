@@ -12,10 +12,22 @@ struct VersionedValue {
 }
 
 #[derive(Default)]
+struct KeyLock {
+    exclusive: Option<u64>,
+    shared: HashSet<u64>,
+}
+
+impl KeyLock {
+    fn is_empty(&self) -> bool {
+        self.exclusive.is_none() && self.shared.is_empty()
+    }
+}
+
+#[derive(Default)]
 struct Store {
     next_ts: u64,
     data: BTreeMap<Vec<u8>, VersionedValue>,
-    locks: HashMap<Vec<u8>, u64>,
+    locks: HashMap<Vec<u8>, KeyLock>,
 }
 
 #[derive(Clone, Default)]
@@ -93,23 +105,52 @@ impl MemTransaction {
         store.data.get(key).and_then(|v| v.value.clone())
     }
 
+    fn lock_conflict() -> Error {
+        Error::new(
+            ERR_LOCK_WAIT_TIMEOUT,
+            "Lock wait timeout exceeded; try restarting transaction",
+        )
+    }
+
+    /// Exclusive lock for `FOR UPDATE` / pessimistic writes; shared for
+    /// `FOR SHARE`. Same-txn upgrade from shared to exclusive is allowed.
     fn acquire(
         store: &mut Store,
         locked: &mut HashSet<Vec<u8>>,
         start_ts: u64,
         key: &[u8],
+        exclusive: bool,
     ) -> Result<()> {
-        if let Some(owner) = store.locks.get(key)
-            && *owner != start_ts
+        let entry = store.locks.entry(key.to_vec()).or_default();
+        if let Some(owner) = entry.exclusive
+            && owner != start_ts
         {
-            return Err(Error::new(
-                ERR_LOCK_WAIT_TIMEOUT,
-                "Lock wait timeout exceeded; try restarting transaction",
-            ));
+            return Err(Self::lock_conflict());
         }
-        store.locks.insert(key.to_vec(), start_ts);
+        if exclusive {
+            if entry.shared.iter().any(|owner| *owner != start_ts) {
+                return Err(Self::lock_conflict());
+            }
+            entry.shared.remove(&start_ts);
+            entry.exclusive = Some(start_ts);
+        } else if entry.exclusive.is_none() {
+            entry.shared.insert(start_ts);
+        }
         locked.insert(key.to_vec());
         Ok(())
+    }
+
+    fn release_one(store: &mut Store, start_ts: u64, key: &[u8]) {
+        let Some(entry) = store.locks.get_mut(key) else {
+            return;
+        };
+        if entry.exclusive == Some(start_ts) {
+            entry.exclusive = None;
+        }
+        entry.shared.remove(&start_ts);
+        if entry.is_empty() {
+            store.locks.remove(key);
+        }
     }
 
     fn release_locks(&mut self) {
@@ -118,10 +159,40 @@ impl MemTransaction {
         }
         let mut store = self.store.lock().expect("mem kv");
         for key in self.locked.drain() {
-            if store.locks.get(&key) == Some(&self.start_ts) {
-                store.locks.remove(&key);
+            Self::release_one(&mut store, self.start_ts, &key);
+        }
+    }
+
+    fn scan_with_lock(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        exclusive: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut store = self.store.lock().expect("mem kv");
+        let mut keys = Vec::new();
+        for (k, v) in store.data.range(start.to_vec()..end.to_vec()) {
+            if self.deletes.contains(k) {
+                continue;
+            }
+            if self.writes.contains_key(k) || v.value.is_some() {
+                keys.push(k.clone());
             }
         }
+        for k in self.writes.keys() {
+            if k.as_slice() >= start && k.as_slice() < end && !keys.iter().any(|ek| ek == k) {
+                keys.push(k.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for key in keys {
+            Self::acquire(&mut store, &mut self.locked, self.start_ts, &key, exclusive)?;
+            if let Some(value) = Self::latest_value(&store, &self.writes, &self.deletes, &key) {
+                out.push((key, value));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 }
 
@@ -139,7 +210,7 @@ impl Transaction for MemTransaction {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.pessimistic {
             let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, key)?;
+            Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
         }
         self.deletes.remove(key);
         self.writes.insert(key.to_vec(), value.to_vec());
@@ -149,7 +220,7 @@ impl Transaction for MemTransaction {
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         if self.pessimistic {
             let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, key)?;
+            Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
         }
         self.writes.remove(key);
         self.deletes.insert(key.to_vec());
@@ -178,35 +249,22 @@ impl Transaction for MemTransaction {
 
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut store = self.store.lock().expect("mem kv");
-        Self::acquire(&mut store, &mut self.locked, self.start_ts, key)?;
+        Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
         Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
     }
 
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_with_lock(start, end, true)
+    }
+
+    fn get_for_share(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut store = self.store.lock().expect("mem kv");
-        let mut keys = Vec::new();
-        for (k, v) in store.data.range(start.to_vec()..end.to_vec()) {
-            if self.deletes.contains(k) {
-                continue;
-            }
-            if self.writes.contains_key(k) || v.value.is_some() {
-                keys.push(k.clone());
-            }
-        }
-        for k in self.writes.keys() {
-            if k.as_slice() >= start && k.as_slice() < end && !keys.iter().any(|ek| ek == k) {
-                keys.push(k.clone());
-            }
-        }
-        let mut out = Vec::new();
-        for key in keys {
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, &key)?;
-            if let Some(value) = Self::latest_value(&store, &self.writes, &self.deletes, &key) {
-                out.push((key, value));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        Self::acquire(&mut store, &mut self.locked, self.start_ts, key, false)?;
+        Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
+    }
+
+    fn scan_for_share(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_with_lock(start, end, false)
     }
 
     fn set_pessimistic(&mut self) {
@@ -256,9 +314,7 @@ impl Transaction for MemTransaction {
             );
         }
         for key in self.locked.drain() {
-            if store.locks.get(&key) == Some(&self.start_ts) {
-                store.locks.remove(&key);
-            }
+            Self::release_one(&mut store, self.start_ts, &key);
         }
         Ok(())
     }
@@ -306,9 +362,7 @@ impl Transaction for MemTransaction {
         {
             let mut store = self.store.lock().expect("mem kv");
             for key in extra {
-                if store.locks.get(&key) == Some(&self.start_ts) {
-                    store.locks.remove(&key);
-                }
+                Self::release_one(&mut store, self.start_ts, &key);
                 self.locked.remove(&key);
             }
         }
@@ -385,6 +439,28 @@ mod tests {
 
         a.commit().unwrap();
         assert_eq!(b.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_for_share_compatible_and_conflicts_for_update() {
+        let storage = MemStorage::new();
+        let mut setup = storage.begin().unwrap();
+        setup.set(b"k", b"v1").unwrap();
+        setup.commit().unwrap();
+
+        let mut a = storage.begin_pessimistic().unwrap();
+        assert_eq!(a.get_for_share(b"k").unwrap(), Some(b"v1".to_vec()));
+
+        let mut b = storage.begin_pessimistic().unwrap();
+        assert_eq!(b.get_for_share(b"k").unwrap(), Some(b"v1".to_vec()));
+
+        let mut c = storage.begin().unwrap();
+        let err = c.get_for_update(b"k").unwrap_err();
+        assert_eq!(err.code, ERR_LOCK_WAIT_TIMEOUT);
+
+        a.commit().unwrap();
+        b.commit().unwrap();
+        assert_eq!(c.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
     }
 
     #[test]

@@ -485,10 +485,18 @@ mod tests {
             crate::ast::Statement::Begin(begin) => assert!(begin.pessimistic),
             other => panic!("expected BeginStmt, got {other:?}"),
         }
-        let err = parser
-            .parse_one_stmt("SELECT * FROM t FOR SHARE")
-            .unwrap_err();
-        assert!(err.message.contains("FOR SHARE"));
+        let share = parser.parse_one_stmt("SELECT * FROM t FOR SHARE").unwrap();
+        assert_eq!(
+            share.as_select().unwrap().lock,
+            crate::ast::SelectLock::ForShare
+        );
+        let share_mode = parser
+            .parse_one_stmt("SELECT * FROM t LOCK IN SHARE MODE")
+            .unwrap();
+        assert_eq!(
+            share_mode.as_select().unwrap().lock,
+            crate::ast::SelectLock::ForShare
+        );
         let err = parser
             .parse_one_stmt("SELECT * FROM t FOR UPDATE NOWAIT")
             .unwrap_err();

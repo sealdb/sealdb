@@ -2301,6 +2301,44 @@ mod tests {
     }
 
     #[test]
+    fn test_select_for_share_lock() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(Arc::clone(&domain));
+        let c = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN PESSIMISTIC").unwrap();
+        let share = a.execute_stmt("SELECT * FROM db1.t FOR SHARE").unwrap();
+        assert_eq!(
+            share.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        b.execute_stmt("BEGIN PESSIMISTIC").unwrap();
+        let share_mode = b
+            .execute_stmt("SELECT * FROM db1.t LOCK IN SHARE MODE")
+            .unwrap();
+        assert_eq!(
+            share_mode.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let err = c
+            .execute_stmt("BEGIN PESSIMISTIC; SELECT * FROM db1.t FOR UPDATE")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_LOCK_WAIT_TIMEOUT);
+        c.execute_stmt("ROLLBACK").unwrap();
+        a.execute_stmt("COMMIT").unwrap();
+        b.execute_stmt("COMMIT").unwrap();
+        let exclusive = c.execute_stmt("SELECT * FROM db1.t FOR UPDATE").unwrap();
+        assert_eq!(
+            exclusive.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+    }
+
+    #[test]
     fn test_pessimistic_update_latest_and_lock() {
         let domain = Arc::new(Domain::new());
         let a = Session::with_domain(Arc::clone(&domain));

@@ -1,11 +1,11 @@
-// F13: FOR UPDATE uses scan_for_update (latest + exclusive lock).
-// Completeness wave / not this feature: blocking lock wait, FOR SHARE,
+// F13: FOR UPDATE uses exclusive lock; FOR SHARE uses shared lock.
+// Completeness wave / not this feature: blocking lock wait,
 // NOWAIT / SKIP LOCKED / WAIT N, OF table list.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
@@ -20,7 +20,7 @@ pub struct TableReaderExec {
     table: TableName,
     current_db: String,
     txn: Arc<TxnHandle>,
-    for_update: bool,
+    lock: RowLock,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     schema: Vec<String>,
@@ -35,7 +35,7 @@ impl TableReaderExec {
         table: TableName,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
-        for_update: bool,
+        lock: RowLock,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
     ) -> Self {
@@ -44,7 +44,7 @@ impl TableReaderExec {
             table,
             current_db: current_db.into(),
             txn,
-            for_update,
+            lock,
             partitions,
             pushed,
             schema: Vec::new(),
@@ -78,7 +78,7 @@ impl Executor for TableReaderExec {
             self.partitions.clone()
         };
         self.rows = filter_rows(
-            scan_table(&self.txn, &info, self.for_update, &physical)?
+            scan_table(&self.txn, &info, self.lock, &physical)?
                 .into_iter()
                 .map(|row| row.values)
                 .collect(),
@@ -120,7 +120,7 @@ pub(crate) struct ScannedRow {
 pub(crate) fn scan_table(
     handle: &TxnHandle,
     info: &TableInfo,
-    for_update: bool,
+    lock: RowLock,
     physical_ids: &[i64],
 ) -> Result<Vec<ScannedRow>> {
     handle.with_txn(|txn| {
@@ -128,11 +128,7 @@ pub(crate) fn scan_table(
         for physical_id in physical_ids {
             let start = gen_table_record_prefix(*physical_id);
             let end = next_prefix(start.as_bytes());
-            let pairs = if for_update {
-                txn.scan_for_update(start.as_bytes(), &end)?
-            } else {
-                txn.scan(start.as_bytes(), &end)?
-            };
+            let pairs = txn.scan_locked(start.as_bytes(), &end, lock)?;
             rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
         }
         Ok(rows)
