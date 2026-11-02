@@ -946,11 +946,11 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
             | "character_set_client"
             | "character_set_connection"
             | "character_set_results" => {
-                let mut collation = session.collation.lock().expect("session collation lock");
-                collation.charset = value.to_ascii_lowercase();
-                if collation.name == "utf8mb4_bin" && collation.charset != "utf8mb4" {
-                    collation.name = format!("{}_bin", collation.charset);
-                }
+                // SET NAMES <charset> resets collation_connection to the charset default
+                // (`gbk`→`gbk_bin`, `latin1`→`latin1_bin`). An explicit COLLATE assignment
+                // that follows in the same SET NAMES overrides this.
+                *session.collation.lock().expect("session collation lock") =
+                    Collation::default_for_charset(&value);
             }
             "collation_connection" | "collation_database" => {
                 *session.collation.lock().expect("session collation lock") =
@@ -2913,6 +2913,88 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
             .unwrap();
         assert!(miss.display_rows().is_empty());
+    }
+
+    #[test]
+    fn test_gbk_latin1_charset_and_collation() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); \
+                 INSERT INTO db1.t VALUES (1, '啊'), (2, '阿'), (3, 'A'), (4, '中')",
+            )
+            .unwrap();
+
+        session.execute_stmt("SET NAMES gbk").unwrap();
+        let vars = session
+            .execute_stmt("SELECT @@character_set_client, @@collation_connection")
+            .unwrap();
+        assert_eq!(
+            vars.display_rows()[0],
+            vec!["gbk".to_string(), "gbk_bin".to_string()]
+        );
+
+        // gbk_bin: 啊 (B0A1) < 阿 (B0A2); case-sensitive.
+        let bin_cmp = session
+            .execute_stmt("SELECT '啊' < '阿', 'A' = 'a'")
+            .unwrap();
+        assert_eq!(
+            bin_cmp.display_rows()[0],
+            vec!["1".to_string(), "0".to_string()]
+        );
+        let bin_order = session
+            .execute_stmt("SELECT name FROM db1.t WHERE id IN (1, 2) ORDER BY name, id")
+            .unwrap();
+        assert_eq!(
+            bin_order.display_rows(),
+            vec![vec!["啊".to_string()], vec!["阿".to_string()]]
+        );
+
+        session
+            .execute_stmt("SET collation_connection = gbk_chinese_ci")
+            .unwrap();
+        // gbk_chinese_ci: 阿 (0x8453) < 啊 (0x8454); A == a.
+        let ci_cmp = session
+            .execute_stmt("SELECT '阿' < '啊', 'A' = 'a'")
+            .unwrap();
+        assert_eq!(
+            ci_cmp.display_rows()[0],
+            vec!["1".to_string(), "1".to_string()]
+        );
+        let ci_where = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(ci_where.display_rows(), vec![vec!["3".to_string()]]);
+        let ci_order = session
+            .execute_stmt("SELECT name FROM db1.t WHERE id IN (1, 2) ORDER BY name, id")
+            .unwrap();
+        assert_eq!(
+            ci_order.display_rows(),
+            vec![vec!["阿".to_string()], vec!["啊".to_string()]]
+        );
+
+        session.execute_stmt("SET NAMES latin1").unwrap();
+        let latin = session
+            .execute_stmt("SELECT @@character_set_client, @@collation_connection")
+            .unwrap();
+        assert_eq!(
+            latin.display_rows()[0],
+            vec!["latin1".to_string(), "latin1_bin".to_string()]
+        );
+        let latin_eq = session.execute_stmt("SELECT 'A' = 'a', 'A' = 'A'").unwrap();
+        assert_eq!(
+            latin_eq.display_rows()[0],
+            vec!["0".to_string(), "1".to_string()]
+        );
+
+        // Encode/decode roundtrip for the GBK / latin1 MVB subsets.
+        let gbk = sealdb_parser::charset::encoding_gbk::encode("中文阿啊");
+        assert_eq!(
+            sealdb_parser::charset::encoding_gbk::decode(&gbk),
+            "中文阿啊"
+        );
+        let lat = sealdb_parser::charset::encoding_latin1::encode("Aaé");
+        assert_eq!(sealdb_parser::charset::encoding_latin1::decode(&lat), "Aaé");
     }
 
     #[test]

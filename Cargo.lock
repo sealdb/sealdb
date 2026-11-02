@@ -1981,6 +1981,7 @@ name = "sealdb-util"
 version = "0.1.0"
 dependencies = [
  "sealdb-errno",
+ "sealdb-parser",
  "sealdb-types",
  "thiserror 2.0.21",
 ]

@@ -49,7 +49,6 @@
       "savepoint"
     ],
     "C5": [
-      "gbk-latin1",
       "only-full-group-by",
       "set-global",
       "leftover-collation-suites"

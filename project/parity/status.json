@@ -208,13 +208,43 @@
       "status": "partial",
       "rust": "pkg/parser/charset/mod.rs",
       "phase": 10,
-      "notes": "C5 Collation parse for utf8mb4_bin / general_ci / unicode_ci"
+      "notes": "C5 Collation parse for utf8mb4 / gbk / latin1 (+ unicode_ci)"
+    },
+    "pkg/parser/charset/encoding_gbk.go": {
+      "status": "partial",
+      "rust": "pkg/parser/charset/encoding_gbk.rs",
+      "phase": 10,
+      "notes": "C5 GBK encode/decode ASCII + Chinese test subset"
+    },
+    "pkg/parser/charset/encoding_latin1.go": {
+      "status": "partial",
+      "rust": "pkg/parser/charset/encoding_latin1.rs",
+      "phase": 10,
+      "notes": "C5 latin1 passthrough (TiDB utf8-compat) + test subset"
     },
     "pkg/util/collate/collate.go": {
       "status": "partial",
       "rust": "pkg/util/collate/collate.rs",
       "phase": 10,
-      "notes": "C5 CollateMode dispatch: bin / general_ci / unicode_ci"
+      "notes": "C5 CollateMode: bin / general_ci / unicode_ci / gbk_bin / gbk_chinese_ci"
+    },
+    "pkg/util/collate/gbk_bin.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/gbk_bin.rs",
+      "phase": 10,
+      "notes": "C5 gbk_bin compare via UTF-8→GBK subset encode"
+    },
+    "pkg/util/collate/gbk_chinese_ci.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/gbk_chinese_ci.rs",
+      "phase": 10,
+      "notes": "C5 gbk_chinese_ci compare from sort-key subset"
+    },
+    "pkg/util/collate/gbk_chinese_ci_data.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/gbk_chinese_ci_data.rs",
+      "phase": 10,
+      "notes": "C5 gbk_chinese_ci sort-key subset (ASCII + test Han)"
     },
     "pkg/util/collate/unicode_0400_ci_impl.go": {
       "status": "partial",

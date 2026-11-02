@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 192,
-  "manifest_entries": 139,
+  "rs_files": 197,
+  "manifest_entries": 144,
   "status_counts": {
-    "not-started": 1542,
-    "partial": 132,
+    "not-started": 1537,
+    "partial": 137,
     "reimplemented": 4,
     "ported": 3
   },
@@ -258,11 +258,11 @@
     },
     "pkg/parser": {
       "go": 58,
-      "rs": 12,
-      "missing": 46,
+      "rs": 14,
+      "missing": 44,
       "status": {
-        "partial": 11,
-        "not-started": 46,
+        "partial": 13,
+        "not-started": 44,
         "reimplemented": 1
       }
     },
@@ -432,11 +432,11 @@
     },
     "pkg/util": {
       "go": 291,
-      "rs": 14,
-      "missing": 277,
+      "rs": 17,
+      "missing": 274,
       "status": {
-        "not-started": 277,
-        "partial": 11,
+        "not-started": 274,
+        "partial": 14,
         "ported": 3
       }
     }
@@ -5564,7 +5564,7 @@
       "rs_path": "pkg/parser/charset/mod.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "C5 Collation parse for utf8mb4_bin / general_ci / unicode_ci"
+      "notes": "C5 Collation parse for utf8mb4 / gbk / latin1 (+ unicode_ci)"
     },
     {
       "go_path": "pkg/parser/charset/encoding.go",
@@ -5596,17 +5596,17 @@
     },
     {
       "go_path": "pkg/parser/charset/encoding_gbk.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/parser/charset/encoding_gbk.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 GBK encode/decode ASCII + Chinese test subset"
     },
     {
       "go_path": "pkg/parser/charset/encoding_latin1.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/parser/charset/encoding_latin1.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 latin1 passthrough (TiDB utf8-compat) + test subset"
     },
     {
       "go_path": "pkg/parser/charset/encoding_table.go",
@@ -10436,28 +10436,28 @@
       "rs_path": "pkg/util/collate/collate.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "C5 CollateMode dispatch: bin / general_ci / unicode_ci"
+      "notes": "C5 CollateMode: bin / general_ci / unicode_ci / gbk_bin / gbk_chinese_ci"
     },
     {
       "go_path": "pkg/util/collate/gbk_bin.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/collate/gbk_bin.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 gbk_bin compare via UTF-8→GBK subset encode"
     },
     {
       "go_path": "pkg/util/collate/gbk_chinese_ci.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/collate/gbk_chinese_ci.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 gbk_chinese_ci compare from sort-key subset"
     },
     {
       "go_path": "pkg/util/collate/gbk_chinese_ci_data.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/collate/gbk_chinese_ci_data.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 gbk_chinese_ci sort-key subset (ASCII + test Han)"
     },
     {
       "go_path": "pkg/util/collate/general_ci.go",
