@@ -341,19 +341,19 @@
       "status": "partial",
       "rust": "pkg/server/server.rs",
       "phase": 9,
-      "notes": "TCP listen/accept; TLS and status HTTP deferred"
+      "notes": "TCP listen/accept + optional rustls TLS; status HTTP deferred"
     },
     "pkg/server/conn.go": {
       "status": "partial",
       "rust": "pkg/server/conn.rs",
       "phase": 9,
-      "notes": "handshake + COM_QUERY/PING/INIT_DB/QUIT; prepared/SSL deferred"
+      "notes": "handshake + SSLRequest/TLS upgrade + COM_QUERY/PING/INIT_DB/QUIT; prepared deferred"
     },
     "pkg/server/internal/packetio.go": {
       "status": "partial",
       "rust": "pkg/server/internal/packetio.rs",
       "phase": 9,
-      "notes": "uncompressed MySQL packet read/write"
+      "notes": "MySQL packet I/O with stream swap for TLS; compression deferred"
     },
     "pkg/ddl/ddl.go": {
       "status": "partial",

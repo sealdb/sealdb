@@ -1,26 +1,70 @@
-/// F22 core: MySQL packet I/O (TiDB `pkg/server/internal/packetio.go`).
-/// Completeness wave: compression, SSL wrap, max-allowed-packet config.
+/// F22: MySQL packet I/O (TiDB `pkg/server/internal/packetio.go`).
+/// Completeness wave: compression, max-allowed-packet config.
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use std::io::{Read, Write};
 
 const HEADER_SIZE: usize = 4;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-pub struct PacketIO<S> {
-    stream: S,
+/// Sync Read+Write used by PacketIO (plain TCP or rustls StreamOwned).
+pub trait ConnIo: Read + Write + Send {}
+impl<T: Read + Write + Send> ConnIo for T {}
+
+pub struct PacketIO {
+    stream: Box<dyn ConnIo>,
     sequence: u8,
 }
 
-impl<S: Read + Write> PacketIO<S> {
-    pub fn new(stream: S) -> Self {
+/// Discarding stand-in while PacketIO stream is upgraded to TLS.
+struct NullIo;
+
+impl Read for NullIo {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+
+impl Write for NullIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl PacketIO {
+    pub fn new(stream: impl ConnIo + 'static) -> Self {
         Self {
-            stream,
+            stream: Box::new(stream),
             sequence: 0,
         }
     }
 
+    pub fn sequence(&self) -> u8 {
+        self.sequence
+    }
+
     pub fn reset_sequence(&mut self) {
         self.sequence = 0;
+    }
+
+    pub fn set_sequence(&mut self, sequence: u8) {
+        self.sequence = sequence;
+    }
+
+    /// Steal the underlying stream (leaves a NullIo placeholder).
+    pub fn take_stream(&mut self) -> Box<dyn ConnIo> {
+        std::mem::replace(&mut self.stream, Box::new(NullIo))
+    }
+
+    pub fn set_stream(&mut self, stream: Box<dyn ConnIo>) {
+        self.stream = stream;
+    }
+
+    pub fn from_parts(stream: Box<dyn ConnIo>, sequence: u8) -> Self {
+        Self { stream, sequence }
     }
 
     pub fn read_packet(&mut self) -> Result<Vec<u8>> {

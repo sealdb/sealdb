@@ -193,7 +193,8 @@ case "$FEATURE" in
     run execute-join-cost cargo test -q -p sealdb-planner --lib plan_cost::tests::test_join_cost_prefers_cheaper_build -- --exact
     ;;
   F22)
-    run execute-com-query cargo test -q -p sealdb-server --lib test_com_query -- --exact
+    run execute-com-query cargo test -q -p sealdb-server --lib tests::test_com_query -- --exact
+    run execute-ssl cargo test -q -p sealdb-server --lib tests::test_ssl_upgrade_roundtrip -- --exact
     ;;
   C1)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
