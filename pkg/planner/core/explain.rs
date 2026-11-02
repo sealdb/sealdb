@@ -118,6 +118,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::Limit { child }
         | PhysicalPlan::HashAgg { child }
+        | PhysicalPlan::StreamAgg { child }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
@@ -183,6 +184,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
         PhysicalPlan::Limit { .. } => ("Limit".to_string(), String::new(), String::new()),
         PhysicalPlan::HashAgg { .. } => ("HashAgg".to_string(), String::new(), String::new()),
+        PhysicalPlan::StreamAgg { .. } => ("StreamAgg".to_string(), String::new(), String::new()),
         PhysicalPlan::HashJoin {
             tp,
             left_table,
@@ -226,6 +228,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::HashAgg { child }
+        | PhysicalPlan::StreamAgg { child }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }

@@ -68,6 +68,9 @@ pub enum PhysicalPlan {
     HashAgg {
         child: Box<PhysicalPlan>,
     },
+    StreamAgg {
+        child: Box<PhysicalPlan>,
+    },
     HashJoin {
         tp: JoinType,
         left: Box<PhysicalPlan>,
@@ -170,6 +173,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
+            PhysicalPlan::StreamAgg { child } => format!("StreamAgg -> {}", child.explain()),
             PhysicalPlan::HashJoin {
                 tp, left, right, ..
             } => {

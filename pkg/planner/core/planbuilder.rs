@@ -75,8 +75,15 @@ impl PlanBuilder {
                     if needs_window(select) {
                         return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
                     }
+                    let stream = select.group_by.is_empty();
                     plan = match plan {
+                        PhysicalPlan::Projection { child, .. } if stream => {
+                            PhysicalPlan::StreamAgg { child }
+                        }
                         PhysicalPlan::Projection { child, .. } => PhysicalPlan::HashAgg { child },
+                        other if stream => PhysicalPlan::StreamAgg {
+                            child: Box::new(other),
+                        },
                         other => PhysicalPlan::HashAgg {
                             child: Box::new(other),
                         },

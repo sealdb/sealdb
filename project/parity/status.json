@@ -474,6 +474,12 @@
       "phase": 5,
       "notes": "in-memory HashAggExec without parallel workers"
     },
+    "pkg/executor/aggregate/agg_stream_executor.go": {
+      "status": "partial",
+      "rust": "pkg/executor/aggregate/agg_stream_executor.rs",
+      "phase": 5,
+      "notes": "scalar StreamAgg; sorted GROUP BY StreamAgg deferred"
+    },
     "pkg/executor/aggfuncs/aggfuncs.go": {
       "status": "partial",
       "phase": 5,

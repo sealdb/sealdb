@@ -1089,6 +1089,26 @@ mod tests {
             .unwrap();
         let count = session.execute_stmt("SELECT COUNT(*) FROM db1.t").unwrap();
         assert_eq!(count.display_rows(), vec![vec!["3".to_string()]]);
+        let stream = session
+            .execute_stmt("EXPLAIN SELECT COUNT(*) FROM db1.t")
+            .unwrap();
+        let stream_text = stream
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(stream_text.contains("StreamAgg"), "{stream_text}");
+        let hashed = session
+            .execute_stmt("EXPLAIN SELECT name, COUNT(*) FROM db1.t GROUP BY name")
+            .unwrap();
+        let hashed_text = hashed
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(hashed_text.contains("HashAgg"), "{hashed_text}");
         let scalars = session
             .execute_stmt("SELECT SUM(id), MIN(id), MAX(id), AVG(id) FROM db1.t")
             .unwrap();
