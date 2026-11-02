@@ -305,6 +305,31 @@ pub enum AlterTableSpec {
         if_exists: bool,
         name: String,
     },
+    /// `CHANGE [COLUMN] old new type` — rename and/or change the column type.
+    ChangeColumn {
+        old_name: String,
+        new_name: String,
+        type_name: String,
+    },
+    /// `MODIFY [COLUMN] col type` — keep the name, change the type.
+    ModifyColumn {
+        name: String,
+        type_name: String,
+    },
+    /// `RENAME COLUMN old TO new`.
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    /// `ALTER TABLE t RENAME TO` / `RENAME TABLE t TO`.
+    RenameTable {
+        new_name: TableName,
+    },
+    /// `ALTER TABLE t RENAME INDEX old TO new`.
+    RenameIndex {
+        old_name: String,
+        new_name: String,
+    },
 }
 
 impl AlterTableSpec {
@@ -338,6 +363,44 @@ impl AlterTableSpec {
                     ctx.write_str("IF EXISTS ");
                 }
                 ctx.write_name(name);
+                Ok(())
+            }
+            AlterTableSpec::ChangeColumn {
+                old_name,
+                new_name,
+                type_name,
+            } => {
+                ctx.write_str("CHANGE COLUMN ");
+                ctx.write_name(old_name);
+                ctx.write_str(" ");
+                ctx.write_name(new_name);
+                ctx.write_str(" ");
+                ctx.write_str(type_name);
+                Ok(())
+            }
+            AlterTableSpec::ModifyColumn { name, type_name } => {
+                ctx.write_str("MODIFY COLUMN ");
+                ctx.write_name(name);
+                ctx.write_str(" ");
+                ctx.write_str(type_name);
+                Ok(())
+            }
+            AlterTableSpec::RenameColumn { old_name, new_name } => {
+                ctx.write_str("RENAME COLUMN ");
+                ctx.write_name(old_name);
+                ctx.write_str(" TO ");
+                ctx.write_name(new_name);
+                Ok(())
+            }
+            AlterTableSpec::RenameTable { new_name } => {
+                ctx.write_str("RENAME TO ");
+                new_name.restore(ctx)
+            }
+            AlterTableSpec::RenameIndex { old_name, new_name } => {
+                ctx.write_str("RENAME INDEX ");
+                ctx.write_name(old_name);
+                ctx.write_str(" TO ");
+                ctx.write_name(new_name);
                 Ok(())
             }
         }

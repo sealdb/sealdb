@@ -160,7 +160,11 @@ fn load_table(is: &InfoSchema, schema: &str, table: &str) -> Result<(i64, TableI
     Ok((db.id, info))
 }
 
-fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) -> Result<()> {
+pub(crate) fn backfill_index(
+    storage: &dyn Storage,
+    info: &TableInfo,
+    index: &IndexInfo,
+) -> Result<()> {
     let mut txn = storage.begin()?;
     for physical_id in info.physical_ids() {
         let start = gen_table_record_prefix(physical_id);
@@ -208,7 +212,7 @@ fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) ->
     txn.commit()
 }
 
-fn drop_index_keys(storage: &dyn Storage, info: &TableInfo, idx_id: i64) -> Result<()> {
+pub(crate) fn drop_index_keys(storage: &dyn Storage, info: &TableInfo, idx_id: i64) -> Result<()> {
     let mut txn = storage.begin()?;
     for physical_id in info.physical_ids() {
         let start = encode_index_seek_key(physical_id, idx_id, &[]);

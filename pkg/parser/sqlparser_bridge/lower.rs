@@ -32,10 +32,11 @@ use sqlparser::ast::{
     FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NamedWindowDefinition,
     NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
-    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
-    SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
-    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
+    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
+    Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
@@ -47,6 +48,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
+    let rewritten = rewrite_rename_index(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
@@ -134,6 +136,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             }))
         }
         SqlStatement::AlterTable(alter) => lower_alter_table(alter),
+        SqlStatement::RenameTable(renames) => lower_rename_tables(renames),
         SqlStatement::Drop {
             object_type,
             if_exists,
@@ -410,8 +413,57 @@ const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
 const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
 const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
+const RENAME_INDEX_MARKER: &str = "__sealdb_rename_index__";
+const RENAME_INDEX_SEP: char = '\u{1f}';
 
 /// sqlparser has no `ADMIN SHOW DDL JOBS`; rewrite to SHOW TABLES FROM a marker schema.
+/// sqlparser MySQL dialect has no `ALTER TABLE t RENAME INDEX`. Rewrite to a
+/// marked `RENAME COLUMN` that `lower_alter_spec` turns back into RenameIndex.
+fn rewrite_rename_index(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "RENAME") {
+            let after_rename = skip_ws(bytes, i + "RENAME".len());
+            if keyword_at(bytes, after_rename, "INDEX") {
+                let after_index = skip_ws(bytes, after_rename + "INDEX".len());
+                let (old_name, after_old) = read_ident(bytes, after_index);
+                let after_old = skip_ws(bytes, after_old);
+                if keyword_at(bytes, after_old, "TO") {
+                    let after_to = skip_ws(bytes, after_old + "TO".len());
+                    let (new_name, after_new) = read_ident(bytes, after_to);
+                    if !old_name.is_empty() && !new_name.is_empty() {
+                        out.push_str("RENAME COLUMN `");
+                        out.push_str(RENAME_INDEX_MARKER);
+                        out.push_str("` TO `");
+                        out.push_str(&escape_backticks(&old_name));
+                        out.push(RENAME_INDEX_SEP);
+                        out.push_str(&escape_backticks(&new_name));
+                        out.push('`');
+                        i = after_new;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn escape_backticks(name: &str) -> String {
+    name.replace('`', "``")
+}
+
+fn split_rename_index_marker(encoded: &str) -> Result<(String, String)> {
+    let (old_name, new_name) = encoded
+        .split_once(RENAME_INDEX_SEP)
+        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "malformed RENAME INDEX marker"))?;
+    Ok((old_name.to_string(), new_name.to_string()))
+}
+
 fn rewrite_admin_show_ddl(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
@@ -2932,9 +2984,21 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
     }))
 }
 
+fn lower_rename_tables(renames: &[SqlRenameTable]) -> Result<Statement> {
+    if renames.len() != 1 {
+        return Err(Error::unsupported("RENAME TABLE multiple pairs"));
+    }
+    Ok(Statement::AlterTable(AlterTableStmt {
+        table: object_table_name(&renames[0].old_name)?,
+        specs: vec![AlterTableSpec::RenameTable {
+            new_name: object_table_name(&renames[0].new_name)?,
+        }],
+    }))
+}
+
 fn lower_alter_table(alter: &sqlparser::ast::AlterTable) -> Result<Statement> {
-    // F18 gap / completeness wave: CHANGE/MODIFY/RENAME, multi-spec mix beyond
-    // ADD/DROP COLUMN|INDEX, partitions, AFTER/FIRST, generated columns.
+    // F18 gap / completeness wave: AFTER/FIRST, ALGORITHM/LOCK, generated
+    // columns, partitions beyond ADD/DROP COLUMN|INDEX.
     if alter.if_exists || alter.only || alter.location.is_some() || alter.on_cluster.is_some() {
         return Err(Error::unsupported("ALTER TABLE option"));
     }
@@ -2988,6 +3052,64 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             if_exists: false,
             name: name.value.clone(),
         }),
+        AlterTableOperation::ChangeColumn {
+            old_name,
+            new_name,
+            data_type,
+            options,
+            column_position,
+        } => {
+            if column_position.is_some() {
+                return Err(Error::unsupported("ALTER TABLE CHANGE COLUMN AFTER/FIRST"));
+            }
+            if !options.is_empty() {
+                return Err(Error::unsupported("CHANGE COLUMN option"));
+            }
+            Ok(AlterTableSpec::ChangeColumn {
+                old_name: old_name.value.clone(),
+                new_name: new_name.value.clone(),
+                type_name: data_type.to_string(),
+            })
+        }
+        AlterTableOperation::ModifyColumn {
+            col_name,
+            data_type,
+            options,
+            column_position,
+        } => {
+            if column_position.is_some() {
+                return Err(Error::unsupported("ALTER TABLE MODIFY COLUMN AFTER/FIRST"));
+            }
+            if !options.is_empty() {
+                return Err(Error::unsupported("MODIFY COLUMN option"));
+            }
+            Ok(AlterTableSpec::ModifyColumn {
+                name: col_name.value.clone(),
+                type_name: data_type.to_string(),
+            })
+        }
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => {
+            if old_column_name.value == RENAME_INDEX_MARKER {
+                let (old_name, new_name) = split_rename_index_marker(&new_column_name.value)?;
+                Ok(AlterTableSpec::RenameIndex { old_name, new_name })
+            } else {
+                Ok(AlterTableSpec::RenameColumn {
+                    old_name: old_column_name.value.clone(),
+                    new_name: new_column_name.value.clone(),
+                })
+            }
+        }
+        AlterTableOperation::RenameTable { table_name } => {
+            let name = match table_name {
+                RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
+            };
+            Ok(AlterTableSpec::RenameTable {
+                new_name: object_table_name(name)?,
+            })
+        }
         AlterTableOperation::AddConstraint { constraint, .. } => match constraint {
             TableConstraint::Index(idx) => {
                 let columns = idx

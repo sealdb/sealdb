@@ -597,6 +597,83 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::ChangeColumn {
+                    old_name, new_name, ..
+                } => {
+                    assert_eq!(old_name, "name");
+                    assert_eq!(new_name, "title");
+                }
+                other => panic!("expected CHANGE COLUMN, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t MODIFY title VARCHAR(40)")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::ModifyColumn { name, .. } => {
+                    assert_eq!(name, "title");
+                }
+                other => panic!("expected MODIFY COLUMN, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t RENAME COLUMN title TO name")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::RenameColumn { old_name, new_name } => {
+                    assert_eq!(old_name, "title");
+                    assert_eq!(new_name, "name");
+                }
+                other => panic!("expected RENAME COLUMN, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t RENAME INDEX idx_name TO idx_title")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::RenameIndex { old_name, new_name } => {
+                    assert_eq!(old_name, "idx_name");
+                    assert_eq!(new_name, "idx_title");
+                }
+                other => panic!("expected RENAME INDEX, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE db1.t RENAME TO t2")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::RenameTable { new_name } => {
+                    assert_eq!(new_name.name, "t2");
+                }
+                other => panic!("expected RENAME TABLE, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("RENAME TABLE db1.t TO db1.t2")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::RenameTable { new_name } => {
+                    assert_eq!(new_name.name, "t2");
+                }
+                other => panic!("expected RENAME TABLE, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
     }
 
     #[test]
