@@ -40,6 +40,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
+    let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
@@ -63,6 +64,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             }
             if let Statement::Show(show) = &mut lowered {
                 decode_show_grants(show);
+                decode_show_index(show);
             }
             if let Statement::CreateTable(create) = &mut lowered {
                 create.partition = partitions.next().flatten();
@@ -223,6 +225,20 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .and_then(|inn| inn.parent_name.as_ref())
                 .map(object_name_last)
                 .transpose()?,
+            table: None,
+            user: None,
+            full: false,
+        })),
+        SqlStatement::ShowCharset(_) => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::Charset,
+            db_name: None,
+            table: None,
+            user: None,
+            full: false,
+        })),
+        SqlStatement::ShowCollation { .. } => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::Collation,
+            db_name: None,
             table: None,
             user: None,
             full: false,
@@ -400,6 +416,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
 const SHOW_GRANT_MARKER: &str = "__sealdb_grant__";
 const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
 const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
+const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 
 fn rewrite_show_create_database(sql: &str) -> String {
     let bytes = sql.as_bytes();
@@ -457,6 +474,79 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
         i += 1;
     }
     (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
+}
+
+fn rewrite_show_index(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            let (kw, kw_len) = if keyword_at(bytes, after_show, "INDEXES") {
+                ("INDEXES", "INDEXES".len())
+            } else if keyword_at(bytes, after_show, "INDEX") {
+                ("INDEX", "INDEX".len())
+            } else if keyword_at(bytes, after_show, "KEYS") {
+                ("KEYS", "KEYS".len())
+            } else {
+                ("", 0)
+            };
+            if !kw.is_empty() {
+                let after_kw = skip_ws(bytes, after_show + kw_len);
+                let after_from = if keyword_at(bytes, after_kw, "FROM") {
+                    skip_ws(bytes, after_kw + "FROM".len())
+                } else if keyword_at(bytes, after_kw, "IN") {
+                    skip_ws(bytes, after_kw + "IN".len())
+                } else {
+                    after_kw
+                };
+                let (first, mut end) = read_ident(bytes, after_from);
+                if !first.is_empty() {
+                    let mut name = first;
+                    let after_first = skip_ws(bytes, end);
+                    if after_first < bytes.len() && bytes[after_first] == b'.' {
+                        let (second, second_end) =
+                            read_ident(bytes, skip_ws(bytes, after_first + 1));
+                        if !second.is_empty() {
+                            name = format!("{name}.{second}");
+                            end = second_end;
+                        }
+                    }
+                    out.push_str("SHOW COLUMNS FROM `");
+                    out.push_str(SHOW_INDEX_SCHEMA);
+                    out.push_str("`.`");
+                    out.push_str(&name);
+                    out.push('`');
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn decode_show_index(show: &mut ShowStmt) {
+    let Some(table) = show.table.as_mut() else {
+        return;
+    };
+    if !table
+        .schema
+        .as_deref()
+        .is_some_and(|schema| schema.eq_ignore_ascii_case(SHOW_INDEX_SCHEMA))
+    {
+        return;
+    }
+    show.kind = ShowStmtKind::Index;
+    if let Some((db, name)) = table.name.split_once('.') {
+        table.schema = Some(db.to_string());
+        table.name = name.to_string();
+    } else {
+        table.schema = None;
+    }
 }
 
 fn rewrite_show_grants(sql: &str) -> Result<String> {

@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-01（SHOW FULL COLUMNS）  
+> 最后更新：2026-11-02（information_schema leftover）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-02
+
+- **Phase**: F11 leftover（其余 information_schema 表）
+- **完成**:
+  - STATISTICS / KEY_COLUMN_USAGE / TABLE_CONSTRAINTS / PARTITIONS
+  - CHARACTER_SETS / COLLATIONS / ENGINES；VIEWS 等空表不再 1146
+  - SHOW INDEX / CHARSET / COLLATION
+- **验证**:
+  - session show + itest infoschema + F11 gate
+- **下一步**:
+  - leftover StreamAgg / spill
+  - C6 保持 deferred
 
 ### 2026-11-01
 

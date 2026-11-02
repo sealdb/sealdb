@@ -156,6 +156,97 @@ impl Executor for ShowExec {
                     .map(|col| column_row(col, full))
                     .collect();
             }
+            ShowStmtKind::Index => {
+                let table = self
+                    .stmt
+                    .table
+                    .as_ref()
+                    .ok_or_else(|| Error::new(ERR_NO_SUCH_TABLE, "missing table name"))?;
+                let (schema, name) = resolve_table(table, &self.current_db)?;
+                let info = is.table_by_name(&schema, &name).ok_or_else(|| {
+                    Error::new(
+                        ERR_NO_SUCH_TABLE,
+                        format!("Table '{schema}.{name}' doesn't exist"),
+                    )
+                })?;
+                self.schema = vec![
+                    "Table".to_string(),
+                    "Non_unique".to_string(),
+                    "Key_name".to_string(),
+                    "Seq_in_index".to_string(),
+                    "Column_name".to_string(),
+                    "Collation".to_string(),
+                    "Cardinality".to_string(),
+                    "Sub_part".to_string(),
+                    "Packed".to_string(),
+                    "Null".to_string(),
+                    "Index_type".to_string(),
+                    "Comment".to_string(),
+                    "Index_comment".to_string(),
+                ];
+                self.rows = info
+                    .indices
+                    .iter()
+                    .flat_map(|idx| {
+                        idx.columns.iter().enumerate().map(|(seq, col)| {
+                            vec![
+                                Datum::Bytes(info.name.o().as_bytes().to_vec()),
+                                Datum::Bytes(if idx.unique || idx.primary {
+                                    b"0".to_vec()
+                                } else {
+                                    b"1".to_vec()
+                                }),
+                                Datum::Bytes(idx.name.o().as_bytes().to_vec()),
+                                Datum::I64((seq + 1) as i64),
+                                Datum::Bytes(col.name.o().as_bytes().to_vec()),
+                                Datum::Bytes(b"A".to_vec()),
+                                Datum::Null,
+                                Datum::Null,
+                                Datum::Null,
+                                Datum::Bytes(b"YES".to_vec()),
+                                Datum::Bytes(b"BTREE".to_vec()),
+                                Datum::Bytes(Vec::new()),
+                                Datum::Bytes(Vec::new()),
+                            ]
+                        })
+                    })
+                    .collect();
+            }
+            ShowStmtKind::Charset => {
+                let (_, rows) = sealdb_infoschema::tables::virtual_rows("character_sets", &is)?;
+                self.schema = vec![
+                    "Charset".to_string(),
+                    "Description".to_string(),
+                    "Default collation".to_string(),
+                    "Maxlen".to_string(),
+                ];
+                self.rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        vec![
+                            row[0].clone(),
+                            row[2].clone(),
+                            row[1].clone(),
+                            row[3].clone(),
+                        ]
+                    })
+                    .collect();
+            }
+            ShowStmtKind::Collation => {
+                let (_, rows) = sealdb_infoschema::tables::virtual_rows("collations", &is)?;
+                self.schema = vec![
+                    "Collation".to_string(),
+                    "Charset".to_string(),
+                    "Id".to_string(),
+                    "Default".to_string(),
+                    "Compiled".to_string(),
+                    "Sortlen".to_string(),
+                ];
+                self.rows = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().take(6).collect())
+                    .collect();
+            }
         }
         Ok(())
     }

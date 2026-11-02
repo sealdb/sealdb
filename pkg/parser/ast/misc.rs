@@ -217,6 +217,9 @@ pub enum ShowStmtKind {
     Grants,
     CreateTable,
     CreateDatabase,
+    Index,
+    Charset,
+    Collation,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +271,14 @@ impl ShowStmt {
                     ctx.write_name(db);
                 }
             }
+            ShowStmtKind::Index => {
+                ctx.write_str("SHOW INDEX FROM ");
+                if let Some(table) = &self.table {
+                    table.restore(ctx)?;
+                }
+            }
+            ShowStmtKind::Charset => ctx.write_str("SHOW CHARSET"),
+            ShowStmtKind::Collation => ctx.write_str("SHOW COLLATION"),
         }
         Ok(())
     }

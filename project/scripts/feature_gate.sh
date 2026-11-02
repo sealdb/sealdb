@@ -60,6 +60,7 @@ case "$FEATURE" in
     run execute-showdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'db1'"
     run execute-show-create cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); SHOW CREATE TABLE db1.t"
     run execute-show-full-columns cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); SHOW FULL COLUMNS FROM db1.t"
+    run execute-is-statistics cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); SELECT INDEX_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA = 'db1'; SHOW INDEX FROM db1.t; SHOW CHARSET"
     ;;
   F03)
     run execute-insert-select cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); CREATE TABLE db1.src (id INT, name VARCHAR(20)); INSERT INTO db1.src VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t SELECT * FROM db1.src; SELECT * FROM db1.t"
