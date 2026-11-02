@@ -56,6 +56,8 @@ case "$FEATURE" in
   F02)
     run execute-createdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1"
     run execute-create-like-as-select cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.src (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.src VALUES (1, 'a'), (2, 'b'); CREATE TABLE db1.like_t LIKE db1.src; CREATE TABLE db1.ctas AS SELECT * FROM db1.src; SELECT * FROM db1.like_t; SELECT * FROM db1.ctas ORDER BY id"
+    run execute-indexes cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE INDEX idx_name ON db1.t (name); SHOW INDEX FROM db1.t; SELECT * FROM db1.t WHERE name = 'a'"
+    run execute-online-ddl-jobs cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); CREATE INDEX idx_id ON db1.t (id); ADMIN SHOW DDL JOBS"
     ;;
   F11)
     run execute-showdb cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'db1'"

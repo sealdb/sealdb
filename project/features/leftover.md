@@ -7,11 +7,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ## Feature gaps still open
 
-### F02
-
-- `online-ddl-jobs`
-- `indexes`
-
 ### F19
 
 - `list-key`
