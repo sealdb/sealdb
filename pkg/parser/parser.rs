@@ -216,6 +216,12 @@ mod tests {
             parser.parse_one_stmt("SHOW COLLATION").unwrap().stmt_type(),
             "ShowStmt"
         );
+        match parser.parse_one_stmt("ADMIN SHOW DDL JOBS").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::DdlJobs);
+            }
+            other => panic!("expected ADMIN SHOW DDL JOBS, got {other:?}"),
+        }
     }
 
     #[test]

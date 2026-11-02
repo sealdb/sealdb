@@ -1,5 +1,5 @@
 // F18 core: CREATE/DROP INDEX schema + in-place backfill.
-// Completeness wave / not this feature: TiDB job states, Reorg,
+// Completeness wave / not this feature: async job queue, Reorg,
 // invisible, concurrent ingest, ALGORITHM/LOCK.
 use crate::table::resolve_name;
 use sealdb_errno::{

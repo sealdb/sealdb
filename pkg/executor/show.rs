@@ -247,6 +247,29 @@ impl Executor for ShowExec {
                     .map(|row| row.into_iter().take(6).collect())
                     .collect();
             }
+            ShowStmtKind::DdlJobs => {
+                self.schema = vec![
+                    "JOB_ID".to_string(),
+                    "DB_NAME".to_string(),
+                    "TABLE_NAME".to_string(),
+                    "JOB_TYPE".to_string(),
+                    "STATE".to_string(),
+                ];
+                self.rows = self
+                    .domain
+                    .ddl_jobs()
+                    .into_iter()
+                    .map(|job| {
+                        vec![
+                            Datum::I64(job.id),
+                            Datum::Bytes(job.schema_name.into_bytes()),
+                            Datum::Bytes(job.table_name.into_bytes()),
+                            Datum::Bytes(job.tp.into_bytes()),
+                            Datum::Bytes(job.state.as_str().as_bytes().to_vec()),
+                        ]
+                    })
+                    .collect();
+            }
         }
         Ok(())
     }

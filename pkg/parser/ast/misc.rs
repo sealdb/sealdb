@@ -220,6 +220,8 @@ pub enum ShowStmtKind {
     Index,
     Charset,
     Collation,
+    /// `ADMIN SHOW DDL JOBS`
+    DdlJobs,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +281,7 @@ impl ShowStmt {
             }
             ShowStmtKind::Charset => ctx.write_str("SHOW CHARSET"),
             ShowStmtKind::Collation => ctx.write_str("SHOW COLLATION"),
+            ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
         }
         Ok(())
     }

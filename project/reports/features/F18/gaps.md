@@ -5,7 +5,7 @@ wave. Rejected via `Error::unsupported` in
 `pkg/parser/sqlparser_bridge/lower.rs` and marked on
 `pkg/ddl/index.rs` / `pkg/ddl/alter.rs`.
 
-- TiDB DDL job queue / schema-state machine (`none` → `delete-only` → `write-only` → `public`)
+- Async DDL job queue / online reorg (`none` → `delete-only` → `write-only` → `public`)
 - Reorg / concurrent ingest / `ALGORITHM` / `LOCK`
 - `FULLTEXT` / prefix indexes (UNIQUE / PRIMARY KEY CREATE INDEX is in)
 - `ALTER TABLE CHANGE` / `MODIFY` / `RENAME`
