@@ -198,6 +198,30 @@ impl Session {
                     .remove(&dealloc.name.to_ascii_lowercase());
                 return Ok(empty_result());
             }
+            Statement::CreateBinding(create) => {
+                let original = self.parser.parse_one_stmt(&create.original_sql)?;
+                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
+                let db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                self.domain.bind_handle().create_binding(
+                    sealdb_bindinfo::Binding::manual(
+                        create.original_sql.clone(),
+                        create.bind_sql.clone(),
+                        db,
+                    ),
+                    &key,
+                );
+                return Ok(empty_result());
+            }
+            Statement::DropBinding(drop) => {
+                let original = self.parser.parse_one_stmt(&drop.original_sql)?;
+                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
+                self.domain.bind_handle().drop_binding(&key);
+                return Ok(empty_result());
+            }
             Statement::Execute(exec) => {
                 let sql = self
                     .prepared
@@ -341,6 +365,9 @@ impl Session {
             }),
             _ => None,
         };
+        // Apply CREATE BINDING rewrite before plan build (MVB: substitute bind SQL).
+        let rebound = self.apply_sql_binding(stmt)?;
+        let stmt = rebound.as_ref().unwrap_or(stmt);
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         let cache_key = restore_sql(stmt);
@@ -1104,6 +1131,27 @@ fn is_write_stmt(stmt: &Statement) -> bool {
 }
 
 impl Session {
+    /// If a Domain binding matches this statement's restored SQL, re-parse the bind SQL.
+    fn apply_sql_binding(&self, stmt: &Statement) -> Result<Option<Statement>> {
+        match stmt {
+            Statement::Select(_) => {
+                let restored = restore_sql(stmt);
+                if let Some(binding) = self.domain.bind_handle().match_binding(&restored) {
+                    return Ok(Some(self.parser.parse_one_stmt(&binding.bind_sql)?));
+                }
+            }
+            Statement::Explain(explain) => {
+                if let Some(inner) = self.apply_sql_binding(&explain.stmt)? {
+                    let mut explain = explain.clone();
+                    explain.stmt = Box::new(inner);
+                    return Ok(Some(Statement::Explain(explain)));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
     fn in_read_only(&self) -> bool {
         let (explicit, txn_ro) = {
             let txn = self.txn.lock().expect("session txn lock");
@@ -2684,6 +2732,58 @@ mod tests {
         session.execute_stmt("SET @a = 2").unwrap();
         let row2 = session.execute_stmt("EXECUTE s USING @a").unwrap();
         assert_eq!(row2.display_rows(), vec![vec!["b".to_string()]]);
+    }
+
+    #[test]
+    fn test_create_drop_show_binding_and_execute() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        let unbound = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            unbound.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        session
+            .execute_stmt(
+                "CREATE BINDING FOR SELECT * FROM db1.t WHERE id > 0 ORDER BY id USING SELECT * FROM db1.t WHERE id = 1 ORDER BY id",
+            )
+            .unwrap();
+        let shown = session.execute_stmt("SHOW BINDINGS").unwrap();
+        assert_eq!(shown.columns[0], "Original_sql");
+        assert_eq!(shown.display_rows().len(), 1);
+        assert!(shown.display_rows()[0][0].contains("id > 0"));
+        assert!(shown.display_rows()[0][1].contains("id = 1"));
+        let bound = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            bound.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        session
+            .execute_stmt("DROP BINDING FOR SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
+            .unwrap();
+        let after = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let empty = session.execute_stmt("SHOW BINDINGS").unwrap();
+        assert!(empty.display_rows().is_empty());
     }
 
     #[test]

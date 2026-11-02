@@ -272,6 +272,30 @@ impl Executor for ShowExec {
                     })
                     .collect();
             }
+            ShowStmtKind::Bindings => {
+                self.schema = vec![
+                    "Original_sql".to_string(),
+                    "Bind_sql".to_string(),
+                    "Default_db".to_string(),
+                    "Status".to_string(),
+                    "Source".to_string(),
+                ];
+                self.rows = self
+                    .domain
+                    .bind_handle()
+                    .all_bindings()
+                    .into_iter()
+                    .map(|b| {
+                        vec![
+                            Datum::Bytes(b.original_sql.into_bytes()),
+                            Datum::Bytes(b.bind_sql.into_bytes()),
+                            Datum::Bytes(b.db.into_bytes()),
+                            Datum::Bytes(b.status.into_bytes()),
+                            Datum::Bytes(b.source.into_bytes()),
+                        ]
+                    })
+                    .collect();
+            }
         }
         Ok(())
     }

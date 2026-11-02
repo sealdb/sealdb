@@ -450,6 +450,8 @@ pub enum ShowStmtKind {
     Collation,
     /// `ADMIN SHOW DDL JOBS`
     DdlJobs,
+    /// `SHOW BINDINGS`
+    Bindings,
 }
 
 #[derive(Clone, Debug)]
@@ -510,7 +512,39 @@ impl ShowStmt {
             ShowStmtKind::Charset => ctx.write_str("SHOW CHARSET"),
             ShowStmtKind::Collation => ctx.write_str("SHOW COLLATION"),
             ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
+            ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
         }
+        Ok(())
+    }
+}
+
+/// `CREATE [GLOBAL|SESSION] BINDING FOR <original> USING <bind>` (TiDB `CreateBindingStmt`).
+#[derive(Clone, Debug)]
+pub struct CreateBindingStmt {
+    pub original_sql: String,
+    pub bind_sql: String,
+}
+
+impl CreateBindingStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE BINDING FOR ");
+        ctx.write_str(&self.original_sql);
+        ctx.write_str(" USING ");
+        ctx.write_str(&self.bind_sql);
+        Ok(())
+    }
+}
+
+/// `DROP [GLOBAL|SESSION] BINDING FOR <original>` (TiDB `DropBindingStmt`).
+#[derive(Clone, Debug)]
+pub struct DropBindingStmt {
+    pub original_sql: String,
+}
+
+impl DropBindingStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP BINDING FOR ");
+        ctx.write_str(&self.original_sql);
         Ok(())
     }
 }

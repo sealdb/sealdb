@@ -16,11 +16,12 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
-    DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt,
-    IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt,
-    RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetRoleKind, SetRoleStmt, SetStmt,
-    SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity, UserSpec,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
+    DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel,
+    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
+    ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
+    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    UserSpec,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -49,6 +50,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
+    let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_rename_index(&rewritten);
     let rewritten = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
@@ -62,6 +64,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, user_ops) = extract_user_ddl(&rewritten)?;
     // sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx`.
     let (rewritten, analyze_indexes) = extract_analyze_index(&rewritten)?;
+    // sqlparser rejects TiDB `CREATE/DROP BINDING`.
+    let (rewritten, binding_ops) = extract_binding_ddl(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -75,6 +79,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut role_ops = role_ops.into_iter();
     let mut user_ops = user_ops.into_iter();
     let mut analyze_indexes = analyze_indexes.into_iter();
+    let mut binding_ops = binding_ops.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -88,6 +93,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             decode_show_grants(show);
             decode_show_index(show);
             decode_show_ddl_jobs(show);
+            decode_show_bindings(show);
         }
         if let Statement::CreateTable(create) = &mut lowered {
             create.partition = partitions.next().flatten();
@@ -122,6 +128,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         }
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_user__"))
             && let Some(op) = user_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_binding__"))
+            && let Some(op) = binding_ops.next().flatten()
         {
             lowered = op;
         }
@@ -475,6 +486,7 @@ const SHOW_GRANT_PREFIX: &str = "__sealdb_grant_";
 const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
 const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
+const SHOW_BINDINGS_SCHEMA: &str = "__sealdb_bindings__";
 const RENAME_INDEX_MARKER: &str = "__sealdb_rename_index__";
 const RENAME_INDEX_SEP: char = '\u{1f}';
 
@@ -566,6 +578,188 @@ fn decode_show_ddl_jobs(show: &mut ShowStmt) {
         show.kind = ShowStmtKind::DdlJobs;
         show.db_name = None;
     }
+}
+
+/// sqlparser has no `SHOW BINDINGS`; rewrite to SHOW TABLES FROM a marker schema.
+fn rewrite_show_bindings(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "BINDINGS") {
+                out.push_str("SHOW TABLES FROM `");
+                out.push_str(SHOW_BINDINGS_SCHEMA);
+                out.push('`');
+                i = after_show + "BINDINGS".len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn decode_show_bindings(show: &mut ShowStmt) {
+    if show.kind == ShowStmtKind::Tables
+        && show
+            .db_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_BINDINGS_SCHEMA))
+    {
+        show.kind = ShowStmtKind::Bindings;
+        show.db_name = None;
+    }
+}
+
+/// sqlparser rejects TiDB `CREATE/DROP BINDING`; replace with `SET NAMES` placeholders.
+fn extract_binding_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after = skip_ws(bytes, i + "CREATE".len());
+            let after_scope = skip_binding_scope(bytes, after);
+            if keyword_at(bytes, after_scope, "BINDING") {
+                let (stmt, end) = parse_create_binding(bytes, after_scope + "BINDING".len())?;
+                out.push_str("SET NAMES '__sealdb_binding__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "DROP") {
+            let after = skip_ws(bytes, i + "DROP".len());
+            let after_scope = skip_binding_scope(bytes, after);
+            if keyword_at(bytes, after_scope, "BINDING") {
+                let (stmt, end) = parse_drop_binding(bytes, after_scope + "BINDING".len())?;
+                out.push_str("SET NAMES '__sealdb_binding__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, ops))
+}
+
+fn skip_binding_scope(bytes: &[u8], i: usize) -> usize {
+    if keyword_at(bytes, i, "GLOBAL") || keyword_at(bytes, i, "SESSION") {
+        let kw = if keyword_at(bytes, i, "GLOBAL") {
+            "GLOBAL"
+        } else {
+            "SESSION"
+        };
+        return skip_ws(bytes, i + kw.len());
+    }
+    i
+}
+
+fn parse_create_binding(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "FOR") {
+        return Err(Error::unsupported("CREATE BINDING without FOR"));
+    }
+    i = skip_ws(bytes, i + "FOR".len());
+    let (original, using_at) = take_sql_until_keyword(bytes, i, "USING")
+        .ok_or_else(|| Error::unsupported("CREATE BINDING without USING"))?;
+    i = skip_ws(bytes, using_at + "USING".len());
+    let (bind_sql, end) = take_sql_until_semicolon(bytes, i);
+    let original_sql = original.trim().to_string();
+    let bind_sql = bind_sql.trim().to_string();
+    if original_sql.is_empty() || bind_sql.is_empty() {
+        return Err(Error::unsupported("CREATE BINDING with empty SQL"));
+    }
+    Ok((
+        Statement::CreateBinding(CreateBindingStmt {
+            original_sql,
+            bind_sql,
+        }),
+        end,
+    ))
+}
+
+fn parse_drop_binding(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "FOR") {
+        return Err(Error::unsupported("DROP BINDING without FOR"));
+    }
+    i = skip_ws(bytes, i + "FOR".len());
+    let (original, end) = take_sql_until_semicolon(bytes, i);
+    let original_sql = original.trim().to_string();
+    if original_sql.is_empty() {
+        return Err(Error::unsupported("DROP BINDING with empty SQL"));
+    }
+    Ok((
+        Statement::DropBinding(DropBindingStmt { original_sql }),
+        end,
+    ))
+}
+
+/// Scan SQL text from `start` until a top-level `keyword` (not inside quotes).
+fn take_sql_until_keyword(bytes: &[u8], start: usize, keyword: &str) -> Option<(String, usize)> {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' || b == b'`' {
+            i = skip_quoted(bytes, i);
+            continue;
+        }
+        if keyword_at(bytes, i, keyword) {
+            let sql = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+            return Some((sql, i));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn take_sql_until_semicolon(bytes: &[u8], start: usize) -> (String, usize) {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' || b == b'`' {
+            i = skip_quoted(bytes, i);
+            continue;
+        }
+        if b == b';' {
+            let sql = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+            return (sql, i);
+        }
+        i += 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[start..]).into_owned(),
+        bytes.len(),
+    )
+}
+
+fn skip_quoted(bytes: &[u8], i: usize) -> usize {
+    let quote = bytes[i];
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] == quote {
+            // MySQL escaped quote by doubling.
+            if j + 1 < bytes.len() && bytes[j + 1] == quote {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+            j += 2;
+            continue;
+        }
+        j += 1;
+    }
+    bytes.len()
 }
 
 fn rewrite_show_create_database(sql: &str) -> String {
