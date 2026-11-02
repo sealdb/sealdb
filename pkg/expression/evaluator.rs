@@ -8,39 +8,49 @@ use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
 use sealdb_types::Datum;
 use sealdb_types::field_type::FieldType;
+use sealdb_util::collate::{CollateMode, compare_bytes};
 use std::cell::RefCell;
 
 thread_local! {
-    static COLLATION_CI: RefCell<bool> = const { RefCell::new(false) };
+    static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
 }
 
-pub fn with_collation_ci<T>(ci: bool, f: impl FnOnce() -> T) -> T {
-    COLLATION_CI.with(|cell| {
+pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
+    COLLATION_MODE.with(|cell| {
         let prev = *cell.borrow();
-        *cell.borrow_mut() = ci;
+        *cell.borrow_mut() = mode;
         let out = f();
         *cell.borrow_mut() = prev;
         out
     })
 }
 
+/// Backward-compatible helper: `true` → GeneralCi, `false` → Bin.
+pub fn with_collation_ci<T>(ci: bool, f: impl FnOnce() -> T) -> T {
+    with_collation(
+        if ci {
+            CollateMode::GeneralCi
+        } else {
+            CollateMode::Bin
+        },
+        f,
+    )
+}
+
+pub fn collation_mode() -> CollateMode {
+    COLLATION_MODE.with(|cell| *cell.borrow())
+}
+
 pub fn collation_ci() -> bool {
-    COLLATION_CI.with(|cell| *cell.borrow())
+    collation_mode().is_ci()
 }
 
 fn compare_datums(left: &Datum, right: &Datum) -> std::cmp::Ordering {
-    if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_)))
-        && COLLATION_CI.with(|c| *c.borrow())
-    {
-        let left_b = left.as_bytes();
-        let right_b = right.as_bytes();
-        return if left_b.eq_ignore_ascii_case(&right_b) {
-            std::cmp::Ordering::Equal
-        } else {
-            left_b
-                .to_ascii_lowercase()
-                .cmp(&right_b.to_ascii_lowercase())
-        };
+    if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_))) {
+        let mode = collation_mode();
+        if mode != CollateMode::Bin {
+            return compare_bytes(mode, &left.as_bytes(), &right.as_bytes());
+        }
     }
     left.compare(right)
 }
@@ -325,7 +335,7 @@ fn eval_like(expr: &PatternLikeExpr, schema: &[String], row: &[Datum]) -> Result
     if value.is_null() || pattern.is_null() {
         return Ok(Datum::Null);
     }
-    let ci = expr.ci || COLLATION_CI.with(|c| *c.borrow());
+    let ci = expr.ci || collation_ci();
     let matched = like_match(&value.as_bytes(), &pattern.as_bytes(), ci);
     Ok(bool_datum(if expr.not { !matched } else { matched }))
 }

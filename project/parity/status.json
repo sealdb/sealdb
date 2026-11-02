@@ -208,7 +208,31 @@
       "status": "partial",
       "rust": "pkg/parser/charset/mod.rs",
       "phase": 10,
-      "notes": "C5 Collation parse for utf8mb4_bin / *_ci"
+      "notes": "C5 Collation parse for utf8mb4_bin / general_ci / unicode_ci"
+    },
+    "pkg/util/collate/collate.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/collate.rs",
+      "phase": 10,
+      "notes": "C5 CollateMode dispatch: bin / general_ci / unicode_ci"
+    },
+    "pkg/util/collate/unicode_0400_ci_impl.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/unicode_0400_ci_impl.rs",
+      "phase": 10,
+      "notes": "C5 unicode_ci GetWeight; Latin/ASCII subset"
+    },
+    "pkg/util/collate/unicode_0400_ci_generated.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/unicode_0400_ci_generated.rs",
+      "phase": 10,
+      "notes": "C5 unicode_ci Compare from UCA weights"
+    },
+    "pkg/util/collate/ucadata/unicode_ci_data_generated.go": {
+      "status": "partial",
+      "rust": "pkg/util/collate/ucadata/unicode_ci_data_generated.rs",
+      "phase": 10,
+      "notes": "C5 DUCET 4.0.0 weight subset: printable ASCII + Latin-1 letters"
     },
     "pkg/parser/opcode/opcode.go": {
       "status": "partial",

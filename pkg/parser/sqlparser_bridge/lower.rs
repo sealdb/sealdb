@@ -518,8 +518,7 @@ fn rewrite_rename_index(sql: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     out
 }
@@ -559,8 +558,7 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     out
 }
@@ -593,8 +591,7 @@ fn rewrite_show_bindings(sql: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     out
 }
@@ -790,8 +787,7 @@ fn rewrite_show_create_database(sql: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     out
 }
@@ -864,8 +860,7 @@ fn rewrite_show_index(sql: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     out
 }
@@ -1186,8 +1181,7 @@ fn rewrite_cte_materialized(sql: &str) -> (String, Vec<(String, CteMaterialize)>
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     (out, hints)
 }
@@ -1379,6 +1373,14 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Copy one UTF-8 character from `sql` at byte offset `i` into `out`.
+/// Rewrites must not use `bytes[i] as char` — that Latin-1-recodes multi-byte UTF-8.
+fn push_sql_char(out: &mut String, sql: &str, i: usize) -> usize {
+    let ch = sql[i..].chars().next().expect("sql index in bounds");
+    out.push(ch);
+    i + ch.len_utf8()
 }
 
 /// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]`.
@@ -2198,8 +2200,7 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                 ops.push(None);
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     Ok((out, ops))
 }
@@ -4517,5 +4518,32 @@ fn data_type_name(tp: &DataType) -> String {
             "CHAR".to_string()
         }
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod unicode_literal_tests {
+    use super::*;
+    use crate::ast::expressions::ExprNode;
+    use sealdb_types::Datum;
+
+    #[test]
+    fn preserves_utf8_string_literal() {
+        let stmts = parse_sql("SELECT 'ä', 'ß'").unwrap();
+        match &stmts[0] {
+            Statement::Select(sel) => {
+                let d0 = match &sel.fields[0].expr {
+                    ExprNode::Value(v) => &v.datum,
+                    other => panic!("expected value, got {other:?}"),
+                };
+                let d1 = match &sel.fields[1].expr {
+                    ExprNode::Value(v) => &v.datum,
+                    other => panic!("expected value, got {other:?}"),
+                };
+                assert_eq!(d0, &Datum::Bytes("ä".as_bytes().to_vec()));
+                assert_eq!(d1, &Datum::Bytes("ß".as_bytes().to_vec()));
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
     }
 }

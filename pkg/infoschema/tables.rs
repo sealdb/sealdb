@@ -488,6 +488,12 @@ const COLLATIONS: &[Collation] = &[
         is_default: false,
     },
     Collation {
+        name: "utf8mb4_unicode_ci",
+        charset: "utf8mb4",
+        id: 224,
+        is_default: false,
+    },
+    Collation {
         name: "utf8_bin",
         charset: "utf8",
         id: 83,
