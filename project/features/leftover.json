@@ -55,9 +55,6 @@
       "serializable",
       "savepoint"
     ],
-    "C4": [
-      "typed-placeholders"
-    ],
     "C5": [
       "unicode-weights",
       "gbk-latin1",

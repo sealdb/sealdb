@@ -239,7 +239,7 @@ def render_markdown(inv: dict) -> str:
             "- Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).",
             "- C2: EXPLAIN ANALYZE / cop-task rows / n-table DP / IndexMerge / cost-model-v2 stay open.",
             "- C3: TiKV cross-cluster and MDL stay open.",
-            "- C4: shared plan cache / typed `?` stay open (COM_STMT_*, user-vars, and CREATE BINDING closed).",
+            "- C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).",
             "- C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.",
             "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.",
             "",

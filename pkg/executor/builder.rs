@@ -232,6 +232,20 @@ impl ExecutorBuilder {
                     .from
                     .clone()
                     .ok_or_else(|| Error::unsupported("point get without FROM"))?;
+                // Prefer literals from the current bound stmt so a plan cached
+                // under a prepared `?` template still PointGets the right row.
+                let handle = select
+                    .selection
+                    .as_ref()
+                    .and_then(|expr| {
+                        expr.split_cnf().into_iter().find_map(|item| {
+                            item.eq_column_const().and_then(|(_, value)| match value {
+                                sealdb_types::Datum::I64(h) => Some(h),
+                                _ => None,
+                            })
+                        })
+                    })
+                    .or(*handle);
                 let lookup = index.as_ref().and_then(|index_name| {
                     index_lookup_value(
                         &domain,
@@ -244,7 +258,7 @@ impl ExecutorBuilder {
                 Ok(Box::new(PointGetExec::new(
                     domain,
                     from,
-                    *handle,
+                    handle,
                     index.clone(),
                     lookup,
                     current_db.to_string(),

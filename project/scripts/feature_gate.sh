@@ -238,6 +238,7 @@ case "$FEATURE" in
     run execute-user-vars cargo test -q -p sealdb-session --lib test_user_vars_set_select_and_execute_using -- --exact
     run execute-binding cargo test -q -p sealdb-session --lib session::tests::test_create_drop_show_binding_and_execute -- --exact
     run execute-shared-plan-cache cargo test -q -p sealdb-session --lib session::tests::test_shared_plan_cache_cross_session -- --exact
+    run execute-typed-placeholders cargo test -q -p sealdb-session --lib session::tests::test_typed_placeholders_share_plan_cache -- --exact
     ;;
   C5)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 183,
-  "manifest_entries": 132,
+  "rs_files": 184,
+  "manifest_entries": 133,
   "status_counts": {
-    "not-started": 1549,
-    "partial": 125,
+    "not-started": 1548,
+    "partial": 126,
     "reimplemented": 4,
     "ported": 3
   },
@@ -268,11 +268,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 16,
-      "missing": 200,
+      "rs": 17,
+      "missing": 199,
       "status": {
-        "not-started": 200,
-        "partial": 16
+        "not-started": 199,
+        "partial": 17
       }
     },
     "pkg/plugin": {
@@ -6579,7 +6579,7 @@
       "rs_path": "pkg/planner/core/plan_cache.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "PlanCacheValue keyed by restored SQL + schema version; typed-param rebuild deferred"
+      "notes": "PlanCacheValue; prepared EXECUTE keys by unbound ? template + schema version"
     },
     {
       "go_path": "pkg/planner/core/plan_cache_instance.go",
@@ -6597,10 +6597,10 @@
     },
     {
       "go_path": "pkg/planner/core/plan_cache_param.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/plan_cache_param.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "MVB: normalize_prep_cache_key for ? template keys; ParamMarker AST rewrite deferred"
     },
     {
       "go_path": "pkg/planner/core/plan_cache_rebuild.go",

@@ -8,5 +8,5 @@ pub mod util;
 
 pub use core::{
     DdlKind, InstancePlanCache, JoinType, LRUPlanCache, PartitionPruneMode, PhysicalPlan,
-    PlanBuilder, PlanCacheValue,
+    PlanBuilder, PlanCacheValue, normalize_prep_cache_key,
 };
