@@ -573,7 +573,7 @@
     "pkg/executor/join/hash_join_v1.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "two-table HashJoinV1Exec with join-key partition spill and CROSS JOIN cartesian"
+      "notes": "left-deep n-table HashJoinV1Exec with join-key partition spill and CROSS JOIN cartesian"
     },
     "pkg/executor/join/hash_join_spill.go": {
       "status": "partial",

@@ -1561,7 +1561,7 @@ fn lower_select(
         .iter()
         .map(lower_select_item)
         .collect::<Result<Vec<_>>>()?;
-    let (from, join) = lower_from(&select.from)?;
+    let (from, joins) = lower_from(&select.from)?;
     let selection = select.selection.as_ref().map(lower_expr).transpose()?;
     let having = select.having.as_ref().map(lower_expr).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
@@ -1569,7 +1569,7 @@ fn lower_select(
     Ok(SelectStmt {
         fields,
         from,
-        join,
+        joins,
         selection,
         group_by,
         having,
@@ -1589,71 +1589,78 @@ fn true_expr() -> ExprNode {
     })
 }
 
-/// Lower FROM. Two comma-separated tables become CROSS JOIN; 3+ tables stay unsupported.
-fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {
+/// Lower FROM into the leftmost table plus a left-deep join chain.
+/// Comma-separated table lists become CROSS JOIN steps.
+fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Vec<Join>)> {
     if from.is_empty() {
-        return Ok((None, None));
+        return Ok((None, Vec::new()));
     }
-    // F09 leftover: two-table comma join is CROSS JOIN. n-table stays deferred.
-    if from.len() == 2 {
-        if !from[0].joins.is_empty() || !from[1].joins.is_empty() {
-            return Err(Error::unsupported("more than two tables in JOIN"));
-        }
-        let left = table_factor_name(&from[0].relation)?;
-        let right = table_factor_name(&from[1].relation)?;
-        return Ok((
-            Some(left.clone()),
-            Some(Join {
-                left,
-                right,
-                tp: JoinType::Cross,
-                on: true_expr(),
-            }),
-        ));
+    let (first, mut joins) = lower_table_with_joins(&from[0])?;
+    let mut prev = joins
+        .last()
+        .map(|j| j.right.clone())
+        .unwrap_or_else(|| first.clone());
+    for extra in &from[1..] {
+        let (right, extra_joins) = lower_table_with_joins(extra)?;
+        joins.push(Join {
+            left: prev,
+            right: right.clone(),
+            tp: JoinType::Cross,
+            on: true_expr(),
+        });
+        joins.extend(extra_joins);
+        prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
     }
-    if from.len() > 2 {
-        return Err(Error::unsupported("more than two tables in JOIN"));
-    }
-    let (left, join) = lower_table_with_joins(&from[0])?;
-    Ok((Some(left), join))
+    Ok((Some(first), joins))
 }
 
-/// Lower `t` or `t1 JOIN t2 ON ...` / `t1 CROSS JOIN t2`. More than two tables is F09 leftover.
-fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> {
+/// Lower `t` or `t1 JOIN t2 ON ... JOIN t3 ON ...` into a left-deep `Join` list.
+fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Vec<Join>)> {
     let left = table_factor_name(&table.relation)?;
     if table.joins.is_empty() {
-        return Ok((left, None));
+        return Ok((left, Vec::new()));
     }
-    if table.joins.len() != 1 {
-        return Err(Error::unsupported("more than two tables in JOIN"));
-    }
-    let join = &table.joins[0];
-    let right = table_factor_name(&join.relation)?;
-    let (tp, on) = match &join.join_operator {
-        JoinOperator::Join(JoinConstraint::On(expr))
-        | JoinOperator::Inner(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
-        JoinOperator::Left(JoinConstraint::On(expr))
-        | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-            (JoinType::LeftOuter, lower_expr(expr)?)
-        }
-        JoinOperator::Right(JoinConstraint::On(expr))
-        | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-            (JoinType::RightOuter, lower_expr(expr)?)
-        }
-        JoinOperator::CrossJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
-        JoinOperator::CrossJoin(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
-        // F09 leftover: NATURAL / USING / semi / anti / full.
-        other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
-    };
-    Ok((
-        left.clone(),
-        Some(Join {
-            left,
-            right,
+    let mut out = Vec::new();
+    let mut prev = left.clone();
+    for join in &table.joins {
+        let right = table_factor_name(&join.relation)?;
+        let (tp, on) = match &join.join_operator {
+            JoinOperator::Join(JoinConstraint::On(expr))
+            | JoinOperator::Inner(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
+            JoinOperator::Left(JoinConstraint::On(expr))
+            | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+                (JoinType::LeftOuter, lower_expr(expr)?)
+            }
+            JoinOperator::Right(JoinConstraint::On(expr))
+            | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+                (JoinType::RightOuter, lower_expr(expr)?)
+            }
+            JoinOperator::CrossJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
+            JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?)
+            }
+            // F09 leftover: NATURAL / USING / semi / anti / full.
+            other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
+        };
+        out.push(Join {
+            left: prev,
+            right: right.clone(),
             tp,
             on,
-        }),
-    ))
+        });
+        prev = right;
+    }
+    Ok((left, out))
+}
+
+/// Two-table DML only: reject n-table JOIN chains on UPDATE / DELETE.
+fn lower_dml_table(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> {
+    let (name, mut joins) = lower_table_with_joins(table)?;
+    match joins.len() {
+        0 => Ok((name, None)),
+        1 => Ok((name, joins.pop())),
+        _ => Err(Error::unsupported("more than two tables in JOIN")),
+    }
 }
 
 fn table_factor_name(factor: &TableFactor) -> Result<TableName> {
@@ -1726,7 +1733,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
     }
-    let (table, join) = lower_table_with_joins(&update.table)?;
+    let (table, join) = lower_dml_table(&update.table)?;
     let order_by = lower_order_by_exprs(&update.order_by)?;
     let limit = update.limit.as_ref().map(expr_as_u64).transpose()?;
     if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
@@ -1775,7 +1782,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
         if using.len() != 1 {
             return Err(Error::unsupported("comma joins"));
         }
-        let rel = lower_table_with_joins(&using[0])?;
+        let rel = lower_dml_table(&using[0])?;
         let tables = if !delete.tables.is_empty() {
             delete
                 .tables
@@ -1797,7 +1804,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
         if from.len() != 1 {
             return Err(Error::unsupported("multi-table DELETE"));
         }
-        let rel = lower_table_with_joins(&from[0])?;
+        let rel = lower_dml_table(&from[0])?;
         let tables = delete
             .tables
             .iter()
@@ -1995,7 +2002,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         }
         Expr::Exists { subquery, negated } => {
             let query = lower_query(subquery)?;
-            if query.join.is_some() {
+            if !query.joins.is_empty() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::Exists(ExistsExpr {
@@ -2009,7 +2016,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             negated,
         } => {
             let query = lower_query(subquery)?;
-            if query.join.is_some() {
+            if !query.joins.is_empty() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::InSubquery(InSubqueryExpr {
@@ -2082,7 +2089,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         })),
         Expr::Subquery(subquery) => {
             let query = lower_query(subquery)?;
-            if query.join.is_some() {
+            if !query.joins.is_empty() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {

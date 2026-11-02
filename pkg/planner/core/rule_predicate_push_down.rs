@@ -138,6 +138,7 @@ fn push_into(
             right,
             left_table,
             right_table,
+            on,
         } => {
             let left_cols = table_columns(is, current_db, &left_table);
             let right_cols = table_columns(is, current_db, &right_table);
@@ -165,6 +166,7 @@ fn push_into(
                     right: Box::new(push_into(*right, right_preds, is, current_db)),
                     left_table,
                     right_table,
+                    on,
                 },
                 residual,
             )
@@ -326,6 +328,7 @@ mod tests {
             right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
             left_table: "t1".to_string(),
             right_table: "t2".to_string(),
+            on: col_eq("t1", "id", 1),
         };
         let filter =
             ExprNode::compose_cnf(vec![col_eq("t1", "id", 1), col_eq("t2", "id", 2)]).expect("and");

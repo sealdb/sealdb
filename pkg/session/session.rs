@@ -320,9 +320,8 @@ impl Session {
                 if let Some(from) = &select.from {
                     require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
                 }
-                if let Some(join) = &select.join {
-                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
-                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                for table in select.join_tables() {
+                    require(&mgr, &user, table, &current_db, PrivilegeType::SELECT)?;
                 }
             }
             Statement::Insert(insert) => {
@@ -391,9 +390,8 @@ impl Session {
                     if let Some(from) = &select.from {
                         require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
                     }
-                    if let Some(join) = &select.join {
-                        require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
-                        require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                    for table in select.join_tables() {
+                        require(&mgr, &user, table, &current_db, PrivilegeType::SELECT)?;
                     }
                 }
             }
@@ -508,7 +506,7 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     let Statement::Select(select) = stmt else {
         return None;
     };
-    if select.from.is_some() || select.join.is_some() {
+    if select.from.is_some() || !select.joins.is_empty() {
         return None;
     }
     let mut columns = Vec::new();
@@ -1562,6 +1560,20 @@ mod tests {
             .execute_stmt("SELECT t1.id, t2.tag FROM db1.t1, db1.t2 ORDER BY t1.id, t2.tag")
             .unwrap();
         assert_eq!(comma.display_rows(), cross.display_rows());
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.t3 (id INT, note VARCHAR(20)); INSERT INTO db1.t3 VALUES (1, 'n')",
+            )
+            .unwrap();
+        let three = session
+            .execute_stmt(
+                "SELECT t1.id, t2.tag, t3.note FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id JOIN db1.t3 ON t2.id = t3.id",
+            )
+            .unwrap();
+        assert_eq!(
+            three.display_rows(),
+            vec![vec!["1".to_string(), "x".to_string(), "n".to_string()]]
+        );
     }
 
     #[test]

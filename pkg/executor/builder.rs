@@ -24,8 +24,7 @@ use sealdb_errno::{Error, Result};
 use sealdb_kv::{Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement};
-use sealdb_planner::PhysicalPlan;
-use sealdb_planner::PlanBuilder;
+use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
 use std::sync::Arc;
 
 pub struct ExecutorBuilder;
@@ -364,18 +363,19 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::HashJoin {
+                tp,
                 left,
                 right,
                 left_table,
-                ..
+                right_table,
+                on,
             } => {
-                let mut join = stmt
-                    .as_select()
-                    .and_then(|s| s.join.clone())
-                    .ok_or_else(|| Error::unsupported("hash join without join"))?;
-                if !join.left.name.eq_ignore_ascii_case(left_table) {
-                    std::mem::swap(&mut join.left, &mut join.right);
-                }
+                let join = sealdb_parser::ast::Join {
+                    left: sealdb_parser::ast::TableName::new(None, left_table.clone()),
+                    right: sealdb_parser::ast::TableName::new(None, right_table.clone()),
+                    tp: ast_join_type(*tp),
+                    on: on.clone(),
+                };
                 Ok(Box::new(HashJoinV1Exec::new(
                     join,
                     Self::build(
@@ -458,7 +458,7 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
     let select = stmt
         .as_select()
         .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
-    if let Some(join) = &select.join {
+    for join in &select.joins {
         if join.left.name.eq_ignore_ascii_case(table) {
             return Ok(join.left.clone());
         }
@@ -534,6 +534,15 @@ fn index_access(
             .map(|(_, inclusive)| *inclusive)
             .unwrap_or(true),
     })
+}
+
+fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {
+    match tp {
+        JoinType::Inner => sealdb_parser::ast::JoinType::Inner,
+        JoinType::LeftOuter => sealdb_parser::ast::JoinType::LeftOuter,
+        JoinType::RightOuter => sealdb_parser::ast::JoinType::RightOuter,
+        JoinType::Cross => sealdb_parser::ast::JoinType::Cross,
+    }
 }
 
 fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
