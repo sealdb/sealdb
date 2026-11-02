@@ -88,6 +88,7 @@ pub enum PhysicalPlan {
     StreamAgg {
         child: Box<PhysicalPlan>,
     },
+    /// Two-table hash join. `Cross` has no equality keys; n-table is leftover.
     HashJoin {
         tp: JoinType,
         left: Box<PhysicalPlan>,
@@ -119,6 +120,7 @@ pub enum PhysicalPlan {
     },
 }
 
+/// Physical join kind. `Cross` is a cartesian product with no equality keys.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum JoinType {
     Inner,

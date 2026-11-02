@@ -1,15 +1,20 @@
 use super::common::{CODEC_VER, ROW_FLAG_CHECKSUM, ROW_FLAG_LARGE};
 
+/// Parsed CodecVer 128 row: sorted col ids, not-null offsets, and raw data bytes.
+/// Layout matches TiDB `pkg/util/rowcodec/row.go`.
 pub struct Row<'a> {
     pub flags: u8,
     pub num_not_null: u16,
     pub num_null: u16,
+    /// Not-null ids first, then null ids; both runs sorted by id.
     pub col_ids: Vec<u32>,
+    /// Exclusive end offset of each not-null column in `data`.
     pub offsets: Vec<u32>,
     pub data: &'a [u8],
 }
 
 impl<'a> Row<'a> {
+    /// Parse a v128 row. Returns `None` if the header is truncated or version mismatches.
     pub fn from_bytes(row_data: &'a [u8]) -> Option<Self> {
         if row_data.len() < 6 || row_data[0] != CODEC_VER {
             return None;
@@ -77,6 +82,7 @@ impl<'a> Row<'a> {
         })
     }
 
+    /// Byte slice for the `not_null_idx`-th not-null column.
     pub fn col_data(&self, not_null_idx: usize) -> Option<&'a [u8]> {
         let end = *self.offsets.get(not_null_idx)? as usize;
         let start = if not_null_idx == 0 {
@@ -87,6 +93,7 @@ impl<'a> Row<'a> {
         self.data.get(start..end)
     }
 
+    /// Binary-search `col_id` in the sorted not-null then null id lists.
     pub fn find_col_id(&self, col_id: i64) -> FindCol {
         let id = col_id as u32;
         let not_null = &self.col_ids[..self.num_not_null as usize];
@@ -101,12 +108,15 @@ impl<'a> Row<'a> {
     }
 }
 
+/// Result of looking up a column id in a v128 row.
 pub enum FindCol {
+    /// Present and not null; index into `offsets` / not-null `col_ids`.
     NotNull(usize),
     Null,
     NotFound,
 }
 
+/// Serialize a v128 row. Checksum flag is cleared; checksum bytes are not written.
 pub fn to_bytes(
     flags: u8,
     not_null_ids: &[u32],

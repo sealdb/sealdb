@@ -20,6 +20,7 @@ use sealdb_util::chunk::Chunk;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// `UPDATE` executor: single-table path, or two-table JOIN via `hash_join_pairs`.
 pub struct UpdateExec {
     domain: Arc<Domain>,
     stmt: UpdateStmt,
@@ -105,6 +106,7 @@ impl Executor for UpdateExec {
 }
 
 impl UpdateExec {
+    /// `UPDATE t1 JOIN t2 ON ... SET ...`: join, assign, coalesce by handle, write.
     fn update_join(&mut self, join: &Join) -> Result<()> {
         let left = load_table(&self.domain, &self.current_db, &join.left)?;
         let right = load_table(&self.domain, &self.current_db, &join.right)?;
@@ -164,6 +166,7 @@ impl UpdateExec {
     }
 }
 
+/// Resolve `schema.table` against the session infoschema.
 pub(crate) fn load_table(domain: &Domain, current_db: &str, name: &TableName) -> Result<TableInfo> {
     let (schema, table) = name.qualified(current_db);
     if schema.is_empty() {
@@ -181,6 +184,7 @@ pub(crate) fn load_table(domain: &Domain, current_db: &str, name: &TableName) ->
         })
 }
 
+/// Unqualified column names in table order (join schema is qualified separately).
 pub(crate) fn col_names(info: &TableInfo) -> Vec<String> {
     info.columns
         .iter()
@@ -188,12 +192,14 @@ pub(crate) fn col_names(info: &TableInfo) -> Vec<String> {
         .collect()
 }
 
+/// Case-insensitive schema+name equality after applying `current_db`.
 pub(crate) fn table_matches(name: &TableName, wanted: &TableName, current_db: &str) -> bool {
     let (s1, t1) = name.qualified(current_db);
     let (s2, t2) = wanted.qualified(current_db);
     s1.eq_ignore_ascii_case(&s2) && t1.eq_ignore_ascii_case(&t2)
 }
 
+/// Concatenate `t.col` names so join filters and SET exprs can resolve both sides.
 pub(crate) fn joined_schema(
     left_table: &str,
     left_names: &[String],
@@ -207,6 +213,7 @@ pub(crate) fn joined_schema(
         .collect()
 }
 
+/// Concatenate optional join sides; unmatched outer rows are padded with NULL.
 fn concat_optional(
     left: Option<&ScannedRow>,
     right: Option<&ScannedRow>,
@@ -224,6 +231,7 @@ fn concat_optional(
     row
 }
 
+/// Evaluate SET exprs against the original joined row, then write into left/right copies.
 fn apply_assignments(
     list: &[Assignment],
     schema: &[String],
@@ -250,6 +258,7 @@ fn apply_assignments(
     Ok(())
 }
 
+/// Locate `table.column` (or unique unqualified `column`) in a join/table schema.
 fn find_schema_index(schema: &[String], table: Option<&str>, column: &str) -> Result<usize> {
     let mut found = None;
     for (i, name) in schema.iter().enumerate() {
@@ -288,6 +297,8 @@ fn column_matches(schema_name: &str, table: Option<&str>, column: &str) -> bool 
     }
 }
 
+/// Rewrite one row: drop old index keys, delete the old record if the handle or
+/// partition moved, then put the new row and unique/secondary indexes.
 pub(crate) fn apply_row_update(
     txn: &mut dyn Transaction,
     info: &TableInfo,

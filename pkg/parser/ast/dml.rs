@@ -3,11 +3,13 @@ use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
 use sealdb_errno::{Error, Result};
 
+/// Two-table join kind. Semi/anti/full stay deferred (F09 leftover).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinType {
     Inner,
     LeftOuter,
     RightOuter,
+    /// Cartesian product; `ON` is omitted on restore. Comma `FROM t1, t2` lowers to this.
     Cross,
 }
 
@@ -21,11 +23,13 @@ impl JoinType {
         }
     }
 
+    /// MySQL CROSS JOIN has no ON clause; INNER/OUTER always restore `ON`.
     pub fn has_on(self) -> bool {
         !matches!(self, JoinType::Cross)
     }
 }
 
+/// Two-table join in FROM / UPDATE / DELETE. n-table chains stay deferred (F09).
 #[derive(Clone, Debug)]
 pub struct Join {
     pub left: TableName,
@@ -35,6 +39,7 @@ pub struct Join {
 }
 
 impl Join {
+    /// Restore `left JOIN right ON expr` or `left CROSS JOIN right`.
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.left.restore(ctx)?;
         ctx.write_str(" ");
@@ -274,6 +279,7 @@ impl InsertStmt {
     }
 }
 
+/// One `SET col = expr` item. `table` is set for qualified `t1.col` in UPDATE JOIN.
 #[derive(Clone, Debug)]
 pub struct Assignment {
     pub table: Option<String>,
@@ -293,6 +299,8 @@ impl Assignment {
     }
 }
 
+/// `UPDATE` statement. `join` is `Some` for `UPDATE t1 JOIN t2 ON ... SET ...`.
+/// ORDER BY / LIMIT are single-table only (MySQL forbids them on multi-table UPDATE).
 #[derive(Clone, Debug)]
 pub struct UpdateStmt {
     pub table: TableName,
@@ -322,6 +330,8 @@ impl UpdateStmt {
     }
 }
 
+/// `DELETE` statement. `tables` is the delete list (`DELETE t1, t2 FROM ...`);
+/// empty means delete `table`. `join` is the FROM/USING join.
 #[derive(Clone, Debug)]
 pub struct DeleteStmt {
     pub table: TableName,
@@ -356,6 +366,7 @@ impl DeleteStmt {
     }
 }
 
+/// Restore `t` or `t1 JOIN t2 ON ...` / `t1 CROSS JOIN t2` for DML.
 fn restore_table_join(ctx: &mut RestoreCtx, table: &TableName, join: Option<&Join>) -> Result<()> {
     if let Some(join) = join {
         join.restore(ctx)

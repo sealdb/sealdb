@@ -3,6 +3,8 @@ use super::row::to_bytes;
 use crate::codec::encode_float;
 use sealdb_types::Datum;
 
+/// Encode one table row in CodecVer 128 (TiDB `rowcodec.Encoder.Encode`).
+/// Column ids are split into sorted not-null / null runs. Checksum is omitted.
 pub fn encode(col_ids: &[i64], values: &[Datum]) -> Vec<u8> {
     let n = col_ids.len().min(values.len());
     let mut not_null: Vec<usize> = (0..n).filter(|&i| !values[i].is_null()).collect();
@@ -25,6 +27,8 @@ pub fn encode(col_ids: &[i64], values: &[Datum]) -> Vec<u8> {
     to_bytes(flags, &not_null_ids, &null_ids, &offsets, &data)
 }
 
+/// Append one datum with no type tag. Integers are compact LE; floats are
+/// memcomparable; decimals are UTF-8 string bytes (MyDecimal bin later).
 fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
     match value {
         Datum::Null => {}
