@@ -15,9 +15,10 @@ mod tests {
         PacketIO, read_lenenc, write_lenenc, write_lenenc_str, write_null_str,
     };
     use sealdb_parser::mysql::{
-        CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
-        CLIENT_SSL, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE,
-        COM_STMT_PREPARE, ERR_HEADER, OK_HEADER, TYPE_LONGLONG,
+        CLIENT_DEPRECATE_EOF, CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS, CLIENT_PLUGIN_AUTH,
+        CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_PING, COM_QUERY, COM_QUIT,
+        COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE, ERR_HEADER, OK_HEADER,
+        SERVER_MORE_RESULTS_EXISTS, TYPE_LONGLONG,
     };
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -348,6 +349,58 @@ mod tests {
         let mut close = vec![COM_STMT_CLOSE];
         close.extend_from_slice(&stmt_id.to_le_bytes());
         client.pkt.write_packet(&close).unwrap();
+        client.quit();
+    }
+
+    #[test]
+    fn test_multi_resultset() {
+        let addr = start_server();
+        let mut client = TestClient::connect(addr);
+        let hello = client.pkt.read_packet().unwrap();
+        assert_eq!(hello[0], 10);
+        let mut resp = Vec::new();
+        let cap = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_DEPRECATE_EOF
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        resp.extend_from_slice(&cap.to_le_bytes());
+        resp.extend_from_slice(&0x1000000u32.to_le_bytes());
+        resp.push(45);
+        resp.extend_from_slice(&[0u8; 23]);
+        write_null_str(&mut resp, "root");
+        resp.push(0);
+        client.pkt.write_packet(&resp).unwrap();
+        assert_eq!(client.pkt.read_packet().unwrap()[0], OK_HEADER);
+
+        client.pkt.reset_sequence();
+        let mut payload = vec![COM_QUERY];
+        payload.extend_from_slice(b"SELECT 1; SELECT 2");
+        client.pkt.write_packet(&payload).unwrap();
+
+        // First resultset
+        let first = client.pkt.read_packet().unwrap();
+        let mut i = 0;
+        assert_eq!(read_lenenc(&first, &mut i).unwrap(), 1);
+        let _ = client.pkt.read_packet().unwrap(); // coldef
+        let _ = client.pkt.read_packet().unwrap(); // row
+        let eof1 = client.pkt.read_packet().unwrap();
+        assert_eq!(eof1.first(), Some(&OK_HEADER));
+        // OK: header + affected_rows(0) + last_insert_id(0) + status
+        let status1 = u16::from_le_bytes([eof1[3], eof1[4]]);
+        assert_ne!(status1 & SERVER_MORE_RESULTS_EXISTS, 0, "{eof1:?}");
+
+        // Second resultset
+        let second = client.pkt.read_packet().unwrap();
+        let mut i = 0;
+        assert_eq!(read_lenenc(&second, &mut i).unwrap(), 1);
+        let _ = client.pkt.read_packet().unwrap();
+        let _ = client.pkt.read_packet().unwrap();
+        let eof2 = client.pkt.read_packet().unwrap();
+        assert_eq!(eof2.first(), Some(&OK_HEADER));
+        let status2 = u16::from_le_bytes([eof2[3], eof2[4]]);
+        assert_eq!(status2 & SERVER_MORE_RESULTS_EXISTS, 0, "{eof2:?}");
         client.quit();
     }
 

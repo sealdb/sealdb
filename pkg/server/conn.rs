@@ -9,10 +9,11 @@ use sealdb_errno::{ERR_ACCESS_DENIED_ERROR, ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_executor::QueryResult;
 use sealdb_parser::ast::UserIdentity;
 use sealdb_parser::mysql::{
-    CLIENT_COMPRESS, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH,
-    CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB,
-    COM_PING, COM_QUERY, COM_QUIT, COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE,
-    DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID, EOF_HEADER, ERR_HEADER, NULL_LENENC, OK_HEADER,
+    CLIENT_COMPRESS, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_MULTI_RESULTS,
+    CLIENT_MULTI_STATEMENTS, CLIENT_PLUGIN_AUTH, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
+    CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT,
+    COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_PREPARE, DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID,
+    EOF_HEADER, ERR_HEADER, NULL_LENENC, OK_HEADER, SERVER_MORE_RESULTS_EXISTS,
     SERVER_STATUS_AUTOCOMMIT, SERVER_VERSION, TYPE_LONGLONG, TYPE_NULL, TYPE_VAR_STRING,
 };
 use sealdb_session::Session;
@@ -333,35 +334,46 @@ impl ClientConn {
         }
         let deprecate_eof = self.capability & CLIENT_DEPRECATE_EOF != 0;
         if !deprecate_eof {
-            self.write_eof()?;
+            self.write_eof_status(false)?;
         }
         for row in &result.rows {
             self.pkt.write_packet(&binary_row_packet(row))?;
         }
         if deprecate_eof {
-            self.write_ok()
+            self.write_ok_status(false)
         } else {
-            self.write_eof()
+            self.write_eof_status(false)
         }
     }
 
     fn handle_query(&mut self, sql: &str) -> Result<()> {
         if sql.trim().is_empty() {
-            return self.write_ok();
+            return self.write_ok_status(false);
         }
-        match self.session.execute_stmt(sql) {
-            Ok(result) => {
-                if !result.columns.is_empty() {
-                    self.write_resultset(&result)
-                } else {
-                    self.write_ok()
+        // Multi-statements require CLIENT_MULTI_STATEMENTS; otherwise take first only.
+        let sql = if self.capability & CLIENT_MULTI_STATEMENTS == 0 {
+            sql.split(';').next().unwrap_or(sql)
+        } else {
+            sql
+        };
+        match self.session.execute_all(sql) {
+            Ok(results) => {
+                let multi = self.capability & CLIENT_MULTI_RESULTS != 0 && results.len() > 1;
+                for (i, result) in results.iter().enumerate() {
+                    let more = multi && i + 1 < results.len();
+                    if result.columns.is_empty() {
+                        self.write_ok_status(more)?;
+                    } else {
+                        self.write_resultset_status(result, more)?;
+                    }
                 }
+                Ok(())
             }
             Err(err) => self.write_error(&err),
         }
     }
 
-    fn write_resultset(&mut self, result: &QueryResult) -> Result<()> {
+    fn write_resultset_status(&mut self, result: &QueryResult, more: bool) -> Result<()> {
         let mut count = Vec::new();
         write_lenenc(&mut count, result.columns.len() as u64);
         self.pkt.write_packet(&count)?;
@@ -370,31 +382,47 @@ impl ClientConn {
         }
         let deprecate_eof = self.capability & CLIENT_DEPRECATE_EOF != 0;
         if !deprecate_eof {
-            self.write_eof()?;
+            self.write_eof_status(more)?;
         }
         for row in &result.rows {
             self.pkt.write_packet(&row_packet(row))?;
         }
         if deprecate_eof {
-            self.write_ok()
+            self.write_ok_status(more)
         } else {
-            self.write_eof()
+            self.write_eof_status(more)
         }
     }
 
     fn write_ok(&mut self) -> Result<()> {
+        self.write_ok_status(false)
+    }
+
+    fn write_ok_status(&mut self, more: bool) -> Result<()> {
+        let mut status = SERVER_STATUS_AUTOCOMMIT;
+        if more {
+            status |= SERVER_MORE_RESULTS_EXISTS;
+        }
         let mut payload = vec![OK_HEADER];
         write_lenenc(&mut payload, 0);
         write_lenenc(&mut payload, 0);
-        payload.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+        payload.extend_from_slice(&status.to_le_bytes());
         payload.extend_from_slice(&0u16.to_le_bytes());
         self.pkt.write_packet(&payload)
     }
 
     fn write_eof(&mut self) -> Result<()> {
+        self.write_eof_status(false)
+    }
+
+    fn write_eof_status(&mut self, more: bool) -> Result<()> {
+        let mut status = SERVER_STATUS_AUTOCOMMIT;
+        if more {
+            status |= SERVER_MORE_RESULTS_EXISTS;
+        }
         let mut payload = vec![EOF_HEADER];
         payload.extend_from_slice(&0u16.to_le_bytes());
-        payload.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+        payload.extend_from_slice(&status.to_le_bytes());
         self.pkt.write_packet(&payload)
     }
 
