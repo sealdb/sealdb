@@ -42,6 +42,7 @@ impl ExecutorBuilder {
                 domain,
                 stmt.clone(),
                 current_db.to_string(),
+                true,
             ))),
             PhysicalPlan::Projection { child, .. } => {
                 let select = stmt

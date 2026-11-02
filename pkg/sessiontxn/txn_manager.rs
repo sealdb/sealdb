@@ -3,7 +3,9 @@ use sealdb_kv::{IsolationLevel, Storage, TxnHandle};
 use std::sync::Arc;
 
 /// Session-owned transaction lifecycle for F12/F13/C3.
-/// Completeness wave / not this feature: XA, transactional DDL, blocking lock wait.
+/// Completeness wave / not this feature: XA, blocking lock wait.
+/// CREATE/DROP DATABASE|TABLE in an explicit txn is leftover-closed on
+/// Domain in-memory schema; CREATE INDEX backfill KV stays F18.
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,
@@ -31,6 +33,12 @@ impl TxnManager {
 
     pub fn schema_ver(&self) -> i64 {
         self.schema_ver
+    }
+
+    /// After this session's own in-txn DDL so SchemaChecker 8028 does not
+    /// reject later statements in the same transaction.
+    pub fn set_schema_ver(&mut self, schema_ver: i64) {
+        self.schema_ver = schema_ver;
     }
 
     pub fn isolation(&self) -> IsolationLevel {

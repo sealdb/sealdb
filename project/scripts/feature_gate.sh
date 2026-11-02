@@ -113,6 +113,7 @@ case "$FEATURE" in
     run execute-txn cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); COMMIT; SELECT * FROM db1.t"
     run execute-savepoint cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); SAVEPOINT sp1; INSERT INTO db1.t VALUES (2, 'b'); ROLLBACK TO sp1; SELECT * FROM db1.t; RELEASE SAVEPOINT sp1; COMMIT"
     run execute-isolation cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); START TRANSACTION READ ONLY; SELECT * FROM db1.t; ROLLBACK; START TRANSACTION READ WRITE; INSERT INTO db1.t VALUES (2, 'b'); COMMIT AND CHAIN; INSERT INTO db1.t VALUES (3, 'c'); COMMIT; SELECT * FROM db1.t ORDER BY id"
+    run execute-txn-ddl cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); ROLLBACK; BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); COMMIT; SELECT * FROM db1.t2"
     ;;
   F13)
     run execute-for-update cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); BEGIN PESSIMISTIC; SELECT * FROM db1.t FOR UPDATE; UPDATE db1.t SET name = 'b' WHERE id = 1; COMMIT; SELECT * FROM db1.t"
