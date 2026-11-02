@@ -359,6 +359,10 @@ pub enum AlterTableSpec {
         old_name: String,
         new_name: String,
     },
+    /// `ALGORITHM [=] DEFAULT|INSTANT|INPLACE|COPY` — accepted and ignored.
+    Algorithm(String),
+    /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
+    Lock(String),
 }
 
 impl AlterTableSpec {
@@ -437,6 +441,16 @@ impl AlterTableSpec {
                 ctx.write_name(old_name);
                 ctx.write_str(" TO ");
                 ctx.write_name(new_name);
+                Ok(())
+            }
+            AlterTableSpec::Algorithm(name) => {
+                ctx.write_str("ALGORITHM=");
+                ctx.write_str(name);
+                Ok(())
+            }
+            AlterTableSpec::Lock(name) => {
+                ctx.write_str("LOCK=");
+                ctx.write_str(name);
                 Ok(())
             }
         }

@@ -1,6 +1,7 @@
 // F18 core: CREATE/DROP INDEX schema + UNIQUE INDEX uniqueness + in-place backfill.
+// ALGORITHM/LOCK on CREATE INDEX are accepted and ignored.
 // Completeness wave / not this feature: async job queue, concurrent ingest,
-// invisible, ALGORITHM/LOCK.
+// invisible.
 use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{

@@ -6,7 +6,6 @@ wave. Rejected via `Error::unsupported` in
 `pkg/ddl/index.rs` / `pkg/ddl/alter.rs`.
 
 - Async DDL job queue / coprocessor reorg workers / concurrent ingest
-- `ALGORITHM` / `LOCK`
 - `FULLTEXT` / prefix indexes
 - Generated columns, partitions, multi-table ALTER
 - Transactional DDL

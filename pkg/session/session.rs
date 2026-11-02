@@ -3354,6 +3354,32 @@ mod tests {
     }
 
     #[test]
+    fn test_algorithm_lock() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT, ALGORITHM=INPLACE, LOCK=NONE")
+            .unwrap();
+        session
+            .execute_stmt("CREATE INDEX idx_age ON db1.t (age) ALGORITHM=INPLACE LOCK=NONE")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (2, 'b', 10)")
+            .unwrap();
+        let hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE age = 10")
+            .unwrap();
+        assert_eq!(
+            hit.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string(), "10".to_string()]]
+        );
+    }
+
+    #[test]
     fn test_partition_prune() {
         let session = Session::new();
         session
