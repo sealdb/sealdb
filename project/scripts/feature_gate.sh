@@ -256,6 +256,7 @@ case "$FEATURE" in
     run execute-collation cargo test -q -p sealdb-session --lib test_set_names_and_ci_collation
     run execute-unicode-weights cargo test -q -p sealdb-session --lib test_unicode_ci_weights_compare_and_order
     run execute-gbk-latin1 cargo test -q -p sealdb-session --lib test_gbk_latin1_charset_and_collation
+    run execute-only-full-group-by cargo test -q -p sealdb-session --lib test_only_full_group_by
     ;;
 esac
 

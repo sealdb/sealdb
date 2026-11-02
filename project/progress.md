@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C5 gbk-latin1 MVB；完整性波 C4=[] → C2=[] → C5）  
+> 最后更新：2026-11-03（C5 only-full-group-by MVB；完整性波 C4=[] → C2=[] → C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C5（only-full-group-by）
+- **完成**:
+  - Session `check_only_full_group_by`：`sql_mode` 含 `ONLY_FULL_GROUP_BY` 且有 GROUP BY 时拒绝非聚合 / 非 GROUP BY 列（ERR 1055）
+  - HashAgg Const + AnyValue：关 mode 后同查询可执行
+  - C5 gate `execute-only-full-group-by`；`status.json` / leftover 去掉 `only-full-group-by`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_only_full_group_by -- --exact`
+  - `./project/scripts/feature_gate.sh C5`
+- **下一步**:
+  - C5 `set-global` → leftover collation suites
 
 ### 2026-11-03
 
