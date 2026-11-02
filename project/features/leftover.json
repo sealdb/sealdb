@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F15": [
-      "union-in-subquery",
       "parallel-union"
     ],
     "F16": [

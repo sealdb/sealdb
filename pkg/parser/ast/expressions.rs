@@ -1,4 +1,4 @@
-use super::dml::{ByItem, SelectStmt};
+use super::dml::{ByItem, ResultSetNode, SelectStmt};
 use crate::format::RestoreCtx;
 use crate::opcode::Op;
 use sealdb_errno::Result;
@@ -250,18 +250,24 @@ impl ExprNode {
                     item.expr.collect_columns(out);
                 }
             }
-            ExprNode::Exists(e) => collect_select_columns(&e.query, out),
+            ExprNode::Exists(e) => collect_result_set_columns(&e.query, out),
             ExprNode::InSubquery(i) => {
                 i.expr.collect_columns(out);
-                collect_select_columns(&i.query, out);
+                collect_result_set_columns(&i.query, out);
             }
-            ExprNode::ScalarSubquery(s) => collect_select_columns(&s.query, out),
+            ExprNode::ScalarSubquery(s) => collect_result_set_columns(&s.query, out),
             ExprNode::QuantifiedCmp(q) => {
                 q.expr.collect_columns(out);
-                collect_select_columns(&q.query, out);
+                collect_result_set_columns(&q.query, out);
             }
             ExprNode::Value(_) => {}
         }
+    }
+}
+
+fn collect_result_set_columns(query: &ResultSetNode, out: &mut Vec<(Option<String>, String)>) {
+    for select in query.selects() {
+        collect_select_columns(select, out);
     }
 }
 
@@ -401,7 +407,7 @@ impl FuncCastExpr {
 #[derive(Clone, Debug)]
 pub struct ExistsExpr {
     pub not: bool,
-    pub query: Box<SelectStmt>,
+    pub query: Box<ResultSetNode>,
 }
 
 impl ExistsExpr {
@@ -420,7 +426,7 @@ impl ExistsExpr {
 pub struct InSubqueryExpr {
     pub expr: Box<ExprNode>,
     pub not: bool,
-    pub query: Box<SelectStmt>,
+    pub query: Box<ResultSetNode>,
 }
 
 impl InSubqueryExpr {
@@ -592,7 +598,7 @@ pub struct QuantifiedCmpExpr {
     pub expr: Box<ExprNode>,
     pub op: Op,
     pub all: bool,
-    pub query: Box<SelectStmt>,
+    pub query: Box<ResultSetNode>,
 }
 
 impl QuantifiedCmpExpr {
@@ -613,7 +619,7 @@ impl QuantifiedCmpExpr {
 
 #[derive(Clone, Debug)]
 pub struct ScalarSubqueryExpr {
-    pub query: Box<SelectStmt>,
+    pub query: Box<ResultSetNode>,
 }
 
 impl ScalarSubqueryExpr {

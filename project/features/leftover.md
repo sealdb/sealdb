@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F15
 
-- `union-in-subquery`
 - `parallel-union`
 
 ### F16
