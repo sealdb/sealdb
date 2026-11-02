@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 184,
-  "manifest_entries": 133,
+  "rs_files": 185,
+  "manifest_entries": 134,
   "status_counts": {
-    "not-started": 1548,
-    "partial": 126,
+    "not-started": 1547,
+    "partial": 127,
     "reimplemented": 4,
     "ported": 3
   },
@@ -268,11 +268,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 17,
-      "missing": 199,
+      "rs": 18,
+      "missing": 198,
       "status": {
-        "not-started": 199,
-        "partial": 17
+        "not-started": 198,
+        "partial": 18
       }
     },
     "pkg/plugin": {
@@ -6859,14 +6859,14 @@
       "rs_path": "pkg/planner/core/rule_join_reorder.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "two-table costed JoinReorder builds cheaper side; n-table DP deferred"
+      "notes": "two-table costed JoinReorder builds cheaper side; n-table via rule_join_reorder_dp"
     },
     {
       "go_path": "pkg/planner/core/rule_join_reorder_dp.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_join_reorder_dp.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "left/right-deep bitmask DP for Inner equality joins (3..8 tables); full bushy deferred"
     },
     {
       "go_path": "pkg/planner/core/rule_join_reorder_greedy.go",

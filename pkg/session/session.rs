@@ -4515,6 +4515,82 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_n_table_join_reorder_dp() {
+        let session = Session::new();
+        // Skewed sizes: naive SQL order is big ⋈ mid ⋈ small (left-deep).
+        // DP joins mid+small first, then lets big probe that tree.
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; \
+                 CREATE TABLE db1.big (id INT); \
+                 CREATE TABLE db1.mid (id INT); \
+                 CREATE TABLE db1.small (id INT); \
+                 INSERT INTO db1.big VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),\
+                   (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),\
+                   (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),\
+                   (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),\
+                   (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),\
+                   (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),\
+                   (61),(62),(63),(64),(65),(66),(67),(68),(69),(70),\
+                   (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),\
+                   (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),\
+                   (91),(92),(93),(94),(95),(96),(97),(98),(99),(100); \
+                 INSERT INTO db1.mid VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10); \
+                 INSERT INTO db1.small VALUES (1); \
+                 ANALYZE TABLE db1.big; ANALYZE TABLE db1.mid; ANALYZE TABLE db1.small",
+            )
+            .unwrap();
+        let join = session
+            .execute_stmt(
+                "EXPLAIN SELECT * FROM db1.big JOIN db1.mid ON big.id = mid.id \
+                 JOIN db1.small ON mid.id = small.id",
+            )
+            .unwrap();
+        let rows = join.display_rows();
+        let text = rows
+            .iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let root = rows
+            .iter()
+            .position(|r| {
+                r.first()
+                    .map(|id| id.contains("HashJoin") && !id.contains("└─") && !id.contains("├─"))
+                    .unwrap_or(false)
+            })
+            .expect(&text);
+        // Naive left-deep starts with a nested HashJoin on the left; DP puts
+        // TableReader(big) as the probe (left) child of the root HashJoin.
+        let left_child = rows.get(root + 1).expect(&text);
+        assert!(
+            left_child
+                .first()
+                .map(|id| id.contains("TableReader"))
+                .unwrap_or(false),
+            "expected TableReader probe under root HashJoin, got:\n{text}"
+        );
+        assert!(
+            text.matches("HashJoin").count() >= 2,
+            "expected nested HashJoin build side:\n{text}"
+        );
+        // Probe subtree lists table:big before mid/small (cop TableFullScan).
+        let big_pos = text.find("table:big").expect(&text);
+        let mid_pos = text.find("table:mid").expect(&text);
+        let small_pos = text.find("table:small").expect(&text);
+        assert!(big_pos < mid_pos && mid_pos < small_pos, "{text}");
+
+        let result = session
+            .execute_stmt(
+                "SELECT big.id, mid.id, small.id FROM db1.big \
+                 JOIN db1.mid ON big.id = mid.id \
+                 JOIN db1.small ON mid.id = small.id",
+            )
+            .unwrap();
+        assert_eq!(result.display_rows().len(), 1, "{text}");
+    }
+
+    #[test]
     fn test_explain_analyze_table_scan_act_rows() {
         let session = Session::new();
         session
