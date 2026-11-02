@@ -270,13 +270,13 @@
       "status": "partial",
       "rust": "pkg/planner/core/plan_cost.rs",
       "phase": 10,
-      "notes": "scan/net/cpu/hash factors for skyline and JoinReorder"
+      "notes": "scan/net/cpu/hash + sort/topn/limit costs; asymmetric HashJoin build/probe"
     },
     "pkg/planner/core/rule_join_reorder.go": {
       "status": "partial",
       "rust": "pkg/planner/core/rule_join_reorder.rs",
       "phase": 10,
-      "notes": "two-table Inner HashJoin builds the smaller side; n-table DP deferred"
+      "notes": "two-table costed JoinReorder builds cheaper side; n-table DP deferred"
     },
     "pkg/meta/meta.go": {
       "status": "partial",

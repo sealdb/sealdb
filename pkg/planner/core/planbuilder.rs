@@ -1,6 +1,7 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
 use super::plan_cost::{
-    eq_row_count_value, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
+    eq_row_count_value, index_lookup_cost, point_get_cost, prefer_topn, table_row_count,
+    table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_partition_processor::{PartitionPruneMode, plan_partitions};
@@ -12,7 +13,7 @@ use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
 use sealdb_parser::ast::{
     CteMaterialize, JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
 };
-use sealdb_statistics::Handle;
+use sealdb_statistics::{Handle, Table};
 use sealdb_types::Datum;
 
 pub struct PlanBuilder;
@@ -89,11 +90,17 @@ impl PlanBuilder {
                         },
                     };
                 }
+                let est_rows = select
+                    .from
+                    .as_ref()
+                    .map(|from| table_row_count(stats, from, current_db))
+                    .unwrap_or(1.0);
                 plan = apply_order_limit(
                     plan,
                     !select.order_by.is_empty(),
                     select.limit,
                     select.offset,
+                    est_rows,
                 );
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
@@ -221,7 +228,13 @@ impl PlanBuilder {
                         )?),
                     };
                 }
-                plan = apply_order_limit(plan, !set.order_by.is_empty(), set.limit, set.offset);
+                plan = apply_order_limit(
+                    plan,
+                    !set.order_by.is_empty(),
+                    set.limit,
+                    set.offset,
+                    Table::PSEUDO_ROW_COUNT as f64,
+                );
                 Ok(plan)
             }
         }
@@ -400,9 +413,19 @@ fn apply_order_limit(
     ordered: bool,
     limit: Option<u64>,
     offset: Option<u64>,
+    est_rows: f64,
 ) -> PhysicalPlan {
-    if ordered && limit.is_some() {
-        return PhysicalPlan::TopN {
+    if ordered && let Some(lim) = limit {
+        // F21 join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
+        if offset.unwrap_or(0) == 0 && prefer_topn(est_rows, lim) {
+            return PhysicalPlan::TopN {
+                child: Box::new(plan),
+            };
+        }
+        plan = PhysicalPlan::Sort {
+            child: Box::new(plan),
+        };
+        return PhysicalPlan::Limit {
             child: Box::new(plan),
         };
     }
