@@ -21,17 +21,22 @@ FEATURE_HINTS = {
     "AlterTableStmt": "F18",
     "CreateIndexStmt": "F18",
     "DropIndexStmt": "F18",
+    "RenameTableStmt": "F18",
+    "AdminStmt": "F18",
     "ShowStmt": "F11",
     "UseStmt": "F11",
     "GrantStmt": "F20",
     "RevokeStmt": "F20",
+    "DropUserStmt": "F20",
+    "GrantRoleStmt": "F20",
+    "RevokeRoleStmt": "F20",
     "AnalyzeTableStmt": "F21",
     "BeginStmt": "F12",
     "CommitStmt": "F12",
     "RollbackStmt": "F12",
     "ExplainStmt": "C2",
-    "SetTxnStmt": "C3",
     "ExplainForStmt": "C2",
+    "SetTxnStmt": "C3",
     "PrepareStmt": "C4",
     "ExecuteStmt": "C4",
     "DeallocateStmt": "C4",
@@ -44,7 +49,51 @@ FEATURE_HINTS = {
     "ImportIntoStmt": "C6",
     "LoadDataStmt": "C6",
     "CalibrateResourceStmt": "C6",
+    "TraceStmt": "C6",
+    "PlanReplayerStmt": "C6",
+    "LoadStatsStmt": "C6",
+    "LockStatsStmt": "C6",
+    "UnlockStatsStmt": "C6",
+    "FlashBackTableStmt": "C6",
+    "FlashBackDatabaseStmt": "C6",
+    "FlashBackToTimestampStmt": "C6",
+    "RecoverTableStmt": "C6",
+    "CreateResourceGroupStmt": "C6",
+    "SetResourceGroupStmt": "C6",
+    "CreateViewStmt": "C6",
+    "CreateSequenceStmt": "C6",
+    "DropSequenceStmt": "C6",
+    "AlterSequenceStmt": "C6",
+    "DropPlacementPolicyStmt": "C6",
+    "CompactTableStmt": "C6",
+    "DistributeTableStmt": "C6",
+    "SplitRegionStmt": "C6",
+    "RecommendIndexStmt": "C6",
+    "AddQueryWatchStmt": "C6",
+    "DropQueryWatchStmt": "C6",
 }
+
+# Frozen allowlist: PlanBuilder kinds intentionally left `unmapped` (not C6 and
+# not owned by a closed F*/C2–C5 wave). C1 verifies open unmapped == this set.
+UNMAPPED_ALLOWLIST = frozenset(
+    {
+        "DoStmt",
+        "BinlogStmt",
+        "ChangeStmt",
+        "FlushStmt",
+        "AlterInstanceStmt",
+        "RenameUserStmt",
+        "KillStmt",
+        "SetPwdStmt",
+        "ShutdownStmt",
+        "AlterDatabaseStmt",
+        "TruncateTableStmt",
+        "LockTablesStmt",
+        "CleanupTableLockStmt",
+        "RepairTableStmt",
+        "OptimizeTableStmt",
+    }
+)
 
 SUITE_HINTS = {
     "access_path_selection": "C2",
@@ -91,6 +140,15 @@ SUITE_HINTS = {
     "window_function": "F16",
 }
 
+# Suites whose MVB is covered by a named feature_gate.sh step (not full suite port).
+SUITE_GATE_COVERAGE = {
+    "C2": ("execute-explain", ("explain", "index_merge", "index_join")),
+    "C5": (
+        "execute-leftover-collation-suites",
+        ("new_character_set", "collation_", "common_collation"),
+    ),
+}
+
 CORE_OWNED = {
     "F01",
     "F02",
@@ -116,6 +174,9 @@ CORE_OWNED = {
     "F22",
 }
 
+# Completeness waves with gaps []; their stmts leave the open leftover surface.
+COMPLETENESS_CLOSED = {"C2", "C3", "C4", "C5"}
+
 
 def collect_go_switch_idents(text: str) -> list[str]:
     found = []
@@ -135,8 +196,9 @@ def owners_of(hint: str) -> set[str]:
     return {part.strip() for part in hint.split("/") if part.strip()}
 
 
-def is_core_owned(hint: str) -> bool:
-    return bool(owners_of(hint) & CORE_OWNED)
+def is_closed_owned(hint: str) -> bool:
+    owners = owners_of(hint)
+    return bool(owners & CORE_OWNED) or bool(owners & COMPLETENESS_CLOSED)
 
 
 def collect_inventory(tidb: Path, rust: Path) -> dict:
@@ -167,7 +229,7 @@ def collect_inventory(tidb: Path, rust: Path) -> dict:
             continue
         seen.add(name)
         hint = FEATURE_HINTS.get(name, "unmapped")
-        if is_core_owned(hint):
+        if is_closed_owned(hint):
             continue
         open_stmts.append({"stmt": ident, "owner": hint})
 
@@ -183,6 +245,7 @@ def collect_inventory(tidb: Path, rust: Path) -> dict:
         "core_ported": core_ported,
         "feature_gaps": feature_gaps,
         "completeness_gaps": completeness_gaps,
+        "unmapped_allowlist": sorted(UNMAPPED_ALLOWLIST),
         "open_stmts": open_stmts,
         "suites": suites,
     }
@@ -221,7 +284,18 @@ def render_markdown(inv: dict) -> str:
     else:
         lines.extend(["- none", ""])
 
-    lines.extend(["## PlanBuilder statement kinds still open", ""])
+    lines.extend(
+        [
+            "## Frozen unmapped PlanBuilder allowlist",
+            "",
+            "These kinds stay `unmapped` on purpose (not claimed by F*/C2–C5, not C6).",
+            "C1 `--check` requires open `unmapped` stmts to equal this set.",
+            "",
+        ]
+    )
+    for name in inv.get("unmapped_allowlist") or sorted(UNMAPPED_ALLOWLIST):
+        lines.append(f"- `{name}`")
+    lines.extend(["", "## PlanBuilder statement kinds still open", ""])
     if inv["open_stmts"]:
         for item in inv["open_stmts"]:
             lines.append(f"- `{item['stmt']}` → {item['owner']}")
@@ -236,12 +310,13 @@ def render_markdown(inv: dict) -> str:
             "## Completeness wave notes",
             "",
             "- C1 is the frozen leftover denominator, not a pass-rate claim.",
-            "- Feature (F*) gaps are empty; C2/C3/C4/C5 completeness gaps closed; remaining is C1 (C6 deferred).",
+            "- Feature (F*) gaps are empty; C1–C5 completeness gaps closed; C6 deferred.",
             "- C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).",
             "- C3: completeness gaps closed (MDL + schema-lease 8027 + SERIALIZABLE→RR + SAVEPOINT F12 + same-cluster TiKV cross-session when SEALDB_TIKV=1).",
             "- C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).",
             "- C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).",
-            "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.",
+            "- Leftover suite execution: suites are owner-classified; C2 `explain*` / `index_merge` MVB via `execute-explain*`; C5 collation / `new_character_set*` via `execute-leftover-collation-suites`. Full integrationtest port is not claimed.",
+            "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins, plus C6-owned open stmts above.",
             "",
         ]
     )
@@ -260,31 +335,137 @@ def lock_cases(inv: dict) -> list[str]:
     return cases
 
 
-def check_inventory(inv: dict, rust: Path) -> list[str]:
+def check_unmapped_allowlist(inv: dict) -> list[str]:
+    errors = []
+    open_unmapped = {
+        stmt_name(item["stmt"])
+        for item in inv["open_stmts"]
+        if item.get("owner") == "unmapped"
+    }
+    allow = set(inv.get("unmapped_allowlist") or UNMAPPED_ALLOWLIST)
+    unexpected = sorted(open_unmapped - allow)
+    missing = sorted(allow - open_unmapped)
+    if unexpected:
+        errors.append(
+            "unmapped stmts not on frozen allowlist: " + ", ".join(unexpected)
+        )
+    if missing:
+        errors.append(
+            "allowlist entries missing from open unmapped stmts: " + ", ".join(missing)
+        )
+    return errors
+
+
+def check_stale_gap_labels(inv: dict, rust: Path) -> list[str]:
     errors = []
     features = json.loads((rust / "project/features/status.json").read_text())
     for key, item in features.get("items", {}).items():
         if item.get("status") != "core-ported":
             continue
-        expected = list(item.get("gaps") or [])
+        gaps = list(item.get("gaps") or [])
+        if key.startswith("F") and gaps:
+            errors.append(f"F* feature {key} still has non-empty gaps: {gaps}")
+        if key.startswith("C") and key != "C6" and gaps:
+            errors.append(
+                f"completeness feature {key} still has non-empty gaps: {gaps}"
+            )
+        expected = gaps
         if key.startswith("C"):
             got = inv.get("completeness_gaps", {}).get(key, [])
             if expected != got:
                 errors.append(
                     f"completeness gaps mismatch for {key}: status={expected} leftover={got}"
                 )
+        else:
+            got = inv["feature_gaps"].get(key, [])
+            if expected != got:
+                errors.append(
+                    f"gaps mismatch for {key}: status={expected} leftover={got}"
+                )
+    return errors
+
+
+def check_suite_smoke(inv: dict, rust: Path) -> list[str]:
+    errors = []
+    for suite in inv["suites"]:
+        owner = (suite.get("owner") or "").strip()
+        if not owner:
+            errors.append(f"suite {suite['name']} has empty owner")
+        elif owner == "unmapped":
+            errors.append(f"suite {suite['name']} is unmapped (must be classified)")
+
+    gate = (rust / "project/scripts/feature_gate.sh").read_text(encoding="utf-8")
+    covered_owners = []
+    for owner, (gate_step, prefixes) in SUITE_GATE_COVERAGE.items():
+        owned = [s["name"] for s in inv["suites"] if s.get("owner") == owner]
+        if not owned:
             continue
-        got = inv["feature_gaps"].get(key, [])
-        if expected != got:
-            errors.append(f"gaps mismatch for {key}: status={expected} leftover={got}")
+        if gate_step not in gate:
+            errors.append(
+                f"feature_gate.sh missing {gate_step} for {owner}-owned leftover suites"
+            )
+            continue
+        if not any(
+            any(name.startswith(prefix) or name == prefix for prefix in prefixes)
+            for name in owned
+        ):
+            errors.append(
+                f"no {owner}-owned leftover suite matches coverage prefixes {prefixes}"
+            )
+            continue
+        covered_owners.append(owner)
+
+    if "C2" not in covered_owners and "C5" not in covered_owners:
+        errors.append(
+            "expected at least one C2/C5-owned leftover suite covered by a feature_gate test"
+        )
+    return errors
+
+
+def check_inventory(inv: dict, rust: Path) -> list[str]:
+    errors = []
+    errors.extend(check_stale_gap_labels(inv, rust))
+    errors.extend(check_unmapped_allowlist(inv))
     if not inv["open_stmts"]:
-        errors.append("expected open PlanBuilder statement kinds")
+        errors.append("expected open PlanBuilder statement kinds (C6 + allowlist)")
     if not inv["suites"]:
         errors.append("expected integrationtest leftover suites")
-    # F* feature gaps may be empty after leftover close; C* completeness gaps remain.
-    if not inv["feature_gaps"] and not inv.get("completeness_gaps"):
-        errors.append("expected feature or completeness gaps in the C1 denominator")
+    # Terminal honest state: F* and C1–C5 gaps empty; open_stmts/suites remain.
+    if inv["feature_gaps"] or inv.get("completeness_gaps"):
+        errors.append(
+            "expected empty feature_gaps and completeness_gaps after C1–C5 close "
+            f"(feature_gaps={inv['feature_gaps']}, completeness_gaps={inv.get('completeness_gaps')})"
+        )
     return errors
+
+
+def write_corpus_lock(inv: dict, rust: Path) -> Path:
+    path = rust / "project/reports/features/C1/corpus.lock.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cases = lock_cases(inv)
+    payload = {
+        "feature": "C1",
+        "frozen": inv.get("frozen", "2026-11-01"),
+        "source": [
+            "project/features/status.json gaps[]",
+            "TiDB pkg/planner/core/planbuilder.go Build",
+            "TiDB tests/integrationtest/t/*.test",
+            "FEATURE_HINTS / UNMAPPED_ALLOWLIST / SUITE_HINTS",
+        ],
+        "cases": cases,
+        "counts": {
+            "feature_gaps": sum(len(v) for v in inv["feature_gaps"].values()),
+            "completeness_gaps": sum(
+                len(v) for v in (inv.get("completeness_gaps") or {}).values()
+            ),
+            "open_stmts": len(inv["open_stmts"]),
+            "suites": len(inv["suites"]),
+            "unmapped_allowlist": len(inv.get("unmapped_allowlist") or []),
+            "total": len(cases),
+        },
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def main() -> int:
@@ -294,6 +475,16 @@ def main() -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--json", default="")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument(
+        "--suite-smoke",
+        action="store_true",
+        help="assert leftover suites are classified and C2/C5 MVB gate coverage exists",
+    )
+    ap.add_argument(
+        "--write-corpus-lock",
+        action="store_true",
+        help="refresh project/reports/features/C1/corpus.lock.json from inventory",
+    )
     args = ap.parse_args()
 
     rust = Path(args.rust_root)
@@ -314,6 +505,27 @@ def main() -> int:
         path.write_text(json.dumps(inv, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {path}")
 
+    if args.write_corpus_lock:
+        lock_path = write_corpus_lock(inv, rust)
+        print(f"wrote {lock_path}")
+
+    if args.suite_smoke:
+        errors = check_suite_smoke(inv, rust)
+        if errors:
+            print("FAIL: leftover suite smoke")
+            for err in errors:
+                print(f"- {err}")
+            return 1
+        print("PASS: leftover suite smoke")
+        print(
+            "classified suites: "
+            f"{len(inv['suites'])}; C2/C5 gate coverage via "
+            + ", ".join(
+                f"{owner}:{step}" for owner, (step, _) in SUITE_GATE_COVERAGE.items()
+            )
+        )
+        return 0
+
     if args.check:
         errors = check_inventory(inv, rust)
         if errors:
@@ -323,6 +535,11 @@ def main() -> int:
             return 1
         print("PASS: leftover inventory check")
         print(f"denominator cases: {len(lock_cases(inv))}")
+        print(
+            f"open_stmts={len(inv['open_stmts'])} "
+            f"(unmapped_allowlist={len(inv.get('unmapped_allowlist') or [])}) "
+            f"suites={len(inv['suites'])}"
+        )
     return 0
 
 

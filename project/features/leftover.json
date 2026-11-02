@@ -35,37 +35,28 @@
     "U3"
   ],
   "feature_gaps": {},
-  "completeness_gaps": {
-    "C1": [
-      "unmapped-stmts",
-      "stale-gap-labels",
-      "leftover-suite-execution"
-    ]
-  },
+  "completeness_gaps": {},
+  "unmapped_allowlist": [
+    "AlterDatabaseStmt",
+    "AlterInstanceStmt",
+    "BinlogStmt",
+    "ChangeStmt",
+    "CleanupTableLockStmt",
+    "DoStmt",
+    "FlushStmt",
+    "KillStmt",
+    "LockTablesStmt",
+    "OptimizeTableStmt",
+    "RenameUserStmt",
+    "RepairTableStmt",
+    "SetPwdStmt",
+    "ShutdownStmt",
+    "TruncateTableStmt"
+  ],
   "open_stmts": [
     {
-      "stmt": "ast.AdminStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.DeallocateStmt",
-      "owner": "C4"
-    },
-    {
-      "stmt": "ast.ExecuteStmt",
-      "owner": "C4"
-    },
-    {
-      "stmt": "ast.ExplainStmt",
-      "owner": "C2"
-    },
-    {
-      "stmt": "ast.ExplainForStmt",
-      "owner": "C2"
-    },
-    {
       "stmt": "ast.TraceStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.ImportIntoStmt",
@@ -77,51 +68,27 @@
     },
     {
       "stmt": "ast.LoadStatsStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.LockStatsStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.UnlockStatsStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.PlanReplayerStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.PrepareStmt",
-      "owner": "C4"
+      "owner": "C6"
     },
     {
       "stmt": "ast.DoStmt",
       "owner": "unmapped"
     },
     {
-      "stmt": "ast.SetStmt",
-      "owner": "C5"
-    },
-    {
-      "stmt": "ast.SetConfigStmt",
-      "owner": "C5"
-    },
-    {
       "stmt": "ast.BinlogStmt",
       "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.CreateBindingStmt",
-      "owner": "C4"
-    },
-    {
-      "stmt": "ast.DropBindingStmt",
-      "owner": "C4"
-    },
-    {
-      "stmt": "ast.SetBindingStmt",
-      "owner": "C4"
     },
     {
       "stmt": "ast.ChangeStmt",
@@ -129,19 +96,19 @@
     },
     {
       "stmt": "ast.SplitRegionStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.DistributeTableStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.CompactTableStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.RecommendIndexStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.FlushStmt",
@@ -165,26 +132,14 @@
     },
     {
       "stmt": "ast.AddQueryWatchStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.DropQueryWatchStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.GrantRoleStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.RevokeRoleStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.KillStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.DropUserStmt",
       "owner": "unmapped"
     },
     {
@@ -197,7 +152,7 @@
     },
     {
       "stmt": "ast.SetResourceGroupStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.AlterDatabaseStmt",
@@ -205,43 +160,39 @@
     },
     {
       "stmt": "ast.AlterSequenceStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.CreateViewStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.CreateSequenceStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.DropSequenceStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.TruncateTableStmt",
       "owner": "unmapped"
     },
     {
-      "stmt": "ast.RenameTableStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.RecoverTableStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.FlashBackTableStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.FlashBackDatabaseStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.FlashBackToTimestampStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.LockTablesStmt",
@@ -257,11 +208,11 @@
     },
     {
       "stmt": "ast.DropPlacementPolicyStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.CreateResourceGroupStmt",
-      "owner": "unmapped"
+      "owner": "C6"
     },
     {
       "stmt": "ast.OptimizeTableStmt",
