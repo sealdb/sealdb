@@ -2526,7 +2526,7 @@
       "rs_path": "pkg/executor/distsql.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "IndexLookUpExecutor double-read for indexed equality"
+      "notes": "IndexLookUpExecutor + IndexMergeExecutor (OR index union + lookup)"
     },
     {
       "go_path": "pkg/executor/expand.go",
@@ -6565,7 +6565,7 @@
       "rs_path": "pkg/planner/core/physical_plans.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE / Explain"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / IndexMerge / Apply / Union / Window / CTE / Explain"
     },
     {
       "go_path": "pkg/planner/core/plan.go",
@@ -6670,7 +6670,7 @@
       "rs_path": "pkg/planner/core/planbuilder.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "Build plus F21/C2 costed skyline IndexLookUp vs TableReader"
+      "notes": "Build plus F21/C2 costed skyline IndexLookUp vs TableReader + IndexMerge OR DNF"
     },
     {
       "go_path": "pkg/planner/core/point_get_plan.go",

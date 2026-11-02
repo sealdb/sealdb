@@ -219,6 +219,7 @@ case "$FEATURE" in
     run execute-explain-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); EXPLAIN ANALYZE SELECT * FROM db1.t WHERE id = 1"
     run execute-cop-task-rows cargo test -q -p sealdb-session --lib session::tests::test_explain_cop_task_rows -- --exact
     run execute-n-table-dp cargo test -q -p sealdb-session --lib session::tests::test_explain_n_table_join_reorder_dp -- --exact
+    run execute-index-merge-join cargo test -q -p sealdb-session --lib session::tests::test_explain_index_merge_or -- --exact
     ;;
   C3)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

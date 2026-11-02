@@ -340,6 +340,53 @@ fn emit_cop_children(
             );
             true
         }
+        PhysicalPlan::IndexMerge {
+            table,
+            indexes,
+            partitions,
+            pushed,
+        } => {
+            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                info = format!("pushed:{}", filter.restore_string());
+            }
+            let n = indexes.len();
+            for (i, index) in indexes.iter().enumerate() {
+                let last_idx = i + 1 == n;
+                // TableRowIDScan always follows as the final sibling.
+                push_explain_row(
+                    rows,
+                    depth,
+                    false,
+                    next_id,
+                    CopRow {
+                        name: "IndexRangeScan",
+                        est: scan_est,
+                        task: "cop",
+                        access: index_access(table, index, partitions),
+                        info: if last_idx {
+                            info.clone()
+                        } else {
+                            "keep order:false".to_string()
+                        },
+                    },
+                );
+            }
+            push_explain_row(
+                rows,
+                depth,
+                true,
+                next_id,
+                CopRow {
+                    name: "TableRowIDScan",
+                    est: scan_est,
+                    task: "cop",
+                    access: table_access(table, partitions),
+                    info: "keep order:false".to_string(),
+                },
+            );
+            true
+        }
         _ => false,
     }
 }
@@ -533,6 +580,42 @@ fn collect_dot_cop_children(
             );
             Some(vec![idx, row])
         }
+        PhysicalPlan::IndexMerge {
+            table,
+            indexes,
+            partitions,
+            pushed,
+        } => {
+            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                info = format!("pushed:{}", filter.restore_string());
+            }
+            let mut ids = Vec::with_capacity(indexes.len() + 1);
+            for (i, index) in indexes.iter().enumerate() {
+                let branch_info = if i + 1 == indexes.len() {
+                    info.as_str()
+                } else {
+                    "keep order:false"
+                };
+                ids.push(push_dot_node(
+                    next_id,
+                    nodes,
+                    "IndexRangeScan",
+                    scan_est,
+                    &index_access(table, index, partitions),
+                    branch_info,
+                ));
+            }
+            ids.push(push_dot_node(
+                next_id,
+                nodes,
+                "TableRowIDScan",
+                scan_est,
+                &table_access(table, partitions),
+                "keep order:false",
+            ));
+            Some(ids)
+        }
         _ => None,
     }
 }
@@ -654,6 +737,18 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 "data:IndexFullScan".to_string()
             },
         ),
+        PhysicalPlan::IndexMerge { indexes, .. } => (
+            "IndexMerge".to_string(),
+            String::new(),
+            format!(
+                "data:{}, TableRowIDScan",
+                indexes
+                    .iter()
+                    .map(|_| "IndexRangeScan")
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ),
         PhysicalPlan::Selection { filter, .. } => (
             "Selection".to_string(),
             String::new(),
@@ -709,6 +804,9 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(_), ..
         }
         | PhysicalPlan::IndexReader {
+            pushed: Some(_), ..
+        }
+        | PhysicalPlan::IndexMerge {
             pushed: Some(_), ..
         } => 8_000.0,
         PhysicalPlan::Limit { child } | PhysicalPlan::TopN { child } => est_rows(child).min(1.0),

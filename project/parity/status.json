@@ -253,12 +253,12 @@
     "pkg/planner/core/planbuilder.go": {
       "status": "partial",
       "phase": 10,
-      "notes": "Build plus F21/C2 costed skyline IndexLookUp vs TableReader"
+      "notes": "Build plus F21/C2 costed skyline IndexLookUp vs TableReader + IndexMerge OR DNF"
     },
     "pkg/planner/core/physical_plans.go": {
       "status": "partial",
       "phase": 10,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE / Explain"
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / IndexMerge / Apply / Union / Window / CTE / Explain"
     },
     "pkg/planner/core/explain.go": {
       "status": "partial",
@@ -442,7 +442,7 @@
     "pkg/executor/distsql.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "IndexLookUpExecutor double-read for indexed equality"
+      "notes": "IndexLookUpExecutor + IndexMergeExecutor (OR index union + lookup)"
     },
     "pkg/executor/coprocessor.go": {
       "status": "partial",

@@ -305,6 +305,7 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
         | PhysicalPlan::BatchPointGet { table, .. }
         | PhysicalPlan::IndexLookUpReader { table, .. }
         | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexMerge { table, .. }
         | PhysicalPlan::HashJoin {
             left_table: table, ..
         } => Some(table.clone()),

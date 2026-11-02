@@ -683,6 +683,37 @@ fn index_plan(
     }
 }
 
+/// Detect pure DNF of column=const arms where each arm has a leading-column index.
+fn index_merge_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let selection = select.selection.as_ref()?;
+    // Only a single top-level OR tree (no AND wrappers) for the MVB.
+    let cnf = selection.split_cnf();
+    if cnf.len() != 1 {
+        return None;
+    }
+    let arms = cnf[0].split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut indexes = Vec::with_capacity(arms.len());
+    for arm in &arms {
+        let (column, _) = arm.eq_column_const()?;
+        let index = info.find_index_covering(&column)?;
+        indexes.push(index.name.o().to_string());
+    }
+    Some(PhysicalPlan::IndexMerge {
+        table: from.name.clone(),
+        indexes,
+        partitions: plan_partitions(info, select.selection.as_ref(), prune_mode),
+        pushed: None,
+    })
+}
+
 fn select_covers_index(
     select: &SelectStmt,
     info: &sealdb_meta::TableInfo,
@@ -837,6 +868,10 @@ fn access_plan(
             if let Some(index) = info.find_index_covering(&range.column) {
                 return index_plan(select, from, info, index, prune_mode);
             }
+        }
+        // C2 IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
+        if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {
+            return plan;
         }
         return PhysicalPlan::table_reader(
             from.name.clone(),

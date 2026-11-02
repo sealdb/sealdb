@@ -88,6 +88,18 @@ impl ExprNode {
         }
     }
 
+    /// Split a DNF (OR of AND-arms). Pure equality arms stay as single nodes.
+    pub fn split_dnf(&self) -> Vec<ExprNode> {
+        match self {
+            ExprNode::Binary(bin) if bin.op == Op::LogicOr => {
+                let mut out = bin.left.split_dnf();
+                out.extend(bin.right.split_dnf());
+                out
+            }
+            other => vec![other.clone()],
+        }
+    }
+
     pub fn compose_cnf(exprs: Vec<ExprNode>) -> Option<ExprNode> {
         exprs.into_iter().reduce(|left, right| {
             ExprNode::Binary(BinaryOpExpr {
