@@ -237,7 +237,7 @@ def render_markdown(inv: dict) -> str:
             "",
             "- C1 is the frozen leftover denominator, not a pass-rate claim.",
             "- Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).",
-            "- C2: IndexMerge / cost-model-v2 stay open (n-table DP JoinReorder MVB done).",
+            "- C2: cost-model-v2 stay open (IndexMerge OR-union MVB done).",
             "- C3: TiKV cross-cluster and MDL stay open.",
             "- C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).",
             "- C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.",

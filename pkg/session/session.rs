@@ -4515,6 +4515,48 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_index_merge_or() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; \
+                 CREATE TABLE db1.t (id INT, a INT, b INT, INDEX idx_a (a), INDEX idx_b (b)); \
+                 INSERT INTO db1.t VALUES (1, 1, 10), (2, 2, 20), (3, 1, 20), (4, 9, 9)",
+            )
+            .unwrap();
+        let explain = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE a = 1 OR b = 20")
+            .unwrap();
+        let text = explain
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("IndexMerge"), "{text}");
+        assert!(text.contains("IndexRangeScan"), "{text}");
+        assert!(text.contains("TableRowIDScan"), "{text}");
+        assert!(
+            explain
+                .display_rows()
+                .iter()
+                .any(|r| r.get(2).map(|t| t.as_str()) == Some("cop")),
+            "{text}"
+        );
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t WHERE a = 1 OR b = 20 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string(), "10".to_string()],
+                vec!["2".to_string(), "2".to_string(), "20".to_string()],
+                vec!["3".to_string(), "1".to_string(), "20".to_string()],
+            ]
+        );
+    }
+
+    #[test]
     fn test_explain_n_table_join_reorder_dp() {
         let session = Session::new();
         // Skewed sizes: naive SQL order is big ⋈ mid ⋈ small (left-deep).

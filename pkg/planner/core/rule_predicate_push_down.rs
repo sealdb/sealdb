@@ -90,6 +90,24 @@ fn push_into(
                 residual,
             )
         }
+        PhysicalPlan::IndexMerge {
+            table,
+            indexes,
+            partitions,
+            pushed,
+        } => {
+            let (pushable, residual): (Vec<_>, Vec<_>) =
+                conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            wrap_residual(
+                PhysicalPlan::IndexMerge {
+                    table,
+                    indexes,
+                    partitions,
+                    pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                },
+                residual,
+            )
+        }
         PhysicalPlan::PointGet {
             table,
             handle,

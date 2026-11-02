@@ -4,7 +4,7 @@ use crate::batch_point_get::BatchPointGetExec;
 use crate::cte::{CTEExec, with_shared_ctes};
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
-use crate::distsql::{IndexAccess, IndexLookUpExecutor};
+use crate::distsql::{IndexAccess, IndexLookUpExecutor, IndexMergeExecutor};
 use crate::explain::ExplainExec;
 use crate::grant::GrantExec;
 use crate::insert::InsertExec;
@@ -222,6 +222,28 @@ impl ExecutorBuilder {
                     partitions.clone(),
                     pushed.clone(),
                     covering,
+                )))
+            }
+            PhysicalPlan::IndexMerge {
+                partitions, pushed, ..
+            } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("index merge without select"))?;
+                let from = select
+                    .from
+                    .clone()
+                    .ok_or_else(|| Error::unsupported("index merge without FROM"))?;
+                Ok(Box::new(IndexMergeExecutor::new(
+                    domain,
+                    from,
+                    current_db.to_string(),
+                    txn,
+                    select_row_lock(select),
+                    select_lock_wait(select),
+                    partitions.clone(),
+                    pushed.clone(),
+                    select.selection.clone(),
                 )))
             }
             PhysicalPlan::PointGet { handle, index, .. } => {

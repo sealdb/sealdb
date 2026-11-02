@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C2 n-table-dp MVB；完整性波 C4=[] → C2→C5）  
+> 最后更新：2026-11-03（C2 index-merge-join / IndexMerge OR-union MVB；完整性波 C4=[] → C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C2（index-merge-join / IndexMerge）
+- **完成**:
+  - `PhysicalPlan::IndexMerge`：OR of ≥2 indexed equalities → union partial index scans + table lookup
+  - `split_dnf` + `access_plan` 检测；`IndexMergeExecutor` 去重 handle 后回表
+  - EXPLAIN：`IndexMerge` + N×`IndexRangeScan` + `TableRowIDScan`（task=cop）
+  - C2 gate `execute-index-merge-join`；`status.json` / leftover 去掉 `index-merge-join`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_explain_index_merge_or`
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - C2 `cost-model-v2`
 
 ### 2026-11-03
 

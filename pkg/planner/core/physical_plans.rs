@@ -69,6 +69,15 @@ pub enum PhysicalPlan {
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
+    /// Union of partial index scans (OR of indexed equalities) then table lookup.
+    /// Completeness wave C2 IndexMerge MVB; intersection / cost skyline deferred.
+    IndexMerge {
+        table: String,
+        indexes: Vec<String>,
+        partitions: Vec<i64>,
+        #[serde(skip)]
+        pushed: Option<ExprNode>,
+    },
     Selection {
         child: Box<PhysicalPlan>,
         #[serde(skip)]
@@ -220,6 +229,30 @@ impl PhysicalPlan {
                 partitions,
                 pushed,
             } => index_plan_name("IndexReader", table, index, partitions, pushed.as_ref()),
+            PhysicalPlan::IndexMerge {
+                table,
+                indexes,
+                partitions,
+                pushed,
+            } => {
+                let mut name = if partitions.is_empty() {
+                    format!("IndexMerge_{table}_{}", indexes.join("+"))
+                } else {
+                    format!(
+                        "IndexMerge_{table}_{}_{}",
+                        indexes.join("+"),
+                        partitions
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                };
+                if let Some(filter) = pushed {
+                    name.push_str(&format!("[{}]", filter.restore_string()));
+                }
+                name
+            }
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::TopN { child } => format!("TopN -> {}", child.explain()),

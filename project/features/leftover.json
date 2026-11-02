@@ -42,7 +42,6 @@
       "leftover-suite-execution"
     ],
     "C2": [
-      "index-merge-join",
       "cost-model-v2"
     ],
     "C3": [
