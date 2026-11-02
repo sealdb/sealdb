@@ -287,6 +287,7 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
         AstJoinType::Inner => JoinType::Inner,
         AstJoinType::LeftOuter => JoinType::LeftOuter,
         AstJoinType::RightOuter => JoinType::RightOuter,
+        AstJoinType::Cross => JoinType::Cross,
     }
 }
 

@@ -238,11 +238,14 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             left_table,
             right_table,
             ..
-        } => (
-            "HashJoin".to_string(),
-            String::new(),
-            format!("{tp:?}, equal:[{left_table} = {right_table}]"),
-        ),
+        } => {
+            let info = if *tp == super::physical_plans::JoinType::Cross {
+                format!("{tp:?}")
+            } else {
+                format!("{tp:?}, equal:[{left_table} = {right_table}]")
+            };
+            ("HashJoin".to_string(), String::new(), info)
+        }
         PhysicalPlan::Apply { filter, .. } => {
             ("Apply".to_string(), String::new(), filter.restore_string())
         }

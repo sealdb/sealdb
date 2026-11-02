@@ -362,6 +362,20 @@ mod tests {
         assert_eq!(join.left.name, "t1");
         assert_eq!(join.right.name, "t2");
         assert_eq!(join.tp, crate::ast::JoinType::Inner);
+        let cross = parser
+            .parse_one_stmt("SELECT * FROM db1.t1 CROSS JOIN db1.t2")
+            .unwrap();
+        assert_eq!(
+            cross.as_select().unwrap().join.as_ref().unwrap().tp,
+            crate::ast::JoinType::Cross
+        );
+        let comma = parser
+            .parse_one_stmt("SELECT * FROM db1.t1, db1.t2")
+            .unwrap();
+        assert_eq!(
+            comma.as_select().unwrap().join.as_ref().unwrap().tp,
+            crate::ast::JoinType::Cross
+        );
     }
 
     #[test]

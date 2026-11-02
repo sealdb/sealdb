@@ -8,6 +8,7 @@ pub enum JoinType {
     Inner,
     LeftOuter,
     RightOuter,
+    Cross,
 }
 
 impl JoinType {
@@ -16,7 +17,12 @@ impl JoinType {
             JoinType::Inner => "JOIN",
             JoinType::LeftOuter => "LEFT JOIN",
             JoinType::RightOuter => "RIGHT JOIN",
+            JoinType::Cross => "CROSS JOIN",
         }
+    }
+
+    pub fn has_on(self) -> bool {
+        !matches!(self, JoinType::Cross)
     }
 }
 
@@ -26,6 +32,21 @@ pub struct Join {
     pub right: TableName,
     pub tp: JoinType,
     pub on: ExprNode,
+}
+
+impl Join {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.left.restore(ctx)?;
+        ctx.write_str(" ");
+        ctx.write_str(self.tp.restore());
+        ctx.write_str(" ");
+        self.right.restore(ctx)?;
+        if self.tp.has_on() {
+            ctx.write_str(" ON ");
+            self.on.restore(ctx)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,13 +177,7 @@ impl SelectStmt {
         }
         if let Some(join) = &self.join {
             ctx.write_str(" FROM ");
-            join.left.restore(ctx)?;
-            ctx.write_str(" ");
-            ctx.write_str(join.tp.restore());
-            ctx.write_str(" ");
-            join.right.restore(ctx)?;
-            ctx.write_str(" ON ");
-            join.on.restore(ctx)?;
+            join.restore(ctx)?;
         } else if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
             from.restore(ctx)?;
@@ -343,13 +358,7 @@ impl DeleteStmt {
 
 fn restore_table_join(ctx: &mut RestoreCtx, table: &TableName, join: Option<&Join>) -> Result<()> {
     if let Some(join) = join {
-        join.left.restore(ctx)?;
-        ctx.write_str(" ");
-        ctx.write_str(join.tp.restore());
-        ctx.write_str(" ");
-        join.right.restore(ctx)?;
-        ctx.write_str(" ON ");
-        join.on.restore(ctx)
+        join.restore(ctx)
     } else {
         table.restore(ctx)
     }

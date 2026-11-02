@@ -13,7 +13,7 @@ pub fn reorder_hash_join(
 ) -> PhysicalPlan {
     let _ = super::plan_cost::hash_join_cost(left_rows, right_rows, left_rows, right_rows);
     let _ = hash_join_probe_build(tp, left_rows, right_rows);
-    if matches!(tp, JoinType::Inner) && left_rows + f64::EPSILON < right_rows {
+    if matches!(tp, JoinType::Inner | JoinType::Cross) && left_rows + f64::EPSILON < right_rows {
         PhysicalPlan::HashJoin {
             tp,
             left: Box::new(right),
@@ -33,7 +33,7 @@ pub fn reorder_hash_join(
 }
 
 fn hash_join_probe_build(tp: JoinType, left_rows: f64, right_rows: f64) -> (f64, f64) {
-    if matches!(tp, JoinType::Inner) && left_rows < right_rows {
+    if matches!(tp, JoinType::Inner | JoinType::Cross) && left_rows < right_rows {
         (right_rows, left_rows)
     } else {
         (left_rows, right_rows)

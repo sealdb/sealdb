@@ -244,7 +244,7 @@ fn classify(
     }
     match (left, right, tp) {
         (true, false, _) => Side::Left,
-        (false, true, JoinType::Inner) => Side::Right,
+        (false, true, JoinType::Inner | JoinType::Cross) => Side::Right,
         (false, true, JoinType::RightOuter) => Side::Right,
         (false, true, JoinType::LeftOuter) => Side::Residual,
         (true, true, _) => Side::Residual,
