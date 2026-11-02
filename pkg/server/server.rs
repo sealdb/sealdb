@@ -91,6 +91,11 @@ impl Server {
         Self::bind_with_domain(addr, Arc::new(Domain::new()))
     }
 
+    /// Listen with grant tables enabled (mysql.user auth during handshake).
+    pub fn bind_with_grant_table(addr: impl ToSocketAddrs) -> Result<Self> {
+        Self::bind_with_domain(addr, Arc::new(Domain::with_grant_table()))
+    }
+
     pub fn bind_with_domain(addr: impl ToSocketAddrs, domain: Arc<Domain>) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("listen: {e}")))?;

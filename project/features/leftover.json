@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F22": [
-      "auth-plugin",
       "multi-resultset"
     ]
   },
