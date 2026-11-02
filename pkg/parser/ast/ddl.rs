@@ -35,6 +35,32 @@ impl TableName {
     }
 }
 
+/// MySQL `FIRST` / `AFTER col` placement for ADD/CHANGE/MODIFY COLUMN.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ColumnPosition {
+    #[default]
+    None,
+    First,
+    After(String),
+}
+
+impl ColumnPosition {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        match self {
+            ColumnPosition::None => Ok(()),
+            ColumnPosition::First => {
+                ctx.write_str(" FIRST");
+                Ok(())
+            }
+            ColumnPosition::After(name) => {
+                ctx.write_str(" AFTER ");
+                ctx.write_name(name);
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
@@ -295,6 +321,7 @@ pub enum AlterTableSpec {
     AddColumn {
         if_not_exists: bool,
         column: ColumnDef,
+        position: ColumnPosition,
     },
     DropColumn {
         if_exists: bool,
@@ -310,11 +337,13 @@ pub enum AlterTableSpec {
         old_name: String,
         new_name: String,
         type_name: String,
+        position: ColumnPosition,
     },
     /// `MODIFY [COLUMN] col type` — keep the name, change the type.
     ModifyColumn {
         name: String,
         type_name: String,
+        position: ColumnPosition,
     },
     /// `RENAME COLUMN old TO new`.
     RenameColumn {
@@ -338,12 +367,14 @@ impl AlterTableSpec {
             AlterTableSpec::AddColumn {
                 if_not_exists,
                 column,
+                position,
             } => {
                 ctx.write_str("ADD COLUMN ");
                 if *if_not_exists {
                     ctx.write_str("IF NOT EXISTS ");
                 }
-                column.restore(ctx)
+                column.restore(ctx)?;
+                position.restore(ctx)
             }
             AlterTableSpec::DropColumn { if_exists, name } => {
                 ctx.write_str("DROP COLUMN ");
@@ -369,6 +400,7 @@ impl AlterTableSpec {
                 old_name,
                 new_name,
                 type_name,
+                position,
             } => {
                 ctx.write_str("CHANGE COLUMN ");
                 ctx.write_name(old_name);
@@ -376,14 +408,18 @@ impl AlterTableSpec {
                 ctx.write_name(new_name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
-                Ok(())
+                position.restore(ctx)
             }
-            AlterTableSpec::ModifyColumn { name, type_name } => {
+            AlterTableSpec::ModifyColumn {
+                name,
+                type_name,
+                position,
+            } => {
                 ctx.write_str("MODIFY COLUMN ");
                 ctx.write_name(name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
-                Ok(())
+                position.restore(ctx)
             }
             AlterTableSpec::RenameColumn { old_name, new_name } => {
                 ctx.write_str("RENAME COLUMN ");

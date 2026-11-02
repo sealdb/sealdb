@@ -9,7 +9,7 @@ pub mod misc;
 
 pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
-    AlterTableSpec, AlterTableStmt, ColumnDef, CreateDatabaseStmt, CreateIndexStmt,
+    AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
     PartitionOption, PartitionType, TableName,
 };
