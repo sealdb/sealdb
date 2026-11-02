@@ -29,13 +29,13 @@ use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized, DataType, Delete,
     DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, LockClause, LockType, NamedWindowDefinition, NamedWindowExpr, NonBlock,
-    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, Revoke,
-    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
-    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
-    Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr,
+    JoinConstraint, JoinOperator, LimitClause, LockClause, LockType, NamedWindowDefinition,
+    NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
+    SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
+    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
@@ -2369,10 +2369,7 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
 }
 
 fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
-    // F16 leftover: LAG/LEAD, IGNORE NULLS.
-    if func.null_treatment.is_some() {
-        return Err(Error::unsupported("IGNORE/RESPECT NULLS"));
-    }
+    let ignore_nulls = window_ignore_nulls(func);
     let name = func.name.to_string();
     match name.to_ascii_uppercase().as_str() {
         "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "LAG"
@@ -2424,7 +2421,20 @@ fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
         args,
         spec,
         window_ref,
+        ignore_nulls,
     }))
+}
+
+fn window_ignore_nulls(func: &Function) -> bool {
+    let mut ignore = matches!(func.null_treatment, Some(NullTreatment::IgnoreNulls));
+    if let FunctionArguments::List(list) = &func.args {
+        for clause in &list.clauses {
+            if let FunctionArgumentClause::IgnoreOrRespectNulls(treatment) = clause {
+                ignore = matches!(treatment, NullTreatment::IgnoreNulls);
+            }
+        }
+    }
+    ignore
 }
 
 fn lower_over_spec(spec: &sqlparser::ast::WindowSpec) -> Result<WindowSpec> {

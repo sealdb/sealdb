@@ -843,6 +843,17 @@ mod tests {
             }
             other => panic!("expected Window, got {other:?}"),
         }
+        match &parser
+            .parse_one_stmt("SELECT FIRST_VALUE(id) IGNORE NULLS OVER (ORDER BY id) FROM t")
+            .unwrap()
+            .as_select()
+            .unwrap()
+            .fields[0]
+            .expr
+        {
+            crate::ast::ExprNode::Window(w) => assert!(w.ignore_nulls),
+            other => panic!("expected Window, got {other:?}"),
+        }
     }
 
     #[test]

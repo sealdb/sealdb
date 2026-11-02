@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F16": [
-      "ignore-nulls",
       "pipelined-window"
     ],
     "F17": [
