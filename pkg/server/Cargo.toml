@@ -9,6 +9,9 @@ license.workspace = true
 path = "lib.rs"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 sealdb-domain.workspace = true
 sealdb-errno.workspace = true
 sealdb-executor.workspace = true
@@ -16,3 +19,6 @@ sealdb-parser.workspace = true
 sealdb-session.workspace = true
 sealdb-types.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"

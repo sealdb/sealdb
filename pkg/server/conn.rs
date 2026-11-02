@@ -1,55 +1,72 @@
-/// F22 core: clientConn handshake + COM_QUERY (TiDB `pkg/server/conn.go`).
-/// Completeness wave: SSL, compression, COM_STMT_*, COM_FIELD_LIST,
+/// F22: clientConn handshake + COM_QUERY (TiDB `pkg/server/conn.go`).
+/// Completeness wave: compression, COM_STMT_*, COM_FIELD_LIST,
 /// auth plugins, binary protocol, multi-result-set.
 use crate::internal::packetio::{
-    PacketIO, read_lenenc, read_null_str, write_lenenc, write_lenenc_str, write_null_str,
+    ConnIo, PacketIO, read_lenenc, read_null_str, write_lenenc, write_lenenc_str, write_null_str,
 };
-use sealdb_errno::{Error, Result};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_executor::QueryResult;
 use sealdb_parser::mysql::{
     CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
-    CLIENT_SECURE_CONNECTION, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, COM_STMT_EXECUTE,
-    COM_STMT_PREPARE, DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID, EOF_HEADER, ERR_HEADER, NULL_LENENC,
-    OK_HEADER, SERVER_STATUS_AUTOCOMMIT, SERVER_VERSION, TYPE_VAR_STRING,
+    CLIENT_SECURE_CONNECTION, CLIENT_SSL, COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT,
+    COM_STMT_EXECUTE, COM_STMT_PREPARE, DEFAULT_CAPABILITY, DEFAULT_CHARSET_ID, EOF_HEADER,
+    ERR_HEADER, NULL_LENENC, OK_HEADER, SERVER_STATUS_AUTOCOMMIT, SERVER_VERSION, TYPE_VAR_STRING,
 };
 use sealdb_session::Session;
 use sealdb_types::Datum;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::sync::Arc;
 
 enum Dispatch {
     Continue,
     Quit,
 }
 
-pub struct ClientConn<S> {
-    pkt: PacketIO<S>,
+pub struct ClientConn {
+    pkt: PacketIO,
     session: Session,
     capability: u32,
     connection_id: u32,
+    tls: Option<Arc<ServerConfig>>,
+    ssl_active: bool,
 }
 
-impl ClientConn<TcpStream> {
-    pub fn from_tcp(stream: TcpStream, connection_id: u32) -> Self {
-        Self::new(stream, connection_id)
+impl ClientConn {
+    pub fn from_tcp(stream: impl ConnIo + 'static, connection_id: u32) -> Self {
+        Self::with_session(stream, connection_id, Session::new(), None)
     }
 
-    pub fn from_tcp_session(stream: TcpStream, connection_id: u32, session: Session) -> Self {
-        Self::with_session(stream, connection_id, session)
-    }
-}
-
-impl<S: Read + Write> ClientConn<S> {
-    pub fn new(stream: S, connection_id: u32) -> Self {
-        Self::with_session(stream, connection_id, Session::new())
+    pub fn from_tcp_session(
+        stream: impl ConnIo + 'static,
+        connection_id: u32,
+        session: Session,
+    ) -> Self {
+        Self::with_session(stream, connection_id, session, None)
     }
 
-    pub fn with_session(stream: S, connection_id: u32, session: Session) -> Self {
+    pub fn with_tls(
+        stream: impl ConnIo + 'static,
+        connection_id: u32,
+        session: Session,
+        tls: Arc<ServerConfig>,
+    ) -> Self {
+        Self::with_session(stream, connection_id, session, Some(tls))
+    }
+
+    pub fn with_session(
+        stream: impl ConnIo + 'static,
+        connection_id: u32,
+        session: Session,
+        tls: Option<Arc<ServerConfig>>,
+    ) -> Self {
         Self {
             pkt: PacketIO::new(stream),
             session,
             capability: DEFAULT_CAPABILITY,
             connection_id,
+            tls,
+            ssl_active: false,
         }
     }
 
@@ -73,10 +90,27 @@ impl<S: Read + Write> ClientConn<S> {
         Ok(())
     }
 
+    fn server_capability(&self) -> u32 {
+        let mut cap = DEFAULT_CAPABILITY;
+        if self.tls.is_some() {
+            cap |= CLIENT_SSL;
+        }
+        cap
+    }
+
     fn handshake(&mut self) -> Result<()> {
         self.write_handshake()?;
         let resp = self.pkt.read_packet()?;
-        let (capability, db) = parse_handshake_response(&resp)?;
+        if is_ssl_request(&resp) {
+            self.upgrade_tls()?;
+            let resp = self.pkt.read_packet()?;
+            return self.finish_handshake(&resp);
+        }
+        self.finish_handshake(&resp)
+    }
+
+    fn finish_handshake(&mut self, resp: &[u8]) -> Result<()> {
+        let (capability, db) = parse_handshake_response(resp)?;
         self.capability = capability;
         if let Some(db) = db.filter(|s| !s.is_empty())
             && let Err(err) = self.session.execute_stmt(&format!("USE `{db}`"))
@@ -87,6 +121,22 @@ impl<S: Read + Write> ClientConn<S> {
         self.write_ok()
     }
 
+    fn upgrade_tls(&mut self) -> Result<()> {
+        let Some(config) = self.tls.clone() else {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "SSL connection requested but server has no certificate",
+            ));
+        };
+        let plain = self.pkt.take_stream();
+        let conn = ServerConnection::new(config)
+            .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tls: {e}")))?;
+        let tls_stream = StreamOwned::new(conn, IoAdapter(plain));
+        self.pkt.set_stream(Box::new(tls_stream));
+        self.ssl_active = true;
+        Ok(())
+    }
+
     fn write_handshake(&mut self) -> Result<()> {
         let mut payload = Vec::new();
         payload.push(10);
@@ -94,7 +144,7 @@ impl<S: Read + Write> ClientConn<S> {
         payload.extend_from_slice(&self.connection_id.to_le_bytes());
         payload.extend_from_slice(b"12345678"); // auth-plugin-data-part-1
         payload.push(0);
-        let cap = DEFAULT_CAPABILITY;
+        let cap = self.server_capability();
         payload.extend_from_slice(&(cap as u16).to_le_bytes());
         payload.push(DEFAULT_CHARSET_ID);
         payload.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
@@ -203,6 +253,39 @@ impl<S: Read + Write> ClientConn<S> {
         payload.extend_from_slice(err.message.as_bytes());
         self.pkt.write_packet(&payload)
     }
+
+    pub fn ssl_active(&self) -> bool {
+        self.ssl_active
+    }
+}
+
+/// Adapter so `Box<dyn ConnIo>` implements Read+Write for rustls StreamOwned.
+pub struct IoAdapter(pub Box<dyn ConnIo>);
+
+impl Read for IoAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for IoAdapter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// MySQL protocol 4.1 SSLRequest is a 32-byte truncated HandshakeResponse
+/// with `CLIENT_SSL` set.
+pub fn is_ssl_request(data: &[u8]) -> bool {
+    if data.len() != 32 {
+        return false;
+    }
+    let capability = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    capability & CLIENT_SSL != 0
 }
 
 fn parse_handshake_response(data: &[u8]) -> Result<(u32, Option<String>)> {

@@ -26,6 +26,8 @@ pub const CLIENT_FOUND_ROWS: u32 = 1 << 1;
 pub const CLIENT_LONG_FLAG: u32 = 1 << 2;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 1 << 3;
 pub const CLIENT_PROTOCOL_41: u32 = 1 << 9;
+/// Client may switch to TLS after the initial handshake (TiDB/MySQL `CLIENT_SSL`).
+pub const CLIENT_SSL: u32 = 1 << 11;
 pub const CLIENT_TRANSACTIONS: u32 = 1 << 13;
 pub const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 pub const CLIENT_MULTI_STATEMENTS: u32 = 1 << 16;
