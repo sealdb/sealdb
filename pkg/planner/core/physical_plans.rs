@@ -1,5 +1,6 @@
 use sealdb_parser::ast::ExplainFormat;
 use sealdb_parser::ast::ExprNode;
+use sealdb_parser::ast::SetOprType;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -109,7 +110,7 @@ pub enum PhysicalPlan {
         filter: ExprNode,
     },
     Union {
-        distinct: bool,
+        op: SetOprType,
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
     },
@@ -229,16 +230,14 @@ impl PhysicalPlan {
                 format!("Explain_{format:?} -> {}", child.explain())
             }
             PhysicalPlan::Apply { child, .. } => format!("Apply -> {}", child.explain()),
-            PhysicalPlan::Union {
-                distinct,
-                left,
-                right,
-            } => format!(
-                "Union_{}({}, {})",
-                if *distinct { "Distinct" } else { "All" },
-                left.explain(),
-                right.explain()
-            ),
+            PhysicalPlan::Union { op, left, right } => {
+                format!(
+                    "Union_{}({}, {})",
+                    op.restore(),
+                    left.explain(),
+                    right.explain()
+                )
+            }
             PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
             PhysicalPlan::CTE { name, seed, .. } => format!("CTE_{name} -> {}", seed.explain()),
             PhysicalPlan::Distinct { keys, child } => {

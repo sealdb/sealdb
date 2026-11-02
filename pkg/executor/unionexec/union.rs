@@ -1,27 +1,28 @@
-// F15 core path: UnionExec for UNION / UNION ALL (TiDB pkg/executor/unionexec/union.go).
-// Completeness wave / not this feature: EXCEPT/INTERSECT, parenthesized nested
-// set ops, UNION in subquery, parallel workers.
+// F15 core path: UnionExec for UNION / EXCEPT / INTERSECT
+// (TiDB pkg/executor/unionexec/union.go). Completeness wave / not this
+// feature: parenthesized nested set ops, UNION in subquery, parallel workers.
 use crate::internal::exec::Executor;
 use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_parser::ast::SetOprType;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct UnionExec {
     left: Box<dyn Executor>,
     right: Box<dyn Executor>,
-    distinct: bool,
+    op: SetOprType,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
 }
 
 impl UnionExec {
-    pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, distinct: bool) -> Self {
+    pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, op: SetOprType) -> Self {
         Self {
             left,
             right,
-            distinct,
+            op,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -49,20 +50,7 @@ impl Executor for UnionExec {
                 return Err(column_mismatch());
             }
         }
-        if self.distinct {
-            let mut seen = HashSet::new();
-            let mut out = Vec::new();
-            for row in left_rows.into_iter().chain(right_rows) {
-                if seen.insert(row_key(&row)) {
-                    out.push(row);
-                }
-            }
-            self.rows = out;
-        } else {
-            let mut rows = left_rows;
-            rows.extend(right_rows);
-            self.rows = rows;
-        }
+        self.rows = apply_set_op(self.op, left_rows, right_rows);
         Ok(())
     }
 
@@ -96,6 +84,94 @@ fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {
         }
     }
     Ok(rows)
+}
+
+fn apply_set_op(op: SetOprType, left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    match op {
+        SetOprType::UnionAll => {
+            let mut rows = left;
+            rows.extend(right);
+            rows
+        }
+        SetOprType::Union => unique_concat(left, right),
+        SetOprType::Except => except_distinct(left, right),
+        SetOprType::ExceptAll => except_all(left, right),
+        SetOprType::Intersect => intersect_distinct(left, right),
+        SetOprType::IntersectAll => intersect_all(left, right),
+    }
+}
+
+fn unique_concat(left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in left.into_iter().chain(right) {
+        if seen.insert(row_key(&row)) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn except_distinct(left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    let banned: HashSet<_> = right.iter().map(|row| row_key(row)).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        let key = row_key(&row);
+        if !banned.contains(&key) && seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn except_all(left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    let mut counts = counts_of(&right);
+    let mut out = Vec::new();
+    for row in left {
+        let key = row_key(&row);
+        match counts.get_mut(&key) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(row),
+        }
+    }
+    out
+}
+
+fn intersect_distinct(left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    let right_keys: HashSet<_> = right.iter().map(|row| row_key(row)).collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        let key = row_key(&row);
+        if right_keys.contains(&key) && seen.insert(key) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn intersect_all(left: Vec<Vec<Datum>>, right: Vec<Vec<Datum>>) -> Vec<Vec<Datum>> {
+    let mut counts = counts_of(&right);
+    let mut out = Vec::new();
+    for row in left {
+        let key = row_key(&row);
+        if let Some(n) = counts.get_mut(&key)
+            && *n > 0
+        {
+            *n -= 1;
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn counts_of(rows: &[Vec<Datum>]) -> HashMap<Vec<String>, usize> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row_key(row)).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn row_key(row: &[Datum]) -> Vec<String> {

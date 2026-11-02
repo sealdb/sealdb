@@ -178,7 +178,7 @@ impl PlanBuilder {
                 )?;
                 for (op, select) in &set.rest {
                     plan = PhysicalPlan::Union {
-                        distinct: op.is_distinct(),
+                        op: *op,
                         left: Box::new(plan),
                         right: Box::new(self.build_with_schema(
                             &Statement::Select(with_inherited(select.clone(), set.with.as_ref())),

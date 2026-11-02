@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F15": [
-      "except-intersect",
       "nested-paren-union",
       "union-in-subquery",
       "parallel-union"

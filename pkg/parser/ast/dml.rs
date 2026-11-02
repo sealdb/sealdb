@@ -455,10 +455,14 @@ fn restore_order_limit(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum SetOprType {
     Union,
     UnionAll,
+    Except,
+    ExceptAll,
+    Intersect,
+    IntersectAll,
 }
 
 impl SetOprType {
@@ -466,11 +470,18 @@ impl SetOprType {
         match self {
             SetOprType::Union => "UNION",
             SetOprType::UnionAll => "UNION ALL",
+            SetOprType::Except => "EXCEPT",
+            SetOprType::ExceptAll => "EXCEPT ALL",
+            SetOprType::Intersect => "INTERSECT",
+            SetOprType::IntersectAll => "INTERSECT ALL",
         }
     }
 
     pub fn is_distinct(self) -> bool {
-        matches!(self, SetOprType::Union)
+        matches!(
+            self,
+            SetOprType::Union | SetOprType::Except | SetOprType::Intersect
+        )
     }
 }
 

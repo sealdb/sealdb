@@ -347,7 +347,7 @@ impl ExecutorBuilder {
                         current_db,
                         Arc::clone(&txn),
                     )?;
-                    exec = Box::new(UnionExec::new(exec, right, op.is_distinct()));
+                    exec = Box::new(UnionExec::new(exec, right, *op));
                 }
                 Ok(exec)
             }

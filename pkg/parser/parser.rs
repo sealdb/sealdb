@@ -718,10 +718,21 @@ mod tests {
             }
             other => panic!("expected SetOprStmt, got {other:?}"),
         }
-        let err = parser
-            .parse_one_stmt("SELECT 1 EXCEPT SELECT 2")
-            .unwrap_err();
-        assert!(err.message.contains("EXCEPT"));
+        match parser.parse_one_stmt("SELECT 1 EXCEPT SELECT 2").unwrap() {
+            crate::ast::Statement::SetOpr(set) => {
+                assert_eq!(set.rest[0].0, crate::ast::SetOprType::Except);
+            }
+            other => panic!("expected SetOprStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("SELECT 1 INTERSECT SELECT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::SetOpr(set) => {
+                assert_eq!(set.rest[0].0, crate::ast::SetOprType::Intersect);
+            }
+            other => panic!("expected SetOprStmt, got {other:?}"),
+        }
     }
 
     #[test]
