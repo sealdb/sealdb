@@ -2506,6 +2506,10 @@ mod tests {
             "expected HashJoin Semi, got {explain_text}"
         );
         assert!(
+            explain_text.contains("HashAgg"),
+            "expected Distinct/HashAgg on Semi inner, got {explain_text}"
+        );
+        assert!(
             !explain_text.contains("Apply"),
             "EXISTS should not stay Apply, got {explain_text}"
         );
@@ -2536,6 +2540,10 @@ mod tests {
         assert!(
             in_text.contains("Semi"),
             "expected HashJoin Semi for IN, got {in_text}"
+        );
+        assert!(
+            in_text.contains("HashAgg"),
+            "expected Distinct/HashAgg on IN inner, got {in_text}"
         );
     }
 
@@ -2606,6 +2614,10 @@ mod tests {
         assert!(
             any_text.contains("Semi"),
             "expected HashJoin Semi for = ANY, got {any_text}"
+        );
+        assert!(
+            any_text.contains("HashAgg"),
+            "expected Distinct/HashAgg on = ANY inner, got {any_text}"
         );
     }
 

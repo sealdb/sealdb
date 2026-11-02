@@ -13,7 +13,7 @@ use crate::join::apply::SubqueryEvalCtx;
 use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
-use crate::select::{LimitExec, MemTableExec, SelectionExec, TableDualExec};
+use crate::select::{DistinctExec, LimitExec, MemTableExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
 use crate::sortexec::{SortExec, TopNExec};
 use crate::table_reader::TableReaderExec;
@@ -104,6 +104,10 @@ impl ExecutorBuilder {
             }
             PhysicalPlan::Selection { child, filter } => Ok(Box::new(SelectionExec::new(
                 filter.clone(),
+                Self::build(child, stmt, domain, current_db, txn)?,
+            ))),
+            PhysicalPlan::Distinct { keys, child } => Ok(Box::new(DistinctExec::new(
+                keys.clone(),
                 Self::build(child, stmt, domain, current_db, txn)?,
             ))),
             PhysicalPlan::Simple { kind } if kind == "Analyze" => Ok(Box::new(AnalyzeExec::new(

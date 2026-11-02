@@ -203,3 +203,114 @@ impl Executor for LimitExec {
         self.child.schema()
     }
 }
+
+/// Dedup child rows by named columns (SemiJoinRewriter inner aggregation).
+pub struct DistinctExec {
+    keys: Vec<String>,
+    child: Box<dyn Executor>,
+    schema: Vec<String>,
+    rows: Vec<Vec<sealdb_types::Datum>>,
+    emitted: bool,
+}
+
+impl DistinctExec {
+    pub fn new(keys: Vec<String>, child: Box<dyn Executor>) -> Self {
+        Self {
+            keys,
+            child,
+            schema: Vec::new(),
+            rows: Vec::new(),
+            emitted: false,
+        }
+    }
+}
+
+impl Executor for DistinctExec {
+    fn open(&mut self) -> Result<()> {
+        self.child.open()?;
+        self.schema = self.child.schema().to_vec();
+        let idxs: Vec<usize> = self
+            .keys
+            .iter()
+            .filter_map(|key| {
+                self.schema.iter().position(|col| {
+                    col.eq_ignore_ascii_case(key)
+                        || col
+                            .rsplit_once('.')
+                            .is_some_and(|(_, name)| name.eq_ignore_ascii_case(key))
+                })
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(chunk) = self.child.next()? {
+            for i in 0..chunk.num_rows() {
+                let row = chunk.get_row(i);
+                if idxs.is_empty() {
+                    self.rows.push(row);
+                    continue;
+                }
+                let key = row_key(&row, &idxs);
+                if seen.insert(key) {
+                    self.rows.push(row);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        let mut chunk = Chunk::new(self.schema.len(), self.rows.len());
+        for row in self.rows.drain(..) {
+            chunk.append_row(row);
+        }
+        Ok(Some(chunk))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.child.close()
+    }
+
+    fn schema(&self) -> &[String] {
+        &self.schema
+    }
+}
+
+fn row_key(row: &[sealdb_types::Datum], idxs: &[usize]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for idx in idxs {
+        match row.get(*idx).unwrap_or(&sealdb_types::Datum::Null) {
+            sealdb_types::Datum::Null => out.push(0),
+            sealdb_types::Datum::I64(v) => {
+                out.push(1);
+                out.extend(v.to_le_bytes());
+            }
+            sealdb_types::Datum::U64(v) => {
+                out.push(2);
+                out.extend(v.to_le_bytes());
+            }
+            sealdb_types::Datum::F64(v) => {
+                out.push(3);
+                out.extend(v.to_le_bytes());
+            }
+            sealdb_types::Datum::Bytes(b) => {
+                out.push(4);
+                out.extend((b.len() as u32).to_le_bytes());
+                out.extend(b);
+            }
+            sealdb_types::Datum::Decimal(d) => {
+                out.push(5);
+                out.extend(d.to_string().into_bytes());
+            }
+            sealdb_types::Datum::Time(t) => {
+                out.push(6);
+                out.extend(t.to_string().into_bytes());
+            }
+        }
+        out.push(0xff);
+    }
+    out
+}

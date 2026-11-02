@@ -1,10 +1,9 @@
 /// F09 leftover: rewrite simple correlated EXISTS / IN / NOT EXISTS Apply
 /// into HashJoin Semi/Anti (TiDB `rule_decorrelate.go`).
 ///
-/// NOT IN stays Apply (null-aware). Scalar subqueries, quantified
-/// comparisons other than `= ANY`/`<> ALL`, derived tables, and composite
-/// join keys stay Apply. F14 `semi-anti-rewrite` is the later
-/// SemiJoinRewriter (semi → inner + agg), not this operator.
+/// F14 `semi-anti-rewrite` then wraps the Semi inner side with Distinct
+/// on the join key (TiDB SemiJoinRewriter: semi → inner + agg). Anti stays
+/// as HashJoin Anti. NOT IN stays Apply.
 use super::physical_plans::{JoinType, PhysicalPlan};
 use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode};
 use sealdb_parser::ast::{SelectStmt, TableName};
@@ -73,6 +72,10 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             name,
             columns,
             seed: Box::new(rewrite_semi_join(*seed)),
+        },
+        PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
+            keys,
+            child: Box::new(rewrite_semi_join(*child)),
         },
         PhysicalPlan::Explain { format, child } => PhysicalPlan::Explain {
             format,
@@ -306,7 +309,128 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
         | PhysicalPlan::Window { child, .. }
-        | PhysicalPlan::Apply { child, .. } => plan_table(child),
+        | PhysicalPlan::Apply { child, .. }
+        | PhysicalPlan::Distinct { child, .. } => plan_table(child),
         _ => None,
     }
+}
+
+/// TiDB SemiJoinRewriter: DISTINCT the Semi inner (right) side on the join
+/// key so the build side is unique. Keep HashJoin Semi so SELECT * still
+/// emits the left schema (TiDB adds a left projection after Inner+Agg).
+pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::HashJoin {
+            tp,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } => {
+            let left = rewrite_semi_join_agg(*left);
+            let right = rewrite_semi_join_agg(*right);
+            if tp == JoinType::Semi
+                && let Some(key) = join_key_on_table(&on, &right_table)
+            {
+                PhysicalPlan::HashJoin {
+                    tp,
+                    left: Box::new(left),
+                    right: Box::new(PhysicalPlan::Distinct {
+                        keys: vec![key],
+                        child: Box::new(right),
+                    }),
+                    left_table,
+                    right_table,
+                    on,
+                }
+            } else {
+                PhysicalPlan::HashJoin {
+                    tp,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    left_table,
+                    right_table,
+                    on,
+                }
+            }
+        }
+        PhysicalPlan::Apply { child, filter } => PhysicalPlan::Apply {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+            filter,
+        },
+        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+            filter,
+        },
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Sort { child } => PhysicalPlan::Sort {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::TopN { child } => PhysicalPlan::TopN {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Limit { child } => PhysicalPlan::Limit {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::HashAgg { child } => PhysicalPlan::HashAgg {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::StreamAgg { child } => PhysicalPlan::StreamAgg {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Window { child } => PhysicalPlan::Window {
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Union {
+            distinct,
+            left,
+            right,
+        } => PhysicalPlan::Union {
+            distinct,
+            left: Box::new(rewrite_semi_join_agg(*left)),
+            right: Box::new(rewrite_semi_join_agg(*right)),
+        },
+        PhysicalPlan::CTE {
+            name,
+            columns,
+            seed,
+        } => PhysicalPlan::CTE {
+            name,
+            columns,
+            seed: Box::new(rewrite_semi_join_agg(*seed)),
+        },
+        PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
+            keys,
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Explain { format, child } => PhysicalPlan::Explain {
+            format,
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        other => other,
+    }
+}
+
+fn join_key_on_table(on: &ExprNode, table: &str) -> Option<String> {
+    let ExprNode::Binary(bin) = on else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    for side in [&bin.left, &bin.right] {
+        if let ExprNode::Column(col) = side.as_ref()
+            && col
+                .table
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(table))
+        {
+            return Some(col.name.clone());
+        }
+    }
+    None
 }
