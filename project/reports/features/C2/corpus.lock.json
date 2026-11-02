@@ -11,6 +11,7 @@
     "explain-format-json",
     "explain-format-dot",
     "explain-analyze",
+    "explain-cop-task-rows",
     "explain-table-reader",
     "explain-index-lookup-unanalyzed",
     "explain-skyline-table-reader",

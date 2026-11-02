@@ -6152,7 +6152,7 @@
       "rs_path": "pkg/planner/core/explain.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "EXPLAIN row/json/dot/ANALYZE tree; per-op RuntimeStats / cop task deferred"
+      "notes": "EXPLAIN row/json/dot/ANALYZE + DistSQL cop-task rows (TableFullScan/IndexRangeScan); per-op RuntimeStats deferred"
     },
     {
       "go_path": "pkg/planner/core/expression_codec_fn.go",

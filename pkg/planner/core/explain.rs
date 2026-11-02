@@ -178,9 +178,223 @@ fn walk(
         access,
         info,
     });
+    // DistSQL readers expand into TiDB-shaped cop children (TableFullScan /
+    // IndexRangeScan / TableRowIDScan) so EXPLAIN shows task=cop estRows.
+    if emit_cop_children(plan, depth + 1, next_id, rows) {
+        return;
+    }
     let children = children_of(plan);
     for (i, child) in children.iter().enumerate() {
         walk(child, depth + 1, i + 1 == children.len(), next_id, rows);
+    }
+}
+
+/// Synthetic coprocessor subtree under TableReader / IndexReader / IndexLookUp.
+/// Returns true when the plan was a DistSQL reader (children already emitted).
+fn emit_cop_children(
+    plan: &PhysicalPlan,
+    depth: usize,
+    next_id: &mut usize,
+    rows: &mut Vec<ExplainRow>,
+) -> bool {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            pushed,
+        } => {
+            let scan_access = table_access(table, partitions);
+            let scan_est = table_scan_est_rows();
+            if let Some(filter) = pushed.as_ref() {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: est_rows(plan),
+                        task: "cop",
+                        access: String::new(),
+                        info: format!("pushed:{}", filter.restore_string()),
+                    },
+                );
+                push_explain_row(
+                    rows,
+                    depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableFullScan",
+                        est: scan_est,
+                        task: "cop",
+                        access: scan_access,
+                        info: "keep order:false".to_string(),
+                    },
+                );
+            } else {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableFullScan",
+                        est: scan_est,
+                        task: "cop",
+                        access: scan_access,
+                        info: "keep order:false".to_string(),
+                    },
+                );
+            }
+            true
+        }
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            partitions,
+            pushed,
+        } => {
+            let access = index_access(table, index, partitions);
+            let (scan_est, info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: est_rows(plan),
+                        task: "cop",
+                        access: String::new(),
+                        info: format!("pushed:{}", filter.restore_string()),
+                    },
+                );
+                push_explain_row(
+                    rows,
+                    depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexRangeScan",
+                        est: scan_est,
+                        task: "cop",
+                        access,
+                        info,
+                    },
+                );
+            } else {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: scan_est,
+                        task: "cop",
+                        access,
+                        info,
+                    },
+                );
+            }
+            true
+        }
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            partitions,
+            pushed,
+        } => {
+            let idx_access = index_access(table, index, partitions);
+            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                info = format!("pushed:{}", filter.restore_string());
+            }
+            push_explain_row(
+                rows,
+                depth,
+                false,
+                next_id,
+                CopRow {
+                    name: "IndexRangeScan",
+                    est: scan_est,
+                    task: "cop",
+                    access: idx_access,
+                    info,
+                },
+            );
+            push_explain_row(
+                rows,
+                depth,
+                true,
+                next_id,
+                CopRow {
+                    name: "TableRowIDScan",
+                    est: scan_est,
+                    task: "cop",
+                    access: table_access(table, partitions),
+                    info: "keep order:false".to_string(),
+                },
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+struct CopRow<'a> {
+    name: &'a str,
+    est: f64,
+    task: &'a str,
+    access: String,
+    info: String,
+}
+
+fn push_explain_row(
+    rows: &mut Vec<ExplainRow>,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    row: CopRow<'_>,
+) {
+    let id = *next_id;
+    *next_id += 1;
+    rows.push(ExplainRow {
+        id: format!("{}{}_{id}", tree_prefix(depth, last), row.name),
+        est_rows: format!("{:.2}", row.est),
+        task: row.task.to_string(),
+        access: row.access,
+        info: row.info,
+    });
+}
+
+fn table_access(table: &str, partitions: &[i64]) -> String {
+    if partitions.is_empty() {
+        format!("table:{table}")
+    } else {
+        format!("table:{table}, partition:{partitions:?}")
+    }
+}
+
+fn index_access(table: &str, index: &str, partitions: &[i64]) -> String {
+    if partitions.is_empty() {
+        format!("table:{table}, index:{index}")
+    } else {
+        format!("table:{table}, index:{index}, partition:{partitions:?}")
+    }
+}
+
+fn table_scan_est_rows() -> f64 {
+    10_000.0
+}
+
+fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, String) {
+    if pushed.is_some() {
+        (8_000.0, "keep order:false".to_string())
+    } else {
+        (10_000.0, "keep order:false".to_string())
     }
 }
 
@@ -203,10 +417,139 @@ fn collect_dot(
         "  N{id}[label=\"{name}_{id}\\nestRows={:.2}\\n{access} {info}\"]",
         est_rows(plan)
     ));
+    if let Some(cop_ids) = collect_dot_cop_children(plan, next_id, nodes) {
+        for child_id in cop_ids {
+            edges.push(format!("  N{id} -> N{child_id}"));
+        }
+        return id;
+    }
     for child in children_of(plan) {
         let child_id = collect_dot(child, next_id, nodes, edges);
         edges.push(format!("  N{id} -> N{child_id}"));
     }
+    id
+}
+
+fn collect_dot_cop_children(
+    plan: &PhysicalPlan,
+    next_id: &mut usize,
+    nodes: &mut Vec<String>,
+) -> Option<Vec<usize>> {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            pushed,
+        } => {
+            let scan_access = table_access(table, partitions);
+            let scan_est = table_scan_est_rows();
+            if let Some(filter) = pushed.as_ref() {
+                Some(vec![
+                    push_dot_node(
+                        next_id,
+                        nodes,
+                        "Selection",
+                        est_rows(plan),
+                        "",
+                        &format!("pushed:{}", filter.restore_string()),
+                    ),
+                    push_dot_node(
+                        next_id,
+                        nodes,
+                        "TableFullScan",
+                        scan_est,
+                        &scan_access,
+                        "keep order:false",
+                    ),
+                ])
+            } else {
+                Some(vec![push_dot_node(
+                    next_id,
+                    nodes,
+                    "TableFullScan",
+                    scan_est,
+                    &scan_access,
+                    "keep order:false",
+                )])
+            }
+        }
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            partitions,
+            pushed,
+        } => {
+            let access = index_access(table, index, partitions);
+            let (scan_est, info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                Some(vec![
+                    push_dot_node(
+                        next_id,
+                        nodes,
+                        "Selection",
+                        est_rows(plan),
+                        "",
+                        &format!("pushed:{}", filter.restore_string()),
+                    ),
+                    push_dot_node(next_id, nodes, "IndexRangeScan", scan_est, &access, &info),
+                ])
+            } else {
+                Some(vec![push_dot_node(
+                    next_id,
+                    nodes,
+                    "IndexFullScan",
+                    scan_est,
+                    &access,
+                    &info,
+                )])
+            }
+        }
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            partitions,
+            pushed,
+        } => {
+            let idx_access = index_access(table, index, partitions);
+            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            if let Some(filter) = pushed.as_ref() {
+                info = format!("pushed:{}", filter.restore_string());
+            }
+            let idx = push_dot_node(
+                next_id,
+                nodes,
+                "IndexRangeScan",
+                scan_est,
+                &idx_access,
+                &info,
+            );
+            let row = push_dot_node(
+                next_id,
+                nodes,
+                "TableRowIDScan",
+                scan_est,
+                &table_access(table, partitions),
+                "keep order:false",
+            );
+            Some(vec![idx, row])
+        }
+        _ => None,
+    }
+}
+
+fn push_dot_node(
+    next_id: &mut usize,
+    nodes: &mut Vec<String>,
+    name: &str,
+    est: f64,
+    access: &str,
+    info: &str,
+) -> usize {
+    let id = *next_id;
+    *next_id += 1;
+    nodes.push(format!(
+        "  N{id}[label=\"{name}_{id}\\nestRows={est:.2}\\n{access} {info}\"]"
+    ));
     id
 }
 
@@ -250,14 +593,14 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         ),
         PhysicalPlan::Update => ("Update".to_string(), String::new(), String::new()),
         PhysicalPlan::Delete => ("Delete".to_string(), String::new(), String::new()),
-        PhysicalPlan::TableReader {
-            table,
-            partitions,
-            pushed,
-        } => (
+        PhysicalPlan::TableReader { pushed, .. } => (
             "TableReader".to_string(),
-            format!("table:{table}"),
-            cop_info(partitions, pushed.as_ref()),
+            String::new(),
+            if pushed.is_some() {
+                "data:Selection".to_string()
+            } else {
+                "data:TableFullScan".to_string()
+            },
         ),
         PhysicalPlan::PointGet {
             table,
@@ -297,31 +640,19 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             format!("keys:{n_keys}"),
         ),
-        PhysicalPlan::IndexLookUpReader {
-            table,
-            index,
-            pushed,
-            ..
-        } => (
+        PhysicalPlan::IndexLookUpReader { .. } => (
             "IndexLookUp".to_string(),
-            format!("table:{table}, index:{index}"),
-            pushed
-                .as_ref()
-                .map(|filter| format!("pushed:{}", filter.restore_string()))
-                .unwrap_or_default(),
+            String::new(),
+            "data:IndexRangeScan, TableRowIDScan".to_string(),
         ),
-        PhysicalPlan::IndexReader {
-            table,
-            index,
-            pushed,
-            ..
-        } => (
+        PhysicalPlan::IndexReader { pushed, .. } => (
             "IndexReader".to_string(),
-            format!("table:{table}, index:{index}"),
-            pushed
-                .as_ref()
-                .map(|filter| format!("pushed:{}", filter.restore_string()))
-                .unwrap_or_default(),
+            String::new(),
+            if pushed.is_some() {
+                "data:Selection".to_string()
+            } else {
+                "data:IndexFullScan".to_string()
+            },
         ),
         PhysicalPlan::Selection { filter, .. } => (
             "Selection".to_string(),
@@ -396,30 +727,10 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
     }
 }
 
-fn task_of(plan: &PhysicalPlan) -> &'static str {
-    match plan {
-        PhysicalPlan::TableReader {
-            pushed: Some(_), ..
-        }
-        | PhysicalPlan::IndexLookUpReader {
-            pushed: Some(_), ..
-        }
-        | PhysicalPlan::IndexReader {
-            pushed: Some(_), ..
-        } => "cop",
-        _ => "root",
-    }
-}
-
-fn cop_info(partitions: &[i64], pushed: Option<&sealdb_parser::ast::ExprNode>) -> String {
-    let mut parts = Vec::new();
-    if !partitions.is_empty() {
-        parts.push(format!("partition:{partitions:?}"));
-    }
-    if let Some(filter) = pushed {
-        parts.push(format!("pushed:{}", filter.restore_string()));
-    }
-    parts.join(", ")
+fn task_of(_plan: &PhysicalPlan) -> &'static str {
+    // PhysicalPlan nodes are root gatherers; DistSQL scans are emitted as
+    // synthetic task=cop rows in emit_cop_children.
+    "root"
 }
 
 fn tree_prefix(depth: usize, last: bool) -> String {

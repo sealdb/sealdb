@@ -1679,7 +1679,15 @@ mod tests {
         assert!(text.contains("TableReader"), "{text}");
         assert!(text.contains("pushed:"), "{text}");
         assert!(text.contains("cop"), "{text}");
-        assert!(!text.contains("Selection"), "{text}");
+        // PPD: filter is under TableReader as a cop Selection, not a root Selection.
+        assert!(
+            text.lines()
+                .next()
+                .map(|l| l.contains("TableReader"))
+                .unwrap_or(false),
+            "{text}"
+        );
+        assert!(!text.lines().any(|l| l.starts_with("Selection")), "{text}");
     }
 
     #[test]
@@ -4539,5 +4547,122 @@ mod tests {
             .execute_stmt("EXPLAIN ANALYZE FORMAT='json' SELECT 1")
             .unwrap();
         assert!(json.display_rows()[0][0].contains("actRows"));
+    }
+
+    #[test]
+    fn test_explain_cop_task_rows() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        let scan = session.execute_stmt("EXPLAIN SELECT * FROM db1.t").unwrap();
+        let scan_text = scan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(scan_text.contains("TableReader"), "{scan_text}");
+        assert!(scan_text.contains("TableFullScan"), "{scan_text}");
+        let scan_rows = scan.display_rows();
+        let cop_scan = scan_rows
+            .iter()
+            .find(|r| {
+                r.first()
+                    .map(|id| id.contains("TableFullScan"))
+                    .unwrap_or(false)
+            })
+            .expect(&scan_text);
+        assert_eq!(
+            cop_scan.get(2).map(String::as_str),
+            Some("cop"),
+            "{scan_text}"
+        );
+        assert!(
+            !cop_scan
+                .get(1)
+                .map(|e| e.is_empty() || e == "0.00")
+                .unwrap_or(true),
+            "cop estRows empty/zero: {scan_text}"
+        );
+        assert!(
+            cop_scan
+                .get(3)
+                .map(|a| a.contains("table:"))
+                .unwrap_or(false),
+            "{scan_text}"
+        );
+
+        let filtered = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        let filtered_text = filtered
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(filtered_text.contains("TableReader"), "{filtered_text}");
+        assert!(filtered_text.contains("TableFullScan"), "{filtered_text}");
+        assert!(
+            filtered
+                .display_rows()
+                .iter()
+                .any(|r| r.get(2).map(|t| t.as_str()) == Some("cop")),
+            "{filtered_text}"
+        );
+
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20), extra VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.u VALUES (1, 'a', 'x')",
+            )
+            .unwrap();
+        let lookup = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        let lookup_text = lookup
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            lookup_text.contains("IndexLookUp") || lookup_text.contains("IndexReader"),
+            "{lookup_text}"
+        );
+        assert!(
+            lookup_text.contains("IndexRangeScan") || lookup_text.contains("IndexFullScan"),
+            "{lookup_text}"
+        );
+        assert!(
+            lookup
+                .display_rows()
+                .iter()
+                .any(|r| r.get(2).map(|t| t.as_str()) == Some("cop")
+                    && r.get(3).map(|a| !a.is_empty()).unwrap_or(false)),
+            "{lookup_text}"
+        );
+
+        let analyze = session
+            .execute_stmt("EXPLAIN ANALYZE SELECT * FROM db1.t")
+            .unwrap();
+        let analyze_text = analyze
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(analyze_text.contains("TableFullScan"), "{analyze_text}");
+        assert!(
+            analyze.display_rows().iter().any(|r| r
+                .first()
+                .map(|id| id.contains("TableFullScan"))
+                .unwrap_or(false)
+                && r.get(2).map(|a| a.as_str()) == Some("2")
+                && r.get(3).map(|t| t.as_str()) == Some("cop")),
+            "{analyze_text}"
+        );
     }
 }
