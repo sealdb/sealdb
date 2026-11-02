@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 170,
-  "manifest_entries": 120,
+  "rs_files": 175,
+  "manifest_entries": 124,
   "status_counts": {
-    "not-started": 1561,
-    "partial": 113,
+    "not-started": 1557,
+    "partial": 117,
     "reimplemented": 4,
     "ported": 3
   },
@@ -431,11 +431,11 @@
     },
     "pkg/util": {
       "go": 291,
-      "rs": 6,
-      "missing": 285,
+      "rs": 10,
+      "missing": 281,
       "status": {
-        "not-started": 285,
-        "partial": 3,
+        "not-started": 281,
+        "partial": 7,
         "ported": 3
       }
     }
@@ -2504,7 +2504,7 @@
       "rs_path": "pkg/executor/delete.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "single-table DELETE + ORDER BY / LIMIT"
+      "notes": "single-table DELETE + ORDER BY / LIMIT + two-table DELETE JOIN"
     },
     {
       "go_path": "pkg/executor/detach.go",
@@ -3365,7 +3365,7 @@
       "rs_path": "pkg/executor/update.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "single-table UPDATE SET + ORDER BY / LIMIT"
+      "notes": "single-table UPDATE SET + ORDER BY / LIMIT + two-table UPDATE JOIN"
     },
     {
       "go_path": "pkg/executor/utils.go",
@@ -9567,7 +9567,7 @@
       "rs_path": "pkg/tablecodec/tablecodec.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "row/index key layout + compact row values + secondary index keys"
+      "notes": "row/index key layout + rowcodec values + secondary index keys"
     },
     {
       "go_path": "pkg/telemetry/data.go",
@@ -11524,31 +11524,31 @@
     },
     {
       "go_path": "pkg/util/rowcodec/common.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/common.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "CodecVer 128 + compact int/uint; checksum constants unused until checksum leftover"
     },
     {
       "go_path": "pkg/util/rowcodec/decoder.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/decoder.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "decode by FieldType; checksum verify deferred"
     },
     {
       "go_path": "pkg/util/rowcodec/encoder.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/encoder.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "NoChecksum encode of int/uint/float/bytes/decimal/time"
     },
     {
       "go_path": "pkg/util/rowcodec/row.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/row.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "small/large row header, col ids, offsets; checksum skip"
     },
     {
       "go_path": "pkg/util/schemacmp/lattice.go",

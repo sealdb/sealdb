@@ -87,6 +87,7 @@ case "$FEATURE" in
   F07)
     run execute-update-delete cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); UPDATE db1.t SET name = 'c' WHERE id = 1; DELETE FROM db1.t WHERE id = 2; SELECT * FROM db1.t"
     run execute-update-delete-order-limit cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c'); UPDATE db1.t SET name = 'z' ORDER BY id DESC LIMIT 1; DELETE FROM db1.t ORDER BY id LIMIT 1; SELECT * FROM db1.t ORDER BY id"
+    run execute-update-join cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (2, 'y'); UPDATE db1.t1 JOIN db1.t2 ON t1.id = t2.id SET t1.name = t2.tag; DELETE db1.t1 FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id WHERE t2.tag = 'x'; SELECT * FROM db1.t1 ORDER BY id"
     ;;
   F08)
     run execute-agg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'); SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name"

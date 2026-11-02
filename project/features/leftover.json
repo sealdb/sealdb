@@ -39,11 +39,6 @@
       "online-ddl-jobs",
       "indexes"
     ],
-    "F07": [
-      "multi-table",
-      "update-join",
-      "returning"
-    ],
     "F09": [
       "semi-anti",
       "cross-join",

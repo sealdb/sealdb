@@ -290,6 +290,32 @@ mod tests {
             }
             other => panic!("expected DeleteStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("UPDATE t1 JOIN t2 ON t1.id = t2.id SET t1.name = t2.name")
+            .unwrap()
+        {
+            crate::ast::Statement::Update(update) => {
+                assert!(update.join.is_some());
+                assert_eq!(update.list[0].table.as_deref(), Some("t1"));
+                assert_eq!(update.list[0].column, "name");
+            }
+            other => panic!("expected UpdateStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id")
+            .unwrap()
+        {
+            crate::ast::Statement::Delete(delete) => {
+                assert_eq!(delete.tables.len(), 1);
+                assert!(delete.join.is_some());
+            }
+            other => panic!("expected DeleteStmt, got {other:?}"),
+        }
+        assert!(
+            parser
+                .parse_one_stmt("UPDATE t SET name = 'x' RETURNING name")
+                .is_err()
+        );
     }
 
     #[test]

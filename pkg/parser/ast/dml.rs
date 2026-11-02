@@ -261,12 +261,17 @@ impl InsertStmt {
 
 #[derive(Clone, Debug)]
 pub struct Assignment {
+    pub table: Option<String>,
     pub column: String,
     pub expr: ExprNode,
 }
 
 impl Assignment {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(table) = &self.table {
+            ctx.write_name(table);
+            ctx.write_str(".");
+        }
         ctx.write_name(&self.column);
         ctx.write_str("=");
         self.expr.restore(ctx)
@@ -276,6 +281,7 @@ impl Assignment {
 #[derive(Clone, Debug)]
 pub struct UpdateStmt {
     pub table: TableName,
+    pub join: Option<Join>,
     pub list: Vec<Assignment>,
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
@@ -285,7 +291,7 @@ pub struct UpdateStmt {
 impl UpdateStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("UPDATE ");
-        self.table.restore(ctx)?;
+        restore_table_join(ctx, &self.table, self.join.as_ref())?;
         ctx.write_str(" SET ");
         for (i, item) in self.list.iter().enumerate() {
             if i > 0 {
@@ -304,6 +310,8 @@ impl UpdateStmt {
 #[derive(Clone, Debug)]
 pub struct DeleteStmt {
     pub table: TableName,
+    pub tables: Vec<TableName>,
+    pub join: Option<Join>,
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
@@ -311,13 +319,39 @@ pub struct DeleteStmt {
 
 impl DeleteStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("DELETE FROM ");
-        self.table.restore(ctx)?;
+        ctx.write_str("DELETE ");
+        if self.tables.is_empty() {
+            ctx.write_str("FROM ");
+            restore_table_join(ctx, &self.table, self.join.as_ref())?;
+        } else {
+            for (i, table) in self.tables.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                table.restore(ctx)?;
+            }
+            ctx.write_str(" FROM ");
+            restore_table_join(ctx, &self.table, self.join.as_ref())?;
+        }
         if let Some(selection) = &self.selection {
             ctx.write_str(" WHERE ");
             selection.restore(ctx)?;
         }
         restore_order_limit(ctx, &self.order_by, self.limit)
+    }
+}
+
+fn restore_table_join(ctx: &mut RestoreCtx, table: &TableName, join: Option<&Join>) -> Result<()> {
+    if let Some(join) = join {
+        join.left.restore(ctx)?;
+        ctx.write_str(" ");
+        ctx.write_str(join.tp.restore());
+        ctx.write_str(" ");
+        join.right.restore(ctx)?;
+        ctx.write_str(" ON ");
+        join.on.restore(ctx)
+    } else {
+        table.restore(ctx)
     }
 }
 

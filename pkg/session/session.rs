@@ -342,15 +342,29 @@ impl Session {
                     &current_db,
                     PrivilegeType::UPDATE,
                 )?;
+                if let Some(join) = &update.join {
+                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::UPDATE)?;
+                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::UPDATE)?;
+                }
             }
             Statement::Delete(delete) => {
-                require(
-                    &mgr,
-                    &user,
-                    &delete.table,
-                    &current_db,
-                    PrivilegeType::DELETE,
-                )?;
+                if delete.tables.is_empty() {
+                    require(
+                        &mgr,
+                        &user,
+                        &delete.table,
+                        &current_db,
+                        PrivilegeType::DELETE,
+                    )?;
+                } else {
+                    for table in &delete.tables {
+                        require(&mgr, &user, table, &current_db, PrivilegeType::DELETE)?;
+                    }
+                }
+                if let Some(join) = &delete.join {
+                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
+                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                }
             }
             Statement::CreateDatabase(create) => {
                 if !mgr.request_verification(&user, &create.name, "", PrivilegeType::CREATE) {
@@ -1335,6 +1349,51 @@ mod tests {
                 vec!["3".to_string(), "z".to_string()]
             ]
         );
+    }
+
+    #[test]
+    fn test_update_join_and_multi_delete() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (2, 'y')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("UPDATE db1.t1 JOIN db1.t2 ON t1.id = t2.id SET t1.name = t2.tag")
+            .unwrap();
+        let updated = session
+            .execute_stmt("SELECT * FROM db1.t1 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            updated.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "y".to_string()]
+            ]
+        );
+        session
+            .execute_stmt(
+                "DELETE db1.t1 FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id WHERE t2.tag = 'x'",
+            )
+            .unwrap();
+        let after_one = session
+            .execute_stmt("SELECT * FROM db1.t1 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_one.display_rows(),
+            vec![vec!["2".to_string(), "y".to_string()]]
+        );
+        session
+            .execute_stmt("INSERT INTO db1.t1 VALUES (1, 'x')")
+            .unwrap();
+        session
+            .execute_stmt("DELETE db1.t1, db1.t2 FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id")
+            .unwrap();
+        let t1 = session.execute_stmt("SELECT * FROM db1.t1").unwrap();
+        let t2 = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
+        assert!(t1.display_rows().is_empty());
+        assert!(t2.display_rows().is_empty());
     }
 
     #[test]
