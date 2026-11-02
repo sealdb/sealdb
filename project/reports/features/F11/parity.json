@@ -4247,7 +4247,7 @@
       "rs_path": "pkg/infoschema/infoschema.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "in-memory schema snapshot + information_schema SCHEMATA/TABLES/COLUMNS"
+      "notes": "in-memory schema snapshot + I_S SCHEMATA/TABLES/COLUMNS/STATISTICS/constraints/partitions/charset"
     },
     {
       "go_path": "pkg/infoschema/infoschema_v2.go",
@@ -4345,7 +4345,7 @@
       "rs_path": "pkg/infoschema/tables.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "virtual SCHEMATA/TABLES/COLUMNS; remaining I_S tables deferred"
+      "notes": "virtual I_S tables for schema/index/partition/charset; cluster/TiKV tables deferred"
     },
     {
       "go_path": "pkg/keyspace/keyspace.go",

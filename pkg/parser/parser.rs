@@ -162,6 +162,23 @@ mod tests {
             }
             other => panic!("expected SHOW CREATE DATABASE, got {other:?}"),
         }
+        match parser.parse_one_stmt("SHOW INDEX FROM db1.t").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::Index);
+                let table = show.table.unwrap();
+                assert_eq!(table.schema.as_deref(), Some("db1"));
+                assert_eq!(table.name, "t");
+            }
+            other => panic!("expected SHOW INDEX, got {other:?}"),
+        }
+        assert_eq!(
+            parser.parse_one_stmt("SHOW CHARSET").unwrap().stmt_type(),
+            "ShowStmt"
+        );
+        assert_eq!(
+            parser.parse_one_stmt("SHOW COLLATION").unwrap().stmt_type(),
+            "ShowStmt"
+        );
     }
 
     #[test]

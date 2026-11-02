@@ -789,6 +789,43 @@ mod tests {
         assert_eq!(create_table.display_rows()[0][0], "t");
         assert!(create_table.display_rows()[0][1].contains("`id` int"));
         assert!(create_table.display_rows()[0][1].contains("`name` varchar(20)"));
+        session
+            .execute_stmt("CREATE INDEX idx_name ON db1.t (name)")
+            .unwrap();
+        let stats = session
+            .execute_stmt(
+                "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA = 'db1' AND TABLE_NAME = 't'",
+            )
+            .unwrap();
+        assert_eq!(
+            stats.display_rows(),
+            vec![vec!["idx_name".to_string(), "name".to_string()]]
+        );
+        let show_index = session.execute_stmt("SHOW INDEX FROM db1.t").unwrap();
+        assert_eq!(show_index.columns[2], "Key_name");
+        assert_eq!(show_index.display_rows()[0][2], "idx_name");
+        let charset = session.execute_stmt("SHOW CHARSET").unwrap();
+        assert!(
+            charset
+                .display_rows()
+                .iter()
+                .any(|row| row.first().map(String::as_str) == Some("utf8mb4"))
+        );
+        let collation = session.execute_stmt("SHOW COLLATION").unwrap();
+        assert!(
+            collation
+                .display_rows()
+                .iter()
+                .any(|row| row.first().map(String::as_str) == Some("utf8mb4_bin"))
+        );
+        let engines = session
+            .execute_stmt("SELECT ENGINE FROM information_schema.engines")
+            .unwrap();
+        assert_eq!(engines.display_rows(), vec![vec!["InnoDB".to_string()]]);
+        let views = session
+            .execute_stmt("SELECT TABLE_NAME FROM information_schema.views")
+            .unwrap();
+        assert!(views.display_rows().is_empty());
     }
 
     #[test]
