@@ -5,9 +5,10 @@ use super::ddl::{
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, DeallocateStmt, DropRoleStmt,
-    ExecuteStmt, GrantRoleStmt, GrantStmt, PrepareStmt, ReleaseSavepointStmt, RevokeRoleStmt,
-    RevokeStmt, RollbackStmt, SavepointStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
+    DropRoleStmt, DropUserStmt, ExecuteStmt, GrantRoleStmt, GrantStmt, PrepareStmt,
+    ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetRoleStmt,
+    SetStmt, SetTxnStmt, ShowStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -46,6 +47,8 @@ pub enum Statement {
     Revoke(RevokeStmt),
     CreateRole(CreateRoleStmt),
     DropRole(DropRoleStmt),
+    CreateUser(CreateUserStmt),
+    DropUser(DropUserStmt),
     GrantRole(GrantRoleStmt),
     RevokeRole(RevokeRoleStmt),
     SetRole(SetRoleStmt),
@@ -84,6 +87,8 @@ impl Node for Statement {
             Statement::Revoke(s) => s.restore(ctx),
             Statement::CreateRole(s) => s.restore(ctx),
             Statement::DropRole(s) => s.restore(ctx),
+            Statement::CreateUser(s) => s.restore(ctx),
+            Statement::DropUser(s) => s.restore(ctx),
             Statement::GrantRole(s) => s.restore(ctx),
             Statement::RevokeRole(s) => s.restore(ctx),
             Statement::SetRole(s) => s.restore(ctx),
@@ -124,6 +129,8 @@ impl StmtNode for Statement {
             Statement::Revoke(_) => "RevokeStmt",
             Statement::CreateRole(_) => "CreateRoleStmt",
             Statement::DropRole(_) => "DropRoleStmt",
+            Statement::CreateUser(_) => "CreateUserStmt",
+            Statement::DropUser(_) => "DropUserStmt",
             Statement::GrantRole(_) => "GrantRoleStmt",
             Statement::RevokeRole(_) => "RevokeRoleStmt",
             Statement::SetRole(_) => "SetRoleStmt",

@@ -443,6 +443,8 @@ impl Session {
             | Statement::Revoke(_)
             | Statement::CreateRole(_)
             | Statement::DropRole(_)
+            | Statement::CreateUser(_)
+            | Statement::DropUser(_)
             | Statement::GrantRole(_)
             | Statement::RevokeRole(_) => {
                 if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::ALL) {
@@ -895,6 +897,8 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::Revoke(_)
             | Statement::CreateRole(_)
             | Statement::DropRole(_)
+            | Statement::CreateUser(_)
+            | Statement::DropUser(_)
             | Statement::GrantRole(_)
             | Statement::RevokeRole(_)
     )

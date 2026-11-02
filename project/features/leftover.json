@@ -35,9 +35,6 @@
     "U3"
   ],
   "feature_gaps": {
-    "F20": [
-      "create-user"
-    ],
     "F21": [
       "histogram",
       "topn",

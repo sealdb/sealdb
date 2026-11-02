@@ -25,7 +25,7 @@
     "F17": {"status": "core-ported", "phase": 8, "notes": "WITH CTE + RECURSIVE + MATERIALIZED + UNION + JOIN + DML + shared storage", "gaps": []},
     "F18": {"status": "core-ported", "phase": 8, "notes": "CREATE/DROP INDEX + UNIQUE INDEX backfill + ALTER ADD/DROP/CHANGE/MODIFY/RENAME + AFTER/FIRST + ALGORITHM/LOCK + ADMIN SHOW DDL JOBS + reorg states", "gaps": []},
     "F19": {"status": "core-ported", "phase": 8, "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys + ADD/DROP PARTITION + SUBPARTITION strip + static/dynamic prune", "gaps": []},
-    "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + column/dynamic privs + roles + persist", "gaps": ["create-user"]},
+    "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + CREATE USER + roles + column/dynamic privs + persist", "gaps": []},
     "F21": {"status": "core-ported", "phase": 7, "notes": "ANALYZE TABLE count/NDV + IndexLookUp vs TableReader CBO", "gaps": ["histogram", "topn", "auto-analyze", "analyze-index", "persist-stats", "join-cost"]},
     "F22": {"status": "core-ported", "phase": 9, "notes": "MySQL handshake + COM_QUERY/COM_PING/COM_INIT_DB/COM_QUIT", "gaps": ["ssl", "compression", "prepared-stmt", "auth-plugin", "binary-protocol", "multi-resultset"]},
     "C1": {"status": "core-ported", "phase": 10, "notes": "frozen leftover denominator: 91 feature gaps + 56 open stmts + 42 suites", "gaps": ["unmapped-stmts", "stale-gap-labels", "leftover-suite-execution"]},

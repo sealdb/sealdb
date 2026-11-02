@@ -16,11 +16,11 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, DeallocateStmt, DropRoleStmt,
-    ExecuteStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt,
-    PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt,
-    SavepointStmt, SetAssignment, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt,
-    ShowStmtKind, UseStmt, UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
+    DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt,
+    IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt,
+    RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetRoleKind, SetRoleStmt, SetStmt,
+    SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity, UserSpec,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -58,6 +58,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
     let (rewritten, role_ops) = extract_role_grants(&rewritten)?;
+    // sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
+    let (rewritten, user_ops) = extract_user_ddl(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -69,6 +71,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
     let mut role_ops = role_ops.into_iter();
+    let mut user_ops = user_ops.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -105,9 +108,14 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         {
             prepare.sql = sql;
         }
-        // Placeholders from extract_role_grants become Set NAMES; swap for role ops.
-        if matches!(&lowered, Statement::Set(s) if is_role_placeholder(s))
+        // Placeholders from extract_role_grants / extract_user_ddl become Set NAMES.
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_role__"))
             && let Some(op) = role_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_user__"))
+            && let Some(op) = user_ops.next().flatten()
         {
             lowered = op;
         }
@@ -117,11 +125,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     Ok(out)
 }
 
-fn is_role_placeholder(stmt: &SetStmt) -> bool {
+fn is_placeholder(stmt: &SetStmt, marker: &str) -> bool {
     matches!(
         stmt.assignments.as_slice(),
         [SetAssignment { name, value }]
-            if name.eq_ignore_ascii_case("names") && value.eq_ignore_ascii_case("__sealdb_role__")
+            if name.eq_ignore_ascii_case("names") && value.eq_ignore_ascii_case(marker)
     )
 }
 
@@ -1173,6 +1181,113 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
+fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after, "USER") {
+                let (stmt, end) = parse_create_user(bytes, after + "USER".len())?;
+                out.push_str("SET NAMES '__sealdb_user__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "DROP") {
+            let after = skip_ws(bytes, i + "DROP".len());
+            if keyword_at(bytes, after, "USER") {
+                let (stmt, end) = parse_drop_user(bytes, after + "USER".len())?;
+                out.push_str("SET NAMES '__sealdb_user__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, ops))
+}
+
+fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let if_not_exists = if keyword_at(bytes, i, "IF") {
+        let after_if = skip_ws(bytes, i + 2);
+        if keyword_at(bytes, after_if, "NOT") {
+            let after_not = skip_ws(bytes, after_if + 3);
+            if keyword_at(bytes, after_not, "EXISTS") {
+                i = skip_ws(bytes, after_not + "EXISTS".len());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let mut users = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (user, after_user) = read_user_identity(bytes, i)?;
+        i = skip_ws(bytes, after_user);
+        let mut auth = None;
+        if keyword_at(bytes, i, "IDENTIFIED") {
+            i = skip_ws(bytes, i + "IDENTIFIED".len());
+            if !keyword_at(bytes, i, "BY") {
+                return Err(Error::unsupported("IDENTIFIED without BY"));
+            }
+            i = skip_ws(bytes, i + "BY".len());
+            let (pwd, after_pwd) = read_quoted_or_ident(bytes, i);
+            auth = Some(pwd);
+            i = skip_ws(bytes, after_pwd);
+        }
+        users.push(UserSpec { user, auth });
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if users.is_empty() {
+        return Err(Error::unsupported("CREATE USER without users"));
+    }
+    Ok((
+        Statement::CreateUser(CreateUserStmt {
+            if_not_exists,
+            users,
+        }),
+        i,
+    ))
+}
+
+fn parse_drop_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let if_exists = if keyword_at(bytes, i, "IF") {
+        let after_if = skip_ws(bytes, i + 2);
+        if keyword_at(bytes, after_if, "EXISTS") {
+            i = skip_ws(bytes, after_if + "EXISTS".len());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let (users, end) = parse_user_list(bytes, i)?;
+    if users.is_empty() {
+        return Err(Error::unsupported("DROP USER without users"));
+    }
+    Ok((Statement::DropUser(DropUserStmt { if_exists, users }), end))
 }
 
 /// sqlparser rejects MySQL `GRANT role TO user` / dynamic privs like

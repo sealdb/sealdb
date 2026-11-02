@@ -5,8 +5,8 @@
 /// Completeness wave: dynamic privileges, column grants, LDAP, auth plugins.
 use sealdb_errno::{ERR_DBACCESS_DENIED_ERROR, ERR_TABLEACCESS_DENIED_ERROR, Error, Result};
 use sealdb_parser::ast::{
-    CreateRoleStmt, DropRoleStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt,
-    PrivilegeType, RevokeRoleStmt, RevokeStmt, SetRoleKind, UserIdentity,
+    CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel, GrantLevelType,
+    GrantRoleStmt, GrantStmt, PrivilegeType, RevokeRoleStmt, RevokeStmt, SetRoleKind, UserIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +35,8 @@ struct Store {
     role_graph: HashMap<(String, String), HashSet<(String, String)>>,
     /// TiDB dynamic privileges (BACKUP_ADMIN, …) per user.
     dynamic: HashMap<(String, String), HashSet<String>>,
+    /// Created users and optional auth string (IDENTIFIED BY).
+    users: HashMap<(String, String), Option<String>>,
 }
 
 pub struct Manager {
@@ -51,6 +53,7 @@ impl Manager {
                 roles: HashSet::new(),
                 role_graph: HashMap::new(),
                 dynamic: HashMap::new(),
+                users: HashMap::new(),
             }),
         }
     }
@@ -63,8 +66,13 @@ impl Manager {
                 roles: HashSet::new(),
                 role_graph: HashMap::new(),
                 dynamic: HashMap::new(),
+                users: HashMap::new(),
             }),
         };
+        {
+            let mut inner = mgr.inner.lock().expect("privilege lock");
+            inner.users.insert(user_key(&UserIdentity::root()), None);
+        }
         mgr.grant_bits(
             &UserIdentity::root(),
             &GrantLevel {
@@ -157,6 +165,61 @@ impl Manager {
             }
         }
         Ok(())
+    }
+
+    pub fn create_user(&self, stmt: &CreateUserStmt) -> Result<()> {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for spec in &stmt.users {
+            let key = user_key(&spec.user);
+            if inner.users.contains_key(&key) {
+                if stmt.if_not_exists {
+                    continue;
+                }
+                return Err(Error::new(
+                    sealdb_errno::ERR_TABLE_EXISTS,
+                    format!(
+                        "Operation CREATE USER failed for '{}'@'{}'",
+                        spec.user.username, spec.user.hostname
+                    ),
+                ));
+            }
+            inner.users.insert(key, spec.auth.clone());
+        }
+        Ok(())
+    }
+
+    pub fn drop_user(&self, stmt: &DropUserStmt) -> Result<()> {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for user in &stmt.users {
+            let key = user_key(user);
+            if inner.users.remove(&key).is_none() {
+                if stmt.if_exists {
+                    continue;
+                }
+                return Err(Error::new(
+                    sealdb_errno::ERR_NO_SUCH_TABLE,
+                    format!(
+                        "Operation DROP USER failed for '{}'@'{}'",
+                        user.username, user.hostname
+                    ),
+                ));
+            }
+            inner.grants.remove(&key);
+            inner.dynamic.remove(&key);
+            inner.role_graph.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub fn user_exists(&self, user: &UserIdentity) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        self.inner
+            .lock()
+            .expect("privilege lock")
+            .users
+            .contains_key(&user_key(user))
     }
 
     pub fn create_role(&self, stmt: &CreateRoleStmt) -> Result<()> {
@@ -446,6 +509,15 @@ impl Manager {
                     names: names.iter().cloned().collect(),
                 })
                 .collect(),
+            users: inner
+                .users
+                .iter()
+                .map(|((u, h), auth)| PersistUser {
+                    user: u.clone(),
+                    host: h.clone(),
+                    auth: auth.clone(),
+                })
+                .collect(),
         };
         serde_json::to_vec(&snap).map_err(|e| {
             Error::new(
@@ -491,11 +563,18 @@ impl Manager {
         for d in snap.dynamic {
             dynamic.insert((d.user, d.host), d.names.into_iter().collect());
         }
+        let mut users = HashMap::new();
+        for u in snap.users {
+            users.insert((u.user, u.host), u.auth);
+        }
         let mut inner = self.inner.lock().expect("privilege lock");
         inner.grants = grants;
         inner.roles = roles;
         inner.role_graph = role_graph;
         inner.dynamic = dynamic;
+        if !users.is_empty() {
+            inner.users = users;
+        }
         Ok(())
     }
 
@@ -519,6 +598,8 @@ struct PersistSnapshot {
     role_graph: Vec<PersistRoleEdge>,
     #[serde(default)]
     dynamic: Vec<PersistDynamic>,
+    #[serde(default)]
+    users: Vec<PersistUser>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -526,6 +607,13 @@ struct PersistDynamic {
     user: String,
     host: String,
     names: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistUser {
+    user: String,
+    host: String,
+    auth: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

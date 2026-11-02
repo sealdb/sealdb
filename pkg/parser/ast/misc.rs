@@ -231,6 +231,63 @@ impl RevokeStmt {
     }
 }
 
+/// `CREATE USER 'u'@'%' [IDENTIFIED BY 'pwd']` (TiDB `CreateUserStmt`).
+#[derive(Clone, Debug)]
+pub struct CreateUserStmt {
+    pub if_not_exists: bool,
+    pub users: Vec<UserSpec>,
+}
+
+impl CreateUserStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE USER ");
+        if self.if_not_exists {
+            ctx.write_str("IF NOT EXISTS ");
+        }
+        for (i, spec) in self.users.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            spec.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// `DROP USER [IF EXISTS] 'u'@'%'`.
+#[derive(Clone, Debug)]
+pub struct DropUserStmt {
+    pub if_exists: bool,
+    pub users: Vec<UserIdentity>,
+}
+
+impl DropUserStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP USER ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
+        restore_users(&self.users, ctx)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UserSpec {
+    pub user: UserIdentity,
+    pub auth: Option<String>,
+}
+
+impl UserSpec {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.user.restore(ctx)?;
+        if let Some(auth) = &self.auth {
+            ctx.write_str(" IDENTIFIED BY ");
+            ctx.write_str(&format!("'{auth}'"));
+        }
+        Ok(())
+    }
+}
+
 /// `CREATE ROLE r1 [, r2 ...]` (TiDB `CreateRoleStmt`).
 #[derive(Clone, Debug)]
 pub struct CreateRoleStmt {
