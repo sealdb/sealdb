@@ -533,3 +533,58 @@ impl SetOprStmt {
         Ok(())
     }
 }
+
+/// TiDB `ast.ResultSetNode`: a SELECT or set operation usable as a subquery
+/// (EXISTS / IN / scalar / ANY|ALL). UNION in CTE stays an F17 leftover.
+#[derive(Clone, Debug)]
+pub enum ResultSetNode {
+    Select(SelectStmt),
+    SetOpr(SetOprStmt),
+}
+
+impl ResultSetNode {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        match self {
+            ResultSetNode::Select(select) => select.restore(ctx),
+            ResultSetNode::SetOpr(set) => set.restore(ctx),
+        }
+    }
+
+    /// Semi-join rewrite only applies to a single SELECT inner.
+    pub fn as_select(&self) -> Option<&SelectStmt> {
+        match self {
+            ResultSetNode::Select(select) => Some(select),
+            ResultSetNode::SetOpr(_) => None,
+        }
+    }
+
+    /// True when any SELECT arm has a JOIN chain.
+    pub fn has_join(&self) -> bool {
+        self.selects().iter().any(|select| !select.joins.is_empty())
+    }
+
+    /// SELECT arms: the statement itself, or first + rest of a set op.
+    pub fn selects(&self) -> Vec<&SelectStmt> {
+        match self {
+            ResultSetNode::Select(select) => vec![select],
+            ResultSetNode::SetOpr(set) => {
+                let mut out = Vec::with_capacity(set.rest.len() + 1);
+                out.push(&set.first);
+                out.extend(set.rest.iter().map(|(_, select)| select));
+                out
+            }
+        }
+    }
+
+    /// Cap LIMIT at `n` on the outer query (EXISTS only needs one row).
+    pub fn cap_limit(&mut self, n: u64) {
+        match self {
+            ResultSetNode::Select(select) => {
+                select.limit = Some(select.limit.unwrap_or(n).min(n));
+            }
+            ResultSetNode::SetOpr(set) => {
+                set.limit = Some(set.limit.unwrap_or(n).min(n));
+            }
+        }
+    }
+}

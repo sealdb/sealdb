@@ -5,8 +5,9 @@ use crate::ast::ddl::{
     PartitionOption, PartitionType, TableName,
 };
 use crate::ast::dml::{
-    Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
-    SelectLock, SelectLockWait, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
+    Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType,
+    ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprStmt, SetOprType,
+    UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
@@ -1611,11 +1612,25 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
             stmt.with = merge_with_ctes(lower_with(query.with.as_ref())?, derived)?;
             Ok(stmt)
         }
-        // F15 gap / completeness wave: UNION inside scalar/EXISTS/IN subquery.
+        // F17 leftover: UNION in CTE / FROM derived table still uses this path.
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
         )),
+    }
+}
+
+/// Lower a subquery body that may be either SELECT or a set operation.
+fn lower_result_set(query: &Query) -> Result<ResultSetNode> {
+    match query.body.as_ref() {
+        SetExpr::Select(_) => Ok(ResultSetNode::Select(lower_query(query)?)),
+        SetExpr::SetOperation { .. } => {
+            let mut set = lower_set_opr(query)?;
+            set.with = lower_with(query.with.as_ref())?;
+            Ok(ResultSetNode::SetOpr(set))
+        }
+        SetExpr::Query(inner) => lower_result_set(inner),
+        other => Err(Error::unsupported(format!("subquery body {other}"))),
     }
 }
 
@@ -2181,8 +2196,8 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             }))
         }
         Expr::Exists { subquery, negated } => {
-            let query = lower_query(subquery)?;
-            if !query.joins.is_empty() {
+            let query = lower_result_set(subquery)?;
+            if query.has_join() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::Exists(ExistsExpr {
@@ -2195,8 +2210,8 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             subquery,
             negated,
         } => {
-            let query = lower_query(subquery)?;
-            if !query.joins.is_empty() {
+            let query = lower_result_set(subquery)?;
+            if query.has_join() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::InSubquery(InSubqueryExpr {
@@ -2268,8 +2283,8 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             not: true,
         })),
         Expr::Subquery(subquery) => {
-            let query = lower_query(subquery)?;
-            if !query.joins.is_empty() {
+            let query = lower_result_set(subquery)?;
+            if query.has_join() {
                 return Err(Error::unsupported("subquery JOIN"));
             }
             Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {
@@ -2452,14 +2467,14 @@ fn lower_quantified_cmp(
     all: bool,
 ) -> Result<ExprNode> {
     let query = match right {
-        Expr::Subquery(subquery) => lower_query(subquery)?,
+        Expr::Subquery(subquery) => lower_result_set(subquery)?,
         other => {
             return Err(Error::unsupported(format!(
                 "quantified comparison of {other}"
             )));
         }
     };
-    if !query.joins.is_empty() {
+    if query.has_join() {
         return Err(Error::unsupported("subquery JOIN"));
     }
     let expr = lower_expr(left)?;

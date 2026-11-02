@@ -697,6 +697,38 @@ mod tests {
                 .expr,
             crate::ast::ExprNode::ScalarSubquery(_)
         ));
+        match &parser
+            .parse_one_stmt("SELECT (SELECT 1 UNION SELECT 1)")
+            .unwrap()
+            .as_select()
+            .unwrap()
+            .fields[0]
+            .expr
+        {
+            crate::ast::ExprNode::ScalarSubquery(s) => {
+                assert!(matches!(
+                    s.query.as_ref(),
+                    crate::ast::ResultSetNode::SetOpr(_)
+                ));
+            }
+            other => panic!("expected ScalarSubquery, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("SELECT * FROM t1 WHERE EXISTS (SELECT 1 UNION SELECT 2)")
+            .unwrap()
+            .as_select()
+            .unwrap()
+            .selection
+            .as_ref()
+        {
+            Some(crate::ast::ExprNode::Exists(e)) => {
+                assert!(matches!(
+                    e.query.as_ref(),
+                    crate::ast::ResultSetNode::SetOpr(_)
+                ));
+            }
+            other => panic!("expected Exists, got {other:?}"),
+        }
     }
 
     #[test]

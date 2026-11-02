@@ -24,7 +24,9 @@ use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{LockWait, RowLock, Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{ByItem, SelectLock, SelectLockWait, SelectStmt, Statement, TableName};
+use sealdb_parser::ast::{
+    ByItem, ResultSetNode, SelectLock, SelectLockWait, SelectStmt, Statement, TableName,
+};
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
 use std::sync::Arc;
 
@@ -485,6 +487,13 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
         .ok_or_else(|| Error::unsupported("table reader without FROM"))
 }
 
+fn find_table_in_result_set(query: &ResultSetNode, table: &str) -> Option<TableName> {
+    query
+        .selects()
+        .into_iter()
+        .find_map(|select| find_table_in_select(select, table))
+}
+
 /// Resolve a TableReader name against FROM, JOIN, or a subquery in WHERE
 /// (EXISTS / IN rewritten to HashJoin Semi still need the inner table).
 fn find_table_in_select(select: &SelectStmt, table: &str) -> Option<TableName> {
@@ -509,13 +518,13 @@ fn find_table_in_select(select: &SelectStmt, table: &str) -> Option<TableName> {
 
 fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
     match expr {
-        ExprNode::Exists(e) => find_table_in_select(&e.query, table),
+        ExprNode::Exists(e) => find_table_in_result_set(&e.query, table),
         ExprNode::InSubquery(s) => {
-            find_table_in_select(&s.query, table).or_else(|| find_table_in_expr(&s.expr, table))
+            find_table_in_result_set(&s.query, table).or_else(|| find_table_in_expr(&s.expr, table))
         }
-        ExprNode::ScalarSubquery(s) => find_table_in_select(&s.query, table),
+        ExprNode::ScalarSubquery(s) => find_table_in_result_set(&s.query, table),
         ExprNode::QuantifiedCmp(q) => {
-            find_table_in_select(&q.query, table).or_else(|| find_table_in_expr(&q.expr, table))
+            find_table_in_result_set(&q.query, table).or_else(|| find_table_in_expr(&q.expr, table))
         }
         ExprNode::Binary(b) => {
             find_table_in_expr(&b.left, table).or_else(|| find_table_in_expr(&b.right, table))

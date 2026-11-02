@@ -1,6 +1,7 @@
 // F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
-// Parallel apply: SEALDB_APPLY_CONCURRENCY workers (default 1). Completeness
-// wave / not this feature: semi/anti rewrite, subquery JOIN. Derived tables
+// Parallel apply: SEALDB_APPLY_CONCURRENCY workers (default 1). Subquery
+// bodies are ResultSetNode so UNION/EXCEPT/INTERSECT run through UnionExec.
+// Completeness wave / not this feature: subquery JOIN. Derived tables
 // flatten to CTEs. SELECT-list scalar subqueries reuse SubqueryEvalCtx.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
@@ -13,7 +14,7 @@ use sealdb_parser::ast::expressions::{
     InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
     UnaryOpExpr, ValueExpr,
 };
-use sealdb_parser::ast::{SelectField, SelectStmt, Statement};
+use sealdb_parser::ast::{ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement};
 use sealdb_parser::opcode::Op;
 use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
@@ -331,9 +332,9 @@ fn eval_exists(
     ctx: &ApplyCtx,
     cache: &mut HashMap<String, QueryResult>,
 ) -> Result<Datum> {
-    let mut inner = bind_select(&exists.query, ctx)?;
-    inner.limit = Some(inner.limit.unwrap_or(1).min(1));
-    let result = run_select(&inner, ctx, cache)?;
+    let mut inner = bind_result_set(&exists.query, ctx)?;
+    inner.cap_limit(1);
+    let result = run_result_set(&inner, ctx, cache)?;
     Ok(bool_datum(result.rows.is_empty() == exists.not))
 }
 
@@ -347,8 +348,8 @@ fn eval_in_subquery(
     if left.is_null() {
         return Ok(Datum::Null);
     }
-    let inner = bind_select(&sub.query, ctx)?;
-    let result = run_select(&inner, ctx, cache)?;
+    let inner = bind_result_set(&sub.query, ctx)?;
+    let result = run_result_set(&inner, ctx, cache)?;
     let mut saw_null = false;
     for row in &result.rows {
         let value = row.first().cloned().unwrap_or(Datum::Null);
@@ -377,8 +378,8 @@ fn eval_quantified_cmp(
 ) -> Result<Datum> {
     let left_expr = materialize(&cmp.expr, ctx, cache)?;
     let left = eval_expr_with_row(&left_expr, &ctx.outer_schema, &ctx.outer_row)?;
-    let inner = bind_select(&cmp.query, ctx)?;
-    let result = run_select(&inner, ctx, cache)?;
+    let inner = bind_result_set(&cmp.query, ctx)?;
+    let result = run_result_set(&inner, ctx, cache)?;
     if result.rows.is_empty() {
         return Ok(bool_datum(cmp.all));
     }
@@ -426,8 +427,8 @@ fn eval_scalar_subquery(
     ctx: &ApplyCtx,
     cache: &mut HashMap<String, QueryResult>,
 ) -> Result<Datum> {
-    let inner = bind_select(&sub.query, ctx)?;
-    let result = run_select(&inner, ctx, cache)?;
+    let inner = bind_result_set(&sub.query, ctx)?;
+    let result = run_result_set(&inner, ctx, cache)?;
     if result.rows.len() > 1 {
         return Err(Error::new(
             ERR_SUBQUERY_NO_1_ROW,
@@ -440,6 +441,26 @@ fn eval_scalar_subquery(
         .and_then(|row| row.first())
         .cloned()
         .unwrap_or(Datum::Null))
+}
+
+fn bind_result_set(query: &ResultSetNode, ctx: &ApplyCtx) -> Result<ResultSetNode> {
+    match query {
+        ResultSetNode::Select(select) => Ok(ResultSetNode::Select(bind_select(select, ctx)?)),
+        ResultSetNode::SetOpr(set) => {
+            let mut rest = Vec::with_capacity(set.rest.len());
+            for (op, select) in &set.rest {
+                rest.push((*op, bind_select(select, ctx)?));
+            }
+            Ok(ResultSetNode::SetOpr(SetOprStmt {
+                first: bind_select(&set.first, ctx)?,
+                rest,
+                order_by: set.order_by.clone(),
+                limit: set.limit,
+                offset: set.offset,
+                with: set.with.clone(),
+            }))
+        }
+    }
 }
 
 fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
@@ -614,16 +635,19 @@ fn lookup_outer(col: &ColumnNameExpr, ctx: &ApplyCtx) -> Option<Datum> {
         .and_then(|idx| ctx.outer_row.get(idx).cloned())
 }
 
-fn run_select(
-    select: &SelectStmt,
+fn run_result_set(
+    query: &ResultSetNode,
     ctx: &ApplyCtx,
     cache: &mut HashMap<String, QueryResult>,
 ) -> Result<QueryResult> {
-    let key = restore_select(select)?;
+    let key = restore_result_set(query)?;
     if let Some(hit) = cache.get(&key) {
         return Ok(hit.clone());
     }
-    let stmt = Statement::Select(select.clone());
+    let stmt = match query {
+        ResultSetNode::Select(select) => Statement::Select(select.clone()),
+        ResultSetNode::SetOpr(set) => Statement::SetOpr(set.clone()),
+    };
     let stats = ctx.domain.stats();
     let plan = PlanBuilder::new().build_with_schema(
         &stmt,
@@ -643,9 +667,9 @@ fn run_select(
     Ok(result)
 }
 
-fn restore_select(select: &SelectStmt) -> Result<String> {
+fn restore_result_set(query: &ResultSetNode) -> Result<String> {
     let mut ctx = sealdb_parser::format::RestoreCtx::new();
-    select.restore(&mut ctx)?;
+    query.restore(&mut ctx)?;
     Ok(ctx.into_string())
 }
 

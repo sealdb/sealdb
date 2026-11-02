@@ -2479,6 +2479,20 @@ mod tests {
             .execute_stmt("SELECT 1 WHERE EXISTS (SELECT * FROM db1.t2 WHERE id = 1)")
             .unwrap();
         assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let union_exists = session
+            .execute_stmt("SELECT 1 WHERE EXISTS (SELECT 2 UNION SELECT 3)")
+            .unwrap();
+        assert_eq!(union_exists.display_rows(), vec![vec!["1".to_string()]]);
+        let union_in = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id IN (SELECT 1 UNION SELECT 2) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            union_in.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
         let err = session
             .execute_stmt("SELECT * FROM db1.t1 WHERE id = (SELECT id FROM db1.t2)")
             .unwrap_err();
@@ -2927,6 +2941,14 @@ mod tests {
             .execute_stmt("SELECT (SELECT id FROM db1.t2) FROM db1.t1")
             .unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_SUBQUERY_NO_1_ROW);
+        let union_scalar = session
+            .execute_stmt("SELECT (SELECT 1 UNION SELECT 1)")
+            .unwrap();
+        assert_eq!(union_scalar.display_rows(), vec![vec!["1".to_string()]]);
+        let union_scalar_err = session
+            .execute_stmt("SELECT (SELECT 1 UNION ALL SELECT 2)")
+            .unwrap_err();
+        assert_eq!(union_scalar_err.code, sealdb_errno::ERR_SUBQUERY_NO_1_ROW);
     }
 
     #[test]

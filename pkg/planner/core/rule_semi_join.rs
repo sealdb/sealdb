@@ -128,10 +128,14 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
 
 fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
     match expr {
-        ExprNode::Exists(exists) => from_exists(exists.not, &exists.query),
-        ExprNode::InSubquery(sub) if !sub.not => {
-            from_in(&sub.expr, &sub.query, plan_table(outer).as_deref())
-        }
+        ExprNode::Exists(exists) => exists
+            .query
+            .as_select()
+            .and_then(|query| from_exists(exists.not, query)),
+        ExprNode::InSubquery(sub) if !sub.not => sub
+            .query
+            .as_select()
+            .and_then(|query| from_in(&sub.expr, query, plan_table(outer).as_deref())),
         _ => None,
     }
 }
