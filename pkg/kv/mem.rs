@@ -1,6 +1,6 @@
-use super::kv::{Storage, Transaction};
+use super::kv::{LockWait, RowLock, Storage, Transaction};
 use sealdb_errno::{
-    ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, ERR_WRITE_CONFLICT, Error, Result,
+    ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, ERR_WRITE_CONFLICT, Error, Result,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -77,7 +77,7 @@ struct Savepoint {
 
 /// In-memory optimistic/pessimistic Repeatable Read.
 /// Completeness wave / not this feature: blocking lock wait, deadlock
-/// detection, NOWAIT/SKIP LOCKED, 2PC/TiKV TSO, stale read.
+/// detection, 2PC/TiKV TSO, stale read.
 struct MemTransaction {
     store: Arc<Mutex<Store>>,
     start_ts: u64,
@@ -105,31 +105,40 @@ impl MemTransaction {
         store.data.get(key).and_then(|v| v.value.clone())
     }
 
-    fn lock_conflict() -> Error {
-        Error::new(
-            ERR_LOCK_WAIT_TIMEOUT,
-            "Lock wait timeout exceeded; try restarting transaction",
-        )
+    fn lock_conflict(wait: LockWait) -> Result<bool> {
+        match wait {
+            LockWait::SkipLocked => Ok(false),
+            LockWait::Nowait => Err(Error::new(
+                ERR_LOCK_NOWAIT,
+                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
+            )),
+            LockWait::Block => Err(Error::new(
+                ERR_LOCK_WAIT_TIMEOUT,
+                "Lock wait timeout exceeded; try restarting transaction",
+            )),
+        }
     }
 
     /// Exclusive lock for `FOR UPDATE` / pessimistic writes; shared for
     /// `FOR SHARE`. Same-txn upgrade from shared to exclusive is allowed.
+    /// Returns false when `SKIP LOCKED` hits a conflicting lock.
     fn acquire(
         store: &mut Store,
         locked: &mut HashSet<Vec<u8>>,
         start_ts: u64,
         key: &[u8],
         exclusive: bool,
-    ) -> Result<()> {
+        wait: LockWait,
+    ) -> Result<bool> {
         let entry = store.locks.entry(key.to_vec()).or_default();
         if let Some(owner) = entry.exclusive
             && owner != start_ts
         {
-            return Err(Self::lock_conflict());
+            return Self::lock_conflict(wait);
         }
         if exclusive {
             if entry.shared.iter().any(|owner| *owner != start_ts) {
-                return Err(Self::lock_conflict());
+                return Self::lock_conflict(wait);
             }
             entry.shared.remove(&start_ts);
             entry.exclusive = Some(start_ts);
@@ -137,7 +146,7 @@ impl MemTransaction {
             entry.shared.insert(start_ts);
         }
         locked.insert(key.to_vec());
-        Ok(())
+        Ok(true)
     }
 
     fn release_one(store: &mut Store, start_ts: u64, key: &[u8]) {
@@ -168,6 +177,7 @@ impl MemTransaction {
         start: &[u8],
         end: &[u8],
         exclusive: bool,
+        wait: LockWait,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut store = self.store.lock().expect("mem kv");
         let mut keys = Vec::new();
@@ -186,7 +196,16 @@ impl MemTransaction {
         }
         let mut out = Vec::new();
         for key in keys {
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, &key, exclusive)?;
+            if !Self::acquire(
+                &mut store,
+                &mut self.locked,
+                self.start_ts,
+                &key,
+                exclusive,
+                wait,
+            )? {
+                continue;
+            }
             if let Some(value) = Self::latest_value(&store, &self.writes, &self.deletes, &key) {
                 out.push((key, value));
             }
@@ -210,7 +229,14 @@ impl Transaction for MemTransaction {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.pessimistic {
             let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
+            Self::acquire(
+                &mut store,
+                &mut self.locked,
+                self.start_ts,
+                key,
+                true,
+                LockWait::Block,
+            )?;
         }
         self.deletes.remove(key);
         self.writes.insert(key.to_vec(), value.to_vec());
@@ -220,7 +246,14 @@ impl Transaction for MemTransaction {
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         if self.pessimistic {
             let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
+            Self::acquire(
+                &mut store,
+                &mut self.locked,
+                self.start_ts,
+                key,
+                true,
+                LockWait::Block,
+            )?;
         }
         self.writes.remove(key);
         self.deletes.insert(key.to_vec());
@@ -248,23 +281,51 @@ impl Transaction for MemTransaction {
     }
 
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut store = self.store.lock().expect("mem kv");
-        Self::acquire(&mut store, &mut self.locked, self.start_ts, key, true)?;
-        Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
+        self.get_locked(key, RowLock::Exclusive, LockWait::Block)
     }
 
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_with_lock(start, end, true)
+        self.scan_locked(start, end, RowLock::Exclusive, LockWait::Block)
     }
 
     fn get_for_share(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut store = self.store.lock().expect("mem kv");
-        Self::acquire(&mut store, &mut self.locked, self.start_ts, key, false)?;
-        Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
+        self.get_locked(key, RowLock::Share, LockWait::Block)
     }
 
     fn scan_for_share(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_with_lock(start, end, false)
+        self.scan_locked(start, end, RowLock::Share, LockWait::Block)
+    }
+
+    fn get_locked(&mut self, key: &[u8], lock: RowLock, wait: LockWait) -> Result<Option<Vec<u8>>> {
+        if lock == RowLock::None {
+            return self.get(key);
+        }
+        let mut store = self.store.lock().expect("mem kv");
+        if !Self::acquire(
+            &mut store,
+            &mut self.locked,
+            self.start_ts,
+            key,
+            lock == RowLock::Exclusive,
+            wait,
+        )? {
+            return Ok(None);
+        }
+        Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
+    }
+
+    fn scan_locked(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        lock: RowLock,
+        wait: LockWait,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match lock {
+            RowLock::None => self.scan(start, end),
+            RowLock::Exclusive => self.scan_with_lock(start, end, true, wait),
+            RowLock::Share => self.scan_with_lock(start, end, false, wait),
+        }
     }
 
     fn set_pessimistic(&mut self) {
@@ -461,6 +522,34 @@ mod tests {
         a.commit().unwrap();
         b.commit().unwrap();
         assert_eq!(c.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_nowait_and_skip_locked() {
+        let storage = MemStorage::new();
+        let mut setup = storage.begin().unwrap();
+        setup.set(b"k", b"v1").unwrap();
+        setup.commit().unwrap();
+
+        let mut a = storage.begin_pessimistic().unwrap();
+        assert_eq!(a.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+
+        let mut b = storage.begin().unwrap();
+        let err = b
+            .get_locked(b"k", RowLock::Exclusive, LockWait::Nowait)
+            .unwrap_err();
+        assert_eq!(err.code, ERR_LOCK_NOWAIT);
+        assert_eq!(
+            b.get_locked(b"k", RowLock::Exclusive, LockWait::SkipLocked)
+                .unwrap(),
+            None
+        );
+        a.commit().unwrap();
+        assert_eq!(
+            b.get_locked(b"k", RowLock::Exclusive, LockWait::Nowait)
+                .unwrap(),
+            Some(b"v1".to_vec())
+        );
     }
 
     #[test]

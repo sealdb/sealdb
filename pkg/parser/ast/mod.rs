@@ -15,7 +15,7 @@ pub use ddl::{
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
-    SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
+    SelectLock, SelectLockWait, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 pub use expressions::{
     BetweenExpr, ColumnRange, ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, IsNullExpr,

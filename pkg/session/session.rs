@@ -2339,6 +2339,36 @@ mod tests {
     }
 
     #[test]
+    fn test_select_nowait_and_skip_locked() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN PESSIMISTIC").unwrap();
+        a.execute_stmt("SELECT * FROM db1.t WHERE id = 1 FOR UPDATE")
+            .unwrap();
+        let err = b
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 1 FOR UPDATE NOWAIT")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_LOCK_NOWAIT);
+        let skipped = b
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id FOR UPDATE SKIP LOCKED")
+            .unwrap();
+        assert_eq!(
+            skipped.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        a.execute_stmt("COMMIT").unwrap();
+        let all = b
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id FOR UPDATE SKIP LOCKED")
+            .unwrap();
+        assert_eq!(all.display_rows().len(), 2);
+    }
+
+    #[test]
     fn test_pessimistic_update_latest_and_lock() {
         let domain = Arc::new(Domain::new());
         let a = Session::with_domain(Arc::clone(&domain));

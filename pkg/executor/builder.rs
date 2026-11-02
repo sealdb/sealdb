@@ -21,9 +21,9 @@ use crate::update::UpdateExec;
 use crate::window::WindowExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
-use sealdb_kv::{RowLock, Storage, TxnHandle};
+use sealdb_kv::{LockWait, RowLock, Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement, TableName};
+use sealdb_parser::ast::{ByItem, SelectLock, SelectLockWait, SelectStmt, Statement, TableName};
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
 use std::sync::Arc;
 
@@ -196,6 +196,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select_row_lock(select),
+                    select_lock_wait(select),
                     partitions.clone(),
                     pushed.clone(),
                     covering,
@@ -227,6 +228,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select_row_lock(select),
+                    select_lock_wait(select),
                 )))
             }
             PhysicalPlan::BatchPointGet { column, index, .. } => {
@@ -250,6 +252,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select_row_lock(select),
+                    select_lock_wait(select),
                 )))
             }
             PhysicalPlan::TableReader {
@@ -264,6 +267,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     stmt_row_lock(stmt),
+                    stmt_lock_wait(stmt),
                     partitions.clone(),
                     pushed.clone(),
                 )))
@@ -589,6 +593,20 @@ fn stmt_row_lock(stmt: &Statement) -> RowLock {
     stmt.as_select()
         .map(select_row_lock)
         .unwrap_or(RowLock::None)
+}
+
+fn select_lock_wait(select: &SelectStmt) -> LockWait {
+    match select.lock_wait {
+        SelectLockWait::Nowait => LockWait::Nowait,
+        SelectLockWait::SkipLocked => LockWait::SkipLocked,
+        SelectLockWait::Block => LockWait::Block,
+    }
+}
+
+fn stmt_lock_wait(stmt: &Statement) -> LockWait {
+    stmt.as_select()
+        .map(select_lock_wait)
+        .unwrap_or(LockWait::Block)
 }
 
 fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {

@@ -497,14 +497,24 @@ mod tests {
             share_mode.as_select().unwrap().lock,
             crate::ast::SelectLock::ForShare
         );
-        let err = parser
+        let nowait = parser
             .parse_one_stmt("SELECT * FROM t FOR UPDATE NOWAIT")
-            .unwrap_err();
-        assert!(err.message.contains("FOR UPDATE NOWAIT"));
-        let err = parser
+            .unwrap();
+        assert_eq!(
+            nowait.as_select().unwrap().lock,
+            crate::ast::SelectLock::ForUpdate
+        );
+        assert_eq!(
+            nowait.as_select().unwrap().lock_wait,
+            crate::ast::SelectLockWait::Nowait
+        );
+        let skip = parser
             .parse_one_stmt("SELECT * FROM t FOR UPDATE SKIP LOCKED")
-            .unwrap_err();
-        assert!(err.message.contains("FOR UPDATE SKIP LOCKED"));
+            .unwrap();
+        assert_eq!(
+            skip.as_select().unwrap().lock_wait,
+            crate::ast::SelectLockWait::SkipLocked
+        );
     }
 
     #[test]

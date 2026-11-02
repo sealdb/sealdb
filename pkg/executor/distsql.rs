@@ -6,7 +6,7 @@ use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::{Key, RowLock, TxnHandle};
+use sealdb_kv::{Key, LockWait, RowLock, TxnHandle};
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
@@ -36,6 +36,7 @@ pub struct IndexLookUpExecutor {
     current_db: String,
     txn: Arc<TxnHandle>,
     lock: RowLock,
+    wait: LockWait,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     covering: bool,
@@ -54,6 +55,7 @@ impl IndexLookUpExecutor {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         lock: RowLock,
+        wait: LockWait,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
         covering: bool,
@@ -66,6 +68,7 @@ impl IndexLookUpExecutor {
             current_db: current_db.into(),
             txn,
             lock,
+            wait,
             partitions,
             pushed,
             covering,
@@ -112,7 +115,7 @@ impl Executor for IndexLookUpExecutor {
                 if start.as_bytes() >= end.as_slice() {
                     continue;
                 }
-                let pairs = txn.scan_locked(start.as_bytes(), &end, self.lock)?;
+                let pairs = txn.scan_locked(start.as_bytes(), &end, self.lock, self.wait)?;
                 for (key, value) in pairs {
                     let handle = index_handle(&index, &key, &value)?;
                     if self.covering {
@@ -120,7 +123,7 @@ impl Executor for IndexLookUpExecutor {
                         continue;
                     }
                     let row_key = encode_row_key_with_handle(physical_id, handle);
-                    let raw = txn.get_locked(row_key.as_bytes(), self.lock)?;
+                    let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
                     if let Some(raw) = raw {
                         let decoded = decode_row(&raw, &info.col_field_types());
                         rows.push(
