@@ -10,3 +10,4 @@ path = "lib.rs"
 
 [dependencies]
 sealdb-parser.workspace = true
+sealdb-types.workspace = true

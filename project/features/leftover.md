@@ -9,8 +9,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F21
 
-- `histogram`
-- `topn`
 - `auto-analyze`
 - `analyze-index`
 - `persist-stats`

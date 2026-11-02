@@ -36,8 +36,6 @@
   ],
   "feature_gaps": {
     "F21": [
-      "histogram",
-      "topn",
       "auto-analyze",
       "analyze-index",
       "persist-stats",
