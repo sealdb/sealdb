@@ -12,10 +12,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `online-ddl-jobs`
 - `indexes`
 
-### F14
-
-- `semi-anti-rewrite`
-
 ### F15
 
 - `except-intersect`

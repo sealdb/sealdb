@@ -123,7 +123,8 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
-        | PhysicalPlan::Explain { child, .. } => vec![child.as_ref()],
+        | PhysicalPlan::Explain { child, .. }
+        | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
         PhysicalPlan::HashJoin { left, right, .. } | PhysicalPlan::Union { left, right, .. } => {
             vec![left.as_ref(), right.as_ref()]
         }
@@ -256,6 +257,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         ),
         PhysicalPlan::Window { .. } => ("Window".to_string(), String::new(), String::new()),
         PhysicalPlan::CTE { name, .. } => ("CTE".to_string(), format!("cte:{name}"), String::new()),
+        PhysicalPlan::Distinct { keys, .. } => (
+            "HashAgg".to_string(),
+            String::new(),
+            format!("distinct:{}", keys.join(",")),
+        ),
         PhysicalPlan::Explain { format, .. } => {
             ("Explain".to_string(), String::new(), format!("{format:?}"))
         }
@@ -287,7 +293,8 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
-        | PhysicalPlan::Explain { child, .. } => est_rows(child),
+        | PhysicalPlan::Explain { child, .. }
+        | PhysicalPlan::Distinct { child, .. } => est_rows(child),
         _ => 10_000.0,
     }
 }

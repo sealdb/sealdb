@@ -132,6 +132,10 @@ fn push_into(
             exprs,
             child: Box::new(push_into(*child, conjuncts, is, current_db)),
         },
+        PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
+            keys,
+            child: Box::new(push_into(*child, conjuncts, is, current_db)),
+        },
         PhysicalPlan::HashJoin {
             tp,
             left,

@@ -121,6 +121,11 @@ pub enum PhysicalPlan {
         columns: Vec<String>,
         seed: Box<PhysicalPlan>,
     },
+    /// Dedup child rows by `keys` (TiDB SemiJoinRewriter inner aggregation).
+    Distinct {
+        keys: Vec<String>,
+        child: Box<PhysicalPlan>,
+    },
 }
 
 /// Physical join kind. `Cross` is a cartesian product with no equality keys.
@@ -236,6 +241,9 @@ impl PhysicalPlan {
             ),
             PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
             PhysicalPlan::CTE { name, seed, .. } => format!("CTE_{name} -> {}", seed.explain()),
+            PhysicalPlan::Distinct { keys, child } => {
+                format!("Distinct({}) -> {}", keys.join(","), child.explain())
+            }
         }
     }
 
