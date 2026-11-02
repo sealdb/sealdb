@@ -35,10 +35,6 @@
     "U3"
   ],
   "feature_gaps": {
-    "F02": [
-      "online-ddl-jobs",
-      "indexes"
-    ],
     "F19": [
       "list-key",
       "range-columns",
