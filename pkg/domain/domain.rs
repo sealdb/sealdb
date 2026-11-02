@@ -24,6 +24,16 @@ pub struct Domain {
 struct Inner {
     meta: Mutator,
     infoschema: InfoSchema,
+    /// Skip Storage writes of Mutator until COMMIT after in-txn DDL.
+    defer_persist: bool,
+}
+
+/// Mutator + InfoSchema captured before the first DDL in an explicit
+/// transaction. Restored on ROLLBACK so CREATE/DROP does not survive.
+#[derive(Clone)]
+pub struct SchemaSnap {
+    meta: Mutator,
+    infoschema: InfoSchema,
 }
 
 const META_START: &[u8] = b"m";
@@ -62,7 +72,11 @@ impl Domain {
         }
         let infoschema = InfoSchema::from_meta(&meta)?;
         Ok(Self {
-            inner: Mutex::new(Inner { meta, infoschema }),
+            inner: Mutex::new(Inner {
+                meta,
+                infoschema,
+                defer_persist: false,
+            }),
             storage,
             privilege: Arc::new(privilege),
             stats: Arc::new(Handle::new()),
@@ -92,11 +106,24 @@ impl Domain {
     pub fn next_handle(&self, table_id: i64) -> Result<i64> {
         let mut inner = self.inner.lock().expect("domain handle lock");
         let next = inner.meta.alloc_handle(table_id)?;
-        persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        if !inner.defer_persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        }
         Ok(next)
     }
 
-    pub fn execute_ddl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
+    /// Clone Mutator + InfoSchema as they are now, before in-txn DDL.
+    pub fn schema_snap(&self) -> SchemaSnap {
+        let inner = self.inner.lock().expect("domain schema snap lock");
+        SchemaSnap {
+            meta: inner.meta.clone(),
+            infoschema: inner.infoschema.clone(),
+        }
+    }
+
+    /// Apply `stmt`. Autocommit (`persist`) writes meta immediately;
+    /// an explicit txn leaves meta in memory until [`persist_schema`].
+    pub fn execute_ddl(&self, stmt: &Statement, current_db: &str, persist: bool) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain ddl lock");
         let snapshot = inner.infoschema.clone();
         execute_ddl(
@@ -107,8 +134,29 @@ impl Domain {
             self.storage.as_ref(),
         )?;
         inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
-        persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        if persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+            inner.defer_persist = false;
+        } else {
+            inner.defer_persist = true;
+        }
         Ok(())
+    }
+
+    /// Flush in-memory Mutator after COMMIT of a txn that ran DDL.
+    pub fn persist_schema(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("domain persist schema lock");
+        persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        inner.defer_persist = false;
+        Ok(())
+    }
+
+    /// Put Mutator + InfoSchema back as they were before in-txn DDL.
+    pub fn restore_schema(&self, snap: SchemaSnap) {
+        let mut inner = self.inner.lock().expect("domain restore schema lock");
+        inner.meta = snap.meta;
+        inner.infoschema = snap.infoschema;
+        inner.defer_persist = false;
     }
 }
 

@@ -27,4 +27,5 @@ pub mod update;
 pub mod window;
 
 pub use builder::ExecutorBuilder;
+pub use ddl::DDLExec;
 pub use internal::QueryResult;

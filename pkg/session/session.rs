@@ -1,7 +1,7 @@
 use sealdb_config::Config;
-use sealdb_domain::Domain;
+use sealdb_domain::{Domain, SchemaSnap};
 use sealdb_errno::Result;
-use sealdb_executor::{ExecutorBuilder, QueryResult};
+use sealdb_executor::{DDLExec, ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
@@ -22,6 +22,8 @@ pub struct Session {
     current_db: Mutex<String>,
     current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
+    /// Schema before the first DDL in the current explicit txn.
+    schema_snap: Mutex<Option<SchemaSnap>>,
     isolation: Mutex<IsolationLevel>,
     read_only: Mutex<bool>,
     prepared: Mutex<HashMap<String, String>>,
@@ -49,6 +51,7 @@ impl Session {
             current_db: Mutex::new(String::new()),
             current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
+            schema_snap: Mutex::new(None),
             isolation: Mutex::new(IsolationLevel::RepeatableRead),
             read_only: Mutex::new(false),
             prepared: Mutex::new(HashMap::new()),
@@ -180,6 +183,7 @@ impl Session {
                 let read_only = begin
                     .read_only
                     .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
+                self.apply_pending_schema(true)?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
@@ -196,10 +200,15 @@ impl Session {
             }
             Statement::Commit(commit) => {
                 let schema_ver = self.domain.infoschema().schema_meta_version();
-                let mut txn = self.txn.lock().expect("session txn lock");
-                if txn.is_explicit() {
-                    sealdb_domain::schema_checker::check(txn.schema_ver(), schema_ver)?;
+                {
+                    let txn = self.txn.lock().expect("session txn lock");
+                    if txn.is_explicit() {
+                        sealdb_domain::schema_checker::check(txn.schema_ver(), schema_ver)?;
+                    }
                 }
+                self.apply_pending_schema(true)?;
+                let schema_ver = self.domain.infoschema().schema_meta_version();
+                let mut txn = self.txn.lock().expect("session txn lock");
                 if commit.chain {
                     txn.chain(self.domain.as_ref(), schema_ver, true)?;
                 } else {
@@ -208,11 +217,17 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::Rollback(rb) => {
+                if let Some(name) = &rb.savepoint {
+                    self.txn
+                        .lock()
+                        .expect("session txn lock")
+                        .rollback_to(name)?;
+                    return Ok(empty_result());
+                }
+                self.apply_pending_schema(false)?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
                 let mut txn = self.txn.lock().expect("session txn lock");
-                if let Some(name) = &rb.savepoint {
-                    txn.rollback_to(name)?;
-                } else if rb.chain {
+                if rb.chain {
                     txn.chain(self.domain.as_ref(), schema_ver, false)?;
                 } else {
                     txn.rollback()?;
@@ -241,9 +256,10 @@ impl Session {
             | Statement::DropTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
-            | Statement::AlterTable(_) => {
-                // F12 gap: no transactional DDL. Implicit-commit then apply.
-                self.txn.lock().expect("session txn lock").commit()?;
+            | Statement::AlterTable(_)
+                if self.txn.lock().expect("session txn lock").is_explicit() =>
+            {
+                self.capture_schema_snap();
             }
             _ => {}
         }
@@ -304,17 +320,33 @@ impl Session {
             self.planner
                 .build_with_schema(stmt, Some(&is), &current_db, Some(stats.as_ref()))?
         };
-        let txn = self
-            .txn
-            .lock()
-            .expect("session txn lock")
-            .ensure(self.domain.as_ref())?;
         if let Some(result) = system_var_result(self, stmt) {
             return Ok(result);
         }
-        let exec = ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?;
+        let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
+        let exec = if matches!(&plan, PhysicalPlan::DDL { .. }) {
+            Box::new(DDLExec::new(
+                Arc::clone(&self.domain),
+                stmt.clone(),
+                current_db.clone(),
+                persist_ddl,
+            ))
+        } else {
+            let txn = self
+                .txn
+                .lock()
+                .expect("session txn lock")
+                .ensure(self.domain.as_ref())?;
+            ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?
+        };
         let ci = self.collation.lock().expect("session collation lock").ci;
         let result = sealdb_expression::with_collation_ci(ci, || ExecutorBuilder::run(exec));
+        if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
+            self.txn
+                .lock()
+                .expect("session txn lock")
+                .set_schema_ver(self.domain.infoschema().schema_meta_version());
+        }
         self.txn
             .lock()
             .expect("session txn lock")
@@ -325,6 +357,28 @@ impl Session {
             return self.execute_one(&Statement::Insert(insert));
         }
         result
+    }
+
+    fn capture_schema_snap(&self) {
+        let mut snap = self.schema_snap.lock().expect("session schema snap lock");
+        if snap.is_none() {
+            *snap = Some(self.domain.schema_snap());
+        }
+    }
+
+    /// Persist in-memory DDL on COMMIT, or restore the pre-DDL snapshot on
+    /// ROLLBACK. CREATE INDEX / ALTER backfill KV is not undone (F18).
+    fn apply_pending_schema(&self, commit: bool) -> Result<()> {
+        let mut snap = self.schema_snap.lock().expect("session schema snap lock");
+        if commit {
+            if snap.is_some() {
+                self.domain.persist_schema()?;
+                *snap = None;
+            }
+        } else if let Some(prev) = snap.take() {
+            self.domain.restore_schema(prev);
+        }
+        Ok(())
     }
 
     pub fn infoschema(&self) -> InfoSchema {
@@ -2026,6 +2080,66 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t ORDER BY id")
             .unwrap();
         assert_eq!(chained.display_rows().len(), 4);
+    }
+
+    #[test]
+    fn test_transactional_ddl() {
+        let session = Session::new();
+        session
+            .execute_stmt("CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt(
+                "BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); SELECT * FROM db1.t2",
+            )
+            .unwrap();
+        session.execute_stmt("ROLLBACK").unwrap();
+        let err = session.execute_stmt("SELECT * FROM db1.t2").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+
+        session
+            .execute_stmt(
+                "BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); COMMIT",
+            )
+            .unwrap();
+        let committed = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
+        assert_eq!(committed.display_rows(), vec![vec!["1".to_string()]]);
+
+        session
+            .execute_stmt("BEGIN; DROP TABLE db1.t2; ROLLBACK")
+            .unwrap();
+        let still = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
+        assert_eq!(still.display_rows(), vec![vec!["1".to_string()]]);
+
+        session
+            .execute_stmt("BEGIN; CREATE TABLE db1.ctas AS SELECT * FROM db1.t2; ROLLBACK")
+            .unwrap();
+        let err = session.execute_stmt("SELECT * FROM db1.ctas").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+
+        session
+            .execute_stmt("BEGIN; CREATE DATABASE db2; ROLLBACK")
+            .unwrap();
+        let err = session
+            .execute_stmt("CREATE TABLE db2.t (id INT)")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_BAD_DB);
+
+        session
+            .execute_stmt(
+                "BEGIN; CREATE TABLE db1.t3 (id INT); INSERT INTO db1.t3 VALUES (7); COMMIT AND CHAIN",
+            )
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t3 VALUES (8); COMMIT")
+            .unwrap();
+        let chained = session
+            .execute_stmt("SELECT * FROM db1.t3 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            chained.display_rows(),
+            vec![vec!["7".to_string()], vec!["8".to_string()]]
+        );
     }
 
     #[test]

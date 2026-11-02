@@ -3,4 +3,4 @@
 
 pub mod domain;
 pub mod schema_checker;
-pub use domain::Domain;
+pub use domain::{Domain, SchemaSnap};
