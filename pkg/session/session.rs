@@ -5,6 +5,7 @@ use sealdb_executor::{DDLExec, ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
 use sealdb_parser::Parser;
+use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{
     InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, SetVarScope, Statement, UserIdentity,
@@ -19,6 +20,8 @@ pub struct Session {
     parser: Parser,
     planner: PlanBuilder,
     domain: Arc<Domain>,
+    /// Domain-local id for MDL holders.
+    session_id: u64,
     current_db: Mutex<String>,
     current_user: Mutex<UserIdentity>,
     txn: Mutex<TxnManager>,
@@ -57,10 +60,12 @@ impl Session {
 
     pub fn with_domain(domain: Arc<Domain>) -> Self {
         let globals = domain.global_vars();
+        let session_id = domain.alloc_session_id();
         Self {
             parser: Parser::new(),
             planner: PlanBuilder::new(),
             domain,
+            session_id,
             current_db: Mutex::new(String::new()),
             current_user: Mutex::new(UserIdentity::root()),
             txn: Mutex::new(TxnManager::new()),
@@ -173,6 +178,8 @@ impl Session {
                 "Cannot execute statement in a READ ONLY transaction.",
             ));
         }
+        // Schema lease 8027 (disabled when lease is Duration::ZERO).
+        self.domain.check_schema_lease()?;
         match stmt {
             Statement::Use(use_stmt) => {
                 let is = self.domain.infoschema();
@@ -317,6 +324,7 @@ impl Session {
                 } else {
                     txn.commit()?;
                 }
+                self.domain.mdl_unlock_session(self.session_id);
                 return Ok(empty_result());
             }
             Statement::Rollback(rb) => {
@@ -335,6 +343,7 @@ impl Session {
                 } else {
                     txn.rollback()?;
                 }
+                self.domain.mdl_unlock_session(self.session_id);
                 return Ok(empty_result());
             }
             Statement::Savepoint(sp) => {
@@ -383,6 +392,14 @@ impl Session {
             .lock()
             .expect("session current_db lock")
             .clone();
+        self.acquire_mdl(stmt, &current_db)?;
+        // Autocommit statements release MDL when the statement ends (including
+        // error paths). Explicit txns hold until COMMIT/ROLLBACK.
+        let mut mdl_guard = MdlGuard {
+            domain: &self.domain,
+            session_id: self.session_id,
+            active: !self.txn.lock().expect("session txn lock").is_explicit(),
+        };
         let is = self.domain.infoschema();
         let ctas_insert = match stmt {
             Statement::CreateTable(create) => create.select.as_ref().and_then(|select| {
@@ -485,15 +502,34 @@ impl Session {
             .lock()
             .expect("session txn lock")
             .finish_autocommit(result.is_ok())?;
+        // Explicit success path keeps MDL; autocommit Drop releases.
         if result.is_ok()
             && let Some(insert) = ctas_insert
         {
+            // Keep MDL across CTAS follow-up INSERT; reinstate on nested call.
+            mdl_guard.active = false;
             return self.execute_one(&Statement::Insert(insert));
         }
         if result.is_ok() {
             maybe_auto_analyze(self, stmt)?;
         }
+        drop(mdl_guard);
         result
+    }
+
+    fn acquire_mdl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
+        let (keys, exclusive) = mdl_targets(stmt, current_db);
+        for key in keys {
+            if key.ends_with('.') || key.starts_with('.') {
+                continue;
+            }
+            if exclusive {
+                self.domain.mdl_lock_exclusive(&key, self.session_id)?;
+            } else {
+                self.domain.mdl_lock_shared(&key, self.session_id)?;
+            }
+        }
+        Ok(())
     }
 
     fn capture_schema_snap(&self) {
@@ -1288,10 +1324,93 @@ fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
     Ok(out)
 }
 
+/// Releases Domain MDL for autocommit statements on all exit paths.
+struct MdlGuard<'a> {
+    domain: &'a Domain,
+    session_id: u64,
+    active: bool,
+}
+
+impl Drop for MdlGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.domain.mdl_unlock_session(self.session_id);
+        }
+    }
+}
+
 fn map_isolation(level: AstIsolation) -> IsolationLevel {
     match level {
         AstIsolation::ReadCommitted => IsolationLevel::ReadCommitted,
         AstIsolation::RepeatableRead => IsolationLevel::RepeatableRead,
+        // C3 MVB: SERIALIZABLE accepted; RR snapshot semantics.
+        AstIsolation::Serializable => IsolationLevel::Serializable,
+    }
+}
+
+fn table_key(schema: &str, table: &str) -> String {
+    format!(
+        "{}.{}",
+        schema.to_ascii_lowercase(),
+        table.to_ascii_lowercase()
+    )
+}
+
+fn mdl_table_key(name: &TableName, current_db: &str) -> String {
+    let (schema, table) = name.qualified(current_db);
+    table_key(&schema, &table)
+}
+
+/// Tables that need shared (DML) or exclusive (DDL) metadata locks.
+fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
+    match stmt {
+        Statement::Insert(insert) => (vec![mdl_table_key(&insert.table, current_db)], false),
+        Statement::Update(update) => {
+            let mut keys = vec![mdl_table_key(&update.table, current_db)];
+            if let Some(join) = &update.join {
+                keys.push(mdl_table_key(&join.left, current_db));
+                keys.push(mdl_table_key(&join.right, current_db));
+            }
+            (keys, false)
+        }
+        Statement::Delete(delete) => {
+            let mut keys = if delete.tables.is_empty() {
+                vec![mdl_table_key(&delete.table, current_db)]
+            } else {
+                delete
+                    .tables
+                    .iter()
+                    .map(|t| mdl_table_key(t, current_db))
+                    .collect()
+            };
+            if let Some(join) = &delete.join {
+                keys.push(mdl_table_key(&join.left, current_db));
+                keys.push(mdl_table_key(&join.right, current_db));
+            }
+            (keys, false)
+        }
+        Statement::Select(select) => {
+            let mut keys = Vec::new();
+            if let Some(from) = &select.from {
+                keys.push(mdl_table_key(from, current_db));
+            }
+            for t in select.join_tables() {
+                keys.push(mdl_table_key(t, current_db));
+            }
+            (keys, false)
+        }
+        Statement::CreateTable(create) => (vec![mdl_table_key(&create.table, current_db)], true),
+        Statement::DropTable(drop) => (
+            drop.tables
+                .iter()
+                .map(|t| mdl_table_key(t, current_db))
+                .collect(),
+            true,
+        ),
+        Statement::AlterTable(alter) => (vec![mdl_table_key(&alter.table, current_db)], true),
+        Statement::CreateIndex(create) => (vec![mdl_table_key(&create.table, current_db)], true),
+        Statement::DropIndex(drop) => (vec![mdl_table_key(&drop.table, current_db)], true),
+        _ => (Vec::new(), false),
     }
 }
 
@@ -2714,10 +2833,10 @@ mod tests {
         assert_eq!(committed.display_rows(), after_sp.display_rows());
         let err = session.execute_stmt("ROLLBACK TO missing").unwrap_err();
         assert!(err.message.contains("SAVEPOINT missing"));
-        let err = session
+        session
             .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-            .unwrap_err();
-        assert!(err.message.contains("SERIALIZABLE"));
+            .unwrap();
+        session.execute_stmt("ROLLBACK").unwrap();
         session.execute_stmt("START TRANSACTION READ ONLY").unwrap();
         let ro = session
             .execute_stmt("SELECT * FROM db1.t ORDER BY id")
@@ -2853,9 +2972,8 @@ mod tests {
             "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
         )
         .unwrap();
+        // BEGIN without touching the table: no MDL, concurrent DDL → 8028.
         a.execute_stmt("BEGIN").unwrap();
-        let snap = a.execute_stmt("SELECT * FROM db1.t").unwrap();
-        assert_eq!(snap.display_rows().len(), 1);
         b.execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT")
             .unwrap();
         let err = a.execute_stmt("SELECT * FROM db1.t").unwrap_err();
@@ -2882,6 +3000,122 @@ mod tests {
         let still = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
         assert_eq!(still.display_rows()[0][1], "c");
         a.execute_stmt("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_mdl_blocks_concurrent_ddl() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(Arc::clone(&domain));
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        a.execute_stmt("SELECT * FROM db1.t").unwrap();
+        let err = b
+            .execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_LOCK_WAIT_TIMEOUT);
+        a.execute_stmt("COMMIT").unwrap();
+        b.execute_stmt("ALTER TABLE db1.t ADD COLUMN age INT")
+            .unwrap();
+        let rows = b.execute_stmt("SELECT id, name, age FROM db1.t").unwrap();
+        assert_eq!(rows.display_rows().len(), 1);
+    }
+
+    #[test]
+    fn test_schema_lease_expired_and_reload() {
+        let domain = Arc::new(Domain::new());
+        let session = Session::with_domain(Arc::clone(&domain));
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+            )
+            .unwrap();
+        domain.set_schema_lease(std::time::Duration::from_millis(20));
+        session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let err = session.execute_stmt("SELECT * FROM db1.t").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_INFO_SCHEMA_EXPIRED);
+        domain.reload_schema_from_storage().unwrap();
+        let rows = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_serializable_maps_to_rr_snapshot() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .unwrap();
+        a.execute_stmt("BEGIN").unwrap();
+        let first = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(first.display_rows()[0][1], "a");
+        b.execute_stmt("UPDATE db1.t SET name = 'z' WHERE id = 1")
+            .unwrap();
+        // SERIALIZABLE MVB uses RR snapshot: committed update stays invisible.
+        let still = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(still.display_rows()[0][1], "a");
+        a.execute_stmt("COMMIT").unwrap();
+        let after = a.execute_stmt("SELECT * FROM db1.t WHERE id = 1").unwrap();
+        assert_eq!(after.display_rows()[0][1], "z");
+    }
+
+    #[test]
+    fn test_tikv_cross_session_same_cluster_if_available() {
+        // Same-cluster multi-session on live TiKV when SEALDB_TIKV=1.
+        // True multi-PD / cross-cluster is out of scope (no fake PD clusters).
+        if std::env::var("SEALDB_TIKV").ok().as_deref() != Some("1") {
+            eprintln!("skip tikv cross-session: set SEALDB_TIKV=1 with a live cluster");
+            return;
+        }
+        let _guard = tikv_test_lock();
+        let cfg = Config {
+            store: sealdb_config::StoreKind::Tikv,
+            ..Config::default()
+        };
+        let storage = match sealdb_store::open(&cfg) {
+            Ok(storage) => storage,
+            Err(err) => {
+                eprintln!("skip live tikv cross-session: {err}");
+                return;
+            }
+        };
+        let domain = match Domain::with_storage(storage) {
+            Ok(domain) => Arc::new(domain),
+            Err(err) => {
+                eprintln!("skip live tikv cross-session: {err}");
+                return;
+            }
+        };
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(domain);
+        a.execute_stmt(
+            "DROP DATABASE IF EXISTS tikv_c3; CREATE DATABASE tikv_c3; CREATE TABLE tikv_c3.t (id INT, name VARCHAR(20)); INSERT INTO tikv_c3.t VALUES (1, 'a')",
+        )
+        .unwrap();
+        a.execute_stmt("START TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .unwrap();
+        let first = a
+            .execute_stmt("SELECT name FROM tikv_c3.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(first.display_rows()[0][0], "a");
+        b.execute_stmt("UPDATE tikv_c3.t SET name = 'b' WHERE id = 1")
+            .unwrap();
+        let second = a
+            .execute_stmt("SELECT name FROM tikv_c3.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(second.display_rows()[0][0], "b");
+        a.execute_stmt("COMMIT").unwrap();
     }
 
     #[test]

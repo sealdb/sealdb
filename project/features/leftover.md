@@ -17,14 +17,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `stale-gap-labels`
 - `leftover-suite-execution`
 
-### C3
-
-- `tikv-cross-cluster`
-- `mdl`
-- `schema-lease`
-- `serializable`
-- `savepoint`
-
 ## PlanBuilder statement kinds still open
 
 - `ast.AdminStmt` → unmapped
@@ -132,9 +124,9 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ## Completeness wave notes
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
-- Feature (F*) gaps are empty; C2/C4/C5 completeness gaps closed; remaining is C1/C3 (C6 deferred).
+- Feature (F*) gaps are empty; C2/C3/C4/C5 completeness gaps closed; remaining is C1 (C6 deferred).
 - C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).
-- C3: TiKV cross-cluster and MDL stay open.
+- C3: completeness gaps closed (MDL + schema-lease 8027 + SERIALIZABLE→RR + SAVEPOINT F12 + same-cluster TiKV cross-session when SEALDB_TIKV=1).
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).
 - C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.

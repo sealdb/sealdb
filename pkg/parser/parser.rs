@@ -1408,10 +1408,18 @@ mod tests {
             }
             other => panic!("expected SetTxnStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-            .unwrap_err();
-        assert!(err.message.contains("SERIALIZABLE"));
+            .unwrap()
+        {
+            crate::ast::Statement::Begin(begin) => {
+                assert_eq!(
+                    begin.isolation,
+                    Some(crate::ast::IsolationLevel::Serializable)
+                );
+            }
+            other => panic!("expected BeginStmt, got {other:?}"),
+        }
         match parser
             .parse_one_stmt("START TRANSACTION READ ONLY")
             .unwrap()

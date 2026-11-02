@@ -38,6 +38,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_ACCESS_DENIED_ERROR => "ErrAccessDenied",
         errcode::ERR_DBACCESS_DENIED_ERROR => "ErrDBaccessDenied",
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
+        errcode::ERR_INFO_SCHEMA_EXPIRED => "ErrInfoSchemaExpired",
         errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
         errcode::ERR_UNKNOWN_CHARACTER_SET => "ErrUnknownCharacterSet",

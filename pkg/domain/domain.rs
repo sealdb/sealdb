@@ -1,3 +1,5 @@
+use crate::mdl::MdlTable;
+use crate::schema_checker;
 use sealdb_bindinfo::SessionBindingHandle;
 use sealdb_ddl::execute_ddl;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
@@ -10,9 +12,10 @@ use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Domain-default system variables for `SET GLOBAL` / `@@GLOBAL.*` (C5 MVB).
 /// New sessions copy these into session-local state at construction.
@@ -47,6 +50,18 @@ pub struct Domain {
     plan_cache: Arc<InstancePlanCache>,
     /// `SET GLOBAL` defaults visible to new sessions and `@@GLOBAL.*`.
     global_vars: Mutex<GlobalSysVars>,
+    /// In-memory metadata locks (DDL exclusive vs DML shared).
+    mdl: Mutex<MdlTable>,
+    /// Monotonic session ids for MDL holders.
+    next_session_id: AtomicU64,
+    /// Schema lease: Duration::ZERO disables 8027 checks (default).
+    schema_lease: Mutex<SchemaLeaseState>,
+}
+
+/// C3 MVB schema lease / reload hook state.
+struct SchemaLeaseState {
+    lease: Duration,
+    expire_at: Instant,
 }
 
 struct Inner {
@@ -124,7 +139,94 @@ impl Domain {
             bind_handle: SessionBindingHandle::new(),
             plan_cache: Arc::new(InstancePlanCache::new()),
             global_vars: Mutex::new(GlobalSysVars::default()),
+            mdl: Mutex::new(MdlTable::new()),
+            next_session_id: AtomicU64::new(1),
+            schema_lease: Mutex::new(SchemaLeaseState {
+                lease: Duration::ZERO,
+                expire_at: Instant::now(),
+            }),
         })
+    }
+
+    /// Allocate a Domain-local session id for MDL tracking.
+    pub fn alloc_session_id(&self) -> u64 {
+        self.next_session_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Shared MDL for DML on `schema.table` (lowercase key).
+    pub fn mdl_lock_shared(&self, table_key: &str, session_id: u64) -> Result<()> {
+        self.mdl
+            .lock()
+            .expect("domain mdl lock")
+            .lock_shared(table_key, session_id)
+    }
+
+    /// Exclusive MDL for DDL on `schema.table`.
+    pub fn mdl_lock_exclusive(&self, table_key: &str, session_id: u64) -> Result<()> {
+        self.mdl
+            .lock()
+            .expect("domain mdl lock")
+            .lock_exclusive(table_key, session_id)
+    }
+
+    /// Release every MDL held by `session_id`.
+    pub fn mdl_unlock_session(&self, session_id: u64) {
+        self.mdl
+            .lock()
+            .expect("domain mdl lock")
+            .unlock_session(session_id);
+    }
+
+    /// Configure schema lease duration. `Duration::ZERO` disables 8027.
+    pub fn set_schema_lease(&self, lease: Duration) {
+        let mut state = self.schema_lease.lock().expect("domain schema lease lock");
+        state.lease = lease;
+        if lease.is_zero() {
+            state.expire_at = Instant::now();
+        } else {
+            state.expire_at = Instant::now() + lease;
+        }
+    }
+
+    /// Refresh the lease expiry without reloading meta.
+    pub fn touch_schema_lease(&self) {
+        let mut state = self.schema_lease.lock().expect("domain schema lease lock");
+        if !state.lease.is_zero() {
+            state.expire_at = Instant::now() + state.lease;
+        }
+    }
+
+    /// Return 8027 when the configured lease has elapsed.
+    pub fn check_schema_lease(&self) -> Result<()> {
+        let state = self.schema_lease.lock().expect("domain schema lease lock");
+        if state.lease.is_zero() {
+            return Ok(());
+        }
+        if Instant::now() > state.expire_at {
+            return Err(schema_checker::expired());
+        }
+        Ok(())
+    }
+
+    /// Reload Mutator + InfoSchema from Storage and renew the lease (C3 MVB).
+    pub fn reload_schema_from_storage(&self) -> Result<()> {
+        let mut meta = load_meta(self.storage.as_ref())?;
+        let infoschema = InfoSchema::from_meta(&meta)?;
+        {
+            let mut inner = self.inner.lock().expect("domain reload lock");
+            // Preserve NextGlobalID bump already in memory when Storage is empty.
+            if meta.get_global_id().unwrap_or(0) == 0 {
+                let current = inner.meta.get_global_id().unwrap_or(0);
+                if current > 0 {
+                    meta.set_global_id(current);
+                }
+            }
+            inner.meta = meta;
+            inner.infoschema = infoschema;
+            inner.defer_persist = false;
+        }
+        self.touch_schema_lease();
+        Ok(())
     }
 
     /// Snapshot of Domain-default sysvars (`SET GLOBAL` / new-session defaults).

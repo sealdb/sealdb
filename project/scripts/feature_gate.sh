@@ -231,6 +231,11 @@ case "$FEATURE" in
       --json "$ROOT/project/features/leftover.json" \
       --check
     run execute-rc cargo test -q -p sealdb-session --lib test_schema_checker_and_read_committed
+    run execute-mdl cargo test -q -p sealdb-session --lib session::tests::test_mdl_blocks_concurrent_ddl -- --exact
+    run execute-schema-lease cargo test -q -p sealdb-session --lib session::tests::test_schema_lease_expired_and_reload -- --exact
+    run execute-serializable cargo test -q -p sealdb-session --lib session::tests::test_serializable_maps_to_rr_snapshot -- --exact
+    run execute-savepoint cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); SAVEPOINT sp1; INSERT INTO db1.t VALUES (2, 'b'); ROLLBACK TO sp1; SELECT * FROM db1.t; RELEASE SAVEPOINT sp1; COMMIT"
+    run execute-tikv-cross-session cargo test -q -p sealdb-session --lib session::tests::test_tikv_cross_session_same_cluster_if_available -- --exact
     ;;
   C4)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
