@@ -3235,6 +3235,17 @@ mod tests {
         session
             .execute_stmt("CREATE UNIQUE INDEX idx_id ON db1.t (id)")
             .unwrap();
+        let dup = session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'dup')")
+            .unwrap_err();
+        assert_eq!(dup.code, sealdb_errno::ERR_DUP_ENTRY);
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (4, 'a')")
+            .unwrap();
+        let uniq_backfill = session
+            .execute_stmt("ALTER TABLE db1.t ADD UNIQUE INDEX idx_name_u (name)")
+            .unwrap_err();
+        assert_eq!(uniq_backfill.code, sealdb_errno::ERR_DUP_ENTRY);
         let err = session
             .execute_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
             .unwrap_err();

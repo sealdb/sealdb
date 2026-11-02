@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F18": [
-      "unique-index",
       "change-modify-rename",
       "after-first",
       "algorithm-lock"

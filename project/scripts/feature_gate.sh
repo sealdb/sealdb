@@ -159,6 +159,7 @@ case "$FEATURE" in
     run execute-ddl cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE INDEX idx_name ON db1.t (name); ALTER TABLE db1.t ADD COLUMN age INT; SELECT * FROM db1.t WHERE name = 'a'"
     run execute-ddl-jobs cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); ADMIN SHOW DDL JOBS"
     run execute-reorg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE INDEX idx_name ON db1.t (name); ADMIN SHOW DDL JOBS"
+    run execute-unique-index cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE UNIQUE INDEX idx_id ON db1.t (id); ALTER TABLE db1.t ADD UNIQUE INDEX idx_name (name)"
     ;;
   F19)
     run execute-partition cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.t VALUES (1, 'a'), (15, 'b'); SELECT * FROM db1.t WHERE id < 10"

@@ -1,6 +1,6 @@
-// F18 core: CREATE/DROP INDEX schema + in-place backfill.
+// F18 core: CREATE/DROP INDEX schema + UNIQUE INDEX uniqueness + in-place backfill.
 // Completeness wave / not this feature: async job queue, concurrent ingest,
-// invisible, concurrent ingest, ALGORITHM/LOCK.
+// invisible, ALGORITHM/LOCK.
 use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
@@ -190,6 +190,8 @@ fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) ->
                         .unwrap_or(Datum::Null)
                 })
                 .collect();
+            // Unique indexes omit the handle from the key; a second row with the
+            // same indexed values is 1062 even during write-reorg backfill.
             let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle, index.unique);
             if index.unique && txn.get(ikey.as_bytes())?.is_some() {
                 return Err(Error::new(
