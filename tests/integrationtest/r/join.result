@@ -63,3 +63,10 @@ x
 SELECT * FROM (SELECT * FROM (SELECT id FROM itest.t1 WHERE id = 2) a) b;
 id
 2
+SELECT id, (SELECT tag FROM itest.t2 WHERE t2.id = t1.id) FROM itest.t1 ORDER BY id;
+id	(SELECT `tag` FROM `itest`.`t2` WHERE `t2`.`id` = `t1`.`id`)
+1	x
+2	NULL
+SELECT (SELECT 1);
+(SELECT 1)
+1

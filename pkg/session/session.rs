@@ -2852,6 +2852,44 @@ mod tests {
     }
 
     #[test]
+    fn test_select_list_subquery() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (3, 'y')",
+            )
+            .unwrap();
+        let dual = session.execute_stmt("SELECT (SELECT 1)").unwrap();
+        assert_eq!(dual.display_rows(), vec![vec!["1".to_string()]]);
+        let correlated = session
+            .execute_stmt(
+                "SELECT id, (SELECT tag FROM db1.t2 WHERE t2.id = t1.id) FROM db1.t1 ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            correlated.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "NULL".to_string()]
+            ]
+        );
+        let uncorrelated = session
+            .execute_stmt("SELECT id, (SELECT COUNT(*) FROM db1.t2) FROM db1.t1 ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            uncorrelated.display_rows(),
+            vec![
+                vec!["1".to_string(), "2".to_string()],
+                vec!["2".to_string(), "2".to_string()]
+            ]
+        );
+        let err = session
+            .execute_stmt("SELECT (SELECT id FROM db1.t2) FROM db1.t1")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_SUBQUERY_NO_1_ROW);
+    }
+
+    #[test]
     fn test_online_ddl() {
         let session = Session::new();
         session

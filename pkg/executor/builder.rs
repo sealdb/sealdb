@@ -9,6 +9,7 @@ use crate::explain::ExplainExec;
 use crate::grant::GrantExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
+use crate::join::apply::SubqueryEvalCtx;
 use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
@@ -50,11 +51,26 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
                 let exprs = select.fields.iter().map(|f| f.expr.clone()).collect();
                 let names = select.fields.iter().map(field_output_name).collect();
-                Ok(Box::new(ProjectionExec::new(
+                let mut exec = ProjectionExec::new(
                     exprs,
                     names,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )))
+                    Self::build(
+                        child,
+                        stmt,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?,
+                );
+                if select.fields.iter().any(|field| field.expr.has_subquery()) {
+                    exec = exec.with_subquery(SubqueryEvalCtx::new(
+                        domain,
+                        current_db.to_string(),
+                        txn,
+                        select.from.as_ref().map(|table| table.name.clone()),
+                    ));
+                }
+                Ok(Box::new(exec))
             }
             PhysicalPlan::Sort { child } => {
                 let by = stmt_order_by(stmt)
@@ -634,6 +650,7 @@ fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
             Some(table) => format!("{table}.{}", col.name),
             None => col.name.clone(),
         },
+        other if other.has_subquery() => other.restore_string(),
         _ => field.as_name.clone().unwrap_or_default(),
     }
 }
