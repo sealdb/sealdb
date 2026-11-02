@@ -35,7 +35,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### C4
 
-- `shared-plan-cache`
 - `typed-placeholders`
 
 ### C5

@@ -2,6 +2,9 @@ pub mod apply;
 pub mod cte;
 pub mod explain;
 pub mod physical_plans;
+pub mod plan_cache;
+pub mod plan_cache_instance;
+pub mod plan_cache_lru;
 pub mod plan_cost;
 pub mod planbuilder;
 pub mod rule_join_reorder;
@@ -12,5 +15,8 @@ pub mod union;
 pub mod window;
 
 pub use physical_plans::{DdlKind, JoinType, PhysicalPlan};
+pub use plan_cache::PlanCacheValue;
+pub use plan_cache_instance::InstancePlanCache;
+pub use plan_cache_lru::LRUPlanCache;
 pub use planbuilder::PlanBuilder;
 pub use rule_partition_processor::PartitionPruneMode;

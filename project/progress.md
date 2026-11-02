@@ -110,6 +110,19 @@
 
 ### 2026-11-03
 
+- **Phase**: 完整性波 C4（shared-plan-cache）
+- **完成**:
+  - Domain-shared `InstancePlanCache`（`plan_cache.rs` / `plan_cache_instance.rs` / `plan_cache_lru.rs`）
+  - 同 Domain 跨 Session 命中同一 restored SQL + schema version；`Domain::plan_cache_hit_count` 测试钩子
+  - C4 gate `execute-shared-plan-cache`；`status.json` 去掉 `shared-plan-cache`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_shared_plan_cache_cross_session`
+  - `cargo fmt` + planner/session tests
+- **下一步**:
+  - C4 `typed-placeholders`
+
+### 2026-11-03
+
 - **Phase**: 完整性波 C4（create-binding）
 - **完成**:
   - `CREATE BINDING FOR … USING …` / `DROP BINDING FOR …` / `SHOW BINDINGS`

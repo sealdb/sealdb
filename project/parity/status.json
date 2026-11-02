@@ -701,6 +701,24 @@
       "rust": "pkg/bindinfo/session_handle.rs",
       "phase": 10,
       "notes": "Domain-shared SessionBindingHandle for create/drop/match/show"
+    },
+    "pkg/planner/core/plan_cache.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/plan_cache.rs",
+      "phase": 10,
+      "notes": "PlanCacheValue keyed by restored SQL + schema version; typed-param rebuild deferred"
+    },
+    "pkg/planner/core/plan_cache_instance.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/plan_cache_instance.rs",
+      "phase": 10,
+      "notes": "Domain-shared InstancePlanCache with hit_count test hook"
+    },
+    "pkg/planner/core/plan_cache_lru.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/plan_cache_lru.rs",
+      "phase": 10,
+      "notes": "thin LRU capacity for InstancePlanCache"
     }
   }
 }
