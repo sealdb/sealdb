@@ -4,7 +4,8 @@ use super::plan_cost::{hash_join_cost, table_scan_cost};
 /// Two-table greedy JoinReorder: Inner HashJoin builds the cheaper side by
 /// `hash_join_cost`. Semi/Anti keep the outer (left) as probe so existence
 /// semantics stay left-only.
-/// Completeness wave: n-table DP/greedy, outer-join assoc, bushy trees.
+/// N-table Inner equality graphs use `rule_join_reorder_dp` (left/right-deep
+/// DP). Completeness: full bushy subset DP, outer-join assoc.
 #[allow(clippy::too_many_arguments)]
 pub fn reorder_hash_join(
     tp: JoinType,

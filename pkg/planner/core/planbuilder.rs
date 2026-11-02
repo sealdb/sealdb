@@ -4,6 +4,7 @@ use super::plan_cost::{
     table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
+use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension, eq_join_edge};
 use super::rule_partition_processor::{PartitionPruneMode, plan_partitions};
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
@@ -317,8 +318,9 @@ impl PlanBuilder {
         }))
     }
 
-    /// Left-deep HashJoin tree. CTE sides use CTEExec; only the first pair of
-    /// table scans is reordered by size.
+    /// HashJoin tree. Inner equality joins of 3+ tables use n-table DP
+    /// (`rule_join_reorder_dp`); otherwise left-deep with two-table reorder on
+    /// the first pair. CTE sides use CTEExec.
     fn build_join_plan(
         &self,
         select: &SelectStmt,
@@ -327,6 +329,9 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
+        if let Some(plan) = self.build_join_plan_dp(select, is, current_db, stats, prune_mode)? {
+            return Ok(plan);
+        }
         let first = &select.joins[0];
         let mut plan = reorder_hash_join(
             map_join_type(first.tp),
@@ -356,6 +361,111 @@ impl PlanBuilder {
             };
         }
         Ok(plan)
+    }
+
+    /// Costed n-table DP when all joins are Inner equality on a connected graph
+    /// of base tables (no CTEs). Returns `Ok(None)` to fall back.
+    fn build_join_plan_dp(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        let tables = select.join_tables();
+        if tables.len() < 3 {
+            return Ok(None);
+        }
+        if tables
+            .iter()
+            .any(|t| named_cte(select.with.as_ref(), &t.name))
+        {
+            return Ok(None);
+        }
+        if select
+            .joins
+            .iter()
+            .any(|j| !matches!(j.tp, AstJoinType::Inner))
+        {
+            return Ok(None);
+        }
+        let names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+        let rows: Vec<f64> = tables
+            .iter()
+            .map(|t| table_row_count(stats, t, current_db))
+            .collect();
+        let mut edges = Vec::with_capacity(select.joins.len());
+        for join in &select.joins {
+            let Some((l, r)) = eq_join_edge(&join.on, &names) else {
+                return Ok(None);
+            };
+            edges.push(JoinEqEdge {
+                left: l,
+                right: r,
+                on: join.on.clone(),
+            });
+        }
+        let Some(steps) = dp_join_steps(&rows, &edges) else {
+            return Ok(None);
+        };
+        let seed = steps[0].table;
+        let mut plan = self.join_side(select, tables[seed], is, current_db, stats, prune_mode)?;
+        let mut used = vec![seed];
+        for step in steps.iter().skip(1) {
+            let edge = edge_for_extension(&edges, &used, step.table)
+                .ok_or_else(|| Error::unsupported("n-table join reorder missing equality edge"))?;
+            let right_side = self.join_side(
+                select,
+                tables[step.table],
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            )?;
+            let peer = if edge.left == step.table {
+                edge.right
+            } else {
+                edge.left
+            };
+            let new_name = names[step.table].clone();
+            let peer_name = names[peer].clone();
+            // First binary join: reuse two-table costed orientation.
+            if used.len() == 1 {
+                plan = reorder_hash_join(
+                    JoinType::Inner,
+                    plan,
+                    right_side,
+                    peer_name,
+                    new_name,
+                    rows[used[0]],
+                    rows[step.table],
+                    edge.on.clone(),
+                );
+            } else if step.swap {
+                // New leaf probes; accumulated plan builds (`right_table` =
+                // peer living inside the build subtree).
+                plan = PhysicalPlan::HashJoin {
+                    tp: JoinType::Inner,
+                    left: Box::new(right_side),
+                    right: Box::new(plan),
+                    left_table: new_name,
+                    right_table: peer_name,
+                    on: edge.on.clone(),
+                };
+            } else {
+                plan = PhysicalPlan::HashJoin {
+                    tp: JoinType::Inner,
+                    left: Box::new(plan),
+                    right: Box::new(right_side),
+                    left_table: peer_name,
+                    right_table: new_name,
+                    on: edge.on.clone(),
+                };
+            }
+            used.push(step.table);
+        }
+        Ok(Some(plan))
     }
 
     fn join_side(

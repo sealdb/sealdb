@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C2 cop-task-rows MVB；完整性波 C4=[] → C2→C5）  
+> 最后更新：2026-11-03（C2 n-table-dp MVB；完整性波 C4=[] → C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,21 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C2（n-table-dp）
+- **完成**:
+  - `rule_join_reorder_dp.rs`：Inner 等式连通图上 left/right-deep bitmask DP（复用 `hash_join_cost` / `table_scan_cost`）
+  - `planbuilder` 3+ 表走 DP；首次二元仍用 two-table `reorder_hash_join`
+  - Session EXPLAIN：偏斜 ANALYZE 后根 HashJoin 探针侧为大表（非 naive 左深嵌套）
+  - C2 gate `execute-n-table-dp`；`status.json` / leftover 去掉 `n-table-dp`
+- **验证**:
+  - `cargo test -q -p sealdb-planner --lib rule_join_reorder_dp`
+  - `cargo test -q -p sealdb-session --lib test_explain_n_table_join_reorder_dp`
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - C2 `index-merge-join` → `cost-model-v2`
 
 ### 2026-11-03
 

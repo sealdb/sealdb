@@ -276,7 +276,13 @@
       "status": "partial",
       "rust": "pkg/planner/core/rule_join_reorder.rs",
       "phase": 10,
-      "notes": "two-table costed JoinReorder builds cheaper side; n-table DP deferred"
+      "notes": "two-table costed JoinReorder builds cheaper side; n-table via rule_join_reorder_dp"
+    },
+    "pkg/planner/core/rule_join_reorder_dp.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/rule_join_reorder_dp.rs",
+      "phase": 10,
+      "notes": "left/right-deep bitmask DP for Inner equality joins (3..8 tables); full bushy deferred"
     },
     "pkg/meta/meta.go": {
       "status": "partial",
