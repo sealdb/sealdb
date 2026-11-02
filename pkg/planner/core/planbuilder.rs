@@ -97,16 +97,12 @@ impl PlanBuilder {
                         },
                     };
                 }
-                if !select.order_by.is_empty() {
-                    plan = PhysicalPlan::Sort {
-                        child: Box::new(plan),
-                    };
-                }
-                if select.limit.is_some() || select.offset.is_some() {
-                    plan = PhysicalPlan::Limit {
-                        child: Box::new(plan),
-                    };
-                }
+                plan = apply_order_limit(
+                    plan,
+                    !select.order_by.is_empty(),
+                    select.limit,
+                    select.offset,
+                );
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
                 plan = wrap_output_projection(plan, select);
@@ -198,16 +194,7 @@ impl PlanBuilder {
                         )?),
                     };
                 }
-                if !set.order_by.is_empty() {
-                    plan = PhysicalPlan::Sort {
-                        child: Box::new(plan),
-                    };
-                }
-                if set.limit.is_some() || set.offset.is_some() {
-                    plan = PhysicalPlan::Limit {
-                        child: Box::new(plan),
-                    };
-                }
+                plan = apply_order_limit(plan, !set.order_by.is_empty(), set.limit, set.offset);
                 Ok(plan)
             }
         }
@@ -301,6 +288,30 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
         AstJoinType::LeftOuter => JoinType::LeftOuter,
         AstJoinType::RightOuter => JoinType::RightOuter,
     }
+}
+
+fn apply_order_limit(
+    mut plan: PhysicalPlan,
+    ordered: bool,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> PhysicalPlan {
+    if ordered && limit.is_some() {
+        return PhysicalPlan::TopN {
+            child: Box::new(plan),
+        };
+    }
+    if ordered {
+        plan = PhysicalPlan::Sort {
+            child: Box::new(plan),
+        };
+    }
+    if limit.is_some() || offset.is_some() {
+        plan = PhysicalPlan::Limit {
+            child: Box::new(plan),
+        };
+    }
+    plan
 }
 
 fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {

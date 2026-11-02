@@ -26,6 +26,18 @@ pub fn merge_runs(
     by: &[ByItem],
     schema: &[String],
 ) -> Result<Vec<Vec<Datum>>> {
+    merge_runs_n(runs, by, schema, usize::MAX)
+}
+
+pub fn merge_runs_n(
+    runs: &mut [DataInDiskByRows],
+    by: &[ByItem],
+    schema: &[String],
+    max_rows: usize,
+) -> Result<Vec<Vec<Datum>>> {
+    if max_rows == 0 {
+        return Ok(Vec::new());
+    }
     let mut heads: Vec<Option<Vec<Datum>>> = Vec::with_capacity(runs.len());
     for run in runs.iter_mut() {
         heads.push(run.next_row()?);
@@ -59,6 +71,9 @@ pub fn merge_runs(
             break;
         };
         out.push(heads[i].take().expect("best head row"));
+        if out.len() >= max_rows {
+            break;
+        }
         heads[i] = runs[i].next_row()?;
     }
     Ok(out)

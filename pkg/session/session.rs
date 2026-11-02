@@ -1010,6 +1010,28 @@ mod tests {
             offset.display_rows(),
             vec![vec!["2".to_string(), "b".to_string()]]
         );
+        let topn = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t ORDER BY id LIMIT 1")
+            .unwrap();
+        let topn_text = topn
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(topn_text.contains("TopN"), "{topn_text}");
+        assert!(!topn_text.contains("Sort"), "{topn_text}");
+        let sorted = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        let sorted_text = sorted
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sorted_text.contains("Sort"), "{sorted_text}");
+        assert!(!sorted_text.contains("TopN"), "{sorted_text}");
     }
 
     #[test]

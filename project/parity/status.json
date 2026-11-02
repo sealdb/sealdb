@@ -477,6 +477,12 @@
       "phase": 5,
       "notes": "sorted run files plus k-way merge; parallel sort deferred"
     },
+    "pkg/executor/sortexec/topn.go": {
+      "status": "partial",
+      "rust": "pkg/executor/sortexec/topn.rs",
+      "phase": 5,
+      "notes": "TopN heap plus spill when LIMIT exceeds mem row limit"
+    },
     "pkg/executor/projection.go": {
       "status": "partial",
       "phase": 2,

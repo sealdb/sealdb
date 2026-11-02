@@ -19,7 +19,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F05
 
-- `topn-spill`
 - `parallel-sort`
 
 ### F07

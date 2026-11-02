@@ -73,6 +73,8 @@ case "$FEATURE" in
   F05)
     run execute-order-limit cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (3, 'c'), (1, 'a'); SELECT * FROM db1.t ORDER BY id LIMIT 1"
     run execute-sort-spill env SEALDB_SPILL_MEM_ROWS=1 cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (3, 'c'), (1, 'a'), (2, 'b'); SELECT * FROM db1.t ORDER BY id"
+    run execute-topn cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (3, 'c'), (1, 'a'), (2, 'b'); EXPLAIN SELECT * FROM db1.t ORDER BY id LIMIT 1; SELECT * FROM db1.t ORDER BY id LIMIT 1"
+    run execute-topn-spill env SEALDB_SPILL_MEM_ROWS=1 cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (4, 'd'), (1, 'a'), (3, 'c'), (2, 'b'); SELECT * FROM db1.t ORDER BY id LIMIT 3"
     ;;
   F06)
     run execute-point-get cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); SELECT * FROM db1.t WHERE id = 2"
