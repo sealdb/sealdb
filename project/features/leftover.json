@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F17": [
-      "union-in-cte",
       "cte-in-join",
       "cte-in-dml",
       "shared-cte-storage"

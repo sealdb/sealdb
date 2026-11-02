@@ -236,6 +236,18 @@ impl PlanBuilder {
                 child: Box::new(seed),
             };
         }
+        for (op, select) in with.set_rest(&from.name)? {
+            seed = PhysicalPlan::Union {
+                op,
+                left: Box::new(seed),
+                right: Box::new(self.build_with_schema(
+                    &Statement::Select(select),
+                    is,
+                    current_db,
+                    stats,
+                )?),
+            };
+        }
         let cte = with.find(&from.name);
         let columns = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
         let inline = cte.is_some_and(|cte| {

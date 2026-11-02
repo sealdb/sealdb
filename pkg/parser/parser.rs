@@ -896,10 +896,15 @@ mod tests {
             inline.as_select().unwrap().with.as_ref().unwrap().ctes[0].materialize,
             crate::ast::CteMaterialize::NotMaterialized
         );
-        let err = parser
+        let unioned = parser
             .parse_one_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
-            .unwrap_err();
-        assert!(err.message.contains("UNION"));
+            .unwrap();
+        assert_eq!(
+            unioned.as_select().unwrap().with.as_ref().unwrap().ctes[0]
+                .set_rest
+                .len(),
+            1
+        );
     }
 
     #[test]
