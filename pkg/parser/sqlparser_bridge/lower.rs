@@ -1582,12 +1582,14 @@ fn lower_select(
     })
 }
 
+/// Dummy `ON 1` for CROSS JOIN / comma join, which have no real join predicate.
 fn true_expr() -> ExprNode {
     ExprNode::Value(ValueExpr {
         datum: Datum::I64(1),
     })
 }
 
+/// Lower FROM. Two comma-separated tables become CROSS JOIN; 3+ tables stay unsupported.
 fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {
     if from.is_empty() {
         return Ok((None, None));
@@ -1616,6 +1618,7 @@ fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join
     Ok((Some(left), join))
 }
 
+/// Lower `t` or `t1 JOIN t2 ON ...` / `t1 CROSS JOIN t2`. More than two tables is F09 leftover.
 fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> {
     let left = table_factor_name(&table.relation)?;
     if table.joins.is_empty() {
@@ -1717,6 +1720,7 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
     }
 }
 
+/// Lower UPDATE, including two-table JOIN. FROM / RETURNING are not in TiDB v8.5.8.
 fn lower_update(update: &Update) -> Result<Statement> {
     // F07 leftover: two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
@@ -1758,6 +1762,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
     }))
 }
 
+/// Lower DELETE, including `DELETE t1 FROM t1 JOIN t2` and `USING`. RETURNING stays rejected.
 fn lower_delete(delete: &Delete) -> Result<Statement> {
     // F07 leftover: two-table DELETE. TiDB v8.5.8 has no DELETE RETURNING.
     if delete.returning.is_some() || delete.output.is_some() {
@@ -1818,6 +1823,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
     }))
 }
 
+/// Split `col` / `t.col` / `db.t.col` into `(table, column)` for UPDATE SET.
 fn assignment_column(name: &ObjectName) -> Result<(Option<String>, String)> {
     let parts = object_name_parts(name)?;
     match parts.as_slice() {

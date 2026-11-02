@@ -9,6 +9,9 @@ use sealdb_types::field_type::{
 };
 use sealdb_types::{Datum, MyDecimal, Time};
 
+/// Decode a v128 row. The new format has no type tags, so each requested column
+/// needs a `FieldType`. An empty `columns` list returns every stored value as
+/// `Bytes` / `Null` (used when the caller has no schema).
 pub fn decode(raw: &[u8], columns: &[(i64, FieldType)]) -> Vec<(i64, Datum)> {
     let Some(row) = Row::from_bytes(raw) else {
         return Vec::new();
@@ -30,6 +33,7 @@ pub fn decode(raw: &[u8], columns: &[(i64, FieldType)]) -> Vec<(i64, Datum)> {
     out
 }
 
+/// Return every stored column without FieldType: not-null as raw `Bytes`.
 fn decode_all(row: &Row<'_>) -> Vec<(i64, Datum)> {
     let mut out = Vec::new();
     for i in 0..row.num_not_null as usize {
@@ -43,6 +47,7 @@ fn decode_all(row: &Row<'_>) -> Vec<(i64, Datum)> {
     out
 }
 
+/// Interpret untyped column bytes using MySQL `FieldType.tp` / unsigned.
 fn decode_value(data: &[u8], ft: &FieldType) -> Datum {
     match ft.tp {
         TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_INT24 | TYPE_LONG_LONG | TYPE_YEAR => {

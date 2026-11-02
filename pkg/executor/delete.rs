@@ -21,6 +21,7 @@ use sealdb_util::chunk::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// `DELETE` executor: single-table path, or two-table JOIN deleting listed tables.
 pub struct DeleteExec {
     domain: Arc<Domain>,
     stmt: DeleteStmt,
@@ -107,6 +108,7 @@ impl Executor for DeleteExec {
 }
 
 impl DeleteExec {
+    /// `DELETE t1 [, t2] FROM t1 JOIN t2 ...`: join, dedup handles, delete listed sides.
     fn delete_join(&mut self, join: &Join) -> Result<()> {
         let delete_left = self
             .stmt
@@ -175,6 +177,7 @@ impl DeleteExec {
     }
 }
 
+/// Concatenate optional join sides; unmatched outer rows are padded with NULL.
 fn concat_optional(
     left: Option<&ScannedRow>,
     right: Option<&ScannedRow>,
@@ -192,6 +195,7 @@ fn concat_optional(
     row
 }
 
+/// Drop index keys then the row record for one scanned handle.
 fn apply_row_delete(
     txn: &mut dyn Transaction,
     info: &TableInfo,

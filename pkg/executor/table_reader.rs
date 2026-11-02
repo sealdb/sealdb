@@ -109,6 +109,7 @@ impl Executor for TableReaderExec {
     }
 }
 
+/// One table row plus the handle / physical table id used to rewrite KV keys.
 #[derive(Clone)]
 pub(crate) struct ScannedRow {
     pub handle: i64,

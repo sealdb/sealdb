@@ -223,10 +223,13 @@ const TAG_I64: u8 = 1;
 const TAG_F64: u8 = 2;
 const TAG_BYTES: u8 = 3;
 
+/// Encode a table row in TiDB CodecVer 128 (`pkg/util/rowcodec`).
 pub fn encode_row(col_ids: &[i64], values: &[Datum]) -> Vec<u8> {
     rowcodec::encode(col_ids, values)
 }
 
+/// Decode a table row. v128 needs `columns` FieldTypes; any other first byte is
+/// the old tagged layout kept as a read fallback for pre-rowcodec KV.
 pub fn decode_row(raw: &[u8], columns: &[(i64, FieldType)]) -> Vec<(i64, Datum)> {
     if raw.first() == Some(&CODEC_VER) {
         rowcodec::decode(raw, columns)
@@ -235,6 +238,7 @@ pub fn decode_row(raw: &[u8], columns: &[(i64, FieldType)]) -> Vec<(i64, Datum)>
     }
 }
 
+/// Tagged `(col_id, type_tag, payload)*` layout used before CodecVer 128.
 fn decode_legacy_row(raw: &[u8]) -> Vec<(i64, Datum)> {
     if raw.len() < 4 {
         return Vec::new();

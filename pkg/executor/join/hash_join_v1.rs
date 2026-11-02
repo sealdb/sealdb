@@ -13,6 +13,8 @@ use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, mem_row_limit};
 use std::collections::HashMap;
 
+/// Two-table hash join. Inner/outer probe on equality keys; CROSS JOIN is a
+/// full cartesian product and never spill-partitions (no join key).
 pub struct HashJoinV1Exec {
     join: Join,
     left: Box<dyn Executor>,
@@ -64,6 +66,7 @@ impl Executor for HashJoinV1Exec {
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
         self.spilled = false;
+        // CROSS JOIN has no equality key, so skip hash index and partition spill.
         if self.join.tp == JoinType::Cross {
             self.rows = probe_cross(&left_rows, &right_rows);
             return Ok(());
@@ -177,6 +180,7 @@ fn probe_join(
     }
 }
 
+/// Concatenate every left row with every right row (CROSS JOIN / comma join).
 fn probe_cross(left_rows: &[Vec<Datum>], right_rows: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
     let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
     for left in left_rows {
@@ -335,6 +339,8 @@ fn key_text(value: &Datum) -> String {
     format!("{value:?}")
 }
 
+/// Join-side index pairs for DML. `None` marks an unmatched outer row so UPDATE /
+/// DELETE can skip that side. CROSS JOIN returns the full cartesian of indices.
 pub(crate) fn hash_join_pairs(
     join: &Join,
     left_schema: &[String],
@@ -369,6 +375,7 @@ pub(crate) fn hash_join_pairs(
     }
 }
 
+/// Inner-join `(probe_i, build_i)` pairs using the same hash index as `probe_inner`.
 fn probe_inner_pairs(
     probe_rows: &[Vec<Datum>],
     build_rows: &[Vec<Datum>],
@@ -393,6 +400,7 @@ fn probe_inner_pairs(
     Ok(out)
 }
 
+/// Left or right outer pairs. Unmatched outer rows use `None` on the inner side.
 fn probe_outer_pairs(
     outer_rows: &[Vec<Datum>],
     inner_rows: &[Vec<Datum>],
@@ -430,6 +438,7 @@ fn probe_outer_pairs(
     Ok(out)
 }
 
+/// Hash index from join-key text to row offsets (for DML pair probes).
 fn build_index_ids(
     rows: &[Vec<Datum>],
     schema: &[String],

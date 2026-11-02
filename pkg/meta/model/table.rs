@@ -56,6 +56,7 @@ impl TableInfo {
             .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
     }
 
+    /// `(col_id, FieldType)` pairs for v128 row decode (no type tags in the data).
     pub fn col_field_types(&self) -> Vec<(i64, FieldType)> {
         self.columns
             .iter()
