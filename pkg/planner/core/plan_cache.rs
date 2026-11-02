@@ -1,7 +1,8 @@
 //! Plan cache value and helpers (TiDB `pkg/planner/core/plan_cache.go`, MVB).
 //!
-//! Cache entries are keyed by restored SQL; validity is gated by infoschema
-//! meta version. Parameter-type (typed placeholder) rebuild is deferred.
+//! Prepared EXECUTE keys the Domain cache by the unbound template SQL
+//! (see `plan_cache_param::normalize_prep_cache_key`); ad-hoc cached SQL still
+//! uses restored bound SQL. Validity is gated by infoschema meta version.
 
 use crate::core::physical_plans::PhysicalPlan;
 

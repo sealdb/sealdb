@@ -706,7 +706,7 @@
       "status": "partial",
       "rust": "pkg/planner/core/plan_cache.rs",
       "phase": 10,
-      "notes": "PlanCacheValue keyed by restored SQL + schema version; typed-param rebuild deferred"
+      "notes": "PlanCacheValue; prepared EXECUTE keys by unbound ? template + schema version"
     },
     "pkg/planner/core/plan_cache_instance.go": {
       "status": "partial",
@@ -719,6 +719,12 @@
       "rust": "pkg/planner/core/plan_cache_lru.rs",
       "phase": 10,
       "notes": "thin LRU capacity for InstancePlanCache"
+    },
+    "pkg/planner/core/plan_cache_param.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/plan_cache_param.rs",
+      "phase": 10,
+      "notes": "MVB: normalize_prep_cache_key for ? template keys; ParamMarker AST rewrite deferred"
     }
   }
 }

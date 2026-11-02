@@ -10,7 +10,7 @@ use sealdb_parser::ast::{
     InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, Statement, UserIdentity,
 };
 use sealdb_parser::charset::Collation;
-use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder};
+use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
 use sealdb_sessiontxn::TxnManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,9 @@ pub struct Session {
     read_only: Mutex<bool>,
     prepared: Mutex<HashMap<String, String>>,
     cache_plans: Mutex<bool>,
+    /// When set, Domain plan-cache lookup/insert uses this key instead of
+    /// restored bound SQL (prepared `?` template).
+    plan_cache_key: Mutex<Option<String>>,
     collation: Mutex<Collation>,
     sql_mode: Mutex<String>,
     /// Session user variables (`SET @a = …` / `SELECT @a`).
@@ -65,6 +68,7 @@ impl Session {
             read_only: Mutex::new(false),
             prepared: Mutex::new(HashMap::new()),
             cache_plans: Mutex::new(false),
+            plan_cache_key: Mutex::new(None),
             collation: Mutex::new(Collation::bin()),
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
             user_vars: Mutex::new(HashMap::new()),
@@ -105,9 +109,29 @@ impl Session {
 
     /// Execute SQL with the session plan cache enabled (text EXECUTE / COM_STMT_EXECUTE).
     pub fn execute_cached_stmt(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_cached_stmt_with_key(sql, None)
+    }
+
+    /// Like [`Self::execute_cached_stmt`], optionally overriding the Domain plan-cache
+    /// key with the unbound prepared template (keeps `?`).
+    pub fn execute_cached_stmt_with_key(
+        &self,
+        sql: &str,
+        prep_cache_key: Option<&str>,
+    ) -> Result<QueryResult> {
         *self.cache_plans.lock().expect("session cache flag lock") = true;
+        if let Some(key) = prep_cache_key {
+            *self
+                .plan_cache_key
+                .lock()
+                .expect("session plan cache key lock") = Some(normalize_prep_cache_key(key));
+        }
         let result = self.execute_stmt(sql);
         *self.cache_plans.lock().expect("session cache flag lock") = false;
+        *self
+            .plan_cache_key
+            .lock()
+            .expect("session plan cache key lock") = None;
         result
     }
 
@@ -236,9 +260,19 @@ impl Session {
                 let using = resolve_exec_params(self, &exec.using)?;
                 let bound = bind_sql(&sql, &using)?;
                 let inner = self.parser.parse_one_stmt(&bound)?;
+                // MVB: still plan/execute the bound SQL, but cache under the
+                // unbound `?` template so different USING literals share one entry.
                 *self.cache_plans.lock().expect("session cache flag lock") = true;
+                *self
+                    .plan_cache_key
+                    .lock()
+                    .expect("session plan cache key lock") = Some(normalize_prep_cache_key(&sql));
                 let result = self.execute_one(&inner);
                 *self.cache_plans.lock().expect("session cache flag lock") = false;
+                *self
+                    .plan_cache_key
+                    .lock()
+                    .expect("session plan cache key lock") = None;
                 return result;
             }
             Statement::Begin(begin) => {
@@ -368,7 +402,13 @@ impl Session {
         let stmt = rebound.as_ref().unwrap_or(stmt);
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
-        let cache_key = restore_sql(stmt);
+        // Prepared EXECUTE may override with the unbound `?` template key.
+        let cache_key = self
+            .plan_cache_key
+            .lock()
+            .expect("session plan cache key lock")
+            .clone()
+            .unwrap_or_else(|| restore_sql(stmt));
         let use_cache = *self.cache_plans.lock().expect("session cache flag lock");
         let plan = if use_cache {
             let cache = self.domain.plan_cache();
@@ -379,6 +419,9 @@ impl Session {
                     .partition_prune_mode
                     .lock()
                     .expect("session partition prune mode lock");
+                // Shortcut: plan is built from the first bound SQL, then reused
+                // under the template key. PointGet/index lookup re-read literals
+                // from the current bound stmt in ExecutorBuilder.
                 let plan = self.planner.build_with_schema(
                     stmt,
                     Some(&is),
@@ -2725,6 +2768,34 @@ mod tests {
         let again = a.execute_stmt("EXECUTE s USING 1").unwrap();
         assert_eq!(again.display_rows(), vec![vec!["a".to_string()]]);
         assert_eq!(domain.plan_cache_hit_count(), 2);
+    }
+
+    #[test]
+    fn test_typed_placeholders_share_plan_cache() {
+        let domain = Arc::new(Domain::new());
+        let session = Session::with_domain(Arc::clone(&domain));
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
+            .unwrap();
+        assert_eq!(domain.plan_cache_hit_count(), 0);
+        assert_eq!(domain.plan_cache().len(), 0);
+        let first = session.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(first.display_rows(), vec![vec!["a".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 0);
+        assert_eq!(domain.plan_cache().len(), 1);
+        let second = session.execute_stmt("EXECUTE s USING 2").unwrap();
+        assert_eq!(second.display_rows(), vec![vec!["b".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 1);
+        assert_eq!(domain.plan_cache().len(), 1);
+        let again = session.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(again.display_rows(), vec![vec!["a".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 2);
+        assert_eq!(domain.plan_cache().len(), 1);
     }
 
     #[test]

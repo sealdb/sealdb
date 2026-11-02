@@ -313,7 +313,11 @@ impl ClientConn {
             .clone();
         let params = parse_binary_params(payload, stmt.num_params)?;
         let sql = bind_placeholders(&stmt.sql, &params)?;
-        match self.session.execute_cached_stmt(&sql) {
+        // Domain plan cache keyed by unbound prepared SQL (with `?`).
+        match self
+            .session
+            .execute_cached_stmt_with_key(&sql, Some(stmt.sql.as_str()))
+        {
             Ok(result) => {
                 if result.columns.is_empty() {
                     self.write_ok()

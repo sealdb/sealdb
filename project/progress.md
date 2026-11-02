@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（F21/F22 leftover 收口；完整性波 C4→C2→C5）  
+> 最后更新：2026-11-03（C4 typed-placeholders 收口；完整性波 C4 gaps=[] → C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C4（typed-placeholders）
+- **完成**:
+  - `plan_cache_param.rs`：`normalize_prep_cache_key` 保留 `?` 模板作 Domain plan-cache key
+  - Text EXECUTE / COM_STMT_EXECUTE：仍 bind 字面量执行，但 put/get 用 unbound prepared SQL
+  - PointGet 执行时从当前 bound stmt 重读 handle（缓存的首执行 plan shape 可复用）
+  - C4 gate `execute-typed-placeholders`；`status.json` / leftover C4 gaps → `[]`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_typed_placeholders_share_plan_cache`
+  - `cargo fmt` + prepare/cache session tests
+- **下一步**:
+  - 完整性波 C2 / C5
 
 ### 2026-11-03
 
