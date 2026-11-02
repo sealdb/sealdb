@@ -56,7 +56,6 @@
       "savepoint"
     ],
     "C4": [
-      "user-vars",
       "create-binding",
       "shared-plan-cache",
       "typed-placeholders"

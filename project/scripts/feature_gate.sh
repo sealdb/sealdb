@@ -235,6 +235,7 @@ case "$FEATURE" in
       --check
     run execute-prepare cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'; EXECUTE s USING 1; DEALLOCATE PREPARE s"
     run execute-com-stmt cargo test -q -p sealdb-server --lib tests::test_com_stmt_prepare_execute -- --exact
+    run execute-user-vars cargo test -q -p sealdb-session --lib test_user_vars_set_select_and_execute_using -- --exact
     ;;
   C5)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

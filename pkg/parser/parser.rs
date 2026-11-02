@@ -1460,4 +1460,30 @@ mod tests {
             other => panic!("expected DeallocateStmt, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_parse_user_vars() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("SET @a = 1").unwrap() {
+            crate::ast::Statement::Set(set) => {
+                assert_eq!(set.assignments[0].name, "@a");
+                assert_eq!(set.assignments[0].value, "1");
+            }
+            other => panic!("expected SetStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SELECT @a").unwrap() {
+            crate::ast::Statement::Select(select) => match &select.fields[0].expr {
+                crate::ast::expressions::ExprNode::Column(col) => assert_eq!(col.name, "@a"),
+                other => panic!("expected Column @a, got {other:?}"),
+            },
+            other => panic!("expected SelectStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("EXECUTE s USING @a").unwrap() {
+            crate::ast::Statement::Execute(exec) => match &exec.using[0] {
+                crate::ast::expressions::ExprNode::Column(col) => assert_eq!(col.name, "@a"),
+                other => panic!("expected Column @a, got {other:?}"),
+            },
+            other => panic!("expected ExecuteStmt, got {other:?}"),
+        }
+    }
 }

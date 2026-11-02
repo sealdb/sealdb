@@ -31,6 +31,8 @@ pub struct Session {
     cache_plans: Mutex<bool>,
     collation: Mutex<Collation>,
     sql_mode: Mutex<String>,
+    /// Session user variables (`SET @a = …` / `SELECT @a`).
+    user_vars: Mutex<HashMap<String, sealdb_types::Datum>>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
     partition_prune_mode: Mutex<PartitionPruneMode>,
     /// Active roles for the session (`SET ROLE`).
@@ -67,6 +69,7 @@ impl Session {
             cache_plans: Mutex::new(false),
             collation: Mutex::new(Collation::bin()),
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
+            user_vars: Mutex::new(HashMap::new()),
             partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(true),
@@ -208,7 +211,8 @@ impl Session {
                             format!("Unknown prepared statement handler ({})", exec.name),
                         )
                     })?;
-                let bound = bind_sql(&sql, &exec.using)?;
+                let using = resolve_exec_params(self, &exec.using)?;
+                let bound = bind_sql(&sql, &using)?;
                 let inner = self.parser.parse_one_stmt(&bound)?;
                 *self.cache_plans.lock().expect("session cache flag lock") = true;
                 let result = self.execute_one(&inner);
@@ -812,8 +816,58 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
     Ok(())
 }
 
+fn is_user_var_name(name: &str) -> bool {
+    name.starts_with('@') && !name.starts_with("@@")
+}
+
+fn user_var_key(name: &str) -> String {
+    name.trim_start_matches('@').to_ascii_lowercase()
+}
+
+fn parse_set_literal(value: &str) -> sealdb_types::Datum {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("null") {
+        return sealdb_types::Datum::Null;
+    }
+    if let Ok(i) = v.parse::<i64>() {
+        return sealdb_types::Datum::I64(i);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        return sealdb_types::Datum::F64(f);
+    }
+    let s = v.trim_matches(|c| c == '\'' || c == '"');
+    sealdb_types::Datum::Bytes(s.as_bytes().to_vec())
+}
+
+fn resolve_exec_params(session: &Session, params: &[ExprNode]) -> Result<Vec<ExprNode>> {
+    let vars = session.user_vars.lock().expect("session user vars lock");
+    params
+        .iter()
+        .map(|expr| match expr {
+            ExprNode::Column(col) if is_user_var_name(&col.name) => {
+                let key = user_var_key(&col.name);
+                let datum = vars.get(&key).cloned().unwrap_or(sealdb_types::Datum::Null);
+                Ok(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr { datum },
+                ))
+            }
+            other => Ok(other.clone()),
+        })
+        .collect()
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
     for a in &stmt.assignments {
+        if is_user_var_name(&a.name) {
+            let key = user_var_key(&a.name);
+            let datum = parse_set_literal(&a.value);
+            session
+                .user_vars
+                .lock()
+                .expect("session user vars lock")
+                .insert(key, datum);
+            continue;
+        }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
         let value = a.value.trim_matches(|c| c == '\'' || c == '"').to_string();
         match name.as_str() {
@@ -895,6 +949,19 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
         let ExprNode::Column(col) = &field.expr else {
             return None;
         };
+        columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
+        if is_user_var_name(&col.name) {
+            let key = user_var_key(&col.name);
+            let datum = session
+                .user_vars
+                .lock()
+                .expect("session user vars lock")
+                .get(&key)
+                .cloned()
+                .unwrap_or(sealdb_types::Datum::Null);
+            row.push(datum);
+            continue;
+        }
         let name = col.name.trim_start_matches('@').to_ascii_lowercase();
         let value = match name.as_str() {
             "sql_mode" => session
@@ -941,7 +1008,6 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                 .to_string(),
             _ => return None,
         };
-        columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
         row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
     }
     if columns.is_empty() {
@@ -2594,6 +2660,30 @@ mod tests {
         session.execute_stmt("DEALLOCATE PREPARE s").unwrap();
         let err = session.execute_stmt("EXECUTE s USING 1").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_UNKNOWN_STMT_HANDLER);
+    }
+
+    #[test]
+    fn test_user_vars_set_select_and_execute_using() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        session.execute_stmt("SET @a = 1, @name = 'b'").unwrap();
+        let got = session.execute_stmt("SELECT @a, @name, @missing").unwrap();
+        assert_eq!(
+            got.display_rows(),
+            vec![vec!["1".to_string(), "b".to_string(), "NULL".to_string()]]
+        );
+        session
+            .execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
+            .unwrap();
+        let row = session.execute_stmt("EXECUTE s USING @a").unwrap();
+        assert_eq!(row.display_rows(), vec![vec!["a".to_string()]]);
+        session.execute_stmt("SET @a = 2").unwrap();
+        let row2 = session.execute_stmt("EXECUTE s USING @a").unwrap();
+        assert_eq!(row2.display_rows(), vec![vec!["b".to_string()]]);
     }
 
     #[test]
