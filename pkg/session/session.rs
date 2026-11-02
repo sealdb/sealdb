@@ -1058,6 +1058,76 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.u WHERE name = 'missing'")
             .unwrap();
         assert!(unique_miss.display_rows().is_empty());
+        let one = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id IN (2)")
+            .unwrap();
+        assert_eq!(
+            one.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_batch_point_get() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let plan = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE id IN (1, 3)")
+            .unwrap();
+        let text = plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("BatchPointGet"), "{text}");
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id IN (1, 3) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["3".to_string(), "c".to_string()]
+            ]
+        );
+        let miss = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id IN (8, 9)")
+            .unwrap();
+        assert!(miss.display_rows().is_empty());
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20), extra VARCHAR(20), UNIQUE INDEX idx_u_name (name)); INSERT INTO db1.u VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')",
+            )
+            .unwrap();
+        let unique_plan = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.u WHERE name IN ('a', 'c')")
+            .unwrap();
+        let unique_text = unique_plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unique_text.contains("BatchPointGet"), "{unique_text}");
+        let unique_rows = session
+            .execute_stmt("SELECT * FROM db1.u WHERE name IN ('a', 'c') ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            unique_rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string(), "x".to_string()],
+                vec!["3".to_string(), "c".to_string(), "z".to_string()]
+            ]
+        );
+        let dup = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id IN (1, 1, 3) ORDER BY id")
+            .unwrap();
+        assert_eq!(dup.display_rows().len(), 2);
     }
 
     #[test]

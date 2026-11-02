@@ -48,6 +48,12 @@ pub enum PhysicalPlan {
         handle: Option<i64>,
         index: Option<String>,
     },
+    BatchPointGet {
+        table: String,
+        column: String,
+        index: Option<String>,
+        n_keys: usize,
+    },
     IndexLookUpReader {
         table: String,
         index: String,
@@ -164,6 +170,15 @@ impl PhysicalPlan {
                 ..
             } => format!("PointGet_{table}_{index}"),
             PhysicalPlan::PointGet { table, .. } => format!("PointGet_{table}"),
+            PhysicalPlan::BatchPointGet {
+                table,
+                index: Some(index),
+                n_keys,
+                ..
+            } => format!("BatchPointGet_{table}_{index}_{n_keys}"),
+            PhysicalPlan::BatchPointGet { table, n_keys, .. } => {
+                format!("BatchPointGet_{table}_{n_keys}")
+            }
             PhysicalPlan::IndexLookUpReader {
                 table,
                 index,

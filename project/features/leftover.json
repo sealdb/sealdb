@@ -47,9 +47,6 @@
       "topn-spill",
       "parallel-sort"
     ],
-    "F06": [
-      "batch-point-get"
-    ],
     "F07": [
       "multi-table",
       "update-join",

@@ -1,6 +1,6 @@
 // F06 core path: handle PointGet + unique-index PointGet
 // (TiDB pkg/executor/point_get.go).
-// Completeness wave / not this feature: BatchPointGet.
+// Completeness wave / not this feature: clustered PK beyond integer handle.
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};

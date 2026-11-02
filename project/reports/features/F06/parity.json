@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 167,
-  "manifest_entries": 117,
+  "rs_files": 168,
+  "manifest_entries": 118,
   "status_counts": {
-    "not-started": 1564,
-    "partial": 110,
+    "not-started": 1563,
+    "partial": 111,
     "reimplemented": 4,
     "ported": 3
   },
@@ -155,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 34,
-      "missing": 151,
+      "rs": 35,
+      "missing": 150,
       "status": {
-        "not-started": 151,
-        "partial": 34
+        "not-started": 150,
+        "partial": 35
       }
     },
     "pkg/expression": {
@@ -2410,10 +2410,10 @@
     },
     {
       "go_path": "pkg/executor/batch_point_get.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/batch_point_get.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "handle and unique-index BatchPointGet for IN lists"
     },
     {
       "go_path": "pkg/executor/bind.go",
@@ -3057,7 +3057,7 @@
       "rs_path": "pkg/executor/point_get.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "integer handle PointGet"
+      "notes": "integer handle PointGet + unique-index PointGet"
     },
     {
       "go_path": "pkg/executor/prepared.go",

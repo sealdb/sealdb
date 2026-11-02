@@ -1,5 +1,6 @@
 use crate::aggregate::{HashAggExec, StreamAggExec};
 use crate::analyze::AnalyzeExec;
+use crate::batch_point_get::BatchPointGetExec;
 use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
@@ -210,6 +211,29 @@ impl ExecutorBuilder {
                     *handle,
                     index.clone(),
                     lookup,
+                    current_db.to_string(),
+                    txn,
+                    select.lock == SelectLock::ForUpdate,
+                )))
+            }
+            PhysicalPlan::BatchPointGet { column, index, .. } => {
+                let select = stmt
+                    .as_select()
+                    .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
+                let from = select
+                    .from
+                    .clone()
+                    .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
+                let lookups = select
+                    .selection
+                    .as_ref()
+                    .and_then(|expr| expr.in_const_on(column))
+                    .ok_or_else(|| Error::unsupported("batch point get without IN list"))?;
+                Ok(Box::new(BatchPointGetExec::new(
+                    domain,
+                    from,
+                    index.clone(),
+                    lookups,
                     current_db.to_string(),
                     txn,
                     select.lock == SelectLock::ForUpdate,
@@ -450,7 +474,12 @@ fn index_lookup_value(
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
     let column = index.columns.first()?.name.o().to_string();
-    selection.and_then(|expr| expr.eq_const_on(&column))
+    if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
+        return Some(value);
+    }
+    selection
+        .and_then(|expr| expr.in_const_on(&column))
+        .and_then(|values| values.into_iter().next())
 }
 
 fn index_access(

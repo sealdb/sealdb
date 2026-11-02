@@ -181,6 +181,21 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             String::new(),
         ),
+        PhysicalPlan::BatchPointGet {
+            table,
+            index: Some(index),
+            n_keys,
+            ..
+        } => (
+            "BatchPointGet".to_string(),
+            format!("table:{table}, index:{index}"),
+            format!("keys:{n_keys}"),
+        ),
+        PhysicalPlan::BatchPointGet { table, n_keys, .. } => (
+            "BatchPointGet".to_string(),
+            format!("table:{table}"),
+            format!("keys:{n_keys}"),
+        ),
         PhysicalPlan::IndexLookUpReader {
             table,
             index,
@@ -246,6 +261,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
         PhysicalPlan::PointGet { .. } => 1.0,
+        PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
         PhysicalPlan::Selection { child, .. } => est_rows(child) * 0.8,
         PhysicalPlan::TableReader {
             pushed: Some(_), ..

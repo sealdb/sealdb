@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F06 leftover（batch-point-get）
+- **完成**:
+  - handle / unique-index `IN (...)` uses BatchPointGet; single-value IN stays PointGet
+  - NOT IN and non-unique IN stay table/index scan
+- **验证**:
+  - session batch + unique IN; F06 gate execute-batch-point-get
+- **下一步**:
+  - leftover F05 topn-spill
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F06 leftover（index-point-get）
 - **完成**:
   - unique-index equality uses PointGet (index key Get, then row Get)
