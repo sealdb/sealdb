@@ -13,3 +13,14 @@ ROLLBACK;
 SELECT * FROM itest.t;
 id	name
 1	a
+BEGIN;
+INSERT INTO itest.t VALUES (2, 'b');
+SAVEPOINT sp1;
+INSERT INTO itest.t VALUES (3, 'c');
+ROLLBACK TO sp1;
+SELECT * FROM itest.t ORDER BY id;
+id	name
+1	a
+2	b
+RELEASE SAVEPOINT sp1;
+COMMIT;

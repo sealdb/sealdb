@@ -29,6 +29,21 @@ pub trait Transaction: Send {
     fn refresh_snapshot(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Record a named marker of the current buffered writes/deletes/locks.
+    /// A later `SAVEPOINT` with the same name replaces the earlier one.
+    fn savepoint(&mut self, _name: &str) -> Result<()> {
+        Err(Error::unsupported("SAVEPOINT"))
+    }
+    /// Restore buffered writes to `name` and drop later savepoints. The
+    /// named marker itself remains. Unknown names are errno 1305.
+    fn rollback_to(&mut self, _name: &str) -> Result<()> {
+        Err(Error::unsupported("ROLLBACK TO SAVEPOINT"))
+    }
+    /// Drop `name` and every savepoint created after it, without restoring
+    /// writes. Unknown names are errno 1305.
+    fn release_savepoint(&mut self, _name: &str) -> Result<()> {
+        Err(Error::unsupported("RELEASE SAVEPOINT"))
+    }
 }
 
 pub fn unsupported_storage() -> Error {

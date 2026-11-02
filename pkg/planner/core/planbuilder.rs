@@ -135,6 +135,12 @@ impl PlanBuilder {
             Statement::Rollback(_) => Ok(PhysicalPlan::Show {
                 kind: "Rollback".to_string(),
             }),
+            Statement::Savepoint(_) => Ok(PhysicalPlan::Show {
+                kind: "Savepoint".to_string(),
+            }),
+            Statement::ReleaseSavepoint(_) => Ok(PhysicalPlan::Show {
+                kind: "ReleaseSavepoint".to_string(),
+            }),
             Statement::Grant(_) => Ok(PhysicalPlan::Simple {
                 kind: "Grant".to_string(),
             }),

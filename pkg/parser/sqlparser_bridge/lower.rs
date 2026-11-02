@@ -15,9 +15,9 @@ use crate::ast::expressions::{
 };
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
-    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType, RevokeStmt,
-    RollbackStmt, SetAssignment, SetStmt, SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt,
-    UserIdentity,
+    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
+    ReleaseSavepointStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetStmt,
+    SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
 use crate::opcode::Op;
@@ -312,11 +312,20 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             Ok(Statement::Commit(CommitStmt))
         }
         SqlStatement::Rollback { chain, savepoint } => {
-            // F12 gap / completeness wave: SAVEPOINT and AND CHAIN.
-            if *chain || savepoint.is_some() {
-                return Err(Error::unsupported("ROLLBACK TO SAVEPOINT"));
+            if *chain {
+                return Err(Error::unsupported("ROLLBACK AND CHAIN"));
             }
-            Ok(Statement::Rollback(RollbackStmt))
+            Ok(Statement::Rollback(RollbackStmt {
+                savepoint: savepoint.as_ref().map(|name| name.value.clone()),
+            }))
+        }
+        SqlStatement::Savepoint { name } => Ok(Statement::Savepoint(SavepointStmt {
+            name: name.value.clone(),
+        })),
+        SqlStatement::ReleaseSavepoint { name } => {
+            Ok(Statement::ReleaseSavepoint(ReleaseSavepointStmt {
+                name: name.value.clone(),
+            }))
         }
         SqlStatement::Grant(grant) => lower_grant(grant),
         SqlStatement::Revoke(revoke) => lower_revoke(revoke),
@@ -374,9 +383,6 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 format: lower_explain_format(*verbose, format.as_ref())?,
                 stmt: Box::new(lower_statement(statement)?),
             }))
-        }
-        SqlStatement::Savepoint { .. } | SqlStatement::ReleaseSavepoint { .. } => {
-            Err(Error::unsupported("SAVEPOINT"))
         }
         other => Err(Error::new(
             ERR_UNSUPPORTED,
