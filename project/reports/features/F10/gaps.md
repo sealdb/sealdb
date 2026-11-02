@@ -7,11 +7,12 @@ or F18. Rejected via `Error::unsupported` in
 `pkg/planner/core/planbuilder.rs`.
 
 - Standalone `CREATE INDEX` / `DROP INDEX` / `ALTER TABLE ADD INDEX` (F18)
-- UNIQUE / PRIMARY KEY / FOREIGN KEY / CHECK / FULLTEXT / SPATIAL
-- Unique-index enforcement and unique PointGet
+- FOREIGN KEY / CHECK / FULLTEXT / SPATIAL
+- Unique-index PointGet
 - Covering IndexReader (no table lookup)
 - Index range scan (`>`, `<`, `BETWEEN`, prefix)
 - Composite lookup beyond first-column equality
 - Prefix-length / functional indexes
 - IndexMerge / lookup push-down / parallel workers
 - Costed index-path enumeration and skyline
+- Multiple NULLs in UNIQUE (MySQL allows them; current unique keys collide)

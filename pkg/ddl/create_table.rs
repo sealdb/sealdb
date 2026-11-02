@@ -36,12 +36,10 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
         }
         let idx_id = (offset as i64) + 1;
-        info.indices.push(IndexInfo::new(
-            idx_id,
-            index.name.clone(),
-            info.name.o(),
-            idx_cols,
-        ));
+        info.indices.push(
+            IndexInfo::new(idx_id, index.name.clone(), info.name.o(), idx_cols)
+                .with_flags(index.unique, index.primary),
+        );
         info.max_idx_id = idx_id;
     }
     Ok(info)

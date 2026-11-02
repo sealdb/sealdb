@@ -357,6 +357,8 @@ mod tests {
                 assert_eq!(create.indices.len(), 1);
                 assert_eq!(create.indices[0].name, "idx_name");
                 assert_eq!(create.indices[0].columns, vec!["name".to_string()]);
+                assert!(!create.indices[0].unique);
+                assert!(!create.indices[0].primary);
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
@@ -367,6 +369,7 @@ mod tests {
             crate::ast::Statement::CreateIndex(create) => {
                 assert_eq!(create.name, "idx_name");
                 assert_eq!(create.columns, vec!["name".to_string()]);
+                assert!(!create.unique);
             }
             other => panic!("expected CreateIndexStmt, got {other:?}"),
         }
@@ -388,10 +391,25 @@ mod tests {
             }
             other => panic!("expected AlterTableStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt("CREATE UNIQUE INDEX idx_name ON db1.t (name)")
-            .unwrap_err();
-        assert!(err.message.contains("UNIQUE"));
+            .unwrap()
+        {
+            crate::ast::Statement::CreateIndex(create) => assert!(create.unique),
+            other => panic!("expected unique CreateIndexStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE db1.t (id INT, name VARCHAR(20), PRIMARY KEY (id), UNIQUE INDEX idx_name (name))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                assert!(create.indices.iter().any(|idx| idx.primary));
+                assert!(create.indices.iter().any(|idx| idx.unique && !idx.primary));
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

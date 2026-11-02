@@ -1,4 +1,4 @@
-use sealdb_errno::Result;
+use sealdb_errno::{ERR_DUP_ENTRY, Error, Result};
 use sealdb_kv::Transaction;
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_tablecodec::{encode_index_key, encode_row_key_with_handle};
@@ -25,7 +25,19 @@ pub(crate) fn write_index_keys(
     physical_id: i64,
 ) -> Result<()> {
     for index in &info.indices {
-        let key = encode_index_key(physical_id, index.id, &index_values(index, values), handle);
+        let key = encode_index_key(
+            physical_id,
+            index.id,
+            &index_values(index, values),
+            handle,
+            index.unique,
+        );
+        if index.unique && txn.get(key.as_bytes())?.is_some() {
+            return Err(Error::new(
+                ERR_DUP_ENTRY,
+                format!("Duplicate entry for key '{}'", index.name.o()),
+            ));
+        }
         txn.set(
             key.as_bytes(),
             encode_row_key_with_handle(physical_id, handle).as_bytes(),
@@ -42,7 +54,13 @@ pub(crate) fn delete_index_keys(
     physical_id: i64,
 ) -> Result<()> {
     for index in &info.indices {
-        let key = encode_index_key(physical_id, index.id, &index_values(index, values), handle);
+        let key = encode_index_key(
+            physical_id,
+            index.id,
+            &index_values(index, values),
+            handle,
+            index.unique,
+        );
         txn.delete(key.as_bytes())?;
     }
     Ok(())

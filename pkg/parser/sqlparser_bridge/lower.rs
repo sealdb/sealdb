@@ -2177,10 +2177,7 @@ fn lower_unary_op(op: &UnaryOperator) -> Result<Op> {
 }
 
 fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement> {
-    // F18 gap / completeness wave: UNIQUE, USING, partial, invisible, ALGORITHM/LOCK.
-    if create.unique {
-        return Err(Error::unsupported("UNIQUE INDEX"));
-    }
+    // F18 gap / completeness wave: USING, partial, invisible, ALGORITHM/LOCK.
     if create.using.is_some()
         || !create.include.is_empty()
         || create.predicate.is_some()
@@ -2207,6 +2204,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
         table: object_table_name(&create.table_name)?,
         name,
         columns,
+        unique: create.unique,
     }))
 }
 
@@ -2284,7 +2282,16 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     .as_ref()
                     .map(|ident| ident.value.clone())
                     .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
-                Ok(AlterTableSpec::AddIndex(IndexDef { name, columns }))
+                Ok(AlterTableSpec::AddIndex(IndexDef {
+                    name,
+                    columns,
+                    unique: false,
+                    primary: false,
+                }))
+            }
+            TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
+            TableConstraint::PrimaryKey(idx) => {
+                Ok(AlterTableSpec::AddIndex(lower_primary_key(idx)?))
             }
             other => Err(Error::unsupported(format!("ALTER TABLE ADD {other}"))),
         },
@@ -2314,11 +2321,15 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     .as_ref()
                     .map(|ident| ident.value.clone())
                     .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
-                indices.push(IndexDef { name, columns });
+                indices.push(IndexDef {
+                    name,
+                    columns,
+                    unique: false,
+                    primary: false,
+                });
             }
-            // F10/F18 gaps: UNIQUE, PRIMARY KEY, FK, CHECK, FULLTEXT stay deferred.
-            TableConstraint::Unique(_) => return Err(Error::unsupported("UNIQUE constraint")),
-            TableConstraint::PrimaryKey(_) => return Err(Error::unsupported("PRIMARY KEY")),
+            TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
+            TableConstraint::PrimaryKey(idx) => indices.push(lower_primary_key(idx)?),
             TableConstraint::ForeignKey(_) => {
                 return Err(Error::unsupported("FOREIGN KEY"));
             }
@@ -2334,6 +2345,52 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
         }
     }
     Ok(indices)
+}
+
+fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef> {
+    if idx.index_type.is_some() || !idx.include.is_empty() {
+        return Err(Error::unsupported("UNIQUE INDEX option"));
+    }
+    let columns = idx
+        .columns
+        .iter()
+        .map(index_column_name)
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(Error::unsupported("UNIQUE INDEX without columns"));
+    }
+    let name = idx
+        .index_name
+        .as_ref()
+        .or(idx.name.as_ref())
+        .map(|ident| ident.value.clone())
+        .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+    Ok(IndexDef {
+        name,
+        columns,
+        unique: true,
+        primary: false,
+    })
+}
+
+fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<IndexDef> {
+    if idx.index_type.is_some() || !idx.include.is_empty() {
+        return Err(Error::unsupported("PRIMARY KEY option"));
+    }
+    let columns = idx
+        .columns
+        .iter()
+        .map(index_column_name)
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(Error::unsupported("PRIMARY KEY without columns"));
+    }
+    Ok(IndexDef {
+        name: "PRIMARY".to_string(),
+        columns,
+        unique: true,
+        primary: true,
+    })
 }
 
 fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {

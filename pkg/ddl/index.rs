@@ -1,10 +1,10 @@
 // F18 core: CREATE/DROP INDEX schema + in-place backfill.
-// Completeness wave / not this feature: TiDB job states, Reorg, UNIQUE,
+// Completeness wave / not this feature: TiDB job states, Reorg,
 // invisible, concurrent ingest, ALGORITHM/LOCK.
 use crate::table::resolve_name;
 use sealdb_errno::{
-    ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE,
-    Error, Result,
+    ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME,
+    ERR_NO_SUCH_TABLE, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -30,6 +30,8 @@ pub fn create_index(
         &IndexDef {
             name: stmt.name.clone(),
             columns: stmt.columns.clone(),
+            unique: stmt.unique,
+            primary: false,
         },
         stmt.if_not_exists,
         current_db,
@@ -94,7 +96,8 @@ pub fn add_index(
         idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
     }
     info.max_idx_id += 1;
-    let built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols);
+    let built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)
+        .with_flags(index.unique, index.primary);
     backfill_index(storage, &info, &built)?;
     info.indices.push(built);
     meta.update_table(db_id, &info)?;
@@ -177,7 +180,13 @@ fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) ->
                         .unwrap_or(Datum::Null)
                 })
                 .collect();
-            let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle);
+            let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle, index.unique);
+            if index.unique && txn.get(ikey.as_bytes())?.is_some() {
+                return Err(Error::new(
+                    ERR_DUP_ENTRY,
+                    format!("Duplicate entry for key '{}'", index.name.o()),
+                ));
+            }
             txn.set(
                 ikey.as_bytes(),
                 encode_row_key_with_handle(physical_id, handle).as_bytes(),

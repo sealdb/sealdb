@@ -63,7 +63,6 @@
       "n-table"
     ],
     "F10": [
-      "unique-pk",
       "covering-reader",
       "range-scan"
     ],
