@@ -1474,14 +1474,11 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     let Some(with) = with else {
         return Ok(None);
     };
-    // F17 gap / completeness wave: recursive CTE, MATERIALIZED, UNION in CTE.
-    if with.recursive {
-        return Err(Error::unsupported("WITH RECURSIVE"));
-    }
+    // F17 leftover: MATERIALIZED, UNION in non-recursive CTE.
     let mut names = Vec::new();
     let mut ctes = Vec::with_capacity(with.cte_tables.len());
     for cte in &with.cte_tables {
-        let lowered = lower_cte(cte)?;
+        let lowered = lower_cte(cte, with.recursive)?;
         if names
             .iter()
             .any(|name: &String| name.eq_ignore_ascii_case(&lowered.name))
@@ -1492,12 +1489,14 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
         ctes.push(lowered);
     }
     Ok(Some(WithClause {
-        is_recursive: false,
+        is_recursive: with.recursive,
         ctes,
     }))
 }
 
-fn lower_cte(cte: &Cte) -> Result<CommonTableExpression> {
+/// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`;
+/// non-recursive `UNION` in a CTE body stays a later leftover.
+fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     if cte.materialized.is_some() {
         return Err(Error::unsupported(match cte.materialized {
             Some(CteAsMaterialized::Materialized) => "MATERIALIZED CTE",
@@ -1511,8 +1510,19 @@ fn lower_cte(cte: &Cte) -> Result<CommonTableExpression> {
     if cte.query.with.is_some() {
         return Err(Error::unsupported("nested WITH"));
     }
-    let query = match cte.query.body.as_ref() {
-        SetExpr::Select(_) => lower_query(&cte.query)?,
+    let (query, recursive_arm) = match cte.query.body.as_ref() {
+        SetExpr::Select(_) => (lower_query(&cte.query)?, None),
+        SetExpr::SetOperation { .. } if recursive => {
+            let set = lower_set_opr(&cte.query)?;
+            if set.rest.len() != 1
+                || !matches!(set.rest[0].0, SetOprType::Union | SetOprType::UnionAll)
+            {
+                return Err(Error::unsupported(
+                    "recursive CTE requires a single UNION / UNION ALL",
+                ));
+            }
+            (set.first, Some(set.rest[0].clone()))
+        }
         SetExpr::SetOperation { .. } => return Err(Error::unsupported("UNION in CTE")),
         other => return Err(Error::unsupported(format!("CTE body {other}"))),
     };
@@ -1525,6 +1535,7 @@ fn lower_cte(cte: &Cte) -> Result<CommonTableExpression> {
             .iter()
             .map(|col| col.name.value.clone())
             .collect(),
+        recursive: recursive_arm,
     })
 }
 
@@ -1862,6 +1873,7 @@ fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpre
                     .iter()
                     .map(|col| col.name.value.clone())
                     .collect(),
+                recursive: None,
             });
             Ok((TableName::new(None, name), ctes))
         }

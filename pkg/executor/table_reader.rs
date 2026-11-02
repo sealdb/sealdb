@@ -60,6 +60,12 @@ impl TableReaderExec {
 
 impl Executor for TableReaderExec {
     fn open(&mut self) -> Result<()> {
+        // Recursive CTE working set is published as a table of the same name.
+        if let Some((schema, rows)) = crate::cte::working_cte(&self.table.name) {
+            self.schema = schema;
+            self.rows = filter_rows(rows, &self.schema, self.pushed.as_ref())?;
+            return Ok(());
+        }
         let (schema, name) = self.table.qualified(&self.current_db);
         if schema.is_empty() {
             return Err(Error::new(ERR_NO_DB, "No database selected"));

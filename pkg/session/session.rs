@@ -2918,10 +2918,23 @@ mod tests {
             unioned.display_rows(),
             vec![vec!["1".to_string()], vec!["2".to_string()]]
         );
-        let err = session
+        let rec_seed = session
             .execute_stmt("WITH RECURSIVE c AS (SELECT 1) SELECT * FROM c")
-            .unwrap_err();
-        assert!(err.message.contains("RECURSIVE"));
+            .unwrap();
+        assert_eq!(rec_seed.display_rows(), vec![vec!["1".to_string()]]);
+        let rec = session
+            .execute_stmt(
+                "WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT * FROM c ORDER BY n",
+            )
+            .unwrap();
+        assert_eq!(
+            rec.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
         let err = session
             .execute_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
             .unwrap_err();

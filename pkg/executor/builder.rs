@@ -381,9 +381,15 @@ impl ExecutorBuilder {
                     .with_clause()
                     .ok_or_else(|| Error::unsupported("CTE without WITH"))?;
                 let seed_stmt = Statement::Select(with.seed_select(name)?);
+                let recursive = with.find(name).and_then(|cte| cte.recursive.clone());
                 Ok(Box::new(CTEExec::new(
                     columns.clone(),
-                    Self::build(seed, &seed_stmt, domain, current_db, txn)?,
+                    name.clone(),
+                    recursive,
+                    Self::build(seed, &seed_stmt, domain.clone(), current_db, txn.clone())?,
+                    domain,
+                    current_db,
+                    txn,
                 )))
             }
             PhysicalPlan::HashJoin {

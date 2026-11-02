@@ -874,12 +874,14 @@ mod tests {
             named.as_select().unwrap().with.as_ref().unwrap().ctes[0].col_name_list,
             vec!["id".to_string()]
         );
-        let err = parser
+        let rec = parser
             .parse_one_stmt(
                 "WITH RECURSIVE c AS (SELECT 1 UNION SELECT id + 1 FROM c) SELECT * FROM c",
             )
-            .unwrap_err();
-        assert!(err.message.contains("RECURSIVE"));
+            .unwrap();
+        let cte = &rec.as_select().unwrap().with.as_ref().unwrap().ctes[0];
+        assert!(cte.recursive.is_some());
+        assert!(rec.as_select().unwrap().with.as_ref().unwrap().is_recursive);
         let err = parser
             .parse_one_stmt("WITH c AS (SELECT 1 UNION SELECT 2) SELECT * FROM c")
             .unwrap_err();

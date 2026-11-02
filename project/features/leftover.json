@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F17": [
-      "recursive-cte",
       "materialized-hint",
       "union-in-cte",
       "cte-in-join",
