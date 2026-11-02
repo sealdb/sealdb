@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 176,
-  "manifest_entries": 125,
+  "rs_files": 177,
+  "manifest_entries": 126,
   "status_counts": {
-    "not-started": 1556,
-    "partial": 118,
+    "not-started": 1555,
+    "partial": 119,
     "reimplemented": 4,
     "ported": 3
   },
@@ -104,11 +104,11 @@
     },
     "pkg/ddl": {
       "go": 112,
-      "rs": 7,
-      "missing": 105,
+      "rs": 8,
+      "missing": 104,
       "status": {
-        "not-started": 105,
-        "partial": 7
+        "not-started": 104,
+        "partial": 8
       }
     },
     "pkg/distsql": {
@@ -866,7 +866,7 @@
       "rs_path": "pkg/ddl/index.rs",
       "status": "partial",
       "phase": 8,
-      "notes": "CREATE/DROP INDEX + in-place backfill; job states deferred"
+      "notes": "CREATE/DROP INDEX + in-place backfill through reorg schema states"
     },
     {
       "go_path": "pkg/ddl/index_cop.go",
@@ -1171,10 +1171,10 @@
     },
     {
       "go_path": "pkg/ddl/reorg.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/ddl/reorg.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "sync ADD INDEX delete-only/write-only/write-reorg/public walk; coprocessor workers deferred"
     },
     {
       "go_path": "pkg/ddl/resource_group.go",

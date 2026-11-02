@@ -1096,10 +1096,18 @@ mod tests {
         let jobs = session.execute_stmt("ADMIN SHOW DDL JOBS").unwrap();
         assert_eq!(
             jobs.columns,
-            vec!["JOB_ID", "DB_NAME", "TABLE_NAME", "JOB_TYPE", "STATE"]
+            vec![
+                "JOB_ID",
+                "DB_NAME",
+                "TABLE_NAME",
+                "JOB_TYPE",
+                "STATE",
+                "SCHEMA_STATE"
+            ]
         );
         assert_eq!(jobs.display_rows()[0][3], "add index");
         assert_eq!(jobs.display_rows()[0][4], "synced");
+        assert_eq!(jobs.display_rows()[0][5], "public");
         assert_eq!(jobs.display_rows()[1][3], "create table");
         assert_eq!(jobs.display_rows()[2][3], "create schema");
     }

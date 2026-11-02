@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F18": [
-      "reorg",
       "unique-index",
       "change-modify-rename",
       "after-first",

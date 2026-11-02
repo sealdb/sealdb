@@ -28,7 +28,7 @@ impl IndexColumn {
 
 /// TiDB `model.IndexInfo` core fields used by F10.
 /// Completeness wave / not this feature: invisible, global, MV, vector,
-/// partial, backfill state.
+/// partial. ADD INDEX walks SchemaState via ddl/reorg.rs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexInfo {
     pub id: i64,
