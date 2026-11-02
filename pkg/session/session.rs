@@ -2986,6 +2986,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(both.display_rows(), vec![vec!["1".to_string()]]);
+        let shared = session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT * FROM c UNION ALL SELECT * FROM c",
+            )
+            .unwrap();
+        assert_eq!(
+            shared.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["1".to_string(), "a".to_string()]
+            ]
+        );
         session
             .execute_stmt(
                 "WITH c AS (SELECT 4 AS id, 'd' AS name) INSERT INTO db1.t SELECT * FROM c",

@@ -6,6 +6,5 @@ wave. Rejected via `Error::unsupported` in
 `pkg/executor/cte.rs` / `pkg/planner/core/cte.rs`.
 
 - Nested `WITH` inside a CTE query
-- Shared `CTETableReader` storage and multi-consumer reuse
 - Qualified CTE names (`db.cte`)
 - CTE `FROM` clause (PostgreSQL-style)

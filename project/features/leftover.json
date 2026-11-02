@@ -39,9 +39,6 @@
       "online-ddl-jobs",
       "indexes"
     ],
-    "F17": [
-      "shared-cte-storage"
-    ],
     "F18": [
       "ddl-job-states",
       "reorg",
