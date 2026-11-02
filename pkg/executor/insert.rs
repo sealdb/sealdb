@@ -4,7 +4,7 @@ use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
 };
-use sealdb_expression::eval_expr;
+use sealdb_expression::{eval_expr, locate_partition_for_row};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
@@ -156,7 +156,7 @@ fn write_row(
         Some(Datum::I64(v)) => *v,
         _ => domain.next_handle(info.id)?,
     };
-    let physical_id = info.locate_partition_row(values)?;
+    let physical_id = locate_partition_for_row(info, values)?;
     let key = encode_row_key_with_handle(physical_id, handle);
     if info.indices.iter().any(|idx| idx.primary) && txn.get(key.as_bytes())?.is_some() {
         return Err(Error::new(

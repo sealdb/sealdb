@@ -1167,6 +1167,29 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("CREATE TABLE t (id INT) PARTITION BY HASH (id % 4) PARTITIONS 4")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("expr hash");
+                assert_eq!(part.expr.as_deref(), Some("id % 4"));
+                assert_eq!(part.columns, vec!["id".to_string()]);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (id INT) PARTITION BY RANGE (ABS(id)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("expr range");
+                assert_eq!(part.expr.as_deref(), Some("ABS(id)"));
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

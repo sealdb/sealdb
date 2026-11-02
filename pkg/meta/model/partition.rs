@@ -100,6 +100,18 @@ impl PartitionInfo {
         self
     }
 
+    /// Scalar expression partition key (HASH/RANGE/LIST); clears `columns`.
+    pub fn with_expr_key(mut self, expr: impl Into<String>) -> Self {
+        self.expr = expr.into();
+        self.columns.clear();
+        self
+    }
+
+    /// True when locate must evaluate `expr` instead of reading a column.
+    pub fn is_expr_key(&self) -> bool {
+        self.columns.is_empty() && !self.expr.is_empty()
+    }
+
     pub fn column(&self) -> &str {
         self.columns
             .first()

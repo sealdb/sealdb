@@ -9,7 +9,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F19
 
-- `expr-keys`
 - `add-drop-partition`
 - `subpartition`
 - `dynamic-prune`
