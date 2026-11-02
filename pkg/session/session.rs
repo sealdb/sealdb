@@ -185,8 +185,29 @@ impl Session {
                 txn.commit()?;
                 return Ok(empty_result());
             }
-            Statement::Rollback(_) => {
-                self.txn.lock().expect("session txn lock").rollback()?;
+            Statement::Rollback(rb) => {
+                let mut txn = self.txn.lock().expect("session txn lock");
+                if let Some(name) = &rb.savepoint {
+                    txn.rollback_to(name)?;
+                } else {
+                    txn.rollback()?;
+                }
+                return Ok(empty_result());
+            }
+            Statement::Savepoint(sp) => {
+                let schema_ver = self.domain.infoschema().schema_meta_version();
+                self.txn.lock().expect("session txn lock").savepoint(
+                    self.domain.as_ref(),
+                    schema_ver,
+                    &sp.name,
+                )?;
+                return Ok(empty_result());
+            }
+            Statement::ReleaseSavepoint(sp) => {
+                self.txn
+                    .lock()
+                    .expect("session txn lock")
+                    .release_savepoint(&sp.name)?;
                 return Ok(empty_result());
             }
             Statement::CreateDatabase(_)
@@ -1891,6 +1912,28 @@ mod tests {
         );
         session.execute_stmt("COMMIT").unwrap();
         session.execute_stmt("ROLLBACK").unwrap();
+        session
+            .execute_stmt("BEGIN; INSERT INTO db1.t VALUES (2, 'b'); SAVEPOINT sp1; INSERT INTO db1.t VALUES (3, 'c'); ROLLBACK TO sp1")
+            .unwrap();
+        let after_sp = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_sp.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("RELEASE SAVEPOINT sp1; COMMIT")
+            .unwrap();
+        let committed = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(committed.display_rows(), after_sp.display_rows());
+        let err = session.execute_stmt("ROLLBACK TO missing").unwrap_err();
+        assert!(err.message.contains("SAVEPOINT missing"));
         let err = session
             .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap_err();

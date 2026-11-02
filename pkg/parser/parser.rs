@@ -426,8 +426,24 @@ mod tests {
             parser.parse_one_stmt("ROLLBACK").unwrap().stmt_type(),
             "RollbackStmt"
         );
-        let err = parser.parse_one_stmt("ROLLBACK TO sp").unwrap_err();
-        assert!(err.message.contains("ROLLBACK TO SAVEPOINT"));
+        let to_sp = parser.parse_one_stmt("ROLLBACK TO sp").unwrap();
+        match to_sp {
+            crate::ast::Statement::Rollback(rb) => {
+                assert_eq!(rb.savepoint.as_deref(), Some("sp"));
+            }
+            other => panic!("expected RollbackStmt, got {other:?}"),
+        }
+        assert_eq!(
+            parser.parse_one_stmt("SAVEPOINT sp").unwrap().stmt_type(),
+            "SavepointStmt"
+        );
+        assert_eq!(
+            parser
+                .parse_one_stmt("RELEASE SAVEPOINT sp")
+                .unwrap()
+                .stmt_type(),
+            "ReleaseSavepointStmt"
+        );
     }
 
     #[test]

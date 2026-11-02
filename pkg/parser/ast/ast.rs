@@ -6,7 +6,8 @@ use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantStmt, PrepareStmt,
-    RevokeStmt, RollbackStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
+    ReleaseSavepointStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetStmt, SetTxnStmt, ShowStmt,
+    UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -38,6 +39,8 @@ pub enum Statement {
     Begin(BeginStmt),
     Commit(CommitStmt),
     Rollback(RollbackStmt),
+    Savepoint(SavepointStmt),
+    ReleaseSavepoint(ReleaseSavepointStmt),
     SetOpr(SetOprStmt),
     Grant(GrantStmt),
     Revoke(RevokeStmt),
@@ -69,6 +72,8 @@ impl Node for Statement {
             Statement::Begin(s) => s.restore(ctx),
             Statement::Commit(s) => s.restore(ctx),
             Statement::Rollback(s) => s.restore(ctx),
+            Statement::Savepoint(s) => s.restore(ctx),
+            Statement::ReleaseSavepoint(s) => s.restore(ctx),
             Statement::SetOpr(s) => s.restore(ctx),
             Statement::Grant(s) => s.restore(ctx),
             Statement::Revoke(s) => s.restore(ctx),
@@ -102,6 +107,8 @@ impl StmtNode for Statement {
             Statement::Begin(_) => "BeginStmt",
             Statement::Commit(_) => "CommitStmt",
             Statement::Rollback(_) => "RollbackStmt",
+            Statement::Savepoint(_) => "SavepointStmt",
+            Statement::ReleaseSavepoint(_) => "ReleaseSavepointStmt",
             Statement::SetOpr(_) => "SetOprStmt",
             Statement::Grant(_) => "GrantStmt",
             Statement::Revoke(_) => "RevokeStmt",

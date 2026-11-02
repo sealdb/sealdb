@@ -1,5 +1,7 @@
 use super::kv::{Storage, Transaction};
-use sealdb_errno::{ERR_LOCK_WAIT_TIMEOUT, ERR_WRITE_CONFLICT, Error, Result};
+use sealdb_errno::{
+    ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, ERR_WRITE_CONFLICT, Error, Result,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,7 @@ impl MemStorage {
             writes: BTreeMap::new(),
             deletes: HashSet::new(),
             locked: HashSet::new(),
+            savepoints: Vec::new(),
             pessimistic,
         }))
     }
@@ -52,6 +55,14 @@ impl Storage for MemStorage {
     }
 }
 
+/// Buffered write state captured by `SAVEPOINT`.
+struct Savepoint {
+    name: String,
+    writes: BTreeMap<Vec<u8>, Vec<u8>>,
+    deletes: HashSet<Vec<u8>>,
+    locked: HashSet<Vec<u8>>,
+}
+
 /// In-memory optimistic/pessimistic Repeatable Read.
 /// Completeness wave / not this feature: blocking lock wait, deadlock
 /// detection, NOWAIT/SKIP LOCKED, 2PC/TiKV TSO, stale read.
@@ -62,6 +73,7 @@ struct MemTransaction {
     writes: BTreeMap<Vec<u8>, Vec<u8>>,
     deletes: HashSet<Vec<u8>>,
     locked: HashSet<Vec<u8>>,
+    savepoints: Vec<Savepoint>,
     pessimistic: bool,
 }
 
@@ -254,7 +266,69 @@ impl Transaction for MemTransaction {
     fn rollback(&mut self) -> Result<()> {
         self.writes.clear();
         self.deletes.clear();
+        self.savepoints.clear();
         self.release_locks();
+        Ok(())
+    }
+
+    /// Snapshot current writes/deletes/locks under `name` (replacing a prior
+    /// marker of the same name, matching MySQL SAVEPOINT semantics).
+    fn savepoint(&mut self, name: &str) -> Result<()> {
+        self.savepoints
+            .retain(|sp| !sp.name.eq_ignore_ascii_case(name));
+        self.savepoints.push(Savepoint {
+            name: name.to_string(),
+            writes: self.writes.clone(),
+            deletes: self.deletes.clone(),
+            locked: self.locked.clone(),
+        });
+        Ok(())
+    }
+
+    /// Restore the write set at `name`, release locks taken after it, and
+    /// keep the named marker so ROLLBACK TO can be repeated.
+    fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|sp| sp.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                Error::new(
+                    ERR_UNKNOWN_FUNCTION,
+                    format!("SAVEPOINT {name} does not exist"),
+                )
+            })?;
+        let sp = &self.savepoints[idx];
+        self.writes = sp.writes.clone();
+        self.deletes = sp.deletes.clone();
+        let keep = sp.locked.clone();
+        let extra: Vec<_> = self.locked.difference(&keep).cloned().collect();
+        {
+            let mut store = self.store.lock().expect("mem kv");
+            for key in extra {
+                if store.locks.get(&key) == Some(&self.start_ts) {
+                    store.locks.remove(&key);
+                }
+                self.locked.remove(&key);
+            }
+        }
+        self.savepoints.truncate(idx + 1);
+        Ok(())
+    }
+
+    /// Drop `name` and later markers. Buffered writes are left unchanged.
+    fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|sp| sp.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                Error::new(
+                    ERR_UNKNOWN_FUNCTION,
+                    format!("SAVEPOINT {name} does not exist"),
+                )
+            })?;
+        self.savepoints.truncate(idx);
         Ok(())
     }
 
@@ -311,5 +385,22 @@ mod tests {
 
         a.commit().unwrap();
         assert_eq!(b.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_savepoint_rollback_to() {
+        let storage = MemStorage::new();
+        let mut txn = storage.begin().unwrap();
+        txn.set(b"k", b"v1").unwrap();
+        txn.savepoint("sp1").unwrap();
+        txn.set(b"k", b"v2").unwrap();
+        txn.set(b"k2", b"x").unwrap();
+        txn.rollback_to("sp1").unwrap();
+        assert_eq!(txn.get(b"k").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(txn.get(b"k2").unwrap(), None);
+        txn.commit().unwrap();
+        let mut read = storage.begin().unwrap();
+        assert_eq!(read.get(b"k").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(read.get(b"k2").unwrap(), None);
     }
 }

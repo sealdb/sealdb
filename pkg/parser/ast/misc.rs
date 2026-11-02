@@ -353,11 +353,46 @@ impl CommitStmt {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RollbackStmt;
+pub struct RollbackStmt {
+    /// `ROLLBACK TO SAVEPOINT name`. Full rollback when `None`.
+    pub savepoint: Option<String>,
+}
 
 impl RollbackStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ROLLBACK");
+        if let Some(name) = &self.savepoint {
+            ctx.write_str(" TO ");
+            ctx.write_name(name);
+        }
+        Ok(())
+    }
+}
+
+/// `SAVEPOINT name` marker inside an open transaction.
+#[derive(Clone, Debug)]
+pub struct SavepointStmt {
+    pub name: String,
+}
+
+impl SavepointStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SAVEPOINT ");
+        ctx.write_name(&self.name);
+        Ok(())
+    }
+}
+
+/// `RELEASE SAVEPOINT name` drops that marker and later ones.
+#[derive(Clone, Debug)]
+pub struct ReleaseSavepointStmt {
+    pub name: String,
+}
+
+impl ReleaseSavepointStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("RELEASE SAVEPOINT ");
+        ctx.write_name(&self.name);
         Ok(())
     }
 }

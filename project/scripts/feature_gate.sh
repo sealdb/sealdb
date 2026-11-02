@@ -111,6 +111,7 @@ case "$FEATURE" in
     ;;
   F12)
     run execute-txn cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); COMMIT; SELECT * FROM db1.t"
+    run execute-savepoint cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); SAVEPOINT sp1; INSERT INTO db1.t VALUES (2, 'b'); ROLLBACK TO sp1; SELECT * FROM db1.t; RELEASE SAVEPOINT sp1; COMMIT"
     ;;
   F13)
     run execute-for-update cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); BEGIN PESSIMISTIC; SELECT * FROM db1.t FOR UPDATE; UPDATE db1.t SET name = 'b' WHERE id = 1; COMMIT; SELECT * FROM db1.t"

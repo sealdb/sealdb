@@ -3,8 +3,8 @@ use sealdb_kv::{IsolationLevel, Storage, TxnHandle};
 use std::sync::Arc;
 
 /// Session-owned transaction lifecycle for F12/F13/C3.
-/// Completeness wave / not this feature: SAVEPOINT, AND CHAIN, XA,
-/// transactional DDL, blocking lock wait.
+/// Completeness wave / not this feature: AND CHAIN, XA, transactional DDL,
+/// blocking lock wait.
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,
@@ -92,6 +92,40 @@ impl TxnManager {
         };
         self.explicit = false;
         result
+    }
+
+    /// Open an explicit transaction if the session has none, then record
+    /// `name` on the KV txn (MySQL SAVEPOINT starts a transaction).
+    pub fn savepoint(&mut self, storage: &dyn Storage, schema_ver: i64, name: &str) -> Result<()> {
+        if self.handle.is_none() {
+            self.enter(storage, false, schema_ver, self.isolation)?;
+        }
+        self.handle
+            .as_ref()
+            .expect("savepoint handle")
+            .with_txn(|txn| txn.savepoint(name))
+    }
+
+    /// Restore writes to `name` without ending the transaction.
+    pub fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let Some(handle) = &self.handle else {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_UNKNOWN_FUNCTION,
+                format!("SAVEPOINT {name} does not exist"),
+            ));
+        };
+        handle.with_txn(|txn| txn.rollback_to(name))
+    }
+
+    /// Drop `name` without restoring writes. The transaction stays open.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let Some(handle) = &self.handle else {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_UNKNOWN_FUNCTION,
+                format!("SAVEPOINT {name} does not exist"),
+            ));
+        };
+        handle.with_txn(|txn| txn.release_savepoint(name))
     }
 
     pub fn ensure(&mut self, storage: &dyn Storage) -> Result<Arc<TxnHandle>> {
