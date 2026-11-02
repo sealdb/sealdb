@@ -41,9 +41,6 @@
       "stale-gap-labels",
       "leftover-suite-execution"
     ],
-    "C2": [
-      "cost-model-v2"
-    ],
     "C3": [
       "tikv-cross-cluster",
       "mdl",

@@ -4515,6 +4515,55 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_cost_model_v2() {
+        // Cost Model v2 MVB: JoinReorder builds the cheaper side; EXPLAIN shows
+        // estCost from plan_cost_ver2 helpers on HashJoin.
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.small (id INT); CREATE TABLE db1.big (id INT); \
+                 INSERT INTO db1.small VALUES (1); \
+                 INSERT INTO db1.big VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10); \
+                 ANALYZE TABLE db1.small; ANALYZE TABLE db1.big",
+            )
+            .unwrap();
+        let join = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.small JOIN db1.big ON small.id = big.id")
+            .unwrap();
+        let join_text = join
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(join_text.contains("estCost="), "{join_text}");
+        let big_pos = join_text.find("table:big").expect(&join_text);
+        let small_pos = join_text.find("table:small").expect(&join_text);
+        assert!(
+            big_pos < small_pos,
+            "v2 cost should probe big / build small:\n{join_text}"
+        );
+        let est: f64 = join
+            .display_rows()
+            .iter()
+            .find_map(|r| {
+                r.last().and_then(|info| {
+                    info.split("estCost=")
+                        .nth(1)
+                        .and_then(|s| s.split(',').next())
+                        .and_then(|s| s.trim().parse().ok())
+                })
+            })
+            .expect(&join_text);
+        assert!(est > 0.0, "{join_text}");
+        let expected = sealdb_planner::core::plan_cost_ver2::hash_join_est_cost(10_000.0, 10_000.0);
+        assert!(
+            (est - expected).abs() < 1e-6,
+            "est={est} expected={expected} text={join_text}"
+        );
+    }
+
+    #[test]
     fn test_explain_index_merge_or() {
         let session = Session::new();
         session

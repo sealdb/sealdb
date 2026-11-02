@@ -761,14 +761,19 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::StreamAgg { .. } => ("StreamAgg".to_string(), String::new(), String::new()),
         PhysicalPlan::HashJoin {
             tp,
+            left,
+            right,
             left_table,
             right_table,
             ..
         } => {
+            // Probe = left, build = right (post JoinReorder). Cost Model v2 MVB.
+            let est_cost =
+                super::plan_cost_ver2::hash_join_est_cost(est_rows(left), est_rows(right));
             let info = if *tp == super::physical_plans::JoinType::Cross {
-                format!("{tp:?}")
+                format!("{tp:?}, estCost={est_cost:.2}")
             } else {
-                format!("{tp:?}, equal:[{left_table} = {right_table}]")
+                format!("{tp:?}, equal:[{left_table} = {right_table}], estCost={est_cost:.2}")
             };
             ("HashJoin".to_string(), String::new(), info)
         }

@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 185,
-  "manifest_entries": 134,
+  "rs_files": 186,
+  "manifest_entries": 135,
   "status_counts": {
-    "not-started": 1547,
-    "partial": 127,
+    "not-started": 1546,
+    "partial": 128,
     "reimplemented": 4,
     "ported": 3
   },
@@ -268,11 +268,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 18,
-      "missing": 198,
+      "rs": 19,
+      "missing": 197,
       "status": {
-        "not-started": 198,
-        "partial": 18
+        "not-started": 197,
+        "partial": 19
       }
     },
     "pkg/plugin": {
@@ -6646,17 +6646,17 @@
     },
     {
       "go_path": "pkg/planner/core/plan_cost_ver1.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
-    },
-    {
-      "go_path": "pkg/planner/core/plan_cost_ver2.go",
       "rs_path": "pkg/planner/core/plan_cost.rs",
       "status": "partial",
       "phase": 10,
-      "notes": "scan/net/cpu/hash + sort/topn/limit costs; asymmetric HashJoin build/probe"
+      "notes": "v1-shaped scan/net/cpu/hash + sort/topn/limit for skyline / TopN"
+    },
+    {
+      "go_path": "pkg/planner/core/plan_cost_ver2.go",
+      "rs_path": "pkg/planner/core/plan_cost_ver2.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "CostVer2 + CPU/mem/net/scan factors; JoinReorder/DP + EXPLAIN estCost MVB"
     },
     {
       "go_path": "pkg/planner/core/plan_to_pb.go",

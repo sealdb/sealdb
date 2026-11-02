@@ -17,10 +17,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `stale-gap-labels`
 - `leftover-suite-execution`
 
-### C2
-
-- `cost-model-v2`
-
 ### C3
 
 - `tikv-cross-cluster`
@@ -145,7 +141,7 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
 - Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).
-- C2: cost-model-v2 stay open (IndexMerge OR-union MVB done).
+- C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).
 - C3: TiKV cross-cluster and MDL stay open.
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.

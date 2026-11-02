@@ -266,11 +266,17 @@
       "phase": 10,
       "notes": "EXPLAIN row/json/dot/ANALYZE + DistSQL cop-task rows (TableFullScan/IndexRangeScan); per-op RuntimeStats deferred"
     },
-    "pkg/planner/core/plan_cost_ver2.go": {
+    "pkg/planner/core/plan_cost_ver1.go": {
       "status": "partial",
       "rust": "pkg/planner/core/plan_cost.rs",
       "phase": 10,
-      "notes": "scan/net/cpu/hash + sort/topn/limit costs; asymmetric HashJoin build/probe"
+      "notes": "v1-shaped scan/net/cpu/hash + sort/topn/limit for skyline / TopN"
+    },
+    "pkg/planner/core/plan_cost_ver2.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/plan_cost_ver2.rs",
+      "phase": 10,
+      "notes": "CostVer2 + CPU/mem/net/scan factors; JoinReorder/DP + EXPLAIN estCost MVB"
     },
     "pkg/planner/core/rule_join_reorder.go": {
       "status": "partial",
