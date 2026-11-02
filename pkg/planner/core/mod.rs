@@ -7,6 +7,7 @@ pub mod plan_cache_instance;
 pub mod plan_cache_lru;
 pub mod plan_cache_param;
 pub mod plan_cost;
+pub mod plan_cost_ver2;
 pub mod planbuilder;
 pub mod rule_join_reorder;
 pub mod rule_join_reorder_dp;

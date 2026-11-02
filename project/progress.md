@@ -110,6 +110,21 @@
 
 ### 2026-11-03
 
+- **Phase**: 完整性波 C2（cost-model-v2）
+- **完成**:
+  - `plan_cost_ver2.rs`：`CostVer2` / `CostFactors`（CPU/mem/net/scan，对齐 TiDB defaultVer2Factors）
+  - JoinReorder 两表 + n-table DP 改走 v2 `hash_join_cost` / `table_scan_cost`
+  - EXPLAIN HashJoin `operator info` 带 `estCost=`（v2 helpers）
+  - C2 gate `execute-cost-model-v2`；`status.json` C2 `gaps: []`
+- **验证**:
+  - `cargo test -q -p sealdb-planner --lib plan_cost_ver2`
+  - `cargo test -q -p sealdb-session --lib test_explain_cost_model_v2`
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - 完整性波 C3 / C5（C2 完成）
+
+### 2026-11-03
+
 - **Phase**: 完整性波 C2（index-merge-join / IndexMerge）
 - **完成**:
   - `PhysicalPlan::IndexMerge`：OR of ≥2 indexed equalities → union partial index scans + table lookup

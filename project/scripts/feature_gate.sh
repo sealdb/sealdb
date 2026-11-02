@@ -220,6 +220,8 @@ case "$FEATURE" in
     run execute-cop-task-rows cargo test -q -p sealdb-session --lib session::tests::test_explain_cop_task_rows -- --exact
     run execute-n-table-dp cargo test -q -p sealdb-session --lib session::tests::test_explain_n_table_join_reorder_dp -- --exact
     run execute-index-merge-join cargo test -q -p sealdb-session --lib session::tests::test_explain_index_merge_or -- --exact
+    run execute-cost-model-v2 cargo test -q -p sealdb-planner --lib plan_cost_ver2
+    run execute-cost-model-v2-explain cargo test -q -p sealdb-session --lib session::tests::test_explain_cost_model_v2 -- --exact
     ;;
   C3)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

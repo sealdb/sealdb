@@ -1,11 +1,11 @@
 //! Left-deep / right-deep n-table JoinReorder DP (TiDB `rule_join_reorder_dp`).
 //!
 //! For 3+ Inner equality-connected tables, bitmask DP picks a lower-cost join
-//! order using `hash_join_cost` / `table_scan_cost`. Each extension may probe
-//! the new leaf and build the accumulated plan (right-deep) when cheaper —
-//! bushy-lite without full subset splits.
+//! order using Cost Model v2 `hash_join_cost` / `table_scan_cost`. Each
+//! extension may probe the new leaf and build the accumulated plan (right-deep)
+//! when cheaper — bushy-lite without full subset splits.
 
-use super::plan_cost::{hash_join_cost, table_scan_cost};
+use super::plan_cost_ver2::{hash_join_cost, table_scan_cost};
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::opcode::Op;
 
