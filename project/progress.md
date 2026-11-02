@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C3 gaps 收口：MDL / schema-lease / SERIALIZABLE→RR / SAVEPOINT / TiKV same-cluster；C6 deferred）  
+> 最后更新：2026-11-03（C1 gaps 收口：unmapped allowlist / stale labels / leftover suite smoke；C1–C5 gaps `[]`；C6 deferred）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -33,7 +33,7 @@
 | 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
 | 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
 | 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
-| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；C2/C3/C4/C5 gaps `[]`；C1 仍开；C6 deferred |
+| 10 | 完整性波 / 可选 | `done` | 2026-11-03 | 2026-11-03 | C1–C5 | C1–C5 gaps `[]`；C6 deferred（Cascades/TiFlash/MPP/BR/plugins） |
 
 ### 2.1 功能波进度
 
@@ -110,6 +110,21 @@
 
 ### 2026-11-03
 
+- **Phase**: 完整性波 C1（leftover denominator terminal state）
+- **完成**:
+  - `unmapped-stmts`：FEATURE_HINTS 补齐已落地 stmt→F*/C2–C5；其余 C6 或 `UNMAPPED_ALLOWLIST`；`--check` 校验 allowlist
+  - `stale-gap-labels`：F* 与 C1–C5 `gaps: []` 与 leftover inventory 一致；C1 gaps.md 去掉过时 F* 冻结措辞
+  - `leftover-suite-execution`：`execute-leftover-suite-smoke` 断言 suite 全部分类且 C2/C5 有对应 feature_gate MVB
+  - `status.json` C1 `gaps: []`；phase 10 `done`（C6 deferred）
+- **验证**:
+  - `python3 project/scripts/leftover_inventory.py --tidb-root "$TIDB_ROOT" --check`
+  - `python3 project/scripts/leftover_inventory.py --tidb-root "$TIDB_ROOT" --suite-smoke`
+  - `./project/scripts/feature_gate.sh C1`
+- **下一步**:
+  - C6 保持 deferred；可选后续 wave 从 leftover 分母摘子集标 `ported`
+
+### 2026-11-03
+
 - **Phase**: 完整性波 C5（leftover-collation-suites）
 - **完成**:
   - `SET NAMES` / `collation_connection` 校验：未知 charset ERR 1115、未知 collation ERR 1273
@@ -119,7 +134,7 @@
   - `cargo test -q -p sealdb-session --lib test_leftover_collation_suites -- --exact`
   - `./project/scripts/feature_gate.sh C5`
 - **下一步**:
-  - 完整性波 C3 / C1（C5 完成）
+  - 完整性波 C1
 
 ### 2026-11-03
 

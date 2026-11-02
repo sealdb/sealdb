@@ -28,7 +28,7 @@
     "F20": {"status": "core-ported", "phase": 8, "notes": "GRANT/REVOKE + CREATE USER + roles + column/dynamic privs + persist", "gaps": []},
     "F21": {"status": "core-ported", "phase": 7, "notes": "ANALYZE count/NDV/histogram/TopN + ANALYZE INDEX + persist + auto-analyze + join/sort/limit cost", "gaps": []},
     "F22": {"status": "core-ported", "phase": 9, "notes": "MySQL protocol: handshake/SSL/compress/COM_STMT/auth/multi-resultset", "gaps": []},
-    "C1": {"status": "core-ported", "phase": 10, "notes": "frozen leftover denominator: 91 feature gaps + 56 open stmts + 42 suites", "gaps": ["unmapped-stmts", "stale-gap-labels", "leftover-suite-execution"]},
+    "C1": {"status": "core-ported", "phase": 10, "notes": "frozen leftover denominator: empty F*/C1–C5 gaps; open stmts = C6 + unmapped allowlist; suites owner-classified with C2/C5 MVB smoke", "gaps": []},
     "C2": {"status": "core-ported", "phase": 10, "notes": "EXPLAIN row/json/dot/ANALYZE + cop-task rows + costed skyline + n-table DP JoinReorder + IndexMerge OR-union + Cost Model v2 MVB", "gaps": []},
     "C3": {"status": "core-ported", "phase": 10, "notes": "SchemaChecker 8028 + RC + MDL + schema lease 8027 + SERIALIZABLE→RR + SAVEPOINT (F12) + same-cluster TiKV cross-session if SEALDB_TIKV=1", "gaps": []},
     "C4": {"status": "core-ported", "phase": 10, "notes": "PREPARE/EXECUTE/DEALLOCATE + Domain-shared plan cache keyed by ? templates + COM_STMT_* + user vars + CREATE/DROP/SHOW BINDING", "gaps": []},

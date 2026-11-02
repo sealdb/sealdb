@@ -206,7 +206,12 @@ case "$FEATURE" in
       --rust-root "$ROOT" \
       --out "$ROOT/project/features/leftover.md" \
       --json "$ROOT/project/features/leftover.json" \
+      --write-corpus-lock \
       --check
+    run execute-leftover-suite-smoke python3 "$ROOT/project/scripts/leftover_inventory.py" \
+      --tidb-root "$TIDB_ROOT" \
+      --rust-root "$ROOT" \
+      --suite-smoke
     ;;
   C2)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

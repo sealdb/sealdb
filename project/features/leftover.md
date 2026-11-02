@@ -11,69 +11,71 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ## Completeness gaps still open
 
-### C1
+- none
 
-- `unmapped-stmts`
-- `stale-gap-labels`
-- `leftover-suite-execution`
+## Frozen unmapped PlanBuilder allowlist
+
+These kinds stay `unmapped` on purpose (not claimed by F*/C2–C5, not C6).
+C1 `--check` requires open `unmapped` stmts to equal this set.
+
+- `AlterDatabaseStmt`
+- `AlterInstanceStmt`
+- `BinlogStmt`
+- `ChangeStmt`
+- `CleanupTableLockStmt`
+- `DoStmt`
+- `FlushStmt`
+- `KillStmt`
+- `LockTablesStmt`
+- `OptimizeTableStmt`
+- `RenameUserStmt`
+- `RepairTableStmt`
+- `SetPwdStmt`
+- `ShutdownStmt`
+- `TruncateTableStmt`
 
 ## PlanBuilder statement kinds still open
 
-- `ast.AdminStmt` → unmapped
-- `ast.DeallocateStmt` → C4
-- `ast.ExecuteStmt` → C4
-- `ast.ExplainStmt` → C2
-- `ast.ExplainForStmt` → C2
-- `ast.TraceStmt` → unmapped
+- `ast.TraceStmt` → C6
 - `ast.ImportIntoStmt` → C6
 - `ast.LoadDataStmt` → C6
-- `ast.LoadStatsStmt` → unmapped
-- `ast.LockStatsStmt` → unmapped
-- `ast.UnlockStatsStmt` → unmapped
-- `ast.PlanReplayerStmt` → unmapped
-- `ast.PrepareStmt` → C4
+- `ast.LoadStatsStmt` → C6
+- `ast.LockStatsStmt` → C6
+- `ast.UnlockStatsStmt` → C6
+- `ast.PlanReplayerStmt` → C6
 - `ast.DoStmt` → unmapped
-- `ast.SetStmt` → C5
-- `ast.SetConfigStmt` → C5
 - `ast.BinlogStmt` → unmapped
-- `ast.CreateBindingStmt` → C4
-- `ast.DropBindingStmt` → C4
-- `ast.SetBindingStmt` → C4
 - `ast.ChangeStmt` → unmapped
-- `ast.SplitRegionStmt` → unmapped
-- `ast.DistributeTableStmt` → unmapped
-- `ast.CompactTableStmt` → unmapped
-- `ast.RecommendIndexStmt` → unmapped
+- `ast.SplitRegionStmt` → C6
+- `ast.DistributeTableStmt` → C6
+- `ast.CompactTableStmt` → C6
+- `ast.RecommendIndexStmt` → C6
 - `ast.FlushStmt` → unmapped
 - `ast.AlterInstanceStmt` → unmapped
 - `ast.RenameUserStmt` → unmapped
 - `ast.BRIEStmt` → C6
 - `ast.CalibrateResourceStmt` → C6
-- `ast.AddQueryWatchStmt` → unmapped
-- `ast.DropQueryWatchStmt` → unmapped
-- `ast.GrantRoleStmt` → unmapped
-- `ast.RevokeRoleStmt` → unmapped
+- `ast.AddQueryWatchStmt` → C6
+- `ast.DropQueryWatchStmt` → C6
 - `ast.KillStmt` → unmapped
-- `ast.DropUserStmt` → unmapped
 - `ast.SetPwdStmt` → unmapped
 - `ast.ShutdownStmt` → unmapped
-- `ast.SetResourceGroupStmt` → unmapped
+- `ast.SetResourceGroupStmt` → C6
 - `ast.AlterDatabaseStmt` → unmapped
-- `ast.AlterSequenceStmt` → unmapped
-- `ast.CreateViewStmt` → unmapped
-- `ast.CreateSequenceStmt` → unmapped
-- `ast.DropSequenceStmt` → unmapped
+- `ast.AlterSequenceStmt` → C6
+- `ast.CreateViewStmt` → C6
+- `ast.CreateSequenceStmt` → C6
+- `ast.DropSequenceStmt` → C6
 - `ast.TruncateTableStmt` → unmapped
-- `ast.RenameTableStmt` → unmapped
-- `ast.RecoverTableStmt` → unmapped
-- `ast.FlashBackTableStmt` → unmapped
-- `ast.FlashBackDatabaseStmt` → unmapped
-- `ast.FlashBackToTimestampStmt` → unmapped
+- `ast.RecoverTableStmt` → C6
+- `ast.FlashBackTableStmt` → C6
+- `ast.FlashBackDatabaseStmt` → C6
+- `ast.FlashBackToTimestampStmt` → C6
 - `ast.LockTablesStmt` → unmapped
 - `ast.CleanupTableLockStmt` → unmapped
 - `ast.RepairTableStmt` → unmapped
-- `ast.DropPlacementPolicyStmt` → unmapped
-- `ast.CreateResourceGroupStmt` → unmapped
+- `ast.DropPlacementPolicyStmt` → C6
+- `ast.CreateResourceGroupStmt` → C6
 - `ast.OptimizeTableStmt` → unmapped
 
 ## integrationtest leftover suites
@@ -124,9 +126,10 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ## Completeness wave notes
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
-- Feature (F*) gaps are empty; C2/C3/C4/C5 completeness gaps closed; remaining is C1 (C6 deferred).
+- Feature (F*) gaps are empty; C1–C5 completeness gaps closed; C6 deferred.
 - C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).
 - C3: completeness gaps closed (MDL + schema-lease 8027 + SERIALIZABLE→RR + SAVEPOINT F12 + same-cluster TiKV cross-session when SEALDB_TIKV=1).
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).
-- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.
+- Leftover suite execution: suites are owner-classified; C2 `explain*` / `index_merge` MVB via `execute-explain*`; C5 collation / `new_character_set*` via `execute-leftover-collation-suites`. Full integrationtest port is not claimed.
+- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins, plus C6-owned open stmts above.
