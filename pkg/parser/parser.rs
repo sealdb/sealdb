@@ -798,10 +798,16 @@ mod tests {
             stmt.as_select().unwrap().fields[1].expr,
             crate::ast::ExprNode::Window(_)
         ));
-        let err = parser
-            .parse_one_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM t")
-            .unwrap_err();
-        assert!(err.message.contains("window function"));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT LAG(id) OVER (ORDER BY id) FROM t")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .fields[0]
+                .expr,
+            crate::ast::ExprNode::Window(_)
+        ));
         match &parser
             .parse_one_stmt(
                 "SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",

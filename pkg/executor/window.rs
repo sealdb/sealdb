@@ -1,7 +1,6 @@
 // F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
 // COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
-// Completeness wave / not this feature: LAG/LEAD/FIRST_VALUE/NTILE,
-// IGNORE NULLS, pipelined window.
+// Completeness wave / not this feature: IGNORE NULLS, pipelined window.
 use crate::aggfuncs::{AggFunc, build_agg_func};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
@@ -167,6 +166,11 @@ fn fill_group(
         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
             fill_window_agg(window, schema, rows, &ordered, out)?
         }
+        "LAG" | "LEAD" => fill_lag_lead(window, schema, rows, &ordered, out)?,
+        "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+            fill_nth_value(window, schema, rows, &ordered, out)?
+        }
+        "NTILE" => fill_ntile(window, schema, rows, &ordered, out)?,
         other => return Err(Error::unsupported(format!("window function {other}"))),
     }
     Ok(())
@@ -208,6 +212,127 @@ fn fill_window_agg(
         }
     }
     Ok(())
+}
+
+/// `LAG(expr[, offset[, default]])` / `LEAD(...)` relative to the ordered
+/// partition. Offset defaults to 1; out-of-range rows use default or NULL.
+fn fill_lag_lead(
+    window: &WindowFuncExpr,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    out: &mut [Datum],
+) -> Result<()> {
+    let expr = window
+        .args
+        .first()
+        .ok_or_else(|| Error::unsupported("LAG/LEAD requires an expression"))?;
+    let lead = window.name.eq_ignore_ascii_case("LEAD");
+    for (i, idx) in ordered.iter().enumerate() {
+        let offset = integer_arg(window, schema, &rows[*idx], 1, 1)?;
+        let default = match window.args.get(2) {
+            Some(arg) => eval_expr_with_row(arg, schema, &rows[*idx])?,
+            None => Datum::Null,
+        };
+        let target = if lead {
+            i.checked_add(offset as usize)
+        } else {
+            i.checked_sub(offset as usize)
+        };
+        out[*idx] = match target.and_then(|t| ordered.get(t)) {
+            Some(src) => eval_expr_with_row(expr, schema, &rows[*src])?,
+            None => default,
+        };
+    }
+    Ok(())
+}
+
+/// `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE(expr, n)` over the current frame.
+fn fill_nth_value(
+    window: &WindowFuncExpr,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    out: &mut [Datum],
+) -> Result<()> {
+    let expr = window
+        .args
+        .first()
+        .ok_or_else(|| Error::unsupported(format!("{} requires an expression", window.name)))?;
+    for (i, idx) in ordered.iter().enumerate() {
+        out[*idx] = match frame_span(&window.spec, schema, rows, ordered, i)? {
+            None => Datum::Null,
+            Some((start, end)) => {
+                let pick = match window.name.to_ascii_uppercase().as_str() {
+                    "FIRST_VALUE" => Some(start),
+                    "LAST_VALUE" => Some(end),
+                    "NTH_VALUE" => {
+                        let n = integer_arg(window, schema, &rows[*idx], 1, 1)?;
+                        if n <= 0 {
+                            return Err(Error::unsupported("NTH_VALUE requires n >= 1"));
+                        }
+                        let pos = start + (n as usize - 1);
+                        (pos <= end).then_some(pos)
+                    }
+                    _ => None,
+                };
+                match pick {
+                    Some(pos) => eval_expr_with_row(expr, schema, &rows[ordered[pos]])?,
+                    None => Datum::Null,
+                }
+            }
+        };
+    }
+    Ok(())
+}
+
+/// `NTILE(n)` splits the ordered partition into `n` buckets (larger first).
+fn fill_ntile(
+    window: &WindowFuncExpr,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    out: &mut [Datum],
+) -> Result<()> {
+    if ordered.is_empty() {
+        return Ok(());
+    }
+    let n = integer_arg(window, schema, &rows[ordered[0]], 0, 1)?.max(1) as usize;
+    let len = ordered.len();
+    let small = len / n;
+    let extra = len % n;
+    let mut pos = 0usize;
+    for bucket in 1..=n {
+        let size = small + usize::from(bucket <= extra);
+        for _ in 0..size {
+            if pos >= len {
+                break;
+            }
+            out[ordered[pos]] = Datum::I64(bucket as i64);
+            pos += 1;
+        }
+    }
+    Ok(())
+}
+
+fn integer_arg(
+    window: &WindowFuncExpr,
+    schema: &[String],
+    row: &[Datum],
+    index: usize,
+    default: i64,
+) -> Result<i64> {
+    let Some(arg) = window.args.get(index) else {
+        return Ok(default);
+    };
+    match eval_expr_with_row(arg, schema, row)? {
+        Datum::I64(n) => Ok(n),
+        Datum::U64(n) => Ok(n as i64),
+        Datum::Null => Ok(default),
+        other => Err(Error::unsupported(format!(
+            "window integer argument {other:?}"
+        ))),
+    }
 }
 
 fn empty_frame_value(name: &str) -> Datum {
