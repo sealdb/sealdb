@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F14
 
-- `any-all`
 - `from-derived-table`
 - `select-list-subquery`
 - `parallel-apply`

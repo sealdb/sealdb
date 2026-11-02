@@ -59,7 +59,10 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
         ExprNode::Between(b) => eval_between(b, schema, row),
         ExprNode::Like(l) => eval_like(l, schema, row),
         ExprNode::IsNull(i) => eval_is_null(i, schema, row),
-        ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => {
+        ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => {
             Err(Error::unsupported("subquery evaluation outside Apply"))
         }
         ExprNode::Window(_) => Err(Error::unsupported("window evaluation outside WindowExec")),

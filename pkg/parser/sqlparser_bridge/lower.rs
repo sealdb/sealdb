@@ -10,8 +10,8 @@ use crate::ast::dml::{
 };
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
-    InSubqueryExpr, IsNullExpr, PatternLikeExpr, ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
-    WindowFuncExpr, WindowSpec,
+    InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
+    UnaryOpExpr, ValueExpr, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
@@ -2170,9 +2170,17 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 query: Box::new(query),
             }))
         }
-        // F14 gap / completeness wave: ANY / ALL / SOME, FROM derived tables.
-        Expr::AnyOp { .. } => Err(Error::unsupported("ANY / SOME subquery")),
-        Expr::AllOp { .. } => Err(Error::unsupported("ALL subquery")),
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => lower_quantified_cmp(left, compare_op, right, false),
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => lower_quantified_cmp(left, compare_op, right, true),
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("expression {other} is not available in this phase"),
@@ -2325,6 +2333,54 @@ fn lower_value(value: &Value) -> Result<Datum> {
         Value::Boolean(b) => Ok(Datum::I64(i64::from(*b))),
         Value::Null => Ok(Datum::Null),
         other => Err(Error::unsupported(format!("literal {other}"))),
+    }
+}
+
+/// Lower `left op ANY|ALL (subquery)`.
+/// `= ANY`/`= SOME` become `IN`; `<> ALL` becomes `NOT IN`; other ops keep
+/// `QuantifiedCmp` and run through NestedLoopApply.
+fn lower_quantified_cmp(
+    left: &Expr,
+    compare_op: &BinaryOperator,
+    right: &Expr,
+    all: bool,
+) -> Result<ExprNode> {
+    let query = match right {
+        Expr::Subquery(subquery) => lower_query(subquery)?,
+        other => {
+            return Err(Error::unsupported(format!(
+                "quantified comparison of {other}"
+            )));
+        }
+    };
+    if !query.joins.is_empty() {
+        return Err(Error::unsupported("subquery JOIN"));
+    }
+    let expr = lower_expr(left)?;
+    let op = lower_binary_op(compare_op)?;
+    match (all, op) {
+        (false, Op::Eq) => Ok(ExprNode::InSubquery(InSubqueryExpr {
+            expr: Box::new(expr),
+            not: false,
+            query: Box::new(query),
+        })),
+        (true, Op::Ne) => Ok(ExprNode::InSubquery(InSubqueryExpr {
+            expr: Box::new(expr),
+            not: true,
+            query: Box::new(query),
+        })),
+        (_, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
+            Ok(ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
+                expr: Box::new(expr),
+                op,
+                all,
+                query: Box::new(query),
+            }))
+        }
+        _ => Err(Error::unsupported(format!(
+            "quantified operator {}",
+            op.restore()
+        ))),
     }
 }
 

@@ -308,6 +308,7 @@ fn walk_aggs(expr: &ExprNode, out: &mut Vec<FuncCallExpr>) {
             walk_aggs(&like.pattern, out);
         }
         ExprNode::IsNull(is_null) => walk_aggs(&is_null.expr, out),
+        ExprNode::QuantifiedCmp(cmp) => walk_aggs(&cmp.expr, out),
         _ => {}
     }
 }
@@ -380,6 +381,14 @@ fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
                 .collect(),
             distinct: func.distinct,
         }),
+        ExprNode::QuantifiedCmp(cmp) => {
+            ExprNode::QuantifiedCmp(sealdb_parser::ast::expressions::QuantifiedCmpExpr {
+                expr: Box::new(rewrite_having(&cmp.expr, select)),
+                op: cmp.op,
+                all: cmp.all,
+                query: cmp.query.clone(),
+            })
+        }
         other => other.clone(),
     }
 }

@@ -2483,10 +2483,13 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t1 WHERE id = (SELECT id FROM db1.t2)")
             .unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_SUBQUERY_NO_1_ROW);
-        let err = session
-            .execute_stmt("SELECT * FROM db1.t1 WHERE id = ANY (SELECT id FROM db1.t2)")
-            .unwrap_err();
-        assert!(err.message.contains("ANY"));
+        let any_eq = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id = ANY (SELECT id FROM db1.t2) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            any_eq.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
         let explain_exists = session
             .execute_stmt(
                 "EXPLAIN SELECT * FROM db1.t1 WHERE EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id)",
@@ -2533,6 +2536,76 @@ mod tests {
         assert!(
             in_text.contains("Semi"),
             "expected HashJoin Semi for IN, got {in_text}"
+        );
+    }
+
+    #[test]
+    fn test_any_all_subquery() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'), (3, 'y')",
+            )
+            .unwrap();
+        let some_eq = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE id = SOME (SELECT id FROM db1.t2) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            some_eq.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let ne_all = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE id <> ALL (SELECT id FROM db1.t2) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            ne_all.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let gt_any = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id > ANY (SELECT id FROM db1.t2) ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            gt_any.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
+        let gt_all = session
+            .execute_stmt("SELECT * FROM db1.t1 WHERE id > ALL (SELECT id FROM db1.t2) ORDER BY id")
+            .unwrap();
+        assert!(gt_all.display_rows().is_empty());
+        let empty_all = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE id > ALL (SELECT id FROM db1.t2 WHERE id = 99) ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            empty_all.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let empty_any = session
+            .execute_stmt(
+                "SELECT * FROM db1.t1 WHERE id > ANY (SELECT id FROM db1.t2 WHERE id = 99)",
+            )
+            .unwrap();
+        assert!(empty_any.display_rows().is_empty());
+        let explain_any = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t1 WHERE id = ANY (SELECT id FROM db1.t2)")
+            .unwrap();
+        let any_text = explain_any
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            any_text.contains("Semi"),
+            "expected HashJoin Semi for = ANY, got {any_text}"
         );
     }
 

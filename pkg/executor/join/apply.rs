@@ -1,6 +1,6 @@
-// F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar subquery.
+// F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
 // Completeness wave / not this feature: parallel apply, semi/anti rewrite,
-// ANY/ALL/SOME, FROM derived tables, subquery JOIN, SELECT-list subquery.
+// FROM derived tables, subquery JOIN, SELECT-list subquery.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
@@ -9,10 +9,11 @@ use sealdb_expression::{eval_expr_with_row, eval_filter};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
-    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, ScalarSubqueryExpr, UnaryOpExpr,
-    ValueExpr,
+    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
+    UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{SelectField, SelectStmt, Statement};
+use sealdb_parser::opcode::Op;
 use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -124,6 +125,9 @@ fn materialize(
         ExprNode::ScalarSubquery(sub) => Ok(ExprNode::Value(ValueExpr {
             datum: eval_scalar_subquery(sub, ctx, cache)?,
         })),
+        ExprNode::QuantifiedCmp(cmp) => Ok(ExprNode::Value(ValueExpr {
+            datum: eval_quantified_cmp(cmp, ctx, cache)?,
+        })),
         ExprNode::Binary(bin) => Ok(ExprNode::Binary(BinaryOpExpr {
             op: bin.op,
             left: Box::new(materialize(&bin.left, ctx, cache)?),
@@ -213,6 +217,60 @@ fn eval_in_subquery(
         Ok(Datum::Null)
     } else {
         Ok(bool_datum(sub.not))
+    }
+}
+
+/// Evaluate `left op ANY|ALL (subquery)` with three-valued SQL logic.
+/// Empty ANY is false; empty ALL is true. A NULL comparison yields NULL
+/// unless another row already decided the quantifier.
+fn eval_quantified_cmp(
+    cmp: &QuantifiedCmpExpr,
+    ctx: &ApplyCtx,
+    cache: &mut HashMap<String, QueryResult>,
+) -> Result<Datum> {
+    let left_expr = materialize(&cmp.expr, ctx, cache)?;
+    let left = eval_expr_with_row(&left_expr, &ctx.outer_schema, &ctx.outer_row)?;
+    let inner = bind_select(&cmp.query, ctx)?;
+    let result = run_select(&inner, ctx, cache)?;
+    if result.rows.is_empty() {
+        return Ok(bool_datum(cmp.all));
+    }
+    if left.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut saw_null = false;
+    for row in &result.rows {
+        let value = row.first().cloned().unwrap_or(Datum::Null);
+        if value.is_null() {
+            saw_null = true;
+            continue;
+        }
+        let matched = cmp_op(&left, cmp.op, &value);
+        if cmp.all {
+            if !matched {
+                return Ok(bool_datum(false));
+            }
+        } else if matched {
+            return Ok(bool_datum(true));
+        }
+    }
+    if saw_null {
+        Ok(Datum::Null)
+    } else {
+        Ok(bool_datum(cmp.all))
+    }
+}
+
+fn cmp_op(left: &Datum, op: Op, right: &Datum) -> bool {
+    let ord = left.compare(right);
+    match op {
+        Op::Eq => ord.is_eq(),
+        Op::Ne => !ord.is_eq(),
+        Op::Lt => ord.is_lt(),
+        Op::Le => ord.is_le(),
+        Op::Gt => ord.is_gt(),
+        Op::Ge => ord.is_ge(),
+        _ => false,
     }
 }
 
@@ -348,6 +406,12 @@ fn bind_expr(
             expr: Box::new(bind_expr(&sub.expr, ctx, inner_table, inner_cols)),
             not: sub.not,
             query: sub.query.clone(),
+        }),
+        ExprNode::QuantifiedCmp(cmp) => ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
+            expr: Box::new(bind_expr(&cmp.expr, ctx, inner_table, inner_cols)),
+            op: cmp.op,
+            all: cmp.all,
+            query: cmp.query.clone(),
         }),
         ExprNode::ScalarSubquery(sub) => ExprNode::ScalarSubquery(sub.clone()),
         other => other.clone(),

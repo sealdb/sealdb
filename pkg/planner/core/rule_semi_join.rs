@@ -1,9 +1,10 @@
 /// F09 leftover: rewrite simple correlated EXISTS / IN / NOT EXISTS Apply
 /// into HashJoin Semi/Anti (TiDB `rule_decorrelate.go`).
 ///
-/// NOT IN stays Apply (null-aware). Scalar subqueries, ALL/ANY, derived
-/// tables, and composite join keys stay Apply. F14 `semi-anti-rewrite` is
-/// the later SemiJoinRewriter (semi → inner + agg), not this operator.
+/// NOT IN stays Apply (null-aware). Scalar subqueries, quantified
+/// comparisons other than `= ANY`/`<> ALL`, derived tables, and composite
+/// join keys stay Apply. F14 `semi-anti-rewrite` is the later
+/// SemiJoinRewriter (semi → inner + agg), not this operator.
 use super::physical_plans::{JoinType, PhysicalPlan};
 use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode};
 use sealdb_parser::ast::{SelectStmt, TableName};

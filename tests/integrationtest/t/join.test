@@ -15,3 +15,8 @@ SELECT t1.id, t2.tag, t3.note FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id JOIN 
 SELECT * FROM itest.t1 WHERE EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
 SELECT * FROM itest.t1 WHERE NOT EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
 SELECT * FROM itest.t1 WHERE id IN (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id = ANY (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id = SOME (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id <> ALL (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id > ANY (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id > ALL (SELECT id FROM itest.t2) ORDER BY id;

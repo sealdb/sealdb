@@ -19,6 +19,9 @@ pub enum ExprNode {
     Like(PatternLikeExpr),
     IsNull(IsNullExpr),
     ScalarSubquery(ScalarSubqueryExpr),
+    /// Quantified comparison: `expr op ANY|ALL (subquery)`.
+    /// `= ANY` / `= SOME` lower to `InSubquery`; `<> ALL` lowers to `NOT IN`.
+    QuantifiedCmp(QuantifiedCmpExpr),
     Window(WindowFuncExpr),
 }
 
@@ -38,13 +41,17 @@ impl ExprNode {
             ExprNode::Like(v) => v.restore(ctx),
             ExprNode::IsNull(v) => v.restore(ctx),
             ExprNode::ScalarSubquery(v) => v.restore(ctx),
+            ExprNode::QuantifiedCmp(v) => v.restore(ctx),
             ExprNode::Window(v) => v.restore(ctx),
         }
     }
 
     pub fn has_subquery(&self) -> bool {
         match self {
-            ExprNode::Exists(_) | ExprNode::InSubquery(_) | ExprNode::ScalarSubquery(_) => true,
+            ExprNode::Exists(_)
+            | ExprNode::InSubquery(_)
+            | ExprNode::ScalarSubquery(_)
+            | ExprNode::QuantifiedCmp(_) => true,
             ExprNode::Binary(b) => b.left.has_subquery() || b.right.has_subquery(),
             ExprNode::Unary(u) => u.expr.has_subquery(),
             ExprNode::Func(f) => f.args.iter().any(Self::has_subquery),
@@ -249,6 +256,10 @@ impl ExprNode {
                 collect_select_columns(&i.query, out);
             }
             ExprNode::ScalarSubquery(s) => collect_select_columns(&s.query, out),
+            ExprNode::QuantifiedCmp(q) => {
+                q.expr.collect_columns(out);
+                collect_select_columns(&q.query, out);
+            }
             ExprNode::Value(_) => {}
         }
     }
@@ -571,6 +582,31 @@ impl IsNullExpr {
         } else {
             ctx.write_str(" IS NULL");
         }
+        Ok(())
+    }
+}
+
+/// `left <op> ANY|ALL (query)`. `all` is true for ALL, false for ANY/SOME.
+#[derive(Clone, Debug)]
+pub struct QuantifiedCmpExpr {
+    pub expr: Box<ExprNode>,
+    pub op: Op,
+    pub all: bool,
+    pub query: Box<SelectStmt>,
+}
+
+impl QuantifiedCmpExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        self.expr.restore(ctx)?;
+        ctx.write_str(" ");
+        ctx.write_str(self.op.restore());
+        if self.all {
+            ctx.write_str(" ALL (");
+        } else {
+            ctx.write_str(" ANY (");
+        }
+        self.query.restore(ctx)?;
+        ctx.write_str(")");
         Ok(())
     }
 }
