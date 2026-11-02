@@ -6,4 +6,7 @@ pub mod implementation;
 pub mod property;
 pub mod util;
 
-pub use core::{DdlKind, JoinType, PartitionPruneMode, PhysicalPlan, PlanBuilder};
+pub use core::{
+    DdlKind, InstancePlanCache, JoinType, LRUPlanCache, PartitionPruneMode, PhysicalPlan,
+    PlanBuilder, PlanCacheValue,
+};

@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 180,
-  "manifest_entries": 129,
+  "rs_files": 183,
+  "manifest_entries": 132,
   "status_counts": {
-    "not-started": 1552,
-    "partial": 122,
+    "not-started": 1549,
+    "partial": 125,
     "reimplemented": 4,
     "ported": 3
   },
@@ -268,11 +268,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 13,
-      "missing": 203,
+      "rs": 16,
+      "missing": 200,
       "status": {
-        "not-started": 203,
-        "partial": 13
+        "not-started": 200,
+        "partial": 16
       }
     },
     "pkg/plugin": {
@@ -6576,24 +6576,24 @@
     },
     {
       "go_path": "pkg/planner/core/plan_cache.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/plan_cache.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "PlanCacheValue keyed by restored SQL + schema version; typed-param rebuild deferred"
     },
     {
       "go_path": "pkg/planner/core/plan_cache_instance.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/plan_cache_instance.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "Domain-shared InstancePlanCache with hit_count test hook"
     },
     {
       "go_path": "pkg/planner/core/plan_cache_lru.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/plan_cache_lru.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "thin LRU capacity for InstancePlanCache"
     },
     {
       "go_path": "pkg/planner/core/plan_cache_param.go",

@@ -27,7 +27,6 @@ pub struct Session {
     isolation: Mutex<IsolationLevel>,
     read_only: Mutex<bool>,
     prepared: Mutex<HashMap<String, String>>,
-    plan_cache: Mutex<HashMap<String, (i64, PhysicalPlan)>>,
     cache_plans: Mutex<bool>,
     collation: Mutex<Collation>,
     sql_mode: Mutex<String>,
@@ -65,7 +64,6 @@ impl Session {
             isolation: Mutex::new(IsolationLevel::RepeatableRead),
             read_only: Mutex::new(false),
             prepared: Mutex::new(HashMap::new()),
-            plan_cache: Mutex::new(HashMap::new()),
             cache_plans: Mutex::new(false),
             collation: Mutex::new(Collation::bin()),
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
@@ -373,11 +371,9 @@ impl Session {
         let cache_key = restore_sql(stmt);
         let use_cache = *self.cache_plans.lock().expect("session cache flag lock");
         let plan = if use_cache {
-            let mut cache = self.plan_cache.lock().expect("session plan cache lock");
-            if let Some((ver, plan)) = cache.get(&cache_key)
-                && *ver == schema_ver
-            {
-                plan.clone()
+            let cache = self.domain.plan_cache();
+            if let Some(plan) = cache.get(&cache_key, schema_ver) {
+                plan
             } else {
                 let prune_mode = *self
                     .partition_prune_mode
@@ -390,7 +386,7 @@ impl Session {
                     Some(stats.as_ref()),
                     prune_mode,
                 )?;
-                cache.insert(cache_key, (schema_ver, plan.clone()));
+                cache.put(cache_key, schema_ver, plan.clone());
                 plan
             }
         } else {
@@ -926,12 +922,8 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .partition_prune_mode
                     .lock()
                     .expect("session partition prune mode lock") = mode;
-                // Prune mode changes plan shape; drop cached plans.
-                session
-                    .plan_cache
-                    .lock()
-                    .expect("session plan cache lock")
-                    .clear();
+                // Prune mode changes plan shape; drop Domain-shared cached plans.
+                session.domain.plan_cache().clear();
             }
             "tidb_enable_auto_analyze" => {
                 let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -2708,6 +2700,31 @@ mod tests {
         session.execute_stmt("DEALLOCATE PREPARE s").unwrap();
         let err = session.execute_stmt("EXECUTE s USING 1").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_UNKNOWN_STMT_HANDLER);
+    }
+
+    #[test]
+    fn test_shared_plan_cache_cross_session() {
+        let domain = Arc::new(Domain::new());
+        let a = Session::with_domain(Arc::clone(&domain));
+        let b = Session::with_domain(Arc::clone(&domain));
+        a.execute_stmt(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+        )
+        .unwrap();
+        a.execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
+            .unwrap();
+        assert_eq!(domain.plan_cache_hit_count(), 0);
+        let warmed = a.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(warmed.display_rows(), vec![vec!["a".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 0);
+        b.execute_stmt("PREPARE s FROM 'SELECT name FROM db1.t WHERE id = ?'")
+            .unwrap();
+        let hit = b.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(hit.display_rows(), vec![vec!["a".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 1);
+        let again = a.execute_stmt("EXECUTE s USING 1").unwrap();
+        assert_eq!(again.display_rows(), vec![vec!["a".to_string()]]);
+        assert_eq!(domain.plan_cache_hit_count(), 2);
     }
 
     #[test]

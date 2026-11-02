@@ -56,7 +56,6 @@
       "savepoint"
     ],
     "C4": [
-      "shared-plan-cache",
       "typed-placeholders"
     ],
     "C5": [

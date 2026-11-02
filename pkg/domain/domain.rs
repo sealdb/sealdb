@@ -5,6 +5,7 @@ use sealdb_infoschema::InfoSchema;
 use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::{Job, JobState, Mutator};
 use sealdb_parser::ast::Statement;
+use sealdb_planner::InstancePlanCache;
 use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
 use std::fs::OpenOptions;
@@ -22,6 +23,8 @@ pub struct Domain {
     stats: Arc<Handle>,
     /// Domain-shared SQL bindings (`CREATE BINDING` / `SHOW BINDINGS`).
     bind_handle: SessionBindingHandle,
+    /// Domain-shared prepared plan cache (TiDB instance plan cache, MVB).
+    plan_cache: Arc<InstancePlanCache>,
 }
 
 struct Inner {
@@ -97,6 +100,7 @@ impl Domain {
             privilege: Arc::new(privilege),
             stats,
             bind_handle: SessionBindingHandle::new(),
+            plan_cache: Arc::new(InstancePlanCache::new()),
         })
     }
 
@@ -107,6 +111,16 @@ impl Domain {
     /// Shared SQL binding handle (TiDB bindinfo session/global handle, MVB Domain-shared).
     pub fn bind_handle(&self) -> &SessionBindingHandle {
         &self.bind_handle
+    }
+
+    /// Shared instance plan cache (cross-session hits for same SQL + schema version).
+    pub fn plan_cache(&self) -> Arc<InstancePlanCache> {
+        Arc::clone(&self.plan_cache)
+    }
+
+    /// Test hook: successful plan-cache hits on this Domain.
+    pub fn plan_cache_hit_count(&self) -> u64 {
+        self.plan_cache.hit_count()
     }
 
     /// Persist grant tables (TiDB mysql.user / db / tables_priv) to Storage.
