@@ -12,10 +12,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `online-ddl-jobs`
 - `indexes`
 
-### F17
-
-- `shared-cte-storage`
-
 ### F18
 
 - `ddl-job-states`

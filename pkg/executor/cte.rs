@@ -1,6 +1,6 @@
 // F17 core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
 // (TiDB pkg/executor/cte.go). Completeness wave / not this feature:
-// CTETableReader shared storage.
+// Nested WITH / qualified CTE names.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
@@ -22,6 +22,40 @@ type CteWorking = (Vec<String>, Vec<Vec<Datum>>);
 
 thread_local! {
     static WORKING: RefCell<HashMap<String, CteWorking>> = RefCell::new(HashMap::new());
+    static SHARED: RefCell<(u32, HashMap<String, CteWorking>)> =
+        RefCell::new((0, HashMap::new()));
+}
+
+/// Scope for statement-local CTETableReader reuse; nested runs keep the map.
+pub fn with_shared_ctes<T>(f: impl FnOnce() -> T) -> T {
+    SHARED.with(|cell| {
+        cell.borrow_mut().0 += 1;
+    });
+    let out = f();
+    SHARED.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.0 = guard.0.saturating_sub(1);
+        if guard.0 == 0 {
+            guard.1.clear();
+        }
+    });
+    out
+}
+
+fn shared_cte(name: &str) -> Option<CteWorking> {
+    SHARED.with(|cell| {
+        cell.borrow()
+            .1
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    })
+}
+
+fn store_shared_cte(name: &str, schema: Vec<String>, rows: Vec<Vec<Datum>>) {
+    SHARED.with(|cell| {
+        cell.borrow_mut().1.insert(name.to_string(), (schema, rows));
+    });
 }
 
 /// Evaluate `SELECT * FROM cte` against `with` (INSERT/UPDATE/DELETE JOIN sides).
@@ -84,7 +118,8 @@ fn with_working_cte<T>(
 const MAX_RECURSION: usize = 1000;
 
 /// Materializes a `WITH` query; recursive CTEs iterate `recursive` against
-/// a TableReader working set published under `name`.
+/// a TableReader working set published under `name`. Shared storage reuses
+/// one materialization per statement (TiDB `CTETableReader`).
 pub struct CTEExec {
     columns: Vec<String>,
     name: String,
@@ -93,6 +128,8 @@ pub struct CTEExec {
     domain: Arc<Domain>,
     current_db: String,
     txn: Arc<TxnHandle>,
+    share: bool,
+    from_cache: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -108,6 +145,7 @@ impl CTEExec {
         domain: Arc<Domain>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
+        share: bool,
     ) -> Self {
         Self {
             columns,
@@ -117,6 +155,8 @@ impl CTEExec {
             domain,
             current_db: current_db.into(),
             txn,
+            share,
+            from_cache: false,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -126,6 +166,14 @@ impl CTEExec {
 
 impl Executor for CTEExec {
     fn open(&mut self) -> Result<()> {
+        if self.share
+            && let Some((schema, rows)) = shared_cte(&self.name)
+        {
+            self.schema = schema;
+            self.rows = rows;
+            self.from_cache = true;
+            return Ok(());
+        }
         self.seed.open()?;
         self.schema = self.seed.schema().to_vec();
         self.rows = collect_rows(&mut self.seed)?;
@@ -155,6 +203,9 @@ impl Executor for CTEExec {
                 &self.txn,
             )?;
         }
+        if self.share {
+            store_shared_cte(&self.name, self.schema.clone(), self.rows.clone());
+        }
         Ok(())
     }
 
@@ -171,7 +222,11 @@ impl Executor for CTEExec {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.seed.close()
+        if self.from_cache {
+            Ok(())
+        } else {
+            self.seed.close()
+        }
     }
 
     fn schema(&self) -> &[String] {

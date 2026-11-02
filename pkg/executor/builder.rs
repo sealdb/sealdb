@@ -1,7 +1,7 @@
 use crate::aggregate::{HashAggExec, StreamAggExec};
 use crate::analyze::AnalyzeExec;
 use crate::batch_point_get::BatchPointGetExec;
-use crate::cte::CTEExec;
+use crate::cte::{CTEExec, with_shared_ctes};
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
 use crate::distsql::{IndexAccess, IndexLookUpExecutor};
@@ -376,7 +376,7 @@ impl ExecutorBuilder {
                 name,
                 columns,
                 seed,
-                ..
+                inline,
             } => {
                 let with = stmt
                     .with_clause()
@@ -396,6 +396,7 @@ impl ExecutorBuilder {
                     })
                 };
                 let recursive = with.find(name).and_then(|cte| cte.recursive.clone());
+                let share = !inline;
                 Ok(Box::new(CTEExec::new(
                     columns.clone(),
                     name.clone(),
@@ -404,6 +405,7 @@ impl ExecutorBuilder {
                     domain,
                     current_db,
                     txn,
+                    share,
                 )))
             }
             PhysicalPlan::HashJoin {
@@ -465,16 +467,18 @@ impl ExecutorBuilder {
     }
 
     pub fn run(mut exec: Box<dyn Executor>) -> Result<QueryResult> {
-        exec.open()?;
-        let columns = exec.schema().to_vec();
-        let mut rows = Vec::new();
-        while let Some(chunk) = exec.next()? {
-            for i in 0..chunk.num_rows() {
-                rows.push(chunk.get_row(i));
+        with_shared_ctes(|| {
+            exec.open()?;
+            let columns = exec.schema().to_vec();
+            let mut rows = Vec::new();
+            while let Some(chunk) = exec.next()? {
+                for i in 0..chunk.num_rows() {
+                    rows.push(chunk.get_row(i));
+                }
             }
-        }
-        exec.close()?;
-        Ok(QueryResult { columns, rows })
+            exec.close()?;
+            Ok(QueryResult { columns, rows })
+        })
     }
 }
 
