@@ -35,7 +35,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### C4
 
-- `user-vars`
 - `create-binding`
 - `shared-plan-cache`
 - `typed-placeholders`
@@ -158,6 +157,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).
 - C2: EXPLAIN ANALYZE / cop-task rows / n-table DP / IndexMerge / cost-model-v2 stay open.
 - C3: TiKV cross-cluster and MDL stay open.
-- C4: user-vars / CREATE BINDING / shared plan cache / typed `?` stay open (COM_STMT_* closed).
+- C4: CREATE BINDING / shared plan cache / typed `?` stay open (COM_STMT_* and user-vars closed).
 - C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.
 - C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.

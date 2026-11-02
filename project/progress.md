@@ -110,6 +110,17 @@
 
 ### 2026-11-03
 
+- **Phase**: 完整性波 C4（user-vars）
+- **完成**:
+  - `SET @a` / `SELECT @a` / `EXECUTE … USING @a` 会话用户变量
+  - 未赋值用户变量读出为 NULL
+- **验证**:
+  - `./project/scripts/feature_gate.sh C4`
+- **下一步**:
+  - C4 `create-binding` → `shared-plan-cache` → `typed-placeholders`
+
+### 2026-11-03
+
 - **Phase**: 完整性波 C4（com-stmt-prepare）
 - **完成**:
   - F21/F22 leftover 收口后进入 C4→C2→C5
