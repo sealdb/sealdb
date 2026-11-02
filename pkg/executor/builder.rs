@@ -3,7 +3,7 @@ use crate::analyze::AnalyzeExec;
 use crate::cte::CTEExec;
 use crate::ddl::DDLExec;
 use crate::delete::DeleteExec;
-use crate::distsql::IndexLookUpExecutor;
+use crate::distsql::{IndexAccess, IndexLookUpExecutor};
 use crate::explain::ExplainExec;
 use crate::grant::GrantExec;
 use crate::insert::InsertExec;
@@ -171,14 +171,14 @@ impl ExecutorBuilder {
                     .from
                     .clone()
                     .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
-                let lookup =
-                    eq_lookup_value(&domain, current_db, &from, index, select.selection.as_ref())
-                        .ok_or_else(|| Error::unsupported("index lookup without equality"))?;
+                let access =
+                    index_access(&domain, current_db, &from, index, select.selection.as_ref())
+                        .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
                 Ok(Box::new(IndexLookUpExecutor::new(
                     domain,
                     from,
                     index.clone(),
-                    lookup,
+                    access,
                     current_db.to_string(),
                     txn,
                     select.lock == SelectLock::ForUpdate,
@@ -424,13 +424,13 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
         .ok_or_else(|| Error::unsupported("table reader without FROM"))
 }
 
-fn eq_lookup_value(
+fn index_access(
     domain: &Domain,
     current_db: &str,
     table: &sealdb_parser::ast::TableName,
     index_name: &str,
     selection: Option<&ExprNode>,
-) -> Option<sealdb_types::Datum> {
+) -> Option<IndexAccess> {
     let (schema, name) = table.qualified(current_db);
     let is = domain.infoschema();
     let info = is.table_by_name(&schema, &name)?;
@@ -439,7 +439,30 @@ fn eq_lookup_value(
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
     let column = index.columns.first()?.name.o().to_string();
-    selection?.eq_const_on(&column)
+    if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
+        return Some(IndexAccess::Equal(value));
+    }
+    let range = selection?
+        .column_ranges()
+        .into_iter()
+        .find(|range| range.column.eq_ignore_ascii_case(&column))?;
+    if range.low.is_none() && range.high.is_none() {
+        return None;
+    }
+    Some(IndexAccess::Range {
+        low: range.low.as_ref().map(|(value, _)| value.clone()),
+        low_inclusive: range
+            .low
+            .as_ref()
+            .map(|(_, inclusive)| *inclusive)
+            .unwrap_or(true),
+        high: range.high.as_ref().map(|(value, _)| value.clone()),
+        high_inclusive: range
+            .high
+            .as_ref()
+            .map(|(_, inclusive)| *inclusive)
+            .unwrap_or(true),
+    })
 }
 
 fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {

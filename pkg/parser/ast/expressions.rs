@@ -120,6 +120,53 @@ impl ExprNode {
         })
     }
 
+    pub fn column_cmp_const(&self) -> Option<(String, Op, Datum)> {
+        let ExprNode::Binary(bin) = self else {
+            return None;
+        };
+        match (bin.left.as_ref(), bin.right.as_ref()) {
+            (ExprNode::Column(col), ExprNode::Value(v))
+                if matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) =>
+            {
+                Some((col.name.clone(), bin.op, v.datum.clone()))
+            }
+            (ExprNode::Value(v), ExprNode::Column(col)) => {
+                flip_cmp(bin.op).map(|op| (col.name.clone(), op, v.datum.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn between_column_const(&self) -> Option<(String, Datum, Datum)> {
+        let ExprNode::Between(b) = self else {
+            return None;
+        };
+        if b.not {
+            return None;
+        }
+        let ExprNode::Column(col) = b.expr.as_ref() else {
+            return None;
+        };
+        let (ExprNode::Value(low), ExprNode::Value(high)) = (b.low.as_ref(), b.high.as_ref())
+        else {
+            return None;
+        };
+        Some((col.name.clone(), low.datum.clone(), high.datum.clone()))
+    }
+
+    pub fn column_ranges(&self) -> Vec<ColumnRange> {
+        let mut ranges = Vec::new();
+        for item in self.split_cnf() {
+            if let Some((name, op, value)) = item.column_cmp_const() {
+                apply_cmp_range(&mut ranges, name, op, value);
+            } else if let Some((name, low, high)) = item.between_column_const() {
+                apply_cmp_range(&mut ranges, name.clone(), Op::Ge, low);
+                apply_cmp_range(&mut ranges, name, Op::Le, high);
+            }
+        }
+        ranges
+    }
+
     fn collect_columns(&self, out: &mut Vec<(Option<String>, String)>) {
         match self {
             ExprNode::Column(col) => out.push((col.table.clone(), col.name.clone())),
@@ -368,6 +415,69 @@ impl InListExpr {
         ctx.write_str(")");
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct ColumnRange {
+    pub column: String,
+    pub low: Option<(Datum, bool)>,
+    pub high: Option<(Datum, bool)>,
+}
+
+fn flip_cmp(op: Op) -> Option<Op> {
+    match op {
+        Op::Lt => Some(Op::Gt),
+        Op::Le => Some(Op::Ge),
+        Op::Gt => Some(Op::Lt),
+        Op::Ge => Some(Op::Le),
+        _ => None,
+    }
+}
+
+fn apply_cmp_range(ranges: &mut Vec<ColumnRange>, name: String, op: Op, value: Datum) {
+    let slot = match ranges
+        .iter()
+        .position(|range| range.column.eq_ignore_ascii_case(&name))
+    {
+        Some(idx) => idx,
+        None => {
+            ranges.push(ColumnRange {
+                column: name,
+                low: None,
+                high: None,
+            });
+            ranges.len() - 1
+        }
+    };
+    match op {
+        Op::Gt => tighten_low(&mut ranges[slot].low, value, false),
+        Op::Ge => tighten_low(&mut ranges[slot].low, value, true),
+        Op::Lt => tighten_high(&mut ranges[slot].high, value, false),
+        Op::Le => tighten_high(&mut ranges[slot].high, value, true),
+        _ => {}
+    }
+}
+
+fn tighten_low(slot: &mut Option<(Datum, bool)>, value: Datum, inclusive: bool) {
+    *slot = Some(match slot.take() {
+        None => (value, inclusive),
+        Some((existing, existing_incl)) => match value.compare(&existing) {
+            std::cmp::Ordering::Greater => (value, inclusive),
+            std::cmp::Ordering::Less => (existing, existing_incl),
+            std::cmp::Ordering::Equal => (existing, existing_incl && inclusive),
+        },
+    });
+}
+
+fn tighten_high(slot: &mut Option<(Datum, bool)>, value: Datum, inclusive: bool) {
+    *slot = Some(match slot.take() {
+        None => (value, inclusive),
+        Some((existing, existing_incl)) => match value.compare(&existing) {
+            std::cmp::Ordering::Less => (value, inclusive),
+            std::cmp::Ordering::Greater => (existing, existing_incl),
+            std::cmp::Ordering::Equal => (existing, existing_incl && inclusive),
+        },
+    });
 }
 
 #[derive(Clone, Debug)]

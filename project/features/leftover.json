@@ -62,9 +62,6 @@
       "cross-join",
       "n-table"
     ],
-    "F10": [
-      "range-scan"
-    ],
     "F12": [
       "pessimistic",
       "savepoint",
