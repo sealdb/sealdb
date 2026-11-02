@@ -1,10 +1,11 @@
 use sealdb_errno::{Error, Result};
 use sealdb_kv::Key;
-use sealdb_types::Datum;
+use sealdb_types::{Datum, FieldType};
 use sealdb_util::codec::{
     decode_bytes, decode_float, decode_int, encode_bytes, encode_float, encode_int,
     encode_int_to_cmp_uint,
 };
+use sealdb_util::rowcodec::{self, CODEC_VER};
 
 pub const TABLE_PREFIX: &[u8] = b"t";
 pub const RECORD_PREFIX_SEP: &[u8] = b"_r";
@@ -222,37 +223,19 @@ const TAG_I64: u8 = 1;
 const TAG_F64: u8 = 2;
 const TAG_BYTES: u8 = 3;
 
-pub fn encode_row(col_ids: &[i64], values: &[sealdb_types::Datum]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&(col_ids.len() as u32).to_le_bytes());
-    for (id, value) in col_ids.iter().zip(values.iter()) {
-        buf.extend_from_slice(&id.to_le_bytes());
-        match value {
-            sealdb_types::Datum::Null => buf.push(TAG_NULL),
-            sealdb_types::Datum::I64(v) => {
-                buf.push(TAG_I64);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            sealdb_types::Datum::U64(v) => {
-                buf.push(TAG_I64);
-                buf.extend_from_slice(&(*v as i64).to_le_bytes());
-            }
-            sealdb_types::Datum::F64(v) => {
-                buf.push(TAG_F64);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            other => {
-                let bytes = other.as_bytes();
-                buf.push(TAG_BYTES);
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&bytes);
-            }
-        }
-    }
-    buf
+pub fn encode_row(col_ids: &[i64], values: &[Datum]) -> Vec<u8> {
+    rowcodec::encode(col_ids, values)
 }
 
-pub fn decode_row(raw: &[u8]) -> Vec<(i64, sealdb_types::Datum)> {
+pub fn decode_row(raw: &[u8], columns: &[(i64, FieldType)]) -> Vec<(i64, Datum)> {
+    if raw.first() == Some(&CODEC_VER) {
+        rowcodec::decode(raw, columns)
+    } else {
+        decode_legacy_row(raw)
+    }
+}
+
+fn decode_legacy_row(raw: &[u8]) -> Vec<(i64, Datum)> {
     if raw.len() < 4 {
         return Vec::new();
     }
@@ -268,16 +251,16 @@ pub fn decode_row(raw: &[u8]) -> Vec<(i64, sealdb_types::Datum)> {
         let tag = raw[i];
         i += 1;
         let value = match tag {
-            TAG_NULL => sealdb_types::Datum::Null,
+            TAG_NULL => Datum::Null,
             TAG_I64 if i + 8 <= raw.len() => {
                 let v = i64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or([0; 8]));
                 i += 8;
-                sealdb_types::Datum::I64(v)
+                Datum::I64(v)
             }
             TAG_F64 if i + 8 <= raw.len() => {
                 let v = f64::from_le_bytes(raw[i..i + 8].try_into().unwrap_or([0; 8]));
                 i += 8;
-                sealdb_types::Datum::F64(v)
+                Datum::F64(v)
             }
             TAG_BYTES if i + 4 <= raw.len() => {
                 let len = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
@@ -285,9 +268,9 @@ pub fn decode_row(raw: &[u8]) -> Vec<(i64, sealdb_types::Datum)> {
                 let end = (i + len).min(raw.len());
                 let bytes = raw[i..end].to_vec();
                 i = end;
-                sealdb_types::Datum::Bytes(bytes)
+                Datum::Bytes(bytes)
             }
-            _ => sealdb_types::Datum::Null,
+            _ => Datum::Null,
         };
         out.push((id, value));
     }
@@ -335,6 +318,37 @@ mod tests {
         let unique = encode_index_key(2, 1, &[Datum::I64(4)], 0, true);
         let (uvals, _) = decode_index_key_values(unique.as_bytes(), 1, true).unwrap();
         assert_eq!(uvals, vec![Datum::I64(4)]);
+    }
+
+    #[test]
+    fn test_rowcodec_roundtrip() {
+        let cols = [
+            (1, FieldType::new_longlong()),
+            (2, FieldType::new_string()),
+            (3, FieldType::new_double()),
+        ];
+        let values = vec![
+            Datum::I64(42),
+            Datum::Bytes(b"hello".to_vec()),
+            Datum::F64(1.5),
+        ];
+        let encoded = encode_row(&[1, 2, 3], &values);
+        assert_eq!(encoded[0], CODEC_VER);
+        let decoded = decode_row(&encoded, &cols);
+        assert_eq!(
+            decoded,
+            vec![
+                (1, values[0].clone()),
+                (2, values[1].clone()),
+                (3, values[2].clone())
+            ]
+        );
+        let with_null = encode_row(&[1, 2], &[Datum::I64(7), Datum::Null]);
+        let decoded_null = decode_row(
+            &with_null,
+            &[(1, FieldType::new_longlong()), (2, FieldType::new_string())],
+        );
+        assert_eq!(decoded_null, vec![(1, Datum::I64(7)), (2, Datum::Null)]);
     }
 
     fn hex(s: &str) -> Vec<u8> {

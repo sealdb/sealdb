@@ -145,7 +145,7 @@ fn decode_scanned_rows(
     pairs
         .into_iter()
         .map(|(key, raw)| {
-            let decoded = decode_row(&raw);
+            let decoded = decode_row(&raw, &info.col_field_types());
             Ok(ScannedRow {
                 handle: decode_handle_from_row_key(&key)?,
                 physical_id,

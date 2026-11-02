@@ -3,7 +3,7 @@ use super::index::IndexInfo;
 use super::job::{STATE_PUBLIC, SchemaState};
 use super::partition::PartitionInfo;
 use sealdb_parser::model::CIStr;
-use sealdb_types::EvalType;
+use sealdb_types::{EvalType, FieldType};
 use serde::{Deserialize, Serialize};
 
 pub const CURR_LATEST_TABLE_INFO_VERSION: u16 = 5;
@@ -54,6 +54,13 @@ impl TableInfo {
         self.indices
             .iter()
             .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
+    }
+
+    pub fn col_field_types(&self) -> Vec<(i64, FieldType)> {
+        self.columns
+            .iter()
+            .map(|c| (c.id, c.field_type.clone()))
+            .collect()
     }
 
     pub fn handle_column(&self) -> Option<&ColumnInfo> {

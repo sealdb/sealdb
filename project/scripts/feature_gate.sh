@@ -65,6 +65,7 @@ case "$FEATURE" in
     ;;
   F03)
     run execute-insert-select cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); CREATE TABLE db1.src (id INT, name VARCHAR(20)); INSERT INTO db1.src VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t SELECT * FROM db1.src; SELECT * FROM db1.t"
+    run execute-rowcodec cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), extra DOUBLE); INSERT INTO db1.t VALUES (1, 'a', 1.5), (2, NULL, 2.5); SELECT * FROM db1.t ORDER BY id"
     ;;
   F04)
     run execute-where cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); SELECT * FROM db1.t WHERE id BETWEEN 1 AND 2 AND name LIKE 'b%'"

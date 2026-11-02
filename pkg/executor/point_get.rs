@@ -131,7 +131,7 @@ impl Executor for PointGetExec {
                     txn.get(key.as_bytes())?
                 };
                 if let Some(raw) = raw {
-                    let decoded = decode_row(&raw);
+                    let decoded = decode_row(&raw, &info.col_field_types());
                     return Ok(Some(
                         info.columns
                             .iter()

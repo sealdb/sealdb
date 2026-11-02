@@ -92,7 +92,31 @@
     "pkg/tablecodec/tablecodec.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "row/index key layout + compact row values + secondary index keys"
+      "notes": "row/index key layout + rowcodec values + secondary index keys"
+    },
+    "pkg/util/rowcodec/common.go": {
+      "status": "partial",
+      "rust": "pkg/util/rowcodec/common.rs",
+      "phase": 5,
+      "notes": "CodecVer 128 + compact int/uint; checksum constants unused until checksum leftover"
+    },
+    "pkg/util/rowcodec/row.go": {
+      "status": "partial",
+      "rust": "pkg/util/rowcodec/row.rs",
+      "phase": 5,
+      "notes": "small/large row header, col ids, offsets; checksum skip"
+    },
+    "pkg/util/rowcodec/encoder.go": {
+      "status": "partial",
+      "rust": "pkg/util/rowcodec/encoder.rs",
+      "phase": 5,
+      "notes": "NoChecksum encode of int/uint/float/bytes/decimal/time"
+    },
+    "pkg/util/rowcodec/decoder.go": {
+      "status": "partial",
+      "rust": "pkg/util/rowcodec/decoder.rs",
+      "phase": 5,
+      "notes": "decode by FieldType; checksum verify deferred"
     },
     "pkg/parser/parser.go": {
       "status": "reimplemented",
