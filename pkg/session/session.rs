@@ -292,6 +292,7 @@ impl Session {
                     columns: Vec::new(),
                     rows: Vec::new(),
                     select: Some(select.clone()),
+                    with: None,
                 })
             }),
             _ => None,
@@ -2985,6 +2986,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(both.display_rows(), vec![vec!["1".to_string()]]);
+        session
+            .execute_stmt(
+                "WITH c AS (SELECT 4 AS id, 'd' AS name) INSERT INTO db1.t SELECT * FROM c",
+            )
+            .unwrap();
+        let inserted = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 4")
+            .unwrap();
+        assert_eq!(
+            inserted.display_rows(),
+            vec![vec!["4".to_string(), "d".to_string()]]
+        );
+        session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id = 4) UPDATE db1.t JOIN c ON t.id = c.id SET t.name = 'z'",
+            )
+            .unwrap();
+        let updated = session
+            .execute_stmt("SELECT name FROM db1.t WHERE id = 4")
+            .unwrap();
+        assert_eq!(updated.display_rows(), vec![vec!["z".to_string()]]);
+        session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id = 4) DELETE db1.t FROM db1.t JOIN c ON t.id = c.id",
+            )
+            .unwrap();
+        let deleted = session
+            .execute_stmt("SELECT COUNT(*) FROM db1.t WHERE id = 4")
+            .unwrap();
+        assert_eq!(deleted.display_rows(), vec![vec!["0".to_string()]]);
         let err = session
             .execute_stmt("WITH c(a, b) AS (SELECT 1) SELECT * FROM c")
             .unwrap_err();

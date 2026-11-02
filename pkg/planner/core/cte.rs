@@ -2,6 +2,5 @@
 /// F14 derived tables (`FROM (SELECT ...) alias`) flatten into this node.
 /// WITH RECURSIVE UNION/UNION ALL iterates in CTEExec. `AS NOT MATERIALIZED`
 /// inlines the seed plan. Non-recursive UNION/EXCEPT/INTERSECT is a Union
-/// seed. Completeness wave / not this feature: CTETableReader shared
-/// storage, CTE in DML.
+/// seed. Completeness wave / not this feature: CTETableReader shared storage.
 pub struct LogicalCTE;

@@ -7,7 +7,9 @@ use crate::internal::exec::Executor;
 use crate::join::hash_join_v1::hash_join_pairs;
 use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
-use crate::update::{col_names, dml_row_lock, joined_schema, load_table, table_matches};
+use crate::update::{
+    col_names, dml_row_lock, joined_schema, load_table, scan_dml_side, table_matches,
+};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_expression::eval_filter;
@@ -126,26 +128,24 @@ impl DeleteExec {
                 "Unknown table in multi-table DELETE",
             ));
         }
-        let left = load_table(&self.domain, &self.current_db, &join.left)?;
-        let right = load_table(&self.domain, &self.current_db, &join.right)?;
-        let left_names = col_names(&left);
-        let right_names = col_names(&right);
-        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
         let lock = dml_row_lock(&self.txn)?;
-        let left_rows = scan_table(
+        let (left_names, left_rows, left_info) = scan_dml_side(
+            &self.domain,
+            &self.current_db,
             &self.txn,
-            &left,
+            self.stmt.with.as_ref(),
+            &join.left,
             lock,
-            LockWait::Block,
-            &left.prune_partitions(None),
         )?;
-        let right_rows = scan_table(
+        let (right_names, right_rows, right_info) = scan_dml_side(
+            &self.domain,
+            &self.current_db,
             &self.txn,
-            &right,
+            self.stmt.with.as_ref(),
+            &join.right,
             lock,
-            LockWait::Block,
-            &right.prune_partitions(None),
         )?;
+        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
@@ -162,26 +162,36 @@ impl DeleteExec {
             {
                 continue;
             }
-            if delete_left && let Some(scanned) = left_row {
+            if delete_left
+                && left_info.is_some()
+                && let Some(scanned) = left_row
+            {
                 let key = (scanned.physical_id, scanned.handle);
                 left_del.insert(key);
                 left_scanned.entry(key).or_insert_with(|| scanned.clone());
             }
-            if delete_right && let Some(scanned) = right_row {
+            if delete_right
+                && right_info.is_some()
+                && let Some(scanned) = right_row
+            {
                 let key = (scanned.physical_id, scanned.handle);
                 right_del.insert(key);
                 right_scanned.entry(key).or_insert_with(|| scanned.clone());
             }
         }
         self.txn.with_txn(|txn| {
-            for key in left_del {
-                if let Some(scanned) = left_scanned.remove(&key) {
-                    apply_row_delete(txn, &left, &scanned)?;
+            if let Some(left) = &left_info {
+                for key in left_del {
+                    if let Some(scanned) = left_scanned.remove(&key) {
+                        apply_row_delete(txn, left, &scanned)?;
+                    }
                 }
             }
-            for key in right_del {
-                if let Some(scanned) = right_scanned.remove(&key) {
-                    apply_row_delete(txn, &right, &scanned)?;
+            if let Some(right) = &right_info {
+                for key in right_del {
+                    if let Some(scanned) = right_scanned.remove(&key) {
+                        apply_row_delete(txn, right, &scanned)?;
+                    }
                 }
             }
             Ok(())

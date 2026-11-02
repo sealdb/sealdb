@@ -909,6 +909,10 @@ mod tests {
             .parse_one_stmt("WITH c AS (SELECT 1 AS id) SELECT * FROM t JOIN c ON t.id = c.id")
             .unwrap();
         assert_eq!(joined.as_select().unwrap().joins.len(), 1);
+        let insert = parser
+            .parse_one_stmt("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c")
+            .unwrap();
+        assert!(matches!(insert, crate::ast::Statement::Insert(_)));
     }
 
     #[test]

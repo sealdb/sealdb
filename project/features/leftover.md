@@ -14,7 +14,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F17
 
-- `cte-in-dml`
 - `shared-cte-storage`
 
 ### F18

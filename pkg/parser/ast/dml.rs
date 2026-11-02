@@ -349,10 +349,14 @@ pub struct InsertStmt {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ExprNode>>,
     pub select: Option<Box<SelectStmt>>,
+    pub with: Option<WithClause>,
 }
 
 impl InsertStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(with) = &self.with {
+            with.restore(ctx)?;
+        }
         ctx.write_str("INSERT INTO ");
         self.table.restore(ctx)?;
         if !self.columns.is_empty() {
@@ -418,10 +422,14 @@ pub struct UpdateStmt {
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
+    pub with: Option<WithClause>,
 }
 
 impl UpdateStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(with) = &self.with {
+            with.restore(ctx)?;
+        }
         ctx.write_str("UPDATE ");
         restore_table_join(ctx, &self.table, self.join.as_ref())?;
         ctx.write_str(" SET ");
@@ -449,10 +457,14 @@ pub struct DeleteStmt {
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
+    pub with: Option<WithClause>,
 }
 
 impl DeleteStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(with) = &self.with {
+            with.restore(ctx)?;
+        }
         ctx.write_str("DELETE ");
         if self.tables.is_empty() {
             ctx.write_str("FROM ");
@@ -588,7 +600,7 @@ impl SetOprStmt {
 }
 
 /// TiDB `ast.ResultSetNode`: a SELECT or set operation usable as a subquery
-/// (EXISTS / IN / scalar / ANY|ALL). UNION in CTE stays an F17 leftover.
+/// (EXISTS / IN / scalar / ANY|ALL).
 #[derive(Clone, Debug)]
 pub enum ResultSetNode {
     Select(SelectStmt),
