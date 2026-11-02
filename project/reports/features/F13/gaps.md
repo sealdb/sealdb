@@ -12,6 +12,5 @@ Rejected via `Error::unsupported` in
 
 - `WAIT N` / `FOR UPDATE OF table`
 - `innodb_lock_wait_timeout` (MemStorage uses `SEALDB_LOCK_WAIT_MS`, default 50ms)
-- Deadlock detection
 - TiKV / 2PC pessimistic lock protocol
 - Isolation switching after BEGIN

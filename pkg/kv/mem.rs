@@ -1,6 +1,7 @@
 use super::kv::{LockWait, RowLock, Storage, Transaction};
 use sealdb_errno::{
-    ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, ERR_WRITE_CONFLICT, Error, Result,
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION,
+    ERR_WRITE_CONFLICT, Error, Result,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,6 +30,8 @@ struct Store {
     next_ts: u64,
     data: BTreeMap<Vec<u8>, VersionedValue>,
     locks: HashMap<Vec<u8>, KeyLock>,
+    /// Waiter start_ts → lock-holder start_ts (wait-for graph).
+    wait_for: HashMap<u64, HashSet<u64>>,
 }
 
 #[derive(Clone)]
@@ -88,8 +91,9 @@ struct Savepoint {
 }
 
 /// In-memory optimistic/pessimistic Repeatable Read.
-/// Completeness wave / not this feature: deadlock detection, 2PC/TiKV TSO,
-/// stale read. `SEALDB_LOCK_WAIT_MS` (default 50) caps blocking wait.
+/// Completeness wave / not this feature: 2PC/TiKV TSO, stale read.
+/// `SEALDB_LOCK_WAIT_MS` (default 50) caps blocking wait. Deadlock is a
+/// wait-for cycle (errno 1213).
 struct MemTransaction {
     store: Arc<Mutex<Store>>,
     wait: Arc<Condvar>,
@@ -127,15 +131,61 @@ impl MemTransaction {
     }
 
     fn conflicts(store: &Store, start_ts: u64, key: &[u8], exclusive: bool) -> bool {
+        !Self::holders(store, start_ts, key, exclusive).is_empty()
+    }
+
+    fn holders(store: &Store, start_ts: u64, key: &[u8], exclusive: bool) -> HashSet<u64> {
+        let mut out = HashSet::new();
         let Some(entry) = store.locks.get(key) else {
-            return false;
+            return out;
         };
         if let Some(owner) = entry.exclusive
             && owner != start_ts
         {
-            return true;
+            out.insert(owner);
         }
-        exclusive && entry.shared.iter().any(|owner| *owner != start_ts)
+        if exclusive {
+            out.extend(
+                entry
+                    .shared
+                    .iter()
+                    .copied()
+                    .filter(|owner| *owner != start_ts),
+            );
+        }
+        out
+    }
+
+    fn wait_for_cycle(store: &Store, start: u64) -> bool {
+        fn dfs(
+            graph: &HashMap<u64, HashSet<u64>>,
+            node: u64,
+            visiting: &mut HashSet<u64>,
+            done: &mut HashSet<u64>,
+        ) -> bool {
+            if done.contains(&node) {
+                return false;
+            }
+            if !visiting.insert(node) {
+                return true;
+            }
+            if let Some(next) = graph.get(&node) {
+                for owner in next {
+                    if dfs(graph, *owner, visiting, done) {
+                        return true;
+                    }
+                }
+            }
+            visiting.remove(&node);
+            done.insert(node);
+            false
+        }
+        dfs(
+            &store.wait_for,
+            start,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        )
     }
 
     fn take(
@@ -178,16 +228,27 @@ impl MemTransaction {
                     ));
                 }
                 LockWait::Block => {
+                    let holders = Self::holders(&guard, start_ts, key, exclusive);
+                    guard.wait_for.entry(start_ts).or_default().extend(holders);
+                    if Self::wait_for_cycle(&guard, start_ts) {
+                        guard.wait_for.remove(&start_ts);
+                        return Err(Error::new(
+                            ERR_LOCK_DEADLOCK,
+                            "Deadlock found when trying to get lock; try restarting transaction",
+                        ));
+                    }
                     let now = Instant::now();
                     if now >= deadline {
+                        guard.wait_for.remove(&start_ts);
                         return Err(Error::new(
                             ERR_LOCK_WAIT_TIMEOUT,
                             "Lock wait timeout exceeded; try restarting transaction",
                         ));
                     }
-                    let (g, timed) = cond
+                    let (mut g, timed) = cond
                         .wait_timeout(guard, deadline.saturating_duration_since(now))
                         .expect("mem kv wait");
+                    g.wait_for.remove(&start_ts);
                     guard = g;
                     if timed.timed_out() {
                         return Err(Error::new(
@@ -606,6 +667,47 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         a.commit().unwrap();
         assert_eq!(waiter.join().expect("waiter"), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_deadlock_detected() {
+        let storage = MemStorage::new();
+        let mut setup = storage.begin().unwrap();
+        setup.set(b"k1", b"v1").unwrap();
+        setup.set(b"k2", b"v2").unwrap();
+        setup.commit().unwrap();
+
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let storage_a = storage.clone();
+        let a = std::thread::spawn(move || {
+            let mut txn = storage_a.begin_pessimistic().unwrap();
+            txn.get_for_update(b"k1").unwrap();
+            wait.recv().unwrap();
+            let result = txn.get_for_update(b"k2").map(|_| ());
+            drop(txn);
+            result
+        });
+        let storage_b = storage.clone();
+        let b = std::thread::spawn(move || {
+            let mut txn = storage_b.begin_pessimistic().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            txn.get_for_update(b"k2").unwrap();
+            go.send(()).unwrap();
+            let result = txn.get_for_update(b"k1").map(|_| ());
+            drop(txn);
+            result
+        });
+        let ra = a.join().expect("a");
+        let rb = b.join().expect("b");
+        let deadlock = |r: &Result<()>| {
+            r.as_ref()
+                .err()
+                .is_some_and(|e| e.code == ERR_LOCK_DEADLOCK)
+        };
+        assert!(
+            deadlock(&ra) || deadlock(&rb),
+            "expected a deadlock, got {ra:?} {rb:?}"
+        );
     }
 
     #[test]
