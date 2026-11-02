@@ -576,6 +576,16 @@ mod tests {
             other => panic!("expected unique CreateIndexStmt, got {other:?}"),
         }
         match parser
+            .parse_one_stmt("ALTER TABLE db1.t ADD UNIQUE INDEX idx_u (name)")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[0] {
+                crate::ast::AlterTableSpec::AddIndex(idx) => assert!(idx.unique),
+                other => panic!("expected ADD UNIQUE INDEX, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
             .parse_one_stmt(
                 "CREATE TABLE db1.t (id INT, name VARCHAR(20), PRIMARY KEY (id), UNIQUE INDEX idx_name (name))",
             )
