@@ -43,7 +43,6 @@
       "pessimistic"
     ],
     "F13": [
-      "blocking-wait",
       "deadlock",
       "tikv-pessimistic"
     ],

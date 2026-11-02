@@ -1,6 +1,7 @@
 // F13: FOR UPDATE uses exclusive lock; FOR SHARE uses shared lock.
-// NOWAIT returns 3572; SKIP LOCKED omits locked rows. Completeness
-// wave / not this feature: blocking lock wait, WAIT N, OF table list.
+// NOWAIT returns 3572; SKIP LOCKED omits locked rows; Block waits
+// until release or SEALDB_LOCK_WAIT_MS. Completeness wave / not this
+// feature: WAIT N, OF table list.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;

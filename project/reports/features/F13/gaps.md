@@ -11,7 +11,7 @@ Rejected via `Error::unsupported` in
 `pkg/sessiontxn/isolation/pessimistic.rs`.
 
 - `WAIT N` / `FOR UPDATE OF table`
-- Blocking lock wait (conflict returns 1205 immediately)
+- `innodb_lock_wait_timeout` (MemStorage uses `SEALDB_LOCK_WAIT_MS`, default 50ms)
 - Deadlock detection
 - TiKV / 2PC pessimistic lock protocol
 - Isolation switching after BEGIN
