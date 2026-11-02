@@ -93,7 +93,15 @@ pub(crate) fn compare_rows(
     for item in by {
         let lv = eval_expr_with_row(&item.expr, schema, left).unwrap_or(Datum::Null);
         let rv = eval_expr_with_row(&item.expr, schema, right).unwrap_or(Datum::Null);
-        let ord = lv.compare(&rv);
+        let ord = if matches!((&lv, &rv), (Datum::Bytes(_), Datum::Bytes(_))) {
+            sealdb_util::collate::compare_bytes(
+                sealdb_expression::collation_mode(),
+                &lv.as_bytes(),
+                &rv.as_bytes(),
+            )
+        } else {
+            lv.compare(&rv)
+        };
         if ord != std::cmp::Ordering::Equal {
             return if item.desc { ord.reverse() } else { ord };
         }

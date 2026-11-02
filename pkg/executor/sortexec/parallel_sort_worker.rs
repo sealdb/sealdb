@@ -2,7 +2,7 @@
 // Completeness wave / not this feature: chunk-channel fetcher, parallel spill helper.
 use crate::sortexec::sort::compare_rows;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
-use sealdb_expression::{collation_ci, with_collation_ci};
+use sealdb_expression::{collation_mode, with_collation};
 use sealdb_parser::ast::ByItem;
 use sealdb_types::Datum;
 use std::thread;
@@ -45,13 +45,13 @@ pub fn parallel_sort_rows_with(
         let take = chunk_len.min(rows.len());
         parts.push(rows.drain(..take).collect::<Vec<_>>());
     }
-    let ci = collation_ci();
+    let mode = collation_mode();
     let mut handles = Vec::with_capacity(parts.len());
     for mut part in parts {
         let by = by.to_vec();
         let schema = schema.to_vec();
         handles.push(thread::spawn(move || {
-            with_collation_ci(ci, || {
+            with_collation(mode, || {
                 part.sort_by(|a, b| compare_rows(a, b, &by, &schema));
                 part
             })

@@ -7,7 +7,7 @@ use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, ERR_UNKNOWN_ERROR, Error, Result};
-use sealdb_expression::{collation_ci, eval_expr_with_row, eval_filter, with_collation_ci};
+use sealdb_expression::{collation_mode, eval_expr_with_row, eval_filter, with_collation};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
@@ -139,7 +139,7 @@ fn filter_outer_rows(
         let take = chunk_len.min(rest.len());
         parts.push(rest.drain(..take).collect::<Vec<_>>());
     }
-    let ci = collation_ci();
+    let mode = collation_mode();
     let mut handles = Vec::with_capacity(parts.len());
     for part in parts {
         let filter = filter.clone();
@@ -149,7 +149,7 @@ fn filter_outer_rows(
         let txn = Arc::clone(txn);
         let outer_table = outer_table.clone();
         handles.push(thread::spawn(move || {
-            with_collation_ci(ci, || {
+            with_collation(mode, || {
                 filter_outer_rows_serial(
                     part,
                     &filter,

@@ -464,8 +464,13 @@ impl Session {
                 .ensure(self.domain.as_ref())?;
             ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?
         };
-        let ci = self.collation.lock().expect("session collation lock").ci;
-        let result = sealdb_expression::with_collation_ci(ci, || ExecutorBuilder::run(exec));
+        let coll = self
+            .collation
+            .lock()
+            .expect("session collation lock")
+            .clone();
+        let mode = sealdb_expression::CollateMode::from_name(&coll.name);
+        let result = sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec));
         if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
             self.txn
                 .lock()
@@ -2908,6 +2913,62 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
             .unwrap();
         assert!(miss.display_rows().is_empty());
+    }
+
+    #[test]
+    fn test_unicode_ci_weights_compare_and_order() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); \
+                 INSERT INTO db1.t VALUES (1, 'A'), (2, 'ä'), (3, 'b'), (4, 'ß'), (5, 'ss')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("SET collation_connection = utf8mb4_unicode_ci")
+            .unwrap();
+        let eq = session
+            .execute_stmt("SELECT 'A' = 'a', 'ä' = 'A', 'ß' = 'ss'")
+            .unwrap();
+        assert_eq!(
+            eq.display_rows()[0],
+            vec!["1".to_string(), "1".to_string(), "1".to_string()]
+        );
+        let where_rows = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            where_rows.display_rows(),
+            vec![vec!["1".to_string()], vec!["2".to_string()]]
+        );
+        let ordered = session
+            .execute_stmt("SELECT name FROM db1.t ORDER BY name, id")
+            .unwrap();
+        let names: Vec<_> = ordered
+            .display_rows()
+            .into_iter()
+            .map(|r| r[0].clone())
+            .collect();
+        // A/ä share primary weight; then b; ß and ss share weight.
+        assert_eq!(names[0], "A");
+        assert_eq!(names[1], "ä");
+        assert_eq!(names[2], "b");
+        assert!(names[3] == "ß" || names[3] == "ss");
+        assert!(names[4] == "ß" || names[4] == "ss");
+        session
+            .execute_stmt("SET collation_connection = utf8mb4_bin")
+            .unwrap();
+        let bin_eq = session
+            .execute_stmt("SELECT 'A' = 'a', 'ß' = 'ss'")
+            .unwrap();
+        assert_eq!(
+            bin_eq.display_rows()[0],
+            vec!["0".to_string(), "0".to_string()]
+        );
+        let bin_miss = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert!(bin_miss.display_rows().is_empty());
     }
 
     #[test]

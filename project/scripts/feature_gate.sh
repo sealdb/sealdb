@@ -254,6 +254,7 @@ case "$FEATURE" in
       --json "$ROOT/project/features/leftover.json" \
       --check
     run execute-collation cargo test -q -p sealdb-session --lib test_set_names_and_ci_collation
+    run execute-unicode-weights cargo test -q -p sealdb-session --lib test_unicode_ci_weights_compare_and_order
     ;;
 esac
 

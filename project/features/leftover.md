@@ -27,7 +27,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### C5
 
-- `unicode-weights`
 - `gbk-latin1`
 - `only-full-group-by`
 - `set-global`
@@ -144,5 +143,5 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).
 - C3: TiKV cross-cluster and MDL stay open.
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
-- C5: unicode-weights / gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open.
+- C5: gbk-latin1 / only-full-group-by / set-global / leftover collation suites stay open (unicode-weights MVB done).
 - C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.

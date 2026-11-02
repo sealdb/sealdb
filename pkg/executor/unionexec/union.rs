@@ -4,7 +4,7 @@
 // op. Parallel child drain: SEALDB_UNION_CONCURRENCY (default 1).
 use crate::internal::exec::Executor;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
-use sealdb_expression::{collation_ci, with_collation_ci};
+use sealdb_expression::{collation_mode, with_collation};
 use sealdb_parser::ast::SetOprType;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -100,10 +100,10 @@ fn collect_pair(
     if workers <= 1 {
         return drain_serial(left, right);
     }
-    let ci = collation_ci();
+    let mode = collation_mode();
     thread::scope(|s| {
-        let left_h = s.spawn(|| with_collation_ci(ci, || drain_child(left)));
-        let right_h = s.spawn(|| with_collation_ci(ci, || drain_child(right)));
+        let left_h = s.spawn(|| with_collation(mode, || drain_child(left)));
+        let right_h = s.spawn(|| with_collation(mode, || drain_child(right)));
         let left = left_h
             .join()
             .map_err(|_| Error::new(ERR_UNKNOWN_ERROR, "parallel union worker panicked"))??;
