@@ -670,7 +670,7 @@
       "status": "partial",
       "rust": "pkg/executor/join/apply.rs",
       "phase": 8,
-      "notes": "serial NestedLoopApplyExec; parallel apply deferred"
+      "notes": "NestedLoopApplyExec plus SEALDB_APPLY_CONCURRENCY workers"
     },
     "pkg/sessiontxn/interface.go": {
       "status": "reimplemented",

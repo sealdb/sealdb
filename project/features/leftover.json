@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F14": [
-      "parallel-apply",
       "semi-anti-rewrite"
     ],
     "F15": [

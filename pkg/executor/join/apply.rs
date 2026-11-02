@@ -1,12 +1,12 @@
 // F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
-// Completeness wave / not this feature: parallel apply, semi/anti rewrite,
-// subquery JOIN. Derived tables flatten to CTEs. SELECT-list scalar
-// subqueries reuse SubqueryEvalCtx from ProjectionExec.
+// Parallel apply: SEALDB_APPLY_CONCURRENCY workers (default 1). Completeness
+// wave / not this feature: semi/anti rewrite, subquery JOIN. Derived tables
+// flatten to CTEs. SELECT-list scalar subqueries reuse SubqueryEvalCtx.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
-use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, Error, Result};
-use sealdb_expression::{eval_expr_with_row, eval_filter};
+use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, ERR_UNKNOWN_ERROR, Error, Result};
+use sealdb_expression::{collation_ci, eval_expr_with_row, eval_filter, with_collation_ci};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
@@ -20,6 +20,7 @@ use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::thread;
 
 pub struct NestedLoopApplyExec {
     filter: ExprNode,
@@ -60,24 +61,21 @@ impl Executor for NestedLoopApplyExec {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;
         self.schema = self.child.schema().to_vec();
-        let mut cache = HashMap::new();
+        let mut outer = Vec::new();
         while let Some(chunk) = self.child.next()? {
             for i in 0..chunk.num_rows() {
-                let row = chunk.get_row(i);
-                let ctx = ApplyCtx {
-                    domain: Arc::clone(&self.domain),
-                    current_db: self.current_db.clone(),
-                    txn: Arc::clone(&self.txn),
-                    outer_table: self.outer_table.clone(),
-                    outer_schema: self.schema.clone(),
-                    outer_row: row.clone(),
-                };
-                let rewritten = materialize(&self.filter, &ctx, &mut cache)?;
-                if eval_filter(&rewritten, &self.schema, &row)? {
-                    self.rows.push(row);
-                }
+                outer.push(chunk.get_row(i));
             }
         }
+        self.rows = filter_outer_rows(
+            outer,
+            &self.filter,
+            &self.schema,
+            &self.domain,
+            &self.current_db,
+            &self.txn,
+            &self.outer_table,
+        )?;
         Ok(())
     }
 
@@ -100,6 +98,106 @@ impl Executor for NestedLoopApplyExec {
     fn schema(&self) -> &[String] {
         &self.schema
     }
+}
+
+/// Worker count for NestedLoopApply. Default 1 (serial); set
+/// `SEALDB_APPLY_CONCURRENCY` to fan out outer rows across threads.
+fn apply_concurrency() -> usize {
+    std::env::var("SEALDB_APPLY_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1)
+}
+
+fn filter_outer_rows(
+    rows: Vec<Vec<Datum>>,
+    filter: &ExprNode,
+    schema: &[String],
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+    outer_table: &Option<String>,
+) -> Result<Vec<Vec<Datum>>> {
+    let workers = apply_concurrency().min(rows.len().max(1));
+    if workers <= 1 {
+        return filter_outer_rows_serial(
+            rows,
+            filter,
+            schema,
+            domain,
+            current_db,
+            txn,
+            outer_table,
+        );
+    }
+    let chunk_len = rows.len().div_ceil(workers);
+    let mut parts = Vec::new();
+    let mut rest = rows;
+    while !rest.is_empty() {
+        let take = chunk_len.min(rest.len());
+        parts.push(rest.drain(..take).collect::<Vec<_>>());
+    }
+    let ci = collation_ci();
+    let mut handles = Vec::with_capacity(parts.len());
+    for part in parts {
+        let filter = filter.clone();
+        let schema = schema.to_vec();
+        let domain = Arc::clone(domain);
+        let current_db = current_db.to_string();
+        let txn = Arc::clone(txn);
+        let outer_table = outer_table.clone();
+        handles.push(thread::spawn(move || {
+            with_collation_ci(ci, || {
+                filter_outer_rows_serial(
+                    part,
+                    &filter,
+                    &schema,
+                    &domain,
+                    &current_db,
+                    &txn,
+                    &outer_table,
+                )
+            })
+        }));
+    }
+    let mut out = Vec::new();
+    for handle in handles {
+        out.extend(
+            handle
+                .join()
+                .map_err(|_| Error::new(ERR_UNKNOWN_ERROR, "parallel apply worker panicked"))??,
+        );
+    }
+    Ok(out)
+}
+
+fn filter_outer_rows_serial(
+    rows: Vec<Vec<Datum>>,
+    filter: &ExprNode,
+    schema: &[String],
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+    outer_table: &Option<String>,
+) -> Result<Vec<Vec<Datum>>> {
+    let mut cache = HashMap::new();
+    let mut kept = Vec::new();
+    for row in rows {
+        let ctx = ApplyCtx {
+            domain: Arc::clone(domain),
+            current_db: current_db.to_string(),
+            txn: Arc::clone(txn),
+            outer_table: outer_table.clone(),
+            outer_schema: schema.to_vec(),
+            outer_row: row.clone(),
+        };
+        let rewritten = materialize(filter, &ctx, &mut cache)?;
+        if eval_filter(&rewritten, schema, &row)? {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 struct ApplyCtx {
