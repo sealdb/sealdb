@@ -110,6 +110,19 @@
 
 ### 2026-11-03
 
+- **Phase**: 完整性波 C4（create-binding）
+- **完成**:
+  - `CREATE BINDING FOR … USING …` / `DROP BINDING FOR …` / `SHOW BINDINGS`
+  - Domain-shared `sealdb-bindinfo` 内存绑定；SELECT 按规范化 restored SQL 命中后替换为 bind SQL
+  - C4 gate `execute-binding`；`status.json` 去掉 `create-binding`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_*binding*`
+  - `./project/scripts/feature_gate.sh C4`（含 leftover check）
+- **下一步**:
+  - C4 `shared-plan-cache` → `typed-placeholders`
+
+### 2026-11-03
+
 - **Phase**: 完整性波 C4（user-vars）
 - **完成**:
   - `SET @a` / `SELECT @a` / `EXECUTE … USING @a` 会话用户变量

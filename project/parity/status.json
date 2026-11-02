@@ -683,6 +683,24 @@
       "rust": "pkg/sessiontxn/txn_manager.rs",
       "phase": 6,
       "notes": "session-owned enter/commit/rollback; TiDB interface.go is the closest counterpart"
+    },
+    "pkg/bindinfo/binding.go": {
+      "status": "partial",
+      "rust": "pkg/bindinfo/binding.rs",
+      "phase": 10,
+      "notes": "Binding record + normalize_sql for CREATE/DROP/SHOW BINDING MVB"
+    },
+    "pkg/bindinfo/binding_cache.go": {
+      "status": "partial",
+      "rust": "pkg/bindinfo/binding_cache.rs",
+      "phase": 10,
+      "notes": "in-memory BindingCache keyed by normalized original SQL"
+    },
+    "pkg/bindinfo/session_handle.go": {
+      "status": "partial",
+      "rust": "pkg/bindinfo/session_handle.rs",
+      "phase": 10,
+      "notes": "Domain-shared SessionBindingHandle for create/drop/match/show"
     }
   }
 }

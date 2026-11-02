@@ -5,10 +5,10 @@ use super::ddl::{
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
-    DropRoleStmt, DropUserStmt, ExecuteStmt, GrantRoleStmt, GrantStmt, PrepareStmt,
-    ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetRoleStmt,
-    SetStmt, SetTxnStmt, ShowStmt, UseStmt,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
+    DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantRoleStmt,
+    GrantStmt, PrepareStmt, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt,
+    SavepointStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -58,6 +58,8 @@ pub enum Statement {
     Prepare(PrepareStmt),
     Execute(ExecuteStmt),
     Deallocate(DeallocateStmt),
+    CreateBinding(CreateBindingStmt),
+    DropBinding(DropBindingStmt),
     Set(SetStmt),
 }
 
@@ -98,6 +100,8 @@ impl Node for Statement {
             Statement::Prepare(s) => s.restore(ctx),
             Statement::Execute(s) => s.restore(ctx),
             Statement::Deallocate(s) => s.restore(ctx),
+            Statement::CreateBinding(s) => s.restore(ctx),
+            Statement::DropBinding(s) => s.restore(ctx),
             Statement::Set(s) => s.restore(ctx),
         }
     }
@@ -140,6 +144,8 @@ impl StmtNode for Statement {
             Statement::Prepare(_) => "PrepareStmt",
             Statement::Execute(_) => "ExecuteStmt",
             Statement::Deallocate(_) => "DeallocateStmt",
+            Statement::CreateBinding(_) => "CreateBindingStmt",
+            Statement::DropBinding(_) => "DropBindingStmt",
             Statement::Set(_) => "SetStmt",
         }
     }

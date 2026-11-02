@@ -1,3 +1,4 @@
+use sealdb_bindinfo::SessionBindingHandle;
 use sealdb_ddl::execute_ddl;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_infoschema::InfoSchema;
@@ -19,6 +20,8 @@ pub struct Domain {
     storage: Arc<dyn Storage>,
     privilege: Arc<Manager>,
     stats: Arc<Handle>,
+    /// Domain-shared SQL bindings (`CREATE BINDING` / `SHOW BINDINGS`).
+    bind_handle: SessionBindingHandle,
 }
 
 struct Inner {
@@ -93,11 +96,17 @@ impl Domain {
             storage,
             privilege: Arc::new(privilege),
             stats,
+            bind_handle: SessionBindingHandle::new(),
         })
     }
 
     pub fn privilege(&self) -> Arc<Manager> {
         Arc::clone(&self.privilege)
+    }
+
+    /// Shared SQL binding handle (TiDB bindinfo session/global handle, MVB Domain-shared).
+    pub fn bind_handle(&self) -> &SessionBindingHandle {
+        &self.bind_handle
     }
 
     /// Persist grant tables (TiDB mysql.user / db / tables_priv) to Storage.

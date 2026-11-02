@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 177,
-  "manifest_entries": 126,
+  "rs_files": 180,
+  "manifest_entries": 129,
   "status_counts": {
-    "not-started": 1555,
-    "partial": 119,
+    "not-started": 1552,
+    "partial": 122,
     "reimplemented": 4,
     "ported": 3
   },
@@ -87,10 +87,11 @@
     },
     "pkg/bindinfo": {
       "go": 10,
-      "rs": 0,
-      "missing": 10,
+      "rs": 3,
+      "missing": 7,
       "status": {
-        "not-started": 10
+        "partial": 3,
+        "not-started": 7
       }
     },
     "pkg/config": {
@@ -555,17 +556,17 @@
     },
     {
       "go_path": "pkg/bindinfo/binding.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/bindinfo/binding.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "Binding record + normalize_sql for CREATE/DROP/SHOW BINDING MVB"
     },
     {
       "go_path": "pkg/bindinfo/binding_cache.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/bindinfo/binding_cache.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "in-memory BindingCache keyed by normalized original SQL"
     },
     {
       "go_path": "pkg/bindinfo/binding_match.go",
@@ -611,10 +612,10 @@
     },
     {
       "go_path": "pkg/bindinfo/session_handle.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/bindinfo/session_handle.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "Domain-shared SessionBindingHandle for create/drop/match/show"
     },
     {
       "go_path": "pkg/bindinfo/util.go",

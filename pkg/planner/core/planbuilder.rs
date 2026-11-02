@@ -194,6 +194,12 @@ impl PlanBuilder {
             Statement::Deallocate(_) => Ok(PhysicalPlan::Simple {
                 kind: "Deallocate".to_string(),
             }),
+            Statement::CreateBinding(_) => Ok(PhysicalPlan::Simple {
+                kind: "CreateBinding".to_string(),
+            }),
+            Statement::DropBinding(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropBinding".to_string(),
+            }),
             Statement::Set(_) => Ok(PhysicalPlan::Simple {
                 kind: "Set".to_string(),
             }),

@@ -1726,6 +1726,7 @@ version = "0.1.0"
 name = "sealdb-domain"
 version = "0.1.0"
 dependencies = [
+ "sealdb-bindinfo",
  "sealdb-ddl",
  "sealdb-errno",
  "sealdb-infoschema",
@@ -1895,6 +1896,7 @@ dependencies = [
 name = "sealdb-session"
 version = "0.1.0"
 dependencies = [
+ "sealdb-bindinfo",
  "sealdb-config",
  "sealdb-domain",
  "sealdb-errno",

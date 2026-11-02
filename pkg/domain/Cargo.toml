@@ -9,6 +9,7 @@ license.workspace = true
 path = "lib.rs"
 
 [dependencies]
+sealdb-bindinfo.workspace = true
 sealdb-ddl.workspace = true
 sealdb-errno.workspace = true
 sealdb-infoschema.workspace = true
