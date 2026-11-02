@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F17": [
-      "cte-in-dml",
       "shared-cte-storage"
     ],
     "F18": [

@@ -2,6 +2,7 @@
 // F13: pessimistic UPDATE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: n-table UPDATE, UPDATE FROM, comma joins,
 // RETURNING (not in TiDB v8.5.8 / MySQL 8.0), MySQL-protocol affected-row counts.
+use crate::cte::eval_named_cte;
 use crate::index::{delete_index_keys, write_index_keys};
 use crate::internal::exec::Executor;
 use crate::join::hash_join_v1::hash_join_pairs;
@@ -13,7 +14,7 @@ use sealdb_expression::{eval_expr_with_row, eval_filter};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::{Assignment, Join, UpdateStmt};
+use sealdb_parser::ast::{Assignment, Join, UpdateStmt, WithClause};
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -108,26 +109,24 @@ impl Executor for UpdateExec {
 impl UpdateExec {
     /// `UPDATE t1 JOIN t2 ON ... SET ...`: join, assign, coalesce by handle, write.
     fn update_join(&mut self, join: &Join) -> Result<()> {
-        let left = load_table(&self.domain, &self.current_db, &join.left)?;
-        let right = load_table(&self.domain, &self.current_db, &join.right)?;
-        let left_names = col_names(&left);
-        let right_names = col_names(&right);
-        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
         let lock = dml_row_lock(&self.txn)?;
-        let left_rows = scan_table(
+        let (left_names, left_rows, left_info) = scan_dml_side(
+            &self.domain,
+            &self.current_db,
             &self.txn,
-            &left,
+            self.stmt.with.as_ref(),
+            &join.left,
             lock,
-            LockWait::Block,
-            &left.prune_partitions(None),
         )?;
-        let right_rows = scan_table(
+        let (right_names, right_rows, right_info) = scan_dml_side(
+            &self.domain,
+            &self.current_db,
             &self.txn,
-            &right,
+            self.stmt.with.as_ref(),
+            &join.right,
             lock,
-            LockWait::Block,
-            &right.prune_partitions(None),
         )?;
+        let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
@@ -153,13 +152,17 @@ impl UpdateExec {
                 left_new.as_deref_mut(),
                 right_new.as_deref_mut(),
             )?;
-            if let (Some(scanned), Some(values)) = (left_row, left_new) {
+            if left_info.is_some()
+                && let (Some(scanned), Some(values)) = (left_row, left_new)
+            {
                 left_updates.insert(
                     (scanned.physical_id, scanned.handle),
                     (scanned.clone(), values),
                 );
             }
-            if let (Some(scanned), Some(values)) = (right_row, right_new) {
+            if right_info.is_some()
+                && let (Some(scanned), Some(values)) = (right_row, right_new)
+            {
                 right_updates.insert(
                     (scanned.physical_id, scanned.handle),
                     (scanned.clone(), values),
@@ -167,15 +170,56 @@ impl UpdateExec {
             }
         }
         self.txn.with_txn(|txn| {
-            for (_, (scanned, values)) in left_updates {
-                apply_row_update(txn, &left, &scanned, values)?;
+            if let Some(left) = &left_info {
+                for (_, (scanned, values)) in left_updates {
+                    apply_row_update(txn, left, &scanned, values)?;
+                }
             }
-            for (_, (scanned, values)) in right_updates {
-                apply_row_update(txn, &right, &scanned, values)?;
+            if let Some(right) = &right_info {
+                for (_, (scanned, values)) in right_updates {
+                    apply_row_update(txn, right, &scanned, values)?;
+                }
             }
             Ok(())
         })
     }
+}
+
+/// Scan a base table or materialize a CTE for UPDATE/DELETE JOIN.
+pub(crate) fn scan_dml_side(
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+    with: Option<&WithClause>,
+    table: &TableName,
+    lock: RowLock,
+) -> Result<(Vec<String>, Vec<ScannedRow>, Option<TableInfo>)> {
+    if let Some(with) = with
+        && with.find(&table.name).is_some()
+    {
+        let out = eval_named_cte(&table.name, with, domain, current_db, txn)?;
+        let rows = out
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, values)| ScannedRow {
+                handle: i as i64,
+                physical_id: 0,
+                values,
+            })
+            .collect();
+        return Ok((out.columns, rows, None));
+    }
+    let info = load_table(domain, current_db, table)?;
+    let names = col_names(&info);
+    let rows = scan_table(
+        txn,
+        &info,
+        lock,
+        LockWait::Block,
+        &info.prune_partitions(None),
+    )?;
+    Ok((names, rows, Some(info)))
 }
 
 /// Resolve `schema.table` against the session infoschema.

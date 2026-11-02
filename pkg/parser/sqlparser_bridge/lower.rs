@@ -281,6 +281,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 columns,
                 rows,
                 select,
+                with: None,
             }))
         }
         SqlStatement::Update(update) => lower_update(update),
@@ -1565,23 +1566,49 @@ fn lower_query_stmt(query: &Query) -> Result<Statement> {
                 return Err(Error::unsupported("nested WITH"));
             }
             let mut stmt = lower_query_stmt(inner)?;
-            if let Some(with) = with {
-                match &mut stmt {
-                    Statement::Select(select) if select.with.is_none() => select.with = Some(with),
-                    Statement::SetOpr(set) if set.with.is_none() => set.with = Some(with),
-                    Statement::Select(_) | Statement::SetOpr(_) => {
-                        return Err(Error::unsupported("nested WITH"));
-                    }
-                    _ => return Err(Error::unsupported("WITH on non-SELECT")),
-                }
-            }
+            attach_dml_with(&mut stmt, with)?;
             Ok(stmt)
+        }
+        SetExpr::Insert(stmt) | SetExpr::Update(stmt) | SetExpr::Delete(stmt) => {
+            let mut lowered = lower_statement(stmt)?;
+            attach_dml_with(&mut lowered, with)?;
+            Ok(lowered)
         }
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
         )),
     }
+}
+
+/// Attach a statement-level `WITH` to INSERT/UPDATE/DELETE (and SELECT).
+fn attach_dml_with(stmt: &mut Statement, with: Option<WithClause>) -> Result<()> {
+    let Some(with) = with else {
+        return Ok(());
+    };
+    match stmt {
+        Statement::Select(select) if select.with.is_none() => select.with = Some(with),
+        Statement::SetOpr(set) if set.with.is_none() => set.with = Some(with),
+        Statement::Insert(insert) if insert.with.is_none() => {
+            if let Some(select) = insert.select.as_mut() {
+                if select.with.is_none() {
+                    select.with = Some(with.clone());
+                } else {
+                    return Err(Error::unsupported("nested WITH"));
+                }
+            }
+            insert.with = Some(with);
+        }
+        Statement::Update(update) if update.with.is_none() => update.with = Some(with),
+        Statement::Delete(delete) if delete.with.is_none() => delete.with = Some(with),
+        Statement::Select(_)
+        | Statement::SetOpr(_)
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_) => return Err(Error::unsupported("nested WITH")),
+        _ => return Err(Error::unsupported("WITH on non-SELECT")),
+    }
+    Ok(())
 }
 
 fn lower_set_opr(query: &Query) -> Result<SetOprStmt> {
@@ -2107,6 +2134,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
         selection: update.selection.as_ref().map(lower_expr).transpose()?,
         order_by,
         limit,
+        with: None,
     }))
 }
 
@@ -2172,6 +2200,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
         selection: delete.selection.as_ref().map(lower_expr).transpose()?,
         order_by,
         limit,
+        with: None,
     }))
 }
 

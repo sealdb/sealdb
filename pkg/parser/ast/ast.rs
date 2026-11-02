@@ -135,6 +135,9 @@ impl Statement {
         match self {
             Statement::Select(s) => s.with.as_ref(),
             Statement::SetOpr(s) => s.with.as_ref(),
+            Statement::Insert(s) => s.with.as_ref(),
+            Statement::Update(s) => s.with.as_ref(),
+            Statement::Delete(s) => s.with.as_ref(),
             Statement::Explain(s) => s.stmt.with_clause(),
             _ => None,
         }

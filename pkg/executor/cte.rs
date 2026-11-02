@@ -1,12 +1,16 @@
 // F17 core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
 // (TiDB pkg/executor/cte.go). Completeness wave / not this feature:
-// CTETableReader shared storage, CTE in DML.
+// CTETableReader shared storage.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
 use sealdb_kv::TxnHandle;
-use sealdb_parser::ast::{SelectStmt, SetOprType, Statement};
+use sealdb_parser::ast::ddl::TableName;
+use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+use sealdb_parser::ast::{
+    SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprType, Statement, WithClause,
+};
 use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -18,6 +22,37 @@ type CteWorking = (Vec<String>, Vec<Vec<Datum>>);
 
 thread_local! {
     static WORKING: RefCell<HashMap<String, CteWorking>> = RefCell::new(HashMap::new());
+}
+
+/// Evaluate `SELECT * FROM cte` against `with` (INSERT/UPDATE/DELETE JOIN sides).
+pub fn eval_named_cte(
+    name: &str,
+    with: &WithClause,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<QueryResult> {
+    let select = SelectStmt {
+        fields: vec![SelectField {
+            expr: ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(b"*".to_vec()),
+            }),
+            as_name: None,
+        }],
+        from: Some(TableName::new(None, name)),
+        joins: Vec::new(),
+        selection: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        lock: SelectLock::None,
+        lock_wait: SelectLockWait::Block,
+        with: Some(with.clone()),
+        text: String::new(),
+    };
+    run_select(&select, domain, current_db, txn)
 }
 
 /// Working rows for a recursive CTE, visible to TableReader as `FROM cte`.
