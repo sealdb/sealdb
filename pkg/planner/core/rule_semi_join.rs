@@ -75,8 +75,13 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             keys,
             child: Box::new(rewrite_semi_join(*child)),
         },
-        PhysicalPlan::Explain { format, child } => PhysicalPlan::Explain {
+        PhysicalPlan::Explain {
             format,
+            analyze,
+            child,
+        } => PhysicalPlan::Explain {
+            format,
+            analyze,
             child: Box::new(rewrite_semi_join(*child)),
         },
         other => other,
@@ -407,8 +412,13 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             keys,
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
-        PhysicalPlan::Explain { format, child } => PhysicalPlan::Explain {
+        PhysicalPlan::Explain {
             format,
+            analyze,
+            child,
+        } => PhysicalPlan::Explain {
+            format,
+            analyze,
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
         other => other,

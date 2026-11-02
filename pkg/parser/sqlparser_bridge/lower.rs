@@ -462,14 +462,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             options,
             ..
         } => {
-            if *analyze {
-                return Err(Error::unsupported("EXPLAIN ANALYZE"));
-            }
             if *query_plan || *estimate || options.is_some() {
                 return Err(Error::unsupported("EXPLAIN QUERY PLAN / ESTIMATE"));
             }
             Ok(Statement::Explain(ExplainStmt {
-                analyze: false,
+                analyze: *analyze,
                 format: lower_explain_format(*verbose, format.as_ref())?,
                 stmt: Box::new(lower_statement(statement)?),
             }))

@@ -264,7 +264,7 @@
       "status": "partial",
       "rust": "pkg/planner/core/explain.rs",
       "phase": 10,
-      "notes": "EXPLAIN row/json/dot tree; ANALYZE / cop task deferred"
+      "notes": "EXPLAIN row/json/dot/ANALYZE tree; per-op RuntimeStats / cop task deferred"
     },
     "pkg/planner/core/plan_cost_ver2.go": {
       "status": "partial",
@@ -431,7 +431,7 @@
       "status": "partial",
       "rust": "pkg/executor/explain.rs",
       "phase": 10,
-      "notes": "EXPLAIN resultset; EXPLAIN ANALYZE / FOR CONNECTION deferred"
+      "notes": "EXPLAIN + EXPLAIN ANALYZE resultset (root actRows/time); FOR CONNECTION deferred"
     },
     "pkg/executor/distsql.go": {
       "status": "partial",

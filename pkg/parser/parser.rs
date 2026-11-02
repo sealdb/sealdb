@@ -1369,10 +1369,14 @@ mod tests {
             }
             other => panic!("expected ExplainStmt, got {other:?}"),
         }
-        let err = parser
-            .parse_one_stmt("EXPLAIN ANALYZE SELECT 1")
-            .unwrap_err();
-        assert!(err.message.contains("ANALYZE"));
+        match parser.parse_one_stmt("EXPLAIN ANALYZE SELECT 1").unwrap() {
+            crate::ast::Statement::Explain(explain) => {
+                assert!(explain.analyze);
+                assert_eq!(explain.format, crate::ast::ExplainFormat::Row);
+                assert!(matches!(*explain.stmt, crate::ast::Statement::Select(_)));
+            }
+            other => panic!("expected ExplainStmt, got {other:?}"),
+        }
     }
 
     #[test]

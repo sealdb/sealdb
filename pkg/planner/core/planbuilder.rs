@@ -205,6 +205,7 @@ impl PlanBuilder {
             }),
             Statement::Explain(explain) => Ok(PhysicalPlan::Explain {
                 format: explain.format,
+                analyze: explain.analyze,
                 child: Box::new(self.build_with_schema(
                     &explain.stmt,
                     is,

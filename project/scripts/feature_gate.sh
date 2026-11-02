@@ -216,6 +216,7 @@ case "$FEATURE" in
       --json "$ROOT/project/features/leftover.json" \
       --check
     run execute-explain cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); EXPLAIN SELECT * FROM db1.t WHERE id = 1"
+    run execute-explain-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); EXPLAIN ANALYZE SELECT * FROM db1.t WHERE id = 1"
     ;;
   C3)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

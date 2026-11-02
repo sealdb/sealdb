@@ -10,7 +10,7 @@
     "explain-select-dual",
     "explain-format-json",
     "explain-format-dot",
-    "explain-analyze-unsupported",
+    "explain-analyze",
     "explain-table-reader",
     "explain-index-lookup-unanalyzed",
     "explain-skyline-table-reader",

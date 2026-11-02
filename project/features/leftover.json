@@ -42,7 +42,6 @@
       "leftover-suite-execution"
     ],
     "C2": [
-      "explain-analyze",
       "cop-task-rows",
       "n-table-dp",
       "index-merge-join",
