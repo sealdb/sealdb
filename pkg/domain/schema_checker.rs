@@ -1,7 +1,9 @@
-use sealdb_errno::{ERR_INFO_SCHEMA_CHANGED, Error, Result};
+use sealdb_errno::{ERR_INFO_SCHEMA_CHANGED, ERR_INFO_SCHEMA_EXPIRED, Error, Result};
 
 /// TiDB `domain.SchemaChecker`: reject DML/SELECT in an explicit txn
-/// after a concurrent DDL bumps the schema version.
+/// after a concurrent DDL bumps the schema version (8028).
+/// Schema lease expiry (8027) is checked via [`Domain::check_schema_lease`].
+/// Concurrent DDL vs DML on the same table is gated by Domain MDL.
 pub fn check(related_ver: i64, current_ver: i64) -> Result<()> {
     if related_ver != current_ver {
         return Err(Error::new(
@@ -10,6 +12,15 @@ pub fn check(related_ver: i64, current_ver: i64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// TiDB `ErrInfoSchemaExpired` (8027): local schema lease elapsed
+/// without a reload.
+pub fn expired() -> Error {
+    Error::new(
+        ERR_INFO_SCHEMA_EXPIRED,
+        "Information schema is out of date: schema failed to update in 1 lease, please make sure TiDB can connect to TiKV",
+    )
 }
 
 #[cfg(test)]

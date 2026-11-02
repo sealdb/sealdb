@@ -40,13 +40,6 @@
       "unmapped-stmts",
       "stale-gap-labels",
       "leftover-suite-execution"
-    ],
-    "C3": [
-      "tikv-cross-cluster",
-      "mdl",
-      "schema-lease",
-      "serializable",
-      "savepoint"
     ]
   },
   "open_stmts": [

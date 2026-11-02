@@ -5,5 +5,6 @@ pub mod txn_manager;
 
 pub use isolation::{
     OptimisticTxnContextProvider, PessimisticRRTxnContextProvider, ReadCommittedTxnContextProvider,
+    SerializableTxnContextProvider,
 };
 pub use txn_manager::TxnManager;

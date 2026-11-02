@@ -2008,6 +2008,10 @@ fn txn_chars(modes: &[TransactionMode]) -> Result<TxnChars> {
             TransactionMode::IsolationLevel(TransactionIsolationLevel::RepeatableRead) => {
                 isolation = Some(IsolationLevel::RepeatableRead);
             }
+            TransactionMode::IsolationLevel(TransactionIsolationLevel::Serializable) => {
+                // C3 MVB: accept SERIALIZABLE; session maps to RR semantics.
+                isolation = Some(IsolationLevel::Serializable);
+            }
             TransactionMode::IsolationLevel(other) => {
                 return Err(Error::unsupported(format!("ISOLATION LEVEL {other}")));
             }

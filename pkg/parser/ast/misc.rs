@@ -567,6 +567,8 @@ pub enum IsolationLevel {
     ReadCommitted,
     #[default]
     RepeatableRead,
+    /// Accepted; SealDB maps to RR snapshot semantics (C3 MVB).
+    Serializable,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -616,6 +618,7 @@ fn restore_txn_chars(
         ctx.write_str(match isolation {
             IsolationLevel::ReadCommitted => "READ COMMITTED",
             IsolationLevel::RepeatableRead => "REPEATABLE READ",
+            IsolationLevel::Serializable => "SERIALIZABLE",
         });
     }
     if let Some(read_only) = read_only {

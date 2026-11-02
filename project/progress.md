@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C5 leftover collation suites MVB；完整性波 C4=[] → C2=[] → C5=[]）  
+> 最后更新：2026-11-03（C3 gaps 收口：MDL / schema-lease / SERIALIZABLE→RR / SAVEPOINT / TiKV same-cluster；C6 deferred）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -33,7 +33,7 @@
 | 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
 | 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
 | 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
-| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；C4/C2/C5 gaps `[]`；C3/C1 仍开；C6 deferred |
+| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；C2/C3/C4/C5 gaps `[]`；C1 仍开；C6 deferred |
 
 ### 2.1 功能波进度
 
@@ -600,6 +600,21 @@
   - `./project/scripts/feature_gate.sh C3`
 - **下一步**:
   - C4 Prepared / Plan Cache / Binding
+
+### 2026-11-03
+
+- **Phase**: C3 completeness gaps 收口
+- **完成**:
+  - Domain 内存 MDL：同表 DML shared vs DDL exclusive（冲突 1205）
+  - schema lease + `reload_schema_from_storage`（过期 8027）
+  - `SERIALIZABLE` 语法接受，MVB 映射 RR 快照
+  - SAVEPOINT 确认已由 F12 覆盖并纳入 C3 gate
+  - TiKV same-cluster 跨会话：`SEALDB_TIKV=1` 时跑，否则 skip（不做假 multi-PD）
+  - `gaps: []`
+- **验证**:
+  - `./project/scripts/feature_gate.sh C3`
+- **下一步**:
+  - C1 leftover 分母 / C6 仍 deferred
 
 ### 2026-11-01
 

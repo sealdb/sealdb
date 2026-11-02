@@ -486,7 +486,19 @@
     "pkg/domain/domain.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "owns meta + infoschema + Arc<dyn Storage>; MemStorage default"
+      "notes": "owns meta + infoschema + Arc<dyn Storage> + MDL + schema lease/reload; MemStorage default"
+    },
+    "pkg/ddl/table_lock.go": {
+      "status": "partial",
+      "rust": "pkg/domain/mdl.rs",
+      "phase": 10,
+      "notes": "in-memory metadata lock table (DML shared vs DDL exclusive); wait queue deferred"
+    },
+    "pkg/domain/schema_validator.go": {
+      "status": "partial",
+      "rust": "pkg/domain/domain.rs",
+      "phase": 10,
+      "notes": "schema lease Duration + check 8027 + reload_schema_from_storage MVB on Domain"
     },
     "pkg/executor/builder.go": {
       "status": "partial",
@@ -679,7 +691,13 @@
       "status": "partial",
       "rust": "pkg/domain/schema_checker.rs",
       "phase": 10,
-      "notes": "reject explicit-txn DML after concurrent DDL; MDL deferred"
+      "notes": "reject explicit-txn DML after concurrent DDL (8028); Domain MDL + schema lease 8027"
+    },
+    "pkg/sessiontxn/isolation/serializable.go": {
+      "status": "partial",
+      "rust": "pkg/sessiontxn/isolation/serializable.rs",
+      "phase": 10,
+      "notes": "SERIALIZABLE accepted; MVB maps to RR snapshot (not TiDB pessimistic SI)"
     },
     "pkg/executor/window.go": {
       "status": "partial",

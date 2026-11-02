@@ -12,6 +12,7 @@ and marked on `pkg/kv/kv.rs` / `pkg/store/driver/mod.rs` /
 
 - CREATE INDEX / ALTER backfill KV on ROLLBACK (F18)
 - Causal consistency / SET TRANSACTION SNAPSHOT / AS OF
-- SERIALIZABLE / READ UNCOMMITTED
+- READ UNCOMMITTED
 - Optimistic retry, pipelined DML, 2PC against live TiKV TSO
 - TiKV SAVEPOINT
+- True TiDB pessimistic SERIALIZABLE / SI (C3 accepts SERIALIZABLE as RR MVB)

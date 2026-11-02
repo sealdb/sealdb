@@ -4,6 +4,7 @@
   "source": [
     "TiDB pkg/domain/schema_checker.go",
     "TiDB pkg/sessiontxn/isolation/readcommitted.go",
+    "TiDB pkg/sessiontxn/isolation/serializable.go",
     "TiDB tests/integrationtest/t/db_integration.test"
   ],
   "cases": [
@@ -13,7 +14,11 @@
     "rc-cross-session-sees-commit",
     "set-transaction-isolation",
     "start-transaction-read-committed",
-    "serializable-unsupported",
+    "serializable-maps-to-rr",
+    "mdl-blocks-concurrent-ddl",
+    "schema-lease-8027-reload",
+    "savepoint-f12",
+    "tikv-same-cluster-cross-session",
     "write-conflict-still-9007"
   ]
 }
