@@ -130,7 +130,7 @@ impl Executor for IndexLookUpExecutor {
                         txn.get(row_key.as_bytes())?
                     };
                     if let Some(raw) = raw {
-                        let decoded = decode_row(&raw);
+                        let decoded = decode_row(&raw, &info.col_field_types());
                         rows.push(
                             info.columns
                                 .iter()

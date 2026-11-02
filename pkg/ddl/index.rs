@@ -158,7 +158,7 @@ fn backfill_index(storage: &dyn Storage, info: &TableInfo, index: &IndexInfo) ->
         let pairs = txn.scan(start.as_bytes(), &end)?;
         for (key, raw) in pairs {
             let handle = decode_handle_from_row_key(&key)?;
-            let decoded = decode_row(&raw);
+            let decoded = decode_row(&raw, &info.col_field_types());
             let values: Vec<Datum> = info
                 .columns
                 .iter()
