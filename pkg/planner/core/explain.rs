@@ -116,6 +116,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Selection { child, .. }
         | PhysicalPlan::Sort { child }
+        | PhysicalPlan::TopN { child }
         | PhysicalPlan::Limit { child }
         | PhysicalPlan::HashAgg { child }
         | PhysicalPlan::StreamAgg { child }
@@ -228,6 +229,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             filter.restore_string(),
         ),
         PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
+        PhysicalPlan::TopN { .. } => ("TopN".to_string(), String::new(), String::new()),
         PhysicalPlan::Limit { .. } => ("Limit".to_string(), String::new(), String::new()),
         PhysicalPlan::HashAgg { .. } => ("HashAgg".to_string(), String::new(), String::new()),
         PhysicalPlan::StreamAgg { .. } => ("StreamAgg".to_string(), String::new(), String::new()),
@@ -272,7 +274,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::IndexReader {
             pushed: Some(_), ..
         } => 8_000.0,
-        PhysicalPlan::Limit { child } => est_rows(child).min(1.0),
+        PhysicalPlan::Limit { child } | PhysicalPlan::TopN { child } => est_rows(child).min(1.0),
         PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
         PhysicalPlan::Union { left, right, .. } => est_rows(left) + est_rows(right),
         PhysicalPlan::Projection { child, .. }

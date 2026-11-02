@@ -76,6 +76,9 @@ pub enum PhysicalPlan {
     Sort {
         child: Box<PhysicalPlan>,
     },
+    TopN {
+        child: Box<PhysicalPlan>,
+    },
     Limit {
         child: Box<PhysicalPlan>,
     },
@@ -199,6 +202,7 @@ impl PhysicalPlan {
             } => index_plan_name("IndexReader", table, index, partitions, pushed.as_ref()),
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
+            PhysicalPlan::TopN { child } => format!("TopN -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
             PhysicalPlan::StreamAgg { child } => format!("StreamAgg -> {}", child.explain()),

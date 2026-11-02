@@ -14,7 +14,7 @@ use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
 use crate::select::{LimitExec, MemTableExec, SelectionExec, TableDualExec};
 use crate::show::ShowExec;
-use crate::sortexec::SortExec;
+use crate::sortexec::{SortExec, TopNExec};
 use crate::table_reader::TableReaderExec;
 use crate::unionexec::UnionExec;
 use crate::update::UpdateExec;
@@ -61,6 +61,19 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 Ok(Box::new(SortExec::new(
                     by,
+                    Self::build(child, stmt, domain, current_db, txn)?,
+                )))
+            }
+            PhysicalPlan::TopN { child } => {
+                let by = stmt_order_by(stmt)
+                    .ok_or_else(|| Error::unsupported("topn without ORDER BY"))?;
+                let (limit, offset) =
+                    stmt_limit(stmt).ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
+                let limit = limit.ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
+                Ok(Box::new(TopNExec::new(
+                    by,
+                    limit,
+                    offset,
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }

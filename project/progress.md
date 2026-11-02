@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F05 leftover（topn-spill）
+- **完成**:
+  - ORDER BY + LIMIT 走 TopN 堆；LIMIT 大于内存行阈值时 spill 有序 run 并只 merge 前 N 行
+  - 无 LIMIT 的 ORDER BY 仍走 Sort
+- **验证**:
+  - executor TopN heap vs spill；F05 gate execute-topn / execute-topn-spill
+- **下一步**:
+  - leftover F05 parallel-sort
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F06 leftover（batch-point-get）
 - **完成**:
   - handle / unique-index `IN (...)` uses BatchPointGet; single-value IN stays PointGet

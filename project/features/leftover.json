@@ -44,7 +44,6 @@
       "rowcodec"
     ],
     "F05": [
-      "topn-spill",
       "parallel-sort"
     ],
     "F07": [
