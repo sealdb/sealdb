@@ -146,13 +146,17 @@ impl IndexDef {
 pub enum PartitionType {
     Range,
     Hash,
+    List,
+    Key,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartitionDef {
     pub name: String,
-    /// RANGE bound; `None` means MAXVALUE. Unused for HASH.
+    /// RANGE bound; `None` means MAXVALUE. Unused for HASH/KEY/LIST.
     pub less_than: Option<i64>,
+    /// LIST `VALUES IN (...)` integers.
+    pub in_values: Vec<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,11 +209,13 @@ impl CreateTableStmt {
             match part.tp {
                 PartitionType::Range => ctx.write_str("RANGE"),
                 PartitionType::Hash => ctx.write_str("HASH"),
+                PartitionType::List => ctx.write_str("LIST"),
+                PartitionType::Key => ctx.write_str("KEY"),
             }
             ctx.write_str(" (");
             ctx.write_name(&part.column);
             ctx.write_str(")");
-            if part.tp == PartitionType::Hash && part.defs.is_empty() {
+            if matches!(part.tp, PartitionType::Hash | PartitionType::Key) && part.defs.is_empty() {
                 ctx.write_str(" PARTITIONS ");
                 ctx.write_str(&part.num.to_string());
             } else {
@@ -225,6 +231,15 @@ impl CreateTableStmt {
                         match def.less_than {
                             Some(v) => ctx.write_str(&v.to_string()),
                             None => ctx.write_str("MAXVALUE"),
+                        }
+                        ctx.write_str(")");
+                    } else if part.tp == PartitionType::List {
+                        ctx.write_str(" VALUES IN (");
+                        for (j, v) in def.in_values.iter().enumerate() {
+                            if j > 0 {
+                                ctx.write_str(", ");
+                            }
+                            ctx.write_str(&v.to_string());
                         }
                         ctx.write_str(")");
                     }

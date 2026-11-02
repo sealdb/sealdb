@@ -168,6 +168,7 @@ case "$FEATURE" in
     ;;
   F19)
     run execute-partition cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.t VALUES (1, 'a'), (15, 'b'); SELECT * FROM db1.t WHERE id < 10"
+    run execute-list-key cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.l (id INT, name VARCHAR(20)) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (10)); INSERT INTO db1.l VALUES (1, 'a'), (10, 'b'); SELECT * FROM db1.l WHERE id = 10; CREATE TABLE db1.k (id INT, name VARCHAR(20)) PARTITION BY KEY (id) PARTITIONS 4; INSERT INTO db1.k VALUES (5, 'z'); SELECT * FROM db1.k WHERE id = 5"
     ;;
   F20)
     run execute-grant cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"

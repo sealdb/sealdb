@@ -13,15 +13,20 @@ use serde::{Deserialize, Serialize};
 pub enum PartitionType {
     Range,
     Hash,
+    List,
+    Key,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionDefinition {
     pub id: i64,
     pub name: CIStr,
-    /// RANGE bound as a decimal string, or `MAXVALUE`. Empty for HASH.
+    /// RANGE bound as a decimal string, or `MAXVALUE`. Empty for HASH/KEY.
     #[serde(rename = "less_than", default)]
     pub less_than: Vec<String>,
+    /// LIST `VALUES IN` integers. Empty for RANGE/HASH/KEY.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_values: Vec<i64>,
 }
 
 impl PartitionDefinition {
@@ -30,7 +35,13 @@ impl PartitionDefinition {
             id,
             name: CIStr::new(name),
             less_than,
+            in_values: Vec::new(),
         }
+    }
+
+    pub fn with_in_values(mut self, values: Vec<i64>) -> Self {
+        self.in_values = values;
+        self
     }
 
     pub fn is_maxvalue(&self) -> bool {
@@ -48,7 +59,7 @@ impl PartitionDefinition {
 }
 
 /// TiDB `model.PartitionInfo` core fields used by F19.
-/// Completeness wave: LIST/KEY, RANGE COLUMNS, subpartition, reorg states.
+/// Completeness wave: RANGE COLUMNS, subpartition, reorg states.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionInfo {
     #[serde(rename = "type")]
@@ -95,7 +106,8 @@ impl PartitionInfo {
     pub fn locate(&self, value: &Datum) -> Result<i64> {
         match self.tp {
             PartitionType::Range => self.locate_range(value),
-            PartitionType::Hash => self.locate_hash(value),
+            PartitionType::Hash | PartitionType::Key => self.locate_hash(value),
+            PartitionType::List => self.locate_list(value),
         }
     }
 
@@ -136,6 +148,24 @@ impl PartitionInfo {
         let n = self.definitions.len() as i64;
         let idx = ((v % n) + n) % n;
         Ok(self.definitions[idx as usize].id)
+    }
+
+    fn locate_list(&self, value: &Datum) -> Result<i64> {
+        if matches!(value, Datum::Null) {
+            return self
+                .definitions
+                .first()
+                .map(|d| d.id)
+                .ok_or_else(no_partition);
+        }
+        let Some(v) = datum_i64(value) else {
+            return Err(no_partition());
+        };
+        self.definitions
+            .iter()
+            .find(|def| def.in_values.contains(&v))
+            .map(|def| def.id)
+            .ok_or_else(no_partition)
     }
 
     pub fn prune(&self, selection: Option<&ExprNode>) -> Vec<i64> {
@@ -187,7 +217,7 @@ impl PartitionInfo {
         }
         let op = if flipped { flip_cmp(op)? } else { op };
         match self.tp {
-            PartitionType::Hash => {
+            PartitionType::Hash | PartitionType::Key | PartitionType::List => {
                 if op != Op::Eq {
                     return None;
                 }

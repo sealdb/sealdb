@@ -1128,12 +1128,31 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt(
-                "CREATE TABLE t (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1))",
+                "CREATE TABLE t (id INT) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1, 2), PARTITION p1 VALUES IN (10))",
             )
-            .unwrap_err();
-        assert!(err.message.contains("LIST") || err.message.contains("partition"));
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("list partition");
+                assert_eq!(part.tp, crate::ast::PartitionType::List);
+                assert_eq!(part.defs[0].in_values, vec![1, 2]);
+                assert_eq!(part.defs[1].in_values, vec![10]);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE TABLE t (id INT) PARTITION BY KEY (id) PARTITIONS 4")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("key partition");
+                assert_eq!(part.tp, crate::ast::PartitionType::Key);
+                assert_eq!(part.num, 4);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

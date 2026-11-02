@@ -1,6 +1,6 @@
-// F19 core: build PartitionInfo for RANGE / HASH (TiDB pkg/ddl/partition.go).
-// Completeness wave / not this feature: LIST/KEY, RANGE COLUMNS, ADD/DROP
-// PARTITION, reorganize, job states.
+// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY.
+// Completeness wave / not this feature: RANGE COLUMNS, ADD/DROP PARTITION,
+// reorganize, job states.
 use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_meta::{Mutator, PartitionDefinition, PartitionInfo, PartitionType, TableInfo};
 use sealdb_parser::ast::{PartitionOption, PartitionType as AstPartitionType};
@@ -23,9 +23,11 @@ pub fn attach_partitions(
     let tp = match spec.tp {
         AstPartitionType::Range => PartitionType::Range,
         AstPartitionType::Hash => PartitionType::Hash,
+        AstPartitionType::List => PartitionType::List,
+        AstPartitionType::Key => PartitionType::Key,
     };
     let defs = match tp {
-        PartitionType::Hash => {
+        PartitionType::Hash | PartitionType::Key => {
             let n = if spec.defs.is_empty() {
                 spec.num
             } else {
@@ -58,6 +60,16 @@ pub fn attach_partitions(
                     def.name.clone(),
                     less_than,
                 ));
+            }
+            defs
+        }
+        PartitionType::List => {
+            let mut defs = Vec::with_capacity(spec.defs.len());
+            for def in &spec.defs {
+                defs.push(
+                    PartitionDefinition::new(meta.gen_global_id()?, def.name.clone(), Vec::new())
+                        .with_in_values(def.in_values.clone()),
+                );
             }
             defs
         }
