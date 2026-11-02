@@ -48,8 +48,7 @@
       "parallel-sort"
     ],
     "F06": [
-      "batch-point-get",
-      "index-point-get"
+      "batch-point-get"
     ],
     "F07": [
       "multi-table",

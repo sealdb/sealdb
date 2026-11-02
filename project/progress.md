@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F06 leftover（index-point-get）
+- **完成**:
+  - unique-index equality uses PointGet (index key Get, then row Get)
+  - non-unique indexes stay IndexLookUp / IndexReader
+- **验证**:
+  - session unique PointGet; F06 gate execute-index-point-get
+- **下一步**:
+  - leftover F06 batch-point-get / F05 topn-spill
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F10 leftover（range-scan）
 - **完成**:
   - first-column index range (`>`, `>=`, `<`, `<=`, `BETWEEN`) on IndexLookUp / covering IndexReader

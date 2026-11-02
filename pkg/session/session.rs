@@ -1031,6 +1031,33 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t WHERE id = 9")
             .unwrap();
         assert!(miss.display_rows().is_empty());
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20), extra VARCHAR(20), UNIQUE INDEX idx_u_name (name)); INSERT INTO db1.u VALUES (1, 'a', 'x'), (2, 'b', 'y')",
+            )
+            .unwrap();
+        let unique_plan = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        let unique_text = unique_plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unique_text.contains("PointGet"), "{unique_text}");
+        assert!(!unique_text.contains("IndexLookUp"), "{unique_text}");
+        let unique_hit = session
+            .execute_stmt("SELECT * FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(
+            unique_hit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
+        );
+        let unique_miss = session
+            .execute_stmt("SELECT * FROM db1.u WHERE name = 'missing'")
+            .unwrap();
+        assert!(unique_miss.display_rows().is_empty());
     }
 
     #[test]
@@ -1422,7 +1449,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            unique_cover_text.contains("IndexReader"),
+            unique_cover_text.contains("PointGet"),
             "{unique_cover_text}"
         );
         let unique_lookup = session

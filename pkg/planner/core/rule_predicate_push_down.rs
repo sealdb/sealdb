@@ -90,12 +90,23 @@ fn push_into(
                 residual,
             )
         }
-        PhysicalPlan::PointGet { table, handle } => {
+        PhysicalPlan::PointGet {
+            table,
+            handle,
+            index,
+        } => {
             let residual = conjuncts
                 .into_iter()
-                .filter(|expr| !is_handle_eq(expr, handle))
+                .filter(|expr| handle.is_none_or(|value| !is_handle_eq(expr, value)))
                 .collect();
-            wrap_residual(PhysicalPlan::PointGet { table, handle }, residual)
+            wrap_residual(
+                PhysicalPlan::PointGet {
+                    table,
+                    handle,
+                    index,
+                },
+                residual,
+            )
         }
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,

@@ -187,7 +187,7 @@ impl ExecutorBuilder {
                     covering,
                 )))
             }
-            PhysicalPlan::PointGet { handle, .. } => {
+            PhysicalPlan::PointGet { handle, index, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("point get without FROM"))?;
@@ -195,10 +195,21 @@ impl ExecutorBuilder {
                     .from
                     .clone()
                     .ok_or_else(|| Error::unsupported("point get without FROM"))?;
+                let lookup = index.as_ref().and_then(|index_name| {
+                    index_lookup_value(
+                        &domain,
+                        current_db,
+                        &from,
+                        index_name,
+                        select.selection.as_ref(),
+                    )
+                });
                 Ok(Box::new(PointGetExec::new(
                     domain,
                     from,
                     *handle,
+                    index.clone(),
+                    lookup,
                     current_db.to_string(),
                     txn,
                     select.lock == SelectLock::ForUpdate,
@@ -422,6 +433,24 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
         .from
         .clone()
         .ok_or_else(|| Error::unsupported("table reader without FROM"))
+}
+
+fn index_lookup_value(
+    domain: &Domain,
+    current_db: &str,
+    table: &sealdb_parser::ast::TableName,
+    index_name: &str,
+    selection: Option<&ExprNode>,
+) -> Option<sealdb_types::Datum> {
+    let (schema, name) = table.qualified(current_db);
+    let is = domain.infoschema();
+    let info = is.table_by_name(&schema, &name)?;
+    let index = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+    let column = index.columns.first()?.name.o().to_string();
+    selection.and_then(|expr| expr.eq_const_on(&column))
 }
 
 fn index_access(

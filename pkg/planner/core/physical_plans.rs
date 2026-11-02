@@ -45,7 +45,8 @@ pub enum PhysicalPlan {
     },
     PointGet {
         table: String,
-        handle: i64,
+        handle: Option<i64>,
+        index: Option<String>,
     },
     IndexLookUpReader {
         table: String,
@@ -152,7 +153,17 @@ impl PhysicalPlan {
                 }
                 name
             }
-            PhysicalPlan::PointGet { table, handle } => format!("PointGet_{table}_{handle}"),
+            PhysicalPlan::PointGet {
+                table,
+                handle: Some(handle),
+                index: None,
+            } => format!("PointGet_{table}_{handle}"),
+            PhysicalPlan::PointGet {
+                table,
+                index: Some(index),
+                ..
+            } => format!("PointGet_{table}_{index}"),
+            PhysicalPlan::PointGet { table, .. } => format!("PointGet_{table}"),
             PhysicalPlan::IndexLookUpReader {
                 table,
                 index,
