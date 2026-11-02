@@ -3908,6 +3908,57 @@ mod tests {
     }
 
     #[test]
+    fn test_analyze_index() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("ANALYZE TABLE db1.t INDEX idx_name")
+            .unwrap();
+        let stats = session.stats().table("db1", "t").unwrap();
+        assert_eq!(stats.count, 3);
+        assert!(stats.column("name").is_some());
+        assert!(stats.column("id").is_none());
+        assert_eq!(stats.column("name").unwrap().ndv, 2);
+        session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
+        let full = session.stats().table("db1", "t").unwrap();
+        assert!(full.column("id").is_some());
+        assert!(full.column("name").is_some());
+    }
+
+    #[test]
+    fn test_stats_persist() {
+        let storage: std::sync::Arc<dyn sealdb_kv::Storage> =
+            std::sync::Arc::new(sealdb_kv::MemStorage::new());
+        let first = Session::with_domain(std::sync::Arc::new(
+            Domain::with_storage(std::sync::Arc::clone(&storage)).unwrap(),
+        ));
+        first
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t",
+            )
+            .unwrap();
+        let before = first.stats().table("db1", "t").unwrap();
+        assert_eq!(before.count, 2);
+        assert_eq!(before.column("name").unwrap().ndv, 1);
+        drop(first);
+
+        let second =
+            Session::with_domain(std::sync::Arc::new(Domain::with_storage(storage).unwrap()));
+        let after = second.stats().table("db1", "t").unwrap();
+        assert_eq!(after.count, before.count);
+        assert_eq!(
+            after.column("name").unwrap().ndv,
+            before.column("name").unwrap().ndv
+        );
+        assert!(after.column("name").unwrap().histogram.is_some());
+        assert!(after.column("name").unwrap().topn.is_some());
+    }
+
+    #[test]
     fn test_explain_skyline_and_join_reorder() {
         let session = Session::new();
         session

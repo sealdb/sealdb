@@ -60,6 +60,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, role_ops) = extract_role_grants(&rewritten)?;
     // sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
     let (rewritten, user_ops) = extract_user_ddl(&rewritten)?;
+    // sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx`.
+    let (rewritten, analyze_indexes) = extract_analyze_index(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -72,6 +74,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut prepares = prepares.into_iter();
     let mut role_ops = role_ops.into_iter();
     let mut user_ops = user_ops.into_iter();
+    let mut analyze_indexes = analyze_indexes.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -107,6 +110,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             && let Some(sql) = prepares.next().flatten()
         {
             prepare.sql = sql;
+        }
+        if let Statement::AnalyzeTable(analyze) = &mut lowered {
+            analyze.indexes = analyze_indexes.next().flatten().unwrap_or_default();
         }
         // Placeholders from extract_role_grants / extract_user_ddl become Set NAMES.
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_role__"))
@@ -816,6 +822,7 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
         .ok_or_else(|| Error::unsupported("ANALYZE without table"))?;
     Ok(Statement::AnalyzeTable(AnalyzeTableStmt {
         table: object_table_name(table)?,
+        indexes: Vec::new(),
     }))
 }
 
@@ -1181,6 +1188,58 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]`.
+/// Strip the INDEX clause and re-attach index names after lower.
+fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut indexes = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "ANALYZE") {
+            let after = skip_ws(bytes, i + "ANALYZE".len());
+            if keyword_at(bytes, after, "TABLE") {
+                let mut j = skip_ws(bytes, after + "TABLE".len());
+                j = skip_ident_or_quoted(bytes, j);
+                j = skip_ws(bytes, j);
+                if j < bytes.len() && bytes[j] == b'.' {
+                    j = skip_ident_or_quoted(bytes, skip_ws(bytes, j + 1));
+                    j = skip_ws(bytes, j);
+                }
+                if keyword_at(bytes, j, "INDEX") {
+                    let mut k = skip_ws(bytes, j + "INDEX".len());
+                    let mut names = Vec::new();
+                    loop {
+                        let (name, next) = read_quoted_or_ident(bytes, k);
+                        if name.is_empty() {
+                            break;
+                        }
+                        names.push(name);
+                        k = skip_ws(bytes, next);
+                        if k < bytes.len() && bytes[k] == b',' {
+                            k = skip_ws(bytes, k + 1);
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push_str(&sql[i..j]);
+                    indexes.push(Some(names));
+                    i = k;
+                    continue;
+                }
+                out.push_str(&sql[i..j]);
+                indexes.push(None);
+                i = j;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, indexes))
 }
 
 /// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.

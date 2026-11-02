@@ -187,6 +187,8 @@ case "$FEATURE" in
   F21)
     run execute-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t; SELECT * FROM db1.t WHERE name = 'a'"
     run execute-histogram-topn cargo test -q -p sealdb-statistics --lib -- histogram
+    run execute-analyze-index cargo test -q -p sealdb-session --lib session::tests::test_analyze_index -- --exact
+    run execute-persist-stats cargo test -q -p sealdb-session --lib session::tests::test_stats_persist -- --exact
     ;;
   F22)
     run execute-com-query cargo test -q -p sealdb-server --lib test_com_query -- --exact
