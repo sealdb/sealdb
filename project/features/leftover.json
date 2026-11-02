@@ -45,7 +45,6 @@
     "F07": [
       "multi-table",
       "update-join",
-      "order-limit",
       "returning"
     ],
     "F09": [

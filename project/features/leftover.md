@@ -20,7 +20,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 - `multi-table`
 - `update-join`
-- `order-limit`
 - `returning`
 
 ### F09

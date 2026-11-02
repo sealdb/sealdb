@@ -85,6 +85,7 @@ case "$FEATURE" in
     ;;
   F07)
     run execute-update-delete cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); UPDATE db1.t SET name = 'c' WHERE id = 1; DELETE FROM db1.t WHERE id = 2; SELECT * FROM db1.t"
+    run execute-update-delete-order-limit cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c'); UPDATE db1.t SET name = 'z' ORDER BY id DESC LIMIT 1; DELETE FROM db1.t ORDER BY id LIMIT 1; SELECT * FROM db1.t ORDER BY id"
     ;;
   F08)
     run execute-agg cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'), (3, 'b'); SELECT name, COUNT(*) FROM db1.t GROUP BY name HAVING COUNT(*) > 1 ORDER BY name"
