@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C5 set-global MVB；完整性波 C4=[] → C2=[] → C5）  
+> 最后更新：2026-11-03（C5 leftover collation suites MVB；完整性波 C4=[] → C2=[] → C5=[]）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -33,7 +33,7 @@
 | 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
 | 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
 | 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
-| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；收 C4→C2→C5；C6 deferred |
+| 10 | 完整性波 / 可选 | `in-progress` | 2026-11-03 | — | C1–C5 | leftover feature gaps 已空；C4/C2/C5 gaps `[]`；C3/C1 仍开；C6 deferred |
 
 ### 2.1 功能波进度
 
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C5（leftover-collation-suites）
+- **完成**:
+  - `SET NAMES` / `collation_connection` 校验：未知 charset ERR 1115、未知 collation ERR 1273
+  - `test_leftover_collation_suites`：invalid SET、utf8mb4/gbk/latin1、SHOW COLLATION + infoschema、general_ci vs bin
+  - C5 gate `execute-leftover-collation-suites`；`status.json` C5 `gaps: []`；leftover notes 标明 `new_character_set*` 由该 MVB 覆盖
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_leftover_collation_suites -- --exact`
+  - `./project/scripts/feature_gate.sh C5`
+- **下一步**:
+  - 完整性波 C3 / C1（C5 完成）
 
 ### 2026-11-03
 

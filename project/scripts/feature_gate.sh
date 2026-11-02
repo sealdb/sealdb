@@ -258,6 +258,7 @@ case "$FEATURE" in
     run execute-gbk-latin1 cargo test -q -p sealdb-session --lib test_gbk_latin1_charset_and_collation
     run execute-only-full-group-by cargo test -q -p sealdb-session --lib test_only_full_group_by
     run execute-set-global cargo test -q -p sealdb-session --lib test_set_global_sysvars_shared_domain
+    run execute-leftover-collation-suites cargo test -q -p sealdb-session --lib test_leftover_collation_suites
     ;;
 esac
 
