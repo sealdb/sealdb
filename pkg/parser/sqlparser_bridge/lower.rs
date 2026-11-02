@@ -6,7 +6,7 @@ use crate::ast::ddl::{
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, DeleteStmt, InsertStmt, Join, JoinType, SelectField,
-    SelectLock, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
+    SelectLock, SelectLockWait, SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
@@ -1396,9 +1396,9 @@ fn parse_u64_at(bytes: &[u8], i: usize) -> Result<(u64, usize)> {
     Ok((n, end))
 }
 
-fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
+fn lower_select_lock(locks: &[LockClause]) -> Result<(SelectLock, SelectLockWait)> {
     if locks.is_empty() {
-        return Ok(SelectLock::None);
+        return Ok((SelectLock::None, SelectLockWait::Block));
     }
     if locks.len() != 1 {
         return Err(Error::unsupported("multiple SELECT lock clauses"));
@@ -1407,15 +1407,16 @@ fn lower_select_lock(locks: &[LockClause]) -> Result<SelectLock> {
     if lock.of.is_some() {
         return Err(Error::unsupported("FOR UPDATE OF"));
     }
-    match lock.nonblock {
-        Some(NonBlock::Nowait) => return Err(Error::unsupported("FOR UPDATE NOWAIT")),
-        Some(NonBlock::SkipLocked) => return Err(Error::unsupported("FOR UPDATE SKIP LOCKED")),
-        None => {}
-    }
-    match lock.lock_type {
-        LockType::Update => Ok(SelectLock::ForUpdate),
-        LockType::Share => Ok(SelectLock::ForShare),
-    }
+    let wait = match lock.nonblock {
+        Some(NonBlock::Nowait) => SelectLockWait::Nowait,
+        Some(NonBlock::SkipLocked) => SelectLockWait::SkipLocked,
+        None => SelectLockWait::Block,
+    };
+    let kind = match lock.lock_type {
+        LockType::Update => SelectLock::ForUpdate,
+        LockType::Share => SelectLock::ForShare,
+    };
+    Ok((kind, wait))
 }
 
 fn lower_query_stmt(query: &Query) -> Result<Statement> {
@@ -1559,6 +1560,7 @@ fn lower_set_operand(expr: &SetExpr) -> Result<SelectStmt> {
             None,
             None,
             SelectLock::None,
+            SelectLockWait::Block,
             select.to_string(),
         ),
         SetExpr::Query(query) => lower_query(query),
@@ -1585,12 +1587,14 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
     match query.body.as_ref() {
         SetExpr::Select(select) => {
             let (limit, offset) = lower_limit(query.limit_clause.as_ref())?;
+            let (lock, lock_wait) = lower_select_lock(&query.locks)?;
             lower_select(
                 select,
                 query.order_by.as_ref(),
                 limit,
                 offset,
-                lower_select_lock(&query.locks)?,
+                lock,
+                lock_wait,
                 query.to_string(),
             )
         }
@@ -1608,6 +1612,7 @@ fn lower_select(
     limit: Option<u64>,
     offset: Option<u64>,
     lock: SelectLock,
+    lock_wait: SelectLockWait,
     text: String,
 ) -> Result<SelectStmt> {
     let fields = select
@@ -1631,6 +1636,7 @@ fn lower_select(
         limit,
         offset,
         lock,
+        lock_wait,
         with: None,
         text,
     })

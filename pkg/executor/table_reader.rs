@@ -1,11 +1,11 @@
 // F13: FOR UPDATE uses exclusive lock; FOR SHARE uses shared lock.
-// Completeness wave / not this feature: blocking lock wait,
-// NOWAIT / SKIP LOCKED / WAIT N, OF table list.
+// NOWAIT returns 3572; SKIP LOCKED omits locked rows. Completeness
+// wave / not this feature: blocking lock wait, WAIT N, OF table list.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::{RowLock, TxnHandle};
+use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
@@ -21,6 +21,7 @@ pub struct TableReaderExec {
     current_db: String,
     txn: Arc<TxnHandle>,
     lock: RowLock,
+    wait: LockWait,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     schema: Vec<String>,
@@ -36,6 +37,7 @@ impl TableReaderExec {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         lock: RowLock,
+        wait: LockWait,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
     ) -> Self {
@@ -45,6 +47,7 @@ impl TableReaderExec {
             current_db: current_db.into(),
             txn,
             lock,
+            wait,
             partitions,
             pushed,
             schema: Vec::new(),
@@ -78,7 +81,7 @@ impl Executor for TableReaderExec {
             self.partitions.clone()
         };
         self.rows = filter_rows(
-            scan_table(&self.txn, &info, self.lock, &physical)?
+            scan_table(&self.txn, &info, self.lock, self.wait, &physical)?
                 .into_iter()
                 .map(|row| row.values)
                 .collect(),
@@ -121,6 +124,7 @@ pub(crate) fn scan_table(
     handle: &TxnHandle,
     info: &TableInfo,
     lock: RowLock,
+    wait: LockWait,
     physical_ids: &[i64],
 ) -> Result<Vec<ScannedRow>> {
     handle.with_txn(|txn| {
@@ -128,7 +132,7 @@ pub(crate) fn scan_table(
         for physical_id in physical_ids {
             let start = gen_table_record_prefix(*physical_id);
             let end = next_prefix(start.as_bytes());
-            let pairs = txn.scan_locked(start.as_bytes(), &end, lock)?;
+            let pairs = txn.scan_locked(start.as_bytes(), &end, lock, wait)?;
             rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
         }
         Ok(rows)

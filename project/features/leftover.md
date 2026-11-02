@@ -18,7 +18,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F13
 
-- `nowait-skip-locked`
 - `blocking-wait`
 - `deadlock`
 - `tikv-pessimistic`

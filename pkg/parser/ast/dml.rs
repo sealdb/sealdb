@@ -81,6 +81,15 @@ pub enum SelectLock {
     ForUpdate,
 }
 
+/// `NOWAIT` / `SKIP LOCKED` after FOR UPDATE or FOR SHARE.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SelectLockWait {
+    #[default]
+    Block,
+    Nowait,
+    SkipLocked,
+}
+
 #[derive(Clone, Debug)]
 pub struct CommonTableExpression {
     pub name: String,
@@ -170,6 +179,7 @@ pub struct SelectStmt {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub lock: SelectLock,
+    pub lock_wait: SelectLockWait,
     pub with: Option<WithClause>,
     pub text: String,
 }
@@ -270,6 +280,11 @@ impl SelectStmt {
             SelectLock::ForUpdate => ctx.write_str(" FOR UPDATE"),
             SelectLock::ForShare => ctx.write_str(" FOR SHARE"),
             SelectLock::None => {}
+        }
+        match self.lock_wait {
+            SelectLockWait::Nowait => ctx.write_str(" NOWAIT"),
+            SelectLockWait::SkipLocked => ctx.write_str(" SKIP LOCKED"),
+            SelectLockWait::Block => {}
         }
         Ok(())
     }

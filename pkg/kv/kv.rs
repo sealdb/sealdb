@@ -19,6 +19,16 @@ pub enum RowLock {
     Exclusive,
 }
 
+/// Wait policy for a row lock. `Block` currently returns 1205 immediately
+/// (blocking wait is a later leftover). `SkipLocked` omits the row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LockWait {
+    #[default]
+    Block,
+    Nowait,
+    SkipLocked,
+}
+
 pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>>;
@@ -38,7 +48,8 @@ pub trait Transaction: Send {
     fn scan_for_share(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_for_update(start, end)
     }
-    fn get_locked(&mut self, key: &[u8], lock: RowLock) -> Result<Option<Vec<u8>>> {
+    fn get_locked(&mut self, key: &[u8], lock: RowLock, wait: LockWait) -> Result<Option<Vec<u8>>> {
+        let _ = wait;
         match lock {
             RowLock::Exclusive => self.get_for_update(key),
             RowLock::Share => self.get_for_share(key),
@@ -50,7 +61,9 @@ pub trait Transaction: Send {
         start: &[u8],
         end: &[u8],
         lock: RowLock,
+        wait: LockWait,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _ = wait;
         match lock {
             RowLock::Exclusive => self.scan_for_update(start, end),
             RowLock::Share => self.scan_for_share(start, end),

@@ -10,7 +10,7 @@ use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_expression::{eval_expr_with_row, eval_filter};
-use sealdb_kv::{RowLock, Transaction, TxnHandle};
+use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::{Assignment, Join, UpdateStmt};
@@ -55,7 +55,7 @@ impl Executor for UpdateExec {
         let col_names = col_names(&info);
         let lock = dml_row_lock(&self.txn)?;
         let physical = info.prune_partitions(self.stmt.selection.as_ref());
-        let rows = scan_table(&self.txn, &info, lock, &physical)?;
+        let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
         let mut matched = Vec::new();
         for scanned in rows {
             if let Some(filter) = &self.stmt.selection
@@ -114,8 +114,20 @@ impl UpdateExec {
         let right_names = col_names(&right);
         let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
         let lock = dml_row_lock(&self.txn)?;
-        let left_rows = scan_table(&self.txn, &left, lock, &left.prune_partitions(None))?;
-        let right_rows = scan_table(&self.txn, &right, lock, &right.prune_partitions(None))?;
+        let left_rows = scan_table(
+            &self.txn,
+            &left,
+            lock,
+            LockWait::Block,
+            &left.prune_partitions(None),
+        )?;
+        let right_rows = scan_table(
+            &self.txn,
+            &right,
+            lock,
+            LockWait::Block,
+            &right.prune_partitions(None),
+        )?;
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
