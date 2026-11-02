@@ -823,6 +823,20 @@ mod tests {
             }
             other => panic!("expected Window, got {other:?}"),
         }
+        match &parser
+            .parse_one_stmt("SELECT ROW_NUMBER() OVER w FROM t WINDOW w AS (ORDER BY id)")
+            .unwrap()
+            .as_select()
+            .unwrap()
+            .fields[0]
+            .expr
+        {
+            crate::ast::ExprNode::Window(w) => {
+                assert_eq!(w.spec.order_by.len(), 1);
+                assert!(w.window_ref.is_none());
+            }
+            other => panic!("expected Window, got {other:?}"),
+        }
     }
 
     #[test]

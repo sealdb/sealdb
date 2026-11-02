@@ -30,14 +30,16 @@ use sqlparser::ast::{
     BinaryOperator, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized, DataType, Delete,
     DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, Grant, GrantObjects, GranteeName, GroupByExpr, JoinConstraint, JoinOperator,
-    LimitClause, LockClause, LockType, NonBlock, ObjectName, ObjectType, OrderByExpr, OrderByKind,
-    OrderBySort, Privileges, Query, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator,
-    SetQuantifier, ShowCreateObject, Statement as SqlStatement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, TransactionAccessMode, TransactionIsolationLevel, TransactionMode,
-    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    LimitClause, LockClause, LockType, NamedWindowDefinition, NamedWindowExpr, NonBlock,
+    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query, Revoke,
+    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
+    Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
+use std::collections::HashMap;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
@@ -1645,11 +1647,15 @@ fn lower_select(
     lock_wait: SelectLockWait,
     text: String,
 ) -> Result<SelectStmt> {
-    let fields = select
+    let windows = lower_named_windows(&select.named_window)?;
+    let mut fields = select
         .projection
         .iter()
         .map(lower_select_item)
         .collect::<Result<Vec<_>>>()?;
+    for field in &mut fields {
+        resolve_named_window(&mut field.expr, &windows)?;
+    }
     let (from, joins, derived) = lower_from(&select.from)?;
     if !joins.is_empty() && !derived.is_empty() {
         return Err(Error::unsupported("subquery JOIN"));
@@ -2363,15 +2369,9 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
 }
 
 fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
-    // F16 leftover: named windows, LAG/LEAD, IGNORE NULLS.
+    // F16 leftover: LAG/LEAD, IGNORE NULLS.
     if func.null_treatment.is_some() {
         return Err(Error::unsupported("IGNORE/RESPECT NULLS"));
-    }
-    let WindowType::WindowSpec(spec) = over else {
-        return Err(Error::unsupported("named window"));
-    };
-    if spec.window_name.is_some() {
-        return Err(Error::unsupported("named window"));
     }
     let name = func.name.to_string();
     match name.to_ascii_uppercase().as_str() {
@@ -2411,23 +2411,99 @@ fn lower_window_func(func: &Function, over: &WindowType) -> Result<ExprNode> {
     } else {
         args
     };
+    let (window_ref, spec) = match over {
+        WindowType::NamedWindow(ident) => (Some(ident.value.clone()), WindowSpec::default()),
+        WindowType::WindowSpec(spec) => (
+            spec.window_name.as_ref().map(|ident| ident.value.clone()),
+            lower_over_spec(spec)?,
+        ),
+    };
     Ok(ExprNode::Window(WindowFuncExpr {
         name,
         args,
-        spec: WindowSpec {
-            partition_by: spec
-                .partition_by
-                .iter()
-                .map(lower_expr)
-                .collect::<Result<Vec<_>>>()?,
-            order_by: lower_order_by_exprs(&spec.order_by)?,
-            frame: spec
-                .window_frame
-                .as_ref()
-                .map(lower_window_frame)
-                .transpose()?,
-        },
+        spec,
+        window_ref,
     }))
+}
+
+fn lower_over_spec(spec: &sqlparser::ast::WindowSpec) -> Result<WindowSpec> {
+    Ok(WindowSpec {
+        partition_by: spec
+            .partition_by
+            .iter()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>>>()?,
+        order_by: lower_order_by_exprs(&spec.order_by)?,
+        frame: spec
+            .window_frame
+            .as_ref()
+            .map(lower_window_frame)
+            .transpose()?,
+    })
+}
+
+/// Lower `WINDOW w AS (...)` definitions in SELECT order.
+fn lower_named_windows(defs: &[NamedWindowDefinition]) -> Result<HashMap<String, WindowSpec>> {
+    let mut windows = HashMap::new();
+    for NamedWindowDefinition(name, expr) in defs {
+        let spec = match expr {
+            NamedWindowExpr::WindowSpec(spec) => lower_over_spec(spec)?,
+            NamedWindowExpr::NamedWindow(other) => {
+                windows.get(&other.value).cloned().ok_or_else(|| {
+                    Error::unsupported(format!("unknown named window {}", other.value))
+                })?
+            }
+        };
+        if windows
+            .keys()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&name.value))
+        {
+            return Err(Error::unsupported("duplicate named window"));
+        }
+        windows.insert(name.value.clone(), spec);
+    }
+    Ok(windows)
+}
+
+fn resolve_named_window(expr: &mut ExprNode, windows: &HashMap<String, WindowSpec>) -> Result<()> {
+    let ExprNode::Window(window) = expr else {
+        return Ok(());
+    };
+    let Some(name) = window.window_ref.take() else {
+        return Ok(());
+    };
+    let Some(base) = windows
+        .iter()
+        .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+        .map(|(_, spec)| spec)
+    else {
+        return Err(Error::unsupported(format!("unknown named window {name}")));
+    };
+    window.spec = merge_window_spec(base, &window.spec)?;
+    Ok(())
+}
+
+fn merge_window_spec(base: &WindowSpec, extra: &WindowSpec) -> Result<WindowSpec> {
+    let mut out = base.clone();
+    if !extra.partition_by.is_empty() {
+        if !out.partition_by.is_empty() {
+            return Err(Error::unsupported("cannot override PARTITION BY"));
+        }
+        out.partition_by = extra.partition_by.clone();
+    }
+    if !extra.order_by.is_empty() {
+        if !out.order_by.is_empty() {
+            return Err(Error::unsupported("cannot override ORDER BY"));
+        }
+        out.order_by = extra.order_by.clone();
+    }
+    if extra.frame.is_some() {
+        if out.frame.is_some() {
+            return Err(Error::unsupported("cannot override frame"));
+        }
+        out.frame = extra.frame.clone();
+    }
+    Ok(out)
 }
 
 /// Lower `ROWS|RANGE|GROUPS BETWEEN start AND end`. RANGE offsets stay

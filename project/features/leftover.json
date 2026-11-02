@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F16": [
-      "named-window",
       "lag-lead",
       "ignore-nulls",
       "pipelined-window"
