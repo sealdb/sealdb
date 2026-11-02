@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 163,
-  "manifest_entries": 113,
+  "rs_files": 167,
+  "manifest_entries": 117,
   "status_counts": {
-    "not-started": 1568,
-    "partial": 106,
+    "not-started": 1564,
+    "partial": 110,
     "reimplemented": 4,
     "ported": 3
   },
@@ -155,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 31,
-      "missing": 154,
+      "rs": 34,
+      "missing": 151,
       "status": {
-        "not-started": 154,
-        "partial": 31
+        "not-started": 151,
+        "partial": 34
       }
     },
     "pkg/expression": {
@@ -431,11 +431,11 @@
     },
     "pkg/util": {
       "go": 291,
-      "rs": 5,
-      "missing": 286,
+      "rs": 6,
+      "missing": 285,
       "status": {
-        "not-started": 286,
-        "partial": 2,
+        "not-started": 285,
+        "partial": 3,
         "ported": 3
       }
     }
@@ -2315,7 +2315,7 @@
       "rs_path": "pkg/executor/aggregate/agg_hash_executor.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory HashAggExec without parallel workers"
+      "notes": "HashAggExec with group-key partition spill; parallel workers deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_hash_final_worker.go",
@@ -2333,10 +2333,10 @@
     },
     {
       "go_path": "pkg/executor/aggregate/agg_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/aggregate/agg_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "partition input rows by group key; recursive/partial-agg serialize deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_stream_executor.go",
@@ -2816,10 +2816,10 @@
     },
     {
       "go_path": "pkg/executor/join/hash_join_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/join/hash_join_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "partition both join sides by key; parallel workers deferred"
     },
     {
       "go_path": "pkg/executor/join/hash_join_spill_helper.go",
@@ -2840,7 +2840,7 @@
       "rs_path": "pkg/executor/join/hash_join_v1.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory two-table HashJoinV1Exec"
+      "notes": "two-table HashJoinV1Exec with join-key partition spill"
     },
     {
       "go_path": "pkg/executor/join/hash_join_v2.go",
@@ -3253,7 +3253,7 @@
       "rs_path": "pkg/executor/sortexec/sort.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory SortExec"
+      "notes": "SortExec with sorted-run spill and k-way merge"
     },
     {
       "go_path": "pkg/executor/sortexec/sort_partition.go",
@@ -3264,10 +3264,10 @@
     },
     {
       "go_path": "pkg/executor/sortexec/sort_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/sortexec/sort_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "sorted run files plus k-way merge; parallel sort deferred"
     },
     {
       "go_path": "pkg/executor/sortexec/sort_util.go",
@@ -10376,10 +10376,10 @@
     },
     {
       "go_path": "pkg/util/chunk/row_in_disk.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/chunk/row_in_disk.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "row-encoded temp spill files; disk tracker / offset index deferred"
     },
     {
       "go_path": "pkg/util/codec/bytes.go",

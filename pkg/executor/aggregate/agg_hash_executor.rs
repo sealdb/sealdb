@@ -1,7 +1,8 @@
 // F08 core path: in-memory HashAgg for COUNT/SUM/AVG/MIN/MAX + GROUP BY + HAVING.
 // Completeness wave / not this feature: sorted GROUP BY StreamAgg,
-// spill / parallel workers, GROUP BY expressions, ROLLUP/CUBE, AVG decimal scale.
+// recursive spill / parallel workers, GROUP BY expressions, ROLLUP/CUBE, AVG decimal scale.
 use crate::aggfuncs::{build_agg_func, is_agg_name};
+use crate::aggregate::agg_spill::{add_to_partition, new_partitions};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
 use sealdb_expression::{eval_expr_with_row, eval_filter};
@@ -9,7 +10,7 @@ use sealdb_parser::ast::SelectStmt;
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, FuncCallExpr};
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
-use sealdb_util::chunk::Chunk;
+use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
 use std::collections::BTreeMap;
 
 enum OutputItem {
@@ -27,6 +28,8 @@ pub struct HashAggExec {
     filter_schema: Vec<String>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
+    mem_limit: usize,
+    spilled: bool,
     emitted: bool,
 }
 
@@ -91,63 +94,57 @@ impl HashAggExec {
             filter_schema,
             schema,
             rows: Vec::new(),
+            mem_limit: mem_row_limit(),
+            spilled: false,
             emitted: false,
         })
+    }
+
+    pub fn with_mem_limit(mut self, mem_limit: usize) -> Self {
+        self.mem_limit = mem_limit;
+        self
+    }
+
+    pub fn spilled(&self) -> bool {
+        self.spilled
     }
 }
 
 impl Executor for HashAggExec {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;
+        self.spilled = false;
         let input_schema = self.child.schema().to_vec();
-        let mut groups: BTreeMap<String, GroupState> = BTreeMap::new();
+        let mut buf: Vec<Vec<Datum>> = Vec::new();
+        let mut parts: Option<Vec<DataInDiskByRows>> = None;
         while let Some(chunk) = self.child.next()? {
             for i in 0..chunk.num_rows() {
                 let row = chunk.get_row(i);
-                let keys = self
-                    .group_by
-                    .iter()
-                    .map(|expr| eval_expr_with_row(expr, &input_schema, &row))
-                    .collect::<Result<Vec<_>>>()?;
-                let map_key = encode_group_key(&keys);
-                if !groups.contains_key(&map_key) {
-                    groups.insert(
-                        map_key.clone(),
-                        GroupState {
-                            keys,
-                            aggs: self
-                                .agg_specs
-                                .iter()
-                                .map(build_agg_func)
-                                .collect::<Result<Vec<_>>>()?,
-                        },
-                    );
-                }
-                let group = groups
-                    .get_mut(&map_key)
-                    .expect("group just inserted or already present");
-                for (spec, agg) in self.agg_specs.iter().zip(group.aggs.iter_mut()) {
-                    if spec.args.is_empty() {
-                        agg.update(None)?;
-                    } else {
-                        let value = eval_expr_with_row(&spec.args[0], &input_schema, &row)?;
-                        agg.update(Some(&value))?;
+                if parts.is_none() && buf.len() >= self.mem_limit {
+                    let mut files = new_partitions()?;
+                    for existing in buf.drain(..) {
+                        self.write_partition(&mut files, &input_schema, &existing)?;
                     }
+                    parts = Some(files);
+                    self.spilled = true;
+                }
+                if let Some(files) = parts.as_mut() {
+                    self.write_partition(files, &input_schema, &row)?;
+                } else {
+                    buf.push(row);
                 }
             }
         }
-        if groups.is_empty() && self.group_by.is_empty() {
-            let mut aggs = self
-                .agg_specs
-                .iter()
-                .map(build_agg_func)
-                .collect::<Result<Vec<_>>>()?;
-            self.push_group(&[], &mut aggs)?;
-        } else {
-            for group in groups.into_values() {
-                let GroupState { keys, mut aggs } = group;
-                self.push_group(&keys, &mut aggs)?;
+        if let Some(mut files) = parts {
+            for file in &mut files {
+                file.finish_write()?;
+                let rows = file.read_all()?;
+                if !rows.is_empty() {
+                    self.aggregate_rows(&input_schema, rows, false)?;
+                }
             }
+        } else {
+            self.aggregate_rows(&input_schema, buf, true)?;
         }
         Ok(())
     }
@@ -179,6 +176,77 @@ struct GroupState {
 }
 
 impl HashAggExec {
+    fn write_partition(
+        &self,
+        files: &mut [DataInDiskByRows],
+        input_schema: &[String],
+        row: &[Datum],
+    ) -> Result<()> {
+        let keys = self
+            .group_by
+            .iter()
+            .map(|expr| eval_expr_with_row(expr, input_schema, row))
+            .collect::<Result<Vec<_>>>()?;
+        add_to_partition(files, &keys, row)
+    }
+
+    fn aggregate_rows(
+        &mut self,
+        input_schema: &[String],
+        rows: Vec<Vec<Datum>>,
+        emit_empty_scalar: bool,
+    ) -> Result<()> {
+        let mut groups: BTreeMap<String, GroupState> = BTreeMap::new();
+        for row in rows {
+            let keys = self
+                .group_by
+                .iter()
+                .map(|expr| eval_expr_with_row(expr, input_schema, &row))
+                .collect::<Result<Vec<_>>>()?;
+            let map_key = encode_group_key(&keys);
+            if !groups.contains_key(&map_key) {
+                groups.insert(
+                    map_key.clone(),
+                    GroupState {
+                        keys,
+                        aggs: self
+                            .agg_specs
+                            .iter()
+                            .map(build_agg_func)
+                            .collect::<Result<Vec<_>>>()?,
+                    },
+                );
+            }
+            let group = groups
+                .get_mut(&map_key)
+                .expect("group just inserted or already present");
+            for (spec, agg) in self.agg_specs.iter().zip(group.aggs.iter_mut()) {
+                if spec.args.is_empty() {
+                    agg.update(None)?;
+                } else {
+                    let value = eval_expr_with_row(&spec.args[0], input_schema, &row)?;
+                    agg.update(Some(&value))?;
+                }
+            }
+        }
+        if groups.is_empty() {
+            if emit_empty_scalar && self.group_by.is_empty() {
+                let mut aggs = self
+                    .agg_specs
+                    .iter()
+                    .map(build_agg_func)
+                    .collect::<Result<Vec<_>>>()?;
+                self.push_group(&[], &mut aggs)?;
+            }
+            return Ok(());
+        }
+        for group in groups.into_values() {
+            let GroupState { keys, mut aggs } = group;
+            self.push_group(&keys, &mut aggs)?;
+        }
+        Ok(())
+    }
+
     fn push_group(
         &mut self,
         keys: &[Datum],
@@ -327,4 +395,55 @@ fn encode_group_key(keys: &[Datum]) -> String {
         .map(|d| format!("{d:?}"))
         .collect::<Vec<_>>()
         .join("\u{1f}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internal::exec::{Executor, VecExec};
+    use sealdb_parser::Parser;
+    use sealdb_types::Datum;
+
+    fn grouped_select() -> SelectStmt {
+        let stmt = Parser::new()
+            .parse_one_stmt("SELECT name, COUNT(*) FROM t GROUP BY name")
+            .unwrap();
+        stmt.as_select().cloned().unwrap()
+    }
+
+    #[test]
+    fn test_hash_agg_spill_matches_in_memory() {
+        let rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())],
+            vec![Datum::I64(2), Datum::Bytes(b"a".to_vec())],
+            vec![Datum::I64(3), Datum::Bytes(b"b".to_vec())],
+            vec![Datum::I64(4), Datum::Bytes(b"b".to_vec())],
+        ];
+        let schema = vec!["id".to_string(), "name".to_string()];
+        let select = grouped_select();
+        let mut mem = HashAggExec::new(
+            &select,
+            Box::new(VecExec::new(schema.clone(), rows.clone())),
+        )
+        .unwrap()
+        .with_mem_limit(usize::MAX);
+        mem.open().unwrap();
+        let mem_chunk = mem.next().unwrap().unwrap();
+        let mut spilled = HashAggExec::new(&select, Box::new(VecExec::new(schema, rows)))
+            .unwrap()
+            .with_mem_limit(1);
+        spilled.open().unwrap();
+        let spilled_chunk = spilled.next().unwrap().unwrap();
+        assert!(spilled.spilled());
+        let mut mem_rows = (0..mem_chunk.num_rows())
+            .map(|i| mem_chunk.get_row(i))
+            .collect::<Vec<_>>();
+        let mut spilled_rows = (0..spilled_chunk.num_rows())
+            .map(|i| spilled_chunk.get_row(i))
+            .collect::<Vec<_>>();
+        mem_rows.sort_by(|a, b| a[0].compare(&b[0]));
+        spilled_rows.sort_by(|a, b| a[0].compare(&b[0]));
+        assert_eq!(mem_rows, spilled_rows);
+        assert_eq!(mem_rows.len(), 2);
+    }
 }

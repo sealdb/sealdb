@@ -34,16 +34,11 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `order-limit`
 - `returning`
 
-### F08
-
-- `spill`
-
 ### F09
 
 - `semi-anti`
 - `cross-join`
 - `n-table`
-- `spill`
 
 ### F10
 

@@ -9,6 +9,6 @@ Rejected at parse/lower time in `pkg/parser/sqlparser_bridge/lower.rs`
 - CROSS JOIN / comma joins
 - Three or more tables
 - USING / NATURAL
-- Hash join spill and parallel workers
+- Hash join recursive spill and parallel workers
 - Merge join / index join
 - Non-equality ON predicates

@@ -1,14 +1,15 @@
 // F09 core path: two-table Inner/Left/Right HashJoin on equality.
 // Completeness wave / not this feature: semi/anti/full, CROSS/comma joins,
-// n-table, USING/NATURAL, spill/parallel workers, merge/index join, non-equality ON.
+// n-table, USING/NATURAL, recursive spill/parallel workers, merge/index join, non-equality ON.
 use crate::internal::exec::Executor;
+use crate::join::hash_join_spill::{partition_count, partition_rows};
 use sealdb_errno::{Error, Result};
 use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{Join, JoinType};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
-use sealdb_util::chunk::Chunk;
+use sealdb_util::chunk::{Chunk, mem_row_limit};
 use std::collections::HashMap;
 
 pub struct HashJoinV1Exec {
@@ -17,6 +18,8 @@ pub struct HashJoinV1Exec {
     right: Box<dyn Executor>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
+    mem_limit: usize,
+    spilled: bool,
     emitted: bool,
 }
 
@@ -28,8 +31,19 @@ impl HashJoinV1Exec {
             right,
             schema: Vec::new(),
             rows: Vec::new(),
+            mem_limit: mem_row_limit(),
+            spilled: false,
             emitted: false,
         }
+    }
+
+    pub fn with_mem_limit(mut self, mem_limit: usize) -> Self {
+        self.mem_limit = mem_limit;
+        self
+    }
+
+    pub fn spilled(&self) -> bool {
+        self.spilled
     }
 }
 
@@ -50,16 +64,10 @@ impl Executor for HashJoinV1Exec {
             split_join_eq(&self.join.on, &self.join.left.name, &self.join.right.name)?;
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
-        self.rows = match self.join.tp {
-            JoinType::Inner => probe_inner(
-                &left_rows,
-                &right_rows,
-                &left_schema,
-                &right_schema,
-                &left_key,
-                &right_key,
-            )?,
-            JoinType::LeftOuter => probe_outer(
+        self.spilled = false;
+        if left_rows.len() < self.mem_limit && right_rows.len() < self.mem_limit {
+            self.rows = probe_join(
+                self.join.tp,
                 &left_rows,
                 &right_rows,
                 &left_schema,
@@ -68,20 +76,30 @@ impl Executor for HashJoinV1Exec {
                 &right_key,
                 left_width,
                 right_width,
-                true,
-            )?,
-            JoinType::RightOuter => probe_outer(
-                &right_rows,
-                &left_rows,
-                &right_schema,
+            )?;
+            return Ok(());
+        }
+        self.spilled = true;
+        let mut left_parts = partition_rows(left_rows, &left_schema, &left_key, partition_count())?;
+        let mut right_parts =
+            partition_rows(right_rows, &right_schema, &right_key, partition_count())?;
+        let mut out = Vec::new();
+        for (left_part, right_part) in left_parts.iter_mut().zip(right_parts.iter_mut()) {
+            let part_left = left_part.read_all()?;
+            let part_right = right_part.read_all()?;
+            out.extend(probe_join(
+                self.join.tp,
+                &part_left,
+                &part_right,
                 &left_schema,
-                &right_key,
+                &right_schema,
                 &left_key,
-                right_width,
+                &right_key,
                 left_width,
-                false,
-            )?,
-        };
+                right_width,
+            )?);
+        }
+        self.rows = out;
         Ok(())
     }
 
@@ -104,6 +122,52 @@ impl Executor for HashJoinV1Exec {
 
     fn schema(&self) -> &[String] {
         &self.schema
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_join(
+    tp: JoinType,
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    left_schema: &[String],
+    right_schema: &[String],
+    left_key: &ExprNode,
+    right_key: &ExprNode,
+    left_width: usize,
+    right_width: usize,
+) -> Result<Vec<Vec<Datum>>> {
+    match tp {
+        JoinType::Inner => probe_inner(
+            left_rows,
+            right_rows,
+            left_schema,
+            right_schema,
+            left_key,
+            right_key,
+        ),
+        JoinType::LeftOuter => probe_outer(
+            left_rows,
+            right_rows,
+            left_schema,
+            right_schema,
+            left_key,
+            right_key,
+            left_width,
+            right_width,
+            true,
+        ),
+        JoinType::RightOuter => probe_outer(
+            right_rows,
+            left_rows,
+            right_schema,
+            left_schema,
+            right_key,
+            left_key,
+            right_width,
+            left_width,
+            false,
+        ),
     }
 }
 
@@ -253,4 +317,76 @@ fn concat_row(left: &[Datum], right: &[Datum]) -> Vec<Datum> {
 
 fn key_text(value: &Datum) -> String {
     format!("{value:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internal::exec::{Executor, VecExec};
+    use sealdb_parser::ast::ddl::TableName;
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr};
+
+    fn inner_join() -> Join {
+        Join {
+            left: TableName::new(None, "t1"),
+            right: TableName::new(None, "t2"),
+            tp: JoinType::Inner,
+            on: ExprNode::Binary(BinaryOpExpr {
+                op: Op::Eq,
+                left: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some("t1".to_string()),
+                    name: "id".to_string(),
+                })),
+                right: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some("t2".to_string()),
+                    name: "id".to_string(),
+                })),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_hash_join_spill_matches_in_memory() {
+        let left_rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())],
+            vec![Datum::I64(2), Datum::Bytes(b"b".to_vec())],
+            vec![Datum::I64(3), Datum::Bytes(b"c".to_vec())],
+        ];
+        let right_rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"x".to_vec())],
+            vec![Datum::I64(3), Datum::Bytes(b"y".to_vec())],
+            vec![Datum::I64(9), Datum::Bytes(b"z".to_vec())],
+        ];
+        let left_schema = vec!["id".to_string(), "name".to_string()];
+        let right_schema = vec!["id".to_string(), "tag".to_string()];
+        let mut mem = HashJoinV1Exec::new(
+            inner_join(),
+            Box::new(VecExec::new(left_schema.clone(), left_rows.clone())),
+            Box::new(VecExec::new(right_schema.clone(), right_rows.clone())),
+        )
+        .with_mem_limit(usize::MAX);
+        mem.open().unwrap();
+        let mem_chunk = mem.next().unwrap().unwrap();
+        let mut spilled = HashJoinV1Exec::new(
+            inner_join(),
+            Box::new(VecExec::new(left_schema, left_rows)),
+            Box::new(VecExec::new(right_schema, right_rows)),
+        )
+        .with_mem_limit(1);
+        spilled.open().unwrap();
+        let spilled_chunk = spilled.next().unwrap().unwrap();
+        assert!(spilled.spilled());
+        let mut mem_out = (0..mem_chunk.num_rows())
+            .map(|i| mem_chunk.get_row(i))
+            .collect::<Vec<_>>();
+        let mut spilled_out = (0..spilled_chunk.num_rows())
+            .map(|i| spilled_chunk.get_row(i))
+            .collect::<Vec<_>>();
+        mem_out.sort_by(|a, b| a[0].compare(&b[0]));
+        spilled_out.sort_by(|a, b| a[0].compare(&b[0]));
+        assert_eq!(mem_out, spilled_out);
+        assert_eq!(mem_out.len(), 2);
+    }
 }
