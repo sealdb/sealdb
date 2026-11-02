@@ -47,9 +47,6 @@
       "schema-lease",
       "serializable",
       "savepoint"
-    ],
-    "C5": [
-      "leftover-collation-suites"
     ]
   },
   "open_stmts": [

@@ -4,6 +4,36 @@
 pub mod encoding_gbk;
 pub mod encoding_latin1;
 
+/// Charsets accepted by `SET NAMES` / character_set_* (MVB surface).
+pub const SUPPORTED_CHARSETS: &[&str] = &["utf8mb4", "utf8", "latin1", "binary", "ascii", "gbk"];
+
+/// Collations accepted by `SET collation_connection` / SHOW COLLATION (MVB surface).
+pub const SUPPORTED_COLLATIONS: &[&str] = &[
+    "utf8mb4_bin",
+    "utf8mb4_general_ci",
+    "utf8mb4_unicode_ci",
+    "utf8_bin",
+    "latin1_bin",
+    "binary",
+    "ascii_bin",
+    "gbk_bin",
+    "gbk_chinese_ci",
+];
+
+pub fn is_supported_charset(name: &str) -> bool {
+    let lower = name
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_ascii_lowercase();
+    SUPPORTED_CHARSETS.contains(&lower.as_str())
+}
+
+pub fn is_supported_collation(name: &str) -> bool {
+    let lower = name
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_ascii_lowercase();
+    SUPPORTED_COLLATIONS.contains(&lower.as_str())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Collation {
     pub name: String,

@@ -236,11 +236,11 @@ def render_markdown(inv: dict) -> str:
             "## Completeness wave notes",
             "",
             "- C1 is the frozen leftover denominator, not a pass-rate claim.",
-            "- Feature (F*) gaps are empty; remaining work is C2–C5 completeness gaps (C6 deferred).",
+            "- Feature (F*) gaps are empty; C2/C4/C5 completeness gaps closed; remaining is C1/C3 (C6 deferred).",
             "- C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).",
             "- C3: TiKV cross-cluster and MDL stay open.",
             "- C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).",
-            "- C5: leftover collation suites stay open (unicode-weights + gbk-latin1 + only-full-group-by + set-global MVB done).",
+            "- C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).",
             "- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins.",
             "",
         ]

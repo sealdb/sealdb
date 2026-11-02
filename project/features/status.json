@@ -32,7 +32,7 @@
     "C2": {"status": "core-ported", "phase": 10, "notes": "EXPLAIN row/json/dot/ANALYZE + cop-task rows + costed skyline + n-table DP JoinReorder + IndexMerge OR-union + Cost Model v2 MVB", "gaps": []},
     "C3": {"status": "core-ported", "phase": 10, "notes": "SchemaChecker 8028 + READ COMMITTED + same-Domain cross-session RW", "gaps": ["tikv-cross-cluster", "mdl", "schema-lease", "serializable", "savepoint"]},
     "C4": {"status": "core-ported", "phase": 10, "notes": "PREPARE/EXECUTE/DEALLOCATE + Domain-shared plan cache keyed by ? templates + COM_STMT_* + user vars + CREATE/DROP/SHOW BINDING", "gaps": []},
-    "C5": {"status": "core-ported", "phase": 10, "notes": "SET NAMES/sql_mode/collation + general_ci + unicode_ci Latin + GBK/latin1 encode+collate subset + ONLY_FULL_GROUP_BY + SET GLOBAL Domain sysvars MVB", "gaps": ["leftover-collation-suites"]},
+    "C5": {"status": "core-ported", "phase": 10, "notes": "SET NAMES/sql_mode/collation + general_ci + unicode_ci Latin + GBK/latin1 encode+collate subset + ONLY_FULL_GROUP_BY + SET GLOBAL Domain sysvars + leftover collation suites MVB", "gaps": []},
     "C6": {"status": "deferred", "phase": 10, "notes": "Cascades/TiFlash/MPP/BR/Lightning/plugin stay out of the main line"}
   }
 }

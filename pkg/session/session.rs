@@ -1023,10 +1023,22 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                 // SET NAMES <charset> resets collation_connection to the charset default
                 // (`gbk`→`gbk_bin`, `latin1`→`latin1_bin`). An explicit COLLATE assignment
                 // that follows in the same SET NAMES overrides this.
+                if !sealdb_parser::charset::is_supported_charset(&value) {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_UNKNOWN_CHARACTER_SET,
+                        format!("Unknown character set: '{value}'"),
+                    ));
+                }
                 *session.collation.lock().expect("session collation lock") =
                     Collation::default_for_charset(&value);
             }
             "collation_connection" | "collation_database" => {
+                if !sealdb_parser::charset::is_supported_collation(&value) {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_UNKNOWN_COLLATION,
+                        format!("Unknown collation: '{value}'"),
+                    ));
+                }
                 *session.collation.lock().expect("session collation lock") =
                     Collation::parse(&value);
             }
@@ -1088,6 +1100,12 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
             session.domain.set_global_enable_auto_analyze(on);
         }
         "names" | "character_set_client" | "character_set_connection" | "character_set_results" => {
+            if !sealdb_parser::charset::is_supported_charset(value) {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_UNKNOWN_CHARACTER_SET,
+                    format!("Unknown character set: '{value}'"),
+                ));
+            }
             session
                 .domain
                 .set_global_character_set_connection(value.to_string());
@@ -3345,6 +3363,101 @@ mod tests {
             .execute_stmt("SELECT id FROM db1.t WHERE name = 'a'")
             .unwrap();
         assert!(bin_miss.display_rows().is_empty());
+    }
+
+    /// MVB for leftover `new_character_set*` / collation suites: invalid SET NAMES,
+    /// utf8mb4/gbk/latin1, SHOW COLLATION key rows, and general_ci vs bin compare.
+    #[test]
+    fn test_leftover_collation_suites() {
+        let session = Session::new();
+
+        let bad_cs = session.execute_stmt("SET NAMES nosuchcharset").unwrap_err();
+        assert_eq!(bad_cs.code, sealdb_errno::ERR_UNKNOWN_CHARACTER_SET);
+        assert!(
+            bad_cs.message.contains("nosuchcharset"),
+            "{}",
+            bad_cs.message
+        );
+        let bad_col = session
+            .execute_stmt("SET collation_connection = utf8mb4_nosuch_ci")
+            .unwrap_err();
+        assert_eq!(bad_col.code, sealdb_errno::ERR_UNKNOWN_COLLATION);
+        assert!(
+            bad_col.message.contains("utf8mb4_nosuch_ci"),
+            "{}",
+            bad_col.message
+        );
+
+        for (charset, coll) in [
+            ("utf8mb4", "utf8mb4_bin"),
+            ("gbk", "gbk_bin"),
+            ("latin1", "latin1_bin"),
+        ] {
+            session
+                .execute_stmt(&format!("SET NAMES {charset}"))
+                .unwrap();
+            let vars = session
+                .execute_stmt("SELECT @@character_set_client, @@collation_connection")
+                .unwrap();
+            assert_eq!(
+                vars.display_rows()[0],
+                vec![charset.to_string(), coll.to_string()],
+                "SET NAMES {charset}"
+            );
+        }
+
+        let show = session.execute_stmt("SHOW COLLATION").unwrap();
+        let names: Vec<_> = show
+            .display_rows()
+            .into_iter()
+            .filter_map(|r| r.first().cloned())
+            .collect();
+        for key in [
+            "utf8mb4_bin",
+            "utf8mb4_general_ci",
+            "utf8mb4_unicode_ci",
+            "gbk_bin",
+            "gbk_chinese_ci",
+            "latin1_bin",
+        ] {
+            assert!(
+                names.iter().any(|n| n == key),
+                "SHOW COLLATION missing {key}: {names:?}"
+            );
+        }
+        let is_rows = session
+            .execute_stmt(
+                "SELECT COLLATION_NAME FROM information_schema.collations \
+                 WHERE COLLATION_NAME IN ('utf8mb4_bin','utf8mb4_general_ci','gbk_bin')",
+            )
+            .unwrap();
+        assert_eq!(is_rows.display_rows().len(), 3);
+
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); \
+                 INSERT INTO db1.t VALUES (1, 'A')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")
+            .unwrap();
+        let ci_hit = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(ci_hit.display_rows(), vec![vec!["1".to_string()]]);
+        session
+            .execute_stmt("SET collation_connection = utf8mb4_bin")
+            .unwrap();
+        let bin_miss = session
+            .execute_stmt("SELECT id FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert!(bin_miss.display_rows().is_empty());
+        let bin_eq = session.execute_stmt("SELECT 'A' = 'a', 'A' = 'A'").unwrap();
+        assert_eq!(
+            bin_eq.display_rows()[0],
+            vec!["0".to_string(), "1".to_string()]
+        );
     }
 
     #[test]

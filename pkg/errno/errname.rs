@@ -40,6 +40,8 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
         errcode::ERR_INFO_SCHEMA_CHANGED => "ErrInfoSchemaChanged",
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
+        errcode::ERR_UNKNOWN_CHARACTER_SET => "ErrUnknownCharacterSet",
+        errcode::ERR_UNKNOWN_COLLATION => "ErrUnknownCollation",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         _ => "ErrUnknown",
     }
