@@ -54,3 +54,12 @@ id	name
 2	b
 SELECT * FROM itest.t1 WHERE id > ALL (SELECT id FROM itest.t2) ORDER BY id;
 id	name
+SELECT * FROM (SELECT id, name FROM itest.t1 WHERE id = 1) d;
+id	name
+1	a
+SELECT x FROM (SELECT 2) AS d(x);
+x
+2
+SELECT * FROM (SELECT * FROM (SELECT id FROM itest.t1 WHERE id = 2) a) b;
+id
+2

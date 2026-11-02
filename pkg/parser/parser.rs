@@ -767,6 +767,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_derived_table() {
+        let parser = Parser::new();
+        let stmt = parser
+            .parse_one_stmt("SELECT * FROM (SELECT 1 AS id) d")
+            .unwrap();
+        let select = stmt.as_select().unwrap();
+        assert_eq!(select.from.as_ref().unwrap().name, "d");
+        let with = select.with.as_ref().expect("derived table CTE");
+        assert_eq!(with.ctes.len(), 1);
+        assert_eq!(with.ctes[0].name, "d");
+        let nested = parser
+            .parse_one_stmt("SELECT * FROM (SELECT * FROM (SELECT 1 AS id) a) b")
+            .unwrap();
+        let names: Vec<_> = nested
+            .as_select()
+            .unwrap()
+            .with
+            .as_ref()
+            .unwrap()
+            .ctes
+            .iter()
+            .map(|cte| cte.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+        let aliased = parser
+            .parse_one_stmt("SELECT x FROM (SELECT 1) AS d(x)")
+            .unwrap();
+        assert_eq!(
+            aliased.as_select().unwrap().with.as_ref().unwrap().ctes[0].col_name_list,
+            vec!["x".to_string()]
+        );
+        let err = parser
+            .parse_one_stmt("SELECT * FROM t1 JOIN (SELECT 1 AS id) d ON t1.id = d.id")
+            .unwrap_err();
+        assert!(err.message.contains("subquery JOIN"));
+    }
+
+    #[test]
     fn test_parse_partition() {
         let parser = Parser::new();
         match parser

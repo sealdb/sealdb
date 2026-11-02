@@ -20,3 +20,6 @@ SELECT * FROM itest.t1 WHERE id = SOME (SELECT id FROM itest.t2) ORDER BY id;
 SELECT * FROM itest.t1 WHERE id <> ALL (SELECT id FROM itest.t2) ORDER BY id;
 SELECT * FROM itest.t1 WHERE id > ANY (SELECT id FROM itest.t2) ORDER BY id;
 SELECT * FROM itest.t1 WHERE id > ALL (SELECT id FROM itest.t2) ORDER BY id;
+SELECT * FROM (SELECT id, name FROM itest.t1 WHERE id = 1) d;
+SELECT x FROM (SELECT 2) AS d(x);
+SELECT * FROM (SELECT * FROM (SELECT id FROM itest.t1 WHERE id = 2) a) b;

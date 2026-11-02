@@ -40,7 +40,6 @@
       "indexes"
     ],
     "F14": [
-      "from-derived-table",
       "select-list-subquery",
       "parallel-apply",
       "semi-anti-rewrite"

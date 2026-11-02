@@ -5,7 +5,6 @@ wave. Rejected via `Error::unsupported` in
 `pkg/parser/sqlparser_bridge/lower.rs` and marked on
 `pkg/executor/join/apply.rs` / `pkg/planner/core/apply.rs`.
 
-- `FROM` derived tables / subquery in FROM
 - Scalar subquery in the SELECT list
 - Subquery `JOIN`
 - Parallel apply
