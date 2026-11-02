@@ -1,7 +1,7 @@
 // F10 core path: IndexLookUpExecutor / covering IndexReader
 // (TiDB pkg/executor/distsql.go).
 // Completeness wave / not this feature: IndexMerge, lookup push-down,
-// parallel workers, unique index PointGet, composite prefix ranges.
+// parallel workers, composite prefix ranges.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;

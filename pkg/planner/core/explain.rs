@@ -158,10 +158,28 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             cop_info(partitions, pushed.as_ref()),
         ),
-        PhysicalPlan::PointGet { table, handle } => (
+        PhysicalPlan::PointGet {
+            table,
+            handle: Some(handle),
+            index: None,
+        } => (
             "PointGet".to_string(),
             format!("table:{table}"),
             format!("handle:{handle}"),
+        ),
+        PhysicalPlan::PointGet {
+            table,
+            index: Some(index),
+            ..
+        } => (
+            "PointGet".to_string(),
+            format!("table:{table}, index:{index}"),
+            String::new(),
+        ),
+        PhysicalPlan::PointGet { table, .. } => (
+            "PointGet".to_string(),
+            format!("table:{table}"),
+            String::new(),
         ),
         PhysicalPlan::IndexLookUpReader {
             table,

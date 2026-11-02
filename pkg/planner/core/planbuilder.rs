@@ -434,11 +434,10 @@ fn access_plan(
     current_db: &str,
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
-    // F10 core: integer handle PointGet still wins; otherwise first-column
-    // equality or range on a secondary INDEX/KEY becomes IndexReader when
-    // covering, else IndexLookUpReader.
-    // Completeness wave: composite prefix, unique PointGet, costed
-    // index path enumeration / skyline.
+    // F10 core: integer handle PointGet still wins; unique-index equality
+    // is PointGet; otherwise first-column equality or range on a secondary
+    // INDEX/KEY becomes IndexReader when covering, else IndexLookUpReader.
+    // Completeness wave: composite prefix, costed index path enumeration.
     if is_information_schema(from, current_db) {
         return PhysicalPlan::InfoSchema {
             table: from.name.clone(),
@@ -457,11 +456,19 @@ fn access_plan(
             let _ = point_get_cost();
             return PhysicalPlan::PointGet {
                 table: from.name.clone(),
-                handle: *handle,
+                handle: Some(*handle),
+                index: None,
             };
         }
         for (column, _) in &eqs {
             if let Some(index) = info.find_index_covering(column) {
+                if index.unique {
+                    return PhysicalPlan::PointGet {
+                        table: from.name.clone(),
+                        handle: None,
+                        index: Some(index.name.o().to_string()),
+                    };
+                }
                 let partitions = info.prune_partitions(select.selection.as_ref());
                 // F10: unanalyzed tables keep the index path.
                 // C2 skyline: after ANALYZE, pick the cheaper of TableReader
@@ -502,7 +509,8 @@ fn access_plan(
     {
         PhysicalPlan::PointGet {
             table: from.name.clone(),
-            handle,
+            handle: Some(handle),
+            index: None,
         }
     } else {
         PhysicalPlan::table_reader(from.name.clone(), Vec::new())

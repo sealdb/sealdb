@@ -25,7 +25,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ### F06
 
 - `batch-point-get`
-- `index-point-get`
 
 ### F07
 
