@@ -1,7 +1,11 @@
 /// TiKV driver (TiDB `pkg/store/driver`). Planner/Executor must not
 /// import `tikv-client` types; they talk to `sealdb_kv::Storage` only.
-/// Completeness wave: coprocessor, 2PC details, stale read, GC, Region cache.
-use sealdb_errno::{ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR, ERR_WRITE_CONFLICT, Error, Result};
+/// Completeness wave: coprocessor, async/pipelined commit, stale read, GC,
+/// Region cache. Pessimistic begin + `get_for_update` is leftover-closed.
+use sealdb_errno::{
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR,
+    ERR_WRITE_CONFLICT, Error, Result,
+};
 use sealdb_kv::{Storage, Transaction};
 use std::sync::Arc;
 use std::time::Duration;
@@ -227,6 +231,10 @@ fn map_tikv_err(err: tikv_client::Error) -> Error {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("writeconflict") || lower.contains("write conflict") {
         Error::new(ERR_WRITE_CONFLICT, msg)
+    } else if lower.contains("deadlock") {
+        Error::new(ERR_LOCK_DEADLOCK, msg)
+    } else if lower.contains("nowait") {
+        Error::new(ERR_LOCK_NOWAIT, msg)
     } else if lower.contains("lock") && (lower.contains("timeout") || lower.contains("wait")) {
         Error::new(ERR_LOCK_WAIT_TIMEOUT, msg)
     } else {

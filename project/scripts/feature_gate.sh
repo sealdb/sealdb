@@ -121,6 +121,7 @@ case "$FEATURE" in
     run execute-nowait-skip cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); BEGIN PESSIMISTIC; SELECT * FROM db1.t WHERE id = 1 FOR UPDATE; SELECT * FROM db1.t ORDER BY id FOR UPDATE SKIP LOCKED; COMMIT"
     run execute-blocking-wait cargo test -q -p sealdb-kv --lib blocking_wait
     run execute-deadlock cargo test -q -p sealdb-kv --lib deadlock
+    run execute-tikv-pessimistic cargo test -q -p sealdb-session --lib tikv_pessimistic
     ;;
   F14)
     run execute-subquery cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t1 (id INT, name VARCHAR(20)); CREATE TABLE db1.t2 (id INT, tag VARCHAR(20)); INSERT INTO db1.t1 VALUES (1, 'a'), (2, 'b'); INSERT INTO db1.t2 VALUES (1, 'x'); SELECT * FROM db1.t1 WHERE EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id)"

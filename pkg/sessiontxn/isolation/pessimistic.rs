@@ -1,5 +1,5 @@
 /// F13 core: pessimistic Repeatable Read (TiDB `PessimisticRRTxnContextProvider`).
-/// Completeness wave / not this feature: 2PC/TiKV pessimistic.
-/// Blocking wait uses `SEALDB_LOCK_WAIT_MS` on MemStorage. Deadlock
-/// is wait-for cycle detection (errno 1213).
+/// Blocking wait uses `SEALDB_LOCK_WAIT_MS` on MemStorage. Deadlock is
+/// wait-for cycle detection (errno 1213). TiKV uses `begin_pessimistic`
+/// + `get_for_update`; async/pipelined 2PC stays in F13 gaps.
 pub struct PessimisticRRTxnContextProvider;

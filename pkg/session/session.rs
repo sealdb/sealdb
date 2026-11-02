@@ -851,6 +851,39 @@ mod tests {
     }
 
     #[test]
+    fn test_tikv_pessimistic_for_update_if_available() {
+        let _guard = tikv_test_lock();
+        let cfg = Config {
+            store: sealdb_config::StoreKind::Tikv,
+            ..Config::default()
+        };
+        let session = match Session::from_config(&cfg) {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("skip live tikv pessimistic: {err}");
+                return;
+            }
+        };
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS tikv_pessimistic; CREATE DATABASE tikv_pessimistic; CREATE TABLE tikv_pessimistic.t (id INT, name VARCHAR(20)); INSERT INTO tikv_pessimistic.t VALUES (1, 'a')",
+            )
+            .unwrap();
+        session
+            .execute_stmt(
+                "BEGIN PESSIMISTIC; SELECT * FROM tikv_pessimistic.t FOR UPDATE; UPDATE tikv_pessimistic.t SET name = 'b' WHERE id = 1; COMMIT",
+            )
+            .unwrap();
+        let rows = session
+            .execute_stmt("SELECT * FROM tikv_pessimistic.t")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
     fn test_create_drop_database_and_table() {
         let session = Session::new();
         session.execute_stmt("CREATE DATABASE db1").unwrap();

@@ -12,14 +12,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 - `online-ddl-jobs`
 - `indexes`
 
-### F12
-
-- `pessimistic`
-
-### F13
-
-- `tikv-pessimistic`
-
 ### F14
 
 - `any-all`
