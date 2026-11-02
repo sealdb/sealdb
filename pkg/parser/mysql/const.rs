@@ -16,6 +16,8 @@ pub const COM_FIELD_LIST: u8 = 4;
 pub const COM_PING: u8 = 14;
 pub const COM_STMT_PREPARE: u8 = 22;
 pub const COM_STMT_EXECUTE: u8 = 23;
+pub const COM_STMT_CLOSE: u8 = 25;
+pub const COM_STMT_RESET: u8 = 26;
 
 pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;

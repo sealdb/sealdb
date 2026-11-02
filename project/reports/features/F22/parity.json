@@ -7642,7 +7642,7 @@
       "rs_path": "pkg/server/conn.rs",
       "status": "partial",
       "phase": 9,
-      "notes": "handshake + SSLRequest/TLS upgrade + COM_QUERY/PING/INIT_DB/QUIT; prepared deferred"
+      "notes": "handshake + SSL/compress + COM_QUERY/PING/INIT_DB/QUIT + COM_STMT_PREPARE/EXECUTE/CLOSE binary"
     },
     {
       "go_path": "pkg/server/conn_stmt.go",

@@ -36,9 +36,7 @@
   ],
   "feature_gaps": {
     "F22": [
-      "prepared-stmt",
       "auth-plugin",
-      "binary-protocol",
       "multi-resultset"
     ]
   },

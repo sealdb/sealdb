@@ -196,6 +196,7 @@ case "$FEATURE" in
     run execute-com-query cargo test -q -p sealdb-server --lib tests::test_com_query -- --exact
     run execute-ssl cargo test -q -p sealdb-server --lib tests::test_ssl_upgrade_roundtrip -- --exact
     run execute-compression cargo test -q -p sealdb-server --lib internal::packetio::compress_tests::test_compress_roundtrip -- --exact
+    run execute-prepared-stmt cargo test -q -p sealdb-server --lib tests::test_com_stmt_prepare_execute -- --exact
     ;;
   C1)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \
