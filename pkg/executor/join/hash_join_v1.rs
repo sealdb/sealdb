@@ -1,5 +1,5 @@
-// F09 core path: two-table Inner/Left/Right HashJoin on equality, plus CROSS JOIN.
-// Completeness wave / not this feature: semi/anti/full, n-table, USING/NATURAL,
+// F09 core path: left-deep Inner/Left/Right HashJoin on equality, plus CROSS JOIN.
+// Completeness wave / not this feature: semi/anti/full, USING/NATURAL,
 // recursive spill/parallel workers, merge/index join, non-equality ON. CROSS JOIN
 // materializes both sides in memory (no join-key partition spill).
 use crate::internal::exec::Executor;
@@ -237,15 +237,16 @@ fn split_join_eq(
     }
 }
 
-fn side_of(expr: &ExprNode, left_table: &str, right_table: &str) -> Option<bool> {
+/// `true` = accumulated left side, `false` = the new right table.
+/// For n-table joins any table other than `right_table` lives on the left.
+fn side_of(expr: &ExprNode, _left_table: &str, right_table: &str) -> Option<bool> {
     let ExprNode::Column(col) = expr else {
         return None;
     };
     match col.table.as_deref() {
-        Some(table) if table.eq_ignore_ascii_case(left_table) => Some(true),
         Some(table) if table.eq_ignore_ascii_case(right_table) => Some(false),
+        Some(_) => Some(true),
         None => None,
-        Some(_) => None,
     }
 }
 

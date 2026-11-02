@@ -358,7 +358,7 @@ mod tests {
         let stmt = parser
             .parse_one_stmt("SELECT * FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id")
             .unwrap();
-        let join = stmt.as_select().unwrap().join.as_ref().unwrap();
+        let join = &stmt.as_select().unwrap().joins[0];
         assert_eq!(join.left.name, "t1");
         assert_eq!(join.right.name, "t2");
         assert_eq!(join.tp, crate::ast::JoinType::Inner);
@@ -366,16 +366,22 @@ mod tests {
             .parse_one_stmt("SELECT * FROM db1.t1 CROSS JOIN db1.t2")
             .unwrap();
         assert_eq!(
-            cross.as_select().unwrap().join.as_ref().unwrap().tp,
+            cross.as_select().unwrap().joins[0].tp,
             crate::ast::JoinType::Cross
         );
         let comma = parser
             .parse_one_stmt("SELECT * FROM db1.t1, db1.t2")
             .unwrap();
         assert_eq!(
-            comma.as_select().unwrap().join.as_ref().unwrap().tp,
+            comma.as_select().unwrap().joins[0].tp,
             crate::ast::JoinType::Cross
         );
+        let three = parser
+            .parse_one_stmt(
+                "SELECT * FROM db1.t1 JOIN db1.t2 ON t1.id = t2.id JOIN db1.t3 ON t2.id = t3.id",
+            )
+            .unwrap();
+        assert_eq!(three.as_select().unwrap().joins.len(), 2);
     }
 
     #[test]

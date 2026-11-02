@@ -2840,7 +2840,7 @@
       "rs_path": "pkg/executor/join/hash_join_v1.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "two-table HashJoinV1Exec with join-key partition spill and CROSS JOIN cartesian"
+      "notes": "left-deep n-table HashJoinV1Exec with join-key partition spill and CROSS JOIN cartesian"
     },
     {
       "go_path": "pkg/executor/join/hash_join_v2.go",

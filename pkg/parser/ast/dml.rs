@@ -29,7 +29,7 @@ impl JoinType {
     }
 }
 
-/// Two-table join in FROM / UPDATE / DELETE. n-table chains stay deferred (F09).
+/// One step in a left-deep join chain (FROM / UPDATE / DELETE).
 #[derive(Clone, Debug)]
 pub struct Join {
     pub left: TableName,
@@ -146,7 +146,9 @@ impl WithClause {
 pub struct SelectStmt {
     pub fields: Vec<SelectField>,
     pub from: Option<TableName>,
-    pub join: Option<Join>,
+    /// Left-deep join chain. Empty means a single table (or dual). `joins[i].left`
+    /// is the previous right table (or the FROM table for `i == 0`).
+    pub joins: Vec<Join>,
     pub selection: Option<ExprNode>,
     pub group_by: Vec<ExprNode>,
     pub having: Option<ExprNode>,
@@ -165,6 +167,19 @@ pub struct ByItem {
 }
 
 impl SelectStmt {
+    /// All tables named in FROM / JOIN, left to right, without duplicates by pointer identity
+    /// of the chain (left of the first join plus each join's right).
+    pub fn join_tables(&self) -> Vec<&TableName> {
+        if self.joins.is_empty() {
+            return self.from.iter().collect();
+        }
+        let mut tables = vec![&self.joins[0].left];
+        for join in &self.joins {
+            tables.push(&join.right);
+        }
+        tables
+    }
+
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         if let Some(with) = &self.with {
             with.restore(ctx)?;
@@ -180,9 +195,19 @@ impl SelectStmt {
                 ctx.write_str(name);
             }
         }
-        if let Some(join) = &self.join {
+        if !self.joins.is_empty() {
             ctx.write_str(" FROM ");
-            join.restore(ctx)?;
+            self.joins[0].restore(ctx)?;
+            for join in self.joins.iter().skip(1) {
+                ctx.write_str(" ");
+                ctx.write_str(join.tp.restore());
+                ctx.write_str(" ");
+                join.right.restore(ctx)?;
+                if join.tp.has_on() {
+                    ctx.write_str(" ON ");
+                    join.on.restore(ctx)?;
+                }
+            }
         } else if let Some(from) = &self.from {
             ctx.write_str(" FROM ");
             from.restore(ctx)?;

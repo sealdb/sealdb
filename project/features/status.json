@@ -14,7 +14,7 @@
     "F06": {"status": "core-ported", "phase": 5, "notes": "integer handle / unique-index PointGet and BatchPointGet", "gaps": []},
     "F07": {"status": "core-ported", "phase": 5, "notes": "single-table UPDATE/DELETE with ORDER BY LIMIT; two-table UPDATE JOIN and multi-table DELETE; RETURNING out of scope (not in TiDB v8.5.8)", "gaps": []},
     "F08": {"status": "core-ported", "phase": 5, "notes": "HashAgg GROUP BY + StreamAgg scalar COUNT/SUM/AVG/MIN/MAX DISTINCT/HAVING + partition spill", "gaps": []},
-    "F09": {"status": "core-ported", "phase": 5, "notes": "two-table Inner/Left/Right HashJoin on equality + CROSS/comma join + partition spill", "gaps": ["semi-anti", "n-table"]},
+    "F09": {"status": "core-ported", "phase": 5, "notes": "left-deep n-table Inner/Left/Right HashJoin on equality + CROSS/comma join + partition spill", "gaps": ["semi-anti"]},
     "F10": {"status": "core-ported", "phase": 5, "notes": "CREATE TABLE INDEX/KEY + unique/PK + IndexLookUp / covering IndexReader + first-column range scan", "gaps": []},
     "F11": {"status": "core-ported", "phase": 3, "notes": "SHOW INDEX/CHARSET/COLLATION + I_S STATISTICS/constraints/partitions/charset/engines/views", "gaps": []},
     "F12": {"status": "core-ported", "phase": 6, "notes": "BEGIN/COMMIT/ROLLBACK + optimistic RR snapshot and write-conflict", "gaps": ["pessimistic", "savepoint", "isolation-modes", "transactional-ddl"]},

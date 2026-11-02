@@ -2,6 +2,7 @@ use super::physical_plans::{JoinType, PhysicalPlan};
 
 /// Two-table greedy JoinReorder: Inner HashJoin builds the smaller side.
 /// Completeness wave: n-table DP/greedy, outer-join assoc, bushy trees.
+#[allow(clippy::too_many_arguments)]
 pub fn reorder_hash_join(
     tp: JoinType,
     left: PhysicalPlan,
@@ -10,6 +11,7 @@ pub fn reorder_hash_join(
     right_table: String,
     left_rows: f64,
     right_rows: f64,
+    on: sealdb_parser::ast::ExprNode,
 ) -> PhysicalPlan {
     let _ = super::plan_cost::hash_join_cost(left_rows, right_rows, left_rows, right_rows);
     let _ = hash_join_probe_build(tp, left_rows, right_rows);
@@ -20,6 +22,7 @@ pub fn reorder_hash_join(
             right: Box::new(left),
             left_table: right_table,
             right_table: left_table,
+            on,
         }
     } else {
         PhysicalPlan::HashJoin {
@@ -28,6 +31,7 @@ pub fn reorder_hash_join(
             right: Box::new(right),
             left_table,
             right_table,
+            on,
         }
     }
 }
@@ -56,6 +60,9 @@ mod tests {
             "big".to_string(),
             1.0,
             100.0,
+            sealdb_parser::ast::ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                datum: sealdb_types::Datum::I64(1),
+            }),
         );
         let PhysicalPlan::HashJoin {
             left_table,

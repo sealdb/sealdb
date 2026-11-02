@@ -88,13 +88,15 @@ pub enum PhysicalPlan {
     StreamAgg {
         child: Box<PhysicalPlan>,
     },
-    /// Two-table hash join. `Cross` has no equality keys; n-table is leftover.
+    /// Left-deep hash join. `on` is skipped in explain JSON; `Cross` has no equality keys.
     HashJoin {
         tp: JoinType,
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         left_table: String,
         right_table: String,
+        #[serde(skip)]
+        on: ExprNode,
     },
     Explain {
         format: ExplainFormat,

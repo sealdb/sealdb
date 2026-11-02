@@ -26,3 +26,8 @@ t1.id	t2.tag
 1	y
 2	x
 2	y
+CREATE TABLE itest.t3 (id INT, note VARCHAR(20));
+INSERT INTO itest.t3 VALUES (1, 'n');
+SELECT t1.id, t2.tag, t3.note FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id JOIN itest.t3 ON t2.id = t3.id;
+t1.id	t2.tag	t3.note
+1	x	n

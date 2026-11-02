@@ -120,9 +120,10 @@ fn select_source_tables<'a>(
     current_db: &str,
 ) -> Result<Vec<&'a TableInfo>> {
     let mut tables = Vec::new();
-    if let Some(join) = &select.join {
-        tables.push(lookup_table(is, &join.left, current_db)?);
-        tables.push(lookup_table(is, &join.right, current_db)?);
+    if !select.joins.is_empty() {
+        for table in select.join_tables() {
+            tables.push(lookup_table(is, table, current_db)?);
+        }
     } else if let Some(from) = &select.from {
         tables.push(lookup_table(is, from, current_db)?);
     }

@@ -33,21 +33,8 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
-                let mut plan = if let Some(join) = &select.join {
-                    if named_cte(select.with.as_ref(), &join.left.name)
-                        || named_cte(select.with.as_ref(), &join.right.name)
-                    {
-                        return Err(Error::unsupported("CTE in JOIN"));
-                    }
-                    reorder_hash_join(
-                        map_join_type(join.tp),
-                        PhysicalPlan::table_reader(join.left.name.clone(), Vec::new()),
-                        PhysicalPlan::table_reader(join.right.name.clone(), Vec::new()),
-                        join.left.name.clone(),
-                        join.right.name.clone(),
-                        table_row_count(stats, &join.left, current_db),
-                        table_row_count(stats, &join.right, current_db),
-                    )
+                let mut plan = if !select.joins.is_empty() {
+                    build_join_plan(select, stats, current_db)?
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
@@ -280,6 +267,47 @@ fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectSt
         select.with = with.cloned();
     }
     select
+}
+
+/// Left-deep HashJoin tree. Only the first pair of table scans is reordered by size;
+/// later tables stay on the right so ON can see the accumulated left schema.
+fn build_join_plan(
+    select: &SelectStmt,
+    stats: Option<&Handle>,
+    current_db: &str,
+) -> Result<PhysicalPlan> {
+    let first = &select.joins[0];
+    for join in &select.joins {
+        if named_cte(select.with.as_ref(), &join.left.name)
+            || named_cte(select.with.as_ref(), &join.right.name)
+        {
+            return Err(Error::unsupported("CTE in JOIN"));
+        }
+    }
+    let mut plan = reorder_hash_join(
+        map_join_type(first.tp),
+        PhysicalPlan::table_reader(first.left.name.clone(), Vec::new()),
+        PhysicalPlan::table_reader(first.right.name.clone(), Vec::new()),
+        first.left.name.clone(),
+        first.right.name.clone(),
+        table_row_count(stats, &first.left, current_db),
+        table_row_count(stats, &first.right, current_db),
+        first.on.clone(),
+    );
+    for join in select.joins.iter().skip(1) {
+        plan = PhysicalPlan::HashJoin {
+            tp: map_join_type(join.tp),
+            left: Box::new(plan),
+            right: Box::new(PhysicalPlan::table_reader(
+                join.right.name.clone(),
+                Vec::new(),
+            )),
+            left_table: join.left.name.clone(),
+            right_table: join.right.name.clone(),
+            on: join.on.clone(),
+        };
+    }
+    Ok(plan)
 }
 
 fn map_join_type(tp: AstJoinType) -> JoinType {
