@@ -156,8 +156,7 @@ fn write_row(
         Some(Datum::I64(v)) => *v,
         _ => domain.next_handle(info.id)?,
     };
-    let part_val = info.partition_value(values).cloned().unwrap_or(Datum::Null);
-    let physical_id = info.locate_partition(&part_val)?;
+    let physical_id = info.locate_partition_row(values)?;
     let key = encode_row_key_with_handle(physical_id, handle);
     if info.indices.iter().any(|idx| idx.primary) && txn.get(key.as_bytes())?.is_some() {
         return Err(Error::new(

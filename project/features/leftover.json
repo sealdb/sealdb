@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F19": [
-      "range-columns",
       "expr-keys",
       "add-drop-partition",
       "subpartition",

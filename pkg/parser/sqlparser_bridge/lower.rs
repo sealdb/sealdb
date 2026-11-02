@@ -1460,12 +1460,7 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
-    // F19 gap: RANGE COLUMNS / subpartition / expr keys.
-    if keyword_at(bytes, i, "RANGE")
-        && keyword_at(bytes, skip_ws(bytes, i + "RANGE".len()), "COLUMNS")
-    {
-        return Err(Error::unsupported("RANGE COLUMNS partition"));
-    }
+    // F19 gap: subpartition / expr keys.
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
         PartitionType::Range
@@ -1481,18 +1476,21 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     } else {
         return Err(Error::unsupported("partition type"));
     };
+    let range_columns = tp == PartitionType::Range && keyword_at(bytes, i, "COLUMNS");
+    if range_columns {
+        i = skip_ws(bytes, i + "COLUMNS".len());
+    }
     if i >= bytes.len() || bytes[i] != b'(' {
         return Err(Error::unsupported("PARTITION BY expression"));
     }
     let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("PARTITION BY"))?;
-    let column = std::str::from_utf8(&bytes[i + 1..close])
-        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid partition column"))?
-        .trim()
-        .trim_matches('`')
-        .to_string();
-    if column.is_empty() || column.contains('(') {
-        return Err(Error::unsupported("partition expression"));
-    }
+    let inner = std::str::from_utf8(&bytes[i + 1..close])
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid partition column"))?;
+    let columns = parse_partition_columns(inner, range_columns)?;
+    let column = columns
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::unsupported("PARTITION BY without columns"))?;
     i = skip_ws(bytes, close + 1);
     match tp {
         PartitionType::Hash | PartitionType::Key => {
@@ -1508,6 +1506,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                 PartitionOption {
                     tp,
                     column,
+                    columns,
                     defs: Vec::new(),
                     num,
                 },
@@ -1527,6 +1526,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                 PartitionOption {
                     tp,
                     column,
+                    columns,
                     num: defs.len() as u64,
                     defs,
                 },
@@ -1546,6 +1546,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                 PartitionOption {
                     tp,
                     column,
+                    columns,
                     num: defs.len() as u64,
                     defs,
                 },
@@ -1553,6 +1554,27 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
             ))
         }
     }
+}
+
+fn parse_partition_columns(inner: &str, allow_list: bool) -> Result<Vec<String>> {
+    if inner.trim().is_empty() {
+        return Err(Error::unsupported("PARTITION BY without columns"));
+    }
+    if inner.contains('(') {
+        return Err(Error::unsupported("partition expression"));
+    }
+    let names: Vec<String> = inner
+        .split(',')
+        .map(|p| p.trim().trim_matches('`').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if names.is_empty() {
+        return Err(Error::unsupported("PARTITION BY without columns"));
+    }
+    if names.len() > 1 && !allow_list {
+        return Err(Error::unsupported("partition expression"));
+    }
+    Ok(names)
 }
 
 fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
@@ -1583,27 +1605,17 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
             return Err(Error::unsupported("VALUES LESS THAN"));
         }
         i = skip_ws(bytes, i + "THAN".len());
-        let less_than = if keyword_at(bytes, i, "MAXVALUE") {
-            None
+        let bounds = parse_less_than_bounds(bytes, i, item)?;
+        let less_than = bounds.first().copied().flatten();
+        let extra_bounds = if bounds.len() > 1 {
+            bounds[1..].to_vec()
         } else {
-            if i >= bytes.len() || bytes[i] != b'(' {
-                return Err(Error::unsupported("VALUES LESS THAN"));
-            }
-            let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
-            let bound = item[i + 1..close].trim();
-            if bound.eq_ignore_ascii_case("MAXVALUE") {
-                None
-            } else {
-                Some(
-                    bound
-                        .parse::<i64>()
-                        .map_err(|_| Error::unsupported("non-integer LESS THAN"))?,
-                )
-            }
+            Vec::new()
         };
         defs.push(PartitionDef {
             name,
             less_than,
+            extra_bounds,
             in_values: Vec::new(),
         });
     }
@@ -1611,6 +1623,36 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
         return Err(Error::unsupported("RANGE without partitions"));
     }
     Ok(defs)
+}
+
+fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Option<i64>>> {
+    if keyword_at(bytes, i, "MAXVALUE") {
+        return Ok(vec![None]);
+    }
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return Err(Error::unsupported("VALUES LESS THAN"));
+    }
+    let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("LESS THAN"))?;
+    let mut bounds = Vec::new();
+    for raw in item[i + 1..close].split(',') {
+        let bound = raw.trim();
+        if bound.is_empty() {
+            continue;
+        }
+        if bound.eq_ignore_ascii_case("MAXVALUE") {
+            bounds.push(None);
+        } else {
+            bounds.push(Some(
+                bound
+                    .parse::<i64>()
+                    .map_err(|_| Error::unsupported("non-integer LESS THAN"))?,
+            ));
+        }
+    }
+    if bounds.is_empty() {
+        return Err(Error::unsupported("VALUES LESS THAN"));
+    }
+    Ok(bounds)
 }
 
 fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
@@ -1658,6 +1700,7 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
         defs.push(PartitionDef {
             name,
             less_than: None,
+            extra_bounds: Vec::new(),
             in_values,
         });
     }

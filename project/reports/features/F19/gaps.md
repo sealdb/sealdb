@@ -5,7 +5,6 @@ wave. Rejected via `Error::unsupported` in
 `pkg/parser/sqlparser_bridge/lower.rs` and marked on
 `pkg/ddl/partition.rs` / `pkg/planner/core/rule_partition_processor.rs`.
 
-- RANGE COLUMNS partition types
 - Partition expression keys (only a single column name)
 - Subpartition
 - `ADD` / `DROP` / `REORGANIZE PARTITION`

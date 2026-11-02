@@ -92,6 +92,14 @@ impl PartitionInfo {
         }
     }
 
+    pub fn with_columns(mut self, columns: Vec<String>) -> Self {
+        if !columns.is_empty() {
+            self.expr = columns.join(",");
+            self.columns = columns.into_iter().map(CIStr::new).collect();
+        }
+        self
+    }
+
     pub fn column(&self) -> &str {
         self.columns
             .first()
@@ -148,6 +156,20 @@ impl PartitionInfo {
         let n = self.definitions.len() as i64;
         let idx = ((v % n) + n) % n;
         Ok(self.definitions[idx as usize].id)
+    }
+
+    /// Lexicographic RANGE COLUMNS compare: the first bound the row is strictly
+    /// less than (MAXVALUE is +inf) is the partition.
+    pub fn locate_tuple(&self, values: &[Datum]) -> Result<i64> {
+        if self.columns.len() <= 1 {
+            return self.locate(values.first().unwrap_or(&Datum::Null));
+        }
+        for def in &self.definitions {
+            if tuple_less(values, &def.less_than) {
+                return Ok(def.id);
+            }
+        }
+        Err(no_partition())
     }
 
     fn locate_list(&self, value: &Datum) -> Result<i64> {
@@ -268,6 +290,35 @@ impl TableInfo {
         }
     }
 
+    /// RANGE COLUMNS uses every partition-key column; other types keep the first.
+    pub fn locate_partition_row(&self, values: &[Datum]) -> Result<i64> {
+        match &self.partition {
+            Some(part) if part.enable && part.columns.len() > 1 => {
+                part.locate_tuple(&self.partition_values(values))
+            }
+            _ => {
+                let value = self.partition_value(values).cloned().unwrap_or(Datum::Null);
+                self.locate_partition(&value)
+            }
+        }
+    }
+
+    pub fn partition_values(&self, values: &[Datum]) -> Vec<Datum> {
+        let Some(part) = &self.partition else {
+            return Vec::new();
+        };
+        part.columns
+            .iter()
+            .map(|name| {
+                self.columns
+                    .iter()
+                    .position(|c| c.name.o().eq_ignore_ascii_case(name.o()))
+                    .and_then(|idx| values.get(idx).cloned())
+                    .unwrap_or(Datum::Null)
+            })
+            .collect()
+    }
+
     pub fn prune_partitions(&self, selection: Option<&ExprNode>) -> Vec<i64> {
         match &self.partition {
             Some(part) if part.enable && !part.definitions.is_empty() => part.prune(selection),
@@ -283,6 +334,25 @@ impl TableInfo {
             .position(|c| c.name.o().eq_ignore_ascii_case(part.column()))?;
         values.get(idx)
     }
+}
+
+fn tuple_less(row: &[Datum], bound: &[String]) -> bool {
+    for (i, b) in bound.iter().enumerate() {
+        if b.eq_ignore_ascii_case("MAXVALUE") {
+            return true;
+        }
+        let rv = row.get(i).and_then(datum_i64).unwrap_or(i64::MIN);
+        let Ok(bv) = b.parse::<i64>() else {
+            return false;
+        };
+        if rv < bv {
+            return true;
+        }
+        if rv > bv {
+            return false;
+        }
+    }
+    false
 }
 
 fn range_overlaps(op: Op, v: i64, low: i64, high: Option<i64>) -> bool {
