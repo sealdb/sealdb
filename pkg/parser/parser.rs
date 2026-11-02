@@ -1153,6 +1153,20 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt(
+                "CREATE TABLE t (a INT, b INT) PARTITION BY RANGE COLUMNS (a, b) (PARTITION p0 VALUES LESS THAN (10, 20), PARTITION p1 VALUES LESS THAN (MAXVALUE, MAXVALUE))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => {
+                let part = create.partition.expect("range columns");
+                assert_eq!(part.columns, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(part.defs[0].less_than, Some(10));
+                assert_eq!(part.defs[0].extra_bounds, vec![Some(20)]);
+            }
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

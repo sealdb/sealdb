@@ -3477,6 +3477,15 @@ mod tests {
             keyed.display_rows(),
             vec![vec!["5".to_string(), "z".to_string()]]
         );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.rc (a INT, b INT, name VARCHAR(20)) PARTITION BY RANGE COLUMNS (a, b) (PARTITION p0 VALUES LESS THAN (10, 20), PARTITION p1 VALUES LESS THAN (MAXVALUE, MAXVALUE)); INSERT INTO db1.rc VALUES (1, 1, 'a'), (10, 30, 'b')",
+            )
+            .unwrap();
+        let rc = session
+            .execute_stmt("SELECT name FROM db1.rc WHERE a = 10")
+            .unwrap();
+        assert_eq!(rc.display_rows(), vec![vec!["b".to_string()]]);
     }
 
     #[test]

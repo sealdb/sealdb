@@ -377,11 +377,7 @@ pub(crate) fn apply_row_update(
             _ => None,
         })
         .unwrap_or(scanned.handle);
-    let new_part = info
-        .partition_value(&new_values)
-        .cloned()
-        .unwrap_or(Datum::Null);
-    let new_physical = info.locate_partition(&new_part)?;
+    let new_physical = info.locate_partition_row(&new_values)?;
     delete_index_keys(
         txn,
         info,

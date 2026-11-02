@@ -155,6 +155,8 @@ pub struct PartitionDef {
     pub name: String,
     /// RANGE bound; `None` means MAXVALUE. Unused for HASH/KEY/LIST.
     pub less_than: Option<i64>,
+    /// RANGE COLUMNS extra bounds after the first `less_than` (`None` = MAXVALUE).
+    pub extra_bounds: Vec<Option<i64>>,
     /// LIST `VALUES IN (...)` integers.
     pub in_values: Vec<i64>,
 }
@@ -163,6 +165,8 @@ pub struct PartitionDef {
 pub struct PartitionOption {
     pub tp: PartitionType,
     pub column: String,
+    /// RANGE COLUMNS list; empty means a single `column`.
+    pub columns: Vec<String>,
     pub defs: Vec<PartitionDef>,
     pub num: u64,
 }
@@ -207,13 +211,23 @@ impl CreateTableStmt {
         if let Some(part) = &self.partition {
             ctx.write_str(" PARTITION BY ");
             match part.tp {
+                PartitionType::Range if part.columns.len() > 1 => ctx.write_str("RANGE COLUMNS"),
                 PartitionType::Range => ctx.write_str("RANGE"),
                 PartitionType::Hash => ctx.write_str("HASH"),
                 PartitionType::List => ctx.write_str("LIST"),
                 PartitionType::Key => ctx.write_str("KEY"),
             }
             ctx.write_str(" (");
-            ctx.write_name(&part.column);
+            if part.columns.len() > 1 {
+                for (i, col) in part.columns.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(col);
+                }
+            } else {
+                ctx.write_name(&part.column);
+            }
             ctx.write_str(")");
             if matches!(part.tp, PartitionType::Hash | PartitionType::Key) && part.defs.is_empty() {
                 ctx.write_str(" PARTITIONS ");
@@ -231,6 +245,13 @@ impl CreateTableStmt {
                         match def.less_than {
                             Some(v) => ctx.write_str(&v.to_string()),
                             None => ctx.write_str("MAXVALUE"),
+                        }
+                        for bound in &def.extra_bounds {
+                            ctx.write_str(", ");
+                            match bound {
+                                Some(v) => ctx.write_str(&v.to_string()),
+                                None => ctx.write_str("MAXVALUE"),
+                            }
                         }
                         ctx.write_str(")");
                     } else if part.tp == PartitionType::List {

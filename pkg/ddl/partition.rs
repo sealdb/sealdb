@@ -1,6 +1,6 @@
-// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY.
-// Completeness wave / not this feature: RANGE COLUMNS, ADD/DROP PARTITION,
-// reorganize, job states.
+// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS.
+// Completeness wave / not this feature: ADD/DROP PARTITION, reorganize, job
+// states, expression keys.
 use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_meta::{Mutator, PartitionDefinition, PartitionInfo, PartitionType, TableInfo};
 use sealdb_parser::ast::{PartitionOption, PartitionType as AstPartitionType};
@@ -10,15 +10,22 @@ pub fn attach_partitions(
     info: &mut TableInfo,
     spec: &PartitionOption,
 ) -> Result<()> {
-    if !info
-        .columns
-        .iter()
-        .any(|c| c.name.o().eq_ignore_ascii_case(&spec.column))
-    {
-        return Err(Error::new(
-            ERR_BAD_FIELD,
-            format!("Unknown column '{}' in partition key", spec.column),
-        ));
+    let key_cols = if spec.columns.is_empty() {
+        vec![spec.column.clone()]
+    } else {
+        spec.columns.clone()
+    };
+    for name in &key_cols {
+        if !info
+            .columns
+            .iter()
+            .any(|c| c.name.o().eq_ignore_ascii_case(name))
+        {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{name}' in partition key"),
+            ));
+        }
     }
     let tp = match spec.tp {
         AstPartitionType::Range => PartitionType::Range,
@@ -51,14 +58,10 @@ pub fn attach_partitions(
         PartitionType::Range => {
             let mut defs = Vec::with_capacity(spec.defs.len());
             for def in &spec.defs {
-                let less_than = match def.less_than {
-                    Some(v) => vec![v.to_string()],
-                    None => vec!["MAXVALUE".to_string()],
-                };
                 defs.push(PartitionDefinition::new(
                     meta.gen_global_id()?,
                     def.name.clone(),
-                    less_than,
+                    range_bounds(def),
                 ));
             }
             defs
@@ -74,6 +77,20 @@ pub fn attach_partitions(
             defs
         }
     };
-    info.partition = Some(PartitionInfo::new(tp, spec.column.clone(), defs));
+    info.partition = Some(PartitionInfo::new(tp, spec.column.clone(), defs).with_columns(key_cols));
     Ok(())
+}
+
+fn range_bounds(def: &sealdb_parser::ast::PartitionDef) -> Vec<String> {
+    let mut out = vec![match def.less_than {
+        Some(v) => v.to_string(),
+        None => "MAXVALUE".to_string(),
+    }];
+    for bound in &def.extra_bounds {
+        out.push(match bound {
+            Some(v) => v.to_string(),
+            None => "MAXVALUE".to_string(),
+        });
+    }
+    out
 }
