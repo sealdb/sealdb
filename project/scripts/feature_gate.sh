@@ -77,6 +77,7 @@ case "$FEATURE" in
   F06)
     run execute-point-get cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); SELECT * FROM db1.t WHERE id = 2"
     run execute-index-point-get cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), extra VARCHAR(20), UNIQUE INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a', 'x'), (2, 'b', 'y'); EXPLAIN SELECT * FROM db1.t WHERE name = 'a'; SELECT * FROM db1.t WHERE name = 'a'"
+    run execute-batch-point-get cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c'); EXPLAIN SELECT * FROM db1.t WHERE id IN (1, 3); SELECT * FROM db1.t WHERE id IN (1, 3) ORDER BY id"
     ;;
   F07)
     run execute-update-delete cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); UPDATE db1.t SET name = 'c' WHERE id = 1; DELETE FROM db1.t WHERE id = 2; SELECT * FROM db1.t"

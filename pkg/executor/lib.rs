@@ -3,6 +3,7 @@
 pub mod aggfuncs;
 pub mod aggregate;
 pub mod analyze;
+pub mod batch_point_get;
 pub mod builder;
 pub mod coprocessor;
 pub mod cte;

@@ -108,6 +108,26 @@ fn push_into(
                 residual,
             )
         }
+        PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+        } => {
+            let residual = conjuncts
+                .into_iter()
+                .filter(|expr| !is_in_list_on(expr, &column))
+                .collect();
+            wrap_residual(
+                PhysicalPlan::BatchPointGet {
+                    table,
+                    column,
+                    index,
+                    n_keys,
+                },
+                residual,
+            )
+        }
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(push_into(*child, conjuncts, is, current_db)),
@@ -179,6 +199,11 @@ fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> 
 
 fn is_handle_eq(expr: &ExprNode, handle: i64) -> bool {
     matches!(expr.eq_column_const(), Some((_, Datum::I64(value))) if value == handle)
+}
+
+fn is_in_list_on(expr: &ExprNode, column: &str) -> bool {
+    expr.column_in_consts()
+        .is_some_and(|(name, _)| name.eq_ignore_ascii_case(column))
 }
 
 enum Side {

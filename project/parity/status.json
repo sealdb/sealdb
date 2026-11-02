@@ -453,7 +453,13 @@
     "pkg/executor/point_get.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "integer handle PointGet"
+      "notes": "integer handle PointGet + unique-index PointGet"
+    },
+    "pkg/executor/batch_point_get.go": {
+      "status": "partial",
+      "rust": "pkg/executor/batch_point_get.rs",
+      "phase": 5,
+      "notes": "handle and unique-index BatchPointGet for IN lists"
     },
     "pkg/executor/select.go": {
       "status": "partial",

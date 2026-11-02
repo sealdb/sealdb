@@ -120,6 +120,41 @@ impl ExprNode {
         })
     }
 
+    pub fn column_in_consts(&self) -> Option<(String, Vec<Datum>)> {
+        let ExprNode::InList(list) = self else {
+            return None;
+        };
+        if list.not {
+            return None;
+        }
+        let ExprNode::Column(col) = list.expr.as_ref() else {
+            return None;
+        };
+        let mut values = Vec::new();
+        for item in &list.list {
+            let ExprNode::Value(value) = item else {
+                return None;
+            };
+            if value.datum.is_null() {
+                continue;
+            }
+            if !values
+                .iter()
+                .any(|have: &Datum| have.compare(&value.datum).is_eq())
+            {
+                values.push(value.datum.clone());
+            }
+        }
+        Some((col.name.clone(), values))
+    }
+
+    pub fn in_const_on(&self, column: &str) -> Option<Vec<Datum>> {
+        self.split_cnf().into_iter().find_map(|expr| {
+            expr.column_in_consts()
+                .and_then(|(name, values)| name.eq_ignore_ascii_case(column).then_some(values))
+        })
+    }
+
     pub fn column_cmp_const(&self) -> Option<(String, Op, Datum)> {
         let ExprNode::Binary(bin) = self else {
             return None;

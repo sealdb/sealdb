@@ -323,6 +323,85 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     }
 }
 
+fn in_list_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+) -> Option<PhysicalPlan> {
+    let lists = select
+        .selection
+        .as_ref()
+        .map(|expr| {
+            expr.split_cnf()
+                .into_iter()
+                .filter_map(|item| item.column_in_consts())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(first) = info.columns.first() {
+        for (column, values) in &lists {
+            if !first.name.o().eq_ignore_ascii_case(column) {
+                continue;
+            }
+            let handles: Vec<i64> = values
+                .iter()
+                .filter_map(|value| match value {
+                    Datum::I64(v) => Some(*v),
+                    Datum::U64(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .collect();
+            if handles.len() != values.len() {
+                continue;
+            }
+            return Some(point_or_batch(
+                from,
+                column.clone(),
+                None,
+                handles.into_iter().map(Datum::I64).collect(),
+            ));
+        }
+    }
+    for (column, values) in lists {
+        if let Some(index) = info.find_index_covering(&column)
+            && index.unique
+        {
+            return Some(point_or_batch(
+                from,
+                column,
+                Some(index.name.o().to_string()),
+                values,
+            ));
+        }
+    }
+    None
+}
+
+fn point_or_batch(
+    from: &TableName,
+    column: String,
+    index: Option<String>,
+    values: Vec<Datum>,
+) -> PhysicalPlan {
+    if let [value] = values.as_slice() {
+        let handle = match (&index, value) {
+            (None, Datum::I64(handle)) => Some(*handle),
+            _ => None,
+        };
+        return PhysicalPlan::PointGet {
+            table: from.name.clone(),
+            handle,
+            index,
+        };
+    }
+    PhysicalPlan::BatchPointGet {
+        table: from.name.clone(),
+        column,
+        index,
+        n_keys: values.len(),
+    }
+}
+
 fn index_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -435,8 +514,9 @@ fn access_plan(
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
     // F10 core: integer handle PointGet still wins; unique-index equality
-    // is PointGet; otherwise first-column equality or range on a secondary
-    // INDEX/KEY becomes IndexReader when covering, else IndexLookUpReader.
+    // is PointGet; handle/unique IN lists are BatchPointGet; otherwise
+    // first-column equality or range on a secondary INDEX/KEY becomes
+    // IndexReader when covering, else IndexLookUpReader.
     // Completeness wave: composite prefix, costed index path enumeration.
     if is_information_schema(from, current_db) {
         return PhysicalPlan::InfoSchema {
@@ -459,6 +539,9 @@ fn access_plan(
                 handle: Some(*handle),
                 index: None,
             };
+        }
+        if let Some(plan) = in_list_plan(select, from, info) {
+            return plan;
         }
         for (column, _) in &eqs {
             if let Some(index) = info.find_index_covering(column) {
