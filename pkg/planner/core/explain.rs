@@ -250,11 +250,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Apply { filter, .. } => {
             ("Apply".to_string(), String::new(), filter.restore_string())
         }
-        PhysicalPlan::Union { distinct, .. } => (
-            "Union".to_string(),
-            String::new(),
-            if *distinct { "distinct" } else { "all" }.to_string(),
-        ),
+        PhysicalPlan::Union { op, .. } => {
+            ("Union".to_string(), String::new(), op.restore().to_string())
+        }
         PhysicalPlan::Window { .. } => ("Window".to_string(), String::new(), String::new()),
         PhysicalPlan::CTE { name, .. } => ("CTE".to_string(), format!("cte:{name}"), String::new()),
         PhysicalPlan::Distinct { keys, .. } => (

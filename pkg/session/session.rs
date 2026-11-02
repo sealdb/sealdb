@@ -2663,10 +2663,16 @@ mod tests {
             err.code,
             sealdb_errno::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
         );
-        let err = session
-            .execute_stmt("SELECT 1 EXCEPT SELECT 2")
-            .unwrap_err();
-        assert!(err.message.contains("EXCEPT"));
+        let except = session.execute_stmt("SELECT 1 EXCEPT SELECT 2").unwrap();
+        assert_eq!(except.display_rows(), vec![vec!["1".to_string()]]);
+        let except_empty = session.execute_stmt("SELECT 1 EXCEPT SELECT 1").unwrap();
+        assert!(except_empty.display_rows().is_empty());
+        let intersect = session.execute_stmt("SELECT 1 INTERSECT SELECT 1").unwrap();
+        assert_eq!(intersect.display_rows(), vec![vec!["1".to_string()]]);
+        let except_all = session
+            .execute_stmt("SELECT 1 UNION ALL SELECT 1 EXCEPT ALL SELECT 1")
+            .unwrap();
+        assert_eq!(except_all.display_rows(), vec![vec!["1".to_string()]]);
     }
 
     #[test]

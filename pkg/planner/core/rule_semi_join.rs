@@ -55,12 +55,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             right_table,
             on,
         },
-        PhysicalPlan::Union {
-            distinct,
-            left,
-            right,
-        } => PhysicalPlan::Union {
-            distinct,
+        PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {
+            op,
             left: Box::new(rewrite_semi_join(*left)),
             right: Box::new(rewrite_semi_join(*right)),
         },
@@ -385,12 +381,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::Window { child } => PhysicalPlan::Window {
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
-        PhysicalPlan::Union {
-            distinct,
-            left,
-            right,
-        } => PhysicalPlan::Union {
-            distinct,
+        PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {
+            op,
             left: Box::new(rewrite_semi_join_agg(*left)),
             right: Box::new(rewrite_semi_join_agg(*right)),
         },

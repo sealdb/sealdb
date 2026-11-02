@@ -1572,9 +1572,18 @@ fn map_set_opr(op: SetOperator, quantifier: SetQuantifier) -> Result<SetOprType>
         (SetOperator::Union, SetQuantifier::None | SetQuantifier::Distinct) => {
             Ok(SetOprType::Union)
         }
-        (SetOperator::Except, _) => Err(Error::unsupported("EXCEPT")),
-        (SetOperator::Intersect, _) => Err(Error::unsupported("INTERSECT")),
-        (SetOperator::Minus, _) => Err(Error::unsupported("MINUS")),
+        (SetOperator::Except, SetQuantifier::All) => Ok(SetOprType::ExceptAll),
+        (SetOperator::Except, SetQuantifier::None | SetQuantifier::Distinct) => {
+            Ok(SetOprType::Except)
+        }
+        (SetOperator::Intersect, SetQuantifier::All) => Ok(SetOprType::IntersectAll),
+        (SetOperator::Intersect, SetQuantifier::None | SetQuantifier::Distinct) => {
+            Ok(SetOprType::Intersect)
+        }
+        (SetOperator::Minus, SetQuantifier::All) => Ok(SetOprType::ExceptAll),
+        (SetOperator::Minus, SetQuantifier::None | SetQuantifier::Distinct) => {
+            Ok(SetOprType::Except)
+        }
         (_, other) => Err(Error::unsupported(format!("UNION {other}"))),
     }
 }

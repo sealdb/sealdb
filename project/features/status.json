@@ -20,7 +20,7 @@
     "F12": {"status": "core-ported", "phase": 6, "notes": "BEGIN/COMMIT/ROLLBACK + SAVEPOINT + READ ONLY/WRITE + AND CHAIN + transactional CREATE/DROP DATABASE|TABLE + optimistic RR snapshot and write-conflict", "gaps": []},
     "F13": {"status": "core-ported", "phase": 6, "notes": "SELECT FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED + blocking wait + deadlock 1213 + BEGIN PESSIMISTIC on MemStorage and TiKV get_for_update", "gaps": []},
     "F14": {"status": "core-ported", "phase": 8, "notes": "EXISTS/IN/scalar subquery via NestedLoopApply plus IN list plus ANY/SOME/ALL plus FROM derived tables plus SELECT-list subquery plus parallel apply plus SemiJoinRewriter Distinct", "gaps": []},
-    "F15": {"status": "core-ported", "phase": 8, "notes": "UNION / UNION ALL with outer ORDER BY/LIMIT", "gaps": ["except-intersect", "nested-paren-union", "union-in-subquery", "parallel-union"]},
+    "F15": {"status": "core-ported", "phase": 8, "notes": "UNION / UNION ALL / EXCEPT / INTERSECT with outer ORDER BY/LIMIT", "gaps": ["nested-paren-union", "union-in-subquery", "parallel-union"]},
     "F16": {"status": "core-ported", "phase": 8, "notes": "ROW_NUMBER/RANK/DENSE_RANK and window COUNT/SUM/AVG/MIN/MAX", "gaps": ["frame-clause", "named-window", "lag-lead", "ignore-nulls", "pipelined-window"]},
     "F17": {"status": "core-ported", "phase": 8, "notes": "non-recursive WITH CTE + column list", "gaps": ["recursive-cte", "materialized-hint", "union-in-cte", "cte-in-join", "cte-in-dml", "shared-cte-storage"]},
     "F18": {"status": "core-ported", "phase": 8, "notes": "CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX with in-place backfill", "gaps": ["ddl-job-states", "reorg", "unique-index", "change-modify-rename", "after-first", "algorithm-lock"]},
