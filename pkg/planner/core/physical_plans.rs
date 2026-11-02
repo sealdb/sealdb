@@ -102,6 +102,8 @@ pub enum PhysicalPlan {
     },
     Explain {
         format: ExplainFormat,
+        #[serde(default)]
+        analyze: bool,
         child: Box<PhysicalPlan>,
     },
     Apply {
@@ -229,8 +231,13 @@ impl PhysicalPlan {
             } => {
                 format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
             }
-            PhysicalPlan::Explain { format, child } => {
-                format!("Explain_{format:?} -> {}", child.explain())
+            PhysicalPlan::Explain {
+                format,
+                analyze,
+                child,
+            } => {
+                let tag = if *analyze { "Analyze" } else { "" };
+                format!("Explain{tag}_{format:?} -> {}", child.explain())
             }
             PhysicalPlan::Apply { child, .. } => format!("Apply -> {}", child.explain()),
             PhysicalPlan::Union { op, left, right } => {

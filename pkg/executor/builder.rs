@@ -448,8 +448,31 @@ impl ExecutorBuilder {
                     Self::build(right, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::Explain { format, child } => {
-                Ok(Box::new(ExplainExec::new(*format, child.as_ref().clone())))
+            PhysicalPlan::Explain {
+                format,
+                analyze,
+                child,
+            } => {
+                if *analyze {
+                    let inner = match stmt {
+                        Statement::Explain(explain) => explain.stmt.as_ref(),
+                        other => other,
+                    };
+                    let child_exec = Self::build(
+                        child,
+                        inner,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?;
+                    Ok(Box::new(ExplainExec::with_analyze(
+                        *format,
+                        child.as_ref().clone(),
+                        child_exec,
+                    )))
+                } else {
+                    Ok(Box::new(ExplainExec::new(*format, child.as_ref().clone())))
+                }
             }
         }
     }

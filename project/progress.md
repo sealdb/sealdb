@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C4 typed-placeholders 收口；完整性波 C4 gaps=[] → C2→C5）  
+> 最后更新：2026-11-03（C2 EXPLAIN ANALYZE MVB；完整性波 C4=[] → C2→C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C2（explain-analyze）
+- **完成**:
+  - `EXPLAIN ANALYZE` 解析 + 执行子计划，输出 TiDB 风格 `actRows` / `execution info`（root 实测行数与耗时）
+  - 复用既有 EXPLAIN row/json/dot；Analyze 路径扩展列与 JSON/DOT 标注
+  - C2 gate `execute-explain-analyze`；`status.json` 去掉 `explain-analyze`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_explain_analyze_table_scan_act_rows`
+  - `cargo test -q -p sealdb-session --lib test_explain_skyline_and_join_reorder`
+  - `./project/scripts/feature_gate.sh C2`
+- **下一步**:
+  - C2 `cop-task-rows` → `n-table-dp` → `index-merge-join` → `cost-model-v2`
 
 ### 2026-11-03
 

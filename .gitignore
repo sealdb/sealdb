@@ -44,3 +44,4 @@ Thumbs.db
 # 测试覆盖率
 *.profraw
 coverage/
+__pycache__/

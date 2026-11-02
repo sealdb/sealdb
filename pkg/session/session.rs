@@ -4476,9 +4476,68 @@ mod tests {
             .unwrap();
         assert_eq!(rows.display_rows().len(), 1);
 
-        let err = session
-            .execute_stmt("EXPLAIN ANALYZE SELECT 1")
-            .unwrap_err();
-        assert!(err.message.contains("ANALYZE"));
+        let analyze = session.execute_stmt("EXPLAIN ANALYZE SELECT 1").unwrap();
+        assert_eq!(
+            analyze.columns,
+            vec![
+                "id",
+                "estRows",
+                "actRows",
+                "task",
+                "access object",
+                "execution info",
+                "operator info"
+            ]
+        );
+        let analyze_text = analyze
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(analyze_text.contains("TableDual"), "{analyze_text}");
+        assert!(analyze_text.contains("time:"), "{analyze_text}");
+        assert!(
+            analyze
+                .display_rows()
+                .iter()
+                .any(|r| r.get(2).map(|c| c.as_str()) == Some("1")),
+            "{analyze_text}"
+        );
+    }
+
+    #[test]
+    fn test_explain_analyze_table_scan_act_rows() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        let result = session
+            .execute_stmt("EXPLAIN ANALYZE SELECT * FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert!(result.columns.iter().any(|c| c == "actRows"));
+        let text = result
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("PointGet") || text.contains("TableReader") || text.contains("Selection"),
+            "{text}"
+        );
+        assert!(
+            result
+                .display_rows()
+                .iter()
+                .any(|r| r.get(2).map(|c| c.as_str()) == Some("1")),
+            "{text}"
+        );
+        let json = session
+            .execute_stmt("EXPLAIN ANALYZE FORMAT='json' SELECT 1")
+            .unwrap();
+        assert!(json.display_rows()[0][0].contains("actRows"));
     }
 }

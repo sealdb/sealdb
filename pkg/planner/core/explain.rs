@@ -1,6 +1,7 @@
 use super::physical_plans::PhysicalPlan;
 use sealdb_parser::ast::ExplainFormat;
 use serde_json::json;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct ExplainRow {
@@ -33,6 +34,92 @@ pub fn explain_result(
         }
         ExplainFormat::Json => (vec!["json".to_string()], vec![vec![explain_json(plan)]]),
         ExplainFormat::Dot => (vec!["dot".to_string()], vec![vec![explain_dot(plan)]]),
+    }
+}
+
+/// TiDB-shaped EXPLAIN ANALYZE columns. MVB attributes measured root
+/// cardinality to every operator; per-operator RuntimeStats stay deferred.
+pub fn explain_analyze_result(
+    plan: &PhysicalPlan,
+    format: ExplainFormat,
+    act_rows: usize,
+    elapsed: Duration,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let time_ms = elapsed.as_secs_f64() * 1000.0;
+    let exec_info = format!("time:{time_ms:.2}ms, loops:1");
+    match format {
+        ExplainFormat::Row => {
+            let rows = explain_rows(plan);
+            (
+                vec![
+                    "id".to_string(),
+                    "estRows".to_string(),
+                    "actRows".to_string(),
+                    "task".to_string(),
+                    "access object".to_string(),
+                    "execution info".to_string(),
+                    "operator info".to_string(),
+                ],
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        vec![
+                            r.id,
+                            r.est_rows,
+                            act_rows.to_string(),
+                            r.task,
+                            r.access,
+                            if i == 0 {
+                                exec_info.clone()
+                            } else {
+                                String::new()
+                            },
+                            r.info,
+                        ]
+                    })
+                    .collect(),
+            )
+        }
+        ExplainFormat::Json => {
+            let payload = json!({
+                "plan": plan,
+                "explain": plan.explain(),
+                "actRows": act_rows,
+                "executionInfo": exec_info,
+            });
+            (
+                vec!["json".to_string()],
+                vec![vec![
+                    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
+                ]],
+            )
+        }
+        ExplainFormat::Dot => {
+            let mut out = String::from("digraph {\n");
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            collect_dot(plan, &mut 1, &mut nodes, &mut edges);
+            for (i, node) in nodes.into_iter().enumerate() {
+                if i == 0 {
+                    // Annotate root with measured actRows / time.
+                    let annotated = node.replacen(
+                        "estRows=",
+                        &format!("actRows={act_rows}\\ntime={time_ms:.2}ms\\nestRows="),
+                        1,
+                    );
+                    out.push_str(&annotated);
+                } else {
+                    out.push_str(&node);
+                }
+                out.push('\n');
+            }
+            for edge in edges {
+                out.push_str(&edge);
+                out.push('\n');
+            }
+            out.push('}');
+            (vec!["dot".to_string()], vec![vec![out]])
+        }
     }
 }
 
