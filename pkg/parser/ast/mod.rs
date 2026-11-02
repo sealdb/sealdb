@@ -19,7 +19,7 @@ pub use dml::{
 };
 pub use expressions::{
     BetweenExpr, ColumnRange, ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, IsNullExpr,
-    PatternLikeExpr, ScalarSubqueryExpr, WindowFuncExpr, WindowSpec,
+    PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr, WindowFuncExpr, WindowSpec,
 };
 pub use misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,

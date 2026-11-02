@@ -40,3 +40,17 @@ id	name
 SELECT * FROM itest.t1 WHERE id IN (SELECT id FROM itest.t2) ORDER BY id;
 id	name
 1	a
+SELECT * FROM itest.t1 WHERE id = ANY (SELECT id FROM itest.t2) ORDER BY id;
+id	name
+1	a
+SELECT * FROM itest.t1 WHERE id = SOME (SELECT id FROM itest.t2) ORDER BY id;
+id	name
+1	a
+SELECT * FROM itest.t1 WHERE id <> ALL (SELECT id FROM itest.t2) ORDER BY id;
+id	name
+2	b
+SELECT * FROM itest.t1 WHERE id > ANY (SELECT id FROM itest.t2) ORDER BY id;
+id	name
+2	b
+SELECT * FROM itest.t1 WHERE id > ALL (SELECT id FROM itest.t2) ORDER BY id;
+id	name

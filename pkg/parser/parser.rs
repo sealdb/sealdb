@@ -637,10 +637,56 @@ mod tests {
                 .as_ref(),
             Some(crate::ast::ExprNode::IsNull(_))
         ));
-        let err = parser
-            .parse_one_stmt("SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2)")
-            .unwrap_err();
-        assert!(err.message.contains("ANY"));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t1 WHERE id = ANY (SELECT id FROM t2)")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::InSubquery(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t1 WHERE id = SOME (SELECT id FROM t2)")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::InSubquery(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t1 WHERE id <> ALL (SELECT id FROM t2)")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::InSubquery(s)) if s.not
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t1 WHERE id > ANY (SELECT id FROM t2)")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::QuantifiedCmp(q)) if !q.all
+        ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT * FROM t1 WHERE id > ALL (SELECT id FROM t2)")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .selection
+                .as_ref(),
+            Some(crate::ast::ExprNode::QuantifiedCmp(q)) if q.all
+        ));
     }
 
     #[test]

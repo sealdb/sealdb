@@ -494,6 +494,9 @@ fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
             find_table_in_select(&s.query, table).or_else(|| find_table_in_expr(&s.expr, table))
         }
         ExprNode::ScalarSubquery(s) => find_table_in_select(&s.query, table),
+        ExprNode::QuantifiedCmp(q) => {
+            find_table_in_select(&q.query, table).or_else(|| find_table_in_expr(&q.expr, table))
+        }
         ExprNode::Binary(b) => {
             find_table_in_expr(&b.left, table).or_else(|| find_table_in_expr(&b.right, table))
         }

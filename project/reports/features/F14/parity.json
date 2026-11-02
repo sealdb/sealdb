@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 135,
-  "manifest_entries": 77,
+  "rs_files": 176,
+  "manifest_entries": 125,
   "status_counts": {
-    "not-started": 1604,
-    "partial": 70,
+    "not-started": 1556,
+    "partial": 118,
     "reimplemented": 4,
     "ported": 3
   },
@@ -95,19 +95,20 @@
     },
     "pkg/config": {
       "go": 3,
-      "rs": 0,
-      "missing": 3,
+      "rs": 1,
+      "missing": 2,
       "status": {
-        "not-started": 3
+        "partial": 1,
+        "not-started": 2
       }
     },
     "pkg/ddl": {
       "go": 112,
-      "rs": 4,
-      "missing": 108,
+      "rs": 7,
+      "missing": 105,
       "status": {
-        "not-started": 108,
-        "partial": 4
+        "not-started": 105,
+        "partial": 7
       }
     },
     "pkg/distsql": {
@@ -128,11 +129,11 @@
     },
     "pkg/domain": {
       "go": 28,
-      "rs": 1,
-      "missing": 27,
+      "rs": 2,
+      "missing": 26,
       "status": {
-        "not-started": 27,
-        "partial": 1
+        "not-started": 26,
+        "partial": 2
       }
     },
     "pkg/errctx": {
@@ -154,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 22,
-      "missing": 163,
+      "rs": 37,
+      "missing": 148,
       "status": {
-        "not-started": 163,
-        "partial": 22
+        "not-started": 148,
+        "partial": 37
       }
     },
     "pkg/expression": {
@@ -180,11 +181,11 @@
     },
     "pkg/infoschema": {
       "go": 22,
-      "rs": 1,
-      "missing": 21,
+      "rs": 2,
+      "missing": 20,
       "status": {
-        "not-started": 21,
-        "partial": 1
+        "not-started": 20,
+        "partial": 2
       }
     },
     "pkg/keyspace": {
@@ -256,21 +257,21 @@
     },
     "pkg/parser": {
       "go": 58,
-      "rs": 11,
-      "missing": 47,
+      "rs": 12,
+      "missing": 46,
       "status": {
-        "partial": 10,
-        "not-started": 47,
+        "partial": 11,
+        "not-started": 46,
         "reimplemented": 1
       }
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 3,
-      "missing": 213,
+      "rs": 13,
+      "missing": 203,
       "status": {
-        "not-started": 213,
-        "partial": 3
+        "not-started": 203,
+        "partial": 13
       }
     },
     "pkg/plugin": {
@@ -283,10 +284,11 @@
     },
     "pkg/privilege": {
       "go": 11,
-      "rs": 0,
-      "missing": 11,
+      "rs": 2,
+      "missing": 9,
       "status": {
-        "not-started": 11
+        "not-started": 9,
+        "partial": 2
       }
     },
     "pkg/resourcegroup": {
@@ -307,10 +309,11 @@
     },
     "pkg/server": {
       "go": 39,
-      "rs": 0,
-      "missing": 39,
+      "rs": 3,
+      "missing": 36,
       "status": {
-        "not-started": 39
+        "partial": 3,
+        "not-started": 36
       }
     },
     "pkg/session": {
@@ -332,28 +335,30 @@
     },
     "pkg/sessiontxn": {
       "go": 15,
-      "rs": 3,
-      "missing": 12,
+      "rs": 4,
+      "missing": 11,
       "status": {
-        "not-started": 12,
+        "not-started": 11,
         "reimplemented": 1,
-        "partial": 2
+        "partial": 3
       }
     },
     "pkg/statistics": {
       "go": 79,
-      "rs": 0,
-      "missing": 79,
+      "rs": 2,
+      "missing": 77,
       "status": {
-        "not-started": 79
+        "not-started": 77,
+        "partial": 2
       }
     },
     "pkg/store": {
       "go": 82,
-      "rs": 0,
-      "missing": 82,
+      "rs": 2,
+      "missing": 80,
       "status": {
-        "not-started": 82
+        "not-started": 80,
+        "partial": 2
       }
     },
     "pkg/structure": {
@@ -366,11 +371,12 @@
     },
     "pkg/table": {
       "go": 18,
-      "rs": 1,
-      "missing": 17,
+      "rs": 2,
+      "missing": 16,
       "status": {
-        "not-started": 17,
-        "reimplemented": 1
+        "not-started": 16,
+        "reimplemented": 1,
+        "partial": 1
       }
     },
     "pkg/tablecodec": {
@@ -425,11 +431,11 @@
     },
     "pkg/util": {
       "go": 291,
-      "rs": 5,
-      "missing": 286,
+      "rs": 10,
+      "missing": 281,
       "status": {
-        "not-started": 286,
-        "partial": 2,
+        "not-started": 281,
+        "partial": 7,
         "ported": 3
       }
     }
@@ -538,7 +544,7 @@
       "rs_path": "cmd/tidb-server/main.rs",
       "status": "partial",
       "phase": 2,
-      "notes": "CLI --parse/--execute; no MySQL protocol yet"
+      "notes": "CLI --parse/--execute/--listen plus --store memory|tikv and --pd"
     },
     {
       "go_path": "pkg/autoid_service/autoid.go",
@@ -619,10 +625,10 @@
     },
     {
       "go_path": "pkg/config/config.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/config/lib.rs",
+      "status": "partial",
+      "phase": 9,
+      "notes": "StoreKind memory|tikv + PD endpoints via CLI/env; toml file deferred"
     },
     {
       "go_path": "pkg/config/config_util.go",
@@ -731,10 +737,10 @@
     },
     {
       "go_path": "pkg/ddl/column.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/ddl/alter.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "ALTER ADD/DROP COLUMN; CHANGE/MODIFY/AFTER deferred"
     },
     {
       "go_path": "pkg/ddl/constant.go",
@@ -762,14 +768,14 @@
       "rs_path": "pkg/ddl/create_table.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY"
+      "notes": "BuildTableInfo columns + CREATE TABLE INDEX/KEY + LIKE / AS SELECT"
     },
     {
       "go_path": "pkg/ddl/ddl.go",
       "rs_path": "pkg/ddl/ddl.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "immediate CREATE/DROP apply; no job queue"
+      "notes": "immediate CREATE/DROP/ALTER apply; job queue / Reorg deferred"
     },
     {
       "go_path": "pkg/ddl/ddl_algorithm.go",
@@ -857,10 +863,10 @@
     },
     {
       "go_path": "pkg/ddl/index.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/ddl/index.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "CREATE/DROP INDEX + in-place backfill; job states deferred"
     },
     {
       "go_path": "pkg/ddl/index_cop.go",
@@ -1109,10 +1115,10 @@
     },
     {
       "go_path": "pkg/ddl/partition.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/ddl/partition.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "RANGE/HASH PartitionInfo attach; LIST/KEY/ADD/DROP PARTITION deferred"
     },
     {
       "go_path": "pkg/ddl/placement/bundle.go",
@@ -1882,7 +1888,7 @@
       "rs_path": "pkg/domain/domain.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "owns meta + infoschema + MemStorage"
+      "notes": "owns meta + infoschema + Arc<dyn Storage>; MemStorage default"
     },
     {
       "go_path": "pkg/domain/domain_sysvars.go",
@@ -2026,10 +2032,10 @@
     },
     {
       "go_path": "pkg/domain/schema_checker.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/domain/schema_checker.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "reject explicit-txn DML after concurrent DDL; MDL deferred"
     },
     {
       "go_path": "pkg/domain/schema_validator.go",
@@ -2309,7 +2315,7 @@
       "rs_path": "pkg/executor/aggregate/agg_hash_executor.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory HashAggExec without parallel workers"
+      "notes": "HashAggExec with group-key partition spill; parallel workers deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_hash_final_worker.go",
@@ -2327,17 +2333,17 @@
     },
     {
       "go_path": "pkg/executor/aggregate/agg_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/aggregate/agg_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "partition input rows by group key; recursive/partial-agg serialize deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_stream_executor.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/aggregate/agg_stream_executor.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "scalar StreamAgg; sorted GROUP BY StreamAgg deferred"
     },
     {
       "go_path": "pkg/executor/aggregate/agg_util.go",
@@ -2348,10 +2354,10 @@
     },
     {
       "go_path": "pkg/executor/analyze.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/analyze.rs",
+      "status": "partial",
+      "phase": 7,
+      "notes": "full-scan ANALYZE TABLE count/NDV; histogram deferred"
     },
     {
       "go_path": "pkg/executor/analyze_col.go",
@@ -2404,10 +2410,10 @@
     },
     {
       "go_path": "pkg/executor/batch_point_get.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/batch_point_get.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "handle and unique-index BatchPointGet for IN lists"
     },
     {
       "go_path": "pkg/executor/bind.go",
@@ -2434,8 +2440,8 @@
       "go_path": "pkg/executor/builder.go",
       "rs_path": "pkg/executor/builder.rs",
       "status": "partial",
-      "phase": 5,
-      "notes": "select + DDL + DML + table reader + hash agg + hash join + IndexLookUp"
+      "phase": 10,
+      "notes": "select + DDL + DML + table reader + hash agg + hash join + IndexLookUp + Apply + Union + Window + CTE + Explain"
     },
     {
       "go_path": "pkg/executor/check_table_index.go",
@@ -2467,24 +2473,24 @@
     },
     {
       "go_path": "pkg/executor/coprocessor.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/coprocessor.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "scan-time pushed filter; TiKV Coprocessor DAG / CopClient deferred"
     },
     {
       "go_path": "pkg/executor/cte.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/cte.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory CTEExec for non-recursive WITH"
     },
     {
       "go_path": "pkg/executor/cte_table_reader.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/cte.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "shared CTETableReader deferred; single-consumer CTEExec materializes the seed"
     },
     {
       "go_path": "pkg/executor/ddl.go",
@@ -2498,7 +2504,7 @@
       "rs_path": "pkg/executor/delete.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "single-table DELETE from mem KV"
+      "notes": "single-table DELETE + ORDER BY / LIMIT + two-table DELETE JOIN"
     },
     {
       "go_path": "pkg/executor/detach.go",
@@ -2530,10 +2536,10 @@
     },
     {
       "go_path": "pkg/executor/explain.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/explain.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "EXPLAIN resultset; EXPLAIN ANALYZE / FOR CONNECTION deferred"
     },
     {
       "go_path": "pkg/executor/foreign_key.go",
@@ -2544,10 +2550,10 @@
     },
     {
       "go_path": "pkg/executor/grant.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/grant.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "GrantExec applies in-memory grants; roles deferred"
     },
     {
       "go_path": "pkg/executor/import_into.go",
@@ -2624,7 +2630,7 @@
       "rs_path": "pkg/executor/insert.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "INSERT VALUES into mem KV"
+      "notes": "INSERT VALUES into mem KV; F19 locates RANGE/HASH physical id"
     },
     {
       "go_path": "pkg/executor/insert_common.go",
@@ -2810,10 +2816,10 @@
     },
     {
       "go_path": "pkg/executor/join/hash_join_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/join/hash_join_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "partition both join sides by key; parallel workers deferred"
     },
     {
       "go_path": "pkg/executor/join/hash_join_spill_helper.go",
@@ -2834,7 +2840,7 @@
       "rs_path": "pkg/executor/join/hash_join_v1.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory two-table HashJoinV1Exec"
+      "notes": "left-deep n-table HashJoinV1Exec with join-key partition spill and CROSS JOIN cartesian"
     },
     {
       "go_path": "pkg/executor/join/hash_join_v2.go",
@@ -3051,7 +3057,7 @@
       "rs_path": "pkg/executor/point_get.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "integer handle PointGet"
+      "notes": "integer handle PointGet + unique-index PointGet"
     },
     {
       "go_path": "pkg/executor/prepared.go",
@@ -3237,17 +3243,17 @@
     },
     {
       "go_path": "pkg/executor/sortexec/parallel_sort_worker.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/sortexec/parallel_sort_worker.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "in-memory parallel sort workers plus k-way merge of sorted partitions"
     },
     {
       "go_path": "pkg/executor/sortexec/sort.go",
       "rs_path": "pkg/executor/sortexec/sort.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "in-memory SortExec"
+      "notes": "SortExec with sorted-run spill and k-way merge"
     },
     {
       "go_path": "pkg/executor/sortexec/sort_partition.go",
@@ -3258,10 +3264,10 @@
     },
     {
       "go_path": "pkg/executor/sortexec/sort_spill.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/sortexec/sort_spill.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "sorted run files plus k-way merge; parallel sort deferred"
     },
     {
       "go_path": "pkg/executor/sortexec/sort_util.go",
@@ -3272,10 +3278,10 @@
     },
     {
       "go_path": "pkg/executor/sortexec/topn.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/sortexec/topn.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "TopN heap plus spill when LIMIT exceeds mem row limit"
     },
     {
       "go_path": "pkg/executor/sortexec/topn_chunk_heap.go",
@@ -3331,7 +3337,7 @@
       "rs_path": "pkg/executor/table_reader.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "scan table prefix for SELECT *"
+      "notes": "scan table prefix for SELECT *; F19 scans physical partition ids"
     },
     {
       "go_path": "pkg/executor/trace.go",
@@ -3349,17 +3355,17 @@
     },
     {
       "go_path": "pkg/executor/unionexec/union.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/unionexec/union.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory UNION / UNION ALL"
     },
     {
       "go_path": "pkg/executor/update.go",
       "rs_path": "pkg/executor/update.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "single-table UPDATE SET into mem KV"
+      "notes": "single-table UPDATE SET + ORDER BY / LIMIT + two-table UPDATE JOIN"
     },
     {
       "go_path": "pkg/executor/utils.go",
@@ -3370,10 +3376,10 @@
     },
     {
       "go_path": "pkg/executor/window.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/window.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory WindowExec for ranking and window aggs"
     },
     {
       "go_path": "pkg/executor/write.go",
@@ -4241,7 +4247,7 @@
       "rs_path": "pkg/infoschema/infoschema.rs",
       "status": "partial",
       "phase": 3,
-      "notes": "in-memory schema snapshot"
+      "notes": "in-memory schema snapshot + I_S SCHEMATA/TABLES/COLUMNS/STATISTICS/constraints/partitions/charset"
     },
     {
       "go_path": "pkg/infoschema/infoschema_v2.go",
@@ -4336,10 +4342,10 @@
     },
     {
       "go_path": "pkg/infoschema/tables.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/infoschema/tables.rs",
+      "status": "partial",
+      "phase": 3,
+      "notes": "virtual I_S tables for schema/index/partition/charset; cluster/TiKV tables deferred"
     },
     {
       "go_path": "pkg/keyspace/keyspace.go",
@@ -5242,7 +5248,7 @@
       "rs_path": "pkg/meta/model/table.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "TableInfo core JSON + typed IndexInfo list"
+      "notes": "TableInfo core JSON + typed IndexInfo list + optional PartitionInfo"
     },
     {
       "go_path": "pkg/meta/reader.go",
@@ -5466,7 +5472,7 @@
       "rs_path": "pkg/parser/ast/ddl.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "CREATE/DROP DATABASE|TABLE + CREATE TABLE INDEX/KEY; CREATE INDEX leftover is F18"
+      "notes": "CREATE/DROP DATABASE|TABLE + CREATE/DROP INDEX + ALTER ADD/DROP COLUMN|INDEX + RANGE/HASH PARTITION BY"
     },
     {
       "go_path": "pkg/parser/ast/dml.go",
@@ -5500,8 +5506,8 @@
       "go_path": "pkg/parser/ast/misc.go",
       "rs_path": "pkg/parser/ast/misc.rs",
       "status": "partial",
-      "phase": 6,
-      "notes": "ShowStmt + UseStmt + Begin/Commit/Rollback"
+      "phase": 8,
+      "notes": "ShowStmt + UseStmt + Begin/Commit/Rollback + Grant/Revoke + SHOW GRANTS"
     },
     {
       "go_path": "pkg/parser/ast/procedure.go",
@@ -5554,10 +5560,10 @@
     },
     {
       "go_path": "pkg/parser/charset/charset.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/parser/charset/mod.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "C5 Collation parse for utf8mb4_bin / *_ci"
     },
     {
       "go_path": "pkg/parser/charset/encoding.go",
@@ -6142,10 +6148,10 @@
     },
     {
       "go_path": "pkg/planner/core/explain.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/explain.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "EXPLAIN row/json/dot tree; ANALYZE / cop task deferred"
     },
     {
       "go_path": "pkg/planner/core/expression_codec_fn.go",
@@ -6338,17 +6344,17 @@
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_cte.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/cte.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "PhysicalCTE marker for F17"
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_cte_table.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/cte.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "CTETableReader shared storage folded into CTEExec for this phase"
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_datasource.go",
@@ -6499,10 +6505,10 @@
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_union_all.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/union.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "PhysicalUnion marker for F15"
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_union_scan.go",
@@ -6513,10 +6519,10 @@
     },
     {
       "go_path": "pkg/planner/core/operator/logicalop/logical_window.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/window.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "PhysicalWindow marker for F16"
     },
     {
       "go_path": "pkg/planner/core/operator/physicalop/base_physical_plan.go",
@@ -6557,8 +6563,8 @@
       "go_path": "pkg/planner/core/physical_plans.go",
       "rs_path": "pkg/planner/core/physical_plans.rs",
       "status": "partial",
-      "phase": 5,
-      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply"
+      "phase": 10,
+      "notes": "TableDual / Projection / DDL / DML / TableReader / Selection / HashAgg / HashJoin / IndexLookUpReader / Apply / Union / Window / CTE / Explain"
     },
     {
       "go_path": "pkg/planner/core/plan.go",
@@ -6646,10 +6652,10 @@
     },
     {
       "go_path": "pkg/planner/core/plan_cost_ver2.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/plan_cost.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "scan/net/cpu/hash factors for skyline and JoinReorder"
     },
     {
       "go_path": "pkg/planner/core/plan_to_pb.go",
@@ -6662,8 +6668,8 @@
       "go_path": "pkg/planner/core/planbuilder.go",
       "rs_path": "pkg/planner/core/planbuilder.rs",
       "status": "partial",
-      "phase": 5,
-      "notes": "Build constant SELECT, DDL, DML, TableReader, Selection, HashAgg, HashJoin, IndexLookUp, Apply"
+      "phase": 10,
+      "notes": "Build plus F21/C2 costed skyline IndexLookUp vs TableReader"
     },
     {
       "go_path": "pkg/planner/core/point_get_plan.go",
@@ -6807,10 +6813,10 @@
     },
     {
       "go_path": "pkg/planner/core/rule_decorrelate.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_semi_join.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "simple EXISTS/IN/NOT EXISTS Apply to HashJoin Semi/Anti; NOT IN and scalar stay Apply"
     },
     {
       "go_path": "pkg/planner/core/rule_derive_topn_from_window.go",
@@ -6849,10 +6855,10 @@
     },
     {
       "go_path": "pkg/planner/core/rule_join_reorder.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_join_reorder.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "two-table Inner HashJoin builds the smaller side; n-table DP deferred"
     },
     {
       "go_path": "pkg/planner/core/rule_join_reorder_dp.go",
@@ -6891,17 +6897,17 @@
     },
     {
       "go_path": "pkg/planner/core/rule_partition_processor.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_partition_processor.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "static RANGE/HASH prune into TableReader partition ids"
     },
     {
       "go_path": "pkg/planner/core/rule_predicate_push_down.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_predicate_push_down.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "CNF push into TableReader/IndexLookUp and join sides; outer-join inner residual"
     },
     {
       "go_path": "pkg/planner/core/rule_predicate_simplification.go",
@@ -7423,10 +7429,10 @@
     },
     {
       "go_path": "pkg/privilege/privilege.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/privilege/privilege.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "in-memory Manager grant/revoke/verify; SkipGrantTables default"
     },
     {
       "go_path": "pkg/privilege/privileges/cache.go",
@@ -7472,10 +7478,10 @@
     },
     {
       "go_path": "pkg/privilege/privileges/privileges.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/privilege/privileges/mod.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "SkipWithGrant default; mysql.* persist and auth deferred"
     },
     {
       "go_path": "pkg/privilege/privileges/tidb_auth_token.go",
@@ -7633,10 +7639,10 @@
     },
     {
       "go_path": "pkg/server/conn.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/server/conn.rs",
+      "status": "partial",
+      "phase": 9,
+      "notes": "handshake + COM_QUERY/PING/INIT_DB/QUIT; prepared/SSL deferred"
     },
     {
       "go_path": "pkg/server/conn_stmt.go",
@@ -7801,10 +7807,10 @@
     },
     {
       "go_path": "pkg/server/internal/packetio.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/server/internal/packetio.rs",
+      "status": "partial",
+      "phase": 9,
+      "notes": "uncompressed MySQL packet read/write"
     },
     {
       "go_path": "pkg/server/internal/parse/parse.go",
@@ -7878,10 +7884,10 @@
     },
     {
       "go_path": "pkg/server/server.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/server/server.rs",
+      "status": "partial",
+      "phase": 9,
+      "notes": "TCP listen/accept; TLS and status HTTP deferred"
     },
     {
       "go_path": "pkg/server/stat.go",
@@ -7964,8 +7970,8 @@
       "go_path": "pkg/session/session.go",
       "rs_path": "pkg/session/session.rs",
       "status": "partial",
-      "phase": 6,
-      "notes": "ExecuteStmt plus explicit BEGIN/COMMIT/ROLLBACK and BEGIN PESSIMISTIC"
+      "phase": 10,
+      "notes": "ExecuteStmt plus txn, SchemaChecker, PREPARE/EXECUTE plan cache"
     },
     {
       "go_path": "pkg/session/sync_upgrade.go",
@@ -8207,10 +8213,10 @@
     },
     {
       "go_path": "pkg/sessiontxn/isolation/readcommitted.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/sessiontxn/isolation/readcommitted.rs",
+      "status": "partial",
+      "phase": 10,
+      "notes": "ReadCommittedTxnContextProvider + statement snapshot refresh"
     },
     {
       "go_path": "pkg/sessiontxn/isolation/repeatable_read.go",
@@ -8564,10 +8570,10 @@
     },
     {
       "go_path": "pkg/statistics/handle/handle.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/statistics/handle/mod.rs",
+      "status": "partial",
+      "phase": 7,
+      "notes": "in-memory Handle; persist/auto-analyze deferred"
     },
     {
       "go_path": "pkg/statistics/handle/history/history_stats.go",
@@ -8809,10 +8815,10 @@
     },
     {
       "go_path": "pkg/statistics/table.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/statistics/table.rs",
+      "status": "partial",
+      "phase": 7,
+      "notes": "Table count + column NDV; HistColl deferred"
     },
     {
       "go_path": "pkg/store/copr/batch_coprocessor.go",
@@ -8907,10 +8913,10 @@
     },
     {
       "go_path": "pkg/store/driver/tikv_driver.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/store/driver/mod.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; Coprocessor DAG deferred"
     },
     {
       "go_path": "pkg/store/driver/txn/batch_getter.go",
@@ -9383,10 +9389,10 @@
     },
     {
       "go_path": "pkg/store/store.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/store/lib.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "open() factory: MemStorage default, TikvStorage when --store tikv"
     },
     {
       "go_path": "pkg/structure/hash.go",
@@ -9474,10 +9480,10 @@
     },
     {
       "go_path": "pkg/table/tables/partition.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/meta/model/partition.rs",
+      "status": "partial",
+      "phase": 8,
+      "notes": "locate/prune on PartitionInfo; LIST/KEY/dynamic prune deferred"
     },
     {
       "go_path": "pkg/table/tables/state_remote.go",
@@ -9561,7 +9567,7 @@
       "rs_path": "pkg/tablecodec/tablecodec.rs",
       "status": "partial",
       "phase": 5,
-      "notes": "row/index key layout + compact row values + secondary index keys"
+      "notes": "row/index key layout + rowcodec values + secondary index keys"
     },
     {
       "go_path": "pkg/telemetry/data.go",
@@ -10370,10 +10376,10 @@
     },
     {
       "go_path": "pkg/util/chunk/row_in_disk.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/chunk/row_in_disk.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "row-encoded temp spill files; disk tracker / offset index deferred"
     },
     {
       "go_path": "pkg/util/codec/bytes.go",
@@ -11518,31 +11524,31 @@
     },
     {
       "go_path": "pkg/util/rowcodec/common.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/common.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "CodecVer 128 + compact int/uint; checksum constants unused until checksum leftover"
     },
     {
       "go_path": "pkg/util/rowcodec/decoder.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/decoder.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "decode by FieldType; checksum verify deferred"
     },
     {
       "go_path": "pkg/util/rowcodec/encoder.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/encoder.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "NoChecksum encode of int/uint/float/bytes/decimal/time"
     },
     {
       "go_path": "pkg/util/rowcodec/row.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/util/rowcodec/row.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "small/large row header, col ids, offsets; checksum skip"
     },
     {
       "go_path": "pkg/util/schemacmp/lattice.go",
