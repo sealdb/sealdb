@@ -748,6 +748,8 @@ pub struct WindowFuncExpr {
     pub spec: WindowSpec,
     /// `OVER w` / `OVER (w ...)` until the SELECT `WINDOW` clause is applied.
     pub window_ref: Option<String>,
+    /// `IGNORE NULLS` (RESPECT NULLS is the default `false`).
+    pub ignore_nulls: bool,
 }
 
 impl WindowFuncExpr {
@@ -764,7 +766,11 @@ impl WindowFuncExpr {
                 arg.restore(ctx)?;
             }
         }
-        ctx.write_str(") OVER (");
+        ctx.write_str(")");
+        if self.ignore_nulls {
+            ctx.write_str(" IGNORE NULLS");
+        }
+        ctx.write_str(" OVER (");
         self.spec.restore(ctx)?;
         ctx.write_str(")");
         Ok(())

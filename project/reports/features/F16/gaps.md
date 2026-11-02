@@ -5,7 +5,6 @@ wave. Rejected via `Error::unsupported` in
 `pkg/parser/sqlparser_bridge/lower.rs` and marked on
 `pkg/executor/window.rs` / `pkg/planner/core/window.rs`.
 
-- `IGNORE NULLS` / `RESPECT NULLS`
 - Pipelined window
 - `GROUP BY` together with window functions
 - Derive TopN from window

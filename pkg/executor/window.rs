@@ -1,6 +1,6 @@
 // F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
 // COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
-// Completeness wave / not this feature: IGNORE NULLS, pipelined window.
+// Completeness wave / not this feature: pipelined window.
 use crate::aggfuncs::{AggFunc, build_agg_func};
 use crate::internal::exec::Executor;
 use sealdb_errno::{Error, Result};
@@ -229,22 +229,58 @@ fn fill_lag_lead(
         .ok_or_else(|| Error::unsupported("LAG/LEAD requires an expression"))?;
     let lead = window.name.eq_ignore_ascii_case("LEAD");
     for (i, idx) in ordered.iter().enumerate() {
-        let offset = integer_arg(window, schema, &rows[*idx], 1, 1)?;
+        let offset = integer_arg(window, schema, &rows[*idx], 1, 1)?.max(0);
         let default = match window.args.get(2) {
             Some(arg) => eval_expr_with_row(arg, schema, &rows[*idx])?,
             None => Datum::Null,
         };
-        let target = if lead {
-            i.checked_add(offset as usize)
-        } else {
-            i.checked_sub(offset as usize)
-        };
-        out[*idx] = match target.and_then(|t| ordered.get(t)) {
-            Some(src) => eval_expr_with_row(expr, schema, &rows[*src])?,
-            None => default,
-        };
+        out[*idx] = offset_value(
+            expr,
+            schema,
+            rows,
+            ordered,
+            i,
+            offset,
+            lead,
+            window.ignore_nulls,
+            default,
+        )?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn offset_value(
+    expr: &ExprNode,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    i: usize,
+    offset: i64,
+    lead: bool,
+    ignore_nulls: bool,
+    default: Datum,
+) -> Result<Datum> {
+    if offset == 0 {
+        return eval_expr_with_row(expr, schema, &rows[ordered[i]]);
+    }
+    let step: isize = if lead { 1 } else { -1 };
+    let mut pos = i as isize;
+    let mut seen = 0i64;
+    loop {
+        pos += step;
+        if pos < 0 || pos >= ordered.len() as isize {
+            return Ok(default);
+        }
+        let value = eval_expr_with_row(expr, schema, &rows[ordered[pos as usize]])?;
+        if ignore_nulls && value.is_null() {
+            continue;
+        }
+        seen += 1;
+        if seen >= offset {
+            return Ok(value);
+        }
+    }
 }
 
 /// `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE(expr, n)` over the current frame.
@@ -263,27 +299,45 @@ fn fill_nth_value(
         out[*idx] = match frame_span(&window.spec, schema, rows, ordered, i)? {
             None => Datum::Null,
             Some((start, end)) => {
-                let pick = match window.name.to_ascii_uppercase().as_str() {
-                    "FIRST_VALUE" => Some(start),
-                    "LAST_VALUE" => Some(end),
-                    "NTH_VALUE" => {
-                        let n = integer_arg(window, schema, &rows[*idx], 1, 1)?;
-                        if n <= 0 {
-                            return Err(Error::unsupported("NTH_VALUE requires n >= 1"));
-                        }
-                        let pos = start + (n as usize - 1);
-                        (pos <= end).then_some(pos)
-                    }
-                    _ => None,
-                };
-                match pick {
-                    Some(pos) => eval_expr_with_row(expr, schema, &rows[ordered[pos]])?,
-                    None => Datum::Null,
-                }
+                frame_nth_value(window, expr, schema, rows, ordered, *idx, start, end)?
             }
         };
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frame_nth_value(
+    window: &WindowFuncExpr,
+    expr: &ExprNode,
+    schema: &[String],
+    rows: &[Vec<Datum>],
+    ordered: &[usize],
+    idx: usize,
+    start: usize,
+    end: usize,
+) -> Result<Datum> {
+    let values = (start..=end)
+        .map(|pos| eval_expr_with_row(expr, schema, &rows[ordered[pos]]))
+        .collect::<Result<Vec<_>>>()?;
+    let values: Vec<Datum> = if window.ignore_nulls {
+        values.into_iter().filter(|v| !v.is_null()).collect()
+    } else {
+        values
+    };
+    let pick = match window.name.to_ascii_uppercase().as_str() {
+        "FIRST_VALUE" => values.first(),
+        "LAST_VALUE" => values.last(),
+        "NTH_VALUE" => {
+            let n = integer_arg(window, schema, &rows[idx], 1, 1)?;
+            if n <= 0 {
+                return Err(Error::unsupported("NTH_VALUE requires n >= 1"));
+            }
+            values.get(n as usize - 1)
+        }
+        _ => None,
+    };
+    Ok(pick.cloned().unwrap_or(Datum::Null))
 }
 
 /// `NTILE(n)` splits the ordered partition into `n` buckets (larger first).

@@ -2847,6 +2847,16 @@ mod tests {
                 vec!["4".to_string(), "1".to_string(), "4".to_string()]
             ]
         );
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (5, NULL)")
+            .unwrap();
+        let ignore = session
+            .execute_stmt(
+                "SELECT id, FIRST_VALUE(name) IGNORE NULLS OVER (ORDER BY id) FROM db1.t ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(ignore.display_rows()[0][1], "a".to_string());
+        assert_eq!(ignore.display_rows()[4][1], "a".to_string());
     }
 
     #[test]
