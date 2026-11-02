@@ -483,6 +483,12 @@
       "phase": 5,
       "notes": "TopN heap plus spill when LIMIT exceeds mem row limit"
     },
+    "pkg/executor/sortexec/parallel_sort_worker.go": {
+      "status": "partial",
+      "rust": "pkg/executor/sortexec/parallel_sort_worker.rs",
+      "phase": 5,
+      "notes": "in-memory parallel sort workers plus k-way merge of sorted partitions"
+    },
     "pkg/executor/projection.go": {
       "status": "partial",
       "phase": 2,

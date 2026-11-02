@@ -1,18 +1,18 @@
 // Sort leftover: sorted runs on disk plus k-way merge.
-// Completeness wave: parallel sort, pipelined chunked merge.
+// Completeness wave: pipelined chunked merge.
+use super::parallel_sort_worker::parallel_sort_rows;
+use super::sort::compare_rows;
 use sealdb_errno::Result;
 use sealdb_parser::ast::ByItem;
 use sealdb_types::Datum;
 use sealdb_util::chunk::DataInDiskByRows;
-
-use super::sort::compare_rows;
 
 pub fn spill_sorted_run(
     rows: &mut Vec<Vec<Datum>>,
     by: &[ByItem],
     schema: &[String],
 ) -> Result<DataInDiskByRows> {
-    rows.sort_by(|a, b| compare_rows(a, b, by, schema));
+    parallel_sort_rows(rows, by, schema)?;
     let mut file = DataInDiskByRows::new()?;
     for row in rows.drain(..) {
         file.add_row(&row)?;

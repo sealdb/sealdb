@@ -22,6 +22,10 @@ pub fn with_collation_ci<T>(ci: bool, f: impl FnOnce() -> T) -> T {
     })
 }
 
+pub fn collation_ci() -> bool {
+    COLLATION_CI.with(|cell| *cell.borrow())
+}
+
 fn compare_datums(left: &Datum, right: &Datum) -> std::cmp::Ordering {
     if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_)))
         && COLLATION_CI.with(|c| *c.borrow())

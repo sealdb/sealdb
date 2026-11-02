@@ -1,4 +1,5 @@
 use crate::internal::exec::Executor;
+use crate::sortexec::parallel_sort_worker::parallel_sort_rows;
 use crate::sortexec::sort_spill::{merge_runs, spill_sorted_run};
 use sealdb_errno::Result;
 use sealdb_expression::eval_expr_with_row;
@@ -59,7 +60,7 @@ impl Executor for SortExec {
             }
         }
         let rows = if runs.is_empty() {
-            buf.sort_by(|a, b| compare_rows(a, b, &self.by, &schema));
+            parallel_sort_rows(&mut buf, &self.by, &schema)?;
             buf
         } else {
             if !buf.is_empty() {

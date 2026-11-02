@@ -1,5 +1,5 @@
 // F05 leftover: TopN heap + spill (TiDB pkg/executor/sortexec/topn.go).
-// Completeness wave / not this feature: parallel sort.
+// Completeness wave / not this feature: parallel TopN workers.
 use crate::internal::exec::Executor;
 use crate::sortexec::sort::compare_rows;
 use crate::sortexec::sort_spill::{merge_runs_n, spill_sorted_run};

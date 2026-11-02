@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 169,
-  "manifest_entries": 119,
+  "rs_files": 170,
+  "manifest_entries": 120,
   "status_counts": {
-    "not-started": 1562,
-    "partial": 112,
+    "not-started": 1561,
+    "partial": 113,
     "reimplemented": 4,
     "ported": 3
   },
@@ -155,11 +155,11 @@
     },
     "pkg/executor": {
       "go": 185,
-      "rs": 36,
-      "missing": 149,
+      "rs": 37,
+      "missing": 148,
       "status": {
-        "not-started": 149,
-        "partial": 36
+        "not-started": 148,
+        "partial": 37
       }
     },
     "pkg/expression": {
@@ -3243,10 +3243,10 @@
     },
     {
       "go_path": "pkg/executor/sortexec/parallel_sort_worker.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/executor/sortexec/parallel_sort_worker.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "in-memory parallel sort workers plus k-way merge of sorted partitions"
     },
     {
       "go_path": "pkg/executor/sortexec/sort.go",
