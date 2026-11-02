@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C5 unicode-weights / utf8mb4_unicode_ci Latin subset；完整性波 C4=[] → C2=[] → C5）  
+> 最后更新：2026-11-03（C5 gbk-latin1 MVB；完整性波 C4=[] → C2=[] → C5）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,21 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: 完整性波 C5（gbk-latin1）
+- **完成**:
+  - `pkg/parser/charset/encoding_gbk.rs` / `encoding_latin1.rs`：decode/encode roundtrip（ASCII + 小汉字 / Latin 子集）
+  - `pkg/util/collate/gbk_bin.rs` / `gbk_chinese_ci*.rs`：`CollateMode::{GbkBin,GbkChineseCi}`；`SET NAMES gbk|latin1`
+  - C5 gate `execute-gbk-latin1`；`status.json` / leftover 去掉 `gbk-latin1`
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib charset`
+  - `cargo test -q -p sealdb-util --lib collate`
+  - `cargo test -q -p sealdb-session --lib test_gbk_latin1_charset_and_collation -- --exact`
+  - `./project/scripts/feature_gate.sh C5`
+- **下一步**:
+  - C5 `only-full-group-by` → `set-global` → leftover collation suites
 
 ### 2026-11-03
 

@@ -1,6 +1,6 @@
-//! Collation dispatch — TiDB `pkg/util/collate/collate.go` (unicode path MVB).
+//! Collation dispatch — TiDB `pkg/util/collate/collate.go`.
 
-use super::unicode_0400_ci_generated;
+use super::{gbk_bin, gbk_chinese_ci, unicode_0400_ci_generated};
 use std::cmp::Ordering;
 
 /// Session / expression collation mode.
@@ -12,6 +12,10 @@ pub enum CollateMode {
     GeneralCi,
     /// UCA 4.0.0 weight path (`utf8mb4_unicode_ci` / `utf8_unicode_ci`).
     UnicodeCi,
+    /// GBK binary byte order after UTF-8→GBK encode (`gbk_bin`).
+    GbkBin,
+    /// GBK Chinese CI sort keys (`gbk_chinese_ci`).
+    GbkChineseCi,
 }
 
 impl CollateMode {
@@ -19,7 +23,11 @@ impl CollateMode {
         let lower = name
             .trim_matches(|c| c == '\'' || c == '"')
             .to_ascii_lowercase();
-        if lower.contains("unicode") {
+        if lower == "gbk_chinese_ci" || (lower.starts_with("gbk") && lower.ends_with("_ci")) {
+            Self::GbkChineseCi
+        } else if lower == "gbk_bin" || (lower.starts_with("gbk") && lower.ends_with("_bin")) {
+            Self::GbkBin
+        } else if lower.contains("unicode") {
             Self::UnicodeCi
         } else if lower.ends_with("_ci") {
             Self::GeneralCi
@@ -29,7 +37,7 @@ impl CollateMode {
     }
 
     pub fn is_ci(self) -> bool {
-        !matches!(self, Self::Bin)
+        matches!(self, Self::GeneralCi | Self::UnicodeCi | Self::GbkChineseCi)
     }
 }
 
@@ -49,14 +57,26 @@ pub fn compare_bytes(mode: CollateMode, left: &[u8], right: &[u8]) -> Ordering {
             let rs = std::str::from_utf8(right).unwrap_or("");
             unicode_0400_ci_generated::compare(ls, rs)
         }
+        CollateMode::GbkBin => {
+            let ls = std::str::from_utf8(left).unwrap_or("");
+            let rs = std::str::from_utf8(right).unwrap_or("");
+            gbk_bin::compare(ls, rs)
+        }
+        CollateMode::GbkChineseCi => {
+            let ls = std::str::from_utf8(left).unwrap_or("");
+            let rs = std::str::from_utf8(right).unwrap_or("");
+            gbk_chinese_ci::compare(ls, rs)
+        }
     }
 }
 
 /// Case/weight equality used by LIKE when collation is CI.
 pub fn bytes_eq(mode: CollateMode, a: u8, b: u8) -> bool {
     match mode {
-        CollateMode::Bin => a == b,
-        CollateMode::GeneralCi | CollateMode::UnicodeCi => a.eq_ignore_ascii_case(&b),
+        CollateMode::Bin | CollateMode::GbkBin => a == b,
+        CollateMode::GeneralCi | CollateMode::UnicodeCi | CollateMode::GbkChineseCi => {
+            a.eq_ignore_ascii_case(&b)
+        }
     }
 }
 
@@ -75,6 +95,12 @@ mod tests {
             CollateMode::from_name("utf8mb4_unicode_ci"),
             CollateMode::UnicodeCi
         );
+        assert_eq!(CollateMode::from_name("gbk_bin"), CollateMode::GbkBin);
+        assert_eq!(
+            CollateMode::from_name("gbk_chinese_ci"),
+            CollateMode::GbkChineseCi
+        );
+        assert_eq!(CollateMode::from_name("latin1_bin"), CollateMode::Bin);
     }
 
     #[test]
@@ -84,5 +110,20 @@ mod tests {
             Ordering::Equal
         );
         assert_eq!(compare_bytes(CollateMode::Bin, b"A", b"a"), Ordering::Less);
+    }
+
+    #[test]
+    fn gbk_modes_compare() {
+        let a = "啊".as_bytes();
+        let b = "阿".as_bytes();
+        assert_eq!(compare_bytes(CollateMode::GbkBin, a, b), Ordering::Less);
+        assert_eq!(
+            compare_bytes(CollateMode::GbkChineseCi, b, a),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_bytes(CollateMode::GbkChineseCi, b"A", b"a"),
+            Ordering::Equal
+        );
     }
 }

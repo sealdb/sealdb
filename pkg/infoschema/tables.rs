@@ -523,6 +523,12 @@ const COLLATIONS: &[Collation] = &[
         id: 87,
         is_default: true,
     },
+    Collation {
+        name: "gbk_chinese_ci",
+        charset: "gbk",
+        id: 28,
+        is_default: false,
+    },
 ];
 
 fn bytes(value: &str) -> Datum {
