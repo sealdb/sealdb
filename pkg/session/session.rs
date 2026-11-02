@@ -3246,10 +3246,75 @@ mod tests {
             .execute_stmt("ALTER TABLE db1.t ADD UNIQUE INDEX idx_name_u (name)")
             .unwrap_err();
         assert_eq!(uniq_backfill.code, sealdb_errno::ERR_DUP_ENTRY);
-        let err = session
+        session
             .execute_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
-            .unwrap_err();
-        assert!(err.message.contains("ALTER TABLE"));
+            .unwrap();
+        let renamed = session
+            .execute_stmt("SELECT title FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(renamed.display_rows(), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn test_change_modify_rename() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), age VARCHAR(8)); INSERT INTO db1.t VALUES (1, 'alice', '10'); CREATE INDEX idx_name ON db1.t (name)",
+            )
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t MODIFY age INT")
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t RENAME COLUMN title TO name")
+            .unwrap();
+        session
+            .execute_stmt("ALTER TABLE db1.t RENAME INDEX idx_name TO idx_title")
+            .unwrap();
+        let row = session
+            .execute_stmt("SELECT name, age FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            row.display_rows(),
+            vec![vec!["alice".to_string(), "10".to_string()]]
+        );
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (2, 'bob', 11)")
+            .unwrap();
+        let by_index = session
+            .execute_stmt("SELECT name FROM db1.t WHERE name = 'alice'")
+            .unwrap();
+        assert_eq!(by_index.display_rows(), vec![vec!["alice".to_string()]]);
+        session
+            .execute_stmt("ALTER TABLE db1.t RENAME TO t2")
+            .unwrap();
+        let moved = session
+            .execute_stmt("SELECT name, age FROM db1.t2 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            moved.display_rows(),
+            vec![vec!["bob".to_string(), "11".to_string()]]
+        );
+        session
+            .execute_stmt("RENAME TABLE db1.t2 TO db1.t")
+            .unwrap();
+        assert!(session.infoschema().table_by_name("db1", "t").is_some());
+        assert!(session.infoschema().table_by_name("db1", "t2").is_none());
+        let table = session
+            .infoschema()
+            .table_by_name("db1", "t")
+            .unwrap()
+            .clone();
+        let idx = table
+            .indices
+            .iter()
+            .find(|idx| idx.name.o() == "idx_title")
+            .unwrap();
+        assert_eq!(idx.columns[0].name.o(), "name");
     }
 
     #[test]
