@@ -39,9 +39,6 @@
       "online-ddl-jobs",
       "indexes"
     ],
-    "F09": [
-      "semi-anti"
-    ],
     "F12": [
       "pessimistic",
       "savepoint",

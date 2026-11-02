@@ -12,3 +12,6 @@ SELECT t1.id, t2.tag FROM itest.t1, itest.t2 ORDER BY t1.id, t2.tag;
 CREATE TABLE itest.t3 (id INT, note VARCHAR(20));
 INSERT INTO itest.t3 VALUES (1, 'n');
 SELECT t1.id, t2.tag, t3.note FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id JOIN itest.t3 ON t2.id = t3.id;
+SELECT * FROM itest.t1 WHERE EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
+SELECT * FROM itest.t1 WHERE NOT EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
+SELECT * FROM itest.t1 WHERE id IN (SELECT id FROM itest.t2) ORDER BY id;

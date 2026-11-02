@@ -1,7 +1,9 @@
-// F09 core path: left-deep Inner/Left/Right HashJoin on equality, plus CROSS JOIN.
-// Completeness wave / not this feature: semi/anti/full, USING/NATURAL,
-// recursive spill/parallel workers, merge/index join, non-equality ON. CROSS JOIN
-// materializes both sides in memory (no join-key partition spill).
+// F09 core path: left-deep Inner/Left/Right/Semi/Anti HashJoin on equality,
+// plus CROSS JOIN. Semi emits each left row once on match; Anti emits a left
+// row when no match exists. Completeness wave / not this feature: full outer,
+// USING/NATURAL, recursive spill/parallel workers, merge/index join,
+// non-equality ON. CROSS JOIN materializes both sides in memory (no join-key
+// partition spill).
 use crate::internal::exec::Executor;
 use crate::join::hash_join_spill::{partition_count, partition_rows};
 use sealdb_errno::{Error, Result};
@@ -13,8 +15,9 @@ use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, mem_row_limit};
 use std::collections::HashMap;
 
-/// Two-table hash join. Inner/outer probe on equality keys; CROSS JOIN is a
-/// full cartesian product and never spill-partitions (no join key).
+/// Two-table hash join. Inner/outer probe on equality keys; Semi/Anti emit
+/// left rows only; CROSS JOIN is a full cartesian product and never
+/// spill-partitions (no join key).
 pub struct HashJoinV1Exec {
     join: Join,
     left: Box<dyn Executor>,
@@ -54,15 +57,22 @@ impl Executor for HashJoinV1Exec {
     fn open(&mut self) -> Result<()> {
         self.left.open()?;
         self.right.open()?;
-        let left_schema = qualify_schema(self.left.schema(), &self.join.left.name);
+        let left_raw = self.left.schema().to_vec();
+        let left_schema = qualify_schema(&left_raw, &self.join.left.name);
         let right_schema = qualify_schema(self.right.schema(), &self.join.right.name);
         let left_width = left_schema.len();
         let right_width = right_schema.len();
-        self.schema = left_schema
-            .iter()
-            .cloned()
-            .chain(right_schema.iter().cloned())
-            .collect();
+        // Semi/Anti keep the probe (left) schema so SELECT * FROM t1 WHERE EXISTS
+        // still returns t1 columns rather than a concatenated join row.
+        self.schema = if self.join.tp.is_semi_anti() {
+            left_raw
+        } else {
+            left_schema
+                .iter()
+                .cloned()
+                .chain(right_schema.iter().cloned())
+                .collect()
+        };
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
         self.spilled = false;
@@ -177,7 +187,67 @@ fn probe_join(
             false,
         ),
         JoinType::Cross => Ok(probe_cross(left_rows, right_rows)),
+        JoinType::Semi => probe_semi(
+            left_rows,
+            right_rows,
+            left_schema,
+            right_schema,
+            left_key,
+            right_key,
+        ),
+        JoinType::Anti => probe_anti(
+            left_rows,
+            right_rows,
+            left_schema,
+            right_schema,
+            left_key,
+            right_key,
+        ),
     }
+}
+
+/// Emit each left row once when any right row shares the join key (EXISTS / IN).
+fn probe_semi(
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    left_schema: &[String],
+    right_schema: &[String],
+    left_key: &ExprNode,
+    right_key: &ExprNode,
+) -> Result<Vec<Vec<Datum>>> {
+    let index = build_index(right_rows, right_schema, right_key)?;
+    let mut out = Vec::new();
+    for left in left_rows {
+        let key = eval_expr_with_row(left_key, left_schema, left)?;
+        if key.is_null() {
+            continue;
+        }
+        if index.contains_key(&key_text(&key)) {
+            out.push(left.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Emit a left row when no right row shares the join key (NOT EXISTS).
+fn probe_anti(
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    left_schema: &[String],
+    right_schema: &[String],
+    left_key: &ExprNode,
+    right_key: &ExprNode,
+) -> Result<Vec<Vec<Datum>>> {
+    let index = build_index(right_rows, right_schema, right_key)?;
+    let mut out = Vec::new();
+    for left in left_rows {
+        let key = eval_expr_with_row(left_key, left_schema, left)?;
+        let matched = !key.is_null() && index.contains_key(&key_text(&key));
+        if !matched {
+            out.push(left.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Concatenate every left row with every right row (CROSS JOIN / comma join).
@@ -373,7 +443,35 @@ pub(crate) fn hash_join_pairs(
             right_rows, left_rows, &right_q, &left_q, &right_key, &left_key, false,
         ),
         JoinType::Cross => unreachable!("cross join pairs handled above"),
+        JoinType::Semi => probe_semi_pairs(
+            left_rows, right_rows, &left_q, &right_q, &left_key, &right_key, true,
+        ),
+        JoinType::Anti => probe_semi_pairs(
+            left_rows, right_rows, &left_q, &right_q, &left_key, &right_key, false,
+        ),
     }
+}
+
+/// Semi (`matched`) / anti (`!matched`) DML pairs keep the left index only.
+fn probe_semi_pairs(
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    left_schema: &[String],
+    right_schema: &[String],
+    left_key: &ExprNode,
+    right_key: &ExprNode,
+    matched: bool,
+) -> Result<Vec<(Option<usize>, Option<usize>)>> {
+    let index = build_index_ids(right_rows, right_schema, right_key)?;
+    let mut out = Vec::new();
+    for (left_i, left) in left_rows.iter().enumerate() {
+        let key = eval_expr_with_row(left_key, left_schema, left)?;
+        let hit = !key.is_null() && index.contains_key(&key_text(&key));
+        if hit == matched {
+            out.push((Some(left_i), None));
+        }
+    }
+    Ok(out)
 }
 
 /// Inner-join `(probe_i, build_i)` pairs using the same hash index as `probe_inner`.
@@ -525,5 +623,51 @@ mod tests {
         spilled_out.sort_by(|a, b| a[0].compare(&b[0]));
         assert_eq!(mem_out, spilled_out);
         assert_eq!(mem_out.len(), 2);
+    }
+
+    fn join_of(tp: JoinType) -> Join {
+        let mut join = inner_join();
+        join.tp = tp;
+        join
+    }
+
+    #[test]
+    fn test_semi_and_anti_emit_left_only() {
+        let left_rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())],
+            vec![Datum::I64(2), Datum::Bytes(b"b".to_vec())],
+        ];
+        let right_rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"x".to_vec())],
+            vec![Datum::I64(1), Datum::Bytes(b"z".to_vec())],
+            vec![Datum::I64(9), Datum::Bytes(b"y".to_vec())],
+        ];
+        let left_schema = vec!["id".to_string(), "name".to_string()];
+        let right_schema = vec!["id".to_string(), "tag".to_string()];
+        let mut semi = HashJoinV1Exec::new(
+            join_of(JoinType::Semi),
+            Box::new(VecExec::new(left_schema.clone(), left_rows.clone())),
+            Box::new(VecExec::new(right_schema.clone(), right_rows.clone())),
+        );
+        semi.open().unwrap();
+        let chunk = semi.next().unwrap().unwrap();
+        assert_eq!(semi.schema(), &["id".to_string(), "name".to_string()]);
+        assert_eq!(chunk.num_rows(), 1);
+        assert_eq!(
+            chunk.get_row(0),
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())]
+        );
+        let mut anti = HashJoinV1Exec::new(
+            join_of(JoinType::Anti),
+            Box::new(VecExec::new(left_schema, left_rows)),
+            Box::new(VecExec::new(right_schema, right_rows)),
+        );
+        anti.open().unwrap();
+        let chunk = anti.next().unwrap().unwrap();
+        assert_eq!(chunk.num_rows(), 1);
+        assert_eq!(
+            chunk.get_row(0),
+            vec![Datum::I64(2), Datum::Bytes(b"b".to_vec())]
+        );
     }
 }

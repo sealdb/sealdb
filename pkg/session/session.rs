@@ -2141,6 +2141,53 @@ mod tests {
             .execute_stmt("SELECT * FROM db1.t1 WHERE id = ANY (SELECT id FROM db1.t2)")
             .unwrap_err();
         assert!(err.message.contains("ANY"));
+        let explain_exists = session
+            .execute_stmt(
+                "EXPLAIN SELECT * FROM db1.t1 WHERE EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id)",
+            )
+            .unwrap();
+        let explain_text = explain_exists
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            explain_text.contains("Semi"),
+            "expected HashJoin Semi, got {explain_text}"
+        );
+        assert!(
+            !explain_text.contains("Apply"),
+            "EXISTS should not stay Apply, got {explain_text}"
+        );
+        let explain_anti = session
+            .execute_stmt(
+                "EXPLAIN SELECT * FROM db1.t1 WHERE NOT EXISTS (SELECT 1 FROM db1.t2 WHERE t2.id = t1.id)",
+            )
+            .unwrap();
+        let anti_text = explain_anti
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            anti_text.contains("Anti"),
+            "expected HashJoin Anti, got {anti_text}"
+        );
+        let explain_in = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t1 WHERE id IN (SELECT id FROM db1.t2)")
+            .unwrap();
+        let in_text = explain_in
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            in_text.contains("Semi"),
+            "expected HashJoin Semi for IN, got {in_text}"
+        );
     }
 
     #[test]

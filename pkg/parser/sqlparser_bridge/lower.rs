@@ -1639,7 +1639,15 @@ fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Vec<Join
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
                 (JoinType::Inner, lower_expr(expr)?)
             }
-            // F09 leftover: NATURAL / USING / semi / anti / full.
+            JoinOperator::Semi(JoinConstraint::On(expr))
+            | JoinOperator::LeftSemi(JoinConstraint::On(expr)) => {
+                (JoinType::Semi, lower_expr(expr)?)
+            }
+            JoinOperator::Anti(JoinConstraint::On(expr))
+            | JoinOperator::LeftAnti(JoinConstraint::On(expr)) => {
+                (JoinType::Anti, lower_expr(expr)?)
+            }
+            // Completeness wave: NATURAL / USING / right semi/anti / full outer.
             other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
         };
         out.push(Join {
@@ -1658,7 +1666,13 @@ fn lower_dml_table(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> 
     let (name, mut joins) = lower_table_with_joins(table)?;
     match joins.len() {
         0 => Ok((name, None)),
-        1 => Ok((name, joins.pop())),
+        1 => {
+            let join = joins.pop().expect("len == 1");
+            if join.tp.is_semi_anti() {
+                return Err(Error::unsupported("SEMI/ANTI JOIN in UPDATE/DELETE"));
+            }
+            Ok((name, Some(join)))
+        }
         _ => Err(Error::unsupported("more than two tables in JOIN")),
     }
 }

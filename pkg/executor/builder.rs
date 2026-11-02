@@ -23,7 +23,7 @@ use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_kv::{Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
-use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement};
+use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement, TableName};
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
 use std::sync::Arc;
 
@@ -458,18 +458,61 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
     let select = stmt
         .as_select()
         .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
+    find_table_in_select(select, table)
+        .or_else(|| select.from.clone())
+        .ok_or_else(|| Error::unsupported("table reader without FROM"))
+}
+
+/// Resolve a TableReader name against FROM, JOIN, or a subquery in WHERE
+/// (EXISTS / IN rewritten to HashJoin Semi still need the inner table).
+fn find_table_in_select(select: &SelectStmt, table: &str) -> Option<TableName> {
+    if let Some(from) = &select.from
+        && from.name.eq_ignore_ascii_case(table)
+    {
+        return Some(from.clone());
+    }
     for join in &select.joins {
         if join.left.name.eq_ignore_ascii_case(table) {
-            return Ok(join.left.clone());
+            return Some(join.left.clone());
         }
         if join.right.name.eq_ignore_ascii_case(table) {
-            return Ok(join.right.clone());
+            return Some(join.right.clone());
         }
     }
     select
-        .from
-        .clone()
-        .ok_or_else(|| Error::unsupported("table reader without FROM"))
+        .selection
+        .as_ref()
+        .and_then(|expr| find_table_in_expr(expr, table))
+}
+
+fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
+    match expr {
+        ExprNode::Exists(e) => find_table_in_select(&e.query, table),
+        ExprNode::InSubquery(s) => {
+            find_table_in_select(&s.query, table).or_else(|| find_table_in_expr(&s.expr, table))
+        }
+        ExprNode::ScalarSubquery(s) => find_table_in_select(&s.query, table),
+        ExprNode::Binary(b) => {
+            find_table_in_expr(&b.left, table).or_else(|| find_table_in_expr(&b.right, table))
+        }
+        ExprNode::Unary(u) => find_table_in_expr(&u.expr, table),
+        ExprNode::Func(f) => f.args.iter().find_map(|arg| find_table_in_expr(arg, table)),
+        ExprNode::Cast(c) => find_table_in_expr(&c.expr, table),
+        ExprNode::InList(i) => find_table_in_expr(&i.expr, table).or_else(|| {
+            i.list
+                .iter()
+                .find_map(|item| find_table_in_expr(item, table))
+        }),
+        ExprNode::Between(b) => find_table_in_expr(&b.expr, table)
+            .or_else(|| find_table_in_expr(&b.low, table))
+            .or_else(|| find_table_in_expr(&b.high, table)),
+        ExprNode::Like(l) => {
+            find_table_in_expr(&l.expr, table).or_else(|| find_table_in_expr(&l.pattern, table))
+        }
+        ExprNode::IsNull(i) => find_table_in_expr(&i.expr, table),
+        ExprNode::Window(w) => w.args.iter().find_map(|arg| find_table_in_expr(arg, table)),
+        ExprNode::Column(_) | ExprNode::Value(_) => None,
+    }
 }
 
 fn index_lookup_value(
@@ -542,6 +585,8 @@ fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {
         JoinType::LeftOuter => sealdb_parser::ast::JoinType::LeftOuter,
         JoinType::RightOuter => sealdb_parser::ast::JoinType::RightOuter,
         JoinType::Cross => sealdb_parser::ast::JoinType::Cross,
+        JoinType::Semi => sealdb_parser::ast::JoinType::Semi,
+        JoinType::Anti => sealdb_parser::ast::JoinType::Anti,
     }
 }
 

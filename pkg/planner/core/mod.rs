@@ -7,6 +7,7 @@ pub mod planbuilder;
 pub mod rule_join_reorder;
 pub mod rule_partition_processor;
 pub mod rule_predicate_push_down;
+pub mod rule_semi_join;
 pub mod union;
 pub mod window;
 
