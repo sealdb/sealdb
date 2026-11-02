@@ -1690,12 +1690,9 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
 }
 
 fn lower_update(update: &Update) -> Result<Statement> {
-    // F07 gaps / completeness wave: UPDATE FROM, RETURNING, ORDER BY, LIMIT, multi-table.
+    // F07 leftover: ORDER BY / LIMIT. Completeness: UPDATE FROM, RETURNING, multi-table.
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
-    }
-    if !update.order_by.is_empty() || update.limit.is_some() {
-        return Err(Error::unsupported("UPDATE ORDER BY / LIMIT"));
     }
     let table = table_from_relation(&update.table)?;
     let list = update
@@ -1721,20 +1718,19 @@ fn lower_update(update: &Update) -> Result<Statement> {
         table,
         list,
         selection: update.selection.as_ref().map(lower_expr).transpose()?,
+        order_by: lower_order_by_exprs(&update.order_by)?,
+        limit: update.limit.as_ref().map(expr_as_u64).transpose()?,
     }))
 }
 
 fn lower_delete(delete: &Delete) -> Result<Statement> {
-    // F07 gaps / completeness wave: multi-table, USING, RETURNING, ORDER BY, LIMIT.
+    // F07 leftover: ORDER BY / LIMIT. Completeness: multi-table, USING, RETURNING.
     if delete.using.is_some()
         || delete.returning.is_some()
         || delete.output.is_some()
         || !delete.tables.is_empty()
     {
         return Err(Error::unsupported("multi-table / RETURNING DELETE"));
-    }
-    if !delete.order_by.is_empty() || delete.limit.is_some() {
-        return Err(Error::unsupported("DELETE ORDER BY / LIMIT"));
     }
     let tables = match &delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
@@ -1745,6 +1741,8 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
     Ok(Statement::Delete(DeleteStmt {
         table: table_from_relation(&tables[0])?,
         selection: delete.selection.as_ref().map(lower_expr).transpose()?,
+        order_by: lower_order_by_exprs(&delete.order_by)?,
+        limit: delete.limit.as_ref().map(expr_as_u64).transpose()?,
     }))
 }
 

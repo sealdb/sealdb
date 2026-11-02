@@ -1,9 +1,10 @@
-// F07 core path: single-table UPDATE SET.
+// F07 core path: single-table UPDATE SET, including ORDER BY / LIMIT.
 // F13: pessimistic UPDATE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: multi-table UPDATE, UPDATE JOIN / FROM,
-// ORDER BY / LIMIT, RETURNING, MySQL-protocol affected-row counts.
+// RETURNING, MySQL-protocol affected-row counts.
 use crate::index::{delete_index_keys, write_index_keys};
 use crate::internal::exec::Executor;
+use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
@@ -62,13 +63,23 @@ impl Executor for UpdateExec {
         let for_update = self.txn.with_txn(|txn| Ok(txn.is_pessimistic()))?;
         let physical = info.prune_partitions(self.stmt.selection.as_ref());
         let rows = scan_table(&self.txn, &info, for_update, &physical)?;
+        let mut matched = Vec::new();
+        for scanned in rows {
+            if let Some(filter) = &self.stmt.selection
+                && !eval_filter(filter, &col_names, &scanned.values)?
+            {
+                continue;
+            }
+            matched.push(scanned);
+        }
+        sort_rows_by(&mut matched, &self.stmt.order_by, &col_names, |row| {
+            &row.values
+        });
+        if let Some(limit) = self.stmt.limit {
+            matched.truncate(limit as usize);
+        }
         self.txn.with_txn(|txn| {
-            for scanned in rows {
-                if let Some(filter) = &self.stmt.selection
-                    && !eval_filter(filter, &col_names, &scanned.values)?
-                {
-                    continue;
-                }
+            for scanned in matched {
                 let mut new_values = scanned.values.clone();
                 for item in &self.stmt.list {
                     let idx = col_names

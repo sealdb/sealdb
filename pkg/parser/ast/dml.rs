@@ -278,6 +278,8 @@ pub struct UpdateStmt {
     pub table: TableName,
     pub list: Vec<Assignment>,
     pub selection: Option<ExprNode>,
+    pub order_by: Vec<ByItem>,
+    pub limit: Option<u64>,
 }
 
 impl UpdateStmt {
@@ -295,7 +297,7 @@ impl UpdateStmt {
             ctx.write_str(" WHERE ");
             selection.restore(ctx)?;
         }
-        Ok(())
+        restore_order_limit(ctx, &self.order_by, self.limit)
     }
 }
 
@@ -303,6 +305,8 @@ impl UpdateStmt {
 pub struct DeleteStmt {
     pub table: TableName,
     pub selection: Option<ExprNode>,
+    pub order_by: Vec<ByItem>,
+    pub limit: Option<u64>,
 }
 
 impl DeleteStmt {
@@ -313,8 +317,32 @@ impl DeleteStmt {
             ctx.write_str(" WHERE ");
             selection.restore(ctx)?;
         }
-        Ok(())
+        restore_order_limit(ctx, &self.order_by, self.limit)
     }
+}
+
+fn restore_order_limit(
+    ctx: &mut RestoreCtx,
+    order_by: &[ByItem],
+    limit: Option<u64>,
+) -> Result<()> {
+    if !order_by.is_empty() {
+        ctx.write_str(" ORDER BY ");
+        for (i, item) in order_by.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            item.expr.restore(ctx)?;
+            if item.desc {
+                ctx.write_str(" DESC");
+            }
+        }
+    }
+    if let Some(limit) = limit {
+        ctx.write_str(" LIMIT ");
+        ctx.write_str(&limit.to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

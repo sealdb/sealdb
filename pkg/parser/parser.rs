@@ -268,6 +268,28 @@ mod tests {
                 .stmt_type(),
             "DeleteStmt"
         );
+        match parser
+            .parse_one_stmt("UPDATE db1.t SET name = 'z' ORDER BY id DESC LIMIT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Update(update) => {
+                assert_eq!(update.order_by.len(), 1);
+                assert!(update.order_by[0].desc);
+                assert_eq!(update.limit, Some(1));
+            }
+            other => panic!("expected UpdateStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DELETE FROM db1.t ORDER BY id LIMIT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Delete(delete) => {
+                assert_eq!(delete.order_by.len(), 1);
+                assert!(!delete.order_by[0].desc);
+                assert_eq!(delete.limit, Some(1));
+            }
+            other => panic!("expected DeleteStmt, got {other:?}"),
+        }
     }
 
     #[test]

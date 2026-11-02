@@ -21,3 +21,16 @@ DELETE FROM itest.t WHERE id = 2;
 SELECT * FROM itest.t;
 id	name
 1	x
+CREATE TABLE itest.ol (id INT, name VARCHAR(20));
+INSERT INTO itest.ol VALUES (1, 'a'), (2, 'b'), (3, 'c');
+UPDATE itest.ol SET name = 'z' ORDER BY id DESC LIMIT 1;
+SELECT * FROM itest.ol ORDER BY id;
+id	name
+1	a
+2	b
+3	z
+DELETE FROM itest.ol ORDER BY id LIMIT 1;
+SELECT * FROM itest.ol ORDER BY id;
+id	name
+2	b
+3	z

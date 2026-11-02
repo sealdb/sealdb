@@ -1288,6 +1288,56 @@ mod tests {
     }
 
     #[test]
+    fn test_update_delete_order_limit() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            )
+            .unwrap();
+        session
+            .execute_stmt("UPDATE db1.t SET name = 'z' ORDER BY id DESC LIMIT 1")
+            .unwrap();
+        let after_update = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_update.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "z".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("DELETE FROM db1.t ORDER BY id LIMIT 1")
+            .unwrap();
+        let after_delete = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            after_delete.display_rows(),
+            vec![
+                vec!["2".to_string(), "b".to_string()],
+                vec!["3".to_string(), "z".to_string()]
+            ]
+        );
+        session
+            .execute_stmt("UPDATE db1.t SET name = 'x' WHERE id > 1 ORDER BY id LIMIT 1")
+            .unwrap();
+        let with_where = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            with_where.display_rows(),
+            vec![
+                vec!["2".to_string(), "x".to_string()],
+                vec!["3".to_string(), "z".to_string()]
+            ]
+        );
+    }
+
+    #[test]
     fn test_agg_and_group_by() {
         let session = Session::new();
         session

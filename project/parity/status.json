@@ -438,12 +438,12 @@
     "pkg/executor/update.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "single-table UPDATE SET into mem KV"
+      "notes": "single-table UPDATE SET + ORDER BY / LIMIT"
     },
     "pkg/executor/delete.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "single-table DELETE from mem KV"
+      "notes": "single-table DELETE + ORDER BY / LIMIT"
     },
     "pkg/executor/table_reader.go": {
       "status": "partial",

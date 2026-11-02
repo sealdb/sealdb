@@ -101,6 +101,18 @@ pub(crate) fn compare_rows(
     std::cmp::Ordering::Equal
 }
 
+pub(crate) fn sort_rows_by<T>(
+    rows: &mut [T],
+    by: &[ByItem],
+    schema: &[String],
+    values: impl Fn(&T) -> &[Datum] + Copy,
+) {
+    if by.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| compare_rows(values(a), values(b), by, schema));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
