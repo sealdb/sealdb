@@ -4,7 +4,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{RowLock, TxnHandle};
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{
     decode_handle_from_row_key, decode_row, encode_index_key, encode_row_key_with_handle,
@@ -21,7 +21,7 @@ pub struct PointGetExec {
     lookup: Option<Datum>,
     current_db: String,
     txn: Arc<TxnHandle>,
-    for_update: bool,
+    lock: RowLock,
     schema: Vec<String>,
     row: Option<Vec<Datum>>,
     emitted: bool,
@@ -37,7 +37,7 @@ impl PointGetExec {
         lookup: Option<Datum>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
-        for_update: bool,
+        lock: RowLock,
     ) -> Self {
         Self {
             domain,
@@ -47,7 +47,7 @@ impl PointGetExec {
             lookup,
             current_db: current_db.into(),
             txn,
-            for_update,
+            lock,
             schema: Vec::new(),
             row: None,
             emitted: false,
@@ -93,11 +93,7 @@ impl Executor for PointGetExec {
                         0,
                         true,
                     );
-                    let raw = if self.for_update {
-                        txn.get_for_update(key.as_bytes())?
-                    } else {
-                        txn.get(key.as_bytes())?
-                    };
+                    let raw = txn.get_locked(key.as_bytes(), self.lock)?;
                     if let Some(raw) = raw {
                         return decode_handle_from_row_key(&raw).map(Some);
                     }
@@ -125,11 +121,7 @@ impl Executor for PointGetExec {
         self.row = self.txn.with_txn(|txn| {
             for physical_id in physical_ids {
                 let key = encode_row_key_with_handle(physical_id, handle);
-                let raw = if self.for_update {
-                    txn.get_for_update(key.as_bytes())?
-                } else {
-                    txn.get(key.as_bytes())?
-                };
+                let raw = txn.get_locked(key.as_bytes(), self.lock)?;
                 if let Some(raw) = raw {
                     let decoded = decode_row(&raw, &info.col_field_types());
                     return Ok(Some(

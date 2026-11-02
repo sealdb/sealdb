@@ -21,7 +21,7 @@ use crate::update::UpdateExec;
 use crate::window::WindowExec;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
-use sealdb_kv::{Storage, TxnHandle};
+use sealdb_kv::{RowLock, Storage, TxnHandle};
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{ByItem, SelectLock, SelectStmt, Statement, TableName};
 use sealdb_planner::{JoinType, PhysicalPlan, PlanBuilder};
@@ -195,7 +195,7 @@ impl ExecutorBuilder {
                     access,
                     current_db.to_string(),
                     txn,
-                    select.lock == SelectLock::ForUpdate,
+                    select_row_lock(select),
                     partitions.clone(),
                     pushed.clone(),
                     covering,
@@ -226,7 +226,7 @@ impl ExecutorBuilder {
                     lookup,
                     current_db.to_string(),
                     txn,
-                    select.lock == SelectLock::ForUpdate,
+                    select_row_lock(select),
                 )))
             }
             PhysicalPlan::BatchPointGet { column, index, .. } => {
@@ -249,7 +249,7 @@ impl ExecutorBuilder {
                     lookups,
                     current_db.to_string(),
                     txn,
-                    select.lock == SelectLock::ForUpdate,
+                    select_row_lock(select),
                 )))
             }
             PhysicalPlan::TableReader {
@@ -258,15 +258,12 @@ impl ExecutorBuilder {
                 pushed,
             } => {
                 let from = resolve_reader_table(stmt, table)?;
-                let for_update = stmt
-                    .as_select()
-                    .is_some_and(|s| s.lock == SelectLock::ForUpdate);
                 Ok(Box::new(TableReaderExec::new(
                     domain,
                     from,
                     current_db.to_string(),
                     txn,
-                    for_update,
+                    stmt_row_lock(stmt),
                     partitions.clone(),
                     pushed.clone(),
                 )))
@@ -578,6 +575,20 @@ fn index_access(
             .map(|(_, inclusive)| *inclusive)
             .unwrap_or(true),
     })
+}
+
+fn select_row_lock(select: &SelectStmt) -> RowLock {
+    match select.lock {
+        SelectLock::ForUpdate => RowLock::Exclusive,
+        SelectLock::ForShare => RowLock::Share,
+        SelectLock::None => RowLock::None,
+    }
+}
+
+fn stmt_row_lock(stmt: &Statement) -> RowLock {
+    stmt.as_select()
+        .map(select_row_lock)
+        .unwrap_or(RowLock::None)
 }
 
 fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {

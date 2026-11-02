@@ -76,6 +76,8 @@ pub struct SelectField {
 pub enum SelectLock {
     #[default]
     None,
+    /// `SELECT ... FOR SHARE` / `LOCK IN SHARE MODE`.
+    ForShare,
     ForUpdate,
 }
 
@@ -264,8 +266,10 @@ impl SelectStmt {
             ctx.write_str(&offset.to_string());
             ctx.write_str(",18446744073709551615");
         }
-        if self.lock == SelectLock::ForUpdate {
-            ctx.write_str(" FOR UPDATE");
+        match self.lock {
+            SelectLock::ForUpdate => ctx.write_str(" FOR UPDATE"),
+            SelectLock::ForShare => ctx.write_str(" FOR SHARE"),
+            SelectLock::None => {}
         }
         Ok(())
     }

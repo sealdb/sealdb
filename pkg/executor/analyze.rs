@@ -4,7 +4,7 @@ use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{RowLock, TxnHandle};
 use sealdb_parser::ast::Statement;
 use sealdb_statistics::{ColumnStats, Table};
 use sealdb_types::Datum;
@@ -51,7 +51,7 @@ impl Executor for AnalyzeExec {
                 format!("Table '{schema}.{name}' doesn't exist"),
             )
         })?;
-        let rows = scan_table(&self.txn, &info, false, &info.physical_ids())?;
+        let rows = scan_table(&self.txn, &info, RowLock::None, &info.physical_ids())?;
         let mut columns = Vec::new();
         for (idx, col) in info.columns.iter().enumerate() {
             let mut distinct = HashSet::new();

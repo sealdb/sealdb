@@ -3,7 +3,7 @@
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::TableName;
 use sealdb_tablecodec::{
@@ -20,7 +20,7 @@ pub struct BatchPointGetExec {
     lookups: Vec<Datum>,
     current_db: String,
     txn: Arc<TxnHandle>,
-    for_update: bool,
+    lock: RowLock,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -35,7 +35,7 @@ impl BatchPointGetExec {
         lookups: Vec<Datum>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
-        for_update: bool,
+        lock: RowLock,
     ) -> Self {
         Self {
             domain,
@@ -44,7 +44,7 @@ impl BatchPointGetExec {
             lookups,
             current_db: current_db.into(),
             txn,
-            for_update,
+            lock,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -88,11 +88,7 @@ impl Executor for BatchPointGetExec {
                             0,
                             true,
                         );
-                        let raw = if self.for_update {
-                            txn.get_for_update(key.as_bytes())?
-                        } else {
-                            txn.get(key.as_bytes())?
-                        };
+                        let raw = txn.get_locked(key.as_bytes(), self.lock)?;
                         if let Some(raw) = raw {
                             handles.push(decode_handle_from_row_key(&raw)?);
                             break;
@@ -114,7 +110,7 @@ impl Executor for BatchPointGetExec {
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
             for handle in handles {
-                if let Some(row) = get_row(txn, &info, handle, self.for_update)? {
+                if let Some(row) = get_row(txn, &info, handle, self.lock)? {
                     rows.push(row);
                 }
             }
@@ -148,7 +144,7 @@ fn get_row(
     txn: &mut dyn sealdb_kv::Transaction,
     info: &TableInfo,
     handle: i64,
-    for_update: bool,
+    lock: RowLock,
 ) -> Result<Option<Vec<Datum>>> {
     let physical_ids = if info.partition.as_ref().is_some_and(|p| {
         p.column()
@@ -163,11 +159,7 @@ fn get_row(
     };
     for physical_id in physical_ids {
         let key = encode_row_key_with_handle(physical_id, handle);
-        let raw = if for_update {
-            txn.get_for_update(key.as_bytes())?
-        } else {
-            txn.get(key.as_bytes())?
-        };
+        let raw = txn.get_locked(key.as_bytes(), lock)?;
         if let Some(raw) = raw {
             let decoded = decode_row(&raw, &info.col_field_types());
             return Ok(Some(

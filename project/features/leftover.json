@@ -43,7 +43,6 @@
       "pessimistic"
     ],
     "F13": [
-      "for-share",
       "nowait-skip-locked",
       "blocking-wait",
       "deadlock",
