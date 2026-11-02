@@ -54,6 +54,13 @@ pub enum PhysicalPlan {
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
+    IndexReader {
+        table: String,
+        index: String,
+        partitions: Vec<i64>,
+        #[serde(skip)]
+        pushed: Option<ExprNode>,
+    },
     Selection {
         child: Box<PhysicalPlan>,
         #[serde(skip)]
@@ -151,24 +158,19 @@ impl PhysicalPlan {
                 index,
                 partitions,
                 pushed,
-            } => {
-                let mut name = if partitions.is_empty() {
-                    format!("IndexLookUpReader_{table}_{index}")
-                } else {
-                    format!(
-                        "IndexLookUpReader_{table}_{index}_{}",
-                        partitions
-                            .iter()
-                            .map(|id| id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                };
-                if let Some(filter) = pushed {
-                    name.push_str(&format!("[{}]", filter.restore_string()));
-                }
-                name
-            }
+            } => index_plan_name(
+                "IndexLookUpReader",
+                table,
+                index,
+                partitions,
+                pushed.as_ref(),
+            ),
+            PhysicalPlan::IndexReader {
+                table,
+                index,
+                partitions,
+                pushed,
+            } => index_plan_name("IndexReader", table, index, partitions, pushed.as_ref()),
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
@@ -205,4 +207,29 @@ impl PhysicalPlan {
             pushed: None,
         }
     }
+}
+
+fn index_plan_name(
+    kind: &str,
+    table: &str,
+    index: &str,
+    partitions: &[i64],
+    pushed: Option<&ExprNode>,
+) -> String {
+    let mut name = if partitions.is_empty() {
+        format!("{kind}_{table}_{index}")
+    } else {
+        format!(
+            "{kind}_{table}_{index}_{}",
+            partitions
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    if let Some(filter) = pushed {
+        name.push_str(&format!("[{}]", filter.restore_string()));
+    }
+    name
 }

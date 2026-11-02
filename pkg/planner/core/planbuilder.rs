@@ -323,6 +323,54 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     }
 }
 
+fn select_covers_index(
+    select: &SelectStmt,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+) -> bool {
+    if is_star_select(select) {
+        return info.index_covers(
+            index,
+            &info
+                .columns
+                .iter()
+                .map(|col| col.name.o().to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    info.index_covers(index, &select_needed_columns(select))
+}
+
+fn select_needed_columns(select: &SelectStmt) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut push = |expr: &ExprNode| {
+        for (_, name) in expr.referenced_columns() {
+            if !names
+                .iter()
+                .any(|have: &String| have.eq_ignore_ascii_case(&name))
+            {
+                names.push(name);
+            }
+        }
+    };
+    for field in &select.fields {
+        push(&field.expr);
+    }
+    if let Some(selection) = &select.selection {
+        push(selection);
+    }
+    for expr in &select.group_by {
+        push(expr);
+    }
+    if let Some(having) = &select.having {
+        push(having);
+    }
+    for item in &select.order_by {
+        push(&item.expr);
+    }
+    names
+}
+
 fn is_star_select(select: &SelectStmt) -> bool {
     matches!(
         select.fields.as_slice(),
@@ -363,7 +411,8 @@ fn access_plan(
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
     // F10 core: integer handle PointGet still wins; otherwise first-column
-    // equality on a secondary INDEX/KEY becomes IndexLookUpReader.
+    // equality on a secondary INDEX/KEY becomes IndexReader when covering,
+    // else IndexLookUpReader.
     // Completeness wave: range, composite prefix, unique PointGet, costed
     // index path enumeration / skyline.
     if is_information_schema(from, current_db) {
@@ -389,22 +438,28 @@ fn access_plan(
         }
         for (column, _) in &eqs {
             if let Some(index) = info.find_index_covering(column) {
-                // F10: unanalyzed tables keep IndexLookUp.
+                let partitions = info.prune_partitions(select.selection.as_ref());
+                // F10: unanalyzed tables keep the index path.
                 // C2 skyline: after ANALYZE, pick the cheaper of TableReader
-                // vs IndexLookUp. F21 NDV<=1 is the same TableReader winner.
+                // vs index. F21 NDV<=1 is the same TableReader winner.
                 if let Some(eq_rows) = eq_row_count(stats, from, current_db, column) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
-                        return PhysicalPlan::table_reader(
-                            from.name.clone(),
-                            info.prune_partitions(select.selection.as_ref()),
-                        );
+                        return PhysicalPlan::table_reader(from.name.clone(), partitions);
                     }
+                }
+                if select_covers_index(select, info, index) {
+                    return PhysicalPlan::IndexReader {
+                        table: from.name.clone(),
+                        index: index.name.o().to_string(),
+                        partitions,
+                        pushed: None,
+                    };
                 }
                 return PhysicalPlan::IndexLookUpReader {
                     table: from.name.clone(),
                     index: index.name.o().to_string(),
-                    partitions: info.prune_partitions(select.selection.as_ref()),
+                    partitions,
                     pushed: None,
                 };
             }

@@ -176,6 +176,19 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 .map(|filter| format!("pushed:{}", filter.restore_string()))
                 .unwrap_or_default(),
         ),
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            pushed,
+            ..
+        } => (
+            "IndexReader".to_string(),
+            format!("table:{table}, index:{index}"),
+            pushed
+                .as_ref()
+                .map(|filter| format!("pushed:{}", filter.restore_string()))
+                .unwrap_or_default(),
+        ),
         PhysicalPlan::Selection { filter, .. } => (
             "Selection".to_string(),
             String::new(),
@@ -221,6 +234,9 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         }
         | PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
+        }
+        | PhysicalPlan::IndexReader {
+            pushed: Some(_), ..
         } => 8_000.0,
         PhysicalPlan::Limit { child } => est_rows(child).min(1.0),
         PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
@@ -243,6 +259,9 @@ fn task_of(plan: &PhysicalPlan) -> &'static str {
             pushed: Some(_), ..
         }
         | PhysicalPlan::IndexLookUpReader {
+            pushed: Some(_), ..
+        }
+        | PhysicalPlan::IndexReader {
             pushed: Some(_), ..
         } => "cop",
         _ => "root",

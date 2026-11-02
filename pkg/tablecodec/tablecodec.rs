@@ -2,7 +2,8 @@ use sealdb_errno::{Error, Result};
 use sealdb_kv::Key;
 use sealdb_types::Datum;
 use sealdb_util::codec::{
-    decode_int, encode_bytes, encode_float, encode_int, encode_int_to_cmp_uint,
+    decode_bytes, decode_float, decode_int, encode_bytes, encode_float, encode_int,
+    encode_int_to_cmp_uint,
 };
 
 pub const TABLE_PREFIX: &[u8] = b"t";
@@ -107,6 +108,61 @@ pub fn decode_handle_from_index_key(key: &[u8]) -> Result<i64> {
     }
     let (_, handle) = decode_int(&key[key.len() - 8..])?;
     Ok(handle)
+}
+
+pub fn decode_index_datum(buf: &[u8]) -> Result<(&[u8], Datum)> {
+    if buf.is_empty() {
+        return Err(Error::new(
+            sealdb_errno::ERR_INVALID_KEY,
+            "index datum too short",
+        ));
+    }
+    match buf[0] {
+        0 => Ok((&buf[1..], Datum::Null)),
+        1 => {
+            let (rest, v) = decode_int(&buf[1..])?;
+            Ok((rest, Datum::I64(v)))
+        }
+        2 => {
+            let (rest, v) = decode_float(&buf[1..])?;
+            Ok((rest, Datum::F64(v)))
+        }
+        3 => {
+            let (rest, bytes) = decode_bytes(&buf[1..], false)?;
+            Ok((rest, Datum::Bytes(bytes)))
+        }
+        other => Err(Error::new(
+            sealdb_errno::ERR_INVALID_KEY,
+            format!("unknown index datum tag {other}"),
+        )),
+    }
+}
+
+pub fn decode_index_key_values(
+    key: &[u8],
+    n_cols: usize,
+    unique: bool,
+) -> Result<(Vec<Datum>, i64)> {
+    if key.len() < PREFIX_LEN + 8 {
+        return Err(Error::new(
+            sealdb_errno::ERR_INVALID_KEY,
+            "index key too short",
+        ));
+    }
+    let mut rest = &key[PREFIX_LEN + 8..];
+    let mut values = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let (next, value) = decode_index_datum(rest)?;
+        rest = next;
+        values.push(value);
+    }
+    let handle = if unique {
+        0
+    } else {
+        let (_, handle) = decode_int(rest)?;
+        handle
+    };
+    Ok((values, handle))
 }
 
 pub fn gen_table_record_prefix(table_id: i64) -> Key {
@@ -273,6 +329,12 @@ mod tests {
         assert_eq!(decode_handle_from_index_key(key.as_bytes()).unwrap(), 9);
         let prefix = encode_index_seek_prefix(2, 1, &[Datum::Bytes(b"abc".to_vec())]);
         assert!(key.as_bytes().starts_with(prefix.as_bytes()));
+        let (values, handle) = decode_index_key_values(key.as_bytes(), 1, false).unwrap();
+        assert_eq!(values, vec![Datum::Bytes(b"abc".to_vec())]);
+        assert_eq!(handle, 9);
+        let unique = encode_index_key(2, 1, &[Datum::I64(4)], 0, true);
+        let (uvals, _) = decode_index_key_values(unique.as_bytes(), 1, true).unwrap();
+        assert_eq!(uvals, vec![Datum::I64(4)]);
     }
 
     fn hex(s: &str) -> Vec<u8> {

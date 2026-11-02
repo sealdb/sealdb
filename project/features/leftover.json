@@ -63,7 +63,6 @@
       "n-table"
     ],
     "F10": [
-      "covering-reader",
       "range-scan"
     ],
     "F12": [
