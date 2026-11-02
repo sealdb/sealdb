@@ -1,4 +1,5 @@
 use crate::internal::exec::Executor;
+use crate::join::apply::SubqueryEvalCtx;
 use sealdb_errno::Result;
 use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::ExprNode;
@@ -8,6 +9,7 @@ pub struct ProjectionExec {
     exprs: Vec<ExprNode>,
     names: Vec<String>,
     child: Box<dyn Executor>,
+    subquery: Option<SubqueryEvalCtx>,
     opened: bool,
 }
 
@@ -17,8 +19,15 @@ impl ProjectionExec {
             exprs,
             names,
             child,
+            subquery: None,
             opened: false,
         }
+    }
+
+    /// Attach Apply-style subquery evaluation for SELECT-list scalar subqueries.
+    pub(crate) fn with_subquery(mut self, subquery: SubqueryEvalCtx) -> Self {
+        self.subquery = Some(subquery);
+        self
     }
 }
 
@@ -36,11 +45,17 @@ impl Executor for ProjectionExec {
         let mut chunk = Chunk::new(self.exprs.len(), input.num_rows());
         for i in 0..input.num_rows() {
             let row = input.get_row(i);
-            let projected = self
-                .exprs
-                .iter()
-                .map(|expr| eval_expr_with_row(expr, schema, &row))
-                .collect::<Result<Vec<_>>>()?;
+            let projected = if let Some(subquery) = &mut self.subquery {
+                self.exprs
+                    .iter()
+                    .map(|expr| subquery.eval(expr, schema, &row))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                self.exprs
+                    .iter()
+                    .map(|expr| eval_expr_with_row(expr, schema, &row))
+                    .collect::<Result<Vec<_>>>()?
+            };
             chunk.append_row(projected);
         }
         Ok(Some(chunk))

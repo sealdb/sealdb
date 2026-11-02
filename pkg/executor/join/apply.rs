@@ -1,6 +1,7 @@
 // F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
 // Completeness wave / not this feature: parallel apply, semi/anti rewrite,
-// subquery JOIN, SELECT-list subquery. Derived tables flatten to CTEs.
+// subquery JOIN. Derived tables flatten to CTEs. SELECT-list scalar
+// subqueries reuse SubqueryEvalCtx from ProjectionExec.
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
@@ -108,6 +109,54 @@ struct ApplyCtx {
     outer_table: Option<String>,
     outer_schema: Vec<String>,
     outer_row: Vec<Datum>,
+}
+
+/// Runs nested subqueries while projecting a row (SELECT-list scalar subquery).
+pub(crate) struct SubqueryEvalCtx {
+    domain: Arc<Domain>,
+    current_db: String,
+    txn: Arc<TxnHandle>,
+    outer_table: Option<String>,
+    cache: HashMap<String, QueryResult>,
+}
+
+impl SubqueryEvalCtx {
+    pub(crate) fn new(
+        domain: Arc<Domain>,
+        current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
+        outer_table: Option<String>,
+    ) -> Self {
+        Self {
+            domain,
+            current_db: current_db.into(),
+            txn,
+            outer_table,
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Materialize subqueries in `expr` against `row`, then evaluate.
+    pub(crate) fn eval(
+        &mut self,
+        expr: &ExprNode,
+        schema: &[String],
+        row: &[Datum],
+    ) -> Result<Datum> {
+        if !expr.has_subquery() {
+            return eval_expr_with_row(expr, schema, row);
+        }
+        let ctx = ApplyCtx {
+            domain: Arc::clone(&self.domain),
+            current_db: self.current_db.clone(),
+            txn: Arc::clone(&self.txn),
+            outer_table: self.outer_table.clone(),
+            outer_schema: schema.to_vec(),
+            outer_row: row.to_vec(),
+        };
+        let rewritten = materialize(expr, &ctx, &mut self.cache)?;
+        eval_expr_with_row(&rewritten, schema, row)
+    }
 }
 
 fn materialize(

@@ -23,3 +23,5 @@ SELECT * FROM itest.t1 WHERE id > ALL (SELECT id FROM itest.t2) ORDER BY id;
 SELECT * FROM (SELECT id, name FROM itest.t1 WHERE id = 1) d;
 SELECT x FROM (SELECT 2) AS d(x);
 SELECT * FROM (SELECT * FROM (SELECT id FROM itest.t1 WHERE id = 2) a) b;
+SELECT id, (SELECT tag FROM itest.t2 WHERE t2.id = t1.id) FROM itest.t1 ORDER BY id;
+SELECT (SELECT 1);

@@ -687,6 +687,16 @@ mod tests {
                 .as_ref(),
             Some(crate::ast::ExprNode::QuantifiedCmp(q)) if q.all
         ));
+        assert!(matches!(
+            parser
+                .parse_one_stmt("SELECT id, (SELECT tag FROM t2 WHERE t2.id = t1.id) FROM t1")
+                .unwrap()
+                .as_select()
+                .unwrap()
+                .fields[1]
+                .expr,
+            crate::ast::ExprNode::ScalarSubquery(_)
+        ));
     }
 
     #[test]
