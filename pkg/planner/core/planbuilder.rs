@@ -157,6 +157,12 @@ impl PlanBuilder {
             Statement::DropRole(_) => Ok(PhysicalPlan::Simple {
                 kind: "DropRole".to_string(),
             }),
+            Statement::CreateUser(_) => Ok(PhysicalPlan::Simple {
+                kind: "CreateUser".to_string(),
+            }),
+            Statement::DropUser(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropUser".to_string(),
+            }),
             Statement::GrantRole(_) => Ok(PhysicalPlan::Simple {
                 kind: "GrantRole".to_string(),
             }),

@@ -31,6 +31,8 @@ impl Executor for GrantExec {
             Statement::Revoke(revoke) => self.domain.privilege().revoke(revoke)?,
             Statement::CreateRole(create) => self.domain.privilege().create_role(create)?,
             Statement::DropRole(drop) => self.domain.privilege().drop_role(drop)?,
+            Statement::CreateUser(create) => self.domain.privilege().create_user(create)?,
+            Statement::DropUser(drop) => self.domain.privilege().drop_user(drop)?,
             Statement::GrantRole(grant) => self.domain.privilege().grant_role(grant)?,
             Statement::RevokeRole(revoke) => self.domain.privilege().revoke_role(revoke)?,
             _ => {}
