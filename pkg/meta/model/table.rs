@@ -3,6 +3,7 @@ use super::index::IndexInfo;
 use super::job::{STATE_PUBLIC, SchemaState};
 use super::partition::PartitionInfo;
 use sealdb_parser::model::CIStr;
+use sealdb_types::EvalType;
 use serde::{Deserialize, Serialize};
 
 pub const CURR_LATEST_TABLE_INFO_VERSION: u16 = 5;
@@ -53,5 +54,38 @@ impl TableInfo {
         self.indices
             .iter()
             .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
+    }
+
+    pub fn handle_column(&self) -> Option<&ColumnInfo> {
+        self.columns
+            .first()
+            .filter(|col| col.field_type.eval_type() == EvalType::Int)
+    }
+
+    pub fn covering_column_names(&self, index: &IndexInfo) -> Vec<String> {
+        let mut names: Vec<String> = index
+            .columns
+            .iter()
+            .map(|col| col.name.o().to_string())
+            .collect();
+        if let Some(handle) = self.handle_column() {
+            let handle_name = handle.name.o();
+            if !names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(handle_name))
+            {
+                names.push(handle_name.to_string());
+            }
+        }
+        names
+    }
+
+    pub fn index_covers(&self, index: &IndexInfo, columns: &[String]) -> bool {
+        let available = self.covering_column_names(index);
+        columns.iter().all(|needed| {
+            available
+                .iter()
+                .any(|have| have.eq_ignore_ascii_case(needed))
+        })
     }
 }

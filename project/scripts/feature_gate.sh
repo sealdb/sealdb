@@ -94,6 +94,7 @@ case "$FEATURE" in
   F10)
     run execute-index-lookup cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'), (3, 'a'); SELECT * FROM db1.t WHERE name = 'a' ORDER BY id"
     run execute-unique-pk cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), PRIMARY KEY (id), UNIQUE INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'); INSERT INTO db1.t VALUES (2, 'b')"
+    run execute-covering cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), extra VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'a', 'z'); EXPLAIN SELECT name FROM db1.t WHERE name = 'a'; SELECT name FROM db1.t WHERE name = 'a' ORDER BY id; SELECT * FROM db1.t WHERE name = 'a' ORDER BY id"
     ;;
   F12)
     run execute-txn cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); BEGIN; INSERT INTO db1.t VALUES (1, 'a'); COMMIT; SELECT * FROM db1.t"

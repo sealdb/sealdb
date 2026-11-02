@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F10 leftover（covering-reader）
+- **完成**:
+  - covering `IndexReader` when SELECT/WHERE/ORDER BY/GROUP BY/HAVING columns ⊆ index ∪ integer handle
+  - unique index handle decoded from row-key value; SELECT `*` still IndexLookUp unless the index covers every table column
+- **验证**:
+  - session covering + unique lookup; F10 gate execute-covering
+- **下一步**:
+  - leftover range-scan
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: F10 leftover（unique-pk）
 - **完成**:
   - CREATE TABLE PRIMARY KEY / UNIQUE INDEX + CREATE UNIQUE INDEX

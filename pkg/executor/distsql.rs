@@ -1,15 +1,17 @@
-// F10 core path: IndexLookUpExecutor (TiDB pkg/executor/distsql.go).
-// Completeness wave / not this feature: covering IndexReader, range scan,
-// IndexMerge, lookup push-down, parallel workers, unique index PointGet.
+// F10 core path: IndexLookUpExecutor / covering IndexReader
+// (TiDB pkg/executor/distsql.go).
+// Completeness wave / not this feature: range scan, IndexMerge,
+// lookup push-down, parallel workers, unique index PointGet.
 use crate::coprocessor::filter_rows;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::TxnHandle;
+use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::{ExprNode, TableName};
 use sealdb_tablecodec::{
-    decode_handle_from_index_key, decode_row, encode_index_seek_prefix, encode_row_key_with_handle,
-    next_prefix,
+    decode_handle_from_index_key, decode_handle_from_row_key, decode_index_key_values, decode_row,
+    encode_index_seek_prefix, encode_row_key_with_handle, next_prefix,
 };
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -25,6 +27,7 @@ pub struct IndexLookUpExecutor {
     for_update: bool,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
+    covering: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -42,6 +45,7 @@ impl IndexLookUpExecutor {
         for_update: bool,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
+        covering: bool,
     ) -> Self {
         Self {
             domain,
@@ -53,6 +57,7 @@ impl IndexLookUpExecutor {
             for_update,
             partitions,
             pushed,
+            covering,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -103,8 +108,12 @@ impl Executor for IndexLookUpExecutor {
                 } else {
                     txn.scan(start.as_bytes(), &end)?
                 };
-                for (key, _) in pairs {
-                    let handle = decode_handle_from_index_key(&key)?;
+                for (key, value) in pairs {
+                    let handle = index_handle(&index, &key, &value)?;
+                    if self.covering {
+                        rows.push(covering_row(&info, &index, &key, handle)?);
+                        continue;
+                    }
                     let row_key = encode_row_key_with_handle(physical_id, handle);
                     let raw = if self.for_update {
                         txn.get_for_update(row_key.as_bytes())?
@@ -157,4 +166,33 @@ impl Executor for IndexLookUpExecutor {
     fn schema(&self) -> &[String] {
         &self.schema
     }
+}
+
+fn index_handle(index: &IndexInfo, key: &[u8], value: &[u8]) -> Result<i64> {
+    if index.unique {
+        decode_handle_from_row_key(value)
+    } else {
+        decode_handle_from_index_key(key)
+    }
+}
+
+fn covering_row(
+    info: &TableInfo,
+    index: &IndexInfo,
+    key: &[u8],
+    handle: i64,
+) -> Result<Vec<Datum>> {
+    let (values, _) = decode_index_key_values(key, index.columns.len(), index.unique)?;
+    let mut row = vec![Datum::Null; info.columns.len()];
+    for (col, value) in index.columns.iter().zip(values) {
+        if let Some(slot) = row.get_mut(col.offset as usize) {
+            *slot = value;
+        }
+    }
+    if let Some(handle_col) = info.handle_column()
+        && let Some(slot) = row.get_mut(handle_col.offset as usize)
+    {
+        *slot = Datum::I64(handle);
+    }
+    Ok(row)
 }

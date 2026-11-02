@@ -1345,6 +1345,97 @@ mod tests {
             .execute_stmt("INSERT INTO db1.u VALUES (1, 'z')")
             .unwrap_err();
         assert_eq!(dup_created.code, sealdb_errno::ERR_DUP_ENTRY);
+        let unique_hit = session
+            .execute_stmt("SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(
+            unique_hit.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_covering_index_reader() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), extra VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a', 'x'), (2, 'b', 'y'), (3, 'a', 'z')",
+            )
+            .unwrap();
+        let covering = session
+            .execute_stmt("EXPLAIN SELECT name FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        let covering_text = covering
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(covering_text.contains("IndexReader"), "{covering_text}");
+        assert!(!covering_text.contains("IndexLookUp"), "{covering_text}");
+        let names = session
+            .execute_stmt("SELECT name FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            names.display_rows(),
+            vec![vec!["a".to_string()], vec!["a".to_string()]]
+        );
+        let ids = session
+            .execute_stmt("SELECT id, name FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            ids.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["3".to_string(), "a".to_string()]
+            ]
+        );
+        let lookup = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name = 'a'")
+            .unwrap();
+        let lookup_text = lookup
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lookup_text.contains("IndexLookUp"), "{lookup_text}");
+        let extra = session
+            .execute_stmt("SELECT extra FROM db1.t WHERE name = 'a' ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            extra.display_rows(),
+            vec![vec!["x".to_string()], vec!["z".to_string()]]
+        );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20), extra VARCHAR(20), UNIQUE INDEX idx_u_name (name)); INSERT INTO db1.u VALUES (1, 'a', 'x'), (2, 'b', 'y')",
+            )
+            .unwrap();
+        let unique_cover = session
+            .execute_stmt("EXPLAIN SELECT name FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        let unique_cover_text = unique_cover
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            unique_cover_text.contains("IndexReader"),
+            "{unique_cover_text}"
+        );
+        let unique_lookup = session
+            .execute_stmt("SELECT extra FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(unique_lookup.display_rows(), vec![vec!["x".to_string()]]);
+        let unique_star = session
+            .execute_stmt("SELECT * FROM db1.u WHERE name = 'a'")
+            .unwrap();
+        assert_eq!(
+            unique_star.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "x".to_string()]]
+        );
     }
 
     #[test]
@@ -2024,7 +2115,16 @@ mod tests {
                 Some(session.stats().as_ref()),
             )
             .unwrap();
-        assert!(before.explain().contains("IndexLookUpReader"));
+        assert!(
+            before.explain().contains("IndexReader"),
+            "{}",
+            before.explain()
+        );
+        assert!(
+            !before.explain().contains("IndexLookUp"),
+            "{}",
+            before.explain()
+        );
         session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
         let stats = session.stats().table("db1", "t").unwrap();
         assert_eq!(stats.count, 3);
@@ -2069,7 +2169,8 @@ mod tests {
             .map(|r| r.join("|"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(before_text.contains("IndexLookUp"), "{before_text}");
+        assert!(before_text.contains("IndexReader"), "{before_text}");
+        assert!(!before_text.contains("IndexLookUp"), "{before_text}");
         session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
         let after = session
             .execute_stmt("EXPLAIN SELECT * FROM db1.t WHERE name = 'a'")
@@ -2082,6 +2183,7 @@ mod tests {
             .join("\n");
         assert!(after_text.contains("TableReader"), "{after_text}");
         assert!(!after_text.contains("IndexLookUp"), "{after_text}");
+        assert!(!after_text.contains("IndexReader"), "{after_text}");
 
         let dual = session.execute_stmt("EXPLAIN SELECT 1").unwrap();
         let dual_text = dual

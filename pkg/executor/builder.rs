@@ -156,7 +156,14 @@ impl ExecutorBuilder {
                 partitions,
                 pushed,
                 ..
+            }
+            | PhysicalPlan::IndexReader {
+                index,
+                partitions,
+                pushed,
+                ..
             } => {
+                let covering = matches!(plan, PhysicalPlan::IndexReader { .. });
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
@@ -177,6 +184,7 @@ impl ExecutorBuilder {
                     select.lock == SelectLock::ForUpdate,
                     partitions.clone(),
                     pushed.clone(),
+                    covering,
                 )))
             }
             PhysicalPlan::PointGet { handle, .. } => {
