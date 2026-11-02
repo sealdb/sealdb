@@ -1,6 +1,6 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
 use super::plan_cost::{
-    eq_row_count, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
+    eq_row_count_value, index_lookup_cost, point_get_cost, table_row_count, table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_partition_processor::{PartitionPruneMode, plan_partitions};
@@ -661,7 +661,7 @@ fn access_plan(
         if let Some(plan) = in_list_plan(select, from, info) {
             return plan;
         }
-        for (column, _) in &eqs {
+        for (column, value) in &eqs {
             if let Some(index) = info.find_index_covering(column) {
                 if index.unique {
                     return PhysicalPlan::PointGet {
@@ -672,9 +672,8 @@ fn access_plan(
                 }
                 let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
                 // F10: unanalyzed tables keep the index path.
-                // C2 skyline: after ANALYZE, pick the cheaper of TableReader
-                // vs index. F21 NDV<=1 is the same TableReader winner.
-                if let Some(eq_rows) = eq_row_count(stats, from, current_db, column) {
+                // C2/F21: after ANALYZE, TopN/NDV drives TableReader vs index.
+                if let Some(eq_rows) = eq_row_count_value(stats, from, current_db, column, value) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
                         return PhysicalPlan::table_reader(from.name.clone(), partitions);

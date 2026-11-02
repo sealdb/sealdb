@@ -1874,6 +1874,7 @@ name = "sealdb-statistics"
 version = "0.1.0"
 dependencies = [
  "sealdb-parser",
+ "sealdb-types",
 ]
 
 [[package]]

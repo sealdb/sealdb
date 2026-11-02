@@ -26,6 +26,20 @@ pub fn eq_row_count(
         .map(|t| t.eq_row_count(column) as f64)
 }
 
+/// Equality selectivity using TopN when the constant is known.
+pub fn eq_row_count_value(
+    stats: Option<&Handle>,
+    from: &TableName,
+    current_db: &str,
+    column: &str,
+    value: &sealdb_types::Datum,
+) -> Option<f64> {
+    let (db, table) = from.qualified(current_db);
+    stats
+        .and_then(|handle| handle.table(&db, &table))
+        .map(|t| t.eq_row_count_value(column, value) as f64)
+}
+
 pub fn table_scan_cost(rows: f64) -> f64 {
     rows * SCAN_FACTOR
 }
