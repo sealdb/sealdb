@@ -1322,6 +1322,17 @@ mod tests {
         match parser.parse_one_stmt("ANALYZE TABLE t").unwrap() {
             crate::ast::Statement::AnalyzeTable(analyze) => {
                 assert_eq!(analyze.table.name, "t");
+                assert!(analyze.indexes.is_empty());
+            }
+            other => panic!("expected AnalyzeTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ANALYZE TABLE db1.t INDEX idx_name, idx_id")
+            .unwrap()
+        {
+            crate::ast::Statement::AnalyzeTable(analyze) => {
+                assert_eq!(analyze.table.name, "t");
+                assert_eq!(analyze.indexes, vec!["idx_name", "idx_id"]);
             }
             other => panic!("expected AnalyzeTableStmt, got {other:?}"),
         }

@@ -5,7 +5,7 @@ use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::{Job, JobState, Mutator};
 use sealdb_parser::ast::Statement;
 use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
-use sealdb_statistics::Handle;
+use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -81,6 +81,8 @@ impl Domain {
         if !privilege.skip_grant_table() {
             load_privileges(storage.as_ref(), &privilege)?;
         }
+        let stats = Arc::new(Handle::new());
+        load_stats(storage.as_ref(), &stats)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 meta,
@@ -90,7 +92,7 @@ impl Domain {
             }),
             storage,
             privilege: Arc::new(privilege),
-            stats: Arc::new(Handle::new()),
+            stats,
         })
     }
 
@@ -106,6 +108,14 @@ impl Domain {
         let bytes = self.privilege.encode()?;
         let mut txn = self.storage.begin()?;
         txn.set(PRIVILEGE_STORAGE_KEY, &bytes)?;
+        txn.commit()
+    }
+
+    /// Persist table statistics (TiDB mysql.stats_* equivalent).
+    pub fn persist_stats(&self) -> Result<()> {
+        let bytes = self.stats.encode()?;
+        let mut txn = self.storage.begin()?;
+        txn.set(STATS_STORAGE_KEY, &bytes)?;
         txn.commit()
     }
 
@@ -213,6 +223,16 @@ fn load_privileges(storage: &dyn Storage, privilege: &Manager) -> Result<()> {
     txn.rollback()?;
     if let Some(bytes) = raw {
         privilege.decode(&bytes)?;
+    }
+    Ok(())
+}
+
+fn load_stats(storage: &dyn Storage, stats: &Handle) -> Result<()> {
+    let mut txn = storage.begin()?;
+    let raw = txn.get(STATS_STORAGE_KEY)?;
+    txn.rollback()?;
+    if let Some(bytes) = raw {
+        stats.decode(&bytes)?;
     }
     Ok(())
 }

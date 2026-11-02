@@ -9,5 +9,8 @@ license.workspace = true
 path = "lib.rs"
 
 [dependencies]
+sealdb-errno.workspace = true
 sealdb-parser.workspace = true
 sealdb-types.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

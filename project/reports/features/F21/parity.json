@@ -2357,7 +2357,7 @@
       "rs_path": "pkg/executor/analyze.rs",
       "status": "partial",
       "phase": 7,
-      "notes": "full-scan ANALYZE TABLE count/NDV; histogram deferred"
+      "notes": "ANALYZE TABLE + INDEX; histogram/TopN; auto-analyze deferred"
     },
     {
       "go_path": "pkg/executor/analyze_col.go",
@@ -8573,7 +8573,7 @@
       "rs_path": "pkg/statistics/handle/mod.rs",
       "status": "partial",
       "phase": 7,
-      "notes": "in-memory Handle; persist/auto-analyze deferred"
+      "notes": "Handle encode/decode to mstats; auto-analyze deferred"
     },
     {
       "go_path": "pkg/statistics/handle/history/history_stats.go",
@@ -8818,7 +8818,7 @@
       "rs_path": "pkg/statistics/table.rs",
       "status": "partial",
       "phase": 7,
-      "notes": "Table count + column NDV; HistColl deferred"
+      "notes": "Table count + column NDV + histogram/TopN"
     },
     {
       "go_path": "pkg/store/copr/batch_coprocessor.go",

@@ -10,8 +10,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 ### F21
 
 - `auto-analyze`
-- `analyze-index`
-- `persist-stats`
 - `join-cost`
 
 ### F22

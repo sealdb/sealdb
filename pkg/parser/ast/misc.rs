@@ -406,12 +406,24 @@ fn restore_privs(privs: &[PrivElem], ctx: &mut RestoreCtx) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct AnalyzeTableStmt {
     pub table: TableName,
+    /// Optional index names for `ANALYZE TABLE t INDEX idx1, idx2`.
+    pub indexes: Vec<String>,
 }
 
 impl AnalyzeTableStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ANALYZE TABLE ");
-        self.table.restore(ctx)
+        self.table.restore(ctx)?;
+        if !self.indexes.is_empty() {
+            ctx.write_str(" INDEX ");
+            for (i, name) in self.indexes.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(name);
+            }
+        }
+        Ok(())
     }
 }
 
