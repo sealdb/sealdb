@@ -3756,15 +3756,28 @@ mod tests {
         let session = Session::new();
         session
             .execute_stmt(
-                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); GRANT SELECT ON db1.t TO 'u'@'%'",
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION",
             )
             .unwrap();
         let grants = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
         assert!(
-            grants
+            grants.display_rows().iter().any(|row| {
+                row[0].contains("SELECT") && row[0].contains("u") && row[0].contains("GRANT OPTION")
+            }),
+            "{:?}",
+            grants.display_rows()
+        );
+        session
+            .execute_stmt("REVOKE GRANT OPTION FOR SELECT ON db1.t FROM 'u'@'%'")
+            .unwrap();
+        let no_opt = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
+        assert!(
+            no_opt
                 .display_rows()
                 .iter()
-                .any(|row| row[0].contains("SELECT") && row[0].contains("u"))
+                .any(|row| row[0].contains("SELECT") && !row[0].contains("GRANT OPTION")),
+            "{:?}",
+            no_opt.display_rows()
         );
         session
             .execute_stmt("REVOKE SELECT ON db1.t FROM 'u'@'%'")
