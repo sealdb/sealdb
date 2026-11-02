@@ -27,8 +27,8 @@ impl IndexColumn {
 }
 
 /// TiDB `model.IndexInfo` core fields used by F10.
-/// Completeness wave / not this feature: unique enforcement, primary,
-/// invisible, global, MV, vector, partial, backfill state.
+/// Completeness wave / not this feature: invisible, global, MV, vector,
+/// partial, backfill state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexInfo {
     pub id: i64,
@@ -61,5 +61,11 @@ impl IndexInfo {
             unique: false,
             primary: false,
         }
+    }
+
+    pub fn with_flags(mut self, unique: bool, primary: bool) -> Self {
+        self.unique = unique || primary;
+        self.primary = primary;
+        self
     }
 }

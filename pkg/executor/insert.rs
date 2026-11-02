@@ -1,7 +1,9 @@
 use crate::index::write_index_keys;
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;
-use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result};
+use sealdb_errno::{
+    ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
+};
 use sealdb_expression::eval_expr;
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::InsertStmt;
@@ -157,6 +159,12 @@ fn write_row(
     let part_val = info.partition_value(values).cloned().unwrap_or(Datum::Null);
     let physical_id = info.locate_partition(&part_val)?;
     let key = encode_row_key_with_handle(physical_id, handle);
+    if info.indices.iter().any(|idx| idx.primary) && txn.get(key.as_bytes())?.is_some() {
+        return Err(Error::new(
+            ERR_DUP_ENTRY,
+            "Duplicate entry for key 'PRIMARY'",
+        ));
+    }
     txn.set(key.as_bytes(), &encode_row(&col_ids, values))?;
     write_index_keys(txn, info, handle, values, physical_id)
 }

@@ -42,7 +42,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F10
 
-- `unique-pk`
 - `covering-reader`
 - `range-scan`
 

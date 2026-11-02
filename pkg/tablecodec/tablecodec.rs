@@ -80,9 +80,17 @@ pub fn encode_index_values(values: &[Datum]) -> Vec<u8> {
 }
 
 /// Non-unique secondary index key: `t{table}_i{idx}{encoded_cols}{handle}`.
-pub fn encode_index_key(table_id: i64, idx_id: i64, values: &[Datum], handle: i64) -> Key {
+pub fn encode_index_key(
+    table_id: i64,
+    idx_id: i64,
+    values: &[Datum],
+    handle: i64,
+    unique: bool,
+) -> Key {
     let mut encoded = encode_index_values(values);
-    encode_int(&mut encoded, handle);
+    if !unique {
+        encode_int(&mut encoded, handle);
+    }
     encode_index_seek_key(table_id, idx_id, &encoded)
 }
 
@@ -261,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_encode_index_key_roundtrip_handle() {
-        let key = encode_index_key(2, 1, &[Datum::Bytes(b"abc".to_vec())], 9);
+        let key = encode_index_key(2, 1, &[Datum::Bytes(b"abc".to_vec())], 9, false);
         assert_eq!(decode_handle_from_index_key(key.as_bytes()).unwrap(), 9);
         let prefix = encode_index_seek_prefix(2, 1, &[Datum::Bytes(b"abc".to_vec())]);
         assert!(key.as_bytes().starts_with(prefix.as_bytes()));

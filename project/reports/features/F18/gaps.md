@@ -7,7 +7,7 @@ wave. Rejected via `Error::unsupported` in
 
 - TiDB DDL job queue / schema-state machine (`none` → `delete-only` → `write-only` → `public`)
 - Reorg / concurrent ingest / `ALGORITHM` / `LOCK`
-- `UNIQUE` / `PRIMARY KEY` / `FULLTEXT` / prefix indexes
+- `FULLTEXT` / prefix indexes (UNIQUE / PRIMARY KEY CREATE INDEX is in)
 - `ALTER TABLE CHANGE` / `MODIFY` / `RENAME`
 - `ADD COLUMN AFTER` / `FIRST`
 - Generated columns, partitions, multi-table ALTER

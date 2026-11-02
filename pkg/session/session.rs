@@ -1304,6 +1304,50 @@ mod tests {
     }
 
     #[test]
+    fn test_unique_and_primary_key() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), PRIMARY KEY (id), UNIQUE INDEX idx_name (name))",
+            )
+            .unwrap();
+        let table = session
+            .infoschema()
+            .table_by_name("db1", "t")
+            .unwrap()
+            .clone();
+        assert!(table.indices.iter().any(|idx| idx.primary && idx.unique));
+        assert!(table.indices.iter().any(|idx| idx.unique && !idx.primary));
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let dup_pk = session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'c')")
+            .unwrap_err();
+        assert_eq!(dup_pk.code, sealdb_errno::ERR_DUP_ENTRY);
+        let dup_unique = session
+            .execute_stmt("INSERT INTO db1.t VALUES (3, 'a')")
+            .unwrap_err();
+        assert_eq!(dup_unique.code, sealdb_errno::ERR_DUP_ENTRY);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.u (id INT, name VARCHAR(20)); INSERT INTO db1.u VALUES (1, 'a'), (2, 'a')",
+            )
+            .unwrap();
+        let dup_backfill = session
+            .execute_stmt("CREATE UNIQUE INDEX idx_u_name ON db1.u (name)")
+            .unwrap_err();
+        assert_eq!(dup_backfill.code, sealdb_errno::ERR_DUP_ENTRY);
+        session
+            .execute_stmt("CREATE UNIQUE INDEX idx_u_id ON db1.u (id)")
+            .unwrap();
+        let dup_created = session
+            .execute_stmt("INSERT INTO db1.u VALUES (1, 'z')")
+            .unwrap_err();
+        assert_eq!(dup_created.code, sealdb_errno::ERR_DUP_ENTRY);
+    }
+
+    #[test]
     fn test_begin_commit_rollback() {
         let session = Session::new();
         session
@@ -1831,10 +1875,9 @@ mod tests {
             after_drop.display_rows(),
             vec![vec!["3".to_string(), "c".to_string()]]
         );
-        let err = session
+        session
             .execute_stmt("CREATE UNIQUE INDEX idx_id ON db1.t (id)")
-            .unwrap_err();
-        assert!(err.message.contains("UNIQUE"));
+            .unwrap();
         let err = session
             .execute_stmt("ALTER TABLE db1.t CHANGE name title VARCHAR(20)")
             .unwrap_err();

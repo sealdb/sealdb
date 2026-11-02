@@ -110,6 +110,18 @@
 
 ### 2026-11-02
 
+- **Phase**: F10 leftover（unique-pk）
+- **完成**:
+  - CREATE TABLE PRIMARY KEY / UNIQUE INDEX + CREATE UNIQUE INDEX
+  - INSERT / unique-index backfill 拒绝 Duplicate entry (1062)
+- **验证**:
+  - parser / session unique-pk + F10 gate
+- **下一步**:
+  - leftover covering-reader / range-scan
+  - C6 保持 deferred
+
+### 2026-11-02
+
 - **Phase**: leftover spill（HashAgg / Sort / HashJoin）
 - **完成**:
   - `DataInDiskByRows` 行编码落盘

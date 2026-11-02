@@ -87,13 +87,23 @@ impl DropDatabaseStmt {
 pub struct IndexDef {
     pub name: String,
     pub columns: Vec<String>,
+    pub unique: bool,
+    pub primary: bool,
 }
 
 impl IndexDef {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("INDEX ");
-        ctx.write_name(&self.name);
-        ctx.write_str(" (");
+        if self.primary {
+            ctx.write_str("PRIMARY KEY (");
+        } else if self.unique {
+            ctx.write_str("UNIQUE INDEX ");
+            ctx.write_name(&self.name);
+            ctx.write_str(" (");
+        } else {
+            ctx.write_str("INDEX ");
+            ctx.write_name(&self.name);
+            ctx.write_str(" (");
+        }
         for (i, col) in self.columns.iter().enumerate() {
             if i > 0 {
                 ctx.write_str(",");
@@ -218,11 +228,16 @@ pub struct CreateIndexStmt {
     pub table: TableName,
     pub name: String,
     pub columns: Vec<String>,
+    pub unique: bool,
 }
 
 impl CreateIndexStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("CREATE INDEX ");
+        ctx.write_str("CREATE ");
+        if self.unique {
+            ctx.write_str("UNIQUE ");
+        }
+        ctx.write_str("INDEX ");
         if self.if_not_exists {
             ctx.write_str("IF NOT EXISTS ");
         }
