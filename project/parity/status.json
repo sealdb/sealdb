@@ -654,6 +654,12 @@
       "phase": 8,
       "notes": "shared CTETableReader deferred; single-consumer CTEExec materializes the seed"
     },
+    "pkg/planner/core/rule_decorrelate.go": {
+      "status": "partial",
+      "rust": "pkg/planner/core/rule_semi_join.rs",
+      "phase": 5,
+      "notes": "simple EXISTS/IN/NOT EXISTS Apply to HashJoin Semi/Anti; NOT IN and scalar stay Apply"
+    },
     "pkg/planner/core/operator/logicalop/logical_apply.go": {
       "status": "partial",
       "rust": "pkg/planner/core/apply.rs",

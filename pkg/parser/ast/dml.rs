@@ -3,7 +3,7 @@ use super::expressions::ExprNode;
 use crate::format::RestoreCtx;
 use sealdb_errno::{Error, Result};
 
-/// Two-table join kind. Semi/anti/full stay deferred (F09 leftover).
+/// Two-table join kind. Full outer / NATURAL / USING stay deferred.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinType {
     Inner,
@@ -11,6 +11,10 @@ pub enum JoinType {
     RightOuter,
     /// Cartesian product; `ON` is omitted on restore. Comma `FROM t1, t2` lowers to this.
     Cross,
+    /// Left semi join: emit each left row at most once when any right row matches.
+    Semi,
+    /// Left anti join: emit each left row when no right row matches.
+    Anti,
 }
 
 impl JoinType {
@@ -20,12 +24,19 @@ impl JoinType {
             JoinType::LeftOuter => "LEFT JOIN",
             JoinType::RightOuter => "RIGHT JOIN",
             JoinType::Cross => "CROSS JOIN",
+            JoinType::Semi => "LEFT SEMI JOIN",
+            JoinType::Anti => "LEFT ANTI JOIN",
         }
     }
 
-    /// MySQL CROSS JOIN has no ON clause; INNER/OUTER always restore `ON`.
+    /// MySQL CROSS JOIN has no ON clause; INNER/OUTER/SEMI/ANTI restore `ON`.
     pub fn has_on(self) -> bool {
         !matches!(self, JoinType::Cross)
+    }
+
+    /// Semi/anti output the left schema only and must not swap probe/build sides.
+    pub fn is_semi_anti(self) -> bool {
+        matches!(self, JoinType::Semi | JoinType::Anti)
     }
 }
 
@@ -39,7 +50,8 @@ pub struct Join {
 }
 
 impl Join {
-    /// Restore `left JOIN right ON expr` or `left CROSS JOIN right`.
+    /// Restore `left JOIN right ON expr`, `left CROSS JOIN right`, or
+    /// `left LEFT SEMI/ANTI JOIN right ON expr`.
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.left.restore(ctx)?;
         ctx.write_str(" ");

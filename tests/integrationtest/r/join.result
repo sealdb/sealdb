@@ -31,3 +31,12 @@ INSERT INTO itest.t3 VALUES (1, 'n');
 SELECT t1.id, t2.tag, t3.note FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id JOIN itest.t3 ON t2.id = t3.id;
 t1.id	t2.tag	t3.note
 1	x	n
+SELECT * FROM itest.t1 WHERE EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
+id	name
+1	a
+SELECT * FROM itest.t1 WHERE NOT EXISTS (SELECT 1 FROM itest.t2 WHERE t2.id = t1.id) ORDER BY id;
+id	name
+2	b
+SELECT * FROM itest.t1 WHERE id IN (SELECT id FROM itest.t2) ORDER BY id;
+id	name
+1	a

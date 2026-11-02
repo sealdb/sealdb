@@ -5,11 +5,11 @@
   "baseline": "v8.5.8",
   "required": [],
   "go_files": 1681,
-  "rs_files": 175,
-  "manifest_entries": 124,
+  "rs_files": 176,
+  "manifest_entries": 125,
   "status_counts": {
-    "not-started": 1557,
-    "partial": 117,
+    "not-started": 1556,
+    "partial": 118,
     "reimplemented": 4,
     "ported": 3
   },
@@ -267,11 +267,11 @@
     },
     "pkg/planner": {
       "go": 216,
-      "rs": 12,
-      "missing": 204,
+      "rs": 13,
+      "missing": 203,
       "status": {
-        "not-started": 204,
-        "partial": 12
+        "not-started": 203,
+        "partial": 13
       }
     },
     "pkg/plugin": {
@@ -6813,10 +6813,10 @@
     },
     {
       "go_path": "pkg/planner/core/rule_decorrelate.go",
-      "rs_path": null,
-      "status": "not-started",
-      "phase": null,
-      "notes": null
+      "rs_path": "pkg/planner/core/rule_semi_join.rs",
+      "status": "partial",
+      "phase": 5,
+      "notes": "simple EXISTS/IN/NOT EXISTS Apply to HashJoin Semi/Anti; NOT IN and scalar stay Apply"
     },
     {
       "go_path": "pkg/planner/core/rule_derive_topn_from_window.go",

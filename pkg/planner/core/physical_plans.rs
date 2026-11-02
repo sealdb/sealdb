@@ -88,7 +88,8 @@ pub enum PhysicalPlan {
     StreamAgg {
         child: Box<PhysicalPlan>,
     },
-    /// Left-deep hash join. `on` is skipped in explain JSON; `Cross` has no equality keys.
+    /// Left-deep hash join. `on` is skipped in explain JSON; `Cross` has no
+    /// equality keys; `Semi`/`Anti` emit the left schema only.
     HashJoin {
         tp: JoinType,
         left: Box<PhysicalPlan>,
@@ -123,12 +124,15 @@ pub enum PhysicalPlan {
 }
 
 /// Physical join kind. `Cross` is a cartesian product with no equality keys.
+/// `Semi` / `Anti` emit the left schema only (match / no-match).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum JoinType {
     Inner,
     LeftOuter,
     RightOuter,
     Cross,
+    Semi,
+    Anti,
 }
 
 impl PhysicalPlan {

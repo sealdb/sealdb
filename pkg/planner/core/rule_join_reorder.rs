@@ -1,6 +1,7 @@
 use super::physical_plans::{JoinType, PhysicalPlan};
 
 /// Two-table greedy JoinReorder: Inner HashJoin builds the smaller side.
+/// Semi/Anti keep the outer (left) as probe so existence semantics stay left-only.
 /// Completeness wave: n-table DP/greedy, outer-join assoc, bushy trees.
 #[allow(clippy::too_many_arguments)]
 pub fn reorder_hash_join(

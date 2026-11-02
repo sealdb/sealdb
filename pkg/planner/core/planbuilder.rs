@@ -4,6 +4,7 @@ use super::plan_cost::{
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
+use super::rule_semi_join::rewrite_semi_join;
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
@@ -93,7 +94,7 @@ impl PlanBuilder {
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
                 plan = wrap_output_projection(plan, select);
-                Ok(plan)
+                Ok(rewrite_semi_join(plan))
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
             Statement::Update(_) => Ok(PhysicalPlan::Update),
@@ -316,6 +317,8 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
         AstJoinType::LeftOuter => JoinType::LeftOuter,
         AstJoinType::RightOuter => JoinType::RightOuter,
         AstJoinType::Cross => JoinType::Cross,
+        AstJoinType::Semi => JoinType::Semi,
+        AstJoinType::Anti => JoinType::Anti,
     }
 }
 

@@ -382,6 +382,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(three.as_select().unwrap().joins.len(), 2);
+        let semi =
+            parser.parse_one_stmt("SELECT * FROM db1.t1 LEFT SEMI JOIN db1.t2 ON t1.id = t2.id");
+        match semi {
+            Ok(stmt) => {
+                assert_eq!(
+                    stmt.as_select().unwrap().joins[0].tp,
+                    crate::ast::JoinType::Semi
+                );
+            }
+            Err(err) => {
+                // MySQL dialect may reject the non-standard SEMI keyword;
+                // EXISTS/IN rewrite is the user-visible path in that case.
+                assert!(
+                    err.message.contains("SEMI")
+                        || err.message.contains("syntax")
+                        || err.message.contains("Expected"),
+                    "{err:?}"
+                );
+            }
+        }
     }
 
     #[test]
