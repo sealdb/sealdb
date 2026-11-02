@@ -3,7 +3,8 @@ use sealdb_errno::{
     ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, ERR_WRITE_CONFLICT, Error, Result,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Default)]
 struct VersionedValue {
@@ -30,9 +31,19 @@ struct Store {
     locks: HashMap<Vec<u8>, KeyLock>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemStorage {
     store: Arc<Mutex<Store>>,
+    wait: Arc<Condvar>,
+}
+
+impl Default for MemStorage {
+    fn default() -> Self {
+        Self {
+            store: Arc::new(Mutex::new(Store::default())),
+            wait: Arc::new(Condvar::new()),
+        }
+    }
 }
 
 impl MemStorage {
@@ -46,6 +57,7 @@ impl MemStorage {
         let start_ts = store.next_ts;
         Ok(Box::new(MemTransaction {
             store: Arc::clone(&self.store),
+            wait: Arc::clone(&self.wait),
             start_ts,
             snapshot: store.data.clone(),
             writes: BTreeMap::new(),
@@ -76,10 +88,11 @@ struct Savepoint {
 }
 
 /// In-memory optimistic/pessimistic Repeatable Read.
-/// Completeness wave / not this feature: blocking lock wait, deadlock
-/// detection, 2PC/TiKV TSO, stale read.
+/// Completeness wave / not this feature: deadlock detection, 2PC/TiKV TSO,
+/// stale read. `SEALDB_LOCK_WAIT_MS` (default 50) caps blocking wait.
 struct MemTransaction {
     store: Arc<Mutex<Store>>,
+    wait: Arc<Condvar>,
     start_ts: u64,
     snapshot: BTreeMap<Vec<u8>, VersionedValue>,
     writes: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -105,48 +118,90 @@ impl MemTransaction {
         store.data.get(key).and_then(|v| v.value.clone())
     }
 
-    fn lock_conflict(wait: LockWait) -> Result<bool> {
-        match wait {
-            LockWait::SkipLocked => Ok(false),
-            LockWait::Nowait => Err(Error::new(
-                ERR_LOCK_NOWAIT,
-                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
-            )),
-            LockWait::Block => Err(Error::new(
-                ERR_LOCK_WAIT_TIMEOUT,
-                "Lock wait timeout exceeded; try restarting transaction",
-            )),
-        }
+    fn lock_wait_timeout() -> Duration {
+        let ms = std::env::var("SEALDB_LOCK_WAIT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(50);
+        Duration::from_millis(ms)
     }
 
-    /// Exclusive lock for `FOR UPDATE` / pessimistic writes; shared for
-    /// `FOR SHARE`. Same-txn upgrade from shared to exclusive is allowed.
-    /// Returns false when `SKIP LOCKED` hits a conflicting lock.
-    fn acquire(
+    fn conflicts(store: &Store, start_ts: u64, key: &[u8], exclusive: bool) -> bool {
+        let Some(entry) = store.locks.get(key) else {
+            return false;
+        };
+        if let Some(owner) = entry.exclusive
+            && owner != start_ts
+        {
+            return true;
+        }
+        exclusive && entry.shared.iter().any(|owner| *owner != start_ts)
+    }
+
+    fn take(
         store: &mut Store,
         locked: &mut HashSet<Vec<u8>>,
         start_ts: u64,
         key: &[u8],
         exclusive: bool,
-        wait: LockWait,
-    ) -> Result<bool> {
+    ) {
         let entry = store.locks.entry(key.to_vec()).or_default();
-        if let Some(owner) = entry.exclusive
-            && owner != start_ts
-        {
-            return Self::lock_conflict(wait);
-        }
         if exclusive {
-            if entry.shared.iter().any(|owner| *owner != start_ts) {
-                return Self::lock_conflict(wait);
-            }
             entry.shared.remove(&start_ts);
             entry.exclusive = Some(start_ts);
         } else if entry.exclusive.is_none() {
             entry.shared.insert(start_ts);
         }
         locked.insert(key.to_vec());
-        Ok(true)
+    }
+
+    /// Exclusive lock for `FOR UPDATE` / pessimistic writes; shared for
+    /// `FOR SHARE`. `LockWait::Block` waits until the holder releases or
+    /// `SEALDB_LOCK_WAIT_MS` elapses (errno 1205).
+    fn lock_key(&mut self, key: &[u8], exclusive: bool, wait: LockWait) -> Result<bool> {
+        let store = Arc::clone(&self.store);
+        let cond = Arc::clone(&self.wait);
+        let start_ts = self.start_ts;
+        let mut guard = store.lock().expect("mem kv");
+        let deadline = Instant::now() + Self::lock_wait_timeout();
+        loop {
+            if !Self::conflicts(&guard, start_ts, key, exclusive) {
+                Self::take(&mut guard, &mut self.locked, start_ts, key, exclusive);
+                return Ok(true);
+            }
+            match wait {
+                LockWait::SkipLocked => return Ok(false),
+                LockWait::Nowait => {
+                    return Err(Error::new(
+                        ERR_LOCK_NOWAIT,
+                        "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
+                    ));
+                }
+                LockWait::Block => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(Error::new(
+                            ERR_LOCK_WAIT_TIMEOUT,
+                            "Lock wait timeout exceeded; try restarting transaction",
+                        ));
+                    }
+                    let (g, timed) = cond
+                        .wait_timeout(guard, deadline.saturating_duration_since(now))
+                        .expect("mem kv wait");
+                    guard = g;
+                    if timed.timed_out() {
+                        return Err(Error::new(
+                            ERR_LOCK_WAIT_TIMEOUT,
+                            "Lock wait timeout exceeded; try restarting transaction",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn notify_waiters(&self) {
+        self.wait.notify_all();
     }
 
     fn release_one(store: &mut Store, start_ts: u64, key: &[u8]) {
@@ -166,10 +221,13 @@ impl MemTransaction {
         if self.locked.is_empty() {
             return;
         }
-        let mut store = self.store.lock().expect("mem kv");
-        for key in self.locked.drain() {
-            Self::release_one(&mut store, self.start_ts, &key);
+        {
+            let mut store = self.store.lock().expect("mem kv");
+            for key in self.locked.drain() {
+                Self::release_one(&mut store, self.start_ts, &key);
+            }
         }
+        self.notify_waiters();
     }
 
     fn scan_with_lock(
@@ -179,33 +237,30 @@ impl MemTransaction {
         exclusive: bool,
         wait: LockWait,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut store = self.store.lock().expect("mem kv");
-        let mut keys = Vec::new();
-        for (k, v) in store.data.range(start.to_vec()..end.to_vec()) {
-            if self.deletes.contains(k) {
-                continue;
+        let mut keys = {
+            let store = self.store.lock().expect("mem kv");
+            let mut keys = Vec::new();
+            for (k, v) in store.data.range(start.to_vec()..end.to_vec()) {
+                if self.deletes.contains(k) {
+                    continue;
+                }
+                if self.writes.contains_key(k) || v.value.is_some() {
+                    keys.push(k.clone());
+                }
             }
-            if self.writes.contains_key(k) || v.value.is_some() {
-                keys.push(k.clone());
+            for k in self.writes.keys() {
+                if k.as_slice() >= start && k.as_slice() < end && !keys.iter().any(|ek| ek == k) {
+                    keys.push(k.clone());
+                }
             }
-        }
-        for k in self.writes.keys() {
-            if k.as_slice() >= start && k.as_slice() < end && !keys.iter().any(|ek| ek == k) {
-                keys.push(k.clone());
-            }
-        }
+            keys
+        };
         let mut out = Vec::new();
-        for key in keys {
-            if !Self::acquire(
-                &mut store,
-                &mut self.locked,
-                self.start_ts,
-                &key,
-                exclusive,
-                wait,
-            )? {
+        for key in keys.drain(..) {
+            if !self.lock_key(&key, exclusive, wait)? {
                 continue;
             }
+            let store = self.store.lock().expect("mem kv");
             if let Some(value) = Self::latest_value(&store, &self.writes, &self.deletes, &key) {
                 out.push((key, value));
             }
@@ -228,15 +283,7 @@ impl Transaction for MemTransaction {
 
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.pessimistic {
-            let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(
-                &mut store,
-                &mut self.locked,
-                self.start_ts,
-                key,
-                true,
-                LockWait::Block,
-            )?;
+            self.lock_key(key, true, LockWait::Block)?;
         }
         self.deletes.remove(key);
         self.writes.insert(key.to_vec(), value.to_vec());
@@ -245,15 +292,7 @@ impl Transaction for MemTransaction {
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         if self.pessimistic {
-            let mut store = self.store.lock().expect("mem kv");
-            Self::acquire(
-                &mut store,
-                &mut self.locked,
-                self.start_ts,
-                key,
-                true,
-                LockWait::Block,
-            )?;
+            self.lock_key(key, true, LockWait::Block)?;
         }
         self.writes.remove(key);
         self.deletes.insert(key.to_vec());
@@ -300,17 +339,10 @@ impl Transaction for MemTransaction {
         if lock == RowLock::None {
             return self.get(key);
         }
-        let mut store = self.store.lock().expect("mem kv");
-        if !Self::acquire(
-            &mut store,
-            &mut self.locked,
-            self.start_ts,
-            key,
-            lock == RowLock::Exclusive,
-            wait,
-        )? {
+        if !self.lock_key(key, lock == RowLock::Exclusive, wait)? {
             return Ok(None);
         }
+        let store = self.store.lock().expect("mem kv");
         Ok(Self::latest_value(&store, &self.writes, &self.deletes, key))
     }
 
@@ -377,6 +409,8 @@ impl Transaction for MemTransaction {
         for key in self.locked.drain() {
             Self::release_one(&mut store, self.start_ts, &key);
         }
+        drop(store);
+        self.notify_waiters();
         Ok(())
     }
 
@@ -427,6 +461,7 @@ impl Transaction for MemTransaction {
                 self.locked.remove(&key);
             }
         }
+        self.notify_waiters();
         self.savepoints.truncate(idx + 1);
         Ok(())
     }
@@ -550,6 +585,27 @@ mod tests {
                 .unwrap(),
             Some(b"v1".to_vec())
         );
+    }
+
+    #[test]
+    fn test_blocking_wait_wakes_on_commit() {
+        let storage = MemStorage::new();
+        let mut setup = storage.begin().unwrap();
+        setup.set(b"k", b"v1").unwrap();
+        setup.commit().unwrap();
+
+        let mut a = storage.begin_pessimistic().unwrap();
+        assert_eq!(a.get_for_update(b"k").unwrap(), Some(b"v1".to_vec()));
+        let storage_b = storage.clone();
+        let waiter = std::thread::spawn(move || {
+            let mut b = storage_b.begin().unwrap();
+            let value = b.get_for_update(b"k").unwrap();
+            b.commit().unwrap();
+            value
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        a.commit().unwrap();
+        assert_eq!(waiter.join().expect("waiter"), Some(b"v1".to_vec()));
     }
 
     #[test]

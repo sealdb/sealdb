@@ -18,7 +18,7 @@
     "F10": {"status": "core-ported", "phase": 5, "notes": "CREATE TABLE INDEX/KEY + unique/PK + IndexLookUp / covering IndexReader + first-column range scan", "gaps": []},
     "F11": {"status": "core-ported", "phase": 3, "notes": "SHOW INDEX/CHARSET/COLLATION + I_S STATISTICS/constraints/partitions/charset/engines/views", "gaps": []},
     "F12": {"status": "core-ported", "phase": 6, "notes": "BEGIN/COMMIT/ROLLBACK + SAVEPOINT + READ ONLY/WRITE + AND CHAIN + transactional CREATE/DROP DATABASE|TABLE + optimistic RR snapshot and write-conflict", "gaps": ["pessimistic"]},
-    "F13": {"status": "core-ported", "phase": 6, "notes": "SELECT FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED + BEGIN PESSIMISTIC exclusive lock and latest read", "gaps": ["blocking-wait", "deadlock", "tikv-pessimistic"]},
+    "F13": {"status": "core-ported", "phase": 6, "notes": "SELECT FOR UPDATE / FOR SHARE / NOWAIT / SKIP LOCKED + blocking lock wait + BEGIN PESSIMISTIC exclusive lock and latest read", "gaps": ["deadlock", "tikv-pessimistic"]},
     "F14": {"status": "core-ported", "phase": 8, "notes": "EXISTS/IN/scalar subquery via NestedLoopApply plus IN list", "gaps": ["any-all", "from-derived-table", "select-list-subquery", "parallel-apply", "semi-anti-rewrite"]},
     "F15": {"status": "core-ported", "phase": 8, "notes": "UNION / UNION ALL with outer ORDER BY/LIMIT", "gaps": ["except-intersect", "nested-paren-union", "union-in-subquery", "parallel-union"]},
     "F16": {"status": "core-ported", "phase": 8, "notes": "ROW_NUMBER/RANK/DENSE_RANK and window COUNT/SUM/AVG/MIN/MAX", "gaps": ["frame-clause", "named-window", "lag-lead", "ignore-nulls", "pipelined-window"]},
