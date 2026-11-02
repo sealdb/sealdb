@@ -41,7 +41,6 @@
     ],
     "F09": [
       "semi-anti",
-      "cross-join",
       "n-table"
     ],
     "F12": [

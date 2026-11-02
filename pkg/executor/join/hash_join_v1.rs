@@ -1,6 +1,7 @@
-// F09 core path: two-table Inner/Left/Right HashJoin on equality.
-// Completeness wave / not this feature: semi/anti/full, CROSS/comma joins,
-// n-table, USING/NATURAL, recursive spill/parallel workers, merge/index join, non-equality ON.
+// F09 core path: two-table Inner/Left/Right HashJoin on equality, plus CROSS JOIN.
+// Completeness wave / not this feature: semi/anti/full, n-table, USING/NATURAL,
+// recursive spill/parallel workers, merge/index join, non-equality ON. CROSS JOIN
+// materializes both sides in memory (no join-key partition spill).
 use crate::internal::exec::Executor;
 use crate::join::hash_join_spill::{partition_count, partition_rows};
 use sealdb_errno::{Error, Result};
@@ -60,11 +61,15 @@ impl Executor for HashJoinV1Exec {
             .cloned()
             .chain(right_schema.iter().cloned())
             .collect();
-        let (left_key, right_key) =
-            split_join_eq(&self.join.on, &self.join.left.name, &self.join.right.name)?;
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
         self.spilled = false;
+        if self.join.tp == JoinType::Cross {
+            self.rows = probe_cross(&left_rows, &right_rows);
+            return Ok(());
+        }
+        let (left_key, right_key) =
+            split_join_eq(&self.join.on, &self.join.left.name, &self.join.right.name)?;
         if left_rows.len() < self.mem_limit && right_rows.len() < self.mem_limit {
             self.rows = probe_join(
                 self.join.tp,
@@ -168,7 +173,18 @@ fn probe_join(
             left_width,
             false,
         ),
+        JoinType::Cross => Ok(probe_cross(left_rows, right_rows)),
     }
+}
+
+fn probe_cross(left_rows: &[Vec<Datum>], right_rows: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
+    let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+    for left in left_rows {
+        for right in right_rows {
+            out.push(concat_row(left, right));
+        }
+    }
+    out
 }
 
 fn collect_rows(exec: &mut dyn Executor) -> Result<Vec<Vec<Datum>>> {
@@ -326,6 +342,15 @@ pub(crate) fn hash_join_pairs(
     left_rows: &[Vec<Datum>],
     right_rows: &[Vec<Datum>],
 ) -> Result<Vec<(Option<usize>, Option<usize>)>> {
+    if join.tp == JoinType::Cross {
+        let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+        for i in 0..left_rows.len() {
+            for j in 0..right_rows.len() {
+                out.push((Some(i), Some(j)));
+            }
+        }
+        return Ok(out);
+    }
     let left_q = qualify_schema(left_schema, &join.left.name);
     let right_q = qualify_schema(right_schema, &join.right.name);
     let (left_key, right_key) = split_join_eq(&join.on, &join.left.name, &join.right.name)?;
@@ -340,6 +365,7 @@ pub(crate) fn hash_join_pairs(
         JoinType::RightOuter => probe_outer_pairs(
             right_rows, left_rows, &right_q, &left_q, &right_key, &left_key, false,
         ),
+        JoinType::Cross => unreachable!("cross join pairs handled above"),
     }
 }
 

@@ -1582,13 +1582,35 @@ fn lower_select(
     })
 }
 
+fn true_expr() -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: Datum::I64(1),
+    })
+}
+
 fn lower_from(from: &[TableWithJoins]) -> Result<(Option<TableName>, Option<Join>)> {
     if from.is_empty() {
         return Ok((None, None));
     }
-    // F09 gap / completeness wave: comma joins and n-table joins.
-    if from.len() > 1 {
-        return Err(Error::unsupported("comma joins"));
+    // F09 leftover: two-table comma join is CROSS JOIN. n-table stays deferred.
+    if from.len() == 2 {
+        if !from[0].joins.is_empty() || !from[1].joins.is_empty() {
+            return Err(Error::unsupported("more than two tables in JOIN"));
+        }
+        let left = table_factor_name(&from[0].relation)?;
+        let right = table_factor_name(&from[1].relation)?;
+        return Ok((
+            Some(left.clone()),
+            Some(Join {
+                left,
+                right,
+                tp: JoinType::Cross,
+                on: true_expr(),
+            }),
+        ));
+    }
+    if from.len() > 2 {
+        return Err(Error::unsupported("more than two tables in JOIN"));
     }
     let (left, join) = lower_table_with_joins(&from[0])?;
     Ok((Some(left), join))
@@ -1615,7 +1637,9 @@ fn lower_table_with_joins(table: &TableWithJoins) -> Result<(TableName, Option<J
         | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
             (JoinType::RightOuter, lower_expr(expr)?)
         }
-        // F09 gap / completeness wave: CROSS / NATURAL / USING / semi / anti / full.
+        JoinOperator::CrossJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
+        JoinOperator::CrossJoin(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
+        // F09 leftover: NATURAL / USING / semi / anti / full.
         other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
     };
     Ok((

@@ -119,11 +119,12 @@ pub enum PhysicalPlan {
     },
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum JoinType {
     Inner,
     LeftOuter,
     RightOuter,
+    Cross,
 }
 
 impl PhysicalPlan {

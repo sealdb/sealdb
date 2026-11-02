@@ -1544,6 +1544,24 @@ mod tests {
                 vec!["NULL".to_string(), "y".to_string()]
             ]
         );
+        let cross = session
+            .execute_stmt(
+                "SELECT t1.id, t2.tag FROM db1.t1 CROSS JOIN db1.t2 ORDER BY t1.id, t2.tag",
+            )
+            .unwrap();
+        assert_eq!(
+            cross.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["1".to_string(), "y".to_string()],
+                vec!["2".to_string(), "x".to_string()],
+                vec!["2".to_string(), "y".to_string()]
+            ]
+        );
+        let comma = session
+            .execute_stmt("SELECT t1.id, t2.tag FROM db1.t1, db1.t2 ORDER BY t1.id, t2.tag")
+            .unwrap();
+        assert_eq!(comma.display_rows(), cross.display_rows());
     }
 
     #[test]
