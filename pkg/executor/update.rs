@@ -10,7 +10,7 @@ use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
-use sealdb_expression::{eval_expr_with_row, eval_filter};
+use sealdb_expression::{eval_expr_with_row, eval_filter, locate_partition_for_row};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ddl::TableName;
@@ -377,7 +377,7 @@ pub(crate) fn apply_row_update(
             _ => None,
         })
         .unwrap_or(scanned.handle);
-    let new_physical = info.locate_partition_row(&new_values)?;
+    let new_physical = locate_partition_for_row(info, &new_values)?;
     delete_index_keys(
         txn,
         info,

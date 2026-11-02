@@ -3486,6 +3486,32 @@ mod tests {
             .execute_stmt("SELECT name FROM db1.rc WHERE a = 10")
             .unwrap();
         assert_eq!(rc.display_rows(), vec![vec!["b".to_string()]]);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.he (id INT, name VARCHAR(20)) PARTITION BY HASH (id % 4) PARTITIONS 4; INSERT INTO db1.he VALUES (1, 'a'), (5, 'b')",
+            )
+            .unwrap();
+        let he = session
+            .execute_stmt("SELECT name FROM db1.he WHERE id = 5")
+            .unwrap();
+        assert_eq!(he.display_rows(), vec![vec!["b".to_string()]]);
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.re (id INT, name VARCHAR(20)) PARTITION BY RANGE (ABS(id)) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE)); INSERT INTO db1.re VALUES (-3, 'n'), (15, 'p')",
+            )
+            .unwrap();
+        let re = session
+            .execute_stmt("SELECT name FROM db1.re WHERE id = -3")
+            .unwrap();
+        assert_eq!(re.display_rows(), vec![vec!["n".to_string()]]);
+        let table = session
+            .infoschema()
+            .table_by_name("db1", "he")
+            .unwrap()
+            .clone();
+        let part = table.partition.as_ref().unwrap();
+        assert!(part.is_expr_key());
+        assert_eq!(part.expr, "id % 4");
     }
 
     #[test]

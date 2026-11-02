@@ -1118,7 +1118,7 @@
       "rs_path": "pkg/ddl/partition.rs",
       "status": "partial",
       "phase": 8,
-      "notes": "RANGE/HASH PartitionInfo attach; LIST/KEY/ADD/DROP PARTITION deferred"
+      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys; ADD/DROP PARTITION deferred"
     },
     {
       "go_path": "pkg/ddl/placement/bundle.go",
@@ -3876,7 +3876,7 @@
       "rs_path": "pkg/expression/evaluator.rs",
       "status": "partial",
       "phase": 2,
-      "notes": "scalar eval for F01"
+      "notes": "scalar eval for F01 + PARTITION BY expression keys"
     },
     {
       "go_path": "pkg/expression/explain.go",
@@ -9483,7 +9483,7 @@
       "rs_path": "pkg/meta/model/partition.rs",
       "status": "partial",
       "phase": 8,
-      "notes": "locate/prune on PartitionInfo; LIST/KEY/dynamic prune deferred"
+      "notes": "locate/prune on PartitionInfo; expression keys + dynamic prune deferred"
     },
     {
       "go_path": "pkg/table/tables/state_remote.go",

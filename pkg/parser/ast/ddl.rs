@@ -165,8 +165,10 @@ pub struct PartitionDef {
 pub struct PartitionOption {
     pub tp: PartitionType,
     pub column: String,
-    /// RANGE COLUMNS list; empty means a single `column`.
+    /// RANGE COLUMNS list; empty means a single `column` or an `expr` key.
     pub columns: Vec<String>,
+    /// Non-column partition key such as `id % 4` or `id + 1`.
+    pub expr: Option<String>,
     pub defs: Vec<PartitionDef>,
     pub num: u64,
 }
@@ -218,7 +220,9 @@ impl CreateTableStmt {
                 PartitionType::Key => ctx.write_str("KEY"),
             }
             ctx.write_str(" (");
-            if part.columns.len() > 1 {
+            if let Some(expr) = &part.expr {
+                ctx.write_str(expr);
+            } else if part.columns.len() > 1 {
                 for (i, col) in part.columns.iter().enumerate() {
                     if i > 0 {
                         ctx.write_str(", ");

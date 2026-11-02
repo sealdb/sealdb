@@ -1,6 +1,7 @@
-// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS.
+// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS
+// and scalar expression keys (`id % 4`, `ABS(id)`).
 // Completeness wave / not this feature: ADD/DROP PARTITION, reorganize, job
-// states, expression keys.
+// states, subpartition.
 use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_meta::{Mutator, PartitionDefinition, PartitionInfo, PartitionType, TableInfo};
 use sealdb_parser::ast::{PartitionOption, PartitionType as AstPartitionType};
@@ -10,10 +11,12 @@ pub fn attach_partitions(
     info: &mut TableInfo,
     spec: &PartitionOption,
 ) -> Result<()> {
-    let key_cols = if spec.columns.is_empty() {
+    let key_cols = if !spec.columns.is_empty() {
+        spec.columns.clone()
+    } else if !spec.column.is_empty() {
         vec![spec.column.clone()]
     } else {
-        spec.columns.clone()
+        Vec::new()
     };
     for name in &key_cols {
         if !info
@@ -27,12 +30,23 @@ pub fn attach_partitions(
             ));
         }
     }
+    if let Some(expr) = &spec.expr
+        && key_cols.is_empty()
+    {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column in partition expression '{expr}'"),
+        ));
+    }
     let tp = match spec.tp {
         AstPartitionType::Range => PartitionType::Range,
         AstPartitionType::Hash => PartitionType::Hash,
         AstPartitionType::List => PartitionType::List,
         AstPartitionType::Key => PartitionType::Key,
     };
+    if matches!(tp, PartitionType::Key) && spec.expr.is_some() {
+        return Err(Error::unsupported("KEY partition expression"));
+    }
     let defs = match tp {
         PartitionType::Hash | PartitionType::Key => {
             let n = if spec.defs.is_empty() {
@@ -77,7 +91,15 @@ pub fn attach_partitions(
             defs
         }
     };
-    info.partition = Some(PartitionInfo::new(tp, spec.column.clone(), defs).with_columns(key_cols));
+    let label = spec.expr.clone().unwrap_or_else(|| spec.column.clone());
+    let mut part = PartitionInfo::new(tp, label, defs);
+    if let Some(expr) = &spec.expr {
+        // TiDB stores expression keys in `expr` with an empty column list.
+        part = part.with_expr_key(expr.clone());
+    } else {
+        part = part.with_columns(key_cols);
+    }
+    info.partition = Some(part);
     Ok(())
 }
 

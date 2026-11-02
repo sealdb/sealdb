@@ -1,9 +1,11 @@
 use sealdb_errno::{ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
+use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
     IsNullExpr, PatternLikeExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
+use sealdb_parser::sqlparser_bridge::parse_expr;
 use sealdb_types::Datum;
 use sealdb_types::field_type::FieldType;
 use std::cell::RefCell;
@@ -71,6 +73,23 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
 
 pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
     Ok(truthy(&eval_expr_with_row(expr, schema, row)?).unwrap_or(false))
+}
+
+/// Locate the physical partition id for `values`, evaluating expression keys.
+pub fn locate_partition_for_row(info: &TableInfo, values: &[Datum]) -> Result<i64> {
+    match &info.partition {
+        Some(part) if part.enable && part.is_expr_key() => {
+            let expr = parse_expr(&part.expr)?;
+            let schema: Vec<String> = info
+                .columns
+                .iter()
+                .map(|c| c.name.o().to_string())
+                .collect();
+            let datum = eval_expr_with_row(&expr, &schema, values)?;
+            part.locate(&datum)
+        }
+        _ => info.locate_partition_row(values),
+    }
 }
 
 fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
@@ -239,6 +258,24 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 eval_expr_with_row(&func.args[1], schema, row)
             } else {
                 Ok(first)
+            }
+        }
+        "ABS" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ABS requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            match value {
+                Datum::I64(v) => Ok(Datum::I64(v.saturating_abs())),
+                Datum::U64(v) => Ok(Datum::U64(v)),
+                Datum::F64(v) => Ok(Datum::F64(v.abs())),
+                other => Ok(Datum::I64(other.as_i64()?.saturating_abs())),
             }
         }
         other => Err(Error::new(

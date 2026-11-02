@@ -1486,11 +1486,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("PARTITION BY"))?;
     let inner = std::str::from_utf8(&bytes[i + 1..close])
         .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid partition column"))?;
-    let columns = parse_partition_columns(inner, range_columns)?;
-    let column = columns
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::unsupported("PARTITION BY without columns"))?;
+    let (column, columns, expr) = parse_partition_key(inner, range_columns)?;
     i = skip_ws(bytes, close + 1);
     match tp {
         PartitionType::Hash | PartitionType::Key => {
@@ -1507,6 +1503,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     tp,
                     column,
                     columns,
+                    expr,
                     defs: Vec::new(),
                     num,
                 },
@@ -1527,6 +1524,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     tp,
                     column,
                     columns,
+                    expr,
                     num: defs.len() as u64,
                     defs,
                 },
@@ -1547,6 +1545,7 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
                     tp,
                     column,
                     columns,
+                    expr,
                     num: defs.len() as u64,
                     defs,
                 },
@@ -1554,6 +1553,55 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
             ))
         }
     }
+}
+
+/// Parse a column list or a scalar partition expression (`id % 4`, `ABS(id)`).
+fn parse_partition_key(
+    inner: &str,
+    range_columns: bool,
+) -> Result<(String, Vec<String>, Option<String>)> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return Err(Error::unsupported("PARTITION BY without columns"));
+    }
+    if range_columns {
+        let columns = parse_partition_columns(trimmed, true)?;
+        let column = columns[0].clone();
+        return Ok((column, columns, None));
+    }
+    if is_partition_expr(trimmed) {
+        // Validate the expression lowers; referenced columns are checked in DDL.
+        let expr = parse_expr(trimmed)?;
+        let mut cols = Vec::new();
+        collect_expr_columns(&expr, &mut cols);
+        return Ok((
+            cols.first().cloned().unwrap_or_default(),
+            cols,
+            Some(trimmed.to_string()),
+        ));
+    }
+    let columns = parse_partition_columns(trimmed, false)?;
+    let column = columns[0].clone();
+    Ok((column, columns, None))
+}
+
+fn is_partition_expr(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    if bytes
+        .iter()
+        .any(|b| matches!(b, b'(' | b'+' | b'*' | b'/' | b'%'))
+    {
+        return true;
+    }
+    // `id - 1` / `id-1` but not a bare identifier.
+    if let Some(pos) = bytes.iter().position(|b| *b == b'-') {
+        let before = &bytes[..pos];
+        let after = &bytes[pos + 1..];
+        if before.iter().any(|b| is_ident_byte(*b)) && after.iter().any(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_partition_columns(inner: &str, allow_list: bool) -> Result<Vec<String>> {
@@ -1575,6 +1623,70 @@ fn parse_partition_columns(inner: &str, allow_list: bool) -> Result<Vec<String>>
         return Err(Error::unsupported("partition expression"));
     }
     Ok(names)
+}
+
+fn collect_expr_columns(expr: &ExprNode, out: &mut Vec<String>) {
+    match expr {
+        ExprNode::Column(col) => {
+            if !out
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&col.name))
+            {
+                out.push(col.name.clone());
+            }
+        }
+        ExprNode::Binary(bin) => {
+            collect_expr_columns(&bin.left, out);
+            collect_expr_columns(&bin.right, out);
+        }
+        ExprNode::Unary(unary) => collect_expr_columns(&unary.expr, out),
+        ExprNode::Func(func) => {
+            for arg in &func.args {
+                collect_expr_columns(arg, out);
+            }
+        }
+        ExprNode::Cast(cast) => collect_expr_columns(&cast.expr, out),
+        ExprNode::Between(between) => {
+            collect_expr_columns(&between.expr, out);
+            collect_expr_columns(&between.low, out);
+            collect_expr_columns(&between.high, out);
+        }
+        ExprNode::InList(in_list) => {
+            collect_expr_columns(&in_list.expr, out);
+            for item in &in_list.list {
+                collect_expr_columns(item, out);
+            }
+        }
+        ExprNode::IsNull(is_null) => collect_expr_columns(&is_null.expr, out),
+        ExprNode::Like(like) => {
+            collect_expr_columns(&like.expr, out);
+            collect_expr_columns(&like.pattern, out);
+        }
+        _ => {}
+    }
+}
+
+/// Lower a scalar SQL expression used as a PARTITION BY key.
+pub fn parse_expr(sql: &str) -> Result<ExprNode> {
+    let wrapped = format!("SELECT ({sql})");
+    let stmts = Parser::parse_sql(&dialect(), &wrapped).map_err(|e| {
+        Error::new(
+            ERR_PARSE_ERROR,
+            format!("You have an error in your SQL syntax: {e}"),
+        )
+    })?;
+    let stmt = stmts
+        .first()
+        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "empty partition expression"))?;
+    let lowered = lower_statement(stmt)?;
+    let Statement::Select(select) = lowered else {
+        return Err(Error::unsupported("partition expression"));
+    };
+    select
+        .fields
+        .first()
+        .map(|f| f.expr.clone())
+        .ok_or_else(|| Error::unsupported("partition expression"))
 }
 
 fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {

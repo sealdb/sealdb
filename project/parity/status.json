@@ -223,7 +223,7 @@
     "pkg/expression/evaluator.go": {
       "status": "partial",
       "phase": 2,
-      "notes": "scalar eval for F01"
+      "notes": "scalar eval for F01 + PARTITION BY expression keys"
     },
     "pkg/expression/builtin_arithmetic.go": {
       "status": "partial",
@@ -397,7 +397,7 @@
       "status": "partial",
       "rust": "pkg/ddl/partition.rs",
       "phase": 8,
-      "notes": "RANGE/HASH PartitionInfo attach; LIST/KEY/ADD/DROP PARTITION deferred"
+      "notes": "RANGE/HASH/LIST/KEY/RANGE COLUMNS + expression keys; ADD/DROP PARTITION deferred"
     },
     "pkg/planner/core/rule_partition_processor.go": {
       "status": "partial",
@@ -415,7 +415,7 @@
       "status": "partial",
       "rust": "pkg/meta/model/partition.rs",
       "phase": 8,
-      "notes": "locate/prune on PartitionInfo; LIST/KEY/dynamic prune deferred"
+      "notes": "locate/prune on PartitionInfo; expression keys + dynamic prune deferred"
     },
     "pkg/domain/domain.go": {
       "status": "partial",
