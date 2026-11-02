@@ -35,7 +35,7 @@ impl PlanBuilder {
         match stmt {
             Statement::Select(select) => {
                 let mut plan = if !select.joins.is_empty() {
-                    build_join_plan(select, stats, current_db)?
+                    self.build_join_plan(select, is, current_db, stats)?
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
@@ -260,6 +260,55 @@ impl PlanBuilder {
             inline,
         }))
     }
+
+    /// Left-deep HashJoin tree. CTE sides use CTEExec; only the first pair of
+    /// table scans is reordered by size.
+    fn build_join_plan(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+    ) -> Result<PhysicalPlan> {
+        let first = &select.joins[0];
+        let mut plan = reorder_hash_join(
+            map_join_type(first.tp),
+            self.join_side(select, &first.left, is, current_db, stats)?,
+            self.join_side(select, &first.right, is, current_db, stats)?,
+            first.left.name.clone(),
+            first.right.name.clone(),
+            table_row_count(stats, &first.left, current_db),
+            table_row_count(stats, &first.right, current_db),
+            first.on.clone(),
+        );
+        for join in select.joins.iter().skip(1) {
+            plan = PhysicalPlan::HashJoin {
+                tp: map_join_type(join.tp),
+                left: Box::new(plan),
+                right: Box::new(self.join_side(select, &join.right, is, current_db, stats)?),
+                left_table: join.left.name.clone(),
+                right_table: join.right.name.clone(),
+                on: join.on.clone(),
+            };
+        }
+        Ok(plan)
+    }
+
+    fn join_side(
+        &self,
+        select: &SelectStmt,
+        table: &TableName,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+    ) -> Result<PhysicalPlan> {
+        if named_cte(select.with.as_ref(), &table.name) {
+            self.build_cte_plan(select, table, is, current_db, stats)?
+                .ok_or_else(|| Error::unsupported(format!("unknown CTE {}", table.name)))
+        } else {
+            Ok(PhysicalPlan::table_reader(table.name.clone(), Vec::new()))
+        }
+    }
 }
 
 impl Default for PlanBuilder {
@@ -288,47 +337,6 @@ fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectSt
         select.with = with.cloned();
     }
     select
-}
-
-/// Left-deep HashJoin tree. Only the first pair of table scans is reordered by size;
-/// later tables stay on the right so ON can see the accumulated left schema.
-fn build_join_plan(
-    select: &SelectStmt,
-    stats: Option<&Handle>,
-    current_db: &str,
-) -> Result<PhysicalPlan> {
-    let first = &select.joins[0];
-    for join in &select.joins {
-        if named_cte(select.with.as_ref(), &join.left.name)
-            || named_cte(select.with.as_ref(), &join.right.name)
-        {
-            return Err(Error::unsupported("CTE in JOIN"));
-        }
-    }
-    let mut plan = reorder_hash_join(
-        map_join_type(first.tp),
-        PhysicalPlan::table_reader(first.left.name.clone(), Vec::new()),
-        PhysicalPlan::table_reader(first.right.name.clone(), Vec::new()),
-        first.left.name.clone(),
-        first.right.name.clone(),
-        table_row_count(stats, &first.left, current_db),
-        table_row_count(stats, &first.right, current_db),
-        first.on.clone(),
-    );
-    for join in select.joins.iter().skip(1) {
-        plan = PhysicalPlan::HashJoin {
-            tp: map_join_type(join.tp),
-            left: Box::new(plan),
-            right: Box::new(PhysicalPlan::table_reader(
-                join.right.name.clone(),
-                Vec::new(),
-            )),
-            left_table: join.left.name.clone(),
-            right_table: join.right.name.clone(),
-            on: join.on.clone(),
-        };
-    }
-    Ok(plan)
 }
 
 fn map_join_type(tp: AstJoinType) -> JoinType {

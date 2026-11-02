@@ -151,6 +151,7 @@ case "$FEATURE" in
     run execute-recursive-cte cargo run -q -p sealdb-server-bin -- --execute "WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT * FROM c ORDER BY n"
     run execute-materialized-cte cargo run -q -p sealdb-server-bin -- --execute "WITH c AS MATERIALIZED (SELECT 1 AS n) SELECT * FROM c; WITH c AS NOT MATERIALIZED (SELECT 1 AS n) SELECT * FROM c"
     run execute-union-in-cte cargo run -q -p sealdb-server-bin -- --execute "WITH c AS (SELECT 1 AS n UNION SELECT 2) SELECT * FROM c ORDER BY n"
+    run execute-cte-in-join cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b'); WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT t.id, t.name FROM db1.t JOIN c ON t.id = c.id"
     ;;
   F18)
     run execute-ddl cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE INDEX idx_name ON db1.t (name); ALTER TABLE db1.t ADD COLUMN age INT; SELECT * FROM db1.t WHERE name = 'a'"

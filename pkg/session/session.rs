@@ -2970,6 +2970,21 @@ mod tests {
             union_cte.display_rows(),
             vec![vec!["1".to_string()], vec!["2".to_string()]]
         );
+        let joined = session
+            .execute_stmt(
+                "WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT t.id, t.name FROM db1.t JOIN c ON t.id = c.id",
+            )
+            .unwrap();
+        assert_eq!(
+            joined.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let both = session
+            .execute_stmt(
+                "WITH a AS (SELECT 1 AS id), b AS (SELECT 1 AS id) SELECT a.id FROM a JOIN b ON a.id = b.id",
+            )
+            .unwrap();
+        assert_eq!(both.display_rows(), vec![vec!["1".to_string()]]);
         let err = session
             .execute_stmt("WITH c(a, b) AS (SELECT 1) SELECT * FROM c")
             .unwrap_err();
