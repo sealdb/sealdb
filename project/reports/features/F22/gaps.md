@@ -7,7 +7,6 @@ on `pkg/server/internal/packetio.rs` / `pkg/server/server.rs`.
 - zstd compression algorithm negotiation
 - Password hash verify beyond empty/native skip (`caching_sha2_password`)
 - `COM_FIELD_LIST` / `COM_CHANGE_USER` / `COM_RESET_CONNECTION`
-- Multi-result-set (`SERVER_MORE_RESULTS_EXISTS`)
 - Connection limits, status HTTP, graceful drain
 - Empty first-column vs OK-packet disambiguation for `CLIENT_DEPRECATE_EOF`
 - `COM_STMT_SEND_LONG_DATA` / cursor fetch

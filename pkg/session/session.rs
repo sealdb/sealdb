@@ -95,6 +95,15 @@ impl Session {
     }
 
     pub fn execute_stmt(&self, sql: &str) -> Result<QueryResult> {
+        let mut results = self.execute_all(sql)?;
+        Ok(results.pop().unwrap_or(QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        }))
+    }
+
+    /// Execute every statement in `sql` and return each result (F22 multi-resultset).
+    pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
         let stmts = self.parser.parse_sql(sql)?;
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
@@ -102,14 +111,11 @@ impl Session {
                 "empty SQL",
             ));
         }
-        let mut last = QueryResult {
-            columns: Vec::new(),
-            rows: Vec::new(),
-        };
+        let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
-            last = self.execute_one(&stmt)?;
+            out.push(self.execute_one(&stmt)?);
         }
-        Ok(last)
+        Ok(out)
     }
 
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {

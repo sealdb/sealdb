@@ -34,11 +34,7 @@
     "U2",
     "U3"
   ],
-  "feature_gaps": {
-    "F22": [
-      "multi-resultset"
-    ]
-  },
+  "feature_gaps": {},
   "open_stmts": [
     {
       "stmt": "ast.AdminStmt",
