@@ -181,6 +181,7 @@ case "$FEATURE" in
     run execute-with-grant-option cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT ON db1.t TO 'u'@'%' WITH GRANT OPTION; SHOW GRANTS FOR 'u'@'%'; REVOKE GRANT OPTION FOR SELECT ON db1.t FROM 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
     run execute-mysql-user-persist cargo test -q -p sealdb-session --lib test_mysql_user_persist -- --exact
     run execute-column-grants cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); GRANT SELECT (id, name) ON db1.t TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
+    run execute-dynamic-privs cargo run -q -p sealdb-server-bin -- --execute "GRANT BACKUP_ADMIN, ROLE_ADMIN ON *.* TO 'u'@'%'; SHOW GRANTS FOR 'u'@'%'; REVOKE BACKUP_ADMIN ON *.* FROM 'u'@'%'; SHOW GRANTS FOR 'u'@'%'"
     ;;
   F21)
     run execute-analyze cargo run -q -p sealdb-server-bin -- --execute "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20), INDEX idx_name (name)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'a'); ANALYZE TABLE db1.t; SELECT * FROM db1.t WHERE name = 'a'"

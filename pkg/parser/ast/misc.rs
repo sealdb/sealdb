@@ -169,12 +169,23 @@ pub struct GrantStmt {
     pub users: Vec<UserIdentity>,
     /// TiDB/MySQL `WITH GRANT OPTION`.
     pub with_grant: bool,
+    /// TiDB dynamic privileges (`BACKUP_ADMIN`, `ROLE_ADMIN`, …) on `*.*`.
+    pub dynamic_privs: Vec<String>,
 }
 
 impl GrantStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("GRANT ");
-        restore_privs(&self.privs, ctx)?;
+        if !self.dynamic_privs.is_empty() {
+            for (i, name) in self.dynamic_privs.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_str(name);
+            }
+        } else {
+            restore_privs(&self.privs, ctx)?;
+        }
         ctx.write_str(" ON ");
         self.level.restore(ctx)?;
         ctx.write_str(" TO ");
@@ -193,6 +204,8 @@ pub struct RevokeStmt {
     pub users: Vec<UserIdentity>,
     /// `REVOKE GRANT OPTION FOR ...` clears only the grant option bit.
     pub grant_option: bool,
+    /// TiDB dynamic privileges to revoke.
+    pub dynamic_privs: Vec<String>,
 }
 
 impl RevokeStmt {
@@ -201,7 +214,16 @@ impl RevokeStmt {
         if self.grant_option {
             ctx.write_str("GRANT OPTION FOR ");
         }
-        restore_privs(&self.privs, ctx)?;
+        if !self.dynamic_privs.is_empty() {
+            for (i, name) in self.dynamic_privs.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_str(name);
+            }
+        } else {
+            restore_privs(&self.privs, ctx)?;
+        }
         ctx.write_str(" ON ");
         self.level.restore(ctx)?;
         ctx.write_str(" FROM ");

@@ -33,6 +33,8 @@ struct Store {
     roles: HashSet<(String, String)>,
     /// User → granted roles.
     role_graph: HashMap<(String, String), HashSet<(String, String)>>,
+    /// TiDB dynamic privileges (BACKUP_ADMIN, …) per user.
+    dynamic: HashMap<(String, String), HashSet<String>>,
 }
 
 pub struct Manager {
@@ -48,6 +50,7 @@ impl Manager {
                 grants: HashMap::new(),
                 roles: HashSet::new(),
                 role_graph: HashMap::new(),
+                dynamic: HashMap::new(),
             }),
         }
     }
@@ -59,6 +62,7 @@ impl Manager {
                 grants: HashMap::new(),
                 roles: HashSet::new(),
                 role_graph: HashMap::new(),
+                dynamic: HashMap::new(),
             }),
         };
         mgr.grant_bits(
@@ -80,6 +84,16 @@ impl Manager {
     }
 
     pub fn grant(&self, stmt: &GrantStmt) -> Result<()> {
+        if !stmt.dynamic_privs.is_empty() {
+            let mut inner = self.inner.lock().expect("privilege lock");
+            for user in &stmt.users {
+                let set = inner.dynamic.entry(user_key(user)).or_default();
+                for name in &stmt.dynamic_privs {
+                    set.insert(name.to_ascii_uppercase());
+                }
+            }
+            return Ok(());
+        }
         for elem in &stmt.privs {
             for user in &stmt.users {
                 self.grant_bits(user, &stmt.level, elem.tp, stmt.with_grant, &elem.cols);
@@ -90,6 +104,20 @@ impl Manager {
 
     pub fn revoke(&self, stmt: &RevokeStmt) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
+        if !stmt.dynamic_privs.is_empty() {
+            for user in &stmt.users {
+                let key = user_key(user);
+                if let Some(set) = inner.dynamic.get_mut(&key) {
+                    for name in &stmt.dynamic_privs {
+                        set.remove(&name.to_ascii_uppercase());
+                    }
+                    if set.is_empty() {
+                        inner.dynamic.remove(&key);
+                    }
+                }
+            }
+            return Ok(());
+        }
         for user in &stmt.users {
             let key = user_key(user);
             if let Some(entries) = inner.grants.get_mut(&key) {
@@ -301,6 +329,14 @@ impl Manager {
                 ));
             }
         }
+        if let Some(dyns) = inner.dynamic.get(&user_key(user)) {
+            for name in dyns {
+                out.push(format!(
+                    "GRANT {} ON *.* TO '{}'@'{}'",
+                    name, user.username, user.hostname
+                ));
+            }
+        }
         out
     }
 
@@ -401,6 +437,15 @@ impl Manager {
                     roles: roles.iter().cloned().collect(),
                 })
                 .collect(),
+            dynamic: inner
+                .dynamic
+                .iter()
+                .map(|((u, h), names)| PersistDynamic {
+                    user: u.clone(),
+                    host: h.clone(),
+                    names: names.iter().cloned().collect(),
+                })
+                .collect(),
         };
         serde_json::to_vec(&snap).map_err(|e| {
             Error::new(
@@ -442,11 +487,28 @@ impl Manager {
         for edge in snap.role_graph {
             role_graph.insert((edge.user, edge.host), edge.roles.into_iter().collect());
         }
+        let mut dynamic = HashMap::new();
+        for d in snap.dynamic {
+            dynamic.insert((d.user, d.host), d.names.into_iter().collect());
+        }
         let mut inner = self.inner.lock().expect("privilege lock");
         inner.grants = grants;
         inner.roles = roles;
         inner.role_graph = role_graph;
+        inner.dynamic = dynamic;
         Ok(())
+    }
+
+    /// True when `user` holds the named TiDB dynamic privilege.
+    pub fn has_dynamic_priv(&self, user: &UserIdentity, name: &str) -> bool {
+        if self.skip_grant_table {
+            return true;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        inner
+            .dynamic
+            .get(&user_key(user))
+            .is_some_and(|s| s.contains(&name.to_ascii_uppercase()))
     }
 }
 
@@ -455,6 +517,15 @@ struct PersistSnapshot {
     grants: Vec<PersistUserGrants>,
     roles: Vec<(String, String)>,
     role_graph: Vec<PersistRoleEdge>,
+    #[serde(default)]
+    dynamic: Vec<PersistDynamic>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistDynamic {
+    user: String,
+    host: String,
+    names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]

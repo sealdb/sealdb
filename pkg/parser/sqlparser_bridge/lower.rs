@@ -822,6 +822,7 @@ fn lower_grant(grant: &Grant) -> Result<Statement> {
         level: lower_grant_objects(grant.objects.as_ref())?,
         users: lower_grantees(&grant.grantees)?,
         with_grant: grant.with_grant_option,
+        dynamic_privs: Vec::new(),
     }))
 }
 
@@ -834,6 +835,7 @@ fn lower_revoke(revoke: &Revoke) -> Result<Statement> {
         level: lower_grant_objects(revoke.objects.as_ref())?,
         users: lower_grantees(&revoke.grantees)?,
         grant_option: revoke.grant_option_for,
+        dynamic_privs: Vec::new(),
     }))
 }
 
@@ -1173,35 +1175,157 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// sqlparser rejects MySQL `GRANT role TO user` / `REVOKE role FROM user`.
-/// Replace each with `SET NAMES '__sealdb_role__'` and re-attach after lower.
+/// sqlparser rejects MySQL `GRANT role TO user` / dynamic privs like
+/// `GRANT BACKUP_ADMIN ON *.*`. Replace with `SET NAMES '__sealdb_role__'`
+/// and re-attach after lower.
 fn extract_role_grants(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut ops = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if keyword_at(bytes, i, "GRANT")
-            && let Some((stmt, end)) = try_parse_grant_role(bytes, i)?
-        {
-            out.push_str("SET NAMES '__sealdb_role__'");
-            ops.push(Some(stmt));
-            i = end;
-            continue;
+        if keyword_at(bytes, i, "GRANT") {
+            if let Some((stmt, end)) = try_parse_grant_role(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+            if let Some((stmt, end)) = try_parse_dynamic_grant(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
         }
-        if keyword_at(bytes, i, "REVOKE")
-            && let Some((stmt, end)) = try_parse_revoke_role(bytes, i)?
-        {
-            out.push_str("SET NAMES '__sealdb_role__'");
-            ops.push(Some(stmt));
-            i = end;
-            continue;
+        if keyword_at(bytes, i, "REVOKE") {
+            if let Some((stmt, end)) = try_parse_revoke_role(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+            if let Some((stmt, end)) = try_parse_dynamic_revoke(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
         }
         let ch = sql[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
     Ok((out, ops))
+}
+
+fn try_parse_dynamic_grant(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "GRANT".len());
+    let (privs, after_privs) = parse_dynamic_priv_list(bytes, i)?;
+    if privs.is_empty() {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, after_privs);
+    if !keyword_at(bytes, i, "ON") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "ON".len());
+    // Dynamic privileges are global (`*.*`).
+    if !(i + 2 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'.' && bytes[i + 2] == b'*') {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + 3);
+    if !keyword_at(bytes, i, "TO") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "TO".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    Ok(Some((
+        Statement::Grant(GrantStmt {
+            privs: Vec::new(),
+            level: GrantLevel {
+                level: GrantLevelType::Global,
+                db_name: String::new(),
+                table_name: String::new(),
+            },
+            users,
+            with_grant: false,
+            dynamic_privs: privs,
+        }),
+        end,
+    )))
+}
+
+fn try_parse_dynamic_revoke(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "REVOKE".len());
+    let (privs, after_privs) = parse_dynamic_priv_list(bytes, i)?;
+    if privs.is_empty() {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, after_privs);
+    if !keyword_at(bytes, i, "ON") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "ON".len());
+    if !(i + 2 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'.' && bytes[i + 2] == b'*') {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + 3);
+    if !keyword_at(bytes, i, "FROM") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "FROM".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    Ok(Some((
+        Statement::Revoke(RevokeStmt {
+            privs: Vec::new(),
+            level: GrantLevel {
+                level: GrantLevelType::Global,
+                db_name: String::new(),
+                table_name: String::new(),
+            },
+            users,
+            grant_option: false,
+            dynamic_privs: privs,
+        }),
+        end,
+    )))
+}
+
+fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {
+    let mut privs = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (name, next) = read_quoted_or_ident(bytes, i);
+        if name.is_empty() || !is_dynamic_priv(&name) {
+            break;
+        }
+        privs.push(name.to_ascii_uppercase());
+        i = skip_ws(bytes, next);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok((privs, i))
+}
+
+fn is_dynamic_priv(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "BACKUP_ADMIN"
+            | "RESTORE_ADMIN"
+            | "SYSTEM_VARIABLES_ADMIN"
+            | "ROLE_ADMIN"
+            | "CONNECTION_ADMIN"
+            | "RESTRICTED_TABLES_ADMIN"
+            | "RESTRICTED_USER_ADMIN"
+            | "RESTRICTED_STATUS_ADMIN"
+            | "RESTRICTED_VARIABLES_ADMIN"
+            | "RESTRICTED_REPLICA_WRITER_ADMIN"
+            | "RESTRICTED_PRIVILEGES_ADMIN"
+    )
 }
 
 fn try_parse_grant_role(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
