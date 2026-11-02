@@ -159,7 +159,7 @@
       "status": "partial",
       "rust": "pkg/executor/grant.rs",
       "phase": 8,
-      "notes": "GrantExec applies in-memory grants; roles deferred"
+      "notes": "GrantExec applies in-memory grants and roles; WITH GRANT OPTION deferred"
     },
     "pkg/executor/analyze.go": {
       "status": "partial",

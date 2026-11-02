@@ -36,7 +36,6 @@
   ],
   "feature_gaps": {
     "F20": [
-      "roles",
       "with-grant-option",
       "mysql-user-persist",
       "column-grants",

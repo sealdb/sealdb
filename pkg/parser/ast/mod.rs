@@ -24,8 +24,9 @@ pub use expressions::{
     WindowFrameUnits, WindowFuncExpr, WindowSpec,
 };
 pub use misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantLevel,
-    GrantLevelType, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
-    ReleaseSavepointStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetStmt,
-    SetTxnStmt, ShowStmt, ShowStmtKind, UseStmt, UserIdentity,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, DeallocateStmt, DropRoleStmt,
+    ExecuteStmt, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt,
+    PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt,
+    SavepointStmt, SetAssignment, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt,
+    ShowStmtKind, UseStmt, UserIdentity,
 };

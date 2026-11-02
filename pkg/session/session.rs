@@ -33,6 +33,8 @@ pub struct Session {
     sql_mode: Mutex<String>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
     partition_prune_mode: Mutex<PartitionPruneMode>,
+    /// Active roles for the session (`SET ROLE`).
+    active_roles: Mutex<Vec<UserIdentity>>,
 }
 
 impl Session {
@@ -62,6 +64,7 @@ impl Session {
             collation: Mutex::new(Collation::bin()),
             sql_mode: Mutex::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string()),
             partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
+            active_roles: Mutex::new(Vec::new()),
         }
     }
 
@@ -132,6 +135,15 @@ impl Session {
             }
             Statement::Set(set) => {
                 apply_set(self, set)?;
+                return Ok(empty_result());
+            }
+            Statement::SetRole(set) => {
+                let user = self.current_user();
+                let roles = self
+                    .domain
+                    .privilege()
+                    .resolve_active_roles(&user, &set.kind)?;
+                *self.active_roles.lock().expect("session active roles lock") = roles;
                 return Ok(empty_result());
             }
             Statement::SetTxn(set) => {
@@ -413,6 +425,11 @@ impl Session {
             return Ok(());
         }
         let user = self.current_user();
+        let roles = self
+            .active_roles
+            .lock()
+            .expect("session active roles lock")
+            .clone();
         let current_db = self
             .current_db
             .lock()
@@ -422,30 +439,56 @@ impl Session {
             return self.check_privilege(&explain.stmt);
         }
         match stmt {
-            Statement::Grant(_) | Statement::Revoke(_) => {
-                if !mgr.request_verification(&user, "", "", PrivilegeType::ALL) {
+            Statement::Grant(_)
+            | Statement::Revoke(_)
+            | Statement::CreateRole(_)
+            | Statement::DropRole(_)
+            | Statement::GrantRole(_)
+            | Statement::RevokeRole(_) => {
+                if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::ALL) {
                     return Err(access_denied("", "", PrivilegeType::ALL, &user));
                 }
             }
             Statement::Show(show)
                 if show.kind == sealdb_parser::ast::ShowStmtKind::Grants
                     && show.user.as_ref().is_some_and(|u| u != &user)
-                    && !mgr.request_verification(&user, "", "", PrivilegeType::ALL) =>
+                    && !mgr.request_verification_with_roles(
+                        &user,
+                        &roles,
+                        "",
+                        "",
+                        PrivilegeType::ALL,
+                    ) =>
             {
                 return Err(access_denied("", "", PrivilegeType::ALL, &user));
             }
             Statement::Select(select) => {
                 if let Some(from) = &select.from {
-                    require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        from,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
                 for table in select.join_tables() {
-                    require(&mgr, &user, table, &current_db, PrivilegeType::SELECT)?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
             }
             Statement::Insert(insert) => {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &insert.table,
                     &current_db,
                     PrivilegeType::INSERT,
@@ -455,13 +498,28 @@ impl Session {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &update.table,
                     &current_db,
                     PrivilegeType::UPDATE,
                 )?;
                 if let Some(join) = &update.join {
-                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::UPDATE)?;
-                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::UPDATE)?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &join.left,
+                        &current_db,
+                        PrivilegeType::UPDATE,
+                    )?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &join.right,
+                        &current_db,
+                        PrivilegeType::UPDATE,
+                    )?;
                 }
             }
             Statement::Delete(delete) => {
@@ -469,22 +527,50 @@ impl Session {
                     require(
                         &mgr,
                         &user,
+                        &roles,
                         &delete.table,
                         &current_db,
                         PrivilegeType::DELETE,
                     )?;
                 } else {
                     for table in &delete.tables {
-                        require(&mgr, &user, table, &current_db, PrivilegeType::DELETE)?;
+                        require(
+                            &mgr,
+                            &user,
+                            &roles,
+                            table,
+                            &current_db,
+                            PrivilegeType::DELETE,
+                        )?;
                     }
                 }
                 if let Some(join) = &delete.join {
-                    require(&mgr, &user, &join.left, &current_db, PrivilegeType::SELECT)?;
-                    require(&mgr, &user, &join.right, &current_db, PrivilegeType::SELECT)?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &join.left,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &join.right,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
             }
             Statement::CreateDatabase(create) => {
-                if !mgr.request_verification(&user, &create.name, "", PrivilegeType::CREATE) {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    &create.name,
+                    "",
+                    PrivilegeType::CREATE,
+                ) {
                     return Err(access_denied(
                         &create.name,
                         "",
@@ -497,19 +583,41 @@ impl Session {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &create.table,
                     &current_db,
                     PrivilegeType::CREATE,
                 )?;
                 if let Some(refer) = &create.refer_table {
-                    require(&mgr, &user, refer, &current_db, PrivilegeType::SELECT)?;
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        refer,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
                 if let Some(select) = &create.select {
                     if let Some(from) = &select.from {
-                        require(&mgr, &user, from, &current_db, PrivilegeType::SELECT)?;
+                        require(
+                            &mgr,
+                            &user,
+                            &roles,
+                            from,
+                            &current_db,
+                            PrivilegeType::SELECT,
+                        )?;
                     }
                     for table in select.join_tables() {
-                        require(&mgr, &user, table, &current_db, PrivilegeType::SELECT)?;
+                        require(
+                            &mgr,
+                            &user,
+                            &roles,
+                            table,
+                            &current_db,
+                            PrivilegeType::SELECT,
+                        )?;
                     }
                 }
             }
@@ -517,6 +625,7 @@ impl Session {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &create.table,
                     &current_db,
                     PrivilegeType::CREATE,
@@ -526,28 +635,43 @@ impl Session {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &alter.table,
                     &current_db,
                     PrivilegeType::CREATE,
                 )?;
             }
             Statement::DropDatabase(drop) => {
-                if !mgr.request_verification(&user, &drop.name, "", PrivilegeType::DROP) {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    &drop.name,
+                    "",
+                    PrivilegeType::DROP,
+                ) {
                     return Err(access_denied(&drop.name, "", PrivilegeType::DROP, &user));
                 }
             }
             Statement::DropTable(drop) => {
                 for table in &drop.tables {
-                    require(&mgr, &user, table, &current_db, PrivilegeType::DROP)?;
+                    require(&mgr, &user, &roles, table, &current_db, PrivilegeType::DROP)?;
                 }
             }
             Statement::DropIndex(drop) => {
-                require(&mgr, &user, &drop.table, &current_db, PrivilegeType::DROP)?;
+                require(
+                    &mgr,
+                    &user,
+                    &roles,
+                    &drop.table,
+                    &current_db,
+                    PrivilegeType::DROP,
+                )?;
             }
             Statement::AnalyzeTable(analyze) => {
                 require(
                     &mgr,
                     &user,
+                    &roles,
                     &analyze.table,
                     &current_db,
                     PrivilegeType::SELECT,
@@ -562,12 +686,13 @@ impl Session {
 fn require(
     mgr: &sealdb_privilege::Manager,
     user: &UserIdentity,
+    roles: &[UserIdentity],
     table: &sealdb_parser::ast::TableName,
     current_db: &str,
     privs: PrivilegeType,
 ) -> Result<()> {
     let (db, name) = table.qualified(current_db);
-    if !mgr.request_verification(user, &db, &name, privs) {
+    if !mgr.request_verification_with_roles(user, roles, &db, &name, privs) {
         return Err(access_denied(&db, &name, privs, user));
     }
     Ok(())
@@ -768,6 +893,10 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::AlterTable(_)
             | Statement::Grant(_)
             | Statement::Revoke(_)
+            | Statement::CreateRole(_)
+            | Statement::DropRole(_)
+            | Statement::GrantRole(_)
+            | Statement::RevokeRole(_)
     )
 }
 
@@ -3642,26 +3771,44 @@ mod tests {
             .unwrap();
         let empty = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
         assert!(empty.display_rows().is_empty());
-        let err = session.execute_stmt("GRANT r TO 'u'@'%'").unwrap_err();
+        session
+            .execute_stmt("CREATE ROLE r; GRANT SELECT ON db1.t TO r; GRANT r TO 'u'@'%'")
+            .unwrap();
+        let role_grants = session.execute_stmt("SHOW GRANTS FOR 'u'@'%'").unwrap();
         assert!(
-            err.message.contains("ROLE")
-                || err.message.contains("GRANT")
-                || err.message.contains("privilege")
+            role_grants
+                .display_rows()
+                .iter()
+                .any(|row| row[0].contains("GRANT") && row[0].contains("'r'@'%'")),
+            "{:?}",
+            role_grants.display_rows()
         );
 
         let checked = Session::with_grant_table();
         checked
             .execute_stmt(
-                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); GRANT SELECT ON db1.t TO 'u'@'%'",
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'); CREATE ROLE r; GRANT SELECT ON db1.t TO r; GRANT r TO 'u'@'%'",
             )
             .unwrap();
         checked.set_current_user(sealdb_parser::ast::UserIdentity::new("u", "%"));
+        let denied = checked.execute_stmt("SELECT * FROM db1.t").unwrap_err();
+        assert_eq!(denied.code, sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR);
+        checked.execute_stmt("SET ROLE r").unwrap();
         let ok = checked.execute_stmt("SELECT * FROM db1.t").unwrap();
         assert_eq!(ok.display_rows().len(), 1);
-        let denied = checked
+        let still_denied = checked
             .execute_stmt("INSERT INTO db1.t VALUES (2, 'b')")
             .unwrap_err();
-        assert_eq!(denied.code, sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR);
+        assert_eq!(
+            still_denied.code,
+            sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR
+        );
+        checked.execute_stmt("SET ROLE NONE").unwrap();
+        let denied_again = checked.execute_stmt("SELECT * FROM db1.t").unwrap_err();
+        assert_eq!(
+            denied_again.code,
+            sealdb_errno::ERR_TABLEACCESS_DENIED_ERROR
+        );
     }
 
     #[test]

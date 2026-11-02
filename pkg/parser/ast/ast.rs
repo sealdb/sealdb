@@ -5,9 +5,9 @@ use super::ddl::{
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, DeallocateStmt, ExecuteStmt, GrantStmt, PrepareStmt,
-    ReleaseSavepointStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetStmt, SetTxnStmt, ShowStmt,
-    UseStmt,
+    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateRoleStmt, DeallocateStmt, DropRoleStmt,
+    ExecuteStmt, GrantRoleStmt, GrantStmt, PrepareStmt, ReleaseSavepointStmt, RevokeRoleStmt,
+    RevokeStmt, RollbackStmt, SavepointStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -44,6 +44,11 @@ pub enum Statement {
     SetOpr(SetOprStmt),
     Grant(GrantStmt),
     Revoke(RevokeStmt),
+    CreateRole(CreateRoleStmt),
+    DropRole(DropRoleStmt),
+    GrantRole(GrantRoleStmt),
+    RevokeRole(RevokeRoleStmt),
+    SetRole(SetRoleStmt),
     AnalyzeTable(AnalyzeTableStmt),
     Explain(ExplainStmt),
     SetTxn(SetTxnStmt),
@@ -77,6 +82,11 @@ impl Node for Statement {
             Statement::SetOpr(s) => s.restore(ctx),
             Statement::Grant(s) => s.restore(ctx),
             Statement::Revoke(s) => s.restore(ctx),
+            Statement::CreateRole(s) => s.restore(ctx),
+            Statement::DropRole(s) => s.restore(ctx),
+            Statement::GrantRole(s) => s.restore(ctx),
+            Statement::RevokeRole(s) => s.restore(ctx),
+            Statement::SetRole(s) => s.restore(ctx),
             Statement::AnalyzeTable(s) => s.restore(ctx),
             Statement::Explain(s) => s.restore(ctx),
             Statement::SetTxn(s) => s.restore(ctx),
@@ -112,6 +122,11 @@ impl StmtNode for Statement {
             Statement::SetOpr(_) => "SetOprStmt",
             Statement::Grant(_) => "GrantStmt",
             Statement::Revoke(_) => "RevokeStmt",
+            Statement::CreateRole(_) => "CreateRoleStmt",
+            Statement::DropRole(_) => "DropRoleStmt",
+            Statement::GrantRole(_) => "GrantRoleStmt",
+            Statement::RevokeRole(_) => "RevokeRoleStmt",
+            Statement::SetRole(_) => "SetRoleStmt",
             Statement::AnalyzeTable(_) => "AnalyzeTableStmt",
             Statement::Explain(_) => "ExplainStmt",
             Statement::SetTxn(_) => "SetTxnStmt",
