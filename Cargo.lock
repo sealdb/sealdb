@@ -1804,6 +1804,8 @@ version = "0.1.0"
 dependencies = [
  "sealdb-errno",
  "sealdb-parser",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

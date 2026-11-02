@@ -4,7 +4,7 @@ use sealdb_infoschema::InfoSchema;
 use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::{Job, JobState, Mutator};
 use sealdb_parser::ast::Statement;
-use sealdb_privilege::Manager;
+use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::Handle;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -57,6 +57,11 @@ impl Domain {
         Self::with_storage_and_privilege(storage, Manager::skip_with_grant(), id_base)
     }
 
+    /// Like `with_grant_table` but keeps grants in the given Storage (mysql.user persist).
+    pub fn with_storage_and_grant_table(storage: Arc<dyn Storage>) -> Result<Self> {
+        Self::with_storage_and_privilege(storage, Manager::with_grant_table(), 0)
+    }
+
     fn with_privilege(privilege: Manager) -> Self {
         Self::with_storage_and_privilege(Arc::new(MemStorage::new()), privilege, 0)
             .expect("memory meta load")
@@ -72,6 +77,10 @@ impl Domain {
             meta.set_global_id(id_base);
         }
         let infoschema = InfoSchema::from_meta(&meta)?;
+        // Reload mysql.user-equivalent grant snapshot when present.
+        if !privilege.skip_grant_table() {
+            load_privileges(storage.as_ref(), &privilege)?;
+        }
         Ok(Self {
             inner: Mutex::new(Inner {
                 meta,
@@ -87,6 +96,17 @@ impl Domain {
 
     pub fn privilege(&self) -> Arc<Manager> {
         Arc::clone(&self.privilege)
+    }
+
+    /// Persist grant tables (TiDB mysql.user / db / tables_priv) to Storage.
+    pub fn persist_privileges(&self) -> Result<()> {
+        if self.privilege.skip_grant_table() {
+            return Ok(());
+        }
+        let bytes = self.privilege.encode()?;
+        let mut txn = self.storage.begin()?;
+        txn.set(PRIVILEGE_STORAGE_KEY, &bytes)?;
+        txn.commit()
     }
 
     pub fn stats(&self) -> Arc<Handle> {
@@ -185,6 +205,16 @@ fn load_meta(storage: &dyn Storage) -> Result<Mutator> {
     let mut meta = Mutator::new();
     meta.load_encoded(pairs);
     Ok(meta)
+}
+
+fn load_privileges(storage: &dyn Storage, privilege: &Manager) -> Result<()> {
+    let mut txn = storage.begin()?;
+    let raw = txn.get(PRIVILEGE_STORAGE_KEY)?;
+    txn.rollback()?;
+    if let Some(bytes) = raw {
+        privilege.decode(&bytes)?;
+    }
+    Ok(())
 }
 
 fn persist_meta(storage: &dyn Storage, meta: &mut Mutator) -> Result<()> {

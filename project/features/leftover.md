@@ -9,7 +9,6 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 
 ### F20
 
-- `mysql-user-persist`
 - `column-grants`
 - `dynamic-privs`
 - `create-user`
