@@ -54,6 +54,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
+    let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -62,6 +63,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     })?;
     let mut flags = pessimistic_flags.into_iter();
     let mut partitions = partitions.into_iter();
+    let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
     let mut materialize_hints = materialize_hints;
     stmts
@@ -80,6 +82,20 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             }
             if let Statement::CreateTable(create) = &mut lowered {
                 create.partition = partitions.next().flatten();
+            }
+            if let Statement::AlterTable(alter) = &mut lowered
+                && let Some(op) = alter_parts.next().flatten()
+            {
+                match op {
+                    AlterPartOp::Add(defs) => {
+                        alter.specs.push(AlterTableSpec::AddPartition { defs });
+                    }
+                    AlterPartOp::Drop { if_exists, names } => {
+                        alter
+                            .specs
+                            .push(AlterTableSpec::DropPartition { if_exists, names });
+                    }
+                }
             }
             if let Statement::Prepare(prepare) = &mut lowered
                 && let Some(sql) = prepares.next().flatten()
@@ -1343,6 +1359,170 @@ fn lower_explain_format(
             }
         },
     }
+}
+
+#[derive(Clone, Debug)]
+enum AlterPartOp {
+    Add(Vec<PartitionDef>),
+    Drop { if_exists: bool, names: Vec<String> },
+}
+
+/// sqlparser MySQL dialect rejects `ADD/DROP PARTITION`; strip and re-attach.
+fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "ALTER") {
+            let after_alter = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after_alter, "TABLE") {
+                let after_table = skip_ws(bytes, after_alter + "TABLE".len());
+                let after_name = skip_ident_or_quoted(bytes, after_table);
+                let after_name = if after_name < bytes.len() && bytes[after_name] == b'.' {
+                    skip_ident_or_quoted(bytes, skip_ws(bytes, after_name + 1))
+                } else {
+                    after_name
+                };
+                let after_name = skip_ws(bytes, after_name);
+                if keyword_at(bytes, after_name, "ADD") {
+                    let after_add = skip_ws(bytes, after_name + "ADD".len());
+                    if keyword_at(bytes, after_add, "PARTITION") {
+                        let after_part = skip_ws(bytes, after_add + "PARTITION".len());
+                        if after_part < bytes.len() && bytes[after_part] == b'(' {
+                            let close = matching_paren(bytes, after_part)
+                                .ok_or_else(|| Error::unsupported("ADD PARTITION list"))?;
+                            let body = std::str::from_utf8(&bytes[after_part + 1..close]).map_err(
+                                |_| Error::new(ERR_PARSE_ERROR, "invalid ADD PARTITION"),
+                            )?;
+                            let defs = parse_add_partition_defs(body)?;
+                            out.push_str(&sql[i..after_name]);
+                            out.push_str("ALGORITHM=INPLACE");
+                            ops.push(Some(AlterPartOp::Add(defs)));
+                            i = skip_ws(bytes, close + 1);
+                            continue;
+                        }
+                    }
+                }
+                if keyword_at(bytes, after_name, "DROP") {
+                    let after_drop = skip_ws(bytes, after_name + "DROP".len());
+                    if keyword_at(bytes, after_drop, "PARTITION") {
+                        let mut j = skip_ws(bytes, after_drop + "PARTITION".len());
+                        let if_exists = if keyword_at(bytes, j, "IF") {
+                            let after_if = skip_ws(bytes, j + "IF".len());
+                            if keyword_at(bytes, after_if, "EXISTS") {
+                                j = skip_ws(bytes, after_if + "EXISTS".len());
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        let mut names = Vec::new();
+                        loop {
+                            let (name, next) = read_ident(bytes, j);
+                            if name.is_empty() {
+                                break;
+                            }
+                            names.push(name);
+                            j = skip_ws(bytes, next);
+                            if j < bytes.len() && bytes[j] == b',' {
+                                j = skip_ws(bytes, j + 1);
+                                continue;
+                            }
+                            break;
+                        }
+                        if names.is_empty() {
+                            return Err(Error::unsupported("DROP PARTITION without names"));
+                        }
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Drop { if_exists, names }));
+                        i = j;
+                        continue;
+                    }
+                }
+                // Non-partition ALTER TABLE — still consume one alter slot as None.
+                ops.push(None);
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Ok((out, ops))
+}
+
+fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
+    let mut defs = Vec::new();
+    for raw in split_defs(body) {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let bytes = item.as_bytes();
+        let mut i = skip_ws(bytes, 0);
+        if !keyword_at(bytes, i, "PARTITION") {
+            return Err(Error::unsupported("ADD PARTITION item"));
+        }
+        i = skip_ws(bytes, i + "PARTITION".len());
+        let name_end = skip_ident_or_quoted(bytes, i);
+        let name = item[i..name_end].trim().trim_matches('`').to_string();
+        i = skip_ws(bytes, name_end);
+        if !keyword_at(bytes, i, "VALUES") {
+            return Err(Error::unsupported("ADD PARTITION VALUES"));
+        }
+        i = skip_ws(bytes, i + "VALUES".len());
+        if keyword_at(bytes, i, "IN") {
+            i = skip_ws(bytes, i + "IN".len());
+            if i >= bytes.len() || bytes[i] != b'(' {
+                return Err(Error::unsupported("VALUES IN"));
+            }
+            let close = matching_paren(bytes, i).ok_or_else(|| Error::unsupported("VALUES IN"))?;
+            let mut in_values = Vec::new();
+            for raw_v in item[i + 1..close].split(',') {
+                let v = raw_v.trim();
+                if v.is_empty() {
+                    continue;
+                }
+                in_values.push(
+                    v.parse::<i64>()
+                        .map_err(|_| Error::unsupported("non-integer LIST value"))?,
+                );
+            }
+            defs.push(PartitionDef {
+                name,
+                less_than: None,
+                extra_bounds: Vec::new(),
+                in_values,
+            });
+        } else if keyword_at(bytes, i, "LESS") {
+            i = skip_ws(bytes, i + "LESS".len());
+            if !keyword_at(bytes, i, "THAN") {
+                return Err(Error::unsupported("VALUES LESS THAN"));
+            }
+            i = skip_ws(bytes, i + "THAN".len());
+            let bounds = parse_less_than_bounds(bytes, i, item)?;
+            let less_than = bounds.first().copied().flatten();
+            let extra_bounds = if bounds.len() > 1 {
+                bounds[1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            defs.push(PartitionDef {
+                name,
+                less_than,
+                extra_bounds,
+                in_values: Vec::new(),
+            });
+        } else {
+            return Err(Error::unsupported("ADD PARTITION VALUES"));
+        }
+    }
+    if defs.is_empty() {
+        return Err(Error::unsupported("ADD PARTITION without definitions"));
+    }
+    Ok(defs)
 }
 
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.

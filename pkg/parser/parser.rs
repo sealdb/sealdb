@@ -1190,6 +1190,37 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("ALTER TABLE t ADD PARTITION (PARTITION p2 VALUES LESS THAN (30))")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[..] {
+                [
+                    crate::ast::AlterTableSpec::Algorithm(_),
+                    crate::ast::AlterTableSpec::AddPartition { defs },
+                ] => {
+                    assert_eq!(defs[0].name, "p2");
+                    assert_eq!(defs[0].less_than, Some(30));
+                }
+                other => panic!("expected ADD PARTITION, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE t DROP PARTITION p0, p1")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => match &alter.specs[..] {
+                [
+                    crate::ast::AlterTableSpec::Algorithm(_),
+                    crate::ast::AlterTableSpec::DropPartition { names, .. },
+                ] => {
+                    assert_eq!(names, &["p0".to_string(), "p1".to_string()]);
+                }
+                other => panic!("expected DROP PARTITION, got {other:?}"),
+            },
+            other => panic!("expected AlterTableStmt, got {other:?}"),
+        }
     }
 
     #[test]
