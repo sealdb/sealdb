@@ -95,6 +95,8 @@ pub struct CommonTableExpression {
     pub name: String,
     pub query: Box<SelectStmt>,
     pub col_name_list: Vec<String>,
+    /// Recursive `UNION` / `UNION ALL` arm for `WITH RECURSIVE`.
+    pub recursive: Option<(SetOprType, SelectStmt)>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +160,12 @@ impl WithClause {
             }
             ctx.write_str(" AS (");
             cte.query.restore(ctx)?;
+            if let Some((op, rec)) = &cte.recursive {
+                ctx.write_str(" ");
+                ctx.write_str(op.restore());
+                ctx.write_str(" ");
+                rec.restore(ctx)?;
+            }
             ctx.write_str(")");
         }
         ctx.write_str(" ");

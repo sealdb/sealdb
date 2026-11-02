@@ -1,24 +1,88 @@
-// F17 core path: CTEExec for non-recursive WITH (TiDB pkg/executor/cte.go).
-// Completeness wave / not this feature: recursive CTE, CTETableReader shared
-// storage, multi-consumer reuse, MATERIALIZED, UNION in CTE, CTE in JOIN/DML.
-use crate::internal::exec::Executor;
+// F17 core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
+// (TiDB pkg/executor/cte.go). Completeness wave / not this feature:
+// CTETableReader shared storage, MATERIALIZED, UNION in non-recursive CTE,
+// CTE in JOIN/DML.
+use crate::builder::ExecutorBuilder;
+use crate::internal::exec::{Executor, QueryResult};
+use sealdb_domain::Domain;
 use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_kv::TxnHandle;
+use sealdb_parser::ast::{SelectStmt, SetOprType, Statement};
+use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+type CteWorking = (Vec<String>, Vec<Vec<Datum>>);
+
+thread_local! {
+    static WORKING: RefCell<HashMap<String, CteWorking>> = RefCell::new(HashMap::new());
+}
+
+/// Working rows for a recursive CTE, visible to TableReader as `FROM cte`.
+pub fn working_cte(name: &str) -> Option<CteWorking> {
+    WORKING.with(|cell| {
+        cell.borrow()
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    })
+}
+
+fn with_working_cte<T>(
+    name: &str,
+    schema: Vec<String>,
+    rows: Vec<Vec<Datum>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    WORKING.with(|cell| {
+        cell.borrow_mut().insert(name.to_string(), (schema, rows));
+    });
+    let out = f();
+    WORKING.with(|cell| {
+        cell.borrow_mut().remove(name);
+    });
+    out
+}
+
+const MAX_RECURSION: usize = 1000;
+
+/// Materializes a `WITH` query; recursive CTEs iterate `recursive` against
+/// a TableReader working set published under `name`.
 pub struct CTEExec {
     columns: Vec<String>,
+    name: String,
+    recursive: Option<(SetOprType, SelectStmt)>,
     seed: Box<dyn Executor>,
+    domain: Arc<Domain>,
+    current_db: String,
+    txn: Arc<TxnHandle>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
 }
 
 impl CTEExec {
-    pub fn new(columns: Vec<String>, seed: Box<dyn Executor>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        columns: Vec<String>,
+        name: String,
+        recursive: Option<(SetOprType, SelectStmt)>,
+        seed: Box<dyn Executor>,
+        domain: Arc<Domain>,
+        current_db: impl Into<String>,
+        txn: Arc<TxnHandle>,
+    ) -> Self {
         Self {
             columns,
+            name,
+            recursive,
             seed,
+            domain,
+            current_db: current_db.into(),
+            txn,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -45,6 +109,18 @@ impl Executor for CTEExec {
             }
             self.schema = self.columns.clone();
         }
+        if let Some((op, rec)) = self.recursive.clone() {
+            self.rows = iterate_recursive(
+                &self.name,
+                self.schema.clone(),
+                std::mem::take(&mut self.rows),
+                op,
+                rec,
+                &self.domain,
+                &self.current_db,
+                &self.txn,
+            )?;
+        }
         Ok(())
     }
 
@@ -69,6 +145,73 @@ impl Executor for CTEExec {
     }
 }
 
+/// Expand the recursive UNION / UNION ALL arm against the working set until
+/// a step produces no new rows or `MAX_RECURSION` is hit.
+#[allow(clippy::too_many_arguments)]
+fn iterate_recursive(
+    name: &str,
+    schema: Vec<String>,
+    seed: Vec<Vec<Datum>>,
+    op: SetOprType,
+    rec: SelectStmt,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<Vec<Vec<Datum>>> {
+    let distinct = op.is_distinct();
+    let mut all = seed;
+    let mut working = all.clone();
+    let mut seen: HashSet<Vec<String>> = all.iter().map(|row| row_key(row)).collect();
+    for iter in 0..=MAX_RECURSION {
+        if working.is_empty() {
+            break;
+        }
+        if iter == MAX_RECURSION {
+            return Err(Error::unsupported("recursive CTE exceeded max recursion"));
+        }
+        let next = with_working_cte(name, schema.clone(), working.clone(), || {
+            run_select(&rec, domain, current_db, txn)
+        })?;
+        let mut step = Vec::new();
+        for row in next.rows {
+            if distinct && !seen.insert(row_key(&row)) {
+                continue;
+            }
+            step.push(row);
+        }
+        if step.is_empty() {
+            break;
+        }
+        all.extend(step.clone());
+        working = step;
+    }
+    Ok(all)
+}
+
+fn run_select(
+    select: &SelectStmt,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<QueryResult> {
+    let stmt = Statement::Select(select.clone());
+    let stats = domain.stats();
+    let plan = PlanBuilder::new().build_with_schema(
+        &stmt,
+        Some(&domain.infoschema()),
+        current_db,
+        Some(stats.as_ref()),
+    )?;
+    let exec = ExecutorBuilder::build(
+        &plan,
+        &stmt,
+        Arc::clone(domain),
+        current_db,
+        Arc::clone(txn),
+    )?;
+    ExecutorBuilder::run(exec)
+}
+
 fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {
     let mut rows = Vec::new();
     while let Some(chunk) = exec.next()? {
@@ -77,4 +220,8 @@ fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {
         }
     }
     Ok(rows)
+}
+
+fn row_key(row: &[Datum]) -> Vec<String> {
+    row.iter().map(Datum::display).collect()
 }
