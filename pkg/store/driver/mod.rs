@@ -79,6 +79,15 @@ impl Storage for TikvStorage {
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>> {
         self.begin_txn(true)
     }
+
+    fn current_timestamp(&self) -> Result<u64> {
+        use tikv_client::TimestampExt;
+        let ts = self
+            .rt
+            .block_on(self.client.current_timestamp())
+            .map_err(map_tikv_err)?;
+        Ok(ts.version())
+    }
 }
 
 struct TikvTransaction {

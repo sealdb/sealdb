@@ -9,6 +9,7 @@ use sealdb_errno::Result;
 use sealdb_kv::{MemStorage, Storage};
 use std::sync::Arc;
 
+pub use copr::{KeyRange, split_key_ranges};
 pub use driver::TikvStorage as TikvStore;
 
 pub fn open(cfg: &Config) -> Result<Arc<dyn Storage>> {
@@ -33,6 +34,28 @@ mod tests {
         txn.commit().unwrap();
         let mut read = storage.begin().unwrap();
         assert_eq!(read.get(b"sealdb:mem:k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_mem_current_timestamp_monotonic() {
+        let storage = open(&Config::default()).unwrap();
+        let a = storage.current_timestamp().unwrap();
+        let b = storage.current_timestamp().unwrap();
+        assert!(b > a, "expected monotonic TSO-like counter, got {a} then {b}");
+    }
+
+    #[test]
+    fn test_tikv_current_timestamp_if_available() {
+        let store = match TikvStorage::connect(&["127.0.0.1:2379".to_string()]) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("skip live tikv tso: {err}");
+                return;
+            }
+        };
+        let a = store.current_timestamp().unwrap();
+        let b = store.current_timestamp().unwrap();
+        assert!(b >= a, "PD TSO should be non-decreasing, got {a} then {b}");
     }
 
     #[test]

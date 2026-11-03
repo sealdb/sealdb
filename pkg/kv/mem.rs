@@ -80,6 +80,12 @@ impl Storage for MemStorage {
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>> {
         self.begin_txn(true)
     }
+
+    fn current_timestamp(&self) -> Result<u64> {
+        let mut store = self.store.lock().expect("mem kv");
+        store.next_ts += 1;
+        Ok(store.next_ts)
+    }
 }
 
 /// Buffered write state captured by `SAVEPOINT`.
