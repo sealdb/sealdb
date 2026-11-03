@@ -24,7 +24,7 @@ flowchart TB
     DDL[pkg/ddl<br/>在线 DDL（后置）]
     STAT[pkg/statistics<br/>直方图/基数]
   end
-  subgraph Storage["保持原样，不修改"]
+  subgraph Storage["仅 PD + TiKV（不修改、不另起引擎）"]
     PD[PD<br/>TSO / Region / 调度]
     TIKV[TiKV<br/>KV / Coprocessor / 2PC]
   end
