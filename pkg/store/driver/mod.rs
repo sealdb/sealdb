@@ -2,14 +2,19 @@
 /// import `tikv-client` types; they talk to `sealdb_kv::Storage` only.
 /// Completeness wave: coprocessor, async/pipelined commit, stale read, GC,
 /// Region cache. Pessimistic begin + `get_for_update` is leftover-closed.
+/// READ COMMITTED `refresh_snapshot` uses a fresh PD TSO snapshot for plain
+/// reads while keeping the underlying txn buffer for writes/locks.
 use sealdb_errno::{
     ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR,
     ERR_WRITE_CONFLICT, Error, Result,
 };
 use sealdb_kv::{Storage, Transaction};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tikv_client::{Key, KvPair, Transaction as TikvTxn, TransactionClient};
+use tikv_client::{
+    Key, KvPair, Snapshot, Transaction as TikvTxn, TransactionClient, TransactionOptions,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const SCAN_LIMIT: u32 = 1024;
@@ -57,8 +62,11 @@ impl TikvStorage {
         };
         Ok(Box::new(TikvTransaction {
             inner: Some(txn),
+            client: self.client.clone(),
             rt: Arc::clone(&self.rt),
             pessimistic,
+            read_snapshot: None,
+            writes: HashMap::new(),
         }))
     }
 }
@@ -75,8 +83,13 @@ impl Storage for TikvStorage {
 
 struct TikvTransaction {
     inner: Option<TikvTxn>,
+    client: TransactionClient,
     rt: Arc<tokio::runtime::Runtime>,
     pessimistic: bool,
+    /// When set (RC after `refresh_snapshot`), plain get/scan read at this TS.
+    read_snapshot: Option<Snapshot>,
+    /// Own writes so RC snapshot reads still see uncommitted mutations.
+    writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl TikvTransaction {
@@ -88,6 +101,10 @@ impl TikvTransaction {
         self.inner = Some(txn);
     }
 
+    fn overlay_get(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.writes.get(key).cloned()
+    }
+
     fn scan_pairs(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if end <= start {
             return Ok(Vec::new());
@@ -97,13 +114,20 @@ impl TikvTransaction {
         loop {
             let range_end = end.to_vec();
             let range_start = cursor.clone();
-            let mut txn = self.take_txn()?;
-            let pairs = self
-                .rt
-                .block_on(txn.scan(Key::from(range_start)..Key::from(range_end), SCAN_LIMIT));
-            self.put_txn(txn);
-            let batch: Vec<(Vec<u8>, Vec<u8>)> =
-                pairs.map_err(map_tikv_err)?.map(pair_owned).collect();
+            let batch: Vec<(Vec<u8>, Vec<u8>)> = if let Some(snap) = self.read_snapshot.as_mut() {
+                let pairs = self.rt.block_on(snap.scan(
+                    Key::from(range_start)..Key::from(range_end),
+                    SCAN_LIMIT,
+                ));
+                pairs.map_err(map_tikv_err)?.map(pair_owned).collect()
+            } else {
+                let mut txn = self.take_txn()?;
+                let pairs = self
+                    .rt
+                    .block_on(txn.scan(Key::from(range_start)..Key::from(range_end), SCAN_LIMIT));
+                self.put_txn(txn);
+                pairs.map_err(map_tikv_err)?.map(pair_owned).collect()
+            };
             let n = batch.len();
             for pair in batch {
                 out.push(pair);
@@ -119,15 +143,34 @@ impl TikvTransaction {
                 break;
             }
         }
+        // Apply local overlay within [start, end): drop scanned keys we
+        // mutated, then insert non-deleted overlay entries.
+        out.retain(|(k, _)| !self.writes.contains_key(k));
+        for (key, value) in &self.writes {
+            if key.as_slice() < start || key.as_slice() >= end {
+                continue;
+            }
+            if let Some(v) = value {
+                out.push((key.clone(), v.clone()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 }
 
 impl Transaction for TikvTransaction {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let key = key.to_vec();
+        if let Some(overlay) = self.overlay_get(key) {
+            return Ok(overlay);
+        }
+        let key_owned = key.to_vec();
+        if let Some(snap) = self.read_snapshot.as_mut() {
+            let out = self.rt.block_on(snap.get(key_owned));
+            return out.map_err(map_tikv_err);
+        }
         let mut txn = self.take_txn()?;
-        let out = self.rt.block_on(txn.get(key));
+        let out = self.rt.block_on(txn.get(key_owned));
         self.put_txn(txn);
         out.map_err(map_tikv_err)
     }
@@ -135,6 +178,7 @@ impl Transaction for TikvTransaction {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let key = key.to_vec();
         let value = value.to_vec();
+        self.writes.insert(key.clone(), Some(value.clone()));
         let mut txn = self.take_txn()?;
         let out = self.rt.block_on(txn.put(key, value));
         self.put_txn(txn);
@@ -143,6 +187,7 @@ impl Transaction for TikvTransaction {
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         let key = key.to_vec();
+        self.writes.insert(key.clone(), None);
         let mut txn = self.take_txn()?;
         let out = self.rt.block_on(txn.delete(key));
         self.put_txn(txn);
@@ -154,6 +199,14 @@ impl Transaction for TikvTransaction {
     }
 
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(overlay) = self.overlay_get(key) {
+            // Still take the pessimistic lock on the live key.
+            let key_owned = key.to_vec();
+            let mut txn = self.take_txn()?;
+            let _ = self.rt.block_on(txn.get_for_update(key_owned));
+            self.put_txn(txn);
+            return Ok(overlay);
+        }
         let key = key.to_vec();
         let mut txn = self.take_txn()?;
         let out = self.rt.block_on(txn.get_for_update(key));
@@ -182,6 +235,8 @@ impl Transaction for TikvTransaction {
 
     fn commit(&mut self) -> Result<()> {
         let mut txn = self.inner.take().ok_or_else(finished_txn)?;
+        self.read_snapshot = None;
+        self.writes.clear();
         self.rt
             .block_on(txn.commit())
             .map(|_| ())
@@ -189,6 +244,8 @@ impl Transaction for TikvTransaction {
     }
 
     fn rollback(&mut self) -> Result<()> {
+        self.read_snapshot = None;
+        self.writes.clear();
         let Some(mut txn) = self.inner.take() else {
             return Ok(());
         };
@@ -196,14 +253,24 @@ impl Transaction for TikvTransaction {
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
-        // Completeness wave: TiKV READ COMMITTED statement snapshot (new
-        // start_ts without dropping buffered writes).
+        // RC statement snapshot: new PD TSO for subsequent plain reads.
+        // Writes stay in `writes` + the underlying txn buffer.
+        let ts = self
+            .rt
+            .block_on(self.client.current_timestamp())
+            .map_err(map_tikv_err)?;
+        self.read_snapshot = Some(
+            self.client
+                .snapshot(ts, TransactionOptions::default().read_only()),
+        );
         Ok(())
     }
 }
 
 impl Drop for TikvTransaction {
     fn drop(&mut self) {
+        self.read_snapshot = None;
+        self.writes.clear();
         if let Some(mut txn) = self.inner.take() {
             let _ = self.rt.block_on(txn.rollback());
         }
@@ -239,5 +306,51 @@ fn map_tikv_err(err: tikv_client::Error) -> Error {
         Error::new(ERR_LOCK_WAIT_TIMEOUT, msg)
     } else {
         Error::new(ERR_UNKNOWN_ERROR, format!("tikv: {msg}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tikv_rc_refresh_snapshot_if_available() {
+        let store = match TikvStorage::connect(&["127.0.0.1:2379".to_string()]) {
+            Ok(store) => store,
+            Err(err) => {
+                eprintln!("skip live tikv rc refresh: {err}");
+                return;
+            }
+        };
+        let key = format!(
+            "sealdb:test:rc:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+        .into_bytes();
+
+        let mut setup = store.begin().unwrap();
+        setup.set(&key, b"v1").unwrap();
+        setup.commit().unwrap();
+
+        let mut a = store.begin().unwrap();
+        a.refresh_snapshot().unwrap();
+        assert_eq!(a.get(&key).unwrap(), Some(b"v1".to_vec()));
+
+        let mut b = store.begin().unwrap();
+        b.set(&key, b"v2").unwrap();
+        b.commit().unwrap();
+
+        // Without refresh, RR-style txn start_ts would still see v1; after
+        // refresh, RC reads at a new PD TSO and must observe v2.
+        a.refresh_snapshot().unwrap();
+        assert_eq!(a.get(&key).unwrap(), Some(b"v2".to_vec()));
+        a.rollback().unwrap();
+
+        let mut cleanup = store.begin().unwrap();
+        cleanup.delete(&key).unwrap();
+        cleanup.commit().unwrap();
     }
 }

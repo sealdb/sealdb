@@ -110,6 +110,19 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-C TiKV RC `refresh_snapshot`
+- **完成**:
+  - `pkg/store/driver`：READ COMMITTED 用 PD TSO 换新 `Snapshot` 做普通读；本地 write overlay 保留本事务未提交写
+  - 驱动级 skip-if-no-PD：`test_tikv_rc_refresh_snapshot_if_available`
+  - 会话级既有：`test_tikv_cross_session_same_cluster_if_available`（SEALDB_TIKV=1）覆盖 RC 可见性
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+  - `cargo test -q -p sealdb-session --lib schema_checker_and_read_committed`
+- **下一步**:
+  - C6-C 续：`batch_get` / Coprocessor DAG / Region 定位面，或算层包文件对齐
+
+### 2026-11-03
+
 - **Phase**: C6-B PlanBuilder stmt 面收口
 - **完成**:
   - stats：`LOAD/LOCK/UNLOCK STATS` no-op
