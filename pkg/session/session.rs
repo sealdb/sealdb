@@ -298,7 +298,6 @@ impl Session {
             | Statement::UnlockStats(_)
             | Statement::Trace(_)
             | Statement::PlanReplayer(_)
-            | Statement::BRIE(_)
             | Statement::ImportInto(_)
             | Statement::SplitRegion(_)
             | Statement::DistributeTable(_)
@@ -315,6 +314,9 @@ impl Session {
             | Statement::AddQueryWatch(_)
             | Statement::DropQueryWatch(_) => {
                 return Ok(empty_result());
+            }
+            Statement::BRIE(brie) => {
+                return crate::brie::execute_brie(self, &brie.raw_sql);
             }
             Statement::SetRole(set) => {
                 let user = self.current_user();
@@ -6702,5 +6704,53 @@ mod tests {
                 && r.get(3).map(|t| t.as_str()) == Some("cop")),
             "{analyze_text}"
         );
+    }
+
+    #[test]
+    fn test_brie_local_backup_restore() {
+        let dir = std::env::temp_dir().join(format!(
+            "sealdb-brie-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("backup.json");
+        let path_str = path.to_string_lossy().into_owned();
+
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE brie_db").unwrap();
+        session
+            .execute_stmt("CREATE TABLE brie_db.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO brie_db.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let backup = session
+            .execute_stmt(&format!("BACKUP DATABASE brie_db TO '{path_str}'"))
+            .unwrap();
+        assert_eq!(backup.display_rows()[0][0], "Backup");
+        assert_eq!(backup.display_rows()[0][2], "OK");
+
+        session.execute_stmt("DROP TABLE brie_db.t").unwrap();
+        let gone = session.execute_stmt("SELECT * FROM brie_db.t").unwrap_err();
+        assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+
+        let restore = session
+            .execute_stmt(&format!("RESTORE DATABASE FROM '{path_str}'"))
+            .unwrap();
+        assert_eq!(restore.display_rows()[0][0], "Restore");
+        let rows = session
+            .execute_stmt("SELECT * FROM brie_db.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
