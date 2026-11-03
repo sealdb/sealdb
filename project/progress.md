@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-B PlanBuilder stmt 面收口；下一步 C6-C PD/TiKV 全量客户端）  
+> 最后更新：2026-11-03（C6-C PD Region locate + TableReader/Index 扫描切分；下一步 Cop DAG / 包文件对齐）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | B stmt 面收口；下一步 C(PD+TiKV)→D(TiFlash) |
+| C6 | `in-progress` | C：PD TSO/Region locate/batch_get/RC；下一步 Cop DAG→D(TiFlash) |
 
 ---
 
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C PD Region locate
+- **完成**:
+  - `split_key_ranges_via_pd`：PD HTTP `/pd/api/v1/region/key/{hex}` 行走 Region 边界
+  - `store::open(Tikv)` 登记 PD endpoints；`split_key_ranges_for_scan` 供 TableReader/IndexLookUp/IndexMerge
+  - PD 失败回退单段；`TikvStorage::split_key_ranges` 暴露同路径
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`（含 `test_split_key_ranges_via_pd_if_available`）
+  - `cargo check -p sealdb-executor`
+- **下一步**:
+  - Coprocessor DAG / tipb；algorithm=TEMPTABLE；算层包文件对齐
 
 ### 2026-11-03
 

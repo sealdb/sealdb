@@ -142,8 +142,8 @@ pub(crate) fn scan_table(
         for physical_id in physical_ids {
             let start = gen_table_record_prefix(*physical_id);
             let end = next_prefix(start.as_bytes());
-            // Region-aware split (MVB: one range until driver locate lands).
-            for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+            // Region-aware split via PD when store::open configured Tikv endpoints.
+            for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
                 let pairs = txn.scan_locked(&range.start, &range.end, lock, wait)?;
                 rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
             }
