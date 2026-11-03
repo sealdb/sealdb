@@ -110,6 +110,17 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-C PD TSO surface + copr KeyRange MVB
+- **完成**:
+  - `Storage::current_timestamp`：Mem 单调计数；TiKV 调 PD TSO
+  - `pkg/store/copr`：`KeyRange` + `split_key_ranges` 单段 MVB（Region 切分待 locate API）
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+- **下一步**:
+  - C6-C 续：Region locate / Cop DAG tipb，或算层包文件对齐
+
+### 2026-11-03
+
 - **Phase**: C6-C TiKV `batch_get` + BatchPointGet
 - **完成**:
   - `sealdb_kv::Transaction::{batch_get,batch_get_for_update}`；TiKV 走 RPC，默认回退逐 key

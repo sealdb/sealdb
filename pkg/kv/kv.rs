@@ -32,6 +32,11 @@ pub enum LockWait {
 pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>>;
+    /// Logical timestamp for snapshot / RC refresh. TiKV uses PD TSO;
+    /// MemStorage returns a monotonic local counter.
+    fn current_timestamp(&self) -> Result<u64> {
+        Err(Error::unsupported("current_timestamp"))
+    }
 }
 
 pub trait Transaction: Send {
