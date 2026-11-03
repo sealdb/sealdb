@@ -1739,6 +1739,26 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
                 expand_views_in_select(select, is, current_db)?;
             }
         }
+        Statement::Update(update) => {
+            if update.join.is_none() {
+                rewrite_updatable_view_target(
+                    &mut update.table,
+                    &mut update.selection,
+                    is,
+                    current_db,
+                )?;
+            }
+        }
+        Statement::Delete(delete) => {
+            if delete.join.is_none() && delete.tables.is_empty() {
+                rewrite_updatable_view_target(
+                    &mut delete.table,
+                    &mut delete.selection,
+                    is,
+                    current_db,
+                )?;
+            }
+        }
         Statement::SetOpr(set) => {
             expand_views_in_select(&mut set.first, is, current_db)?;
             for (_, select) in &mut set.rest {
@@ -1756,6 +1776,58 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Simple updatable VIEW: single-table SELECT (no JOIN/GROUP BY). Rewrite the
+/// DML target to the base table and AND the view WHERE into the statement.
+fn rewrite_updatable_view_target(
+    table: &mut TableName,
+    selection: &mut Option<ExprNode>,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    use sealdb_parser::ast::expressions::BinaryOpExpr;
+    use sealdb_parser::opcode::Op;
+
+    let (schema, name) = table.qualified(current_db);
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let Some(info) = is.table_by_name(&schema, &name) else {
+        return Ok(());
+    };
+    let Some(view) = &info.view else {
+        return Ok(());
+    };
+    let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
+    let Statement::Select(view_select) = parsed else {
+        return Err(sealdb_errno::Error::unsupported(
+            "VIEW definition must be SELECT",
+        ));
+    };
+    if !view_select.joins.is_empty()
+        || view_select.from.is_none()
+        || !view_select.group_by.is_empty()
+        || view_select.having.is_some()
+        || view_select.with.is_some()
+    {
+        return Err(sealdb_errno::Error::unsupported(format!(
+            "VIEW `{schema}`.`{name}` is not updatable"
+        )));
+    }
+    let base = view_select.from.expect("checked above");
+    if let Some(view_where) = view_select.selection {
+        *selection = Some(match selection.take() {
+            Some(user_where) => ExprNode::Binary(BinaryOpExpr {
+                op: Op::LogicAnd,
+                left: Box::new(view_where),
+                right: Box::new(user_where),
+            }),
+            None => view_where,
+        });
+    }
+    *table = base;
     Ok(())
 }
 
@@ -2506,6 +2578,42 @@ mod tests {
         session.execute_stmt("DROP VIEW db1.v").unwrap();
         let gone = session.execute_stmt("SELECT * FROM db1.v").unwrap_err();
         assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+    }
+
+    #[test]
+    fn test_simple_updatable_view_update_delete() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        session
+            .execute_stmt("CREATE VIEW db1.v AS SELECT id, name FROM db1.t WHERE id = 1")
+            .unwrap();
+        session
+            .execute_stmt("UPDATE db1.v SET name = 'x'")
+            .unwrap();
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "x".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        session.execute_stmt("DELETE FROM db1.v").unwrap();
+        let left = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            left.display_rows(),
+            vec![vec!["2".to_string(), "b".to_string()]]
+        );
     }
 
     #[test]

@@ -110,6 +110,16 @@
 
 ### 2026-11-03
 
+- **Phase**: C6 简单可更新 VIEW
+- **完成**:
+  - 单表无 JOIN/GROUP BY 的 VIEW：`UPDATE`/`DELETE` 改写到基表并 AND 视图 WHERE
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_simple_updatable_view_update_delete`
+- **下一步**:
+  - WITH CHECK OPTION / algorithm=TEMPTABLE；Region locate / Cop DAG
+
+### 2026-11-03
+
 - **Phase**: C6-C TableReader/IndexLookUp 走 copr split
 - **完成**:
   - `TableReaderExec` / `IndexLookUp` / `IndexMerge` 扫描经 `sealdb_store::split_key_ranges`
