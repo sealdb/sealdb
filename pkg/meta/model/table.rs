@@ -8,6 +8,34 @@ use serde::{Deserialize, Serialize};
 
 pub const CURR_LATEST_TABLE_INFO_VERSION: u16 = 5;
 
+/// TiDB `model.ViewInfo` — metadata for a VIEW (select text + security attrs).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewInfo {
+    #[serde(default = "default_view_algorithm")]
+    pub algorithm: String,
+    #[serde(default)]
+    pub definer: String,
+    #[serde(default = "default_view_security")]
+    pub security: String,
+    pub select_stmt: String,
+    #[serde(default = "default_view_check_option")]
+    pub check_option: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cols: Vec<CIStr>,
+}
+
+fn default_view_algorithm() -> String {
+    "UNDEFINED".to_string()
+}
+
+fn default_view_security() -> String {
+    "DEFINER".to_string()
+}
+
+fn default_view_check_option() -> String {
+    "CASCADED".to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TableInfo {
     pub id: i64,
@@ -28,6 +56,8 @@ pub struct TableInfo {
     pub max_idx_id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<PartitionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewInfo>,
 }
 
 impl TableInfo {
@@ -46,7 +76,12 @@ impl TableInfo {
             max_col_id,
             max_idx_id: 0,
             partition: None,
+            view: None,
         }
+    }
+
+    pub fn is_view(&self) -> bool {
+        self.view.is_some()
     }
 
     pub fn find_index_covering(&self, column: &str) -> Option<&IndexInfo> {

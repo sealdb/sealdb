@@ -1,9 +1,9 @@
 use super::dialect::dialect;
 use crate::ast::ddl::{
     AlterDatabaseStmt, AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition,
-    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, DropDatabaseStmt, DropIndexStmt,
-    DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType, TableName,
-    TruncateTableStmt,
+    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DropDatabaseStmt,
+    DropIndexStmt, DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType,
+    TableName, TruncateTableStmt,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -32,10 +32,11 @@ use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
-    BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized,
-    DataType, Delete, DescribeAlias, DuplicateTreatment, Expr, FlushType, FromTable, Function,
-    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects,
-    GranteeName, GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
+    BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
+    CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
+    DescribeAlias, DuplicateTreatment, Expr, FlushType, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
+    GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
     LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
     NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
     OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
@@ -182,6 +183,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             name: schema_name_last(schema_name)?,
         })),
         SqlStatement::CreateTable(create) => lower_create_table(create),
+        SqlStatement::CreateView(create) => lower_create_view(create),
         SqlStatement::CreateIndex(create) => lower_create_index(create),
         SqlStatement::Truncate(truncate) => lower_truncate(truncate),
         SqlStatement::Drop {
@@ -234,6 +236,15 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         .iter()
                         .map(object_table_name)
                         .collect::<Result<Vec<_>>>()?,
+                    is_view: false,
+                })),
+                ObjectType::View => Ok(Statement::DropTable(DropTableStmt {
+                    if_exists: *if_exists,
+                    tables: names
+                        .iter()
+                        .map(object_table_name)
+                        .collect::<Result<Vec<_>>>()?,
+                    is_view: true,
                 })),
                 ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
                     if_exists: *if_exists,
@@ -280,6 +291,16 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 }))
             }
         }
+        SqlStatement::ShowCreate {
+            obj_type: ShowCreateObject::View,
+            obj_name,
+        } => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::CreateView,
+            db_name: None,
+            table: Some(object_table_name(obj_name)?),
+            user: None,
+            full: false,
+        })),
         SqlStatement::ShowDatabases { .. } | SqlStatement::ShowSchemas { .. } => {
             Ok(Statement::Show(ShowStmt {
                 kind: ShowStmtKind::Databases,
@@ -4178,6 +4199,76 @@ fn lower_truncate(truncate: &sqlparser::ast::Truncate) -> Result<Statement> {
     }
     Ok(Statement::TruncateTable(TruncateTableStmt {
         table: object_table_name(&target.name)?,
+    }))
+}
+
+fn lower_create_view(create: &CreateView) -> Result<Statement> {
+    if create.materialized {
+        return Err(Error::unsupported("CREATE MATERIALIZED VIEW"));
+    }
+    if create.temporary {
+        return Err(Error::unsupported("CREATE TEMPORARY VIEW"));
+    }
+    if create.if_not_exists {
+        return Err(Error::unsupported("CREATE VIEW IF NOT EXISTS"));
+    }
+    let mut select = lower_query(&create.query)?;
+    // Keep restore text for ViewInfo.select_stmt persistence.
+    let mut ctx = crate::format::RestoreCtx::new();
+    select.restore(&mut ctx)?;
+    select.text = ctx.into_string();
+    let (algorithm, definer, security) = match &create.params {
+        Some(params) => {
+            let algorithm = params
+                .algorithm
+                .as_ref()
+                .map(|a| match a {
+                    CreateViewAlgorithm::Undefined => "UNDEFINED",
+                    CreateViewAlgorithm::Merge => "MERGE",
+                    CreateViewAlgorithm::TempTable => "TEMPTABLE",
+                })
+                .unwrap_or("UNDEFINED")
+                .to_string();
+            let definer = params
+                .definer
+                .as_ref()
+                .map(|d| match d {
+                    GranteeName::UserHost { user, host } => {
+                        format!("`{}`@`{}`", user.value, host.value)
+                    }
+                    GranteeName::ObjectName(name) => name.to_string(),
+                })
+                .unwrap_or_else(|| "CURRENT_USER".to_string());
+            let security = params
+                .security
+                .as_ref()
+                .map(|s| match s {
+                    CreateViewSecurity::Definer => "DEFINER",
+                    CreateViewSecurity::Invoker => "INVOKER",
+                })
+                .unwrap_or("DEFINER")
+                .to_string();
+            (algorithm, definer, security)
+        }
+        None => (
+            "UNDEFINED".to_string(),
+            "CURRENT_USER".to_string(),
+            "DEFINER".to_string(),
+        ),
+    };
+    Ok(Statement::CreateView(CreateViewStmt {
+        or_replace: create.or_replace,
+        view_name: object_table_name(&create.name)?,
+        cols: create
+            .columns
+            .iter()
+            .map(|col| col.name.value.clone())
+            .collect(),
+        select: Box::new(select),
+        algorithm,
+        definer,
+        security,
+        check_option: "CASCADED".to_string(),
     }))
 }
 

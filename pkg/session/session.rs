@@ -8,7 +8,8 @@ use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{
-    InsertStmt, IsolationLevel as AstIsolation, PrivilegeType, SetVarScope, Statement, UserIdentity,
+    CommonTableExpression, CteMaterialize, InsertStmt, IsolationLevel as AstIsolation,
+    PrivilegeType, SelectStmt, SetVarScope, Statement, UserIdentity,
 };
 use sealdb_parser::charset::Collation;
 use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
@@ -461,6 +462,7 @@ impl Session {
             | Statement::DropDatabase(_)
             | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
+            | Statement::CreateView(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
@@ -516,7 +518,9 @@ impl Session {
         };
         // Apply CREATE BINDING rewrite before plan build (MVB: substitute bind SQL).
         let rebound = self.apply_sql_binding(stmt)?;
-        let stmt = rebound.as_ref().unwrap_or(stmt);
+        let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
+        expand_views(&mut expanded, &is, &current_db)?;
+        let stmt = &expanded;
         check_only_full_group_by(self, stmt)?;
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
@@ -922,6 +926,36 @@ impl Session {
                             PrivilegeType::SELECT,
                         )?;
                     }
+                }
+            }
+            Statement::CreateView(create) => {
+                require(
+                    &mgr,
+                    &user,
+                    &roles,
+                    &create.view_name,
+                    &current_db,
+                    PrivilegeType::CREATE,
+                )?;
+                if let Some(from) = &create.select.from {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        from,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
+                }
+                for table in create.select.join_tables() {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
             }
             Statement::CreateIndex(create) => {
@@ -1596,6 +1630,9 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
             (keys, false)
         }
         Statement::CreateTable(create) => (vec![mdl_table_key(&create.table, current_db)], true),
+        Statement::CreateView(create) => {
+            (vec![mdl_table_key(&create.view_name, current_db)], true)
+        }
         Statement::DropTable(drop) => (
             drop.tables
                 .iter()
@@ -1623,6 +1660,7 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::DropDatabase(_)
             | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
+            | Statement::CreateView(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
@@ -1641,6 +1679,122 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::LockTables(_)
             | Statement::CleanupTableLock(_)
     )
+}
+
+/// Expand VIEW references into CTEs so planner/executor reuse derived-table paths.
+fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Result<()> {
+    match stmt {
+        Statement::Select(select) => expand_views_in_select(select, is, current_db)?,
+        Statement::Insert(insert) => {
+            if let Some(select) = insert.select.as_mut() {
+                expand_views_in_select(select, is, current_db)?;
+            }
+        }
+        Statement::SetOpr(set) => {
+            expand_views_in_select(&mut set.first, is, current_db)?;
+            for (_, select) in &mut set.rest {
+                expand_views_in_select(select, is, current_db)?;
+            }
+        }
+        Statement::Explain(explain) => expand_views(&mut explain.stmt, is, current_db)?,
+        Statement::CreateView(create) => {
+            expand_views_in_select(&mut create.select, is, current_db)?;
+        }
+        Statement::CreateTable(create) => {
+            if let Some(select) = create.select.as_mut() {
+                expand_views_in_select(select, is, current_db)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn expand_views_in_select(select: &mut SelectStmt, is: &InfoSchema, current_db: &str) -> Result<()> {
+    if let Some(with) = select.with.as_mut() {
+        for cte in &mut with.ctes {
+            expand_views_in_select(&mut cte.query, is, current_db)?;
+            for (_, arm) in &mut cte.set_rest {
+                expand_views_in_select(arm, is, current_db)?;
+            }
+            if let Some((_, rec)) = cte.recursive.as_mut() {
+                expand_views_in_select(rec, is, current_db)?;
+            }
+        }
+    }
+    let refs: Vec<TableName> = select.join_tables().into_iter().cloned().collect();
+    for table in refs {
+        inject_view_cte(select, &table, is, current_db)?;
+    }
+    Ok(())
+}
+
+fn inject_view_cte(
+    select: &mut SelectStmt,
+    table: &TableName,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, name) = table.qualified(current_db);
+    if schema.is_empty() {
+        return Ok(());
+    }
+    if named_cte_exists(select.with.as_ref(), &name) {
+        return Ok(());
+    }
+    let Some(info) = is.table_by_name(&schema, &name) else {
+        return Ok(());
+    };
+    let Some(view) = &info.view else {
+        return Ok(());
+    };
+    let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
+    let Statement::Select(mut view_select) = parsed else {
+        return Err(sealdb_errno::Error::unsupported(
+            "VIEW definition must be SELECT",
+        ));
+    };
+    expand_views_in_select(&mut view_select, is, current_db)?;
+    let mut ctes = select
+        .with
+        .take()
+        .map(|w| w.ctes)
+        .unwrap_or_default();
+    ctes.push(CommonTableExpression {
+        name: name.clone(),
+        query: Box::new(view_select),
+        col_name_list: view.cols.iter().map(|c| c.o().to_string()).collect(),
+        recursive: None,
+        set_rest: Vec::new(),
+        materialize: CteMaterialize::Default,
+    });
+    select.with = Some(sealdb_parser::ast::WithClause {
+        is_recursive: false,
+        ctes,
+    });
+    // CTE names are unqualified; strip schema so planner hits the injected CTE.
+    strip_table_schema(select, &name);
+    Ok(())
+}
+
+fn strip_table_schema(select: &mut SelectStmt, name: &str) {
+    if let Some(from) = select.from.as_mut()
+        && from.name.eq_ignore_ascii_case(name)
+    {
+        from.schema = None;
+    }
+    for join in &mut select.joins {
+        if join.left.name.eq_ignore_ascii_case(name) {
+            join.left.schema = None;
+        }
+        if join.right.name.eq_ignore_ascii_case(name) {
+            join.right.schema = None;
+        }
+    }
+}
+
+fn named_cte_exists(with: Option<&sealdb_parser::ast::WithClause>, name: &str) -> bool {
+    with.is_some_and(|w| w.find(name).is_some())
 }
 
 impl Session {
@@ -2011,6 +2165,51 @@ mod tests {
                 .display_rows()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_create_drop_view_select() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        session
+            .execute_stmt("CREATE VIEW db1.v AS SELECT id, name FROM db1.t WHERE id = 1")
+            .unwrap();
+        let rows = session.execute_stmt("SELECT * FROM db1.v").unwrap();
+        assert_eq!(rows.columns, vec!["id", "name"]);
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let is_views = session
+            .execute_stmt(
+                "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.views WHERE TABLE_SCHEMA = 'db1'",
+            )
+            .unwrap();
+        assert_eq!(is_views.display_rows()[0][0], "v");
+        assert!(
+            is_views.display_rows()[0][1].contains("SELECT"),
+            "view definition: {}",
+            is_views.display_rows()[0][1]
+        );
+        let show = session.execute_stmt("SHOW CREATE VIEW db1.v").unwrap();
+        assert_eq!(show.columns, vec!["View", "Create View"]);
+        assert!(show.display_rows()[0][1].contains("CREATE ALGORITHM="));
+        session
+            .execute_stmt("CREATE OR REPLACE VIEW db1.v AS SELECT id FROM db1.t WHERE id = 2")
+            .unwrap();
+        let replaced = session.execute_stmt("SELECT * FROM db1.v").unwrap();
+        assert_eq!(replaced.display_rows(), vec![vec!["2".to_string()]]);
+        let err = session.execute_stmt("DROP TABLE db1.v").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_WRONG_OBJECT);
+        session.execute_stmt("DROP VIEW db1.v").unwrap();
+        let gone = session.execute_stmt("SELECT * FROM db1.v").unwrap_err();
+        assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
     }
 
     #[test]

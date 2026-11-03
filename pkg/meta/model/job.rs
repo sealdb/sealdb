@@ -82,13 +82,21 @@ impl Job {
                 let (db, table) = s.table.qualified(current_db);
                 ("create table", db, table)
             }
+            Statement::CreateView(s) => {
+                let (db, table) = s.view_name.qualified(current_db);
+                ("create view", db, table)
+            }
             Statement::DropTable(s) => {
                 let (db, table) = s
                     .tables
                     .first()
                     .map(|t| t.qualified(current_db))
                     .unwrap_or_else(|| (current_db.to_string(), String::new()));
-                ("drop table", db, table)
+                if s.is_view {
+                    ("drop view", db, table)
+                } else {
+                    ("drop table", db, table)
+                }
             }
             Statement::TruncateTable(s) => {
                 let (db, table) = s.table.qualified(current_db);

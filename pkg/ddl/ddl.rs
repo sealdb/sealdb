@@ -1,4 +1,4 @@
-use crate::{alter, index, schema, table};
+use crate::{alter, index, schema, table, view};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -24,6 +24,9 @@ pub fn execute_ddl(
         }
         Statement::CreateTable(s) => {
             table::create_table(meta, is, s, current_db)?;
+        }
+        Statement::CreateView(s) => {
+            view::create_view(meta, is, s, current_db)?;
         }
         Statement::DropTable(s) => {
             table::drop_table(meta, is, s, current_db)?;

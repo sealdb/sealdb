@@ -18,14 +18,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "collations" => Ok(collations()),
         "collation_character_set_applicability" => Ok(collation_applicability()),
         "engines" => Ok(engines()),
-        "views" => Ok(empty(&[
-            "TABLE_CATALOG",
-            "TABLE_SCHEMA",
-            "TABLE_NAME",
-            "VIEW_DEFINITION",
-            "CHECK_OPTION",
-            "IS_UPDATABLE",
-        ])),
+        "views" => Ok(views(is)),
         "referential_constraints" => Ok(empty(&[
             "CONSTRAINT_SCHEMA",
             "CONSTRAINT_NAME",
@@ -89,12 +82,17 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
+        let (table_type, engine) = if table.is_view() {
+            ("VIEW", "")
+        } else {
+            ("BASE TABLE", "InnoDB")
+        };
         rows.push(vec![
             bytes("def"),
             bytes(db),
             bytes(table.name.o()),
-            bytes("BASE TABLE"),
-            bytes("InnoDB"),
+            bytes(table_type),
+            bytes(engine),
         ]);
     });
     (schema, rows)
@@ -383,6 +381,32 @@ fn engines() -> (Vec<String>, Vec<Vec<Datum>>) {
             bytes("YES"),
         ]],
     )
+}
+
+fn views(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec![
+        "TABLE_CATALOG".to_string(),
+        "TABLE_SCHEMA".to_string(),
+        "TABLE_NAME".to_string(),
+        "VIEW_DEFINITION".to_string(),
+        "CHECK_OPTION".to_string(),
+        "IS_UPDATABLE".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for_each_table(is, |db, table| {
+        let Some(view) = &table.view else {
+            return;
+        };
+        rows.push(vec![
+            bytes("def"),
+            bytes(db),
+            bytes(table.name.o()),
+            bytes(&view.select_stmt),
+            bytes(&view.check_option),
+            bytes("NO"),
+        ]);
+    });
+    (schema, rows)
 }
 
 fn empty(cols: &[&str]) -> (Vec<String>, Vec<Vec<Datum>>) {

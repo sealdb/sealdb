@@ -137,6 +137,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_drop_view() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("CREATE VIEW db1.v AS SELECT id FROM db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateView(stmt) => {
+                assert!(!stmt.or_replace);
+                assert_eq!(stmt.view_name.schema.as_deref(), Some("db1"));
+                assert_eq!(stmt.view_name.name, "v");
+                assert_eq!(stmt.algorithm, "UNDEFINED");
+                assert!(!stmt.select.text.is_empty());
+            }
+            other => panic!("expected CreateViewStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE OR REPLACE VIEW v (a) AS SELECT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateView(stmt) => {
+                assert!(stmt.or_replace);
+                assert_eq!(stmt.cols, vec!["a".to_string()]);
+            }
+            other => panic!("expected CreateViewStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("DROP VIEW IF EXISTS db1.v").unwrap() {
+            crate::ast::Statement::DropTable(stmt) => {
+                assert!(stmt.is_view);
+                assert!(stmt.if_exists);
+                assert_eq!(stmt.tables[0].name, "v");
+            }
+            other => panic!("expected DropTableStmt(is_view), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_do_flush_setpwd_shutdown_alter_db() {
         let parser = Parser::new();
         match parser.parse_one_stmt("DO 1, 2 + 3").unwrap() {
