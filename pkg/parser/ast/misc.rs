@@ -1129,3 +1129,69 @@ impl AlterInstanceStmt {
         Ok(())
     }
 }
+
+/// `TRACE [PLAN] [FORMAT=…] stmt` (TiDB `TraceStmt`) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct TraceStmt {
+    pub format: String,
+    pub trace_plan: bool,
+    pub stmt_sql: String,
+}
+
+impl TraceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("TRACE ");
+        if self.trace_plan {
+            ctx.write_str("PLAN ");
+        }
+        if !self.format.is_empty() && !self.format.eq_ignore_ascii_case("row") {
+            ctx.write_str("FORMAT = ");
+            ctx.write_str(&format!("'{}'", self.format));
+            ctx.write_str(" ");
+        }
+        ctx.write_str(&self.stmt_sql);
+        Ok(())
+    }
+}
+
+/// `PLAN REPLAYER LOAD/DUMP/CAPTURE …` (TiDB `PlanReplayerStmt`) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct PlanReplayerStmt {
+    pub load: bool,
+    pub capture: bool,
+    pub remove: bool,
+    pub analyze: bool,
+    pub file: String,
+    pub sql_digest: String,
+    pub plan_digest: String,
+    pub stmt_sql: String,
+}
+
+impl PlanReplayerStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if self.load {
+            ctx.write_str("PLAN REPLAYER LOAD ");
+            ctx.write_str(&format!("'{}'", self.file));
+            return Ok(());
+        }
+        if self.capture {
+            if self.remove {
+                ctx.write_str("PLAN REPLAYER CAPTURE REMOVE ");
+            } else {
+                ctx.write_str("PLAN REPLAYER CAPTURE ");
+            }
+            ctx.write_str(&format!("'{}' '{}'", self.sql_digest, self.plan_digest));
+            return Ok(());
+        }
+        ctx.write_str("PLAN REPLAYER DUMP ");
+        if self.analyze {
+            ctx.write_str("EXPLAIN ANALYZE ");
+        }
+        if !self.file.is_empty() {
+            ctx.write_str(&format!("'{}'", self.file));
+        } else {
+            ctx.write_str(&self.stmt_sql);
+        }
+        Ok(())
+    }
+}

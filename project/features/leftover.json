@@ -39,15 +39,7 @@
   "unmapped_allowlist": [],
   "open_stmts": [
     {
-      "stmt": "ast.TraceStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.ImportIntoStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.PlanReplayerStmt",
       "owner": "C6"
     },
     {

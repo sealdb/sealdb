@@ -235,6 +235,12 @@ impl PlanBuilder {
             Statement::UnlockStats(_) => Ok(PhysicalPlan::Simple {
                 kind: "UnlockStats".to_string(),
             }),
+            Statement::Trace(_) => Ok(PhysicalPlan::Simple {
+                kind: "Trace".to_string(),
+            }),
+            Statement::PlanReplayer(_) => Ok(PhysicalPlan::Simple {
+                kind: "PlanReplayer".to_string(),
+            }),
             Statement::RenameUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "RenameUser".to_string(),
             }),
