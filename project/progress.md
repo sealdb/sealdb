@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6 cascades 骨架；下一步 TableReader-via-Cop / BRIE）
+> 最后更新：2026-11-03（C6-C TableReader CopTask 调度；下一步 tipb chunk decode / BRIE）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C TableReader CopTask 调度
+- **完成**:
+  - `executor/cop_client`：按物理表构建 tipb TableScan CopTasks（Region 切分）
+  - TableReader 经 CopTask 本地 KV 执行；`SEALDB_USE_COP_RPC=1` 可探测 TiKV Cop RPC
+  - tipb chunk→Datum 解码仍待（远程结果尚未替代本地扫描）
+- **验证**:
+  - `cargo test -q -p sealdb-executor --lib`
+  - `cargo test -q -p sealdb-session --lib test_where_selection`
+- **下一步**:
+  - tipb chunk decode；BRIE 本地备份/恢复
 
 ### 2026-11-03
 

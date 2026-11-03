@@ -24,7 +24,7 @@ pub use dag::{
     decode_select_response, encode_table_scan_dag, Chunk, ColumnInfo, DagRequest, ExecType,
     Executor, IndexScan, Limit, SelectResponse, Selection, TableScan, TipbError, REQ_TYPE_DAG,
 };
-pub use rpc::execute_cop_task;
+pub use rpc::{execute_cop_task, execute_cop_task_blocking};
 pub use task::{build_table_scan_tasks, CopTask};
 
 use pd::{decode_pd_key, pd_get_region};
@@ -43,6 +43,14 @@ pub fn set_pd_endpoints(endpoints: Vec<String>) {
 /// Clear process PD endpoints (Mem store / tests).
 pub fn clear_pd_endpoints() {
     set_pd_endpoints(Vec::new());
+}
+
+/// Current process PD endpoints (empty for MemStorage).
+pub fn pd_endpoints() -> Vec<String> {
+    PD_ENDPOINTS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 /// Half-open key range `[start, end)`.
