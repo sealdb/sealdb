@@ -13,4 +13,4 @@ pub use job::{
     STATE_WRITE_ONLY, STATE_WRITE_REORGANIZATION, SchemaState,
 };
 pub use partition::{PartitionDefinition, PartitionInfo, PartitionType};
-pub use table::{TableInfo, ViewInfo};
+pub use table::{SequenceInfo, TableInfo, ViewInfo};

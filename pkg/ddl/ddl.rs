@@ -1,4 +1,4 @@
-use crate::{alter, index, schema, table, view};
+use crate::{alter, index, schema, sequence, table, view};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -27,6 +27,15 @@ pub fn execute_ddl(
         }
         Statement::CreateView(s) => {
             view::create_view(meta, is, s, current_db)?;
+        }
+        Statement::CreateSequence(s) => {
+            sequence::create_sequence(meta, is, s, current_db)?;
+        }
+        Statement::DropSequence(s) => {
+            sequence::drop_sequence(meta, is, s, current_db)?;
+        }
+        Statement::AlterSequence(s) => {
+            sequence::alter_sequence(meta, is, s, current_db)?;
         }
         Statement::DropTable(s) => {
             table::drop_table(meta, is, s, current_db)?;

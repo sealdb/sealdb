@@ -25,11 +25,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
             "TABLE_NAME",
             "REFERENCED_TABLE_NAME",
         ])),
-        "sequences" => Ok(empty(&[
-            "TABLE_CATALOG",
-            "SEQUENCE_SCHEMA",
-            "SEQUENCE_NAME",
-        ])),
+        "sequences" => Ok(sequences(is)),
         "check_constraints" => Ok(empty(&[
             "CONSTRAINT_CATALOG",
             "CONSTRAINT_SCHEMA",
@@ -84,6 +80,8 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     for_each_table(is, |db, table| {
         let (table_type, engine) = if table.is_view() {
             ("VIEW", "")
+        } else if table.is_sequence() {
+            ("SEQUENCE", "")
         } else {
             ("BASE TABLE", "InnoDB")
         };
@@ -381,6 +379,36 @@ fn engines() -> (Vec<String>, Vec<Vec<Datum>>) {
             bytes("YES"),
         ]],
     )
+}
+
+fn sequences(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec![
+        "TABLE_CATALOG".to_string(),
+        "SEQUENCE_SCHEMA".to_string(),
+        "SEQUENCE_NAME".to_string(),
+        "START".to_string(),
+        "MIN_VALUE".to_string(),
+        "MAX_VALUE".to_string(),
+        "INCREMENT".to_string(),
+        "CYCLE".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for_each_table(is, |db, table| {
+        let Some(seq) = &table.sequence else {
+            return;
+        };
+        rows.push(vec![
+            bytes("def"),
+            bytes(db),
+            bytes(table.name.o()),
+            Datum::I64(seq.start),
+            Datum::I64(seq.min_value),
+            Datum::I64(seq.max_value),
+            Datum::I64(seq.increment),
+            bytes(if seq.cycle { "YES" } else { "NO" }),
+        ]);
+    });
+    (schema, rows)
 }
 
 fn views(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {

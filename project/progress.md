@@ -110,6 +110,19 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-B SEQUENCE
+- **完成**:
+  - `CREATE/DROP/ALTER SEQUENCE` + `NEXTVAL` + `information_schema.sequences`
+  - leftover：`CreateSequenceStmt` / `DropSequenceStmt` / `AlterSequenceStmt` 收口；open_stmts 22
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib test_parse_create_drop_alter_sequence`
+  - `cargo test -q -p sealdb-session --lib test_create_drop_alter_sequence_nextval`
+  - `leftover_inventory.py --check` PASS（denominator 64）
+- **下一步**:
+  - C6-B `LOAD DATA` 或 VIEW 边角
+
+### 2026-11-03
+
 - **Phase**: 对齐顺序澄清（先 PD/TiKV 全量，再 TiFlash）
 - **完成**:
   - `requirements.md` / `features.md` / `roadmap.md` / `status.json`：TiFlash **延后不放弃**；终点 **逐包/逐文件**对齐 TiDB；顺序 A/B → C（算层大件+PD/TiKV 全量客户端）→ D（TiFlash）

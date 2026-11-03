@@ -506,6 +506,41 @@ impl Domain {
         inner.jobs.iter().rev().cloned().collect()
     }
 
+    /// Allocate the next value for a SEQUENCE (TiDB `NEXTVAL`).
+    pub fn next_sequence_value(&self, schema: &str, name: &str) -> Result<i64> {
+        let mut inner = self.inner.lock().expect("domain sequence lock");
+        let is = inner.infoschema.clone();
+        let db = is.schema_by_name(schema).ok_or_else(|| {
+            sealdb_errno::Error::new(
+                sealdb_errno::ERR_BAD_DB,
+                format!("Unknown database '{schema}'"),
+            )
+        })?;
+        let table = is.table_by_name(schema, name).ok_or_else(|| {
+            sealdb_errno::Error::new(
+                sealdb_errno::ERR_NO_SUCH_TABLE,
+                format!("Table '{schema}.{name}' doesn't exist"),
+            )
+        })?;
+        if !table.is_sequence() {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_WRONG_OBJECT,
+                format!("'{schema}.{name}' is not SEQUENCE"),
+            ));
+        }
+        let mut info = table.clone();
+        let seq = info.sequence.as_mut().expect("is_sequence");
+        let value = seq
+            .next_val()
+            .map_err(|msg| sealdb_errno::Error::unsupported(msg))?;
+        inner.meta.update_table(db.id, &info)?;
+        inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
+        if !inner.defer_persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        }
+        Ok(value)
+    }
+
     /// Flush in-memory Mutator after COMMIT of a txn that ran DDL.
     pub fn persist_schema(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("domain persist schema lock");

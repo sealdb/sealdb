@@ -463,6 +463,9 @@ impl Session {
             | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
             | Statement::CreateView(_)
+            | Statement::CreateSequence(_)
+            | Statement::DropSequence(_)
+            | Statement::AlterSequence(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
@@ -521,6 +524,10 @@ impl Session {
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         expand_views(&mut expanded, &is, &current_db)?;
         let stmt = &expanded;
+        if let Some(result) = try_eval_nextval(self, stmt, &current_db)? {
+            drop(mdl_guard);
+            return Ok(result);
+        }
         check_only_full_group_by(self, stmt)?;
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
@@ -1633,6 +1640,15 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
         Statement::CreateView(create) => {
             (vec![mdl_table_key(&create.view_name, current_db)], true)
         }
+        Statement::CreateSequence(create) => (vec![mdl_table_key(&create.name, current_db)], true),
+        Statement::DropSequence(drop) => (
+            drop.sequences
+                .iter()
+                .map(|t| mdl_table_key(t, current_db))
+                .collect(),
+            true,
+        ),
+        Statement::AlterSequence(alter) => (vec![mdl_table_key(&alter.name, current_db)], true),
         Statement::DropTable(drop) => (
             drop.tables
                 .iter()
@@ -1661,6 +1677,9 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
             | Statement::CreateView(_)
+            | Statement::CreateSequence(_)
+            | Statement::DropSequence(_)
+            | Statement::AlterSequence(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
@@ -1795,6 +1814,71 @@ fn strip_table_schema(select: &mut SelectStmt, name: &str) {
 
 fn named_cte_exists(with: Option<&sealdb_parser::ast::WithClause>, name: &str) -> bool {
     with.is_some_and(|w| w.find(name).is_some())
+}
+
+/// MVB: `SELECT NEXTVAL(seq)` / `SELECT NEXTVAL(db.seq)` without FROM.
+fn try_eval_nextval(
+    session: &Session,
+    stmt: &Statement,
+    current_db: &str,
+) -> Result<Option<QueryResult>> {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_types::Datum;
+    let Statement::Select(select) = stmt else {
+        return Ok(None);
+    };
+    if select.from.is_some()
+        || !select.joins.is_empty()
+        || select.fields.len() != 1
+        || select.selection.is_some()
+        || select.with.is_some()
+    {
+        return Ok(None);
+    }
+    let ExprNode::Func(func) = &select.fields[0].expr else {
+        return Ok(None);
+    };
+    if !func.name.eq_ignore_ascii_case("NEXTVAL") || func.args.len() != 1 {
+        return Ok(None);
+    }
+    let (schema, name) = match &func.args[0] {
+        ExprNode::Column(col) => {
+            // `db.seq` → schema+name; `seq` → current_db+name; `db.t.col` unsupported.
+            if let Some(schema) = &col.schema {
+                (schema.clone(), col.name.clone())
+            } else if let Some(table) = &col.table {
+                (table.clone(), col.name.clone())
+            } else {
+                (current_db.to_string(), col.name.clone())
+            }
+        }
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) => {
+            let raw = String::from_utf8_lossy(b);
+            if let Some((s, n)) = raw.split_once('.') {
+                (s.to_string(), n.to_string())
+            } else {
+                (current_db.to_string(), raw.to_string())
+            }
+        }
+        _ => return Ok(None),
+    };
+    if schema.is_empty() {
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_NO_DB,
+            "No database selected",
+        ));
+    }
+    let value = session.domain.next_sequence_value(&schema, &name)?;
+    let col_name = select.fields[0]
+        .as_name
+        .clone()
+        .unwrap_or_else(|| "NEXTVAL(...)".to_string());
+    Ok(Some(QueryResult {
+        columns: vec![col_name],
+        rows: vec![vec![Datum::I64(value)]],
+    }))
 }
 
 impl Session {
@@ -2165,6 +2249,36 @@ mod tests {
                 .display_rows()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_create_drop_alter_sequence_nextval() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE SEQUENCE db1.s START WITH 10 INCREMENT BY 2")
+            .unwrap();
+        let first = session.execute_stmt("SELECT NEXTVAL(db1.s)").unwrap();
+        assert_eq!(first.display_rows(), vec![vec!["10".to_string()]]);
+        let second = session.execute_stmt("SELECT NEXTVAL(db1.s)").unwrap();
+        assert_eq!(second.display_rows(), vec![vec!["12".to_string()]]);
+        session
+            .execute_stmt("ALTER SEQUENCE db1.s RESTART WITH 100")
+            .unwrap();
+        let restarted = session.execute_stmt("SELECT NEXTVAL(db1.s)").unwrap();
+        assert_eq!(restarted.display_rows(), vec![vec!["100".to_string()]]);
+        let is_seq = session
+            .execute_stmt(
+                "SELECT SEQUENCE_NAME, START, INCREMENT FROM information_schema.sequences WHERE SEQUENCE_SCHEMA = 'db1'",
+            )
+            .unwrap();
+        assert_eq!(is_seq.display_rows()[0][0], "s");
+        assert_eq!(is_seq.display_rows()[0][1], "100");
+        let err = session.execute_stmt("DROP TABLE db1.s").unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_WRONG_OBJECT);
+        session.execute_stmt("DROP SEQUENCE db1.s").unwrap();
+        let gone = session.execute_stmt("SELECT NEXTVAL(db1.s)").unwrap_err();
+        assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
     }
 
     #[test]

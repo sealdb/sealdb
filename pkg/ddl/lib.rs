@@ -8,6 +8,7 @@ pub mod index;
 pub mod partition;
 pub mod reorg;
 pub mod schema;
+pub mod sequence;
 pub mod table;
 pub mod view;
 
