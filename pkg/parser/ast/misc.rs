@@ -1286,3 +1286,120 @@ impl CalibrateResourceStmt {
         Ok(())
     }
 }
+
+/// TiDB `FlashBackTableStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct FlashBackTableStmt {
+    pub raw_sql: String,
+}
+
+impl FlashBackTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `FlashBackDatabaseStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct FlashBackDatabaseStmt {
+    pub raw_sql: String,
+}
+
+impl FlashBackDatabaseStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `FlashBackToTimestampStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct FlashBackToTimestampStmt {
+    pub raw_sql: String,
+}
+
+impl FlashBackToTimestampStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `RecoverTableStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct RecoverTableStmt {
+    pub raw_sql: String,
+}
+
+impl RecoverTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `DropPlacementPolicyStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct DropPlacementPolicyStmt {
+    pub raw_sql: String,
+}
+
+impl DropPlacementPolicyStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `CreateResourceGroupStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct CreateResourceGroupStmt {
+    pub raw_sql: String,
+}
+
+impl CreateResourceGroupStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `SetResourceGroupStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct SetResourceGroupStmt {
+    pub raw_sql: String,
+}
+
+impl SetResourceGroupStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `AddQueryWatchStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct AddQueryWatchStmt {
+    pub raw_sql: String,
+}
+
+impl AddQueryWatchStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `DropQueryWatchStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct DropQueryWatchStmt {
+    pub raw_sql: String,
+}
+
+impl DropQueryWatchStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}

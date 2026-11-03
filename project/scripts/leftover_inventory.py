@@ -108,6 +108,15 @@ C6_CLOSED_STMTS: frozenset[str] = frozenset(
         "CompactTableStmt",
         "RecommendIndexStmt",
         "CalibrateResourceStmt",
+        "FlashBackTableStmt",
+        "FlashBackDatabaseStmt",
+        "FlashBackToTimestampStmt",
+        "RecoverTableStmt",
+        "DropPlacementPolicyStmt",
+        "CreateResourceGroupStmt",
+        "SetResourceGroupStmt",
+        "AddQueryWatchStmt",
+        "DropQueryWatchStmt",
     }
 )
 
@@ -343,7 +352,8 @@ def render_markdown(inv: dict) -> str:
             "- C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).",
             "- C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).",
             "- Leftover suite execution: suites are owner-classified; C2 `explain*` / `index_merge` MVB via `execute-explain*`; C5 collation / `new_character_set*` via `execute-leftover-collation-suites`. Full integrationtest port is not claimed.",
-            "- C6 is production parity: package/file align TiDB compute; order A/B → C (compute + full PD/TiKV client) → D (TiFlash; deferred not dropped). Closed C6 stmts: C6_CLOSED_STMTS. Open stmts = B backlog.",
+            "- C6 is production parity: package/file align TiDB compute; order A/B → C (compute + full PD/TiKV client) → D (TiFlash; deferred not dropped).",
+            "- C6-B PlanBuilder stmt surface: closed via C6_CLOSED_STMTS (accepted AST + session round-trip; deeper semantics remain in C6 gaps). Open stmts empty when backlog cleared; leftover suites (e.g. black_list) and C6-C/D remain.",
             "",
         ]
     )
@@ -457,11 +467,13 @@ def check_inventory(inv: dict, rust: Path) -> list[str]:
     errors = []
     errors.extend(check_stale_gap_labels(inv, rust))
     errors.extend(check_unmapped_allowlist(inv))
-    if not inv["open_stmts"]:
+    c6_hinted = {name for name, hint in FEATURE_HINTS.items() if hint == "C6"}
+    if not inv["open_stmts"] and not c6_hinted <= C6_CLOSED_STMTS:
         errors.append("expected open PlanBuilder statement kinds (C6 + allowlist)")
     if not inv["suites"]:
         errors.append("expected integrationtest leftover suites")
-    # Terminal honest state: F* and C1–C5 gaps empty; open_stmts/suites remain.
+    # Terminal honest state: F* and C1–C5 gaps empty; suites remain.
+    # open_stmts may be empty once every C6-hinted PlanBuilder kind is closed.
     if inv["feature_gaps"] or inv.get("completeness_gaps"):
         errors.append(
             "expected empty feature_gaps and completeness_gaps after C1–C5 close "

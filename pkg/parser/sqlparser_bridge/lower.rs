@@ -17,17 +17,19 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt, CalibrateResourceStmt,
-    ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt, CreateBindingStmt,
-    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
-    DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType,
-    GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt,
-    LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem,
-    PrivilegeType, RecommendIndexStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
-    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind,
-    SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt,
-    SplitRegionStmt, TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt,
-    UserIdentity, UserSpec, UserToUser,
+    AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
+    CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
+    CreateBindingStmt, CreateResourceGroupStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
+    DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
+    DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
+    FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
+    GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
+    LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType,
+    RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
+    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt,
+    SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt,
+    ShowStmtKind, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType, TraceStmt,
+    UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -1652,6 +1654,47 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 continue;
             }
         }
+        if keyword_at(bytes, i, "FLASHBACK") {
+            let (raw_sql, end) = capture_raw_stmt(bytes, i);
+            let upper = raw_sql.to_ascii_uppercase();
+            let stmt = if upper.contains(" TO TIMESTAMP") || upper.contains(" TO TSO") {
+                Statement::FlashBackToTimestamp(FlashBackToTimestampStmt { raw_sql })
+            } else if upper.contains("FLASHBACK DATABASE") || upper.contains("FLASHBACK SCHEMA") {
+                Statement::FlashBackDatabase(FlashBackDatabaseStmt { raw_sql })
+            } else {
+                Statement::FlashBackTable(FlashBackTableStmt { raw_sql })
+            };
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "RECOVER") {
+            let after = skip_ws(bytes, i + "RECOVER".len());
+            if keyword_at(bytes, after, "TABLE") {
+                let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::RecoverTable(RecoverTableStmt { raw_sql })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "QUERY") {
+            let after = skip_ws(bytes, i + "QUERY".len());
+            if keyword_at(bytes, after, "WATCH") {
+                let after_watch = skip_ws(bytes, after + "WATCH".len());
+                let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                let stmt = if keyword_at(bytes, after_watch, "REMOVE") {
+                    Statement::DropQueryWatch(DropQueryWatchStmt { raw_sql })
+                } else {
+                    Statement::AddQueryWatch(AddQueryWatchStmt { raw_sql })
+                };
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
         if keyword_at(bytes, i, "BINLOG") {
             let (stmt, end) = parse_binlog_stmt(bytes, i + "BINLOG".len())?;
             out.push_str("SET NAMES '__sealdb_misc__'");
@@ -1767,6 +1810,18 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 i = end;
                 continue;
             }
+            if keyword_at(bytes, after, "RESOURCE") {
+                let after_res = skip_ws(bytes, after + "RESOURCE".len());
+                if keyword_at(bytes, after_res, "GROUP") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::SetResourceGroup(SetResourceGroupStmt {
+                        raw_sql,
+                    })));
+                    i = end;
+                    continue;
+                }
+            }
         }
         if keyword_at(bytes, i, "RENAME") {
             let after = skip_ws(bytes, i + "RENAME".len());
@@ -1776,6 +1831,36 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 ops.push(Some(stmt));
                 i = end;
                 continue;
+            }
+        }
+        if keyword_at(bytes, i, "CREATE") {
+            let after = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after, "RESOURCE") {
+                let after_res = skip_ws(bytes, after + "RESOURCE".len());
+                if keyword_at(bytes, after_res, "GROUP") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::CreateResourceGroup(
+                        CreateResourceGroupStmt { raw_sql },
+                    )));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if keyword_at(bytes, i, "DROP") {
+            let after = skip_ws(bytes, i + "DROP".len());
+            if keyword_at(bytes, after, "PLACEMENT") {
+                let after_pl = skip_ws(bytes, after + "PLACEMENT".len());
+                if keyword_at(bytes, after_pl, "POLICY") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::DropPlacementPolicy(
+                        DropPlacementPolicyStmt { raw_sql },
+                    )));
+                    i = end;
+                    continue;
+                }
             }
         }
         if keyword_at(bytes, i, "ALTER") {

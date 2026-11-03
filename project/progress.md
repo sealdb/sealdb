@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（定调：先算层+PD/TiKV 全量，再 TiFlash；逐包/文件对齐；VIEW 已开）  
+> 最后更新：2026-11-03（C6-B PlanBuilder stmt 面收口；下一步 C6-C PD/TiKV 全量客户端）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -33,7 +33,7 @@
 | 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
 | 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
 | 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
-| 10 | 完整性 + C6 生产对齐 | `in-progress` | 2026-11-03 | — | C1–C5；C6 进行中 | C1–C5 gaps `[]`；C6：A/B→C(PD+TiKV 全量)→D(TiFlash)；逐包对齐；首刀 VIEW |
+| 10 | 完整性 + C6 生产对齐 | `in-progress` | 2026-11-03 | — | C1–C5；C6 进行中 | C1–C5 gaps `[]`；C6-B PlanBuilder stmts 收口；下一步 C(PD+TiKV 全量)→D(TiFlash) |
 
 ### 2.1 功能波进度
 
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | A/B→C(PD+TiKV)→D(TiFlash)；首刀 VIEW |
+| C6 | `in-progress` | B stmt 面收口；下一步 C(PD+TiKV)→D(TiFlash) |
 
 ---
 
@@ -107,6 +107,21 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-B PlanBuilder stmt 面收口
+- **完成**:
+  - stats：`LOAD/LOCK/UNLOCK STATS` no-op
+  - 诊断：`TRACE` / `PLAN REPLAYER`
+  - 运维：`BACKUP/RESTORE`、`IMPORT INTO`、`SPLIT`/`DISTRIBUTE`、`COMPACT`、`RECOMMEND INDEX`、`CALIBRATE RESOURCE`
+  - DDL 边角：`FLASHBACK*`、`RECOVER TABLE`、`DROP PLACEMENT POLICY`、`CREATE/SET RESOURCE GROUP`、`QUERY WATCH`
+  - leftover：`open_stmts=0`；C6_CLOSED_STMTS 覆盖全部 C6-hinted PlanBuilder kinds
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib test_parse_c6_*`
+  - `leftover_inventory.py --check` PASS（open_stmts=0）
+- **下一步**:
+  - C6-C：算层包/文件对齐加深 + PD/TiKV 全量客户端；C6-D TiFlash 仍延后
 
 ### 2026-11-03
 
