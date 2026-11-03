@@ -21,8 +21,10 @@ pub mod store;
 pub mod task;
 
 pub use dag::{
-    decode_select_response, encode_table_scan_dag, Chunk, ColumnInfo, DagRequest, ExecType,
-    Executor, IndexScan, Limit, SelectResponse, Selection, TableScan, TipbError, REQ_TYPE_DAG,
+    decode_default_rows, decode_select_response, decode_select_rows, encode_default_row,
+    encode_select_response, encode_table_scan_dag, Chunk, ColumnInfo, DagRequest, EncodeType,
+    ExecType, Executor, IndexScan, Limit, RowMeta, SelectResponse, Selection, TableScan,
+    TipbError, REQ_TYPE_DAG,
 };
 pub use rpc::{execute_cop_task, execute_cop_task_blocking};
 pub use task::{build_table_scan_tasks, CopTask};

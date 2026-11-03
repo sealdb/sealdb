@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6 本地文件 BRIE；下一步 tipb chunk decode / PD 全量客户端）
+> 最后更新：2026-11-03（C6-C tipb TypeDefault chunk decode；下一步 PD 全量客户端）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C tipb TypeDefault chunk decode
+- **完成**:
+  - 修正 tipb `Chunk`/`DAGRequest`/`ColumnInfo` wire tag；`EncodeType::TypeDefault`
+  - `util/codec/datum` EncodeValue/DecodeOne；`decode_select_rows`
+  - `SEALDB_USE_COP_RPC=1` 时 TableReader 尝试远程 Cop + decode，失败回退本地 KV
+- **验证**:
+  - `cargo test -q -p sealdb-util --lib codec::datum`
+  - `cargo test -q -p sealdb-store --lib`
+  - `cargo test -q -p sealdb-session --lib test_where_selection`
+- **下一步**:
+  - PD 全量客户端加深；TypeChunk decode
 
 ### 2026-11-03
 
