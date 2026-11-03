@@ -297,7 +297,14 @@ impl Session {
             | Statement::LockStats(_)
             | Statement::UnlockStats(_)
             | Statement::Trace(_)
-            | Statement::PlanReplayer(_) => {
+            | Statement::PlanReplayer(_)
+            | Statement::BRIE(_)
+            | Statement::ImportInto(_)
+            | Statement::SplitRegion(_)
+            | Statement::DistributeTable(_)
+            | Statement::CompactTable(_)
+            | Statement::RecommendIndex(_)
+            | Statement::CalibrateResource(_) => {
                 return Ok(empty_result());
             }
             Statement::SetRole(set) => {

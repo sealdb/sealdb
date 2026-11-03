@@ -137,6 +137,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_c6_admin_ops() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("BACKUP DATABASE * TO 's3://bucket/path'")
+            .unwrap()
+        {
+            crate::ast::Statement::BRIE(_) => {}
+            other => panic!("expected BRIEStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("IMPORT INTO t FROM '/tmp/a.csv'")
+            .unwrap()
+        {
+            crate::ast::Statement::ImportInto(_) => {}
+            other => panic!("expected ImportIntoStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("SPLIT TABLE t BETWEEN (1) AND (100) REGIONS 4")
+            .unwrap()
+        {
+            crate::ast::Statement::SplitRegion(_) => {}
+            other => panic!("expected SplitRegionStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DISTRIBUTE TABLE t RULE = 'key'")
+            .unwrap()
+        {
+            crate::ast::Statement::DistributeTable(_) => {}
+            other => panic!("expected DistributeTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER TABLE t COMPACT TIFLASH REPLICA")
+            .unwrap()
+        {
+            crate::ast::Statement::CompactTable(_) => {}
+            other => panic!("expected CompactTableStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("RECOMMEND INDEX RUN").unwrap() {
+            crate::ast::Statement::RecommendIndex(_) => {}
+            other => panic!("expected RecommendIndexStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CALIBRATE RESOURCE WORKLOAD TPCC")
+            .unwrap()
+        {
+            crate::ast::Statement::CalibrateResource(_) => {}
+            other => panic!("expected CalibrateResourceStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_trace_and_plan_replayer() {
         let parser = Parser::new();
         match parser.parse_one_stmt("TRACE SELECT 1").unwrap() {

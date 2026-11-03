@@ -17,16 +17,17 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AlterInstanceStmt, AnalyzeTableStmt, BeginStmt, BinlogStmt, ChangeStmt, CleanupTableLockStmt,
-    PlanReplayerStmt, TraceStmt,
-    CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DoStmt,
-    DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel,
-    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, KillStmt, LockTablesStmt,
-    LoadStatsStmt, LockStatsStmt, OptimizeTableStmt, PrepareStmt, PrivElem, PrivilegeType,
-    ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt,
-    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt,
-    SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, TableLockItem, TableLockType,
-    UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt, CalibrateResourceStmt,
+    ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt, CreateBindingStmt,
+    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
+    DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType,
+    GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt,
+    LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem,
+    PrivilegeType, RecommendIndexStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
+    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind,
+    SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt,
+    SplitRegionStmt, TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt,
+    UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -1594,6 +1595,63 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 continue;
             }
         }
+        if keyword_at(bytes, i, "BACKUP") || keyword_at(bytes, i, "RESTORE") {
+            let (raw_sql, end) = capture_raw_stmt(bytes, i);
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(Statement::BRIE(BRIEStmt { raw_sql })));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "IMPORT") {
+            let after = skip_ws(bytes, i + "IMPORT".len());
+            if keyword_at(bytes, after, "INTO") {
+                let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::ImportInto(ImportIntoStmt { raw_sql })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "SPLIT") {
+            let (raw_sql, end) = capture_raw_stmt(bytes, i);
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(Statement::SplitRegion(SplitRegionStmt { raw_sql })));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "DISTRIBUTE") {
+            let (raw_sql, end) = capture_raw_stmt(bytes, i);
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(Statement::DistributeTable(DistributeTableStmt {
+                raw_sql,
+            })));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "RECOMMEND") {
+            let after = skip_ws(bytes, i + "RECOMMEND".len());
+            if keyword_at(bytes, after, "INDEX") {
+                let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::RecommendIndex(RecommendIndexStmt {
+                    raw_sql,
+                })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "CALIBRATE") {
+            let after = skip_ws(bytes, i + "CALIBRATE".len());
+            if keyword_at(bytes, after, "RESOURCE") {
+                let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::CalibrateResource(CalibrateResourceStmt {
+                    raw_sql,
+                })));
+                i = end;
+                continue;
+            }
+        }
         if keyword_at(bytes, i, "BINLOG") {
             let (stmt, end) = parse_binlog_stmt(bytes, i + "BINLOG".len())?;
             out.push_str("SET NAMES '__sealdb_misc__'");
@@ -1741,6 +1799,16 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 i = end;
                 continue;
             }
+            if keyword_at(bytes, after, "TABLE") {
+                let end = skip_stmt_tail(bytes, i);
+                if stmt_contains_keyword(&bytes[i..end], "COMPACT") {
+                    let raw_sql = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::CompactTable(CompactTableStmt { raw_sql })));
+                    i = end;
+                    continue;
+                }
+            }
         }
         let ch = sql[i..].chars().next().unwrap();
         out.push(ch);
@@ -1823,6 +1891,39 @@ fn parse_binlog_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
         Statement::Binlog(BinlogStmt { payload }),
         skip_ws(bytes, after),
     ))
+}
+
+fn capture_raw_stmt(bytes: &[u8], start: usize) -> (String, usize) {
+    let end = skip_stmt_tail(bytes, start);
+    let raw_sql = String::from_utf8_lossy(&bytes[start..end]).trim().to_string();
+    (raw_sql, end)
+}
+
+fn stmt_contains_keyword(bytes: &[u8], keyword: &str) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, keyword) {
+            return true;
+        }
+        // Skip string / ident literals so embedded text does not false-match.
+        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            let q = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Advance past one statement body (quotes / parens aware) up to `;` or EOF.

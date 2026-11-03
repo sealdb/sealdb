@@ -241,6 +241,27 @@ impl PlanBuilder {
             Statement::PlanReplayer(_) => Ok(PhysicalPlan::Simple {
                 kind: "PlanReplayer".to_string(),
             }),
+            Statement::BRIE(_) => Ok(PhysicalPlan::Simple {
+                kind: "BRIE".to_string(),
+            }),
+            Statement::ImportInto(_) => Ok(PhysicalPlan::Simple {
+                kind: "ImportInto".to_string(),
+            }),
+            Statement::SplitRegion(_) => Ok(PhysicalPlan::Simple {
+                kind: "SplitRegion".to_string(),
+            }),
+            Statement::DistributeTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "DistributeTable".to_string(),
+            }),
+            Statement::CompactTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "CompactTable".to_string(),
+            }),
+            Statement::RecommendIndex(_) => Ok(PhysicalPlan::Simple {
+                kind: "RecommendIndex".to_string(),
+            }),
+            Statement::CalibrateResource(_) => Ok(PhysicalPlan::Simple {
+                kind: "CalibrateResource".to_string(),
+            }),
             Statement::RenameUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "RenameUser".to_string(),
             }),
