@@ -1744,6 +1744,8 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
                 rewrite_updatable_view_target(
                     &mut update.table,
                     &mut update.selection,
+                    &mut update.check_option_where,
+                    &mut update.check_option_view,
                     is,
                     current_db,
                 )?;
@@ -1751,9 +1753,13 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
         }
         Statement::Delete(delete) => {
             if delete.join.is_none() && delete.tables.is_empty() {
+                let mut unused_check = None;
+                let mut unused_view = None;
                 rewrite_updatable_view_target(
                     &mut delete.table,
                     &mut delete.selection,
+                    &mut unused_check,
+                    &mut unused_view,
                     is,
                     current_db,
                 )?;
@@ -1781,9 +1787,13 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
 
 /// Simple updatable VIEW: single-table SELECT (no JOIN/GROUP BY). Rewrite the
 /// DML target to the base table and AND the view WHERE into the statement.
+/// When the view has `WITH CHECK OPTION`, stash the predicate for post-update
+/// validation (`check_option_where`).
 fn rewrite_updatable_view_target(
     table: &mut TableName,
     selection: &mut Option<ExprNode>,
+    check_option_where: &mut Option<ExprNode>,
+    check_option_view: &mut Option<String>,
     is: &InfoSchema,
     current_db: &str,
 ) -> Result<()> {
@@ -1817,7 +1827,13 @@ fn rewrite_updatable_view_target(
         )));
     }
     let base = view_select.from.expect("checked above");
+    let enforce_check = !view.check_option.is_empty()
+        && !view.check_option.eq_ignore_ascii_case("NONE");
     if let Some(view_where) = view_select.selection {
+        if enforce_check {
+            *check_option_where = Some(view_where.clone());
+            *check_option_view = Some(format!("{schema}.{name}"));
+        }
         *selection = Some(match selection.take() {
             Some(user_where) => ExprNode::Binary(BinaryOpExpr {
                 op: Op::LogicAnd,
@@ -2613,6 +2629,37 @@ mod tests {
         assert_eq!(
             left.display_rows(),
             vec![vec!["2".to_string(), "b".to_string()]]
+        );
+    }
+
+    #[test]
+    fn test_view_with_check_option_rejects_escape() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        session
+            .execute_stmt(
+                "CREATE VIEW db1.v AS SELECT id, name FROM db1.t WHERE id = 1 WITH CHECK OPTION",
+            )
+            .unwrap();
+        session
+            .execute_stmt("UPDATE db1.v SET name = 'ok'")
+            .unwrap();
+        let err = session
+            .execute_stmt("UPDATE db1.v SET id = 2")
+            .unwrap_err();
+        assert_eq!(err.code, sealdb_errno::ERR_VIEW_CHECK_FAILED);
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "ok".to_string()]]
         );
     }
 

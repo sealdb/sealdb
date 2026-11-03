@@ -137,6 +137,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_view_with_check_option() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt(
+                "CREATE VIEW db1.v AS SELECT id FROM db1.t WHERE id = 1 WITH CHECK OPTION",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateView(stmt) => {
+                assert_eq!(stmt.check_option.to_ascii_uppercase(), "CASCADED");
+            }
+            other => panic!("expected CreateViewStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "CREATE VIEW db1.v AS SELECT id FROM db1.t WHERE id > 0 WITH LOCAL CHECK OPTION",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateView(stmt) => {
+                assert_eq!(stmt.check_option.to_ascii_uppercase(), "LOCAL");
+            }
+            other => panic!("expected CreateViewStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE VIEW db1.v AS SELECT id FROM db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateView(stmt) => {
+                assert_eq!(stmt.check_option.to_ascii_uppercase(), "NONE");
+            }
+            other => panic!("expected CreateViewStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_c6_flashback_and_rg() {
         let parser = Parser::new();
         match parser

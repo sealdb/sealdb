@@ -110,6 +110,18 @@
 
 ### 2026-11-03
 
+- **Phase**: C6 VIEW `WITH CHECK OPTION`
+- **完成**:
+  - 解析 `WITH [CASCADED|LOCAL] CHECK OPTION`；默认 `NONE`
+  - UPDATE 经视图改写后对新行求值，失败返回 1369
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib test_parse_view_with_check_option`
+  - `cargo test -q -p sealdb-session --lib view_with_check`
+- **下一步**:
+  - Region locate / Cop DAG；algorithm=TEMPTABLE
+
+### 2026-11-03
+
 - **Phase**: C6 简单可更新 VIEW
 - **完成**:
   - 单表无 JOIN/GROUP BY 的 VIEW：`UPDATE`/`DELETE` 改写到基表并 AND 视图 WHERE

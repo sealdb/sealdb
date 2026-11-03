@@ -110,7 +110,7 @@ fn default_view_security() -> String {
 }
 
 fn default_view_check_option() -> String {
-    "CASCADED".to_string()
+    "NONE".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
