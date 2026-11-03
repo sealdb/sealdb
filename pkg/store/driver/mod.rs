@@ -93,6 +93,23 @@ impl TikvStorage {
             .block_on(async move { crate::copr::execute_cop_task(&pd, &task).await })
     }
 
+    /// PD HTTP client bound to this store's endpoints.
+    pub fn pd_client(&self) -> crate::copr::pd::PdClient {
+        crate::copr::pd::PdClient::new(self.pd_endpoints.clone())
+    }
+
+    pub fn list_stores(&self) -> Result<Vec<crate::copr::pd::PdStoreInfo>> {
+        crate::copr::pd::pd_list_stores(&self.pd_endpoints)
+    }
+
+    pub fn scan_regions(
+        &self,
+        start_key: &[u8],
+        limit: u32,
+    ) -> Result<Vec<crate::copr::pd::PdRegion>> {
+        crate::copr::pd::pd_scan_regions(&self.pd_endpoints, start_key, limit)
+    }
+
     fn begin_txn(&self, pessimistic: bool) -> Result<Box<dyn Transaction>> {
         let txn = if pessimistic {
             self.rt

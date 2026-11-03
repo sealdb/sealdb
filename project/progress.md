@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C tipb TypeDefault chunk decode；下一步 PD 全量客户端）
+> 最后更新：2026-11-03（C6-C PD list stores / scan regions；下一步 TypeChunk / TiFlash）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C PD stores/regions 客户端
+- **完成**:
+  - `PdClient`：`list_stores` / `scan_regions` / `get_region` / `store_address`
+  - `TikvStorage::{pd_client,list_stores,scan_regions}`
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`（含 skip-if-no-PD）
+- **下一步**:
+  - tipb TypeChunk；C6-D TiFlash；cascades 实装
 
 ### 2026-11-03
 

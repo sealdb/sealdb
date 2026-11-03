@@ -3,5 +3,6 @@
 //! Full RegionCache (epoch, buckets, invalidate) remains a later deepen.
 
 pub use super::pd::{
-    decode_pd_key, hex_encode, pd_get_region, pd_store_address, PdPeer, PdRegion, PdRegionEpoch,
+    decode_pd_key, hex_encode, pd_get_region, pd_get_store, pd_list_stores, pd_scan_regions,
+    pd_store_address, PdClient, PdPeer, PdRegion, PdRegionEpoch, PdStoreInfo,
 };
