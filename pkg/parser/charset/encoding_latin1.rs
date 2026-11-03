@@ -8,7 +8,7 @@
 /// Encoding name — TiDB `CharsetLatin1`.
 pub const NAME: &str = "latin1";
 
-/// Latin-1 letters commonly used in C5 session tests (stored as UTF-8).
+/// Latin-1 letters commonly used in session tests (stored as UTF-8).
 pub const LATIN1_TEST_SUBSET: &[char] = &['A', 'a', 'Z', 'z', 'é', 'É', 'ñ', 'Ñ'];
 
 /// Encode: passthrough (TiDB latin1 ≡ utf8 storage).

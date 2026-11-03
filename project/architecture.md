@@ -119,7 +119,6 @@ sealdb/
 ├── docker/                    # 复用并固定 8.5.8
 ├── monitoring/                # 复用
 ├── config/                    # 复用并重写
-├── legacy-rust-scaffold/      # 归档旧代码，不参与构建
 └── project/                   # 本工程手册
 ```
 
@@ -134,7 +133,7 @@ sealdb/
 | R5 | 生成文件（`parser.go`、`*_generated.go`）若在 Rust 中不生成，则对应 `.rs` 作为**手写替代**，状态在 manifest 标 `reimplemented`。 |
 | R6 | `.y`、`.toml`、`.json`、`.md`、testdata 等非 Rust 文件：保留文件名；不参与编译；必要时放只读参考副本或说明文件。 |
 | R7 | 构建文件 `Cargo.toml`（根与每个 crate）、`Cargo.lock`、`rust-toolchain.toml`、`mod.rs`、`lib.rs` 属于**允许的额外文件**。 |
-| R8 | `tools/`、`project/`、`tests/`、`testdata/`、`reports/`、`legacy-rust-scaffold/` 属于**允许的额外目录**。 |
+| R8 | `tools/`、`project/`、`tests/`、`testdata/`、`reports/` 属于**允许的额外目录**。 |
 | R9 | `pkg/parser/sqlparser_bridge/` 是显式允许的扩展模块；原因：sqlparser-rs 与目标 AST 的桥接不属于参考源码树。 |
 | R10 | 暂不使用的文件在 manifest 标 `omitted` 并说明原因与计划阶段；不要求创建空 `.rs`。进入当前阶段的包必须文件齐全（可 `stub`）。 |
 | R11 | **源码中不写来源/移植标记**；状态、来源路径、偏差统一维护在 `project/parity/status.json`。 |

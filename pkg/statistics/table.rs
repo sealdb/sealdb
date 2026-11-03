@@ -1,4 +1,4 @@
-/// TiDB `statistics.Table` / `HistColl` fields for F21.
+/// TiDB `statistics.Table` / `HistColl` fields for .
 /// Histograms + TopN feed selectivity; CMSketch / correlation deferred.
 use sealdb_types::Datum;
 

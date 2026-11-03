@@ -26,7 +26,7 @@
 | Rust 工具链 | **1.99.1**（edition 2024） | 已通过 rsproxy 安装 |
 | SQL 解析 | `sqlparser` **0.63.x** | 本项目保留 sqlparser-rs |
 | TiKV Rust 客户端 | `tikv-client` **0.4.x** | Phase 0 做能力 spike |
-| 旧 Rust 代码 | `legacy-rust-scaffold/` | 已归档，不参与构建 |
+| 旧 Rust 代码 | （已删除） | 原 `legacy-rust-scaffold/`；见 ADR-0007 / git 历史 |
 
 > **版本统一**：TiDB / PD / TiKV 统一到 **v8.5.8** 发行线。  
 > 本地 PD/TiKV 若仍在 9.0 beta，仅用于快速冒烟；一致性测试必须使用 8.5.8 镜像或切到对应 tag。
@@ -35,7 +35,7 @@
 
 ## 3. 当前仓库状态
 
-- 旧 `src/`、`tests/`、`docs/`、`Cargo.toml`、`Makefile` 已移动到 `legacy-rust-scaffold/`。
+- 旧 `src/`、`tests/`、`docs/`、`Cargo.toml`、`Makefile` 曾归档为 `legacy-rust-scaffold/`，现已删除（ADR-0007）。
 - 新 workspace 已建立：`pkg/` 下按 TiDB 顶层包粒度拆 crate，`cmd/tidb-server` 为入口。
 - `cargo check --workspace` / `cargo test --workspace` / clippy `-D warnings` 通过（Rust 1.99.1）。
 - U0–U3 与 F01 已 `core-ported`：codec 向量、`--parse --ast-json`、`SELECT 1`、算术/比较/逻辑/`CAST`/`IF`。

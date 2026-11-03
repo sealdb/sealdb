@@ -1,4 +1,4 @@
-// F13: FOR UPDATE uses exclusive lock; FOR SHARE uses shared lock.
+// FOR UPDATE uses exclusive lock; FOR SHARE uses shared lock.
 // NOWAIT returns 3572; SKIP LOCKED omits locked rows; Block waits
 // until release or SEALDB_LOCK_WAIT_MS. Completeness wave / not this
 // feature: WAIT N, OF table list.
@@ -82,7 +82,7 @@ impl Executor for TableReaderExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
-        // Empty partitions + pushed filter = dynamic prune at execute (F19).
+        // Empty partitions + pushed filter = dynamic prune at execute.
         let physical = if !self.partitions.is_empty() {
             self.partitions.clone()
         } else if let Some(filter) = self.pushed.as_ref() {

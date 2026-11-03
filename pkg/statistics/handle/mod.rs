@@ -1,4 +1,4 @@
-/// F21: in-memory stats Handle (TiDB `statistics/handle`).
+/// in-memory stats Handle (TiDB `statistics/handle`).
 /// Persists under Storage key `mstats` (mysql.stats_* equivalent).
 use crate::table::{ColumnStats, Histogram, HistogramBucket, Table, TopN};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};

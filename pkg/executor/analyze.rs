@@ -1,4 +1,4 @@
-/// F21: AnalyzeExec (TiDB `executor/analyze.go`) — count/NDV/histogram/TopN.
+/// AnalyzeExec (TiDB `executor/analyze.go`) — count/NDV/histogram/TopN.
 /// Supports `ANALYZE TABLE t INDEX idx` for index-column subsets.
 use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;

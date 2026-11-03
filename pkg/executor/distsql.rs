@@ -1,6 +1,6 @@
-// F10 core path: IndexLookUpExecutor / covering IndexReader
+// core path: IndexLookUpExecutor / covering IndexReader
 // (TiDB pkg/executor/distsql.go).
-// C2 IndexMerge MVB: OR of indexed equalities → union handles + table lookup.
+// IndexMerge MVB: OR of indexed equalities → union handles + table lookup.
 // Completeness wave / not this feature: lookup push-down, parallel workers,
 // composite prefix ranges, IndexMerge intersection.
 use crate::coprocessor::filter_rows;

@@ -1,4 +1,4 @@
-/// F19: partition prune modes (TiDB `tidb_partition_prune_mode`).
+/// partition prune modes (TiDB `tidb_partition_prune_mode`).
 /// Static prunes at plan time; dynamic defers to execute using the pushed filter.
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ExprNode;

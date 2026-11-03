@@ -1,4 +1,4 @@
-// F08 leftover: StreamAgg for scalar aggregations (no GROUP BY).
+// StreamAgg for scalar aggregations (no GROUP BY).
 // Completeness wave: sorted GROUP BY StreamAgg, pipelined partial aggs.
 use super::HashAggExec;
 use crate::internal::exec::Executor;

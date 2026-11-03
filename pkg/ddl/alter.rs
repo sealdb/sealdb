@@ -1,4 +1,4 @@
-// F18/F19: ALTER TABLE ADD/DROP COLUMN|INDEX|PARTITION, CHANGE/MODIFY/RENAME,
+// /ALTER TABLE ADD/DROP COLUMN|INDEX|PARTITION, CHANGE/MODIFY/RENAME,
 // AFTER/FIRST, ALGORITHM/LOCK (accepted, in-place).
 // Completeness wave / not this feature: generated columns, nested subpartition storage,
 // multi-schema-state jobs.

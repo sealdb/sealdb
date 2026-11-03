@@ -1,4 +1,4 @@
-/// F22: Server listen/accept + optional TLS (TiDB `pkg/server/server.go` SSL).
+/// Server listen/accept + optional TLS (TiDB `pkg/server/server.go` SSL).
 /// Completeness wave: connection limits, status HTTP, graceful drain.
 use crate::conn::ClientConn;
 use rustls::ServerConfig;

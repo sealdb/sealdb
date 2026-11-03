@@ -2,10 +2,10 @@ use sealdb_errno::Result;
 use sealdb_kv::{IsolationLevel, Storage, TxnHandle};
 use std::sync::Arc;
 
-/// Session-owned transaction lifecycle for F12/F13/C3.
+/// Session-owned transaction lifecycle for //.
 /// Completeness wave / not this feature: XA, blocking lock wait.
 /// CREATE/DROP DATABASE|TABLE in an explicit txn is leftover-closed on
-/// Domain in-memory schema; CREATE INDEX backfill KV stays F18.
+/// Domain in-memory schema; CREATE INDEX backfill KV stays .
 pub struct TxnManager {
     handle: Option<Arc<TxnHandle>>,
     explicit: bool,

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Domain-default system variables for `SET GLOBAL` / `@@GLOBAL.*` (C5 MVB).
+/// Domain-default system variables for `SET GLOBAL` / `@@GLOBAL.*` (MVB).
 /// New sessions copy these into session-local state at construction.
 #[derive(Clone, Debug)]
 pub struct GlobalSysVars {
@@ -59,9 +59,9 @@ pub struct Domain {
     schema_lease: Mutex<SchemaLeaseState>,
     /// Set by `SHUTDOWN`; tidb-server listen loop exits when true.
     shutdown_requested: AtomicBool,
-    /// Connection/session registry for `KILL` (F22).
+    /// Connection/session registry for `KILL`.
     connections: Mutex<HashMap<u64, ConnState>>,
-    /// Explicit `LOCK TABLES` holds (F12); distinct from short-lived MDL.
+    /// Explicit `LOCK TABLES` holds; distinct from short-lived MDL.
     table_locks: Mutex<TableLockTable>,
 }
 
@@ -80,7 +80,7 @@ struct TableLockTable {
     by_session: HashMap<u64, HashSet<String>>,
 }
 
-/// C3 MVB schema lease / reload hook state.
+/// MVB schema lease / reload hook state.
 struct SchemaLeaseState {
     lease: Duration,
     expire_at: Instant,
@@ -173,7 +173,7 @@ impl Domain {
         })
     }
 
-    /// Mark that `SHUTDOWN` was requested (F22 server ops).
+    /// Mark that `SHUTDOWN` was requested ( server ops).
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
     }
@@ -183,7 +183,7 @@ impl Domain {
         self.shutdown_requested.load(Ordering::SeqCst)
     }
 
-    /// Register a connection/session id for `KILL` (F22).
+    /// Register a connection/session id for `KILL`.
     pub fn register_connection(&self, id: u64) {
         self.connections
             .lock()
@@ -346,7 +346,7 @@ impl Domain {
         Ok(())
     }
 
-    /// Reload Mutator + InfoSchema from Storage and renew the lease (C3 MVB).
+    /// Reload Mutator + InfoSchema from Storage and renew the lease (MVB).
     pub fn reload_schema_from_storage(&self) -> Result<()> {
         let mut meta = load_meta(self.storage.as_ref())?;
         let infoschema = InfoSchema::from_meta(&meta)?;

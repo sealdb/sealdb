@@ -1,6 +1,6 @@
 //! GBK encoding — TiDB `pkg/parser/charset/encoding_gbk.go`.
 //!
-//! C5 MVB ships a **minimal Unicode↔GBK subset** used by tests (ASCII + a few
+//! MVB ships a **minimal Unicode↔GBK subset** used by tests (ASCII + a few
 //! Chinese characters). Full GBK tables live in TiDB via
 //! `golang.org/x/text/encoding/simplifiedchinese`.
 

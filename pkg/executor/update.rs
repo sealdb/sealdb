@@ -1,5 +1,5 @@
-// F07: single-table UPDATE SET (ORDER BY / LIMIT) and two-table UPDATE JOIN.
-// F13: pessimistic UPDATE reads latest and takes exclusive locks.
+// single-table UPDATE SET (ORDER BY / LIMIT) and two-table UPDATE JOIN.
+// pessimistic UPDATE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: n-table UPDATE, UPDATE FROM, comma joins,
 // RETURNING (not in TiDB v8.5.8 / MySQL 8.0), MySQL-protocol affected-row counts.
 use crate::cte::eval_named_cte;

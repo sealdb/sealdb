@@ -66,7 +66,7 @@ flowchart LR
 - [x] `tools/oracle/` 的 `parse` 模式可运行（`plan`/`execute` 待补）
 - [x] `project/scripts/parity_check.py`
 - [x] `project/scripts/install-skills.sh`
-- [x] 旧 `src/`/`tests/`/`docs/` 归档到 `legacy-rust-scaffold/`
+- [x] 旧 `src/`/`tests/`/`docs/` 脚手架已丢弃（曾归档后删除，见 ADR-0007）
 - [ ] CI（GitHub Actions 或本地脚本）：fmt + clippy + test + oracle smoke
 - [ ] TiKV/PD 连接 spike：PD TSO、RegionCache、乐观/悲观事务、RawClient Coprocessor
 - [ ] `project/parity/status.json` 初始登记与 `--strict` 通过

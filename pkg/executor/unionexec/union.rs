@@ -1,4 +1,4 @@
-// F15 core path: UnionExec for UNION / EXCEPT / INTERSECT
+// core path: UnionExec for UNION / EXCEPT / INTERSECT
 // (TiDB pkg/executor/unionexec/union.go). Parenthesized set operands flatten
 // left-to-right. EXISTS / IN / scalar subqueries may hold a ResultSetNode set
 // op. Parallel child drain: SEALDB_UNION_CONCURRENCY (default 1).

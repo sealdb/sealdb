@@ -980,7 +980,7 @@
 
 **决策落地**
 
-- 旧代码移动到 `legacy-rust-scaffold/`（`src/`、`tests/`、`docs/`、旧 `Cargo.toml`、旧 `Makefile`）。
+- 旧脚手架代码已丢弃（曾短暂归档为 `legacy-rust-scaffold/`，现已删除；ADR-0007）。
 - 新 workspace：24 个 `pkg/*` crate + `cmd/tidb-server`，顶层包粒度，共 25 个 package。
 - Rust 升级到 **1.99.1**（rsproxy 镜像），edition 2024，resolver 3。
 - 版本统一：TiDB/PD/TiKV 基线 **v8.5.8**；本地 9.0 beta 仅冒烟。

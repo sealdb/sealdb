@@ -1,4 +1,4 @@
-/// F22: MySQL packet I/O (TiDB `pkg/server/internal/packetio.go`).
+/// MySQL packet I/O (TiDB `pkg/server/internal/packetio.go`).
 /// Supports optional zlib compression (`CLIENT_COMPRESS`).
 use flate2::Compression;
 use flate2::read::ZlibDecoder;

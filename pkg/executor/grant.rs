@@ -1,4 +1,4 @@
-/// F20: GrantExec — GRANT/REVOKE privileges and roles, CREATE/DROP ROLE
+/// GrantExec — GRANT/REVOKE privileges and roles, CREATE/DROP ROLE
 /// (TiDB `executor/grant.go` / `role.go`). Completeness wave: mysql.* tables,
 /// WITH GRANT OPTION.
 use crate::internal::exec::Executor;

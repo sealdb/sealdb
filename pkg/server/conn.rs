@@ -1,4 +1,4 @@
-/// F22: clientConn handshake + COM_QUERY (TiDB `pkg/server/conn.go`).
+/// clientConn handshake + COM_QUERY (TiDB `pkg/server/conn.go`).
 /// Completeness wave: compression, COM_STMT_*, COM_FIELD_LIST,
 /// auth plugins, binary protocol, multi-result-set.
 use crate::internal::packetio::{
@@ -695,7 +695,7 @@ fn read_binary_value(data: &[u8], i: &mut usize, ty: u8) -> Result<Datum> {
             Ok(Datum::Bytes(bytes))
         }
         _ => {
-            // Fallback: length-encoded string.
+ // Fallback: length-encoded string.
             let n = read_lenenc(data, i)? as usize;
             if *i + n > data.len() {
                 return Err(Error::new(ERR_UNKNOWN_ERROR, "truncated param value"));

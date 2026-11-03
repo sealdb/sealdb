@@ -1,7 +1,7 @@
-/// F09 leftover: rewrite simple correlated EXISTS / IN / NOT EXISTS Apply
+/// rewrite simple correlated EXISTS / IN / NOT EXISTS Apply
 /// into HashJoin Semi/Anti (TiDB `rule_decorrelate.go`).
 ///
-/// F14 `semi-anti-rewrite` then wraps the Semi inner side with Distinct
+/// `semi-anti-rewrite` then wraps the Semi inner side with Distinct
 /// on the join key (TiDB SemiJoinRewriter: semi → inner + agg). Anti stays
 /// as HashJoin Anti. NOT IN stays Apply.
 use super::physical_plans::{JoinType, PhysicalPlan};

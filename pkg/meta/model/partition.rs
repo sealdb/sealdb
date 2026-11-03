@@ -7,7 +7,7 @@ use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 use serde::{Deserialize, Serialize};
 
-/// TiDB `model.PartitionType` core cases for F19.
+/// TiDB `model.PartitionType` core cases for .
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PartitionType {
@@ -58,7 +58,7 @@ impl PartitionDefinition {
     }
 }
 
-/// TiDB `model.PartitionInfo` core fields used by F19.
+/// TiDB `model.PartitionInfo` core fields used by .
 /// Completeness wave: nested subpartition storage, reorg states.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionInfo {

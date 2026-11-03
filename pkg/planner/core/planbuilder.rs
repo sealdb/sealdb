@@ -578,7 +578,7 @@ fn apply_order_limit(
     est_rows: f64,
 ) -> PhysicalPlan {
     if ordered && let Some(lim) = limit {
-        // F21 join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
+        // join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
         if offset.unwrap_or(0) == 0 && prefer_topn(est_rows, lim) {
             return PhysicalPlan::TopN {
                 child: Box::new(plan),
@@ -847,7 +847,7 @@ fn access_plan(
     stats: Option<&Handle>,
     prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
-    // F10 core: integer handle PointGet still wins; unique-index equality
+    // integer handle PointGet still wins; unique-index equality
     // is PointGet; handle/unique IN lists are BatchPointGet; otherwise
     // first-column equality or range on a secondary INDEX/KEY becomes
     // IndexReader when covering, else IndexLookUpReader.
@@ -887,8 +887,8 @@ fn access_plan(
                     };
                 }
                 let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
-                // F10: unanalyzed tables keep the index path.
-                // C2/F21: after ANALYZE, TopN/NDV drives TableReader vs index.
+                // unanalyzed tables keep the index path.
+                // after ANALYZE, TopN/NDV drives TableReader vs index.
                 if let Some(eq_rows) = eq_row_count_value(stats, from, current_db, column, value) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
@@ -914,7 +914,7 @@ fn access_plan(
                 return index_plan(select, from, info, index, prune_mode);
             }
         }
-        // C2 IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
+        // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {
             return plan;
         }

@@ -7,7 +7,7 @@ pub struct IndexColumn {
     pub name: CIStr,
     pub offset: i32,
     /// UnspecifiedLength (-1) when the full column is indexed.
-    /// Prefix indexes stay out of F10.
+    /// Prefix indexes stay out of .
     #[serde(default = "unspecified_length")]
     pub length: i32,
 }
@@ -26,7 +26,7 @@ impl IndexColumn {
     }
 }
 
-/// TiDB `model.IndexInfo` core fields used by F10.
+/// TiDB `model.IndexInfo` core fields used by .
 /// Completeness wave / not this feature: invisible, global, MV, vector,
 /// partial. ADD INDEX walks SchemaState via ddl/reorg.rs.
 #[derive(Clone, Debug, Serialize, Deserialize)]

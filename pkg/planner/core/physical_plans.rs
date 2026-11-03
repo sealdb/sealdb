@@ -72,7 +72,7 @@ pub enum PhysicalPlan {
         pushed: Option<ExprNode>,
     },
     /// Union of partial index scans (OR of indexed equalities) then table lookup.
-    /// Completeness wave C2 IndexMerge MVB; intersection / cost skyline deferred.
+    /// Completeness wave IndexMerge MVB; intersection / cost skyline deferred.
     IndexMerge {
         table: String,
         indexes: Vec<String>,

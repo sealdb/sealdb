@@ -1,4 +1,4 @@
-// F17 core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
+// core path: CTEExec for WITH, including WITH RECURSIVE UNION/UNION ALL
 // (TiDB pkg/executor/cte.go). Completeness wave / not this feature:
 // Nested WITH / qualified CTE names.
 use crate::builder::ExecutorBuilder;

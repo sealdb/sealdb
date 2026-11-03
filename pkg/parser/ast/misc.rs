@@ -567,7 +567,7 @@ pub enum IsolationLevel {
     ReadCommitted,
     #[default]
     RepeatableRead,
-    /// Accepted; SealDB maps to RR snapshot semantics (C3 MVB).
+    /// Accepted; SealDB maps to RR snapshot semantics (MVB).
     Serializable,
 }
 
