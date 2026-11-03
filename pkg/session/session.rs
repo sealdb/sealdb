@@ -1810,6 +1810,11 @@ fn rewrite_updatable_view_target(
     let Some(view) = &info.view else {
         return Ok(());
     };
+    if view.algorithm.eq_ignore_ascii_case("TEMPTABLE") {
+        return Err(sealdb_errno::Error::unsupported(format!(
+            "VIEW `{schema}`.`{name}` ALGORITHM=TEMPTABLE is not updatable"
+        )));
+    }
     let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
     let Statement::Select(view_select) = parsed else {
         return Err(sealdb_errno::Error::unsupported(
@@ -1892,6 +1897,13 @@ fn inject_view_cte(
         ));
     };
     expand_views_in_select(&mut view_select, is, current_db)?;
+    let materialize = if view.algorithm.eq_ignore_ascii_case("TEMPTABLE") {
+        CteMaterialize::Materialized
+    } else if view.algorithm.eq_ignore_ascii_case("MERGE") {
+        CteMaterialize::NotMaterialized
+    } else {
+        CteMaterialize::Default
+    };
     let mut ctes = select
         .with
         .take()
@@ -1903,7 +1915,7 @@ fn inject_view_cte(
         col_name_list: view.cols.iter().map(|c| c.o().to_string()).collect(),
         recursive: None,
         set_rest: Vec::new(),
-        materialize: CteMaterialize::Default,
+        materialize,
     });
     select.with = Some(sealdb_parser::ast::WithClause {
         is_recursive: false,
@@ -2549,6 +2561,49 @@ mod tests {
         session.execute_stmt("DROP SEQUENCE db1.s").unwrap();
         let gone = session.execute_stmt("SELECT NEXTVAL(db1.s)").unwrap_err();
         assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+    }
+
+    #[test]
+    fn test_view_algorithm_temptable() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        session
+            .execute_stmt(
+                "CREATE ALGORITHM=TEMPTABLE VIEW db1.v AS SELECT id, name FROM db1.t WHERE id = 1",
+            )
+            .unwrap();
+        let rows = session.execute_stmt("SELECT * FROM db1.v").unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        let explain = session.execute_stmt("EXPLAIN SELECT * FROM db1.v").unwrap();
+        let plan = format!("{:?}", explain.display_rows());
+        assert!(
+            plan.contains("CTE") || plan.to_ascii_lowercase().contains("material"),
+            "expected materialized CTE in plan, got:\n{plan}"
+        );
+        let upd = session
+            .execute_stmt("UPDATE db1.v SET name = 'x'")
+            .unwrap_err();
+        assert!(
+            upd.message.contains("TEMPTABLE") || upd.message.contains("not updatable"),
+            "{}",
+            upd.message
+        );
+        let bad = session
+            .execute_stmt(
+                "CREATE ALGORITHM=TEMPTABLE VIEW db1.bad AS SELECT id FROM db1.t WITH CHECK OPTION",
+            )
+            .unwrap_err();
+        assert_eq!(bad.code, sealdb_errno::ERR_VIEW_INVALID);
+        session.execute_stmt("DROP VIEW db1.v").unwrap();
     }
 
     #[test]
