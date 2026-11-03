@@ -9,13 +9,22 @@ use sealdb_errno::Result;
 use sealdb_kv::{MemStorage, Storage};
 use std::sync::Arc;
 
-pub use copr::{KeyRange, split_key_ranges};
+pub use copr::{
+    KeyRange, clear_pd_endpoints, set_pd_endpoints, split_key_ranges, split_key_ranges_for_scan,
+    split_key_ranges_via_pd,
+};
 pub use driver::TikvStorage as TikvStore;
 
 pub fn open(cfg: &Config) -> Result<Arc<dyn Storage>> {
     match cfg.store {
-        StoreKind::Memory => Ok(Arc::new(MemStorage::new())),
-        StoreKind::Tikv => Ok(Arc::new(TikvStorage::connect(&cfg.pd_endpoints)?)),
+        StoreKind::Memory => {
+            clear_pd_endpoints();
+            Ok(Arc::new(MemStorage::new()))
+        }
+        StoreKind::Tikv => {
+            set_pd_endpoints(cfg.pd_endpoints.clone());
+            Ok(Arc::new(TikvStorage::connect(&cfg.pd_endpoints)?))
+        }
     }
 }
 

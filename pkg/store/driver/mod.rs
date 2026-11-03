@@ -22,6 +22,7 @@ const SCAN_LIMIT: u32 = 1024;
 pub struct TikvStorage {
     client: TransactionClient,
     rt: Arc<tokio::runtime::Runtime>,
+    pd_endpoints: Vec<String>,
 }
 
 impl TikvStorage {
@@ -47,7 +48,13 @@ impl TikvStorage {
         Ok(Self {
             client,
             rt: Arc::new(rt),
+            pd_endpoints: pd_endpoints.to_vec(),
         })
+    }
+
+    /// Region-aligned split of `[start, end)` via PD HTTP locate.
+    pub fn split_key_ranges(&self, start: &[u8], end: &[u8]) -> Result<Vec<crate::copr::KeyRange>> {
+        crate::copr::split_key_ranges_via_pd(&self.pd_endpoints, start, end)
     }
 
     fn begin_txn(&self, pessimistic: bool) -> Result<Box<dyn Transaction>> {

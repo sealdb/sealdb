@@ -119,7 +119,7 @@ impl Executor for IndexLookUpExecutor {
                 if start.as_bytes() >= end.as_slice() {
                     continue;
                 }
-                for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+                for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
                     let pairs =
                         txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
                     for (key, value) in pairs {
@@ -263,7 +263,7 @@ impl Executor for IndexMergeExecutor {
                     if start.as_bytes() >= end.as_slice() {
                         continue;
                     }
-                    for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+                    for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
                         let pairs =
                             txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
                         for (key, value) in pairs {
