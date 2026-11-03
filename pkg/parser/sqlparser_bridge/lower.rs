@@ -17,12 +17,14 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
-    DeallocateStmt, DoStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt,
-    FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel,
-    PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt,
-    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt,
-    SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, UseStmt, UserIdentity, UserSpec,
+    AlterInstanceStmt, AnalyzeTableStmt, BeginStmt, BinlogStmt, ChangeStmt, CleanupTableLockStmt,
+    CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DoStmt,
+    DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel,
+    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, KillStmt, LockTablesStmt,
+    OptimizeTableStmt, PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RenameUserStmt,
+    RepairTableStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
+    SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
+    ShutdownStmt, TableLockItem, TableLockType, UseStmt, UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -33,15 +35,15 @@ use sqlparser::ast::{
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized,
     DataType, Delete, DescribeAlias, DuplicateTreatment, Expr, FlushType, FromTable, Function,
     FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects,
-    GranteeName, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType,
-    MySQLColumnPosition, NamedWindowDefinition, NamedWindowExpr, NonBlock, NullTreatment,
-    ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query,
-    RenameTable as SqlRenameTable, RenameTableNameKind, Revoke, SchemaName, SelectItem, Set,
-    SetExpr, SetOperator, SetQuantifier, ShowCreateObject, Statement as SqlStatement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionAccessMode,
-    TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use, Value, Values,
-    WindowFrameBound as SqlWindowFrameBound, WindowFrameUnits as SqlWindowFrameUnits, WindowType,
-    With,
+    GranteeName, GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
+    LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
+    NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
+    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
+    Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
+    Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -443,6 +445,27 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         SqlStatement::Grant(grant) => lower_grant(grant),
         SqlStatement::Revoke(revoke) => lower_revoke(revoke),
         SqlStatement::Analyze(analyze) => lower_analyze(analyze),
+        SqlStatement::Kill { modifier, id } => Ok(Statement::Kill(KillStmt {
+            query: matches!(modifier, Some(KillType::Query)),
+            connection_id: *id,
+        })),
+        SqlStatement::LockTables { tables } => Ok(Statement::LockTables(LockTablesStmt {
+            table_locks: tables
+                .iter()
+                .map(|t| {
+                    Ok(TableLockItem {
+                        table: TableName::new(None, t.table.value.clone()),
+                        lock_type: match &t.lock_type {
+                            SqlLockTableType::Read { .. } => TableLockType::Read,
+                            SqlLockTableType::Write { .. } => TableLockType::Write,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })),
+        SqlStatement::UnlockTables => Ok(Statement::CleanupTableLock(CleanupTableLockStmt {
+            tables: Vec::new(),
+        })),
         SqlStatement::Prepare {
             name, statement, ..
         } => {
@@ -1492,8 +1515,10 @@ fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     Ok((out, ops))
 }
 
-/// Extract MySQL stmts sqlparser lacks or mishandles: `DO`, `SET PASSWORD`,
-/// `SHUTDOWN`, `ALTER DATABASE … CHARACTER SET / COLLATE`.
+/// Extract MySQL/TiDB stmts sqlparser lacks or mishandles: `DO`, `SET PASSWORD`,
+/// `SHUTDOWN`, `ALTER DATABASE … CHARSET`, leftover allowlist ops (OPTIMIZE /
+/// REPAIR / RENAME USER / BINLOG / CHANGE / ALTER INSTANCE / LOCK TABLES with
+/// schema-qualified names / ADMIN CLEANUP).
 fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
@@ -1513,10 +1538,93 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
             i = skip_ws(bytes, i + "SHUTDOWN".len());
             continue;
         }
+        if keyword_at(bytes, i, "BINLOG") {
+            let (stmt, end) = parse_binlog_stmt(bytes, i + "BINLOG".len())?;
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "CHANGE") {
+            let after = skip_ws(bytes, i + "CHANGE".len());
+            // TiDB `CHANGE PUMP/DRAINER …` only — skip `ALTER TABLE … CHANGE COLUMN`.
+            if keyword_at(bytes, after, "PUMP") || keyword_at(bytes, after, "DRAINER") {
+                let (stmt, end) = parse_change_stmt(bytes, i + "CHANGE".len())?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "OPTIMIZE") {
+            let (stmt, end) = parse_optimize_table(bytes, i + "OPTIMIZE".len())?;
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "REPAIR") {
+            let (stmt, end) = parse_repair_table(bytes, i + "REPAIR".len())?;
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "LOCK") {
+            let after = skip_ws(bytes, i + "LOCK".len());
+            if keyword_at(bytes, after, "TABLES") || keyword_at(bytes, after, "TABLE") {
+                let kw = if keyword_at(bytes, after, "TABLES") {
+                    "TABLES".len()
+                } else {
+                    "TABLE".len()
+                };
+                let (stmt, end) = parse_lock_tables(bytes, after + kw)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "UNLOCK") {
+            let after = skip_ws(bytes, i + "UNLOCK".len());
+            if keyword_at(bytes, after, "TABLES") || keyword_at(bytes, after, "TABLE") {
+                let kw = if keyword_at(bytes, after, "TABLES") {
+                    "TABLES".len()
+                } else {
+                    "TABLE".len()
+                };
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::CleanupTableLock(CleanupTableLockStmt {
+                    tables: Vec::new(),
+                })));
+                i = skip_ws(bytes, after + kw);
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "ADMIN") {
+            let after = skip_ws(bytes, i + "ADMIN".len());
+            if keyword_at(bytes, after, "CLEANUP") {
+                let (stmt, end) = parse_admin_cleanup_table_lock(bytes, after + "CLEANUP".len())?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
         if keyword_at(bytes, i, "SET") {
             let after = skip_ws(bytes, i + "SET".len());
             if keyword_at(bytes, after, "PASSWORD") {
                 let (stmt, end) = parse_set_password(bytes, after + "PASSWORD".len())?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "RENAME") {
+            let after = skip_ws(bytes, i + "RENAME".len());
+            if keyword_at(bytes, after, "USER") {
+                let (stmt, end) = parse_rename_user(bytes, after + "USER".len())?;
                 out.push_str("SET NAMES '__sealdb_misc__'");
                 ops.push(Some(stmt));
                 i = end;
@@ -1532,6 +1640,13 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                     "SCHEMA".len()
                 };
                 let (stmt, end) = parse_alter_database(bytes, after + kw_len)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+            if keyword_at(bytes, after, "INSTANCE") {
+                let (stmt, end) = parse_alter_instance(bytes, after + "INSTANCE".len())?;
                 out.push_str("SET NAMES '__sealdb_misc__'");
                 ops.push(Some(stmt));
                 i = end;
@@ -1610,6 +1725,263 @@ fn parse_set_password(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> 
         Statement::SetPwd(SetPwdStmt { user, password }),
         skip_ws(bytes, after),
     ))
+}
+
+fn parse_binlog_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let (payload, after) = read_quoted_or_ident(bytes, i);
+    Ok((
+        Statement::Binlog(BinlogStmt { payload }),
+        skip_ws(bytes, after),
+    ))
+}
+
+fn parse_change_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let (node_type, after_type) = read_quoted_or_ident(bytes, i);
+    if node_type.is_empty() {
+        return Err(Error::unsupported("CHANGE without node type"));
+    }
+    i = skip_ws(bytes, after_type);
+    if !keyword_at(bytes, i, "TO") {
+        return Err(Error::unsupported("CHANGE without TO"));
+    }
+    i = skip_ws(bytes, i + "TO".len());
+    if !keyword_at(bytes, i, "NODE_STATE") {
+        return Err(Error::unsupported("CHANGE without NODE_STATE"));
+    }
+    i = skip_ws(bytes, i + "NODE_STATE".len());
+    if i < bytes.len() && bytes[i] == b'=' {
+        i = skip_ws(bytes, i + 1);
+    }
+    let (state, after_state) = read_quoted_or_ident(bytes, i);
+    i = skip_ws(bytes, after_state);
+    if !keyword_at(bytes, i, "FOR") {
+        return Err(Error::unsupported("CHANGE without FOR NODE_ID"));
+    }
+    i = skip_ws(bytes, i + "FOR".len());
+    if !keyword_at(bytes, i, "NODE_ID") {
+        return Err(Error::unsupported("CHANGE without NODE_ID"));
+    }
+    i = skip_ws(bytes, i + "NODE_ID".len());
+    let (node_id, after_id) = read_quoted_or_ident(bytes, i);
+    Ok((
+        Statement::Change(ChangeStmt {
+            node_type,
+            state,
+            node_id,
+        }),
+        skip_ws(bytes, after_id),
+    ))
+}
+
+fn parse_optimize_table(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "NO_WRITE_TO_BINLOG") || keyword_at(bytes, i, "LOCAL") {
+        let kw = if keyword_at(bytes, i, "LOCAL") {
+            "LOCAL".len()
+        } else {
+            "NO_WRITE_TO_BINLOG".len()
+        };
+        i = skip_ws(bytes, i + kw);
+    }
+    if !keyword_at(bytes, i, "TABLE") {
+        return Err(Error::unsupported("OPTIMIZE without TABLE"));
+    }
+    i = skip_ws(bytes, i + "TABLE".len());
+    let (tables, end) = parse_table_name_list(bytes, i)?;
+    Ok((Statement::OptimizeTable(OptimizeTableStmt { tables }), end))
+}
+
+fn parse_repair_table(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "NO_WRITE_TO_BINLOG") || keyword_at(bytes, i, "LOCAL") {
+        let kw = if keyword_at(bytes, i, "LOCAL") {
+            "LOCAL".len()
+        } else {
+            "NO_WRITE_TO_BINLOG".len()
+        };
+        i = skip_ws(bytes, i + kw);
+    }
+    if !keyword_at(bytes, i, "TABLE") {
+        return Err(Error::unsupported("REPAIR without TABLE"));
+    }
+    i = skip_ws(bytes, i + "TABLE".len());
+    let (tables, end) = parse_table_name_list(bytes, i)?;
+    Ok((Statement::RepairTable(RepairTableStmt { tables }), end))
+}
+
+fn parse_lock_tables(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    let mut table_locks = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (table, after_table) = parse_table_name(bytes, i)?;
+        i = skip_ws(bytes, after_table);
+        // Optional AS alias.
+        if keyword_at(bytes, i, "AS") {
+            i = skip_ws(bytes, i + "AS".len());
+            let (_alias, after_alias) = read_quoted_or_ident(bytes, i);
+            i = skip_ws(bytes, after_alias);
+        } else if i < bytes.len()
+            && is_ident_byte(bytes[i])
+            && !keyword_at(bytes, i, "READ")
+            && !keyword_at(bytes, i, "WRITE")
+            && !keyword_at(bytes, i, "LOW_PRIORITY")
+        {
+            let (_alias, after_alias) = read_quoted_or_ident(bytes, i);
+            i = skip_ws(bytes, after_alias);
+        }
+        let lock_type = if keyword_at(bytes, i, "READ") {
+            i = skip_ws(bytes, i + "READ".len());
+            if keyword_at(bytes, i, "LOCAL") {
+                i = skip_ws(bytes, i + "LOCAL".len());
+            }
+            TableLockType::Read
+        } else if keyword_at(bytes, i, "LOW_PRIORITY") {
+            i = skip_ws(bytes, i + "LOW_PRIORITY".len());
+            if !keyword_at(bytes, i, "WRITE") {
+                return Err(Error::unsupported("LOCK TABLES LOW_PRIORITY without WRITE"));
+            }
+            i = skip_ws(bytes, i + "WRITE".len());
+            TableLockType::Write
+        } else if keyword_at(bytes, i, "WRITE") {
+            i = skip_ws(bytes, i + "WRITE".len());
+            TableLockType::Write
+        } else {
+            return Err(Error::unsupported("LOCK TABLES without READ/WRITE"));
+        };
+        table_locks.push(TableLockItem { table, lock_type });
+        i = skip_ws(bytes, i);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok((Statement::LockTables(LockTablesStmt { table_locks }), i))
+}
+
+fn parse_admin_cleanup_table_lock(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "TABLE") {
+        return Err(Error::unsupported("ADMIN CLEANUP without TABLE"));
+    }
+    i = skip_ws(bytes, i + "TABLE".len());
+    if !keyword_at(bytes, i, "LOCK") {
+        return Err(Error::unsupported("ADMIN CLEANUP TABLE without LOCK"));
+    }
+    i = skip_ws(bytes, i + "LOCK".len());
+    let (tables, end) = parse_table_name_list(bytes, i)?;
+    Ok((
+        Statement::CleanupTableLock(CleanupTableLockStmt { tables }),
+        end,
+    ))
+}
+
+fn parse_rename_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    let mut user_to_users = Vec::new();
+    loop {
+        i = skip_ws(bytes, i);
+        let (old_user, after_old) = read_user_identity(bytes, i)?;
+        i = skip_ws(bytes, after_old);
+        if !keyword_at(bytes, i, "TO") {
+            return Err(Error::unsupported("RENAME USER without TO"));
+        }
+        i = skip_ws(bytes, i + "TO".len());
+        let (new_user, after_new) = read_user_identity(bytes, i)?;
+        user_to_users.push(UserToUser { old_user, new_user });
+        i = skip_ws(bytes, after_new);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok((Statement::RenameUser(RenameUserStmt { user_to_users }), i))
+}
+
+fn parse_alter_instance(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let mut reload_tls = false;
+    let mut no_rollback_on_error = false;
+    while i < bytes.len() && bytes[i] != b';' {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b';' {
+            break;
+        }
+        if keyword_at(bytes, i, "RELOAD") {
+            i = skip_ws(bytes, i + "RELOAD".len());
+            if !keyword_at(bytes, i, "TLS") {
+                return Err(Error::unsupported("ALTER INSTANCE RELOAD without TLS"));
+            }
+            i = skip_ws(bytes, i + "TLS".len());
+            reload_tls = true;
+            continue;
+        }
+        if keyword_at(bytes, i, "NO") {
+            i = skip_ws(bytes, i + "NO".len());
+            if !keyword_at(bytes, i, "ROLLBACK") {
+                return Err(Error::unsupported("ALTER INSTANCE NO without ROLLBACK"));
+            }
+            i = skip_ws(bytes, i + "ROLLBACK".len());
+            if !keyword_at(bytes, i, "ON") {
+                return Err(Error::unsupported("ALTER INSTANCE NO ROLLBACK without ON"));
+            }
+            i = skip_ws(bytes, i + "ON".len());
+            if !keyword_at(bytes, i, "ERROR") {
+                return Err(Error::unsupported(
+                    "ALTER INSTANCE NO ROLLBACK ON without ERROR",
+                ));
+            }
+            i = skip_ws(bytes, i + "ERROR".len());
+            no_rollback_on_error = true;
+            continue;
+        }
+        break;
+    }
+    if !reload_tls {
+        return Err(Error::unsupported("ALTER INSTANCE without RELOAD TLS"));
+    }
+    Ok((
+        Statement::AlterInstance(AlterInstanceStmt {
+            reload_tls,
+            no_rollback_on_error,
+        }),
+        i,
+    ))
+}
+
+fn parse_table_name(bytes: &[u8], mut i: usize) -> Result<(TableName, usize)> {
+    i = skip_ws(bytes, i);
+    let (first, after_first) = read_quoted_or_ident(bytes, i);
+    if first.is_empty() {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing table name"));
+    }
+    let mut j = skip_ws(bytes, after_first);
+    if j < bytes.len() && bytes[j] == b'.' {
+        j = skip_ws(bytes, j + 1);
+        let (second, after_second) = read_quoted_or_ident(bytes, j);
+        if second.is_empty() {
+            return Err(Error::new(ERR_PARSE_ERROR, "missing table name after ."));
+        }
+        return Ok((TableName::new(Some(first), second), after_second));
+    }
+    Ok((TableName::new(None, first), after_first))
+}
+
+fn parse_table_name_list(bytes: &[u8], mut i: usize) -> Result<(Vec<TableName>, usize)> {
+    let mut tables = Vec::new();
+    loop {
+        let (table, after) = parse_table_name(bytes, i)?;
+        tables.push(table);
+        i = skip_ws(bytes, after);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok((tables, i))
 }
 
 fn parse_alter_database(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {

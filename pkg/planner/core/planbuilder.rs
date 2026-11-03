@@ -198,6 +198,33 @@ impl PlanBuilder {
             Statement::Shutdown(_) => Ok(PhysicalPlan::Simple {
                 kind: "Shutdown".to_string(),
             }),
+            Statement::Kill(_) => Ok(PhysicalPlan::Simple {
+                kind: "Kill".to_string(),
+            }),
+            Statement::LockTables(_) => Ok(PhysicalPlan::Simple {
+                kind: "LockTables".to_string(),
+            }),
+            Statement::CleanupTableLock(_) => Ok(PhysicalPlan::Simple {
+                kind: "CleanupTableLock".to_string(),
+            }),
+            Statement::OptimizeTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "OptimizeTable".to_string(),
+            }),
+            Statement::RepairTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "RepairTable".to_string(),
+            }),
+            Statement::RenameUser(_) => Ok(PhysicalPlan::Simple {
+                kind: "RenameUser".to_string(),
+            }),
+            Statement::Binlog(_) => Ok(PhysicalPlan::Simple {
+                kind: "Binlog".to_string(),
+            }),
+            Statement::Change(_) => Ok(PhysicalPlan::Simple {
+                kind: "Change".to_string(),
+            }),
+            Statement::AlterInstance(_) => Ok(PhysicalPlan::Simple {
+                kind: "AlterInstance".to_string(),
+            }),
             Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "Analyze".to_string(),
             }),

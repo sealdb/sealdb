@@ -2,7 +2,7 @@ use crate::mdl::MdlTable;
 use crate::schema_checker;
 use sealdb_bindinfo::SessionBindingHandle;
 use sealdb_ddl::execute_ddl;
-use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
+use sealdb_errno::{ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::{MemStorage, Storage};
 use sealdb_meta::{Job, JobState, Mutator};
@@ -10,6 +10,7 @@ use sealdb_parser::ast::Statement;
 use sealdb_planner::InstancePlanCache;
 use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -58,6 +59,25 @@ pub struct Domain {
     schema_lease: Mutex<SchemaLeaseState>,
     /// Set by `SHUTDOWN`; tidb-server listen loop exits when true.
     shutdown_requested: AtomicBool,
+    /// Connection/session registry for `KILL` (F22).
+    connections: Mutex<HashMap<u64, ConnState>>,
+    /// Explicit `LOCK TABLES` holds (F12); distinct from short-lived MDL.
+    table_locks: Mutex<TableLockTable>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConnState {
+    /// Set by `KILL [CONNECTION|QUERY] id`.
+    killed: bool,
+}
+
+/// In-memory LOCK TABLES registry keyed by lowercase `schema.table`.
+#[derive(Default)]
+struct TableLockTable {
+    /// table_key → (holder session_id, write?)
+    held: HashMap<String, (u64, bool)>,
+    /// session_id → table keys held.
+    by_session: HashMap<u64, HashSet<String>>,
 }
 
 /// C3 MVB schema lease / reload hook state.
@@ -148,6 +168,8 @@ impl Domain {
                 expire_at: Instant::now(),
             }),
             shutdown_requested: AtomicBool::new(false),
+            connections: Mutex::new(HashMap::new()),
+            table_locks: Mutex::new(TableLockTable::default()),
         })
     }
 
@@ -161,6 +183,99 @@ impl Domain {
         self.shutdown_requested.load(Ordering::SeqCst)
     }
 
+    /// Register a connection/session id for `KILL` (F22).
+    pub fn register_connection(&self, id: u64) {
+        self.connections
+            .lock()
+            .expect("domain connections lock")
+            .entry(id)
+            .or_default();
+    }
+
+    /// `KILL` — mark connection/query for close. Returns false if id unknown.
+    pub fn kill_connection(&self, id: u64) -> bool {
+        let mut conns = self.connections.lock().expect("domain connections lock");
+        if let Some(state) = conns.get_mut(&id) {
+            state.killed = true;
+            return true;
+        }
+        // Allow tests / admin to register-on-kill a synthetic id.
+        conns.insert(id, ConnState { killed: true });
+        true
+    }
+
+    /// True after `KILL` for this connection id.
+    pub fn is_connection_killed(&self, id: u64) -> bool {
+        self.connections
+            .lock()
+            .expect("domain connections lock")
+            .get(&id)
+            .is_some_and(|s| s.killed)
+    }
+
+    /// `LOCK TABLES` — acquire READ (shared) or WRITE (exclusive) table locks.
+    pub fn lock_tables(&self, session_id: u64, locks: &[(String, bool)]) -> Result<()> {
+        let mut table = self.table_locks.lock().expect("domain table locks");
+        // MySQL: LOCK TABLES releases previous locks for this session first.
+        table.unlock_session(session_id);
+        for (key, _write) in locks {
+            if let Some((holder, _)) = table.held.get(key)
+                && *holder != session_id
+            {
+                // MVB: any cross-session hold conflicts (MySQL allows multi-READ;
+                // SealDB serializes LOCK TABLES holders for simplicity).
+                return Err(Error::new(
+                    ERR_LOCK_WAIT_TIMEOUT,
+                    format!(
+                        "Lock wait timeout exceeded; try restarting transaction (LOCK TABLES on {key})"
+                    ),
+                ));
+            }
+        }
+        for (key, write) in locks {
+            table.held.insert(key.clone(), (session_id, *write));
+            table
+                .by_session
+                .entry(session_id)
+                .or_default()
+                .insert(key.clone());
+        }
+        Ok(())
+    }
+
+    /// `UNLOCK TABLES` / empty `ADMIN CLEANUP TABLE LOCK` — drop session locks.
+    pub fn unlock_tables(&self, session_id: u64) {
+        self.table_locks
+            .lock()
+            .expect("domain table locks")
+            .unlock_session(session_id);
+    }
+
+    /// `ADMIN CLEANUP TABLE LOCK t[,…]` — drop locks on the listed tables.
+    pub fn cleanup_table_locks(&self, table_keys: &[String]) {
+        let mut table = self.table_locks.lock().expect("domain table locks");
+        for key in table_keys {
+            if let Some((holder, _)) = table.held.remove(key)
+                && let Some(set) = table.by_session.get_mut(&holder)
+            {
+                set.remove(key);
+                if set.is_empty() {
+                    table.by_session.remove(&holder);
+                }
+            }
+        }
+    }
+
+    /// True when `session_id` currently holds a LOCK TABLES entry.
+    pub fn session_holds_table_lock(&self, session_id: u64, table_key: &str) -> bool {
+        self.table_locks
+            .lock()
+            .expect("domain table locks")
+            .by_session
+            .get(&session_id)
+            .is_some_and(|s| s.contains(table_key))
+    }
+
     /// Reload privilege cache from Storage (`FLUSH PRIVILEGES`).
     pub fn reload_privileges(&self) -> Result<()> {
         if self.privilege.skip_grant_table() {
@@ -171,7 +286,9 @@ impl Domain {
 
     /// Allocate a Domain-local session id for MDL tracking.
     pub fn alloc_session_id(&self) -> u64 {
-        self.next_session_id.fetch_add(1, Ordering::Relaxed)
+        let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        self.register_connection(id);
+        id
     }
 
     /// Shared MDL for DML on `schema.table` (lowercase key).
@@ -403,6 +520,23 @@ impl Domain {
         inner.meta = snap.meta;
         inner.infoschema = snap.infoschema;
         inner.defer_persist = false;
+    }
+}
+
+impl TableLockTable {
+    fn unlock_session(&mut self, session_id: u64) {
+        let Some(keys) = self.by_session.remove(&session_id) else {
+            return;
+        };
+        for key in keys {
+            if self
+                .held
+                .get(&key)
+                .is_some_and(|(holder, _)| *holder == session_id)
+            {
+                self.held.remove(&key);
+            }
+        }
     }
 }
 

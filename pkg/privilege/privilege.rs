@@ -6,8 +6,8 @@
 use sealdb_errno::{ERR_DBACCESS_DENIED_ERROR, ERR_TABLEACCESS_DENIED_ERROR, Error, Result};
 use sealdb_parser::ast::{
     CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel, GrantLevelType,
-    GrantRoleStmt, GrantStmt, PrivilegeType, RevokeRoleStmt, RevokeStmt, SetPwdStmt, SetRoleKind,
-    UserIdentity,
+    GrantRoleStmt, GrantStmt, PrivilegeType, RenameUserStmt, RevokeRoleStmt, RevokeStmt,
+    SetPwdStmt, SetRoleKind, UserIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -208,6 +208,57 @@ impl Manager {
             inner.grants.remove(&key);
             inner.dynamic.remove(&key);
             inner.role_graph.remove(&key);
+        }
+        Ok(())
+    }
+
+    /// `RENAME USER old TO new` — move auth + grants under the new identity (F20).
+    pub fn rename_user(&self, stmt: &RenameUserStmt) -> Result<()> {
+        let mut inner = self.inner.lock().expect("privilege lock");
+        for pair in &stmt.user_to_users {
+            let old_key = user_key(&pair.old_user);
+            let new_key = user_key(&pair.new_user);
+            if old_key == new_key {
+                continue;
+            }
+            if !inner.users.contains_key(&old_key) && !self.skip_grant_table {
+                return Err(Error::new(
+                    sealdb_errno::ERR_NO_SUCH_TABLE,
+                    format!(
+                        "Operation RENAME USER failed for '{}'@'{}'",
+                        pair.old_user.username, pair.old_user.hostname
+                    ),
+                ));
+            }
+            if inner.users.contains_key(&new_key) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_TABLE_EXISTS,
+                    format!(
+                        "Operation RENAME USER failed for '{}'@'{}'",
+                        pair.new_user.username, pair.new_user.hostname
+                    ),
+                ));
+            }
+            let auth = inner.users.remove(&old_key).unwrap_or(None);
+            inner.users.insert(new_key.clone(), auth);
+            if let Some(grants) = inner.grants.remove(&old_key) {
+                inner.grants.insert(new_key.clone(), grants);
+            }
+            if let Some(dyns) = inner.dynamic.remove(&old_key) {
+                inner.dynamic.insert(new_key.clone(), dyns);
+            }
+            if let Some(roles) = inner.role_graph.remove(&old_key) {
+                inner.role_graph.insert(new_key.clone(), roles);
+            }
+            // Role memberships pointing at the old user as a role name.
+            if inner.roles.remove(&old_key) {
+                inner.roles.insert(new_key.clone());
+            }
+            for members in inner.role_graph.values_mut() {
+                if members.remove(&old_key) {
+                    members.insert(new_key.clone());
+                }
+            }
         }
         Ok(())
     }
