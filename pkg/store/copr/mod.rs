@@ -6,9 +6,18 @@
 //! `split_key_ranges_for_scan` uses process PD endpoints set by `store::open`.
 //! tipb DAG encode / CopTask / Coprocessor RPC live in `dag` / `task` / `rpc`.
 
+pub mod batch_coprocessor;
+pub mod batch_request_sender;
+pub mod coprocessor;
+pub mod coprocessor_cache;
 pub mod dag;
+pub mod key_ranges;
+pub mod mpp;
+pub mod mpp_probe;
 pub mod pd;
+pub mod region_cache;
 pub mod rpc;
+pub mod store;
 pub mod task;
 
 pub use dag::{
@@ -18,7 +27,7 @@ pub use dag::{
 pub use rpc::execute_cop_task;
 pub use task::{build_table_scan_tasks, CopTask};
 
-use pd::{decode_pd_key, hex_encode, pd_get_region};
+use pd::{decode_pd_key, pd_get_region};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use std::sync::Mutex;
 
@@ -149,6 +158,7 @@ mod tests {
 
     #[test]
     fn test_hex_roundtrip() {
+        use super::pd::hex_encode;
         let raw = b"\x01\xab\xff";
         let hex = hex_encode(raw);
         assert_eq!(hex, "01abff");

@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C TiKV Coprocessor RPC；下一步包文件对齐 / cascades）
+> 最后更新：2026-11-03（C6-C store/copr + distsql 包文件对齐；下一步 TableReader-via-Cop / cascades）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C `store/copr` + `distsql` 包文件对齐
+- **完成**:
+  - 对齐 TiDB 文件名：`key_ranges`/`coprocessor`/`region_cache`/`store`/`batch_*`/`mpp*`
+  - `distsql::{distsql,request_builder,select_result}`；parity manifest 登记
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+  - `cargo test -q -p sealdb-distsql --lib`
+  - `parity_check.py --tidb-root …`（无 invalid entries）
+- **下一步**:
+  - TableReader 切 Cop 路径；cascades / BRIE
 
 ### 2026-11-03
 

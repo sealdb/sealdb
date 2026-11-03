@@ -400,8 +400,8 @@
     "pkg/store/driver/tikv_driver.go": {
       "status": "partial",
       "rust": "pkg/store/driver/mod.rs",
-      "phase": 5,
-      "notes": "tikv-client TransactionClient wrapped as sealdb_kv::Storage; Coprocessor DAG deferred"
+      "phase": 10,
+      "notes": "TransactionClient + PD TSO/RC/batch_get + CopTask execute_cop_task"
     },
     "pkg/server/server.go": {
       "status": "partial",
@@ -514,7 +514,8 @@
     "pkg/executor/distsql.go": {
       "status": "partial",
       "phase": 5,
-      "notes": "IndexLookUpExecutor + IndexMergeExecutor (OR index union + lookup)"
+      "notes": "IndexLookUp/IndexMerge + Region split_for_scan",
+      "rust": "pkg/executor/distsql.rs"
     },
     "pkg/executor/coprocessor.go": {
       "status": "partial",
@@ -809,6 +810,84 @@
       "rust": "pkg/planner/core/plan_cache_param.rs",
       "phase": 10,
       "notes": "MVB: normalize_prep_cache_key for ? template keys; ParamMarker AST rewrite deferred"
+    },
+    "pkg/store/copr/key_ranges.go": {
+      "status": "partial",
+      "rust": "pkg/store/copr/key_ranges.rs",
+      "phase": 10,
+      "notes": "KeyRange + PD HTTP Region split / for_scan"
+    },
+    "pkg/store/copr/coprocessor.go": {
+      "status": "partial",
+      "rust": "pkg/store/copr/coprocessor.rs",
+      "phase": 10,
+      "notes": "tipb DAG encode + CopTask + TiKV Coprocessor unary RPC"
+    },
+    "pkg/store/copr/region_cache.go": {
+      "status": "partial",
+      "rust": "pkg/store/copr/region_cache.rs",
+      "phase": 10,
+      "notes": "PD HTTP get_region / store address; full RegionCache later"
+    },
+    "pkg/store/copr/store.go": {
+      "status": "partial",
+      "rust": "pkg/store/copr/store.rs",
+      "phase": 10,
+      "notes": "CopStore build+execute over PD endpoints"
+    },
+    "pkg/store/copr/coprocessor_cache.go": {
+      "status": "stub",
+      "rust": "pkg/store/copr/coprocessor_cache.rs",
+      "phase": 10,
+      "notes": "cache skeleton"
+    },
+    "pkg/store/copr/batch_coprocessor.go": {
+      "status": "stub",
+      "rust": "pkg/store/copr/batch_coprocessor.rs",
+      "phase": 10,
+      "notes": "BatchCop deferred; unary Cop live"
+    },
+    "pkg/store/copr/batch_request_sender.go": {
+      "status": "stub",
+      "rust": "pkg/store/copr/batch_request_sender.rs",
+      "phase": 10,
+      "notes": "BatchCop sender deferred"
+    },
+    "pkg/store/copr/mpp.go": {
+      "status": "stub",
+      "rust": "pkg/store/copr/mpp.rs",
+      "phase": 10,
+      "notes": "C6-D TiFlash placeholder stub"
+    },
+    "pkg/store/copr/mpp_probe.go": {
+      "status": "stub",
+      "rust": "pkg/store/copr/mpp_probe.rs",
+      "phase": 10,
+      "notes": "C6-D TiFlash placeholder stub"
+    },
+    "pkg/distsql/distsql.go": {
+      "status": "partial",
+      "rust": "pkg/distsql/distsql.rs",
+      "phase": 10,
+      "notes": "Select task build entry"
+    },
+    "pkg/distsql/request_builder.go": {
+      "status": "partial",
+      "rust": "pkg/distsql/request_builder.rs",
+      "phase": 10,
+      "notes": "TableScan CopTask builder"
+    },
+    "pkg/distsql/select_result.go": {
+      "status": "partial",
+      "rust": "pkg/distsql/select_result.rs",
+      "phase": 10,
+      "notes": "tipb SelectResponse decode surface; chunk row decode later"
+    },
+    "pkg/ddl/sequence.go": {
+      "status": "partial",
+      "rust": "pkg/ddl/sequence.rs",
+      "phase": 10,
+      "notes": "CREATE/DROP SEQUENCE + NEXTVAL path"
     }
   }
 }
