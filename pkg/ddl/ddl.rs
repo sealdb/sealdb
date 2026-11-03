@@ -19,6 +19,9 @@ pub fn execute_ddl(
         Statement::DropDatabase(s) => {
             schema::drop_schema(meta, is, s)?;
         }
+        Statement::AlterDatabase(s) => {
+            schema::alter_schema(meta, is, s, current_db)?;
+        }
         Statement::CreateTable(s) => {
             table::create_table(meta, is, s, current_db)?;
         }

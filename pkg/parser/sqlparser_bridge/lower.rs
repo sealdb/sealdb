@@ -1,8 +1,9 @@
 use super::dialect::dialect;
 use crate::ast::ddl::{
-    AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
-    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
-    PartitionOption, PartitionType, TableName, TruncateTableStmt,
+    AlterDatabaseStmt, AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition,
+    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, DropDatabaseStmt, DropIndexStmt,
+    DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType, TableName,
+    TruncateTableStmt,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -17,22 +18,22 @@ use crate::ast::expressions::{
 };
 use crate::ast::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
-    DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel,
-    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
-    ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, UseStmt,
-    UserIdentity, UserSpec,
+    DeallocateStmt, DoStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt,
+    FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel,
+    PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt,
+    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt,
+    SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, UseStmt, UserIdentity, UserSpec,
 };
-use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement};
+use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
 use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, Cte, CteAsMaterialized,
-    DataType, Delete, DescribeAlias, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
-    GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType,
+    DataType, Delete, DescribeAlias, DuplicateTreatment, Expr, FlushType, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects,
+    GranteeName, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, LockClause, LockType,
     MySQLColumnPosition, NamedWindowDefinition, NamedWindowExpr, NonBlock, NullTreatment,
     ObjectName, ObjectType, OrderByExpr, OrderByKind, OrderBySort, Privileges, Query,
     RenameTable as SqlRenameTable, RenameTableNameKind, Revoke, SchemaName, SelectItem, Set,
@@ -67,6 +68,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, analyze_indexes) = extract_analyze_index(&rewritten)?;
     // sqlparser rejects TiDB `CREATE/DROP BINDING`.
     let (rewritten, binding_ops) = extract_binding_ddl(&rewritten)?;
+    // sqlparser rejects MySQL `DO` / `SET PASSWORD` / `SHUTDOWN` / `ALTER DATABASE … CHARSET`.
+    let (rewritten, misc_ops) = extract_misc_allowlist(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -81,6 +84,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut user_ops = user_ops.into_iter();
     let mut analyze_indexes = analyze_indexes.into_iter();
     let mut binding_ops = binding_ops.into_iter();
+    let mut misc_ops = misc_ops.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -134,6 +138,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         }
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_binding__"))
             && let Some(op) = binding_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_misc__"))
+            && let Some(op) = misc_ops.next().flatten()
         {
             lowered = op;
         }
@@ -394,6 +403,18 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             }))
         }
         SqlStatement::Set(set) => lower_set(set),
+        SqlStatement::Flush {
+            object_type,
+            location,
+            ..
+        } => Ok(Statement::Flush(FlushStmt {
+            tp: match object_type {
+                FlushType::Privileges => FlushStmtType::Privileges,
+                FlushType::Tables => FlushStmtType::Tables,
+                _ => FlushStmtType::Other,
+            },
+            no_write_to_binlog: location.is_some(),
+        })),
         SqlStatement::Commit {
             chain, modifier, ..
         } => {
@@ -1469,6 +1490,201 @@ fn extract_user_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
         i += ch.len_utf8();
     }
     Ok((out, ops))
+}
+
+/// Extract MySQL stmts sqlparser lacks or mishandles: `DO`, `SET PASSWORD`,
+/// `SHUTDOWN`, `ALTER DATABASE … CHARACTER SET / COLLATE`.
+fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "DO") {
+            let (stmt, end) = parse_do_stmt(bytes, i + "DO".len())?;
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "SHUTDOWN") {
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(Statement::Shutdown(ShutdownStmt)));
+            i = skip_ws(bytes, i + "SHUTDOWN".len());
+            continue;
+        }
+        if keyword_at(bytes, i, "SET") {
+            let after = skip_ws(bytes, i + "SET".len());
+            if keyword_at(bytes, after, "PASSWORD") {
+                let (stmt, end) = parse_set_password(bytes, after + "PASSWORD".len())?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "ALTER") {
+            let after = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after, "DATABASE") || keyword_at(bytes, after, "SCHEMA") {
+                let kw_len = if keyword_at(bytes, after, "DATABASE") {
+                    "DATABASE".len()
+                } else {
+                    "SCHEMA".len()
+                };
+                let (stmt, end) = parse_alter_database(bytes, after + kw_len)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok((out, ops))
+}
+
+fn stmt_end(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b';' => return i,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn parse_do_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let end = stmt_end(bytes, i);
+    let expr_sql = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+    if expr_sql.is_empty() {
+        return Err(Error::unsupported("DO without expressions"));
+    }
+    let select_sql = format!("SELECT {expr_sql}");
+    let parsed = Parser::parse_sql(&dialect(), &select_sql).map_err(|e| {
+        Error::new(
+            ERR_PARSE_ERROR,
+            format!("You have an error in your SQL syntax: {e}"),
+        )
+    })?;
+    let first = parsed
+        .first()
+        .ok_or_else(|| Error::unsupported("DO without expressions"))?;
+    let lowered = lower_statement(first)?;
+    let exprs = match lowered {
+        Statement::Select(select) => select.fields.into_iter().map(|f| f.expr).collect(),
+        other => {
+            return Err(Error::unsupported(format!("DO body {}", other.stmt_type())));
+        }
+    };
+    Ok((Statement::Do(DoStmt { exprs }), end))
+}
+
+fn parse_set_password(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let mut user = None;
+    if keyword_at(bytes, i, "FOR") {
+        i = skip_ws(bytes, i + "FOR".len());
+        let (ident, after) = read_user_identity(bytes, i)?;
+        user = Some(ident);
+        i = skip_ws(bytes, after);
+    }
+    if i >= bytes.len() || bytes[i] != b'=' {
+        return Err(Error::unsupported("SET PASSWORD without ="));
+    }
+    i = skip_ws(bytes, i + 1);
+    let (password, after) = read_quoted_or_ident(bytes, i);
+    Ok((
+        Statement::SetPwd(SetPwdStmt { user, password }),
+        skip_ws(bytes, after),
+    ))
+}
+
+fn parse_alter_database(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let end = stmt_end(bytes, i);
+    let mut name = String::new();
+    // Optional db name before CHARACTER/COLLATE.
+    if i < end
+        && !keyword_at(bytes, i, "CHARACTER")
+        && !keyword_at(bytes, i, "CHARSET")
+        && !keyword_at(bytes, i, "COLLATE")
+        && !keyword_at(bytes, i, "DEFAULT")
+    {
+        let (ident, after) = read_quoted_or_ident(bytes, i);
+        name = ident;
+        i = skip_ws(bytes, after);
+    }
+    let mut charset = None;
+    let mut collate = None;
+    while i < end {
+        i = skip_ws(bytes, i);
+        if i >= end {
+            break;
+        }
+        if keyword_at(bytes, i, "DEFAULT") {
+            i = skip_ws(bytes, i + "DEFAULT".len());
+            continue;
+        }
+        if keyword_at(bytes, i, "CHARACTER") {
+            i = skip_ws(bytes, i + "CHARACTER".len());
+            if !keyword_at(bytes, i, "SET") {
+                return Err(Error::unsupported("ALTER DATABASE CHARACTER without SET"));
+            }
+            i = skip_ws(bytes, i + "SET".len());
+            if i < end && bytes[i] == b'=' {
+                i = skip_ws(bytes, i + 1);
+            }
+            let (cs, after) = read_quoted_or_ident(bytes, i);
+            charset = Some(cs);
+            i = after;
+            continue;
+        }
+        if keyword_at(bytes, i, "CHARSET") {
+            i = skip_ws(bytes, i + "CHARSET".len());
+            if i < end && bytes[i] == b'=' {
+                i = skip_ws(bytes, i + 1);
+            }
+            let (cs, after) = read_quoted_or_ident(bytes, i);
+            charset = Some(cs);
+            i = after;
+            continue;
+        }
+        if keyword_at(bytes, i, "COLLATE") {
+            i = skip_ws(bytes, i + "COLLATE".len());
+            if i < end && bytes[i] == b'=' {
+                i = skip_ws(bytes, i + 1);
+            }
+            let (coll, after) = read_quoted_or_ident(bytes, i);
+            collate = Some(coll);
+            i = after;
+            continue;
+        }
+        return Err(Error::unsupported("ALTER DATABASE option"));
+    }
+    if charset.is_none() && collate.is_none() {
+        return Err(Error::unsupported("ALTER DATABASE without options"));
+    }
+    Ok((
+        Statement::AlterDatabase(AlterDatabaseStmt {
+            name,
+            charset,
+            collate,
+        }),
+        end,
+    ))
 }
 
 fn parse_create_user(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {

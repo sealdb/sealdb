@@ -9,9 +9,10 @@ pub mod misc;
 
 pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
-    AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
-    CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
-    PartitionOption, PartitionType, TableName, TruncateTableStmt,
+    AlterDatabaseStmt, AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition,
+    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, DropDatabaseStmt, DropIndexStmt,
+    DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType, TableName,
+    TruncateTableStmt,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -25,9 +26,9 @@ pub use expressions::{
 };
 pub use misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
-    DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantLevel,
-    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, PrepareStmt, PrivElem, PrivilegeType,
-    ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
-    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, UseStmt,
-    UserIdentity, UserSpec,
+    DeallocateStmt, DoStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt,
+    FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel,
+    PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt,
+    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt,
+    SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, UseStmt, UserIdentity, UserSpec,
 };

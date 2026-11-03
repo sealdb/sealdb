@@ -117,6 +117,9 @@ impl PlanBuilder {
             Statement::DropDatabase(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropDatabase,
             }),
+            Statement::AlterDatabase(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::AlterDatabase,
+            }),
             Statement::CreateTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateTable,
             }),
@@ -182,6 +185,18 @@ impl PlanBuilder {
             }),
             Statement::SetRole(_) => Ok(PhysicalPlan::Simple {
                 kind: "SetRole".to_string(),
+            }),
+            Statement::SetPwd(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetPwd".to_string(),
+            }),
+            Statement::Flush(_) => Ok(PhysicalPlan::Simple {
+                kind: "Flush".to_string(),
+            }),
+            Statement::Do(_) => Ok(PhysicalPlan::Simple {
+                kind: "Do".to_string(),
+            }),
+            Statement::Shutdown(_) => Ok(PhysicalPlan::Simple {
+                kind: "Shutdown".to_string(),
             }),
             Statement::AnalyzeTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "Analyze".to_string(),

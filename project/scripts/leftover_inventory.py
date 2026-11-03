@@ -19,6 +19,11 @@ FEATURE_HINTS = {
     "TruncateTableStmt": "F02",
     "CreateDatabaseStmt": "F02",
     "DropDatabaseStmt": "F02",
+    "AlterDatabaseStmt": "F02",
+    "DoStmt": "F01",
+    "SetPwdStmt": "F20",
+    "FlushStmt": "F20",
+    "ShutdownStmt": "F22",
     "AlterTableStmt": "F18",
     "CreateIndexStmt": "F18",
     "DropIndexStmt": "F18",
@@ -78,16 +83,11 @@ FEATURE_HINTS = {
 # not owned by a closed F*/C2–C5 wave). C1 verifies open unmapped == this set.
 UNMAPPED_ALLOWLIST = frozenset(
     {
-        "DoStmt",
         "BinlogStmt",
         "ChangeStmt",
-        "FlushStmt",
         "AlterInstanceStmt",
         "RenameUserStmt",
         "KillStmt",
-        "SetPwdStmt",
-        "ShutdownStmt",
-        "AlterDatabaseStmt",
         "LockTablesStmt",
         "CleanupTableLockStmt",
         "RepairTableStmt",

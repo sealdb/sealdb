@@ -144,6 +144,18 @@ impl Mutator {
         self.hset(DBS, &field, &serde_json::to_vec(db).map_err(json_err)?)
     }
 
+    /// Replace database meta (charset/collate) under the same id.
+    pub fn update_database(&mut self, db: &DBInfo) -> Result<()> {
+        let field = db_key(db.id);
+        if self.hget(DBS, &field)?.is_none() {
+            return Err(Error::new(
+                ERR_BAD_DB,
+                format!("Unknown database '{}'", db.name.o()),
+            ));
+        }
+        self.hset(DBS, &field, &serde_json::to_vec(db).map_err(json_err)?)
+    }
+
     pub fn drop_database(&mut self, db_id: i64) -> Result<()> {
         let field = db_key(db_id);
         if self.hget(DBS, &field)?.is_none() {

@@ -789,3 +789,83 @@ impl SetStmt {
         Ok(())
     }
 }
+
+/// `DO expr[, expr…]` — evaluate for side effects; no result set (MySQL/TiDB `DoStmt`).
+#[derive(Clone, Debug)]
+pub struct DoStmt {
+    pub exprs: Vec<ExprNode>,
+}
+
+impl DoStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DO ");
+        for (i, expr) in self.exprs.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            expr.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// `SET PASSWORD [FOR user] = 'pwd'` (TiDB `SetPwdStmt`).
+#[derive(Clone, Debug)]
+pub struct SetPwdStmt {
+    pub user: Option<UserIdentity>,
+    pub password: String,
+}
+
+impl SetPwdStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SET PASSWORD");
+        if let Some(user) = &self.user {
+            ctx.write_str(" FOR ");
+            user.restore(ctx)?;
+        }
+        ctx.write_str(" = ");
+        ctx.write_str(&format!("'{}'", self.password));
+        Ok(())
+    }
+}
+
+/// Flush target (TiDB `FlushStmtType` subset).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlushStmtType {
+    Privileges,
+    Tables,
+    Other,
+}
+
+/// `FLUSH PRIVILEGES` / `FLUSH TABLES` (TiDB `FlushStmt`).
+#[derive(Clone, Debug)]
+pub struct FlushStmt {
+    pub tp: FlushStmtType,
+    pub no_write_to_binlog: bool,
+}
+
+impl FlushStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("FLUSH ");
+        if self.no_write_to_binlog {
+            ctx.write_str("NO_WRITE_TO_BINLOG ");
+        }
+        match self.tp {
+            FlushStmtType::Privileges => ctx.write_str("PRIVILEGES"),
+            FlushStmtType::Tables => ctx.write_str("TABLES"),
+            FlushStmtType::Other => ctx.write_str("STATUS"),
+        }
+        Ok(())
+    }
+}
+
+/// `SHUTDOWN` — request server exit (TiDB `ShutdownStmt`).
+#[derive(Clone, Debug, Default)]
+pub struct ShutdownStmt;
+
+impl ShutdownStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("SHUTDOWN");
+        Ok(())
+    }
+}

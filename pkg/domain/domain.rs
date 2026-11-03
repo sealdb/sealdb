@@ -12,7 +12,7 @@ use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ pub struct Domain {
     next_session_id: AtomicU64,
     /// Schema lease: Duration::ZERO disables 8027 checks (default).
     schema_lease: Mutex<SchemaLeaseState>,
+    /// Set by `SHUTDOWN`; tidb-server listen loop exits when true.
+    shutdown_requested: AtomicBool,
 }
 
 /// C3 MVB schema lease / reload hook state.
@@ -145,7 +147,26 @@ impl Domain {
                 lease: Duration::ZERO,
                 expire_at: Instant::now(),
             }),
+            shutdown_requested: AtomicBool::new(false),
         })
+    }
+
+    /// Mark that `SHUTDOWN` was requested (F22 server ops).
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// True after a successful `SHUTDOWN` statement.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// Reload privilege cache from Storage (`FLUSH PRIVILEGES`).
+    pub fn reload_privileges(&self) -> Result<()> {
+        if self.privilege.skip_grant_table() {
+            return Ok(());
+        }
+        load_privileges(self.storage.as_ref(), self.privilege.as_ref())
     }
 
     /// Allocate a Domain-local session id for MDL tracking.

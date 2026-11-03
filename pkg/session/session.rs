@@ -197,6 +197,32 @@ impl Session {
                 apply_set(self, set)?;
                 return Ok(empty_result());
             }
+            Statement::Do(doit) => {
+                for expr in &doit.exprs {
+                    let _ = sealdb_expression::eval_expr(expr)?;
+                }
+                return Ok(empty_result());
+            }
+            Statement::SetPwd(set) => {
+                let user = self.current_user();
+                self.domain.privilege().set_password(set, &user)?;
+                self.domain.persist_privileges()?;
+                return Ok(empty_result());
+            }
+            Statement::Flush(flush) => {
+                match flush.tp {
+                    sealdb_parser::ast::FlushStmtType::Privileges => {
+                        self.domain.reload_privileges()?;
+                    }
+                    sealdb_parser::ast::FlushStmtType::Tables
+                    | sealdb_parser::ast::FlushStmtType::Other => {}
+                }
+                return Ok(empty_result());
+            }
+            Statement::Shutdown(_) => {
+                self.domain.request_shutdown();
+                return Ok(empty_result());
+            }
             Statement::SetRole(set) => {
                 let user = self.current_user();
                 let roles = self
@@ -364,6 +390,7 @@ impl Session {
             }
             Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
+            | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
@@ -590,7 +617,10 @@ impl Session {
             | Statement::CreateUser(_)
             | Statement::DropUser(_)
             | Statement::GrantRole(_)
-            | Statement::RevokeRole(_) => {
+            | Statement::RevokeRole(_)
+            | Statement::SetPwd(_)
+            | Statement::Flush(_)
+            | Statement::Shutdown(_) => {
                 if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::ALL) {
                     return Err(access_denied("", "", PrivilegeType::ALL, &user));
                 }
@@ -723,6 +753,22 @@ impl Session {
                         PrivilegeType::CREATE,
                         &user,
                     ));
+                }
+            }
+            Statement::AlterDatabase(alter) => {
+                let name = if alter.name.is_empty() {
+                    current_db.as_str()
+                } else {
+                    alter.name.as_str()
+                };
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    name,
+                    "",
+                    PrivilegeType::CREATE,
+                ) {
+                    return Err(access_denied(name, "", PrivilegeType::CREATE, &user));
                 }
             }
             Statement::CreateTable(create) => {
@@ -1436,6 +1482,7 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::Delete(_)
             | Statement::CreateDatabase(_)
             | Statement::DropDatabase(_)
+            | Statement::AlterDatabase(_)
             | Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::TruncateTable(_)
@@ -1450,10 +1497,16 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::DropUser(_)
             | Statement::GrantRole(_)
             | Statement::RevokeRole(_)
+            | Statement::SetPwd(_)
     )
 }
 
 impl Session {
+    /// Shared Domain (tests / SHUTDOWN flag).
+    pub fn domain(&self) -> Arc<Domain> {
+        Arc::clone(&self.domain)
+    }
+
     /// If a Domain binding matches this statement's restored SQL, re-parse the bind SQL.
     fn apply_sql_binding(&self, stmt: &Statement) -> Result<Option<Statement>> {
         match stmt {
@@ -1644,6 +1697,43 @@ mod tests {
         session.execute_stmt("DROP TABLE db1.t").unwrap();
         session.execute_stmt("DROP DATABASE db1").unwrap();
         assert!(session.infoschema().schema_by_name("db1").is_none());
+    }
+
+    #[test]
+    fn test_do_flush_setpwd_shutdown_alter_database() {
+        let session = Session::new();
+        session.execute_stmt("DO 1, 2 + 3").unwrap();
+        session.execute_stmt("FLUSH TABLES").unwrap();
+        session.execute_stmt("FLUSH PRIVILEGES").unwrap();
+
+        session
+            .execute_stmt("CREATE USER 'u'@'%' IDENTIFIED BY 'old'")
+            .unwrap();
+        session
+            .execute_stmt("SET PASSWORD FOR 'u'@'%' = 'newpwd'")
+            .unwrap();
+        let auth = session
+            .privilege_manager()
+            .auth_string(&sealdb_parser::ast::UserIdentity::new("u", "%"));
+        assert_eq!(auth.as_deref(), Some("newpwd"));
+
+        assert!(!session.domain().is_shutdown_requested());
+        session.execute_stmt("SHUTDOWN").unwrap();
+        assert!(session.domain().is_shutdown_requested());
+
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("ALTER DATABASE db1 CHARACTER SET latin1 COLLATE latin1_bin")
+            .unwrap();
+        let db = session.infoschema().schema_by_name("db1").unwrap().clone();
+        assert_eq!(db.charset, "latin1");
+        assert_eq!(db.collate, "latin1_bin");
+        let create = session.execute_stmt("SHOW CREATE DATABASE db1").unwrap();
+        assert!(
+            create.display_rows()[0][1].contains("CHARACTER SET latin1"),
+            "{:?}",
+            create.display_rows()
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 use sealdb_errno::{ERR_DBACCESS_DENIED_ERROR, ERR_TABLEACCESS_DENIED_ERROR, Error, Result};
 use sealdb_parser::ast::{
     CreateRoleStmt, CreateUserStmt, DropRoleStmt, DropUserStmt, GrantLevel, GrantLevelType,
-    GrantRoleStmt, GrantStmt, PrivilegeType, RevokeRoleStmt, RevokeStmt, SetRoleKind, UserIdentity,
+    GrantRoleStmt, GrantStmt, PrivilegeType, RevokeRoleStmt, RevokeStmt, SetPwdStmt, SetRoleKind,
+    UserIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -209,6 +210,43 @@ impl Manager {
             inner.role_graph.remove(&key);
         }
         Ok(())
+    }
+
+    /// `SET PASSWORD` — update auth string (mysql_native_password plugin, F22).
+    /// Stores the password the same way as `CREATE USER … IDENTIFIED BY`.
+    pub fn set_password(&self, stmt: &SetPwdStmt, current: &UserIdentity) -> Result<()> {
+        let target = stmt.user.clone().unwrap_or_else(|| current.clone());
+        let key = user_key(&target);
+        let mut inner = self.inner.lock().expect("privilege lock");
+        if !inner.users.contains_key(&key) {
+            // Ensure the user exists so SET PASSWORD can create the auth slot
+            // (skip-grant and bootstrap root already present).
+            if self.skip_grant_table {
+                inner.users.insert(key.clone(), None);
+            } else {
+                return Err(Error::new(
+                    sealdb_errno::ERR_NO_SUCH_TABLE,
+                    format!(
+                        "Operation SET PASSWORD failed for '{}'@'{}'",
+                        target.username, target.hostname
+                    ),
+                ));
+            }
+        }
+        let auth = encode_native_password(&stmt.password);
+        inner.users.insert(key, Some(auth));
+        Ok(())
+    }
+
+    /// Auth string for `user` (IDENTIFIED BY / SET PASSWORD).
+    pub fn auth_string(&self, user: &UserIdentity) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("privilege lock")
+            .users
+            .get(&user_key(user))
+            .cloned()
+            .flatten()
     }
 
     pub fn user_exists(&self, user: &UserIdentity) -> bool {
@@ -660,6 +698,17 @@ fn user_key(user: &UserIdentity) -> (String, String) {
         user.username.to_ascii_lowercase(),
         user.hostname.to_ascii_lowercase(),
     )
+}
+
+/// mysql_native_password-style auth string used by F22 handshake.
+/// Already-hashed values (`*…`) are kept; otherwise store the plaintext
+/// (same shape as `CREATE USER … IDENTIFIED BY`, verified by plugin name).
+fn encode_native_password(password: &str) -> String {
+    if password.starts_with('*') {
+        password.to_ascii_uppercase()
+    } else {
+        password.to_string()
+    }
 }
 
 fn same_level(entry: &GrantEntry, level: &GrantLevel) -> bool {

@@ -18,20 +18,15 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 These kinds stay `unmapped` on purpose (not claimed by F*/C2–C5, not C6).
 C1 `--check` requires open `unmapped` stmts to equal this set.
 
-- `AlterDatabaseStmt`
 - `AlterInstanceStmt`
 - `BinlogStmt`
 - `ChangeStmt`
 - `CleanupTableLockStmt`
-- `DoStmt`
-- `FlushStmt`
 - `KillStmt`
 - `LockTablesStmt`
 - `OptimizeTableStmt`
 - `RenameUserStmt`
 - `RepairTableStmt`
-- `SetPwdStmt`
-- `ShutdownStmt`
 
 ## PlanBuilder statement kinds still open
 
@@ -42,14 +37,12 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.LockStatsStmt` → C6
 - `ast.UnlockStatsStmt` → C6
 - `ast.PlanReplayerStmt` → C6
-- `ast.DoStmt` → unmapped
 - `ast.BinlogStmt` → unmapped
 - `ast.ChangeStmt` → unmapped
 - `ast.SplitRegionStmt` → C6
 - `ast.DistributeTableStmt` → C6
 - `ast.CompactTableStmt` → C6
 - `ast.RecommendIndexStmt` → C6
-- `ast.FlushStmt` → unmapped
 - `ast.AlterInstanceStmt` → unmapped
 - `ast.RenameUserStmt` → unmapped
 - `ast.BRIEStmt` → C6
@@ -57,10 +50,7 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.AddQueryWatchStmt` → C6
 - `ast.DropQueryWatchStmt` → C6
 - `ast.KillStmt` → unmapped
-- `ast.SetPwdStmt` → unmapped
-- `ast.ShutdownStmt` → unmapped
 - `ast.SetResourceGroupStmt` → C6
-- `ast.AlterDatabaseStmt` → unmapped
 - `ast.AlterSequenceStmt` → C6
 - `ast.CreateViewStmt` → C6
 - `ast.CreateSequenceStmt` → C6
