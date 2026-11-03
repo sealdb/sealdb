@@ -22,13 +22,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 
 ## PlanBuilder statement kinds still open
 
-- `ast.ImportIntoStmt` → C6
-- `ast.SplitRegionStmt` → C6
-- `ast.DistributeTableStmt` → C6
-- `ast.CompactTableStmt` → C6
-- `ast.RecommendIndexStmt` → C6
-- `ast.BRIEStmt` → C6
-- `ast.CalibrateResourceStmt` → C6
 - `ast.AddQueryWatchStmt` → C6
 - `ast.DropQueryWatchStmt` → C6
 - `ast.SetResourceGroupStmt` → C6

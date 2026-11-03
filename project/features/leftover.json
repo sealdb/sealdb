@@ -39,34 +39,6 @@
   "unmapped_allowlist": [],
   "open_stmts": [
     {
-      "stmt": "ast.ImportIntoStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.SplitRegionStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.DistributeTableStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.CompactTableStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.RecommendIndexStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.BRIEStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.CalibrateResourceStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.AddQueryWatchStmt",
       "owner": "C6"
     },

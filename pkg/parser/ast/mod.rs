@@ -25,13 +25,15 @@ pub use expressions::{
     WindowFrameUnits, WindowFuncExpr, WindowSpec,
 };
 pub use misc::{
-    AlterInstanceStmt, AnalyzeTableStmt, BeginStmt, BinlogStmt, ChangeStmt, CleanupTableLockStmt,
-    CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DoStmt,
-    DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel,
-    GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, KillStmt, LoadStatsStmt,
+    AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt, CalibrateResourceStmt,
+    ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt, CreateBindingStmt,
+    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
+    DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType,
+    GrantRoleStmt, GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt,
     LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem,
-    PrivilegeType, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RevokeRoleStmt,
-    RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt,
-    SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, TableLockItem,
-    TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    PrivilegeType, RecommendIndexStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
+    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind,
+    SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt,
+    SplitRegionStmt, TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt,
+    UserIdentity, UserSpec, UserToUser,
 };

@@ -101,6 +101,13 @@ C6_CLOSED_STMTS: frozenset[str] = frozenset(
         "UnlockStatsStmt",
         "TraceStmt",
         "PlanReplayerStmt",
+        "BRIEStmt",
+        "ImportIntoStmt",
+        "SplitRegionStmt",
+        "DistributeTableStmt",
+        "CompactTableStmt",
+        "RecommendIndexStmt",
+        "CalibrateResourceStmt",
     }
 )
 

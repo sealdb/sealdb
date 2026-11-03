@@ -1195,3 +1195,94 @@ impl PlanReplayerStmt {
         Ok(())
     }
 }
+
+/// TiDB `BRIEStmt` (`BACKUP` / `RESTORE` …) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct BRIEStmt {
+    pub raw_sql: String,
+}
+
+impl BRIEStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `ImportIntoStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct ImportIntoStmt {
+    pub raw_sql: String,
+}
+
+impl ImportIntoStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `SplitRegionStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct SplitRegionStmt {
+    pub raw_sql: String,
+}
+
+impl SplitRegionStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `DistributeTableStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct DistributeTableStmt {
+    pub raw_sql: String,
+}
+
+impl DistributeTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `CompactTableStmt` (`ALTER TABLE … COMPACT`) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct CompactTableStmt {
+    pub raw_sql: String,
+}
+
+impl CompactTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `RecommendIndexStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct RecommendIndexStmt {
+    pub raw_sql: String,
+}
+
+impl RecommendIndexStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `CalibrateResourceStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct CalibrateResourceStmt {
+    pub raw_sql: String,
+}
+
+impl CalibrateResourceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
