@@ -9,6 +9,7 @@ pub enum DdlKind {
     DropDatabase,
     AlterDatabase,
     CreateTable,
+    CreateView,
     DropTable,
     TruncateTable,
     CreateIndex,

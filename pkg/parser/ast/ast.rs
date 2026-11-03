@@ -1,6 +1,6 @@
 use super::ddl::{
     AlterDatabaseStmt, AlterTableStmt, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
-    DropDatabaseStmt, DropIndexStmt, DropTableStmt, TruncateTableStmt,
+    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, TruncateTableStmt,
 };
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
@@ -31,6 +31,7 @@ pub enum Statement {
     DropDatabase(DropDatabaseStmt),
     AlterDatabase(AlterDatabaseStmt),
     CreateTable(CreateTableStmt),
+    CreateView(CreateViewStmt),
     DropTable(DropTableStmt),
     TruncateTable(TruncateTableStmt),
     CreateIndex(CreateIndexStmt),
@@ -88,6 +89,7 @@ impl Node for Statement {
             Statement::DropDatabase(s) => s.restore(ctx),
             Statement::AlterDatabase(s) => s.restore(ctx),
             Statement::CreateTable(s) => s.restore(ctx),
+            Statement::CreateView(s) => s.restore(ctx),
             Statement::DropTable(s) => s.restore(ctx),
             Statement::TruncateTable(s) => s.restore(ctx),
             Statement::CreateIndex(s) => s.restore(ctx),
@@ -147,6 +149,7 @@ impl StmtNode for Statement {
             Statement::DropDatabase(_) => "DropDatabaseStmt",
             Statement::AlterDatabase(_) => "AlterDatabaseStmt",
             Statement::CreateTable(_) => "CreateTableStmt",
+            Statement::CreateView(_) => "CreateViewStmt",
             Statement::DropTable(_) => "DropTableStmt",
             Statement::TruncateTable(_) => "TruncateTableStmt",
             Statement::CreateIndex(_) => "CreateIndexStmt",

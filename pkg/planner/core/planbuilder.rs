@@ -123,6 +123,9 @@ impl PlanBuilder {
             Statement::CreateTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateTable,
             }),
+            Statement::CreateView(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::CreateView,
+            }),
             Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropTable,
             }),

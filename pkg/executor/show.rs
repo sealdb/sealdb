@@ -119,6 +119,31 @@ impl Executor for ShowExec {
                     Datum::Bytes(render_create_table(info).into_bytes()),
                 ]];
             }
+            ShowStmtKind::CreateView => {
+                let table = self
+                    .stmt
+                    .table
+                    .as_ref()
+                    .ok_or_else(|| Error::new(ERR_NO_SUCH_TABLE, "missing view name"))?;
+                let (schema, name) = resolve_table(table, &self.current_db)?;
+                let info = is.table_by_name(&schema, &name).ok_or_else(|| {
+                    Error::new(
+                        ERR_NO_SUCH_TABLE,
+                        format!("Table '{schema}.{name}' doesn't exist"),
+                    )
+                })?;
+                let view = info.view.as_ref().ok_or_else(|| {
+                    Error::new(
+                        sealdb_errno::ERR_WRONG_OBJECT,
+                        format!("'{schema}.{name}' is not VIEW"),
+                    )
+                })?;
+                self.schema = vec!["View".to_string(), "Create View".to_string()];
+                self.rows = vec![vec![
+                    Datum::Bytes(name.as_bytes().to_vec()),
+                    Datum::Bytes(render_create_view(info, view).into_bytes()),
+                ]];
+            }
             ShowStmtKind::Columns => {
                 let table = self
                     .stmt
@@ -379,6 +404,29 @@ fn render_create_table(info: &TableInfo) -> String {
         "CREATE TABLE `{}` (\n{}\n)",
         info.name.o(),
         cols.join(",\n")
+    )
+}
+
+fn render_create_view(info: &TableInfo, view: &sealdb_meta::ViewInfo) -> String {
+    let cols = if view.cols.is_empty() {
+        String::new()
+    } else {
+        let list = view
+            .cols
+            .iter()
+            .map(|c| format!("`{}`", c.o()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" ({list})")
+    };
+    format!(
+        "CREATE ALGORITHM={} DEFINER={} SQL SECURITY {} VIEW `{}`{} AS {}",
+        view.algorithm,
+        view.definer,
+        view.security,
+        info.name.o(),
+        cols,
+        view.select_stmt
     )
 }
 

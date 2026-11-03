@@ -444,6 +444,7 @@ pub enum ShowStmtKind {
     Columns,
     Grants,
     CreateTable,
+    CreateView,
     CreateDatabase,
     Index,
     Charset,
@@ -493,6 +494,12 @@ impl ShowStmt {
             }
             ShowStmtKind::CreateTable => {
                 ctx.write_str("SHOW CREATE TABLE ");
+                if let Some(table) = &self.table {
+                    table.restore(ctx)?;
+                }
+            }
+            ShowStmtKind::CreateView => {
+                ctx.write_str("SHOW CREATE VIEW ");
                 if let Some(table) = &self.table {
                     table.restore(ctx)?;
                 }

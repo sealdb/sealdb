@@ -1,5 +1,7 @@
 use crate::create_table::{build_table_info, build_table_info_with_like, columns_from_select};
-use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_WRONG_OBJECT, Error, Result,
+};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
 use sealdb_meta::{Mutator, TableInfo};
@@ -70,6 +72,18 @@ pub fn drop_table(
             is.table_by_name(&schema, &table),
         ) {
             (Some(db), Some(tbl)) => {
+                if stmt.is_view && !tbl.is_view() {
+                    return Err(Error::new(
+                        ERR_WRONG_OBJECT,
+                        format!("'{schema}.{table}' is not VIEW"),
+                    ));
+                }
+                if !stmt.is_view && tbl.is_view() {
+                    return Err(Error::new(
+                        ERR_WRONG_OBJECT,
+                        format!("'{schema}.{table}' is not BASE TABLE"),
+                    ));
+                }
                 meta.drop_table_or_view(db.id, tbl.id)?;
                 meta.gen_schema_version()?;
             }

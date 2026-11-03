@@ -315,11 +315,17 @@ impl CreateTableStmt {
 pub struct DropTableStmt {
     pub if_exists: bool,
     pub tables: Vec<TableName>,
+    /// TiDB `IsView`: `DROP VIEW` vs `DROP TABLE`.
+    pub is_view: bool,
 }
 
 impl DropTableStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("DROP TABLE ");
+        if self.is_view {
+            ctx.write_str("DROP VIEW ");
+        } else {
+            ctx.write_str("DROP TABLE ");
+        }
         if self.if_exists {
             ctx.write_str("IF EXISTS ");
         }
@@ -328,6 +334,54 @@ impl DropTableStmt {
                 ctx.write_str(",");
             }
             table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// TiDB `ast.CreateViewStmt`.
+#[derive(Clone, Debug)]
+pub struct CreateViewStmt {
+    pub or_replace: bool,
+    pub view_name: TableName,
+    pub cols: Vec<String>,
+    pub select: Box<SelectStmt>,
+    pub algorithm: String,
+    pub definer: String,
+    pub security: String,
+    pub check_option: String,
+}
+
+impl CreateViewStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE ");
+        if self.or_replace {
+            ctx.write_str("OR REPLACE ");
+        }
+        ctx.write_str("ALGORITHM = ");
+        ctx.write_str(&self.algorithm);
+        ctx.write_str(" DEFINER = ");
+        ctx.write_str(&self.definer);
+        ctx.write_str(" SQL SECURITY ");
+        ctx.write_str(&self.security);
+        ctx.write_str(" VIEW ");
+        self.view_name.restore(ctx)?;
+        if !self.cols.is_empty() {
+            ctx.write_str(" (");
+            for (i, col) in self.cols.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        }
+        ctx.write_str(" AS ");
+        self.select.restore(ctx)?;
+        if !self.check_option.eq_ignore_ascii_case("CASCADED") {
+            ctx.write_str(" WITH ");
+            ctx.write_str(&self.check_option);
+            ctx.write_str(" CHECK OPTION");
         }
         Ok(())
     }
