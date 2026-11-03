@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C TableReader CopTask 调度；下一步 tipb chunk decode / BRIE）
+> 最后更新：2026-11-03（C6 本地文件 BRIE；下一步 tipb chunk decode / PD 全量客户端）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6 本地文件 BRIE
+- **完成**:
+  - `BACKUP DATABASE … TO 'path'` / `RESTORE DATABASE FROM 'path'`（`file://` 本地 JSON）
+  - 远程 s3/gs/hdfs 仍 unsupported；跳过 VIEW
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_brie_local_backup_restore`
+  - `cargo test -q -p sealdb-session --lib brie::`
+- **下一步**:
+  - tipb chunk decode；PD 全量客户端加深
 
 ### 2026-11-03
 
