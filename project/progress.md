@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C store/copr + distsql 包文件对齐；下一步 TableReader-via-Cop / cascades）
+> 最后更新：2026-11-03（C6 cascades 骨架；下一步 TableReader-via-Cop / BRIE）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6 Cascades 包骨架
+- **完成**:
+  - `pkg/planner/cascades` 对齐 optimize/memo/rule/task/base 等 TiDB 文件名；`optimize` no-op
+  - 生产路径仍为 RBO；parity stub 登记
+- **验证**:
+  - `cargo test -q -p sealdb-planner --lib cascades`
+- **下一步**:
+  - TableReader 切 Cop 路径；BRIE 语义加深
 
 ### 2026-11-03
 
