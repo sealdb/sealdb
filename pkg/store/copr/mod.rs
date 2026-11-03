@@ -4,6 +4,16 @@
 //! `split_key_ranges_via_pd` walks PD HTTP `/pd/api/v1/region/key/{hex}` to
 //! produce Region-aligned half-open ranges for Cop / TableReader.
 //! `split_key_ranges_for_scan` uses process PD endpoints set by `store::open`.
+//! tipb DAG encode / CopTask builders live in `dag` / `task`.
+
+pub mod dag;
+pub mod task;
+
+pub use dag::{
+    decode_select_response, encode_table_scan_dag, Chunk, ColumnInfo, DagRequest, ExecType,
+    Executor, IndexScan, Limit, SelectResponse, Selection, TableScan, TipbError, REQ_TYPE_DAG,
+};
+pub use task::{build_table_scan_tasks, CopTask};
 
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use serde::Deserialize;

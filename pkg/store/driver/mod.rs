@@ -57,6 +57,31 @@ impl TikvStorage {
         crate::copr::split_key_ranges_via_pd(&self.pd_endpoints, start, end)
     }
 
+    /// Build tipb TableScan CopTasks split by Region (send RPC lands next).
+    pub fn build_table_scan_tasks(
+        &self,
+        start_ts: u64,
+        table_id: i64,
+        columns: &[crate::copr::ColumnInfo],
+        output_offsets: &[i64],
+        start: &[u8],
+        end: &[u8],
+        selection: Option<crate::copr::Selection>,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::copr::CopTask>> {
+        crate::copr::build_table_scan_tasks(
+            &self.pd_endpoints,
+            start_ts,
+            table_id,
+            columns,
+            output_offsets,
+            start,
+            end,
+            selection,
+            limit,
+        )
+    }
+
     fn begin_txn(&self, pessimistic: bool) -> Result<Box<dyn Transaction>> {
         let txn = if pessimistic {
             self.rt
