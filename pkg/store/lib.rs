@@ -10,8 +10,10 @@ use sealdb_kv::{MemStorage, Storage};
 use std::sync::Arc;
 
 pub use copr::{
-    KeyRange, clear_pd_endpoints, set_pd_endpoints, split_key_ranges, split_key_ranges_for_scan,
-    split_key_ranges_via_pd,
+    build_table_scan_tasks, clear_pd_endpoints, decode_select_response, encode_table_scan_dag,
+    set_pd_endpoints, split_key_ranges, split_key_ranges_for_scan, split_key_ranges_via_pd,
+    Chunk, ColumnInfo, CopTask, DagRequest, ExecType, Executor, IndexScan, KeyRange, Limit,
+    SelectResponse, Selection, TableScan, TipbError, REQ_TYPE_DAG,
 };
 pub use driver::TikvStorage as TikvStore;
 

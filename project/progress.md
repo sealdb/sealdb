@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C PD Region locate + TableReader/Index 扫描切分；下一步 Cop DAG / 包文件对齐）
+> 最后更新：2026-11-03（C6-C tipb DAG encode + CopTask；下一步 Cop RPC / TEMPTABLE / 包对齐）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C：PD TSO/Region locate/batch_get/RC；下一步 Cop DAG→D(TiFlash) |
+| C6 | `in-progress` | C：PD TSO/Region/batch_get/RC + tipb DAG CopTask；下一步 Cop RPC→D |
 
 ---
 
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C tipb DAG + CopTask
+- **完成**:
+  - `pkg/store/copr/dag`：tipb 兼容 `DAGRequest`/`TableScan`/`SelectResponse` encode/decode（`REQ_TYPE_DAG=103`）
+  - `CopTask` + `build_table_scan_tasks`（按 Region 切分）；`sealdb-distsql::build_table_select_tasks`
+  - TiKV gRPC Coprocessor 发送仍待（下一切片）
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+  - `cargo test -q -p sealdb-distsql --lib`
+- **下一步**:
+  - Coprocessor RPC 发送；VIEW algorithm=TEMPTABLE；算层包文件对齐
 
 ### 2026-11-03
 
