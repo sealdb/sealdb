@@ -1759,6 +1759,7 @@ dependencies = [
  "sealdb-parser",
  "sealdb-planner",
  "sealdb-statistics",
+ "sealdb-store",
  "sealdb-tablecodec",
  "sealdb-types",
  "sealdb-util",
