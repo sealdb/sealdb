@@ -137,6 +137,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_stats_lock_load() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("LOAD STATS '/tmp/s.json'").unwrap() {
+            crate::ast::Statement::LoadStats(stmt) => assert_eq!(stmt.path, "/tmp/s.json"),
+            other => panic!("expected LoadStatsStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("LOCK STATS db1.t, db1.u").unwrap() {
+            crate::ast::Statement::LockStats(stmt) => assert_eq!(stmt.tables.len(), 2),
+            other => panic!("expected LockStatsStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("UNLOCK STATS db1.t").unwrap() {
+            crate::ast::Statement::UnlockStats(stmt) => assert_eq!(stmt.tables.len(), 1),
+            other => panic!("expected UnlockStatsStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_load_data() {
         let parser = Parser::new();
         match parser

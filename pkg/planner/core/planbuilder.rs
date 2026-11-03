@@ -226,6 +226,15 @@ impl PlanBuilder {
             Statement::RepairTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "RepairTable".to_string(),
             }),
+            Statement::LoadStats(_) => Ok(PhysicalPlan::Simple {
+                kind: "LoadStats".to_string(),
+            }),
+            Statement::LockStats(_) => Ok(PhysicalPlan::Simple {
+                kind: "LockStats".to_string(),
+            }),
+            Statement::UnlockStats(_) => Ok(PhysicalPlan::Simple {
+                kind: "UnlockStats".to_string(),
+            }),
             Statement::RenameUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "RenameUser".to_string(),
             }),

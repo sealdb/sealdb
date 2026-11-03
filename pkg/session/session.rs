@@ -290,7 +290,12 @@ impl Session {
                 self.domain.persist_privileges()?;
                 return Ok(empty_result());
             }
-            Statement::Binlog(_) | Statement::Change(_) | Statement::AlterInstance(_) => {
+            Statement::Binlog(_)
+            | Statement::Change(_)
+            | Statement::AlterInstance(_)
+            | Statement::LoadStats(_)
+            | Statement::LockStats(_)
+            | Statement::UnlockStats(_) => {
                 return Ok(empty_result());
             }
             Statement::SetRole(set) => {
