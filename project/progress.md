@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6 VIEW ALGORITHM=TEMPTABLE；下一步 Cop RPC / 包对齐）
+> 最后更新：2026-11-03（C6-C TiKV Coprocessor RPC；下一步包文件对齐 / cascades）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C：PD TSO/Region/batch_get/RC + tipb DAG CopTask；下一步 Cop RPC→D |
+| C6 | `in-progress` | C：PD/TiKV 客户端加深含 Cop RPC；下一步包对齐→D(TiFlash) |
 
 ---
 
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6-C TiKV Coprocessor RPC
+- **完成**:
+  - PD Region leader + store address → tonic `/tikvpb.Tikv/Coprocessor`
+  - `execute_cop_task` / `TikvStorage::execute_cop_task`；skip-if-no-cluster 单测
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+- **下一步**:
+  - TableReader 切 Cop 路径；算层包文件对齐；cascades / BRIE
 
 ### 2026-11-03
 
