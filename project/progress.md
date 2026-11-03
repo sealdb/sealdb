@@ -110,6 +110,18 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-C TiKV `batch_get` + BatchPointGet
+- **完成**:
+  - `sealdb_kv::Transaction::{batch_get,batch_get_for_update}`；TiKV 走 RPC，默认回退逐 key
+  - `BatchPointGetExec` 无锁路径一次 `batch_get` 拉行
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib`
+  - `cargo test -q -p sealdb-session --lib point_get`
+- **下一步**:
+  - C6-C 续：Coprocessor DAG / Region 定位，或算层包文件对齐
+
+### 2026-11-03
+
 - **Phase**: C6-C TiKV RC `refresh_snapshot`
 - **完成**:
   - `pkg/store/driver`：READ COMMITTED 用 PD TSO 换新 `Snapshot` 做普通读；本地 write overlay 保留本事务未提交写

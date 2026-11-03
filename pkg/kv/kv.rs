@@ -39,8 +39,29 @@ pub trait Transaction: Send {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&mut self, key: &[u8]) -> Result<()>;
     fn scan(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Batch get. Default loops `get`; TiKV overrides with `batch_get` RPC.
+    /// Missing keys are omitted from the result (TiKV semantics).
+    fn batch_get(&mut self, keys: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(key)? {
+                out.push((key.clone(), value));
+            }
+        }
+        Ok(out)
+    }
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Batch pessimistic lock+get. Default loops `get_for_update`.
+    fn batch_get_for_update(&mut self, keys: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get_for_update(key)? {
+                out.push((key.clone(), value));
+            }
+        }
+        Ok(out)
+    }
     /// Shared lock (`FOR SHARE`). Default is exclusive; MemStorage overrides.
     fn get_for_share(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_for_update(key)
