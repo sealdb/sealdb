@@ -142,8 +142,11 @@ pub(crate) fn scan_table(
         for physical_id in physical_ids {
             let start = gen_table_record_prefix(*physical_id);
             let end = next_prefix(start.as_bytes());
-            let pairs = txn.scan_locked(start.as_bytes(), &end, lock, wait)?;
-            rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
+            // Region-aware split (MVB: one range until driver locate lands).
+            for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+                let pairs = txn.scan_locked(&range.start, &range.end, lock, wait)?;
+                rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
+            }
         }
         Ok(rows)
     })
