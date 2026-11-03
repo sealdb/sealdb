@@ -213,6 +213,8 @@ case "$FEATURE" in
       --rust-root "$ROOT" \
       --suite-smoke
     run execute-truncate cargo test -q -p sealdb-session --lib truncate
+    run execute-do-flush-setpwd-shutdown-alterdb cargo test -q -p sealdb-session --lib do_flush_setpwd_shutdown_alter
+    run execute-parse-allowlist-misc cargo test -q -p sealdb-parser --lib parse_do_flush_setpwd_shutdown_alter
     ;;
   C2)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

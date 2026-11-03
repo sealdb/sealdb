@@ -110,6 +110,34 @@ impl DropDatabaseStmt {
     }
 }
 
+/// `ALTER DATABASE db [CHARACTER SET [=] cs] [COLLATE [=] coll]` (TiDB `AlterDatabaseStmt`).
+#[derive(Clone, Debug)]
+pub struct AlterDatabaseStmt {
+    /// Empty means alter the session current database.
+    pub name: String,
+    pub charset: Option<String>,
+    pub collate: Option<String>,
+}
+
+impl AlterDatabaseStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER DATABASE");
+        if !self.name.is_empty() {
+            ctx.write_str(" ");
+            ctx.write_name(&self.name);
+        }
+        if let Some(cs) = &self.charset {
+            ctx.write_str(" CHARACTER SET ");
+            ctx.write_str(cs);
+        }
+        if let Some(coll) = &self.collate {
+            ctx.write_str(" COLLATE ");
+            ctx.write_str(coll);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexDef {
     pub name: String,

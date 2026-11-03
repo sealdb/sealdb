@@ -37,20 +37,15 @@
   "feature_gaps": {},
   "completeness_gaps": {},
   "unmapped_allowlist": [
-    "AlterDatabaseStmt",
     "AlterInstanceStmt",
     "BinlogStmt",
     "ChangeStmt",
     "CleanupTableLockStmt",
-    "DoStmt",
-    "FlushStmt",
     "KillStmt",
     "LockTablesStmt",
     "OptimizeTableStmt",
     "RenameUserStmt",
-    "RepairTableStmt",
-    "SetPwdStmt",
-    "ShutdownStmt"
+    "RepairTableStmt"
   ],
   "open_stmts": [
     {
@@ -82,10 +77,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.DoStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.BinlogStmt",
       "owner": "unmapped"
     },
@@ -108,10 +99,6 @@
     {
       "stmt": "ast.RecommendIndexStmt",
       "owner": "C6"
-    },
-    {
-      "stmt": "ast.FlushStmt",
-      "owner": "unmapped"
     },
     {
       "stmt": "ast.AlterInstanceStmt",
@@ -142,20 +129,8 @@
       "owner": "unmapped"
     },
     {
-      "stmt": "ast.SetPwdStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.ShutdownStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.SetResourceGroupStmt",
       "owner": "C6"
-    },
-    {
-      "stmt": "ast.AlterDatabaseStmt",
-      "owner": "unmapped"
     },
     {
       "stmt": "ast.AlterSequenceStmt",

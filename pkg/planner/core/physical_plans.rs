@@ -7,6 +7,7 @@ use serde::Serialize;
 pub enum DdlKind {
     CreateDatabase,
     DropDatabase,
+    AlterDatabase,
     CreateTable,
     DropTable,
     TruncateTable,

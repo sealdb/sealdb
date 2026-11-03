@@ -15,14 +15,12 @@
     "stmt:ast.LockStatsStmt",
     "stmt:ast.UnlockStatsStmt",
     "stmt:ast.PlanReplayerStmt",
-    "stmt:ast.DoStmt",
     "stmt:ast.BinlogStmt",
     "stmt:ast.ChangeStmt",
     "stmt:ast.SplitRegionStmt",
     "stmt:ast.DistributeTableStmt",
     "stmt:ast.CompactTableStmt",
     "stmt:ast.RecommendIndexStmt",
-    "stmt:ast.FlushStmt",
     "stmt:ast.AlterInstanceStmt",
     "stmt:ast.RenameUserStmt",
     "stmt:ast.BRIEStmt",
@@ -30,10 +28,7 @@
     "stmt:ast.AddQueryWatchStmt",
     "stmt:ast.DropQueryWatchStmt",
     "stmt:ast.KillStmt",
-    "stmt:ast.SetPwdStmt",
-    "stmt:ast.ShutdownStmt",
     "stmt:ast.SetResourceGroupStmt",
-    "stmt:ast.AlterDatabaseStmt",
     "stmt:ast.AlterSequenceStmt",
     "stmt:ast.CreateViewStmt",
     "stmt:ast.CreateSequenceStmt",
@@ -94,9 +89,9 @@
   "counts": {
     "feature_gaps": 0,
     "completeness_gaps": 0,
-    "open_stmts": 40,
+    "open_stmts": 35,
     "suites": 42,
-    "unmapped_allowlist": 14,
-    "total": 82
+    "unmapped_allowlist": 9,
+    "total": 77
   }
 }

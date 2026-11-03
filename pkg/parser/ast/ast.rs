@@ -1,14 +1,15 @@
 use super::ddl::{
-    AlterTableStmt, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, DropDatabaseStmt,
-    DropIndexStmt, DropTableStmt, TruncateTableStmt,
+    AlterDatabaseStmt, AlterTableStmt, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
+    DropDatabaseStmt, DropIndexStmt, DropTableStmt, TruncateTableStmt,
 };
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
     AnalyzeTableStmt, BeginStmt, CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt,
-    DeallocateStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, GrantRoleStmt,
-    GrantStmt, PrepareStmt, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt,
-    SavepointStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, UseStmt,
+    DeallocateStmt, DoStmt, DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt,
+    GrantRoleStmt, GrantStmt, PrepareStmt, ReleaseSavepointStmt, RevokeRoleStmt, RevokeStmt,
+    RollbackStmt, SavepointStmt, SetPwdStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt,
+    ShutdownStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -27,6 +28,7 @@ pub enum Statement {
     Select(SelectStmt),
     CreateDatabase(CreateDatabaseStmt),
     DropDatabase(DropDatabaseStmt),
+    AlterDatabase(AlterDatabaseStmt),
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
     TruncateTable(TruncateTableStmt),
@@ -53,6 +55,10 @@ pub enum Statement {
     GrantRole(GrantRoleStmt),
     RevokeRole(RevokeRoleStmt),
     SetRole(SetRoleStmt),
+    SetPwd(SetPwdStmt),
+    Flush(FlushStmt),
+    Do(DoStmt),
+    Shutdown(ShutdownStmt),
     AnalyzeTable(AnalyzeTableStmt),
     Explain(ExplainStmt),
     SetTxn(SetTxnStmt),
@@ -70,6 +76,7 @@ impl Node for Statement {
             Statement::Select(s) => s.restore(ctx),
             Statement::CreateDatabase(s) => s.restore(ctx),
             Statement::DropDatabase(s) => s.restore(ctx),
+            Statement::AlterDatabase(s) => s.restore(ctx),
             Statement::CreateTable(s) => s.restore(ctx),
             Statement::DropTable(s) => s.restore(ctx),
             Statement::TruncateTable(s) => s.restore(ctx),
@@ -96,6 +103,10 @@ impl Node for Statement {
             Statement::GrantRole(s) => s.restore(ctx),
             Statement::RevokeRole(s) => s.restore(ctx),
             Statement::SetRole(s) => s.restore(ctx),
+            Statement::SetPwd(s) => s.restore(ctx),
+            Statement::Flush(s) => s.restore(ctx),
+            Statement::Do(s) => s.restore(ctx),
+            Statement::Shutdown(s) => s.restore(ctx),
             Statement::AnalyzeTable(s) => s.restore(ctx),
             Statement::Explain(s) => s.restore(ctx),
             Statement::SetTxn(s) => s.restore(ctx),
@@ -115,6 +126,7 @@ impl StmtNode for Statement {
             Statement::Select(_) => "SelectStmt",
             Statement::CreateDatabase(_) => "CreateDatabaseStmt",
             Statement::DropDatabase(_) => "DropDatabaseStmt",
+            Statement::AlterDatabase(_) => "AlterDatabaseStmt",
             Statement::CreateTable(_) => "CreateTableStmt",
             Statement::DropTable(_) => "DropTableStmt",
             Statement::TruncateTable(_) => "TruncateTableStmt",
@@ -141,6 +153,10 @@ impl StmtNode for Statement {
             Statement::GrantRole(_) => "GrantRoleStmt",
             Statement::RevokeRole(_) => "RevokeRoleStmt",
             Statement::SetRole(_) => "SetRoleStmt",
+            Statement::SetPwd(_) => "SetPwdStmt",
+            Statement::Flush(_) => "FlushStmt",
+            Statement::Do(_) => "DoStmt",
+            Statement::Shutdown(_) => "ShutdownStmt",
             Statement::AnalyzeTable(_) => "AnalyzeTableStmt",
             Statement::Explain(_) => "ExplainStmt",
             Statement::SetTxn(_) => "SetTxnStmt",

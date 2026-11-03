@@ -13,7 +13,7 @@ SCHEMA_NAME
 itest
 SHOW CREATE DATABASE itest;
 Database	Create Database
-itest	CREATE DATABASE `itest`
+itest	CREATE DATABASE `itest` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
 SHOW CREATE TABLE itest.t;
 Table	Create Table
 t	CREATE TABLE `t` (

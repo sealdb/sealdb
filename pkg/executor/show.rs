@@ -89,10 +89,15 @@ impl Executor for ShowExec {
                 if is.schema_by_name(&db).is_none() {
                     return Err(Error::new(ERR_BAD_DB, format!("Unknown database '{db}'")));
                 }
+                let info = is.schema_by_name(&db).expect("checked above");
                 self.schema = vec!["Database".to_string(), "Create Database".to_string()];
+                let create = format!(
+                    "CREATE DATABASE `{db}` DEFAULT CHARACTER SET {} COLLATE {}",
+                    info.charset, info.collate
+                );
                 self.rows = vec![vec![
                     Datum::Bytes(db.as_bytes().to_vec()),
-                    Datum::Bytes(format!("CREATE DATABASE `{db}`").into_bytes()),
+                    Datum::Bytes(create.into_bytes()),
                 ]];
             }
             ShowStmtKind::CreateTable => {

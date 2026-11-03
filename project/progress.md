@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（TruncateTableStmt：parse/execute + C1 `execute-truncate`；从 UNMAPPED_ALLOWLIST 摘出 → F02）  
+> 最后更新：2026-11-03（Do/SetPwd/Flush/Shutdown/AlterDatabase：从 UNMAPPED_ALLOWLIST 摘出 → F01/F20/F22/F02）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,23 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: leftover allowlist shrink（Do/SetPwd/Flush/Shutdown/AlterDatabase）
+- **完成**:
+  - `DoStmt`：`DO expr[,…]` extract+eval（F01）；常量副作用无结果集
+  - `SetPwdStmt`：`SET PASSWORD [FOR user] = 'pwd'` 更新 privilege auth（F20）
+  - `FlushStmt`：`FLUSH PRIVILEGES` reload / `FLUSH TABLES` no-op（F20）
+  - `ShutdownStmt`：Domain flag + listen loop 可退出（F22）
+  - `AlterDatabaseStmt`：`ALTER DATABASE … CHARACTER SET / COLLATE` 更新 DB meta（F02）
+  - 均移出 `UNMAPPED_ALLOWLIST`；C1 `execute-do-flush-setpwd-shutdown-alterdb` + parse gate
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib parse_do_flush`
+  - `cargo test -q -p sealdb-session --lib do_flush_setpwd`
+  - `./project/scripts/feature_gate.sh C1`
+- **下一步**:
+  - 继续消化剩余 allowlist（Binlog/Kill/LockTables…）；C6 仍 deferred
 
 ### 2026-11-03
 

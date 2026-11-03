@@ -7,11 +7,13 @@ use sealdb_domain::Domain;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use sealdb_session::Session;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, ErrorKind};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::Duration;
 
 /// PEM cert + key paths used by `Server::with_ssl_config`.
 #[derive(Clone, Debug)]
@@ -128,8 +130,37 @@ impl Server {
     }
 
     pub fn serve(&self) -> Result<()> {
+        // Non-blocking accept so SHUTDOWN can exit without a new connection.
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("set nonblocking: {e}")))?;
         loop {
-            self.accept_one()?;
+            if self.domain.is_shutdown_requested() {
+                let _ = self.listener.set_nonblocking(false);
+                return Ok(());
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    // Accepted fds inherit nonblocking on some platforms.
+                    let _ = stream.set_nonblocking(false);
+                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                    let session = Session::with_domain(Arc::clone(&self.domain));
+                    let tls = self.tls.clone();
+                    thread::spawn(move || {
+                        let mut conn = match tls {
+                            Some(tls) => ClientConn::with_tls(stream, id, session, tls),
+                            None => ClientConn::from_tcp_session(stream, id, session),
+                        };
+                        let _ = conn.run();
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(Error::new(ERR_UNKNOWN_ERROR, format!("accept: {e}")));
+                }
+            }
         }
     }
 
@@ -141,7 +172,7 @@ impl Server {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let session = Session::with_domain(Arc::clone(&self.domain));
         let tls = self.tls.clone();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let mut conn = match tls {
                 Some(tls) => ClientConn::with_tls(stream, id, session, tls),
                 None => ClientConn::from_tcp_session(stream, id, session),
@@ -149,5 +180,9 @@ impl Server {
             let _ = conn.run();
         });
         Ok(())
+    }
+
+    pub fn domain(&self) -> Arc<Domain> {
+        Arc::clone(&self.domain)
     }
 }

@@ -137,6 +137,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_do_flush_setpwd_shutdown_alter_db() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("DO 1, 2 + 3").unwrap() {
+            crate::ast::Statement::Do(stmt) => {
+                assert_eq!(stmt.exprs.len(), 2);
+            }
+            other => panic!("expected DoStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("FLUSH PRIVILEGES").unwrap() {
+            crate::ast::Statement::Flush(stmt) => {
+                assert_eq!(stmt.tp, crate::ast::FlushStmtType::Privileges);
+            }
+            other => panic!("expected FlushStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("FLUSH TABLES").unwrap() {
+            crate::ast::Statement::Flush(stmt) => {
+                assert_eq!(stmt.tp, crate::ast::FlushStmtType::Tables);
+            }
+            other => panic!("expected FlushStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("SET PASSWORD FOR 'u'@'%' = 'secret'")
+            .unwrap()
+        {
+            crate::ast::Statement::SetPwd(stmt) => {
+                let user = stmt.user.expect("FOR user");
+                assert_eq!(user.username, "u");
+                assert_eq!(stmt.password, "secret");
+            }
+            other => panic!("expected SetPwdStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SET PASSWORD = 'x'").unwrap() {
+            crate::ast::Statement::SetPwd(stmt) => {
+                assert!(stmt.user.is_none());
+                assert_eq!(stmt.password, "x");
+            }
+            other => panic!("expected SetPwdStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SHUTDOWN").unwrap() {
+            crate::ast::Statement::Shutdown(_) => {}
+            other => panic!("expected ShutdownStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER DATABASE db1 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterDatabase(stmt) => {
+                assert_eq!(stmt.name, "db1");
+                assert_eq!(stmt.charset.as_deref(), Some("utf8mb4"));
+                assert_eq!(stmt.collate.as_deref(), Some("utf8mb4_bin"));
+            }
+            other => panic!("expected AlterDatabaseStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_table_like_as_select() {
         let parser = Parser::new();
         match parser
