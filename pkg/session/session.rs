@@ -523,6 +523,11 @@ impl Session {
         let rebound = self.apply_sql_binding(stmt)?;
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         expand_views(&mut expanded, &is, &current_db)?;
+        if let Statement::LoadData(load) = &expanded {
+            let insert = load_data_to_insert(load, &is, &current_db)?;
+            mdl_guard.active = false;
+            return self.execute_one(&Statement::Insert(insert));
+        }
         let stmt = &expanded;
         if let Some(result) = try_eval_nextval(self, stmt, &current_db)? {
             drop(mdl_guard);
@@ -1662,6 +1667,7 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
         Statement::AlterTable(alter) => (vec![mdl_table_key(&alter.table, current_db)], true),
         Statement::CreateIndex(create) => (vec![mdl_table_key(&create.table, current_db)], true),
         Statement::DropIndex(drop) => (vec![mdl_table_key(&drop.table, current_db)], true),
+        Statement::LoadData(load) => (vec![mdl_table_key(&load.table, current_db)], false),
         _ => (Vec::new(), false),
     }
 }
@@ -1685,6 +1691,7 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
+            | Statement::LoadData(_)
             | Statement::Grant(_)
             | Statement::Revoke(_)
             | Statement::CreateRole(_)
@@ -1814,6 +1821,130 @@ fn strip_table_schema(select: &mut SelectStmt, name: &str) {
 
 fn named_cte_exists(with: Option<&sealdb_parser::ast::WithClause>, name: &str) -> bool {
     with.is_some_and(|w| w.find(name).is_some())
+}
+
+fn load_data_to_insert(
+    load: &sealdb_parser::ast::LoadDataStmt,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<InsertStmt> {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    let (schema, table) = load.table.qualified(current_db);
+    if schema.is_empty() {
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_NO_DB,
+            "No database selected",
+        ));
+    }
+    let info = is.table_by_name(&schema, &table).ok_or_else(|| {
+        sealdb_errno::Error::new(
+            sealdb_errno::ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    if info.is_view() || info.is_sequence() {
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_WRONG_OBJECT,
+            format!("'{schema}.{table}' is not BASE TABLE"),
+        ));
+    }
+    let content = std::fs::read_to_string(&load.path).map_err(|e| {
+        sealdb_errno::Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!("failed to read '{}': {e}", load.path),
+        )
+    })?;
+    let line_sep = &load.lines_terminated_by;
+    let field_sep = &load.fields_terminated_by;
+    let mut lines: Vec<&str> = if line_sep.is_empty() {
+        vec![content.as_str()]
+    } else {
+        content.split(line_sep).collect()
+    };
+    // Drop trailing empty line from final terminator.
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let skip = load.ignore_lines as usize;
+    let lines = if skip >= lines.len() {
+        Vec::new()
+    } else {
+        lines[skip..].to_vec()
+    };
+    let columns = if load.columns.is_empty() {
+        info.columns.iter().map(|c| c.name.o().to_string()).collect()
+    } else {
+        load.columns.clone()
+    };
+    let mut rows = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = if field_sep.is_empty() {
+            vec![line]
+        } else {
+            line.split(field_sep).collect()
+        };
+        if fields.len() != columns.len() {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_WRONG_VALUE_COUNT,
+                format!(
+                    "Column count doesn't match value count at row {}",
+                    rows.len() + 1
+                ),
+            ));
+        }
+        let mut row = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let col = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(&columns[i]))
+                .ok_or_else(|| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_BAD_FIELD,
+                        format!("Unknown column '{}' in 'field list'", columns[i]),
+                    )
+                })?;
+            let datum = parse_load_field(field, col.field_type.eval_type())?;
+            row.push(ExprNode::Value(ValueExpr { datum }));
+        }
+        rows.push(row);
+    }
+    Ok(InsertStmt {
+        table: load.table.clone(),
+        columns,
+        rows,
+        select: None,
+        with: None,
+    })
+}
+
+fn parse_load_field(raw: &str, eval_type: sealdb_types::EvalType) -> Result<sealdb_types::Datum> {
+    use sealdb_types::{Datum, EvalType};
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") || trimmed.is_empty() {
+        return Ok(Datum::Null);
+    }
+    match eval_type {
+        EvalType::Int => trimmed
+            .parse::<i64>()
+            .map(Datum::I64)
+            .map_err(|_| {
+                sealdb_errno::Error::new(
+                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Incorrect integer value: '{trimmed}'"),
+                )
+            }),
+        EvalType::Real => trimmed.parse::<f64>().map(Datum::F64).map_err(|_| {
+            sealdb_errno::Error::new(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Incorrect double value: '{trimmed}'"),
+            )
+        }),
+        _ => Ok(Datum::Bytes(trimmed.as_bytes().to_vec())),
+    }
 }
 
 /// MVB: `SELECT NEXTVAL(seq)` / `SELECT NEXTVAL(db.seq)` without FROM.
@@ -2249,6 +2380,34 @@ mod tests {
                 .display_rows()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_load_data_infile() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sealdb_load_{}.csv", std::process::id()));
+        std::fs::write(&path, "id,name\n1,a\n2,b\n").unwrap();
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.t (id INT, name VARCHAR(20))")
+            .unwrap();
+        let sql = format!(
+            "LOAD DATA INFILE '{}' INTO TABLE db1.t FIELDS TERMINATED BY ',' LINES TERMINATED BY '\\n' IGNORE 1 LINES",
+            path.display()
+        );
+        session.execute_stmt(&sql).unwrap();
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

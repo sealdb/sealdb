@@ -137,6 +137,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_load_data() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt(
+                "LOAD DATA LOCAL INFILE '/tmp/x.csv' INTO TABLE db1.t FIELDS TERMINATED BY ',' LINES TERMINATED BY '\\n' IGNORE 1 LINES (id, name)",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::LoadData(stmt) => {
+                assert!(stmt.local);
+                assert_eq!(stmt.path, "/tmp/x.csv");
+                assert_eq!(stmt.table.name, "t");
+                assert_eq!(stmt.fields_terminated_by, ",");
+                assert_eq!(stmt.lines_terminated_by, "\n");
+                assert_eq!(stmt.ignore_lines, 1);
+                assert_eq!(stmt.columns, vec!["id".to_string(), "name".to_string()]);
+            }
+            other => panic!("expected LoadDataStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_drop_alter_sequence() {
         let parser = Parser::new();
         match parser

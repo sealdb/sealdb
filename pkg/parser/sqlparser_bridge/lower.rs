@@ -7,8 +7,8 @@ use crate::ast::ddl::{
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
-    JoinType, ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprStmt,
-    SetOprType, UpdateStmt, WithClause,
+    JoinType, LoadDataStmt, ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt,
+    SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
@@ -75,6 +75,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, misc_ops) = extract_misc_allowlist(&rewritten)?;
     // sqlparser MySQL dialect only partially supports SEQUENCE DDL.
     let (rewritten, seq_ops) = extract_sequence_ddl(&rewritten)?;
+    // sqlparser has Hive LOAD DATA INPATH, not MySQL LOAD DATA INFILE.
+    let (rewritten, load_ops) = extract_load_data(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -91,6 +93,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut binding_ops = binding_ops.into_iter();
     let mut misc_ops = misc_ops.into_iter();
     let mut seq_ops = seq_ops.into_iter();
+    let mut load_ops = load_ops.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -154,6 +157,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         }
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_seq__"))
             && let Some(op) = seq_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_load__"))
+            && let Some(op) = load_ops.next().flatten()
         {
             lowered = op;
         }
@@ -4208,6 +4216,209 @@ fn lower_truncate(truncate: &sqlparser::ast::Truncate) -> Result<Statement> {
     Ok(Statement::TruncateTable(TruncateTableStmt {
         table: object_table_name(&target.name)?,
     }))
+}
+
+/// Extract MySQL `LOAD DATA [LOCAL] INFILE ... INTO TABLE`.
+fn extract_load_data(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "LOAD") {
+            let after_load = skip_ws(bytes, i + "LOAD".len());
+            if keyword_at(bytes, after_load, "DATA") {
+                let mut j = skip_ws(bytes, after_load + "DATA".len());
+                let local = if keyword_at(bytes, j, "LOCAL") {
+                    j = skip_ws(bytes, j + "LOCAL".len());
+                    true
+                } else {
+                    false
+                };
+                if !keyword_at(bytes, j, "INFILE") {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                j = skip_ws(bytes, j + "INFILE".len());
+                let (path, after_path) = read_sql_string(bytes, j)?;
+                j = skip_ws(bytes, after_path);
+                if keyword_at(bytes, j, "REPLACE") || keyword_at(bytes, j, "IGNORE") {
+                    // MVB: accept and ignore REPLACE/IGNORE keyword before INTO.
+                    let kw = if keyword_at(bytes, j, "REPLACE") {
+                        "REPLACE".len()
+                    } else {
+                        "IGNORE".len()
+                    };
+                    j = skip_ws(bytes, j + kw);
+                }
+                if !keyword_at(bytes, j, "INTO") {
+                    return Err(Error::new(ERR_PARSE_ERROR, "LOAD DATA missing INTO TABLE"));
+                }
+                j = skip_ws(bytes, j + "INTO".len());
+                if !keyword_at(bytes, j, "TABLE") {
+                    return Err(Error::new(ERR_PARSE_ERROR, "LOAD DATA missing INTO TABLE"));
+                }
+                j = skip_ws(bytes, j + "TABLE".len());
+                let (schema, name, after_name) = read_qualified_name(bytes, j)?;
+                j = skip_ws(bytes, after_name);
+                let mut fields_terminated_by = "\t".to_string();
+                let mut lines_terminated_by = "\n".to_string();
+                let mut ignore_lines = 0u64;
+                let mut columns = Vec::new();
+                loop {
+                    j = skip_ws(bytes, j);
+                    if j >= bytes.len() || bytes[j] == b';' {
+                        break;
+                    }
+                    if keyword_at(bytes, j, "FIELDS") || keyword_at(bytes, j, "COLUMNS") {
+                        let kw = if keyword_at(bytes, j, "FIELDS") {
+                            "FIELDS".len()
+                        } else {
+                            "COLUMNS".len()
+                        };
+                        j = skip_ws(bytes, j + kw);
+                        if keyword_at(bytes, j, "TERMINATED") {
+                            j = skip_ws(bytes, j + "TERMINATED".len());
+                            if !keyword_at(bytes, j, "BY") {
+                                return Err(Error::new(
+                                    ERR_PARSE_ERROR,
+                                    "LOAD DATA FIELDS TERMINATED BY",
+                                ));
+                            }
+                            j = skip_ws(bytes, j + "BY".len());
+                            let (term, next) = read_sql_string(bytes, j)?;
+                            fields_terminated_by = unescape_sql_string(&term);
+                            j = next;
+                            continue;
+                        }
+                        return Err(Error::unsupported("LOAD DATA FIELDS option"));
+                    }
+                    if keyword_at(bytes, j, "LINES") {
+                        j = skip_ws(bytes, j + "LINES".len());
+                        if keyword_at(bytes, j, "TERMINATED") {
+                            j = skip_ws(bytes, j + "TERMINATED".len());
+                            if !keyword_at(bytes, j, "BY") {
+                                return Err(Error::new(
+                                    ERR_PARSE_ERROR,
+                                    "LOAD DATA LINES TERMINATED BY",
+                                ));
+                            }
+                            j = skip_ws(bytes, j + "BY".len());
+                            let (term, next) = read_sql_string(bytes, j)?;
+                            lines_terminated_by = unescape_sql_string(&term);
+                            j = next;
+                            continue;
+                        }
+                        return Err(Error::unsupported("LOAD DATA LINES option"));
+                    }
+                    if keyword_at(bytes, j, "IGNORE") {
+                        j = skip_ws(bytes, j + "IGNORE".len());
+                        let (n, next) = read_signed_number(bytes, j)?;
+                        if n < 0 {
+                            return Err(Error::new(ERR_PARSE_ERROR, "IGNORE lines must be >= 0"));
+                        }
+                        ignore_lines = n as u64;
+                        j = skip_ws(bytes, next);
+                        if keyword_at(bytes, j, "LINES") || keyword_at(bytes, j, "ROWS") {
+                            let kw = if keyword_at(bytes, j, "LINES") {
+                                "LINES".len()
+                            } else {
+                                "ROWS".len()
+                            };
+                            j = skip_ws(bytes, j + kw);
+                        }
+                        continue;
+                    }
+                    if bytes[j] == b'(' {
+                        j += 1;
+                        loop {
+                            j = skip_ws(bytes, j);
+                            if j < bytes.len() && bytes[j] == b')' {
+                                j += 1;
+                                break;
+                            }
+                            let (col, next) = read_ident(bytes, j);
+                            if col.is_empty() {
+                                return Err(Error::new(
+                                    ERR_PARSE_ERROR,
+                                    "LOAD DATA column list",
+                                ));
+                            }
+                            columns.push(col);
+                            j = skip_ws(bytes, next);
+                            if j < bytes.len() && bytes[j] == b',' {
+                                j += 1;
+                                continue;
+                            }
+                            if j < bytes.len() && bytes[j] == b')' {
+                                j += 1;
+                                break;
+                            }
+                            return Err(Error::new(ERR_PARSE_ERROR, "LOAD DATA column list"));
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                out.push_str("SET NAMES '__sealdb_load__'");
+                ops.push(Some(Statement::LoadData(LoadDataStmt {
+                    local,
+                    path,
+                    table: TableName::new(schema, name),
+                    fields_terminated_by,
+                    lines_terminated_by,
+                    ignore_lines,
+                    columns,
+                })));
+                i = j;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Ok((out, ops))
+}
+
+fn read_sql_string(bytes: &[u8], start: usize) -> Result<(String, usize)> {
+    let i = skip_ws(bytes, start);
+    if i >= bytes.len() || (bytes[i] != b'\'' && bytes[i] != b'"') {
+        return Err(Error::new(ERR_PARSE_ERROR, "expected string literal"));
+    }
+    let quote = bytes[i];
+    let mut j = i + 1;
+    let mut out = String::new();
+    while j < bytes.len() {
+        if bytes[j] == quote {
+            if j + 1 < bytes.len() && bytes[j + 1] == quote {
+                out.push(quote as char);
+                j += 2;
+                continue;
+            }
+            return Ok((out, j + 1));
+        }
+        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+            j += 1;
+            match bytes[j] {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'0' => out.push('\0'),
+                other => out.push(other as char),
+            }
+            j += 1;
+            continue;
+        }
+        out.push(bytes[j] as char);
+        j += 1;
+    }
+    Err(Error::new(ERR_PARSE_ERROR, "unterminated string literal"))
+}
+
+fn unescape_sql_string(s: &str) -> String {
+    // Already unescaped by read_sql_string; keep for TERMINATED BY values.
+    s.to_string()
 }
 
 /// Extract CREATE/DROP/ALTER SEQUENCE (sqlparser MySQL coverage is incomplete).

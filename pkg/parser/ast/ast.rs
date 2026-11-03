@@ -3,7 +3,7 @@ use super::ddl::{
     CreateSequenceStmt, CreateTableStmt, CreateViewStmt, DropDatabaseStmt, DropIndexStmt,
     DropSequenceStmt, DropTableStmt, TruncateTableStmt,
 };
-use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
+use super::dml::{DeleteStmt, InsertStmt, LoadDataStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
     AlterInstanceStmt, AnalyzeTableStmt, BeginStmt, BinlogStmt, ChangeStmt, CleanupTableLockStmt,
@@ -44,6 +44,7 @@ pub enum Statement {
     Show(ShowStmt),
     Use(UseStmt),
     Insert(InsertStmt),
+    LoadData(LoadDataStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Begin(BeginStmt),
@@ -105,6 +106,7 @@ impl Node for Statement {
             Statement::Show(s) => s.restore(ctx),
             Statement::Use(s) => s.restore(ctx),
             Statement::Insert(s) => s.restore(ctx),
+            Statement::LoadData(s) => s.restore(ctx),
             Statement::Update(s) => s.restore(ctx),
             Statement::Delete(s) => s.restore(ctx),
             Statement::Begin(s) => s.restore(ctx),
@@ -168,6 +170,7 @@ impl StmtNode for Statement {
             Statement::Show(_) => "ShowStmt",
             Statement::Use(_) => "UseStmt",
             Statement::Insert(_) => "InsertStmt",
+            Statement::LoadData(_) => "LoadDataStmt",
             Statement::Update(_) => "UpdateStmt",
             Statement::Delete(_) => "DeleteStmt",
             Statement::Begin(_) => "BeginStmt",

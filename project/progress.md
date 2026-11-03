@@ -110,6 +110,19 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-B LOAD DATA
+- **完成**:
+  - `LOAD DATA [LOCAL] INFILE … INTO TABLE`（FIELDS/LINES/IGNORE/列清单）→ 物化为 INSERT
+  - leftover：`LoadDataStmt` 收口；open_stmts 21
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib test_parse_load_data`
+  - `cargo test -q -p sealdb-session --lib test_load_data_infile`
+  - `leftover_inventory.py --check` PASS（denominator 63）
+- **下一步**:
+  - 继续 C6-B（TRACE / BRIE / stats lock…）或 PD/TiKV 客户端加深
+
+### 2026-11-03
+
 - **Phase**: C6-B SEQUENCE
 - **完成**:
   - `CREATE/DROP/ALTER SEQUENCE` + `NEXTVAL` + `information_schema.sequences`
