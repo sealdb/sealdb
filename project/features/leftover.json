@@ -107,10 +107,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.CreateViewStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.CreateSequenceStmt",
       "owner": "C6"
     },

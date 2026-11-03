@@ -62,6 +62,15 @@
 
 RBO 规则跟着功能走：F04 带 PPD/ColumnPrune，F09 带 JoinReorder 基础 DP，F10 带索引路径枚举。`optRuleList` 顺序与上游一致，未实现规则保持 no-op。
 
+## 产品约束（硬）
+
+| 项 | 要求 |
+|---|---|
+| 最终对齐 | **逐包 / 逐文件**对齐 TiDB v8.5.8 计算层能力（`parity/status.json`）；基本对齐，不是永久子集 |
+| 交付顺序 | **先**算层 + PD/TiKV 全量客户端能力 → **再**接 TiFlash（MPP/列存）；**不丢弃** TiFlash |
+| 当前主路径 | 阶段内以 **PD + TiKV** 为主（不改其源码、不另起引擎） |
+| 交付方式 | 分期切片向生产靠拢；禁止长期停在「演示级 MVB」而不回填语义 |
+
 ## 完整性波
 
 | ID | 工作 |
@@ -71,7 +80,18 @@ RBO 规则跟着功能走：F04 带 PPD/ColumnPrune，F09 带 JoinReorder 基础
 | C3 | 事务隔离边角、SchemaChecker、交叉读写 |
 | C4 | Prepared / Plan Cache / Binding |
 | C5 | 错误码、SQL Mode、charset/collation 剩余项 |
-| C6 | 明确不做：Cascades、TiFlash/MPP、BR/Lightning、插件 |
+| C6 | **生产对齐波**（算层 + PD/TiKV 全量 → 再 TiFlash；逐包/文件对齐 TiDB） |
+
+### C6 分期（A → B → C → D）
+
+| 层 | 含义 | 示例切片 |
+|---|---|---|
+| **A. 语义加深** | 已有能力从 MVB → TiDB 行为/语料 | IndexJoin、collation 全量、EXPLAIN ANALYZE、事务边角 |
+| **B. 语句补齐** | leftover 中 C6-owned PlanBuilder kinds | VIEW（已开）、`SEQUENCE`、`LOAD DATA`、`TRACE`… |
+| **C. 算层大件 + PD/TiKV 全量** | Cascades、Cop 全路径、BR/Lightning 入口、插件；PD/TiKV 客户端能力收齐 | 仍不接 TiFlash |
+| **D. TiFlash** | 列存副本 / MPP 调度与执行入口（远端引擎，不改 TiFlash 源码） | 在 C 收口后再开 |
+
+> Cascades / TiFlash·MPP / BR / 插件均在对齐范围内：**延后 ≠ 放弃**。当前优先 A/B，并行补齐对 PD/TiKV 的全量调用。
 
 ## 单个功能出门标准（`core-ported`）
 

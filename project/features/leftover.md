@@ -39,7 +39,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.DropQueryWatchStmt` → C6
 - `ast.SetResourceGroupStmt` → C6
 - `ast.AlterSequenceStmt` → C6
-- `ast.CreateViewStmt` → C6
 - `ast.CreateSequenceStmt` → C6
 - `ast.DropSequenceStmt` → C6
 - `ast.RecoverTableStmt` → C6
@@ -97,10 +96,10 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 ## Completeness wave notes
 
 - C1 is the frozen leftover denominator, not a pass-rate claim.
-- Feature (F*) gaps are empty; C1–C5 completeness gaps closed; C6 deferred.
+- Feature (F*) gaps are empty; C1–C5 completeness gaps closed.
 - C2: completeness gaps closed (Cost Model v2 MVB + IndexMerge OR-union).
 - C3: completeness gaps closed (MDL + schema-lease 8027 + SERIALIZABLE→RR + SAVEPOINT F12 + same-cluster TiKV cross-session when SEALDB_TIKV=1).
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).
 - Leftover suite execution: suites are owner-classified; C2 `explain*` / `index_merge` MVB via `execute-explain*`; C5 collation / `new_character_set*` via `execute-leftover-collation-suites`. Full integrationtest port is not claimed.
-- C6 stays deferred: Cascades, TiFlash/MPP, BR/Lightning, plugins, plus C6-owned open stmts above.
+- C6 is production parity: package/file align TiDB compute; order A/B → C (compute + full PD/TiKV client) → D (TiFlash; deferred not dropped). Closed C6 stmts: C6_CLOSED_STMTS. Open stmts = B backlog.

@@ -34,13 +34,28 @@ TiKV（保持原样，不修改）
 | G6 | 目录名、文件名与 TiDB 对齐 | `parity_check.py` |
 | G7 | 每个阶段都有可运行的竖切链路 | Phase Gate |
 
-### 1.3 非目标（初版明确不做）
+### 1.3 存储边界与计算对齐
 
-- 不修改 TiKV、PD 的任何代码；不替换 Raft/Region/2PC 存储实现。
+**最终目标（不变）：**
+
+- 本仓库 = TiDB **计算层**的 Rust 实现对齐；终点是与 TiDB v8.5.8 **逐包 / 逐文件能力基本对齐**（`parity/status.json` + 行为语料），不是长期停在子集演示。
+- **不丢弃 TiFlash / MPP**：只是分期，不是永久剔除。
+
+**交付顺序（硬）：**
+
+1. **先**：计算层能力 + 对 **PD / TiKV 的全量客户端能力调用**（TSO、Region、KV/2PC、Coprocessor、悲观锁等）收齐并语义加深。
+2. **再**：接入 **TiFlash**（作远端列存 / MPP 引擎；仍不修改 TiFlash/PD/TiKV 源码，本仓库只做调度与协议侧）。
+3. 全程按 TiDB `pkg/` **包名 / 文件名 / 核心算法**对齐推进，缺能力记 `stub/omitted` 或 gaps，禁止静默放弃。
+
+**当前阶段存储边界：**
+
+- 现阶段主路径只对接 **PD + TiKV**；不修改其源码；不另起存储引擎。
 - 不实现 TiKV LSM、Raft、Region 调度内部逻辑。
-- 首版不追求 TiFlash/MPP、向量化 SIMD 内核、BR/Dumpling/Lightning、Plugin/Telemetry 的完整能力。
-- 不追求 MySQL/TiDB 100% 边缘语法与错误消息逐字一致；以「兼容矩阵 + Oracle 差异清单」逐步收敛。
-- 不在首版追求极致性能；先正确、可观测、可回归，再优化。
+
+**计算层质量：**
+
+- 能力面见 C6 A/B/C；边缘语法与错误消息以兼容矩阵 + Oracle 差异清单收敛到 TiDB。
+- 性能：先正确、可观测、可回归，再向生产吞吐/延迟靠拢。
 
 ---
 
@@ -96,7 +111,7 @@ pkg/parser/types      parser 用的类型
 | `pkg/disttask/`, `pkg/resourcemanager/`, `pkg/owner/` | 后置（DDL 阶段按需） |
 | `pkg/plugin/`, `pkg/extension/`, `pkg/telemetry/` | 后置 |
 | `pkg/util/` 中与计算无关的工具 | 按需移植；未用文件 `omitted` |
-| TiFlash / MPP / 向量索引 | Phase 10 可选 |
+| TiFlash / MPP / 向量索引 | C6-D：算层+PD/TiKV 全量之后再接；不丢弃 |
 
 > 目录占位仍需遵守“目录名与 TiDB 一致”；占位目录内放 `README.md` 说明原因。
 

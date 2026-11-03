@@ -16,7 +16,7 @@
 | 7 | F21 `core-ported` |
 | 8 | F14–F20 `core-ported` |
 | 9 | F22 `core-ported`（F03 之后可并行） |
-| 10 | 完整性波 C1–C5；C6 保持 deferred |
+| 10 | 完整性波 C1–C5 收口；**C6 生产对齐**（A/B → C 算层+PD/TiKV 全量 → D TiFlash；逐包/文件对齐 TiDB） |
 
 ---
 
@@ -33,7 +33,7 @@ flowchart LR
   P6 --> P7[Phase 7<br/>CBO/统计]
   P7 --> P8[Phase 8<br/>DDL/高级 SQL]
   P8 --> P9[Phase 9<br/>MySQL 协议/运维]
-  P9 --> P10[Phase 10<br/>可选：TiFlash/MPP 等]
+  P9 --> P10[Phase 10<br/>C6 生产对齐]
 ```
 
 | Phase | 名称 | 预估 | 核心交付 | Gate |
@@ -48,7 +48,7 @@ flowchart LR
 | 7 | CBO 与统计信息 | 5–7 周 | statistics、cardinality、cost model、FindBestTask、Skyline | 计划选择与 TiDB 对齐 |
 | 8 | DDL 与高级 SQL | 8–12 周 | 在线 DDL、分区、CTE/Window、SetOp、IndexMerge、权限 | DDL/复杂查询回归 |
 | 9 | MySQL 协议与运维 | 3–4 周 | 握手/认证/COM_QUERY/结果集/TLS/状态页 | `mysql` 客户端可连接 |
-| 10 | 可选高级能力 | 持续 | TiFlash/MPP、Plan Cache、Binding、资源组、插件 | 按需 |
+| 10 | 完整性 + **C6 生产对齐** | 持续 | C1–C5；A/B 语句与语义；C 算层大件+PD/TiKV 全量；**D 再接 TiFlash**；逐包/文件 parity | leftover `ported` + TiKV 回归；其后 TiFlash/MPP |
 
 ---
 
