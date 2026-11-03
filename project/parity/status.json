@@ -888,6 +888,114 @@
       "rust": "pkg/ddl/sequence.rs",
       "phase": 10,
       "notes": "CREATE/DROP SEQUENCE + NEXTVAL path"
+    },
+    "pkg/planner/cascades/optimize.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/optimize.rs",
+      "phase": 10,
+      "notes": "no-op entry; RBO remains default"
+    },
+    "pkg/planner/cascades/enforcer_rules.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/enforcer_rules.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/implementation_rules.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/implementation_rules.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/transformation_rules.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/transformation_rules.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/stringer.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/stringer.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/memo/memo.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/memo/mod.rs",
+      "phase": 10,
+      "notes": "Memo/Group skeleton"
+    },
+    "pkg/planner/cascades/memo/group.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/memo/group.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/memo/group_expr.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/memo/group_expr.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/memo/group_id_generator.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/memo/group_id_generator.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/memo/memo_expr.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/memo/memo_expr.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/base/base.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/base/mod.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/base/hash_equaler.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/base/hash_equaler.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/rule/rule.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/rule/mod.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/rule/rule_type.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/rule/rule_type.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/rule/binder.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/rule/binder.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/rule/join/join_to_apply.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/rule/join/join_to_apply.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/task/task.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/task/mod.rs",
+      "phase": 10,
+      "notes": "skeleton"
+    },
+    "pkg/planner/cascades/task/task_scheduler.go": {
+      "status": "stub",
+      "rust": "pkg/planner/cascades/task/task_scheduler.rs",
+      "phase": 10,
+      "notes": "skeleton"
     }
   }
 }
