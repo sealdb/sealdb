@@ -137,6 +137,49 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_trace_and_plan_replayer() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("TRACE SELECT 1").unwrap() {
+            crate::ast::Statement::Trace(stmt) => {
+                assert!(!stmt.trace_plan);
+                assert!(stmt.stmt_sql.to_ascii_uppercase().contains("SELECT"));
+            }
+            other => panic!("expected TraceStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("TRACE PLAN FORMAT = 'json' SELECT 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Trace(stmt) => {
+                assert!(stmt.trace_plan);
+                assert_eq!(stmt.format.to_ascii_lowercase(), "json");
+            }
+            other => panic!("expected TraceStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("PLAN REPLAYER LOAD '/tmp/plan.zip'")
+            .unwrap()
+        {
+            crate::ast::Statement::PlanReplayer(stmt) => {
+                assert!(stmt.load);
+                assert_eq!(stmt.file, "/tmp/plan.zip");
+            }
+            other => panic!("expected PlanReplayerStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("PLAN REPLAYER CAPTURE 'sql' 'plan'")
+            .unwrap()
+        {
+            crate::ast::Statement::PlanReplayer(stmt) => {
+                assert!(stmt.capture);
+                assert_eq!(stmt.sql_digest, "sql");
+                assert_eq!(stmt.plan_digest, "plan");
+            }
+            other => panic!("expected PlanReplayerStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_stats_lock_load() {
         let parser = Parser::new();
         match parser.parse_one_stmt("LOAD STATS '/tmp/s.json'").unwrap() {

@@ -18,6 +18,7 @@ use crate::ast::expressions::{
 };
 use crate::ast::misc::{
     AlterInstanceStmt, AnalyzeTableStmt, BeginStmt, BinlogStmt, ChangeStmt, CleanupTableLockStmt,
+    PlanReplayerStmt, TraceStmt,
     CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DoStmt,
     DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, KillStmt, LockTablesStmt,
@@ -1576,6 +1577,23 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
             i = skip_ws(bytes, i + "SHUTDOWN".len());
             continue;
         }
+        if keyword_at(bytes, i, "TRACE") {
+            let (stmt, end) = parse_trace_stmt(bytes, i + "TRACE".len())?;
+            out.push_str("SET NAMES '__sealdb_misc__'");
+            ops.push(Some(stmt));
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "PLAN") {
+            let after = skip_ws(bytes, i + "PLAN".len());
+            if keyword_at(bytes, after, "REPLAYER") {
+                let (stmt, end) = parse_plan_replayer_stmt(bytes, after + "REPLAYER".len())?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
         if keyword_at(bytes, i, "BINLOG") {
             let (stmt, end) = parse_binlog_stmt(bytes, i + "BINLOG".len())?;
             out.push_str("SET NAMES '__sealdb_misc__'");
@@ -1804,6 +1822,192 @@ fn parse_binlog_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     Ok((
         Statement::Binlog(BinlogStmt { payload }),
         skip_ws(bytes, after),
+    ))
+}
+
+/// Advance past one statement body (quotes / parens aware) up to `;` or EOF.
+fn skip_stmt_tail(bytes: &[u8], mut i: usize) -> usize {
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_bt {
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn parse_trace_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    let mut format = "row".to_string();
+    let mut trace_plan = false;
+    if keyword_at(bytes, i, "PLAN") {
+        trace_plan = true;
+        i = skip_ws(bytes, i + "PLAN".len());
+        if keyword_at(bytes, i, "TARGET") {
+            i = skip_ws(bytes, i + "TARGET".len());
+            if i < bytes.len() && bytes[i] == b'=' {
+                i = skip_ws(bytes, i + 1);
+            }
+            let (_target, after) = read_quoted_or_ident(bytes, i);
+            i = skip_ws(bytes, after);
+        }
+    }
+    if keyword_at(bytes, i, "FORMAT") {
+        i = skip_ws(bytes, i + "FORMAT".len());
+        if i < bytes.len() && bytes[i] == b'=' {
+            i = skip_ws(bytes, i + 1);
+        }
+        let (fmt, after) = read_quoted_or_ident(bytes, i);
+        format = fmt;
+        i = skip_ws(bytes, after);
+    }
+    let end = skip_stmt_tail(bytes, i);
+    let stmt_sql = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+    if stmt_sql.is_empty() {
+        return Err(Error::unsupported("TRACE without statement"));
+    }
+    Ok((
+        Statement::Trace(TraceStmt {
+            format,
+            trace_plan,
+            stmt_sql,
+        }),
+        end,
+    ))
+}
+
+fn parse_plan_replayer_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+    i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "LOAD") {
+        i = skip_ws(bytes, i + "LOAD".len());
+        let (file, after) = read_sql_string(bytes, i)?;
+        return Ok((
+            Statement::PlanReplayer(PlanReplayerStmt {
+                load: true,
+                capture: false,
+                remove: false,
+                analyze: false,
+                file,
+                sql_digest: String::new(),
+                plan_digest: String::new(),
+                stmt_sql: String::new(),
+            }),
+            skip_ws(bytes, after),
+        ));
+    }
+    if keyword_at(bytes, i, "CAPTURE") {
+        i = skip_ws(bytes, i + "CAPTURE".len());
+        let mut remove = false;
+        if keyword_at(bytes, i, "REMOVE") {
+            remove = true;
+            i = skip_ws(bytes, i + "REMOVE".len());
+        }
+        let (sql_digest, after_sql) = read_sql_string(bytes, i)?;
+        i = skip_ws(bytes, after_sql);
+        let (plan_digest, after_plan) = read_sql_string(bytes, i)?;
+        return Ok((
+            Statement::PlanReplayer(PlanReplayerStmt {
+                load: false,
+                capture: true,
+                remove,
+                analyze: false,
+                file: String::new(),
+                sql_digest,
+                plan_digest,
+                stmt_sql: String::new(),
+            }),
+            skip_ws(bytes, after_plan),
+        ));
+    }
+    // DUMP [EXPLAIN] [ANALYZE] … | DUMP EXPLAIN ANALYZE 'file'
+    let mut analyze = false;
+    if keyword_at(bytes, i, "DUMP") {
+        i = skip_ws(bytes, i + "DUMP".len());
+    }
+    if keyword_at(bytes, i, "EXPLAIN") {
+        i = skip_ws(bytes, i + "EXPLAIN".len());
+    }
+    if keyword_at(bytes, i, "ANALYZE") {
+        analyze = true;
+        i = skip_ws(bytes, i + "ANALYZE".len());
+    }
+    i = skip_ws(bytes, i);
+    if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+        let (file, after) = read_sql_string(bytes, i)?;
+        return Ok((
+            Statement::PlanReplayer(PlanReplayerStmt {
+                load: false,
+                capture: false,
+                remove: false,
+                analyze,
+                file,
+                sql_digest: String::new(),
+                plan_digest: String::new(),
+                stmt_sql: String::new(),
+            }),
+            skip_ws(bytes, after),
+        ));
+    }
+    let end = skip_stmt_tail(bytes, i);
+    let stmt_sql = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+    Ok((
+        Statement::PlanReplayer(PlanReplayerStmt {
+            load: false,
+            capture: false,
+            remove: false,
+            analyze,
+            file: String::new(),
+            sql_digest: String::new(),
+            plan_digest: String::new(),
+            stmt_sql,
+        }),
+        end,
     ))
 }
 

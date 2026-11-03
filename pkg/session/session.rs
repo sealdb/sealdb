@@ -295,7 +295,9 @@ impl Session {
             | Statement::AlterInstance(_)
             | Statement::LoadStats(_)
             | Statement::LockStats(_)
-            | Statement::UnlockStats(_) => {
+            | Statement::UnlockStats(_)
+            | Statement::Trace(_)
+            | Statement::PlanReplayer(_) => {
                 return Ok(empty_result());
             }
             Statement::SetRole(set) => {
