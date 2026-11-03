@@ -119,29 +119,32 @@ impl Executor for IndexLookUpExecutor {
                 if start.as_bytes() >= end.as_slice() {
                     continue;
                 }
-                let pairs = txn.scan_locked(start.as_bytes(), &end, self.lock, self.wait)?;
-                for (key, value) in pairs {
-                    let handle = index_handle(&index, &key, &value)?;
-                    if self.covering {
-                        rows.push(covering_row(&info, &index, &key, handle)?);
-                        continue;
-                    }
-                    let row_key = encode_row_key_with_handle(physical_id, handle);
-                    let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
-                    if let Some(raw) = raw {
-                        let decoded = decode_row(&raw, &info.col_field_types());
-                        rows.push(
-                            info.columns
-                                .iter()
-                                .map(|col| {
-                                    decoded
-                                        .iter()
-                                        .find(|(id, _)| *id == col.id)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or(Datum::Null)
-                                })
-                                .collect(),
-                        );
+                for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+                    let pairs =
+                        txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
+                    for (key, value) in pairs {
+                        let handle = index_handle(&index, &key, &value)?;
+                        if self.covering {
+                            rows.push(covering_row(&info, &index, &key, handle)?);
+                            continue;
+                        }
+                        let row_key = encode_row_key_with_handle(physical_id, handle);
+                        let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                        if let Some(raw) = raw {
+                            let decoded = decode_row(&raw, &info.col_field_types());
+                            rows.push(
+                                info.columns
+                                    .iter()
+                                    .map(|col| {
+                                        decoded
+                                            .iter()
+                                            .find(|(id, _)| *id == col.id)
+                                            .map(|(_, v)| v.clone())
+                                            .unwrap_or(Datum::Null)
+                                    })
+                                    .collect(),
+                            );
+                        }
                     }
                 }
             }
@@ -260,11 +263,14 @@ impl Executor for IndexMergeExecutor {
                     if start.as_bytes() >= end.as_slice() {
                         continue;
                     }
-                    let pairs = txn.scan_locked(start.as_bytes(), &end, self.lock, self.wait)?;
-                    for (key, value) in pairs {
-                        let handle = index_handle(index, &key, &value)?;
-                        if seen.insert((*physical_id, handle)) {
-                            handles.push((*physical_id, handle));
+                    for range in sealdb_store::split_key_ranges(start.as_bytes(), &end) {
+                        let pairs =
+                            txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
+                        for (key, value) in pairs {
+                            let handle = index_handle(index, &key, &value)?;
+                            if seen.insert((*physical_id, handle)) {
+                                handles.push((*physical_id, handle));
+                            }
                         }
                     }
                 }

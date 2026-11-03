@@ -110,6 +110,17 @@
 
 ### 2026-11-03
 
+- **Phase**: C6-C TableReader/IndexLookUp 走 copr split
+- **完成**:
+  - `TableReaderExec` / `IndexLookUp` / `IndexMerge` 扫描经 `sealdb_store::split_key_ranges`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_where_selection`
+  - `cargo test -q -p sealdb-session --lib test_index`
+- **下一步**:
+  - C6-C 续：Region locate / Cop DAG tipb，或算层包文件对齐
+
+### 2026-11-03
+
 - **Phase**: C6-C PD TSO surface + copr KeyRange MVB
 - **完成**:
   - `Storage::current_timestamp`：Mem 单调计数；TiKV 调 PD TSO

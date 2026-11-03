@@ -18,6 +18,7 @@ sealdb-meta.workspace = true
 sealdb-parser.workspace = true
 sealdb-planner.workspace = true
 sealdb-statistics.workspace = true
+sealdb-store.workspace = true
 sealdb-tablecodec.workspace = true
 sealdb-types.workspace = true
 sealdb-util.workspace = true
