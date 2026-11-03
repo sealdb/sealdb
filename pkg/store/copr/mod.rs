@@ -4,19 +4,22 @@
 //! `split_key_ranges_via_pd` walks PD HTTP `/pd/api/v1/region/key/{hex}` to
 //! produce Region-aligned half-open ranges for Cop / TableReader.
 //! `split_key_ranges_for_scan` uses process PD endpoints set by `store::open`.
-//! tipb DAG encode / CopTask builders live in `dag` / `task`.
+//! tipb DAG encode / CopTask / Coprocessor RPC live in `dag` / `task` / `rpc`.
 
 pub mod dag;
+pub mod pd;
+pub mod rpc;
 pub mod task;
 
 pub use dag::{
     decode_select_response, encode_table_scan_dag, Chunk, ColumnInfo, DagRequest, ExecType,
     Executor, IndexScan, Limit, SelectResponse, Selection, TableScan, TipbError, REQ_TYPE_DAG,
 };
+pub use rpc::execute_cop_task;
 pub use task::{build_table_scan_tasks, CopTask};
 
+use pd::{decode_pd_key, hex_encode, pd_get_region};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
-use serde::Deserialize;
 use std::sync::Mutex;
 
 static PD_ENDPOINTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -128,93 +131,6 @@ pub fn split_key_ranges_via_pd(
         out.push(KeyRange::new(start.to_vec(), end.to_vec()));
     }
     Ok(out)
-}
-
-#[derive(Debug, Deserialize)]
-struct PdRegion {
-    #[serde(default)]
-    start_key: String,
-    #[serde(default)]
-    end_key: String,
-}
-
-fn pd_get_region(pd_endpoints: &[String], key: &[u8]) -> Result<PdRegion> {
-    let hex = hex_encode(key);
-    let mut last_err = None;
-    for ep in pd_endpoints {
-        let base = normalize_pd_http(ep);
-        let url = format!("{base}/pd/api/v1/region/key/{hex}");
-        match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
-            Ok(resp) => {
-                return resp.json::<PdRegion>().map_err(|e| {
-                    Error::new(ERR_UNKNOWN_ERROR, format!("pd region decode: {e}"))
-                });
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(Error::new(
-        ERR_UNKNOWN_ERROR,
-        format!(
-            "pd get region failed: {}",
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no endpoints".into())
-        ),
-    ))
-}
-
-fn normalize_pd_http(endpoint: &str) -> String {
-    let ep = endpoint.trim().trim_end_matches('/');
-    if ep.starts_with("http://") || ep.starts_with("https://") {
-        ep.to_string()
-    } else {
-        format!("http://{ep}")
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0xf) as usize] as char);
-    }
-    out
-}
-
-fn decode_pd_key(hex: &str) -> Result<Vec<u8>> {
-    if hex.is_empty() {
-        return Ok(Vec::new());
-    }
-    let h = hex.as_bytes();
-    if h.len() % 2 != 0 {
-        return Err(Error::new(
-            ERR_UNKNOWN_ERROR,
-            format!("odd-length PD key hex: {hex}"),
-        ));
-    }
-    let mut out = Vec::with_capacity(h.len() / 2);
-    let mut i = 0;
-    while i < h.len() {
-        let hi = hex_nibble(h[i])?;
-        let lo = hex_nibble(h[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(c: u8) -> Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(Error::new(
-            ERR_UNKNOWN_ERROR,
-            format!("invalid hex digit {}", c as char),
-        )),
-    }
 }
 
 #[cfg(test)]

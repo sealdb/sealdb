@@ -57,7 +57,7 @@ impl TikvStorage {
         crate::copr::split_key_ranges_via_pd(&self.pd_endpoints, start, end)
     }
 
-    /// Build tipb TableScan CopTasks split by Region (send RPC lands next).
+    /// Build tipb TableScan CopTasks split by Region.
     pub fn build_table_scan_tasks(
         &self,
         start_ts: u64,
@@ -80,6 +80,17 @@ impl TikvStorage {
             selection,
             limit,
         )
+    }
+
+    /// Send a tipb DAG CopTask to TiKV Coprocessor (Region leader via PD).
+    pub fn execute_cop_task(
+        &self,
+        task: &crate::copr::CopTask,
+    ) -> Result<crate::copr::SelectResponse> {
+        let pd = self.pd_endpoints.clone();
+        let task = task.clone();
+        self.rt
+            .block_on(async move { crate::copr::execute_cop_task(&pd, &task).await })
     }
 
     fn begin_txn(&self, pessimistic: bool) -> Result<Box<dyn Transaction>> {
