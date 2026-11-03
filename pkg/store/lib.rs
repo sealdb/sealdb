@@ -9,6 +9,10 @@ use sealdb_errno::Result;
 use sealdb_kv::{MemStorage, Storage};
 use std::sync::Arc;
 
+pub use copr::pd::{
+    pd_get_region, pd_get_store, pd_list_stores, pd_scan_regions, pd_store_address, PdClient,
+    PdPeer, PdRegion, PdRegionEpoch, PdStoreInfo,
+};
 pub use copr::{
     build_table_scan_tasks, clear_pd_endpoints, decode_default_rows, decode_select_response,
     decode_select_rows, encode_default_row, encode_select_response, encode_table_scan_dag,
