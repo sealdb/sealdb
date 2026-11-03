@@ -2,7 +2,7 @@ use super::dialect::dialect;
 use crate::ast::ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
-    PartitionOption, PartitionType, TableName,
+    PartitionOption, PartitionType, TableName, TruncateTableStmt,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -172,6 +172,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         })),
         SqlStatement::CreateTable(create) => lower_create_table(create),
         SqlStatement::CreateIndex(create) => lower_create_index(create),
+        SqlStatement::Truncate(truncate) => lower_truncate(truncate),
         SqlStatement::Drop {
             object_type: ObjectType::Index,
             if_exists,
@@ -3574,6 +3575,22 @@ fn assignment_column(name: &ObjectName) -> Result<(Option<String>, String)> {
         [_, table, column] => Ok((Some(table.clone()), column.clone())),
         _ => Err(Error::unsupported(format!("UPDATE column {name}"))),
     }
+}
+
+fn lower_truncate(truncate: &sqlparser::ast::Truncate) -> Result<Statement> {
+    let target = truncate
+        .table_names
+        .first()
+        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing table name"))?;
+    if truncate.table_names.len() != 1 {
+        return Err(Error::unsupported("TRUNCATE multiple tables"));
+    }
+    if truncate.partitions.is_some() {
+        return Err(Error::unsupported("TRUNCATE PARTITION"));
+    }
+    Ok(Statement::TruncateTable(TruncateTableStmt {
+        table: object_table_name(&target.name)?,
+    }))
 }
 
 fn lower_create_table(create: &CreateTable) -> Result<Statement> {

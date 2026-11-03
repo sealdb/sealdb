@@ -123,6 +123,9 @@ impl PlanBuilder {
             Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropTable,
             }),
+            Statement::TruncateTable(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::TruncateTable,
+            }),
             Statement::CreateIndex(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateIndex,
             }),

@@ -50,8 +50,7 @@
     "RenameUserStmt",
     "RepairTableStmt",
     "SetPwdStmt",
-    "ShutdownStmt",
-    "TruncateTableStmt"
+    "ShutdownStmt"
   ],
   "open_stmts": [
     {
@@ -173,10 +172,6 @@
     {
       "stmt": "ast.DropSequenceStmt",
       "owner": "C6"
-    },
-    {
-      "stmt": "ast.TruncateTableStmt",
-      "owner": "unmapped"
     },
     {
       "stmt": "ast.RecoverTableStmt",

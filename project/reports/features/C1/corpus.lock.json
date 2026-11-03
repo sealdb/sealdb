@@ -38,7 +38,6 @@
     "stmt:ast.CreateViewStmt",
     "stmt:ast.CreateSequenceStmt",
     "stmt:ast.DropSequenceStmt",
-    "stmt:ast.TruncateTableStmt",
     "stmt:ast.RecoverTableStmt",
     "stmt:ast.FlashBackTableStmt",
     "stmt:ast.FlashBackDatabaseStmt",
@@ -95,9 +94,9 @@
   "counts": {
     "feature_gaps": 0,
     "completeness_gaps": 0,
-    "open_stmts": 41,
+    "open_stmts": 40,
     "suites": 42,
-    "unmapped_allowlist": 15,
-    "total": 83
+    "unmapped_allowlist": 14,
+    "total": 82
   }
 }

@@ -1,8 +1,10 @@
 use crate::create_table::{build_table_info, build_table_info_with_like, columns_from_select};
 use sealdb_errno::{ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, Error, Result};
 use sealdb_infoschema::InfoSchema;
+use sealdb_kv::Storage;
 use sealdb_meta::{Mutator, TableInfo};
-use sealdb_parser::ast::{CreateTableStmt, DropTableStmt, TableName};
+use sealdb_parser::ast::{CreateTableStmt, DropTableStmt, TableName, TruncateTableStmt};
+use sealdb_tablecodec::{encode_table_prefix, next_prefix};
 
 pub fn create_table(
     meta: &mut Mutator,
@@ -87,6 +89,47 @@ pub fn drop_table(
         }
     }
     Ok(())
+}
+
+/// Clear all row/index keys for the table and reset next_handle; keep schema.
+pub fn truncate_table(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &TruncateTableStmt,
+    current_db: &str,
+    storage: &dyn Storage,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let tbl = is.table_by_name(&schema, &table).ok_or_else(|| {
+        if is.schema_by_name(&schema).is_none() {
+            Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
+        } else {
+            Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{schema}.{table}' doesn't exist"),
+            )
+        }
+    })?;
+    clear_table_keys(storage, &tbl.physical_ids())?;
+    meta.reset_handle(tbl.id);
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+fn clear_table_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<()> {
+    if physical_ids.is_empty() {
+        return Ok(());
+    }
+    let mut txn = storage.begin()?;
+    for id in physical_ids {
+        let start = encode_table_prefix(*id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, _) in pairs {
+            txn.delete(&key)?;
+        }
+    }
+    txn.commit()
 }
 
 pub(crate) fn resolve_name(name: &TableName, current_db: &str) -> Result<(String, String)> {

@@ -366,6 +366,7 @@ impl Session {
             | Statement::DropDatabase(_)
             | Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
@@ -801,6 +802,16 @@ impl Session {
                 for table in &drop.tables {
                     require(&mgr, &user, &roles, table, &current_db, PrivilegeType::DROP)?;
                 }
+            }
+            Statement::TruncateTable(truncate) => {
+                require(
+                    &mgr,
+                    &user,
+                    &roles,
+                    &truncate.table,
+                    &current_db,
+                    PrivilegeType::DROP,
+                )?;
             }
             Statement::DropIndex(drop) => {
                 require(
@@ -1407,6 +1418,9 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
                 .collect(),
             true,
         ),
+        Statement::TruncateTable(truncate) => {
+            (vec![mdl_table_key(&truncate.table, current_db)], true)
+        }
         Statement::AlterTable(alter) => (vec![mdl_table_key(&alter.table, current_db)], true),
         Statement::CreateIndex(create) => (vec![mdl_table_key(&create.table, current_db)], true),
         Statement::DropIndex(drop) => (vec![mdl_table_key(&drop.table, current_db)], true),
@@ -1424,6 +1438,7 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::DropDatabase(_)
             | Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::TruncateTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
@@ -1629,6 +1644,62 @@ mod tests {
         session.execute_stmt("DROP TABLE db1.t").unwrap();
         session.execute_stmt("DROP DATABASE db1").unwrap();
         assert!(session.infoschema().schema_by_name("db1").is_none());
+    }
+
+    #[test]
+    fn test_truncate_table_clears_rows_keeps_schema() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20)); INSERT INTO db1.t VALUES (1, 'a'), (2, 'b')",
+            )
+            .unwrap();
+        let before = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            before.display_rows(),
+            vec![
+                vec!["1".to_string(), "a".to_string()],
+                vec!["2".to_string(), "b".to_string()]
+            ]
+        );
+        let table_id = session.infoschema().table_by_name("db1", "t").unwrap().id;
+        // Bump next_handle via auto-handle inserts; truncate resets it.
+        session
+            .execute_stmt("INSERT INTO db1.t (name) VALUES ('x'), ('y')")
+            .unwrap();
+        session.execute_stmt("TRUNCATE TABLE db1.t").unwrap();
+        let after = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert!(after.display_rows().is_empty());
+        let info = session
+            .infoschema()
+            .table_by_name("db1", "t")
+            .unwrap()
+            .clone();
+        assert_eq!(info.id, table_id);
+        assert_eq!(info.columns.len(), 2);
+        assert_eq!(info.columns[0].name.o(), "id");
+        assert_eq!(info.columns[1].name.o(), "name");
+        // Re-insert into the same schema; without truncate this would be a dup key.
+        session
+            .execute_stmt("INSERT INTO db1.t VALUES (1, 'c')")
+            .unwrap();
+        let rows = session
+            .execute_stmt("SELECT * FROM db1.t ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.display_rows(),
+            vec![vec!["1".to_string(), "c".to_string()]]
+        );
+        session.execute_stmt("TRUNCATE db1.t").unwrap();
+        assert!(
+            session
+                .execute_stmt("SELECT * FROM db1.t")
+                .unwrap()
+                .display_rows()
+                .is_empty()
+        );
     }
 
     #[test]

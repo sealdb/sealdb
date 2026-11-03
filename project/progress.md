@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C1 gaps 收口：unmapped allowlist / stale labels / leftover suite smoke；C1–C5 gaps `[]`；C6 deferred）  
+> 最后更新：2026-11-03（TruncateTableStmt：parse/execute + C1 `execute-truncate`；从 UNMAPPED_ALLOWLIST 摘出 → F02）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,20 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: leftover allowlist shrink（TruncateTableStmt）
+- **完成**:
+  - Parse `TRUNCATE [TABLE] db.t` → AST `TruncateTableStmt`（TiDB 1:1 命名）
+  - Execute：按 `encode_table_prefix` 清 MemStorage/TiKV 行+索引键；`reset_handle`；保留表 schema
+  - `FEATURE_HINTS["TruncateTableStmt"] = "F02"`；移出 `UNMAPPED_ALLOWLIST`
+  - Session 单测 `test_truncate_table_clears_rows_keeps_schema`；C1 gate `execute-truncate`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib truncate`
+  - `./project/scripts/feature_gate.sh C1`（含 leftover regenerate）
+- **下一步**:
+  - 继续消化 `UNMAPPED_ALLOWLIST` 下一项；C6 仍 deferred
 
 ### 2026-11-03
 
