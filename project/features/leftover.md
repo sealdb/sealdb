@@ -22,15 +22,7 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 
 ## PlanBuilder statement kinds still open
 
-- `ast.AddQueryWatchStmt` → C6
-- `ast.DropQueryWatchStmt` → C6
-- `ast.SetResourceGroupStmt` → C6
-- `ast.RecoverTableStmt` → C6
-- `ast.FlashBackTableStmt` → C6
-- `ast.FlashBackDatabaseStmt` → C6
-- `ast.FlashBackToTimestampStmt` → C6
-- `ast.DropPlacementPolicyStmt` → C6
-- `ast.CreateResourceGroupStmt` → C6
+- none
 
 ## integrationtest leftover suites
 
@@ -86,4 +78,5 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - C4: completeness gaps closed (template-keyed plan cache / COM_STMT_* / user-vars / BINDING).
 - C5: completeness gaps closed (unicode-weights + gbk-latin1 + only-full-group-by + set-global + leftover collation suites MVB; new_character_set* exercised by test_leftover_collation_suites).
 - Leftover suite execution: suites are owner-classified; C2 `explain*` / `index_merge` MVB via `execute-explain*`; C5 collation / `new_character_set*` via `execute-leftover-collation-suites`. Full integrationtest port is not claimed.
-- C6 is production parity: package/file align TiDB compute; order A/B → C (compute + full PD/TiKV client) → D (TiFlash; deferred not dropped). Closed C6 stmts: C6_CLOSED_STMTS. Open stmts = B backlog.
+- C6 is production parity: package/file align TiDB compute; order A/B → C (compute + full PD/TiKV client) → D (TiFlash; deferred not dropped).
+- C6-B PlanBuilder stmt surface: closed via C6_CLOSED_STMTS (accepted AST + session round-trip; deeper semantics remain in C6 gaps). Open stmts empty when backlog cleared; leftover suites (e.g. black_list) and C6-C/D remain.

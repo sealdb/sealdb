@@ -304,7 +304,16 @@ impl Session {
             | Statement::DistributeTable(_)
             | Statement::CompactTable(_)
             | Statement::RecommendIndex(_)
-            | Statement::CalibrateResource(_) => {
+            | Statement::CalibrateResource(_)
+            | Statement::FlashBackTable(_)
+            | Statement::FlashBackDatabase(_)
+            | Statement::FlashBackToTimestamp(_)
+            | Statement::RecoverTable(_)
+            | Statement::DropPlacementPolicy(_)
+            | Statement::CreateResourceGroup(_)
+            | Statement::SetResourceGroup(_)
+            | Statement::AddQueryWatch(_)
+            | Statement::DropQueryWatch(_) => {
                 return Ok(empty_result());
             }
             Statement::SetRole(set) => {

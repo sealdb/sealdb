@@ -262,6 +262,33 @@ impl PlanBuilder {
             Statement::CalibrateResource(_) => Ok(PhysicalPlan::Simple {
                 kind: "CalibrateResource".to_string(),
             }),
+            Statement::FlashBackTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "FlashBackTable".to_string(),
+            }),
+            Statement::FlashBackDatabase(_) => Ok(PhysicalPlan::Simple {
+                kind: "FlashBackDatabase".to_string(),
+            }),
+            Statement::FlashBackToTimestamp(_) => Ok(PhysicalPlan::Simple {
+                kind: "FlashBackToTimestamp".to_string(),
+            }),
+            Statement::RecoverTable(_) => Ok(PhysicalPlan::Simple {
+                kind: "RecoverTable".to_string(),
+            }),
+            Statement::DropPlacementPolicy(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropPlacementPolicy".to_string(),
+            }),
+            Statement::CreateResourceGroup(_) => Ok(PhysicalPlan::Simple {
+                kind: "CreateResourceGroup".to_string(),
+            }),
+            Statement::SetResourceGroup(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetResourceGroup".to_string(),
+            }),
+            Statement::AddQueryWatch(_) => Ok(PhysicalPlan::Simple {
+                kind: "AddQueryWatch".to_string(),
+            }),
+            Statement::DropQueryWatch(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropQueryWatch".to_string(),
+            }),
             Statement::RenameUser(_) => Ok(PhysicalPlan::Simple {
                 kind: "RenameUser".to_string(),
             }),

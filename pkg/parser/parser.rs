@@ -137,6 +137,68 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_c6_flashback_and_rg() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("FLASHBACK TABLE t TO t2")
+            .unwrap()
+        {
+            crate::ast::Statement::FlashBackTable(_) => {}
+            other => panic!("expected FlashBackTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("FLASHBACK DATABASE db1 TO db2")
+            .unwrap()
+        {
+            crate::ast::Statement::FlashBackDatabase(_) => {}
+            other => panic!("expected FlashBackDatabaseStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("FLASHBACK CLUSTER TO TIMESTAMP '2020-01-01 00:00:00'")
+            .unwrap()
+        {
+            crate::ast::Statement::FlashBackToTimestamp(_) => {}
+            other => panic!("expected FlashBackToTimestampStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("RECOVER TABLE BY JOB 1")
+            .unwrap()
+        {
+            crate::ast::Statement::RecoverTable(_) => {}
+            other => panic!("expected RecoverTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DROP PLACEMENT POLICY IF EXISTS p1")
+            .unwrap()
+        {
+            crate::ast::Statement::DropPlacementPolicy(_) => {}
+            other => panic!("expected DropPlacementPolicyStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CREATE RESOURCE GROUP rg1 RU_PER_SEC = 100")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateResourceGroup(_) => {}
+            other => panic!("expected CreateResourceGroupStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("SET RESOURCE GROUP rg1").unwrap() {
+            crate::ast::Statement::SetResourceGroup(_) => {}
+            other => panic!("expected SetResourceGroupStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("QUERY WATCH ADD RESOURCE GROUP rg1")
+            .unwrap()
+        {
+            crate::ast::Statement::AddQueryWatch(_) => {}
+            other => panic!("expected AddQueryWatchStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("QUERY WATCH REMOVE 1").unwrap() {
+            crate::ast::Statement::DropQueryWatch(_) => {}
+            other => panic!("expected DropQueryWatchStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_c6_admin_ops() {
         let parser = Parser::new();
         match parser

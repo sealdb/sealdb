@@ -37,44 +37,7 @@
   "feature_gaps": {},
   "completeness_gaps": {},
   "unmapped_allowlist": [],
-  "open_stmts": [
-    {
-      "stmt": "ast.AddQueryWatchStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.DropQueryWatchStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.SetResourceGroupStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.RecoverTableStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.FlashBackTableStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.FlashBackDatabaseStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.FlashBackToTimestampStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.DropPlacementPolicyStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.CreateResourceGroupStmt",
-      "owner": "C6"
-    }
-  ],
+  "open_stmts": [],
   "suites": [
     {
       "name": "access_path_selection",
