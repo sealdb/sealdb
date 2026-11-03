@@ -111,13 +111,17 @@ impl Executor for BatchPointGetExec {
                 .collect()
         };
         self.rows = self.txn.with_txn(|txn| {
-            let mut rows = Vec::new();
-            for handle in handles {
-                if let Some(row) = get_row(txn, &info, handle, self.lock, self.wait)? {
-                    rows.push(row);
+            if self.lock == RowLock::None {
+                get_rows_batch(txn, &info, &handles)
+            } else {
+                let mut rows = Vec::new();
+                for handle in handles {
+                    if let Some(row) = get_row(txn, &info, handle, self.lock, self.wait)? {
+                        rows.push(row);
+                    }
                 }
+                Ok(rows)
             }
-            Ok(rows)
         })?;
         Ok(())
     }
@@ -143,14 +147,8 @@ impl Executor for BatchPointGetExec {
     }
 }
 
-fn get_row(
-    txn: &mut dyn sealdb_kv::Transaction,
-    info: &TableInfo,
-    handle: i64,
-    lock: RowLock,
-    wait: LockWait,
-) -> Result<Option<Vec<Datum>>> {
-    let physical_ids = if info.partition.as_ref().is_some_and(|p| {
+fn physical_ids_for_handle(info: &TableInfo, handle: i64) -> Vec<i64> {
+    if info.partition.as_ref().is_some_and(|p| {
         p.column()
             .eq_ignore_ascii_case(info.columns.first().map(|c| c.name.o()).unwrap_or(""))
     }) {
@@ -160,25 +158,70 @@ fn get_row(
         }
     } else {
         info.physical_ids()
-    };
-    for physical_id in physical_ids {
+    }
+}
+
+fn decode_table_row(info: &TableInfo, raw: &[u8]) -> Vec<Datum> {
+    let decoded = decode_row(raw, &info.col_field_types());
+    info.columns
+        .iter()
+        .map(|col| {
+            decoded
+                .iter()
+                .find(|(id, _)| *id == col.id)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Datum::Null)
+        })
+        .collect()
+}
+
+fn get_row(
+    txn: &mut dyn sealdb_kv::Transaction,
+    info: &TableInfo,
+    handle: i64,
+    lock: RowLock,
+    wait: LockWait,
+) -> Result<Option<Vec<Datum>>> {
+    for physical_id in physical_ids_for_handle(info, handle) {
         let key = encode_row_key_with_handle(physical_id, handle);
         let raw = txn.get_locked(key.as_bytes(), lock, wait)?;
         if let Some(raw) = raw {
-            let decoded = decode_row(&raw, &info.col_field_types());
-            return Ok(Some(
-                info.columns
-                    .iter()
-                    .map(|col| {
-                        decoded
-                            .iter()
-                            .find(|(id, _)| *id == col.id)
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or(Datum::Null)
-                    })
-                    .collect(),
-            ));
+            return Ok(Some(decode_table_row(info, &raw)));
         }
     }
     Ok(None)
+}
+
+/// Unlocked BatchPointGet: one `batch_get` RPC (or Mem loop) for all row keys.
+fn get_rows_batch(
+    txn: &mut dyn sealdb_kv::Transaction,
+    info: &TableInfo,
+    handles: &[i64],
+) -> Result<Vec<Vec<Datum>>> {
+    let mut handle_keys: Vec<(i64, Vec<Vec<u8>>)> = Vec::with_capacity(handles.len());
+    let mut all_keys = Vec::new();
+    for &handle in handles {
+        let keys: Vec<Vec<u8>> = physical_ids_for_handle(info, handle)
+            .into_iter()
+            .map(|physical_id| {
+                encode_row_key_with_handle(physical_id, handle)
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+        all_keys.extend(keys.iter().cloned());
+        handle_keys.push((handle, keys));
+    }
+    let pairs = txn.batch_get(&all_keys)?;
+    let by_key: std::collections::HashMap<Vec<u8>, Vec<u8>> = pairs.into_iter().collect();
+    let mut rows = Vec::new();
+    for (_handle, keys) in handle_keys {
+        for key in keys {
+            if let Some(raw) = by_key.get(&key) {
+                rows.push(decode_table_row(info, raw));
+                break;
+            }
+        }
+    }
+    Ok(rows)
 }
