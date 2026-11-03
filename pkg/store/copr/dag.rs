@@ -1,15 +1,25 @@
-//! Minimal tipb DAG request/response for Coprocessor pushdown (C6-C MVB).
+//! Minimal tipb DAG request/response for Coprocessor pushdown (C6-C).
 //!
 //! Field tags match pingcap/tipb so bytes are wire-compatible with TiKV.
-//! Full expression pushdown / chunk decode lands in later slices.
 
 use prost::Message;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
+use sealdb_types::Datum;
+use sealdb_util::codec::{decode_one, encode_value};
 
 /// TiDB / TiKV Coprocessor request type for a tipb DAG.
 pub const REQ_TYPE_DAG: i64 = 103;
 
-/// tipb.ExecType
+/// tipb.EncodeType
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub enum EncodeType {
+    TypeDefault = 0,
+    TypeChunk = 1,
+    TypeCHBlock = 2,
+}
+
+/// tipb.ExecType (subset used by SealDB).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
 pub enum ExecType {
@@ -20,17 +30,18 @@ pub enum ExecType {
     TopN = 4,
     Limit = 5,
     StreamAgg = 6,
-    Projection = 7,
+    // Join = 7 in tipb; Projection is 11.
+    Projection = 11,
 }
 
-/// tipb.ColumnInfo (id-only MVB).
+/// tipb.ColumnInfo
 #[derive(Clone, PartialEq, Message)]
 pub struct ColumnInfo {
     #[prost(int64, tag = "1")]
     pub column_id: i64,
     #[prost(int32, tag = "2")]
     pub tp: i32,
-    #[prost(bool, tag = "12")]
+    #[prost(bool, tag = "21")]
     pub pk_handle: bool,
 }
 
@@ -91,11 +102,13 @@ pub struct Executor {
 #[derive(Clone, PartialEq, Message)]
 pub struct DagRequest {
     #[prost(uint64, tag = "1")]
-    pub start_ts: u64,
+    pub start_ts_fallback: u64,
     #[prost(message, repeated, tag = "2")]
     pub executors: Vec<Executor>,
-    #[prost(int64, repeated, tag = "3")]
-    pub output_offsets: Vec<i64>,
+    #[prost(uint32, repeated, tag = "5")]
+    pub output_offsets: Vec<u32>,
+    #[prost(int32, tag = "8")]
+    pub encode_type: i32,
 }
 
 /// tipb.Error (subset)
@@ -107,13 +120,22 @@ pub struct TipbError {
     pub msg: String,
 }
 
-/// tipb.Chunk (raw rows_data only)
+/// tipb.RowMeta
+#[derive(Clone, PartialEq, Message)]
+pub struct RowMeta {
+    #[prost(int64, tag = "1")]
+    pub handle: i64,
+    #[prost(int64, tag = "2")]
+    pub length: i64,
+}
+
+/// tipb.Chunk
 #[derive(Clone, PartialEq, Message)]
 pub struct Chunk {
-    #[prost(int32, repeated, packed = "false", tag = "1")]
-    pub rows_meta: Vec<i32>,
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", tag = "3")]
     pub rows_data: Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    pub rows_meta: Vec<RowMeta>,
 }
 
 /// tipb.SelectResponse (subset)
@@ -121,8 +143,10 @@ pub struct Chunk {
 pub struct SelectResponse {
     #[prost(message, optional, tag = "1")]
     pub error: Option<TipbError>,
-    #[prost(message, repeated, tag = "2")]
+    #[prost(message, repeated, tag = "3")]
     pub chunks: Vec<Chunk>,
+    #[prost(int32, tag = "9")]
+    pub encode_type: i32,
 }
 
 /// Build a TableScan (+ optional Selection/Limit) DAG payload for Coprocessor `data`.
@@ -158,9 +182,10 @@ pub fn encode_table_scan_dag(
         });
     }
     let dag = DagRequest {
-        start_ts,
+        start_ts_fallback: start_ts,
         executors,
-        output_offsets: output_offsets.to_vec(),
+        output_offsets: output_offsets.iter().map(|o| *o as u32).collect(),
+        encode_type: EncodeType::TypeDefault as i32,
     };
     dag.encode_to_vec()
 }
@@ -184,6 +209,76 @@ pub fn decode_select_response(data: &[u8]) -> Result<SelectResponse> {
     Ok(resp)
 }
 
+/// Encode one TypeDefault row (column-major EncodeValue stream).
+pub fn encode_default_row(values: &[Datum]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for v in values {
+        encode_value(&mut buf, v);
+    }
+    buf
+}
+
+/// Decode TypeDefault `rows_data` into rows of `col_count` columns each.
+pub fn decode_default_rows(rows_data: &[u8], col_count: usize) -> Result<Vec<Vec<Datum>>> {
+    if col_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut rest = rows_data;
+    let mut rows = Vec::new();
+    while !rest.is_empty() {
+        let mut row = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            let (next, d) = decode_one(rest)?;
+            row.push(d);
+            rest = next;
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Decode all TypeDefault chunks in a SelectResponse.
+pub fn decode_select_rows(resp: &SelectResponse, col_count: usize) -> Result<Vec<Vec<Datum>>> {
+    if resp.encode_type != EncodeType::TypeDefault as i32 && resp.encode_type != 0 {
+        // encode_type 0 is Default; non-zero non-default still try Default layout for MVB.
+        if resp.encode_type == EncodeType::TypeChunk as i32
+            || resp.encode_type == EncodeType::TypeCHBlock as i32
+        {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("unsupported tipb encode_type {}", resp.encode_type),
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for chunk in &resp.chunks {
+        out.extend(decode_default_rows(&chunk.rows_data, col_count)?);
+    }
+    Ok(out)
+}
+
+/// Build a SelectResponse carrying TypeDefault-encoded rows (tests / local sim).
+pub fn encode_select_response(rows: &[Vec<Datum>]) -> SelectResponse {
+    let mut rows_data = Vec::new();
+    let mut rows_meta = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let encoded = encode_default_row(row);
+        rows_meta.push(RowMeta {
+            handle: (i as i64) + 1,
+            length: encoded.len() as i64,
+        });
+        rows_data.extend_from_slice(&encoded);
+    }
+    SelectResponse {
+        error: None,
+        chunks: vec![Chunk {
+            rows_data,
+            rows_meta,
+        }],
+        encode_type: EncodeType::TypeDefault as i32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,13 +292,15 @@ mod tests {
         }];
         let bytes = encode_table_scan_dag(42, 100, &cols, &[0], None, Some(10));
         let dag = DagRequest::decode(bytes.as_slice()).unwrap();
-        assert_eq!(dag.start_ts, 42);
+        assert_eq!(dag.start_ts_fallback, 42);
         assert_eq!(dag.executors.len(), 2); // TableScan + Limit
         assert_eq!(dag.executors[0].tp, ExecType::TableScan as i32);
         assert_eq!(dag.executors[0].tbl_scan.as_ref().unwrap().table_id, 100);
+        assert!(dag.executors[0].tbl_scan.as_ref().unwrap().columns[0].pk_handle);
         assert_eq!(dag.executors[1].tp, ExecType::Limit as i32);
         assert_eq!(dag.executors[1].limit.as_ref().unwrap().limit, 10);
         assert_eq!(dag.output_offsets, vec![0]);
+        assert_eq!(dag.encode_type, EncodeType::TypeDefault as i32);
     }
 
     #[test]
@@ -220,9 +317,24 @@ mod tests {
                 msg: "boom".into(),
             }),
             chunks: vec![],
+            encode_type: 0,
         }
         .encode_to_vec();
         let err = decode_select_response(&raw).unwrap_err();
         assert_eq!(err.code, 1105);
+    }
+
+    #[test]
+    fn test_default_chunk_roundtrip() {
+        let rows = vec![
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec())],
+            vec![Datum::I64(2), Datum::Null],
+        ];
+        let resp = encode_select_response(&rows);
+        let decoded = decode_select_rows(&resp, 2).unwrap();
+        assert_eq!(decoded, rows);
+        let wire = resp.encode_to_vec();
+        let parsed = decode_select_response(&wire).unwrap();
+        assert_eq!(decode_select_rows(&parsed, 2).unwrap(), rows);
     }
 }

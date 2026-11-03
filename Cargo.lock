@@ -2172,6 +2172,8 @@ dependencies = [
  "sealdb-config",
  "sealdb-errno",
  "sealdb-kv",
+ "sealdb-types",
+ "sealdb-util",
  "serde",
  "serde_json",
  "tikv-client",

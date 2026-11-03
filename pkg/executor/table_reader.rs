@@ -142,10 +142,15 @@ pub(crate) fn scan_table(
             // DistSQL / Cop scheduling: Region-split tipb TableScan tasks, then
             // local KV execute (tipb chunk decode from TiKV RPC still deferred).
             let tasks = crate::cop_client::build_table_cop_tasks(info, *physical_id, start_ts)?;
-            crate::cop_client::probe_cop_rpc(&tasks);
-            rows.extend(crate::cop_client::execute_cop_tasks_locally(
-                txn, info, *physical_id, &tasks, lock, wait,
-            )?);
+            if let Some(remote) =
+                crate::cop_client::try_execute_cop_tasks_remote(info, *physical_id, &tasks)
+            {
+                rows.extend(remote);
+            } else {
+                rows.extend(crate::cop_client::execute_cop_tasks_locally(
+                    txn, info, *physical_id, &tasks, lock, wait,
+                )?);
+            }
         }
         Ok(rows)
     })
