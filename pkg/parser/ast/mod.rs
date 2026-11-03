@@ -9,10 +9,10 @@ pub mod misc;
 
 pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
-    AlterDatabaseStmt, AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition,
-    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DropDatabaseStmt,
-    DropIndexStmt, DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType,
-    TableName, TruncateTableStmt,
+    AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
+    ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
+    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt, IndexDef,
+    PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,

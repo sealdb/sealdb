@@ -339,6 +339,110 @@ impl DropTableStmt {
     }
 }
 
+/// Sequence options shared by CREATE / ALTER SEQUENCE.
+#[derive(Clone, Debug, Default)]
+pub struct SequenceOptionSet {
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub start: Option<i64>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+    pub no_min: bool,
+    pub no_max: bool,
+    pub no_cache: bool,
+}
+
+/// TiDB `ast.CreateSequenceStmt`.
+#[derive(Clone, Debug)]
+pub struct CreateSequenceStmt {
+    pub if_not_exists: bool,
+    pub name: TableName,
+    pub options: SequenceOptionSet,
+}
+
+impl CreateSequenceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CREATE SEQUENCE ");
+        if self.if_not_exists {
+            ctx.write_str("IF NOT EXISTS ");
+        }
+        self.name.restore(ctx)?;
+        restore_seq_options(&self.options, ctx);
+        Ok(())
+    }
+}
+
+/// TiDB `ast.DropSequenceStmt`.
+#[derive(Clone, Debug)]
+pub struct DropSequenceStmt {
+    pub if_exists: bool,
+    pub sequences: Vec<TableName>,
+}
+
+impl DropSequenceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP SEQUENCE ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
+        for (i, name) in self.sequences.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            name.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// TiDB `ast.AlterSequenceStmt`.
+#[derive(Clone, Debug)]
+pub struct AlterSequenceStmt {
+    pub if_exists: bool,
+    pub name: TableName,
+    pub options: SequenceOptionSet,
+}
+
+impl AlterSequenceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER SEQUENCE ");
+        if self.if_exists {
+            ctx.write_str("IF EXISTS ");
+        }
+        self.name.restore(ctx)?;
+        restore_seq_options(&self.options, ctx);
+        Ok(())
+    }
+}
+
+fn restore_seq_options(opts: &SequenceOptionSet, ctx: &mut RestoreCtx) {
+    if let Some(v) = opts.increment {
+        ctx.write_str(&format!(" INCREMENT BY {v}"));
+    }
+    if opts.no_min {
+        ctx.write_str(" NO MINVALUE");
+    } else if let Some(v) = opts.min_value {
+        ctx.write_str(&format!(" MINVALUE {v}"));
+    }
+    if opts.no_max {
+        ctx.write_str(" NO MAXVALUE");
+    } else if let Some(v) = opts.max_value {
+        ctx.write_str(&format!(" MAXVALUE {v}"));
+    }
+    if let Some(v) = opts.start {
+        ctx.write_str(&format!(" START WITH {v}"));
+    }
+    if opts.no_cache {
+        ctx.write_str(" NOCACHE");
+    } else if let Some(v) = opts.cache {
+        ctx.write_str(&format!(" CACHE {v}"));
+    }
+    if let Some(cycle) = opts.cycle {
+        ctx.write_str(if cycle { " CYCLE" } else { " NOCYCLE" });
+    }
+}
+
 /// TiDB `ast.CreateViewStmt`.
 #[derive(Clone, Debug)]
 pub struct CreateViewStmt {

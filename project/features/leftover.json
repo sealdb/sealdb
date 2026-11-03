@@ -103,18 +103,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.AlterSequenceStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.CreateSequenceStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.DropSequenceStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.RecoverTableStmt",
       "owner": "C6"
     },

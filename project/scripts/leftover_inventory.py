@@ -89,7 +89,14 @@ FEATURE_HINTS = {
 }
 
 # C6 production-parity slices already landed: leave the open leftover surface.
-C6_CLOSED_STMTS: frozenset[str] = frozenset({"CreateViewStmt"})
+C6_CLOSED_STMTS: frozenset[str] = frozenset(
+    {
+        "CreateViewStmt",
+        "CreateSequenceStmt",
+        "DropSequenceStmt",
+        "AlterSequenceStmt",
+    }
+)
 
 # Frozen allowlist: PlanBuilder kinds intentionally left `unmapped` (not C6 and
 # not owned by a closed F*/C2–C5 wave). C1 verifies open unmapped == this set.

@@ -86,6 +86,22 @@ impl Job {
                 let (db, table) = s.view_name.qualified(current_db);
                 ("create view", db, table)
             }
+            Statement::CreateSequence(s) => {
+                let (db, table) = s.name.qualified(current_db);
+                ("create sequence", db, table)
+            }
+            Statement::DropSequence(s) => {
+                let (db, table) = s
+                    .sequences
+                    .first()
+                    .map(|t| t.qualified(current_db))
+                    .unwrap_or_else(|| (current_db.to_string(), String::new()));
+                ("drop sequence", db, table)
+            }
+            Statement::AlterSequence(s) => {
+                let (db, table) = s.name.qualified(current_db);
+                ("alter sequence", db, table)
+            }
             Statement::DropTable(s) => {
                 let (db, table) = s
                     .tables

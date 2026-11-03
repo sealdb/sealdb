@@ -137,6 +137,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_create_drop_alter_sequence() {
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt(
+                "CREATE SEQUENCE IF NOT EXISTS db1.s INCREMENT BY 1 START WITH 10 CACHE 20 NOCYCLE",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::CreateSequence(stmt) => {
+                assert!(stmt.if_not_exists);
+                assert_eq!(stmt.name.schema.as_deref(), Some("db1"));
+                assert_eq!(stmt.name.name, "s");
+                assert_eq!(stmt.options.increment, Some(1));
+                assert_eq!(stmt.options.start, Some(10));
+                assert_eq!(stmt.options.cache, Some(20));
+                assert_eq!(stmt.options.cycle, Some(false));
+            }
+            other => panic!("expected CreateSequenceStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("DROP SEQUENCE IF EXISTS db1.s, db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::DropSequence(stmt) => {
+                assert!(stmt.if_exists);
+                assert_eq!(stmt.sequences.len(), 2);
+            }
+            other => panic!("expected DropSequenceStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER SEQUENCE db1.s INCREMENT BY 2 RESTART WITH 5")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterSequence(stmt) => {
+                assert_eq!(stmt.options.increment, Some(2));
+                assert_eq!(stmt.options.start, Some(5));
+            }
+            other => panic!("expected AlterSequenceStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_drop_view() {
         let parser = Parser::new();
         match parser

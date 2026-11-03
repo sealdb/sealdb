@@ -38,9 +38,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.AddQueryWatchStmt` → C6
 - `ast.DropQueryWatchStmt` → C6
 - `ast.SetResourceGroupStmt` → C6
-- `ast.AlterSequenceStmt` → C6
-- `ast.CreateSequenceStmt` → C6
-- `ast.DropSequenceStmt` → C6
 - `ast.RecoverTableStmt` → C6
 - `ast.FlashBackTableStmt` → C6
 - `ast.FlashBackDatabaseStmt` → C6

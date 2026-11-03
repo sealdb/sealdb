@@ -1,9 +1,9 @@
 use super::dialect::dialect;
 use crate::ast::ddl::{
-    AlterDatabaseStmt, AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition,
-    CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt, CreateViewStmt, DropDatabaseStmt,
-    DropIndexStmt, DropTableStmt, IndexDef, PartitionDef, PartitionOption, PartitionType,
-    TableName, TruncateTableStmt,
+    AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
+    ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
+    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt, IndexDef,
+    PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -73,6 +73,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, binding_ops) = extract_binding_ddl(&rewritten)?;
     // sqlparser rejects MySQL `DO` / `SET PASSWORD` / `SHUTDOWN` / `ALTER DATABASE … CHARSET`.
     let (rewritten, misc_ops) = extract_misc_allowlist(&rewritten)?;
+    // sqlparser MySQL dialect only partially supports SEQUENCE DDL.
+    let (rewritten, seq_ops) = extract_sequence_ddl(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -88,6 +90,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut analyze_indexes = analyze_indexes.into_iter();
     let mut binding_ops = binding_ops.into_iter();
     let mut misc_ops = misc_ops.into_iter();
+    let mut seq_ops = seq_ops.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -146,6 +149,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         }
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_misc__"))
             && let Some(op) = misc_ops.next().flatten()
+        {
+            lowered = op;
+        }
+        if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_seq__"))
+            && let Some(op) = seq_ops.next().flatten()
         {
             lowered = op;
         }
@@ -4200,6 +4208,273 @@ fn lower_truncate(truncate: &sqlparser::ast::Truncate) -> Result<Statement> {
     Ok(Statement::TruncateTable(TruncateTableStmt {
         table: object_table_name(&target.name)?,
     }))
+}
+
+/// Extract CREATE/DROP/ALTER SEQUENCE (sqlparser MySQL coverage is incomplete).
+fn extract_sequence_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after_create, "SEQUENCE") {
+                let mut j = skip_ws(bytes, after_create + "SEQUENCE".len());
+                let if_not_exists = if keyword_at(bytes, j, "IF") {
+                    let after_if = skip_ws(bytes, j + "IF".len());
+                    if keyword_at(bytes, after_if, "NOT") {
+                        let after_not = skip_ws(bytes, after_if + "NOT".len());
+                        if keyword_at(bytes, after_not, "EXISTS") {
+                            j = skip_ws(bytes, after_not + "EXISTS".len());
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let (schema, name, after_name) = read_qualified_name(bytes, j)?;
+                j = skip_ws(bytes, after_name);
+                let (options, end) = parse_sequence_option_tail(bytes, j)?;
+                out.push_str("SET NAMES '__sealdb_seq__'");
+                ops.push(Some(Statement::CreateSequence(CreateSequenceStmt {
+                    if_not_exists,
+                    name: TableName::new(schema, name),
+                    options,
+                })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "DROP") {
+            let after_drop = skip_ws(bytes, i + "DROP".len());
+            if keyword_at(bytes, after_drop, "SEQUENCE") {
+                let mut j = skip_ws(bytes, after_drop + "SEQUENCE".len());
+                let if_exists = if keyword_at(bytes, j, "IF") {
+                    let after_if = skip_ws(bytes, j + "IF".len());
+                    if keyword_at(bytes, after_if, "EXISTS") {
+                        j = skip_ws(bytes, after_if + "EXISTS".len());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let mut sequences = Vec::new();
+                loop {
+                    let (schema, name, next) = read_qualified_name(bytes, j)?;
+                    sequences.push(TableName::new(schema, name));
+                    j = skip_ws(bytes, next);
+                    if j < bytes.len() && bytes[j] == b',' {
+                        j = skip_ws(bytes, j + 1);
+                        continue;
+                    }
+                    break;
+                }
+                out.push_str("SET NAMES '__sealdb_seq__'");
+                ops.push(Some(Statement::DropSequence(DropSequenceStmt {
+                    if_exists,
+                    sequences,
+                })));
+                i = j;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "ALTER") {
+            let after_alter = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after_alter, "SEQUENCE") {
+                let mut j = skip_ws(bytes, after_alter + "SEQUENCE".len());
+                let if_exists = if keyword_at(bytes, j, "IF") {
+                    let after_if = skip_ws(bytes, j + "IF".len());
+                    if keyword_at(bytes, after_if, "EXISTS") {
+                        j = skip_ws(bytes, after_if + "EXISTS".len());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let (schema, name, after_name) = read_qualified_name(bytes, j)?;
+                j = skip_ws(bytes, after_name);
+                let (options, end) = parse_sequence_option_tail(bytes, j)?;
+                out.push_str("SET NAMES '__sealdb_seq__'");
+                ops.push(Some(Statement::AlterSequence(AlterSequenceStmt {
+                    if_exists,
+                    name: TableName::new(schema, name),
+                    options,
+                })));
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Ok((out, ops))
+}
+
+fn read_qualified_name(
+    bytes: &[u8],
+    start: usize,
+) -> Result<(Option<String>, String, usize)> {
+    let (first, after_first) = read_ident(bytes, start);
+    if first.is_empty() {
+        return Err(Error::new(ERR_PARSE_ERROR, "missing sequence name"));
+    }
+    let after_first = skip_ws(bytes, after_first);
+    if after_first < bytes.len() && bytes[after_first] == b'.' {
+        let (second, after_second) = read_ident(bytes, skip_ws(bytes, after_first + 1));
+        if second.is_empty() {
+            return Err(Error::new(ERR_PARSE_ERROR, "missing sequence name"));
+        }
+        Ok((Some(first), second, after_second))
+    } else {
+        Ok((None, first, after_first))
+    }
+}
+
+fn parse_sequence_option_tail(bytes: &[u8], mut i: usize) -> Result<(SequenceOptionSet, usize)> {
+    let mut options = SequenceOptionSet::default();
+    loop {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b';' {
+            break;
+        }
+        if keyword_at(bytes, i, "INCREMENT") {
+            let mut j = skip_ws(bytes, i + "INCREMENT".len());
+            if keyword_at(bytes, j, "BY") {
+                j = skip_ws(bytes, j + "BY".len());
+            }
+            let (num, next) = read_signed_number(bytes, j)?;
+            options.increment = Some(num);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "MINVALUE") {
+            let j = skip_ws(bytes, i + "MINVALUE".len());
+            let (num, next) = read_signed_number(bytes, j)?;
+            options.min_value = Some(num);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "MAXVALUE") {
+            let j = skip_ws(bytes, i + "MAXVALUE".len());
+            let (num, next) = read_signed_number(bytes, j)?;
+            options.max_value = Some(num);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "START") {
+            let mut j = skip_ws(bytes, i + "START".len());
+            if keyword_at(bytes, j, "WITH") {
+                j = skip_ws(bytes, j + "WITH".len());
+            }
+            let (num, next) = read_signed_number(bytes, j)?;
+            options.start = Some(num);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "CACHE") {
+            let j = skip_ws(bytes, i + "CACHE".len());
+            let (num, next) = read_signed_number(bytes, j)?;
+            options.cache = Some(num);
+            i = next;
+            continue;
+        }
+        if keyword_at(bytes, i, "NOCACHE") || keyword_at(bytes, i, "NO") {
+            if keyword_at(bytes, i, "NOCACHE") {
+                options.no_cache = true;
+                i = skip_ws(bytes, i + "NOCACHE".len());
+                continue;
+            }
+            let after_no = skip_ws(bytes, i + "NO".len());
+            if keyword_at(bytes, after_no, "MINVALUE") {
+                options.no_min = true;
+                i = skip_ws(bytes, after_no + "MINVALUE".len());
+                continue;
+            }
+            if keyword_at(bytes, after_no, "MAXVALUE") {
+                options.no_max = true;
+                i = skip_ws(bytes, after_no + "MAXVALUE".len());
+                continue;
+            }
+            if keyword_at(bytes, after_no, "CACHE") {
+                options.no_cache = true;
+                i = skip_ws(bytes, after_no + "CACHE".len());
+                continue;
+            }
+            if keyword_at(bytes, after_no, "CYCLE") {
+                options.cycle = Some(false);
+                i = skip_ws(bytes, after_no + "CYCLE".len());
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "CYCLE") {
+            options.cycle = Some(true);
+            i = skip_ws(bytes, i + "CYCLE".len());
+            continue;
+        }
+        if keyword_at(bytes, i, "NOCYCLE") {
+            options.cycle = Some(false);
+            i = skip_ws(bytes, i + "NOCYCLE".len());
+            continue;
+        }
+        if keyword_at(bytes, i, "RESTART") {
+            let mut j = skip_ws(bytes, i + "RESTART".len());
+            if keyword_at(bytes, j, "WITH") {
+                j = skip_ws(bytes, j + "WITH".len());
+                let (num, next) = read_signed_number(bytes, j)?;
+                options.start = Some(num);
+                i = next;
+                continue;
+            }
+            // RESTART without WITH → restart at original start; encode as start=None sentinel via cache=-1? Use start Some with special: leave start unset and set increment None; handle in DDL as restart_to_start flag.
+            // Encode RESTART as no_cache=false + start = i64::MIN sentinel? Cleaner: use min_value Option and a dedicated field.
+            // For MVB: RESTART alone sets start to current SequenceInfo.start via options.start = None and cycle=None and a comment in options — use cache = Some(0) as restart marker? Ugly.
+            // Use options.start = Some(i64::MIN) as RESTART-without-value sentinel.
+            options.start = Some(i64::MIN);
+            i = j;
+            continue;
+        }
+        break;
+    }
+    Ok((options, i))
+}
+
+fn read_signed_number(bytes: &[u8], start: usize) -> Result<(i64, usize)> {
+    let mut i = skip_ws(bytes, start);
+    let neg = if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+        true
+    } else if i < bytes.len() && bytes[i] == b'+' {
+        i += 1;
+        false
+    } else {
+        false
+    };
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return Err(Error::new(ERR_PARSE_ERROR, "expected sequence number"));
+    }
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    let raw = std::str::from_utf8(&bytes[i..j]).map_err(|_| {
+        Error::new(ERR_PARSE_ERROR, "invalid sequence number")
+    })?;
+    let mut value: i64 = raw
+        .parse()
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid sequence number {raw}")))?;
+    if neg {
+        value = -value;
+    }
+    Ok((value, j))
 }
 
 fn lower_create_view(create: &CreateView) -> Result<Statement> {

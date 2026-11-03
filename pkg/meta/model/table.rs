@@ -8,6 +8,83 @@ use serde::{Deserialize, Serialize};
 
 pub const CURR_LATEST_TABLE_INFO_VERSION: u16 = 5;
 
+/// TiDB `model.SequenceInfo`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SequenceInfo {
+    pub start: i64,
+    pub cache: bool,
+    pub cycle: bool,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub increment: i64,
+    pub cache_value: i64,
+    #[serde(default)]
+    pub comment: String,
+    /// Next value to return from NEXTVAL (base + offset style).
+    #[serde(default)]
+    pub next_value: i64,
+}
+
+impl Default for SequenceInfo {
+    fn default() -> Self {
+        Self {
+            start: 1,
+            cache: true,
+            cycle: false,
+            min_value: 1,
+            max_value: 9223372036854775806,
+            increment: 1,
+            cache_value: 1000,
+            comment: String::new(),
+            next_value: 1,
+        }
+    }
+}
+
+impl SequenceInfo {
+    pub fn with_defaults_for_increment(increment: i64) -> Self {
+        let mut info = Self::default();
+        info.increment = if increment == 0 { 1 } else { increment };
+        if info.increment > 0 {
+            info.min_value = 1;
+            info.max_value = 9223372036854775806;
+            info.start = 1;
+        } else {
+            info.min_value = -9223372036854775807;
+            info.max_value = -1;
+            info.start = -1;
+        }
+        info.next_value = info.start;
+        info
+    }
+
+    /// Allocate and return the next sequence value.
+    pub fn next_val(&mut self) -> Result<i64, String> {
+        let cur = self.next_value;
+        if self.increment > 0 {
+            if cur > self.max_value {
+                if self.cycle {
+                    self.next_value = self.min_value;
+                    let out = self.next_value;
+                    self.next_value = self.next_value.saturating_add(self.increment);
+                    return Ok(out);
+                }
+                return Err("Sequence has run out".to_string());
+            }
+        } else if cur < self.min_value {
+            if self.cycle {
+                self.next_value = self.max_value;
+                let out = self.next_value;
+                self.next_value = self.next_value.saturating_add(self.increment);
+                return Ok(out);
+            }
+            return Err("Sequence has run out".to_string());
+        }
+        self.next_value = cur.saturating_add(self.increment);
+        Ok(cur)
+    }
+}
+
 /// TiDB `model.ViewInfo` — metadata for a VIEW (select text + security attrs).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewInfo {
@@ -58,6 +135,8 @@ pub struct TableInfo {
     pub partition: Option<PartitionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<SequenceInfo>,
 }
 
 impl TableInfo {
@@ -77,11 +156,16 @@ impl TableInfo {
             max_idx_id: 0,
             partition: None,
             view: None,
+            sequence: None,
         }
     }
 
     pub fn is_view(&self) -> bool {
         self.view.is_some()
+    }
+
+    pub fn is_sequence(&self) -> bool {
+        self.sequence.is_some()
     }
 
     pub fn find_index_covering(&self, column: &str) -> Option<&IndexInfo> {

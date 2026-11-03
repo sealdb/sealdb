@@ -1,6 +1,7 @@
 use super::ddl::{
-    AlterDatabaseStmt, AlterTableStmt, CreateDatabaseStmt, CreateIndexStmt, CreateTableStmt,
-    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, TruncateTableStmt,
+    AlterDatabaseStmt, AlterSequenceStmt, AlterTableStmt, CreateDatabaseStmt, CreateIndexStmt,
+    CreateSequenceStmt, CreateTableStmt, CreateViewStmt, DropDatabaseStmt, DropIndexStmt,
+    DropSequenceStmt, DropTableStmt, TruncateTableStmt,
 };
 use super::dml::{DeleteStmt, InsertStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
@@ -32,6 +33,9 @@ pub enum Statement {
     AlterDatabase(AlterDatabaseStmt),
     CreateTable(CreateTableStmt),
     CreateView(CreateViewStmt),
+    CreateSequence(CreateSequenceStmt),
+    DropSequence(DropSequenceStmt),
+    AlterSequence(AlterSequenceStmt),
     DropTable(DropTableStmt),
     TruncateTable(TruncateTableStmt),
     CreateIndex(CreateIndexStmt),
@@ -90,6 +94,9 @@ impl Node for Statement {
             Statement::AlterDatabase(s) => s.restore(ctx),
             Statement::CreateTable(s) => s.restore(ctx),
             Statement::CreateView(s) => s.restore(ctx),
+            Statement::CreateSequence(s) => s.restore(ctx),
+            Statement::DropSequence(s) => s.restore(ctx),
+            Statement::AlterSequence(s) => s.restore(ctx),
             Statement::DropTable(s) => s.restore(ctx),
             Statement::TruncateTable(s) => s.restore(ctx),
             Statement::CreateIndex(s) => s.restore(ctx),
@@ -150,6 +157,9 @@ impl StmtNode for Statement {
             Statement::AlterDatabase(_) => "AlterDatabaseStmt",
             Statement::CreateTable(_) => "CreateTableStmt",
             Statement::CreateView(_) => "CreateViewStmt",
+            Statement::CreateSequence(_) => "CreateSequenceStmt",
+            Statement::DropSequence(_) => "DropSequenceStmt",
+            Statement::AlterSequence(_) => "AlterSequenceStmt",
             Statement::DropTable(_) => "DropTableStmt",
             Statement::TruncateTable(_) => "TruncateTableStmt",
             Statement::CreateIndex(_) => "CreateIndexStmt",

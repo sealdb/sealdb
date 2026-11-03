@@ -126,6 +126,15 @@ impl PlanBuilder {
             Statement::CreateView(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateView,
             }),
+            Statement::CreateSequence(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::CreateSequence,
+            }),
+            Statement::DropSequence(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::DropSequence,
+            }),
+            Statement::AlterSequence(_) => Ok(PhysicalPlan::DDL {
+                kind: DdlKind::AlterSequence,
+            }),
             Statement::DropTable(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::DropTable,
             }),

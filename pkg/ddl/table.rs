@@ -84,6 +84,12 @@ pub fn drop_table(
                         format!("'{schema}.{table}' is not BASE TABLE"),
                     ));
                 }
+                if !stmt.is_view && tbl.is_sequence() {
+                    return Err(Error::new(
+                        ERR_WRONG_OBJECT,
+                        format!("'{schema}.{table}' is not BASE TABLE"),
+                    ));
+                }
                 meta.drop_table_or_view(db.id, tbl.id)?;
                 meta.gen_schema_version()?;
             }
