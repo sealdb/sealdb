@@ -45,6 +45,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_UNKNOWN_COLLATION => "ErrUnknownCollation",
         errcode::ERR_WRONG_OBJECT => "ErrWrongObject",
         errcode::ERR_VIEW_CHECK_FAILED => "ErrViewCheckFailed",
+        errcode::ERR_VIEW_INVALID => "ErrViewInvalid",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         _ => "ErrUnknown",
     }

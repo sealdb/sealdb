@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C tipb DAG encode + CopTask；下一步 Cop RPC / TEMPTABLE / 包对齐）
+> 最后更新：2026-11-03（C6 VIEW ALGORITHM=TEMPTABLE；下一步 Cop RPC / 包对齐）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: C6 VIEW `ALGORITHM=TEMPTABLE`
+- **完成**:
+  - SELECT 展开为 `AS MATERIALIZED` CTE；`MERGE` → `NOT MATERIALIZED`
+  - TEMPTABLE + WITH CHECK OPTION → 1471；TEMPTABLE VIEW 不可 UPDATE/DELETE
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib test_view_algorithm_temptable`
+- **下一步**:
+  - Coprocessor RPC 发送；算层包文件对齐；cascades / BRIE 深化
 
 ### 2026-11-03
 

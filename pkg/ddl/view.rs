@@ -1,6 +1,8 @@
 use crate::create_table::{build_table_info, columns_from_select};
 use crate::table::resolve_name;
-use sealdb_errno::{ERR_BAD_DB, ERR_TABLE_EXISTS, ERR_WRONG_OBJECT, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_DB, ERR_TABLE_EXISTS, ERR_VIEW_INVALID, ERR_WRONG_OBJECT, Error, Result,
+};
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{Mutator, TableInfo, ViewInfo};
 use sealdb_parser::ast::{CreateTableStmt, CreateViewStmt};
@@ -32,6 +34,19 @@ pub fn create_view(
                 format!("Table '{name}' already exists"),
             ));
         }
+    }
+    let check = stmt.check_option.trim();
+    if stmt.algorithm.eq_ignore_ascii_case("TEMPTABLE")
+        && !check.is_empty()
+        && !check.eq_ignore_ascii_case("NONE")
+    {
+        return Err(Error::new(
+            ERR_VIEW_INVALID,
+            format!(
+                "VIEW '{}' WITH CHECK OPTION is invalid for ALGORITHM=TEMPTABLE",
+                name
+            ),
+        ));
     }
     let table_id = meta.gen_global_id()?;
     let mut cols = columns_from_select(is, &stmt.select, current_db)?;
