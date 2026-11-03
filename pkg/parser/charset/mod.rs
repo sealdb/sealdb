@@ -1,4 +1,4 @@
-//! Session charset / collation names used by C5 SET NAMES.
+//! Session charset / collation names used by SET NAMES.
 //! Completeness wave: GBK / latin1 encode-decode MVB + collation dispatch.
 
 pub mod encoding_gbk;

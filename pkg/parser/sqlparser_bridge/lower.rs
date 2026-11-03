@@ -1038,7 +1038,7 @@ fn parse_quoted_or_ident(bytes: &[u8], i: usize) -> Result<(String, usize)> {
 }
 
 fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
-    // F21 gaps: ANALYZE INDEX, PARTITION, columns, NOSCAN, COMPUTE STATISTICS extras.
+    // gaps: ANALYZE INDEX, PARTITION, columns, NOSCAN, COMPUTE STATISTICS extras.
     if analyze.partitions.as_ref().is_some_and(|p| !p.is_empty()) {
         return Err(Error::unsupported("ANALYZE PARTITION"));
     }
@@ -1059,7 +1059,7 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
 }
 
 fn lower_grant(grant: &Grant) -> Result<Statement> {
-    // F20: WITH GRANT OPTION stored on the grant entry. Gaps: IDENTIFIED BY,
+    // WITH GRANT OPTION stored on the grant entry. Gaps: IDENTIFIED BY,
     // column grants.
     if grant.as_grantor.is_some() || grant.granted_by.is_some() || grant.current_grants.is_some() {
         return Err(Error::unsupported("GRANT option"));
@@ -2598,7 +2598,7 @@ fn txn_chars(modes: &[TransactionMode]) -> Result<TxnChars> {
                 isolation = Some(IsolationLevel::RepeatableRead);
             }
             TransactionMode::IsolationLevel(TransactionIsolationLevel::Serializable) => {
-                // C3 MVB: accept SERIALIZABLE; session maps to RR semantics.
+                // MVB: accept SERIALIZABLE; session maps to RR semantics.
                 isolation = Some(IsolationLevel::Serializable);
             }
             TransactionMode::IsolationLevel(other) => {
@@ -2998,7 +2998,7 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
-    // F19: SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
+    // SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
     // rejected under HASH/KEY with ErrSubpartition.
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
@@ -3578,7 +3578,7 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     let Some(with) = with else {
         return Ok(None);
     };
-    // F17 leftover: CTE FROM clause / nested WITH.
+    // CTE FROM clause / nested WITH.
     let mut names = Vec::new();
     let mut ctes = Vec::with_capacity(with.cte_tables.len());
     for cte in &with.cte_tables {
@@ -3732,7 +3732,7 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
             stmt.with = merge_with_ctes(lower_with(query.with.as_ref())?, derived)?;
             Ok(stmt)
         }
-        // F17 leftover: UNION in FROM derived table still uses this path.
+        // UNION in FROM derived table still uses this path.
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
@@ -3991,7 +3991,7 @@ fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpre
 fn lower_group_by(group_by: &GroupByExpr) -> Result<Vec<ExprNode>> {
     match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
-            // F08 gap / completeness wave: ROLLUP / CUBE / GROUPING SETS.
+            // completeness wave: ROLLUP / CUBE / GROUPING SETS.
             if !modifiers.is_empty() {
                 return Err(Error::unsupported("GROUP BY WITH ROLLUP/CUBE"));
             }
@@ -4047,7 +4047,7 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
 
 /// Lower UPDATE, including two-table JOIN. FROM / RETURNING are not in TiDB v8.5.8.
 fn lower_update(update: &Update) -> Result<Statement> {
-    // F07 leftover: two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
+    // two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
     }
@@ -4090,7 +4090,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
 
 /// Lower DELETE, including `DELETE t1 FROM t1 JOIN t2` and `USING`. RETURNING stays rejected.
 fn lower_delete(delete: &Delete) -> Result<Statement> {
-    // F07 leftover: two-table DELETE. TiDB v8.5.8 has no DELETE RETURNING.
+    // two-table DELETE. TiDB v8.5.8 has no DELETE RETURNING.
     if delete.returning.is_some() || delete.output.is_some() {
         return Err(Error::unsupported("DELETE RETURNING"));
     }
@@ -4182,7 +4182,7 @@ fn lower_truncate(truncate: &sqlparser::ast::Truncate) -> Result<Statement> {
 }
 
 fn lower_create_table(create: &CreateTable) -> Result<Statement> {
-    // F02 leftover: LIKE / AS SELECT. TEMPORARY stays deferred (F02 gaps).
+    // LIKE / AS SELECT. TEMPORARY stays deferred ( gaps).
     if create.temporary {
         return Err(Error::unsupported("TEMPORARY CREATE TABLE"));
     }
@@ -5069,7 +5069,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                 if columns.is_empty() {
                     return Err(Error::unsupported("INDEX without columns"));
                 }
-                // F10 gap / completeness wave: prefix length, functional, USING HASH.
+                // completeness wave: prefix length, functional, USING HASH.
                 if idx.index_type.is_some() {
                     return Err(Error::unsupported("INDEX USING type"));
                 }

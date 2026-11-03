@@ -1,4 +1,4 @@
-// F09 core path: left-deep Inner/Left/Right/Semi/Anti HashJoin on equality,
+// core path: left-deep Inner/Left/Right/Semi/Anti HashJoin on equality,
 // plus CROSS JOIN. Semi emits each left row once on match; Anti emits a left
 // row when no match exists. Completeness wave / not this feature: full outer,
 // USING/NATURAL, recursive spill/parallel workers, merge/index join,

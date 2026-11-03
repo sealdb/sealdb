@@ -102,7 +102,7 @@ impl Session {
             .clone()
     }
 
-    /// Privilege manager for MySQL handshake auth (F22).
+    /// Privilege manager for MySQL handshake auth.
     pub fn privilege_manager(&self) -> Arc<sealdb_privilege::Manager> {
         self.domain.privilege()
     }
@@ -143,7 +143,7 @@ impl Session {
         result
     }
 
-    /// Execute every statement in `sql` and return each result (F22 multi-resultset).
+    /// Execute every statement in `sql` and return each result ( multi-resultset).
     pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
         let stmts = self.parser.parse_sql(sql)?;
         if stmts.is_empty() {
@@ -637,7 +637,7 @@ impl Session {
     }
 
     /// Persist in-memory DDL on COMMIT, or restore the pre-DDL snapshot on
-    /// ROLLBACK. CREATE INDEX / ALTER backfill KV is not undone (F18).
+    /// ROLLBACK. CREATE INDEX / ALTER backfill KV is not undone.
     fn apply_pending_schema(&self, commit: bool) -> Result<()> {
         let mut snap = self.schema_snap.lock().expect("session schema snap lock");
         if commit {
@@ -1321,7 +1321,7 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
     Ok(())
 }
 
-/// Domain-shared `SET GLOBAL` for the C5 MVB variable set.
+/// Domain-shared `SET GLOBAL` for the MVB variable set.
 fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
     match name {
         "sql_mode" => {
@@ -1539,7 +1539,7 @@ fn map_isolation(level: AstIsolation) -> IsolationLevel {
     match level {
         AstIsolation::ReadCommitted => IsolationLevel::ReadCommitted,
         AstIsolation::RepeatableRead => IsolationLevel::RepeatableRead,
-        // C3 MVB: SERIALIZABLE accepted; RR snapshot semantics.
+        // MVB: SERIALIZABLE accepted; RR snapshot semantics.
         AstIsolation::Serializable => IsolationLevel::Serializable,
     }
 }

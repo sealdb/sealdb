@@ -1,6 +1,6 @@
 //! Collators — TiDB `pkg/util/collate`.
 //!
-//! C5: `utf8mb4_unicode_ci` Latin/ASCII UCA subset + GBK (`gbk_bin` /
+//! `utf8mb4_unicode_ci` Latin/ASCII UCA subset + GBK (`gbk_bin` /
 //! `gbk_chinese_ci`) / latin1 charset MVB.
 
 // TiDB keeps `collate.go` beside the package; allow `collate::collate` name.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["legacy-rust-scaffold", "tools/spikes/tikv-client"]
+exclude = ["tools/spikes/tikv-client"]
 members = [
     "pkg/parser",
     "pkg/types",

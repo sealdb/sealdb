@@ -1,5 +1,5 @@
-// F07: single-table DELETE (ORDER BY / LIMIT) and two-table DELETE ... JOIN.
-// F13: pessimistic DELETE reads latest and takes exclusive locks.
+// single-table DELETE (ORDER BY / LIMIT) and two-table DELETE ... JOIN.
+// pessimistic DELETE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: n-table DELETE, comma FROM without USING,
 // RETURNING (not in TiDB v8.5.8 / MySQL 8.0), MySQL-protocol affected-row counts.
 use crate::index::delete_index_keys;

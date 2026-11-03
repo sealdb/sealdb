@@ -1,5 +1,5 @@
-/// F17 core: PhysicalCTE (TiDB `LogicalCTE` / `LogicalCTETable`).
-/// F14 derived tables (`FROM (SELECT ...) alias`) flatten into this node.
+/// PhysicalCTE (TiDB `LogicalCTE` / `LogicalCTETable`).
+/// derived tables (`FROM (SELECT ...) alias`) flatten into this node.
 /// WITH RECURSIVE UNION/UNION ALL iterates in CTEExec. `AS NOT MATERIALIZED`
 /// inlines the seed plan. Non-recursive UNION/EXCEPT/INTERSECT is a Union
 /// seed. Shared CTETableReader storage reuses one materialization per

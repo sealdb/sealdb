@@ -1,4 +1,4 @@
-// F05 leftover: parallel sort workers (TiDB pkg/executor/sortexec/parallel_sort_worker.go).
+// parallel sort workers (TiDB pkg/executor/sortexec/parallel_sort_worker.go).
 // Completeness wave / not this feature: chunk-channel fetcher, parallel spill helper.
 use crate::sortexec::sort::compare_rows;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};

@@ -1,4 +1,4 @@
-// F06 leftover: BatchPointGet (TiDB pkg/executor/batch_point_get.go).
+// BatchPointGet (TiDB pkg/executor/batch_point_get.go).
 // Completeness wave / not this feature: coprocessor batch get, lock wait.
 use crate::internal::exec::Executor;
 use sealdb_domain::Domain;

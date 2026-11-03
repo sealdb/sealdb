@@ -112,7 +112,7 @@ python3 project/scripts/parity_check.py \
 | K8 | Mock stats（Phase 4） | 分阶段 | CBO 精度后置 | Phase 7 替换 |
 | K9 | 暂不移植 `br/`、`dumpling/`、`lightning/`、`tiflash/`、`tispark/` | 非计算层主链路 | 目录占位 | n/a |
 | K10 | 源码不含来源标记 | 用户要求 | 追溯依赖 manifest | `status.json` |
-| K11 | `legacy-rust-scaffold/` | 归档旧代码 | 不参与构建 | ADR-0007 |
+| K11 | （已删除）旧脚手架 | 丢弃旧代码 | 不参与构建 | ADR-0007 |
 | K12 | `pkg/parser/mysql/const.rs` 模块名为 `r#const` | `const` 是 Rust 关键字 | 文件名仍是 `const.rs` | 允许；`pub use r#const::*` |
 | K13 | `foo/foo.rs` 触发 `module_inception` | 对齐 `foo/foo.go` | 模块路径多一层 | 允许 clippy；禁止并进 `mod.rs` |
 

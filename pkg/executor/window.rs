@@ -1,4 +1,4 @@
-// F16 core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
+// core path: WindowExec for ROW_NUMBER/RANK/DENSE_RANK and
 // COUNT/SUM/AVG/MIN/MAX OVER (PARTITION BY ... ORDER BY ... [frame]).
 // Pipelined window: emit one chunk per partition when all windows share
 // the same PARTITION BY (TiDB pipelined window shape).

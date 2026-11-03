@@ -1,4 +1,4 @@
-// F18 core: CREATE/DROP INDEX schema + UNIQUE INDEX uniqueness + in-place backfill.
+// CREATE/DROP INDEX schema + UNIQUE INDEX uniqueness + in-place backfill.
 // ALGORITHM/LOCK on CREATE INDEX are accepted and ignored.
 // Completeness wave / not this feature: async job queue, concurrent ingest,
 // invisible.

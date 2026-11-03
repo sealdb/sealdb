@@ -1,4 +1,4 @@
-// F19 core: build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS
+// build PartitionInfo for RANGE / HASH / LIST / KEY / RANGE COLUMNS
 // and scalar expression keys (`id % 4`, `ABS(id)`), plus ADD/DROP PARTITION.
 // SUBPARTITION BY under RANGE/LIST is accepted then stripped (TiDB parity);
 // under HASH/KEY it is rejected. Completeness wave: reorganize, job states.

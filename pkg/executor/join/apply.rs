@@ -1,4 +1,4 @@
-// F14 core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
+// core path: NestedLoopApplyExec for EXISTS / IN / scalar / ANY/ALL.
 // Parallel apply: SEALDB_APPLY_CONCURRENCY workers (default 1). Subquery
 // bodies are ResultSetNode so UNION/EXCEPT/INTERSECT run through UnionExec.
 // Completeness wave / not this feature: subquery JOIN. Derived tables

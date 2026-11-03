@@ -1,4 +1,4 @@
-/// F20: in-memory privilege Manager (TiDB `pkg/privilege/privilege.go`).
+/// in-memory privilege Manager (TiDB `pkg/privilege/privilege.go`).
 /// Roles: CREATE/DROP ROLE, GRANT/REVOKE role, SET ROLE, and active-role
 /// privilege checks. Grant state persists to Storage under `mprivilege`
 /// (mysql.user / mysql.db / mysql.tables_priv equivalent for SealDB).
@@ -212,7 +212,7 @@ impl Manager {
         Ok(())
     }
 
-    /// `RENAME USER old TO new` — move auth + grants under the new identity (F20).
+    /// `RENAME USER old TO new` — move auth + grants under the new identity.
     pub fn rename_user(&self, stmt: &RenameUserStmt) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
         for pair in &stmt.user_to_users {
@@ -263,7 +263,7 @@ impl Manager {
         Ok(())
     }
 
-    /// `SET PASSWORD` — update auth string (mysql_native_password plugin, F22).
+    /// `SET PASSWORD` — update auth string (mysql_native_password plugin, ).
     /// Stores the password the same way as `CREATE USER … IDENTIFIED BY`.
     pub fn set_password(&self, stmt: &SetPwdStmt, current: &UserIdentity) -> Result<()> {
         let target = stmt.user.clone().unwrap_or_else(|| current.clone());
@@ -751,7 +751,7 @@ fn user_key(user: &UserIdentity) -> (String, String) {
     )
 }
 
-/// mysql_native_password-style auth string used by F22 handshake.
+/// mysql_native_password-style auth string used by handshake.
 /// Already-hashed values (`*…`) are kept; otherwise store the plaintext
 /// (same shape as `CREATE USER … IDENTIFIED BY`, verified by plugin name).
 fn encode_native_password(password: &str) -> String {

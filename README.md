@@ -4,7 +4,7 @@ SealDB is a Rust implementation of a TiDB-compatible SQL compute layer. It keeps
 
 ## Status
 
-**Unlock + F01.** The workspace compiles, codec vectors and `SELECT 1` work, and the feature-granularity backlog lives in `project/features.md`. Later SQL features stay `not-started` until their core path is ported. The legacy Rust scaffold remains under `legacy-rust-scaffold/` and is not part of the build.
+The workspace compiles, codec vectors and `SELECT 1` work, and the feature backlog lives in `project/features.md`. Core SQL paths are ported; deferred optional work is noted there and in `project/progress.md`.
 
 ## Unified baseline
 
@@ -27,7 +27,6 @@ pkg/                    compute-layer crates (top-level package granularity)
 tools/oracle/           Go oracle for AST/plan/result comparison
 tests/                  Rust integration and conformance tests (to be populated)
 project/                requirements, architecture, roadmap, progress, ADRs, skills
-legacy-rust-scaffold/   archived pre-rewrite code (not built)
 docker/                 local PD/TiKV environment
 monitoring/             Prometheus/Grafana assets
 config/                 configuration templates

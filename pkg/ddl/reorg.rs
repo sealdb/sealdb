@@ -1,4 +1,4 @@
-// F18 leftover: TiDB `pkg/ddl/reorg.go` schema-state walk for ADD INDEX.
+// TiDB `pkg/ddl/reorg.go` schema-state walk for ADD INDEX.
 // Sync owner still applies states in-process; coprocessor workers /
 // concurrent ingest stay deferred.
 use sealdb_meta::{

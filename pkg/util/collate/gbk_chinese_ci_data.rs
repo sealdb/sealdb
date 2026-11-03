@@ -2,7 +2,7 @@
 //!
 //! Full table is `[0xFFFF+1]uint16` (~64K entries). This MVB keeps ASCII
 //! (with A–Z / a–z case folding) plus the Chinese characters exercised by
-//! C5 tests. Uncovered BMP runes fall back to `0x3F` (`?`), matching TiDB
+//! tests. Uncovered BMP runes fall back to `0x3F` (`?`), matching TiDB
 //! for out-of-range / missing entries used in tests.
 
 /// `(rune, sort_key)` pairs from TiDB `gbkChineseCISortKeyTable`.
@@ -94,7 +94,7 @@ pub static SORT_KEY_SUBSET: &[(char, u16)] = &[
     ('x', 0x58),
     ('y', 0x59),
     ('z', 0x5a),
-    // Chinese subset used by C5 gbk-latin1 tests.
+    // Chinese subset used by gbk-latin1 tests.
     ('一', 0xca26),
     ('中', 0xd321),
     ('二', 0x923b),

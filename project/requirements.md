@@ -240,7 +240,7 @@ pkg/parser/types      parser 用的类型
 
 | ID | 问题 | 决策 |
 |---|---|---|
-| Q1 | 旧 `src/` 处置 | 移到 `legacy-rust-scaffold/`，不参与构建；保留 `docker/`/`monitoring/`/`config/` |
+| Q1 | 旧 `src/` 处置 | 曾归档为 `legacy-rust-scaffold/`，现已删除；保留 `docker/`/`monitoring/`/`config/` |
 | Q2 | 工程粒度 | workspace，按 TiDB **顶层包粒度**拆 crate；子包为模块 |
 | Q3 | Rust 版本 | **Rust 1.99.1 / edition 2024**（已通过 rsproxy 安装） |
 | Q4 | PD/TiKV 版本 | 统一到 **v8.5.8**；本地 9.0 beta 仅冒烟 |

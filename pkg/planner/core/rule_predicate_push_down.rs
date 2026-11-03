@@ -1,4 +1,4 @@
-/// F04 leftover: predicate pushdown (TiDB `rule_predicate_push_down.go`).
+/// predicate pushdown (TiDB `rule_predicate_push_down.go`).
 /// CNF conjuncts without subqueries attach to TableReader / IndexLookUp /
 /// IndexReader (coprocessor-filter analog). Join-local predicates push to each side;
 /// outer-join inner-side filters stay residual. Completeness wave: TiKV
