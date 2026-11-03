@@ -18,15 +18,7 @@ Do not claim leftover pass rates until a later wave marks a subset `ported`.
 These kinds stay `unmapped` on purpose (not claimed by F*/C2–C5, not C6).
 C1 `--check` requires open `unmapped` stmts to equal this set.
 
-- `AlterInstanceStmt`
-- `BinlogStmt`
-- `ChangeStmt`
-- `CleanupTableLockStmt`
-- `KillStmt`
-- `LockTablesStmt`
-- `OptimizeTableStmt`
-- `RenameUserStmt`
-- `RepairTableStmt`
+- none
 
 ## PlanBuilder statement kinds still open
 
@@ -37,19 +29,14 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.LockStatsStmt` → C6
 - `ast.UnlockStatsStmt` → C6
 - `ast.PlanReplayerStmt` → C6
-- `ast.BinlogStmt` → unmapped
-- `ast.ChangeStmt` → unmapped
 - `ast.SplitRegionStmt` → C6
 - `ast.DistributeTableStmt` → C6
 - `ast.CompactTableStmt` → C6
 - `ast.RecommendIndexStmt` → C6
-- `ast.AlterInstanceStmt` → unmapped
-- `ast.RenameUserStmt` → unmapped
 - `ast.BRIEStmt` → C6
 - `ast.CalibrateResourceStmt` → C6
 - `ast.AddQueryWatchStmt` → C6
 - `ast.DropQueryWatchStmt` → C6
-- `ast.KillStmt` → unmapped
 - `ast.SetResourceGroupStmt` → C6
 - `ast.AlterSequenceStmt` → C6
 - `ast.CreateViewStmt` → C6
@@ -59,12 +46,8 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.FlashBackTableStmt` → C6
 - `ast.FlashBackDatabaseStmt` → C6
 - `ast.FlashBackToTimestampStmt` → C6
-- `ast.LockTablesStmt` → unmapped
-- `ast.CleanupTableLockStmt` → unmapped
-- `ast.RepairTableStmt` → unmapped
 - `ast.DropPlacementPolicyStmt` → C6
 - `ast.CreateResourceGroupStmt` → C6
-- `ast.OptimizeTableStmt` → unmapped
 
 ## integrationtest leftover suites
 

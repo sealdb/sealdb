@@ -36,17 +36,7 @@
   ],
   "feature_gaps": {},
   "completeness_gaps": {},
-  "unmapped_allowlist": [
-    "AlterInstanceStmt",
-    "BinlogStmt",
-    "ChangeStmt",
-    "CleanupTableLockStmt",
-    "KillStmt",
-    "LockTablesStmt",
-    "OptimizeTableStmt",
-    "RenameUserStmt",
-    "RepairTableStmt"
-  ],
+  "unmapped_allowlist": [],
   "open_stmts": [
     {
       "stmt": "ast.TraceStmt",
@@ -77,14 +67,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.BinlogStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.ChangeStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.SplitRegionStmt",
       "owner": "C6"
     },
@@ -101,14 +83,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.AlterInstanceStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.RenameUserStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.BRIEStmt",
       "owner": "C6"
     },
@@ -123,10 +97,6 @@
     {
       "stmt": "ast.DropQueryWatchStmt",
       "owner": "C6"
-    },
-    {
-      "stmt": "ast.KillStmt",
-      "owner": "unmapped"
     },
     {
       "stmt": "ast.SetResourceGroupStmt",
@@ -165,28 +135,12 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.LockTablesStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.CleanupTableLockStmt",
-      "owner": "unmapped"
-    },
-    {
-      "stmt": "ast.RepairTableStmt",
-      "owner": "unmapped"
-    },
-    {
       "stmt": "ast.DropPlacementPolicyStmt",
       "owner": "C6"
     },
     {
       "stmt": "ast.CreateResourceGroupStmt",
       "owner": "C6"
-    },
-    {
-      "stmt": "ast.OptimizeTableStmt",
-      "owner": "unmapped"
     }
   ],
   "suites": [

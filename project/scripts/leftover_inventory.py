@@ -24,19 +24,28 @@ FEATURE_HINTS = {
     "SetPwdStmt": "F20",
     "FlushStmt": "F20",
     "ShutdownStmt": "F22",
+    "KillStmt": "F22",
+    "BinlogStmt": "F22",
+    "ChangeStmt": "F22",
+    "AlterInstanceStmt": "F22",
     "AlterTableStmt": "F18",
     "CreateIndexStmt": "F18",
     "DropIndexStmt": "F18",
     "RenameTableStmt": "F18",
     "AdminStmt": "F18",
+    "RepairTableStmt": "F18",
     "ShowStmt": "F11",
     "UseStmt": "F11",
     "GrantStmt": "F20",
     "RevokeStmt": "F20",
     "DropUserStmt": "F20",
+    "RenameUserStmt": "F20",
     "GrantRoleStmt": "F20",
     "RevokeRoleStmt": "F20",
     "AnalyzeTableStmt": "F21",
+    "OptimizeTableStmt": "F21",
+    "LockTablesStmt": "F12",
+    "CleanupTableLockStmt": "F12",
     "BeginStmt": "F12",
     "CommitStmt": "F12",
     "RollbackStmt": "F12",
@@ -81,19 +90,8 @@ FEATURE_HINTS = {
 
 # Frozen allowlist: PlanBuilder kinds intentionally left `unmapped` (not C6 and
 # not owned by a closed F*/C2–C5 wave). C1 verifies open unmapped == this set.
-UNMAPPED_ALLOWLIST = frozenset(
-    {
-        "BinlogStmt",
-        "ChangeStmt",
-        "AlterInstanceStmt",
-        "RenameUserStmt",
-        "KillStmt",
-        "LockTablesStmt",
-        "CleanupTableLockStmt",
-        "RepairTableStmt",
-        "OptimizeTableStmt",
-    }
-)
+# Empty when every non-C6 PlanBuilder kind is owned by a closed F*/C2–C5 wave.
+UNMAPPED_ALLOWLIST: frozenset[str] = frozenset()
 
 SUITE_HINTS = {
     "access_path_selection": "C2",
@@ -293,8 +291,14 @@ def render_markdown(inv: dict) -> str:
             "",
         ]
     )
-    for name in inv.get("unmapped_allowlist") or sorted(UNMAPPED_ALLOWLIST):
-        lines.append(f"- `{name}`")
+    allow_names = inv["unmapped_allowlist"] if "unmapped_allowlist" in inv else sorted(
+        UNMAPPED_ALLOWLIST
+    )
+    if allow_names:
+        for name in allow_names:
+            lines.append(f"- `{name}`")
+    else:
+        lines.append("- none")
     lines.extend(["", "## PlanBuilder statement kinds still open", ""])
     if inv["open_stmts"]:
         for item in inv["open_stmts"]:
@@ -342,7 +346,11 @@ def check_unmapped_allowlist(inv: dict) -> list[str]:
         for item in inv["open_stmts"]
         if item.get("owner") == "unmapped"
     }
-    allow = set(inv.get("unmapped_allowlist") or UNMAPPED_ALLOWLIST)
+    # Empty list is a valid terminal allowlist (all non-C6 stmts owned).
+    if "unmapped_allowlist" in inv:
+        allow = set(inv["unmapped_allowlist"])
+    else:
+        allow = set(UNMAPPED_ALLOWLIST)
     unexpected = sorted(open_unmapped - allow)
     missing = sorted(allow - open_unmapped)
     if unexpected:

@@ -869,3 +869,204 @@ impl ShutdownStmt {
         Ok(())
     }
 }
+
+/// `KILL [CONNECTION|QUERY] id` (TiDB `KillStmt`).
+#[derive(Clone, Debug)]
+pub struct KillStmt {
+    pub query: bool,
+    pub connection_id: u64,
+}
+
+impl KillStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("KILL ");
+        if self.query {
+            ctx.write_str("QUERY ");
+        } else {
+            ctx.write_str("CONNECTION ");
+        }
+        ctx.write_str(&self.connection_id.to_string());
+        Ok(())
+    }
+}
+
+/// Lock mode for `LOCK TABLES` (TiDB `TableLock` / READ|WRITE).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableLockType {
+    Read,
+    Write,
+}
+
+/// One entry in `LOCK TABLES t READ|WRITE`.
+#[derive(Clone, Debug)]
+pub struct TableLockItem {
+    pub table: TableName,
+    pub lock_type: TableLockType,
+}
+
+/// `LOCK TABLES t READ|WRITE[, …]` (TiDB `LockTablesStmt`).
+#[derive(Clone, Debug)]
+pub struct LockTablesStmt {
+    pub table_locks: Vec<TableLockItem>,
+}
+
+impl LockTablesStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("LOCK TABLES ");
+        for (i, item) in self.table_locks.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            item.table.restore(ctx)?;
+            match item.lock_type {
+                TableLockType::Read => ctx.write_str(" READ"),
+                TableLockType::Write => ctx.write_str(" WRITE"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `UNLOCK TABLES` / `ADMIN CLEANUP TABLE LOCK` (TiDB `CleanupTableLockStmt`).
+#[derive(Clone, Debug)]
+pub struct CleanupTableLockStmt {
+    /// Empty = unlock every table held by the current session (`UNLOCK TABLES`).
+    pub tables: Vec<TableName>,
+}
+
+impl CleanupTableLockStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if self.tables.is_empty() {
+            ctx.write_str("UNLOCK TABLES");
+            return Ok(());
+        }
+        ctx.write_str("ADMIN CLEANUP TABLE LOCK ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// `OPTIMIZE TABLE t[, …]` (TiDB `OptimizeTableStmt`) — MVB status-row no-op.
+#[derive(Clone, Debug)]
+pub struct OptimizeTableStmt {
+    pub tables: Vec<TableName>,
+}
+
+impl OptimizeTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("OPTIMIZE TABLE ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// `REPAIR TABLE t[, …]` MySQL-style status rows (mapped to TiDB `RepairTableStmt`).
+#[derive(Clone, Debug)]
+pub struct RepairTableStmt {
+    pub tables: Vec<TableName>,
+}
+
+impl RepairTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("REPAIR TABLE ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// One `old TO new` pair in `RENAME USER`.
+#[derive(Clone, Debug)]
+pub struct UserToUser {
+    pub old_user: UserIdentity,
+    pub new_user: UserIdentity,
+}
+
+/// `RENAME USER 'u'@'%' TO 'v'@'%'` (TiDB `RenameUserStmt`).
+#[derive(Clone, Debug)]
+pub struct RenameUserStmt {
+    pub user_to_users: Vec<UserToUser>,
+}
+
+impl RenameUserStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("RENAME USER ");
+        for (i, pair) in self.user_to_users.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            pair.old_user.restore(ctx)?;
+            ctx.write_str(" TO ");
+            pair.new_user.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// `BINLOG '…'` (TiDB `BinlogStmt`) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct BinlogStmt {
+    pub payload: String,
+}
+
+impl BinlogStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("BINLOG ");
+        ctx.write_str(&format!("'{}'", self.payload));
+        Ok(())
+    }
+}
+
+/// TiDB `CHANGE PUMP/DRAINER …` (TiDB `ChangeStmt`) — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct ChangeStmt {
+    pub node_type: String,
+    pub state: String,
+    pub node_id: String,
+}
+
+impl ChangeStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CHANGE ");
+        ctx.write_str(&self.node_type);
+        ctx.write_str(" TO NODE_STATE = ");
+        ctx.write_str(&format!("'{}'", self.state));
+        ctx.write_str(" FOR NODE_ID ");
+        ctx.write_str(&format!("'{}'", self.node_id));
+        Ok(())
+    }
+}
+
+/// `ALTER INSTANCE RELOAD TLS` (TiDB `AlterInstanceStmt`) — accepted no-op.
+#[derive(Clone, Debug, Default)]
+pub struct AlterInstanceStmt {
+    pub reload_tls: bool,
+    pub no_rollback_on_error: bool,
+}
+
+impl AlterInstanceStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("ALTER INSTANCE");
+        if self.reload_tls {
+            ctx.write_str(" RELOAD TLS");
+        }
+        if self.no_rollback_on_error {
+            ctx.write_str(" NO ROLLBACK ON ERROR");
+        }
+        Ok(())
+    }
+}

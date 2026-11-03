@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（Do/SetPwd/Flush/Shutdown/AlterDatabase：从 UNMAPPED_ALLOWLIST 摘出 → F01/F20/F22/F02）  
+> 最后更新：2026-11-03（Kill/Lock/Optimize/RenameUser/Repair/Binlog/Change/AlterInstance：UNMAPPED_ALLOWLIST 清空）  
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,24 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-03
+
+- **Phase**: leftover allowlist shrink（Kill/Lock/Optimize/RenameUser/Repair/Binlog/Change/AlterInstance）
+- **完成**:
+  - `KillStmt`：`KILL [CONNECTION|QUERY] id` + Domain connection registry（F22）
+  - `LockTablesStmt` / `CleanupTableLockStmt`：`LOCK TABLES` / `UNLOCK TABLES` + in-memory table locks（F12）
+  - `OptimizeTableStmt`：`OPTIMIZE TABLE` status-row OK no-op（F21）
+  - `RepairTableStmt`：`REPAIR TABLE` status-row OK no-op（F18）
+  - `RenameUserStmt`：privilege manager rename（F20）
+  - `BinlogStmt` / `ChangeStmt` / `AlterInstanceStmt`：accepted OK no-op（F22）
+  - `UNMAPPED_ALLOWLIST = frozenset()`；`--check` 允许空 allowlist 当 `open_unmapped` 为空
+- **验证**:
+  - `cargo test -q -p sealdb-parser --lib parse_allowlist_misc_kill_lock`
+  - `cargo test -q -p sealdb-session --lib allowlist_kill_lock_optimize`
+  - `./project/scripts/feature_gate.sh C1`
+- **下一步**:
+  - C6 仍 deferred；open_stmts 仅剩 C6-owned kinds
 
 ### 2026-11-03
 

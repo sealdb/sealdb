@@ -85,6 +85,14 @@ impl Executor for GrantExec {
             Statement::Shutdown(_) => {
                 self.domain.request_shutdown();
             }
+            Statement::RenameUser(rename) => {
+                self.domain.privilege().rename_user(rename)?;
+                persist_priv = true;
+            }
+            Statement::Kill(kill) => {
+                let _ = self.domain.kill_connection(kill.connection_id);
+            }
+            Statement::Binlog(_) | Statement::Change(_) | Statement::AlterInstance(_) => {}
             _ => {}
         }
         // Flush mysql.user-equivalent snapshot after privilege DDL.

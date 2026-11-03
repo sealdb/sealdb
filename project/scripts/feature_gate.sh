@@ -215,6 +215,8 @@ case "$FEATURE" in
     run execute-truncate cargo test -q -p sealdb-session --lib truncate
     run execute-do-flush-setpwd-shutdown-alterdb cargo test -q -p sealdb-session --lib do_flush_setpwd_shutdown_alter
     run execute-parse-allowlist-misc cargo test -q -p sealdb-parser --lib parse_do_flush_setpwd_shutdown_alter
+    run execute-allowlist-kill-lock-optimize-repair-rename cargo test -q -p sealdb-session --lib allowlist_kill_lock_optimize_repair_rename
+    run execute-parse-allowlist-kill-lock-optimize cargo test -q -p sealdb-parser --lib parse_allowlist_misc_kill_lock_optimize
     ;;
   C2)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

@@ -193,6 +193,101 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_allowlist_misc_kill_lock_optimize_repair_rename_binlog_change_alter_instance() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("KILL QUERY 42").unwrap() {
+            crate::ast::Statement::Kill(stmt) => {
+                assert!(stmt.query);
+                assert_eq!(stmt.connection_id, 42);
+            }
+            other => panic!("expected KillStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("LOCK TABLES db1.t READ, t2 WRITE")
+            .unwrap()
+        {
+            crate::ast::Statement::LockTables(stmt) => {
+                assert_eq!(stmt.table_locks.len(), 2);
+                assert_eq!(stmt.table_locks[0].table.schema.as_deref(), Some("db1"));
+                assert!(matches!(
+                    stmt.table_locks[0].lock_type,
+                    crate::ast::TableLockType::Read
+                ));
+                assert!(matches!(
+                    stmt.table_locks[1].lock_type,
+                    crate::ast::TableLockType::Write
+                ));
+            }
+            other => panic!("expected LockTablesStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("UNLOCK TABLES").unwrap() {
+            crate::ast::Statement::CleanupTableLock(stmt) => {
+                assert!(stmt.tables.is_empty());
+            }
+            other => panic!("expected CleanupTableLockStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ADMIN CLEANUP TABLE LOCK db1.t")
+            .unwrap()
+        {
+            crate::ast::Statement::CleanupTableLock(stmt) => {
+                assert_eq!(stmt.tables.len(), 1);
+                assert_eq!(stmt.tables[0].name, "t");
+            }
+            other => panic!("expected CleanupTableLockStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("OPTIMIZE TABLE db1.t").unwrap() {
+            crate::ast::Statement::OptimizeTable(stmt) => {
+                assert_eq!(stmt.tables.len(), 1);
+                assert_eq!(stmt.tables[0].name, "t");
+            }
+            other => panic!("expected OptimizeTableStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("REPAIR TABLE db1.t").unwrap() {
+            crate::ast::Statement::RepairTable(stmt) => {
+                assert_eq!(stmt.tables[0].name, "t");
+            }
+            other => panic!("expected RepairTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("RENAME USER 'u'@'%' TO 'v'@'%'")
+            .unwrap()
+        {
+            crate::ast::Statement::RenameUser(stmt) => {
+                assert_eq!(stmt.user_to_users.len(), 1);
+                assert_eq!(stmt.user_to_users[0].old_user.username, "u");
+                assert_eq!(stmt.user_to_users[0].new_user.username, "v");
+            }
+            other => panic!("expected RenameUserStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("BINLOG 'abc'").unwrap() {
+            crate::ast::Statement::Binlog(stmt) => assert_eq!(stmt.payload, "abc"),
+            other => panic!("expected BinlogStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("CHANGE PUMP TO NODE_STATE = 'offline' FOR NODE_ID 'n1'")
+            .unwrap()
+        {
+            crate::ast::Statement::Change(stmt) => {
+                assert_eq!(stmt.node_type.to_ascii_uppercase(), "PUMP");
+                assert_eq!(stmt.state, "offline");
+                assert_eq!(stmt.node_id, "n1");
+            }
+            other => panic!("expected ChangeStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ALTER INSTANCE RELOAD TLS NO ROLLBACK ON ERROR")
+            .unwrap()
+        {
+            crate::ast::Statement::AlterInstance(stmt) => {
+                assert!(stmt.reload_tls);
+                assert!(stmt.no_rollback_on_error);
+            }
+            other => panic!("expected AlterInstanceStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_table_like_as_select() {
         let parser = Parser::new();
         match parser

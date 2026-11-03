@@ -223,6 +223,75 @@ impl Session {
                 self.domain.request_shutdown();
                 return Ok(empty_result());
             }
+            Statement::Kill(kill) => {
+                let _ = self.domain.kill_connection(kill.connection_id);
+                return Ok(empty_result());
+            }
+            Statement::LockTables(lock) => {
+                let current_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                let locks: Vec<(String, bool)> = lock
+                    .table_locks
+                    .iter()
+                    .map(|item| {
+                        let key = mdl_table_key(&item.table, &current_db);
+                        let write =
+                            matches!(item.lock_type, sealdb_parser::ast::TableLockType::Write);
+                        (key, write)
+                    })
+                    .collect();
+                self.domain.lock_tables(self.session_id, &locks)?;
+                return Ok(empty_result());
+            }
+            Statement::CleanupTableLock(cleanup) => {
+                if cleanup.tables.is_empty() {
+                    self.domain.unlock_tables(self.session_id);
+                } else {
+                    let current_db = self
+                        .current_db
+                        .lock()
+                        .expect("session current_db lock")
+                        .clone();
+                    let keys: Vec<String> = cleanup
+                        .tables
+                        .iter()
+                        .map(|t| mdl_table_key(t, &current_db))
+                        .collect();
+                    self.domain.cleanup_table_locks(&keys);
+                }
+                return Ok(empty_result());
+            }
+            Statement::OptimizeTable(optimize) => {
+                let current_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                return Ok(table_status_result(
+                    "optimize",
+                    &optimize.tables,
+                    &current_db,
+                ));
+            }
+            Statement::RepairTable(repair) => {
+                let current_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                return Ok(table_status_result("repair", &repair.tables, &current_db));
+            }
+            Statement::RenameUser(rename) => {
+                self.domain.privilege().rename_user(rename)?;
+                self.domain.persist_privileges()?;
+                return Ok(empty_result());
+            }
+            Statement::Binlog(_) | Statement::Change(_) | Statement::AlterInstance(_) => {
+                return Ok(empty_result());
+            }
             Statement::SetRole(set) => {
                 let user = self.current_user();
                 let roles = self
@@ -620,9 +689,51 @@ impl Session {
             | Statement::RevokeRole(_)
             | Statement::SetPwd(_)
             | Statement::Flush(_)
-            | Statement::Shutdown(_) => {
+            | Statement::Shutdown(_)
+            | Statement::Kill(_)
+            | Statement::RenameUser(_)
+            | Statement::Binlog(_)
+            | Statement::Change(_)
+            | Statement::AlterInstance(_)
+            | Statement::CleanupTableLock(_) => {
                 if !mgr.request_verification_with_roles(&user, &roles, "", "", PrivilegeType::ALL) {
                     return Err(access_denied("", "", PrivilegeType::ALL, &user));
+                }
+            }
+            Statement::LockTables(lock) => {
+                for item in &lock.table_locks {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        &item.table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
+                }
+            }
+            Statement::OptimizeTable(optimize) => {
+                for table in &optimize.tables {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
+                }
+            }
+            Statement::RepairTable(repair) => {
+                for table in &repair.tables {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
                 }
             }
             Statement::Show(show)
@@ -914,6 +1025,34 @@ fn empty_result() -> QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
     }
+}
+
+/// MySQL-style OPTIMIZE/REPAIR TABLE status rows: Table, Op, Msg_type, Msg_text.
+fn table_status_result(op: &str, tables: &[TableName], current_db: &str) -> QueryResult {
+    let columns = vec![
+        "Table".to_string(),
+        "Op".to_string(),
+        "Msg_type".to_string(),
+        "Msg_text".to_string(),
+    ];
+    let rows = tables
+        .iter()
+        .map(|table| {
+            let (schema, name) = table.qualified(current_db);
+            let display = if schema.is_empty() {
+                name
+            } else {
+                format!("{schema}.{name}")
+            };
+            vec![
+                sealdb_types::Datum::Bytes(display.into_bytes()),
+                sealdb_types::Datum::Bytes(op.as_bytes().to_vec()),
+                sealdb_types::Datum::Bytes(b"status".to_vec()),
+                sealdb_types::Datum::Bytes(b"OK".to_vec()),
+            ]
+        })
+        .collect();
+    QueryResult { columns, rows }
 }
 
 /// MySQL/TiDB ONLY_FULL_GROUP_BY: when the mode is set and the query has
@@ -1498,6 +1637,9 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::GrantRole(_)
             | Statement::RevokeRole(_)
             | Statement::SetPwd(_)
+            | Statement::RenameUser(_)
+            | Statement::LockTables(_)
+            | Statement::CleanupTableLock(_)
     )
 }
 
@@ -1505,6 +1647,11 @@ impl Session {
     /// Shared Domain (tests / SHUTDOWN flag).
     pub fn domain(&self) -> Arc<Domain> {
         Arc::clone(&self.domain)
+    }
+
+    /// Domain-local session / connection id (MDL + KILL + LOCK TABLES).
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     /// If a Domain binding matches this statement's restored SQL, re-parse the bind SQL.
@@ -1734,6 +1881,80 @@ mod tests {
             "{:?}",
             create.display_rows()
         );
+    }
+
+    #[test]
+    fn test_allowlist_kill_lock_optimize_repair_rename_binlog_change_alter_instance() {
+        let session = Session::new();
+        // KILL: register a fake id and mark it.
+        session.domain().register_connection(99);
+        assert!(!session.domain().is_connection_killed(99));
+        session.execute_stmt("KILL CONNECTION 99").unwrap();
+        assert!(session.domain().is_connection_killed(99));
+        session.execute_stmt("KILL QUERY 99").unwrap();
+
+        session
+            .execute_stmt(
+                "CREATE DATABASE db1; CREATE TABLE db1.t (id INT); CREATE TABLE db1.t2 (id INT)",
+            )
+            .unwrap();
+        session
+            .execute_stmt("LOCK TABLES db1.t READ, db1.t2 WRITE")
+            .unwrap();
+        let sid = session.session_id();
+        assert!(session.domain().session_holds_table_lock(sid, "db1.t"));
+        assert!(session.domain().session_holds_table_lock(sid, "db1.t2"));
+        session.execute_stmt("UNLOCK TABLES").unwrap();
+        assert!(!session.domain().session_holds_table_lock(sid, "db1.t"));
+
+        session.execute_stmt("LOCK TABLES db1.t WRITE").unwrap();
+        session
+            .execute_stmt("ADMIN CLEANUP TABLE LOCK db1.t")
+            .unwrap();
+        assert!(!session.domain().session_holds_table_lock(sid, "db1.t"));
+
+        let optimize = session.execute_stmt("OPTIMIZE TABLE db1.t").unwrap();
+        assert_eq!(
+            optimize.columns,
+            vec!["Table", "Op", "Msg_type", "Msg_text"]
+        );
+        assert_eq!(
+            optimize.display_rows(),
+            vec![vec![
+                "db1.t".to_string(),
+                "optimize".to_string(),
+                "status".to_string(),
+                "OK".to_string()
+            ]]
+        );
+        let repair = session.execute_stmt("REPAIR TABLE db1.t").unwrap();
+        assert_eq!(repair.display_rows()[0][1], "repair".to_string());
+
+        session
+            .execute_stmt("CREATE USER 'u'@'%' IDENTIFIED BY 'pwd'")
+            .unwrap();
+        session
+            .execute_stmt("RENAME USER 'u'@'%' TO 'v'@'%'")
+            .unwrap();
+        assert_eq!(
+            session
+                .privilege_manager()
+                .auth_string(&sealdb_parser::ast::UserIdentity::new("v", "%"))
+                .as_deref(),
+            Some("pwd")
+        );
+        assert!(
+            session
+                .privilege_manager()
+                .auth_string(&sealdb_parser::ast::UserIdentity::new("u", "%"))
+                .is_none()
+        );
+
+        session.execute_stmt("BINLOG 'deadbeef'").unwrap();
+        session
+            .execute_stmt("CHANGE PUMP TO NODE_STATE = 'offline' FOR NODE_ID 'n1'")
+            .unwrap();
+        session.execute_stmt("ALTER INSTANCE RELOAD TLS").unwrap();
     }
 
     #[test]
