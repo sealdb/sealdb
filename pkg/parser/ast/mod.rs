@@ -11,7 +11,7 @@ pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
     AlterTableSpec, AlterTableStmt, ColumnDef, ColumnPosition, CreateDatabaseStmt, CreateIndexStmt,
     CreateTableStmt, DropDatabaseStmt, DropIndexStmt, DropTableStmt, IndexDef, PartitionDef,
-    PartitionOption, PartitionType, TableName,
+    PartitionOption, PartitionType, TableName, TruncateTableStmt,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,

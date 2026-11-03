@@ -305,6 +305,19 @@ impl DropTableStmt {
     }
 }
 
+/// `TRUNCATE [TABLE] db.t` — empty the table, keep schema (TiDB `TruncateTableStmt`).
+#[derive(Clone, Debug)]
+pub struct TruncateTableStmt {
+    pub table: TableName,
+}
+
+impl TruncateTableStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("TRUNCATE TABLE ");
+        self.table.restore(ctx)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateIndexStmt {
     pub if_not_exists: bool,

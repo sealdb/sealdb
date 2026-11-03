@@ -32,7 +32,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `RepairTableStmt`
 - `SetPwdStmt`
 - `ShutdownStmt`
-- `TruncateTableStmt`
 
 ## PlanBuilder statement kinds still open
 
@@ -66,7 +65,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 - `ast.CreateViewStmt` → C6
 - `ast.CreateSequenceStmt` → C6
 - `ast.DropSequenceStmt` → C6
-- `ast.TruncateTableStmt` → unmapped
 - `ast.RecoverTableStmt` → C6
 - `ast.FlashBackTableStmt` → C6
 - `ast.FlashBackDatabaseStmt` → C6

@@ -212,6 +212,7 @@ case "$FEATURE" in
       --tidb-root "$TIDB_ROOT" \
       --rust-root "$ROOT" \
       --suite-smoke
+    run execute-truncate cargo test -q -p sealdb-session --lib truncate
     ;;
   C2)
     run leftover python3 "$ROOT/project/scripts/leftover_inventory.py" \

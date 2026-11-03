@@ -90,6 +90,10 @@ impl Job {
                     .unwrap_or_else(|| (current_db.to_string(), String::new()));
                 ("drop table", db, table)
             }
+            Statement::TruncateTable(s) => {
+                let (db, table) = s.table.qualified(current_db);
+                ("truncate table", db, table)
+            }
             Statement::CreateIndex(s) => {
                 let (db, table) = s.table.qualified(current_db);
                 ("add index", db, table)

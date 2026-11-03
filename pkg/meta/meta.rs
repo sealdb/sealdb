@@ -103,6 +103,12 @@ impl Mutator {
         self.inc_int(format!("NextHandle:{table_id}").as_bytes(), 1)
     }
 
+    /// Reset auto handle so the next alloc starts at 1 (empty-table state).
+    pub fn reset_handle(&mut self, table_id: i64) {
+        let key = encode_string_data_key(format!("NextHandle:{table_id}").as_bytes()).into_bytes();
+        self.remove_key(key);
+    }
+
     pub fn load_encoded(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>) {
         self.kv.clear();
         self.removed.clear();
@@ -351,6 +357,15 @@ mod tests {
         let mut meta = Mutator::new();
         meta.set_global_id(9_000);
         assert_eq!(meta.gen_global_id().unwrap(), 9_001);
+    }
+
+    #[test]
+    fn test_reset_handle_restarts_allocator() {
+        let mut meta = Mutator::new();
+        assert_eq!(meta.alloc_handle(42).unwrap(), 1);
+        assert_eq!(meta.alloc_handle(42).unwrap(), 2);
+        meta.reset_handle(42);
+        assert_eq!(meta.alloc_handle(42).unwrap(), 1);
     }
 
     #[test]

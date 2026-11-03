@@ -25,6 +25,9 @@ pub fn execute_ddl(
         Statement::DropTable(s) => {
             table::drop_table(meta, is, s, current_db)?;
         }
+        Statement::TruncateTable(s) => {
+            table::truncate_table(meta, is, s, current_db, storage)?;
+        }
         Statement::CreateIndex(s) => {
             index::create_index(meta, is, s, current_db, storage)?;
         }

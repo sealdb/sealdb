@@ -116,6 +116,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_truncate_table() {
+        let parser = Parser::new();
+        match parser.parse_one_stmt("TRUNCATE TABLE db1.t").unwrap() {
+            crate::ast::Statement::TruncateTable(stmt) => {
+                assert_eq!(stmt.table.schema.as_deref(), Some("db1"));
+                assert_eq!(stmt.table.name, "t");
+                let mut ctx = crate::format::RestoreCtx::new();
+                stmt.restore(&mut ctx).unwrap();
+                assert_eq!(ctx.into_string(), "TRUNCATE TABLE `db1`.`t`");
+            }
+            other => panic!("expected TruncateTableStmt, got {other:?}"),
+        }
+        match parser.parse_one_stmt("TRUNCATE db1.t").unwrap() {
+            crate::ast::Statement::TruncateTable(stmt) => {
+                assert_eq!(stmt.table.name, "t");
+            }
+            other => panic!("expected TruncateTableStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_create_table_like_as_select() {
         let parser = Parser::new();
         match parser
