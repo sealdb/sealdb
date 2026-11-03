@@ -47,18 +47,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.LoadStatsStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.LockStatsStmt",
-      "owner": "C6"
-    },
-    {
-      "stmt": "ast.UnlockStatsStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.PlanReplayerStmt",
       "owner": "C6"
     },

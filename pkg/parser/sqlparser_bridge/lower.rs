@@ -21,10 +21,11 @@ use crate::ast::misc::{
     CommitStmt, CreateBindingStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt, DoStmt,
     DropBindingStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlushStmt, FlushStmtType, GrantLevel,
     GrantLevelType, GrantRoleStmt, GrantStmt, IsolationLevel, KillStmt, LockTablesStmt,
-    OptimizeTableStmt, PrepareStmt, PrivElem, PrivilegeType, ReleaseSavepointStmt, RenameUserStmt,
-    RepairTableStmt, RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment,
-    SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
-    ShutdownStmt, TableLockItem, TableLockType, UseStmt, UserIdentity, UserSpec, UserToUser,
+    LoadStatsStmt, LockStatsStmt, OptimizeTableStmt, PrepareStmt, PrivElem, PrivilegeType,
+    ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt,
+    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetRoleKind, SetRoleStmt, SetStmt,
+    SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShutdownStmt, TableLockItem, TableLockType,
+    UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -1589,6 +1590,39 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 let (stmt, end) = parse_change_stmt(bytes, i + "CHANGE".len())?;
                 out.push_str("SET NAMES '__sealdb_misc__'");
                 ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "LOAD") {
+            let after = skip_ws(bytes, i + "LOAD".len());
+            if keyword_at(bytes, after, "STATS") {
+                let j = skip_ws(bytes, after + "STATS".len());
+                let (path, end) = read_sql_string(bytes, j)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::LoadStats(LoadStatsStmt { path })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "LOCK") {
+            let after = skip_ws(bytes, i + "LOCK".len());
+            if keyword_at(bytes, after, "STATS") {
+                let j = skip_ws(bytes, after + "STATS".len());
+                let (tables, end) = parse_table_name_list(bytes, j)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::LockStats(LockStatsStmt { tables })));
+                i = end;
+                continue;
+            }
+        }
+        if keyword_at(bytes, i, "UNLOCK") {
+            let after = skip_ws(bytes, i + "UNLOCK".len());
+            if keyword_at(bytes, after, "STATS") {
+                let j = skip_ws(bytes, after + "STATS".len());
+                let (tables, end) = parse_table_name_list(bytes, j)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::UnlockStats(UnlockStatsStmt { tables })));
                 i = end;
                 continue;
             }

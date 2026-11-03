@@ -958,6 +958,58 @@ impl CleanupTableLockStmt {
     }
 }
 
+/// TiDB `LoadStatsStmt`: `LOAD STATS 'path'`.
+#[derive(Clone, Debug)]
+pub struct LoadStatsStmt {
+    pub path: String,
+}
+
+impl LoadStatsStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("LOAD STATS ");
+        ctx.write_str(&format!("'{}'", self.path.replace('\'', "''")));
+        Ok(())
+    }
+}
+
+/// TiDB `LockStatsStmt`: `LOCK STATS t[, …]`.
+#[derive(Clone, Debug)]
+pub struct LockStatsStmt {
+    pub tables: Vec<TableName>,
+}
+
+impl LockStatsStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("LOCK STATS ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// TiDB `UnlockStatsStmt`: `UNLOCK STATS t[, …]`.
+#[derive(Clone, Debug)]
+pub struct UnlockStatsStmt {
+    pub tables: Vec<TableName>,
+}
+
+impl UnlockStatsStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("UNLOCK STATS ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
 /// `OPTIMIZE TABLE t[, …]` (TiDB `OptimizeTableStmt`) — MVB status-row no-op.
 #[derive(Clone, Debug)]
 pub struct OptimizeTableStmt {
