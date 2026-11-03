@@ -423,6 +423,10 @@ pub struct UpdateStmt {
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub with: Option<WithClause>,
+    /// VIEW `WITH CHECK OPTION` predicate; evaluated on the post-update row.
+    pub check_option_where: Option<ExprNode>,
+    /// Qualified view name for CHECK OPTION error text (`db.v`).
+    pub check_option_view: Option<String>,
 }
 
 impl UpdateStmt {

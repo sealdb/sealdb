@@ -9,7 +9,9 @@ use crate::join::hash_join_v1::hash_join_pairs;
 use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
-use sealdb_errno::{ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_VIEW_CHECK_FAILED, Error, Result,
+};
 use sealdb_expression::{eval_expr_with_row, eval_filter, locate_partition_for_row};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
 use sealdb_meta::TableInfo;
@@ -83,6 +85,19 @@ impl Executor for UpdateExec {
                     Some(&mut new_values),
                     None,
                 )?;
+                if let Some(check) = &self.stmt.check_option_where
+                    && !eval_filter(check, &col_names, &new_values)?
+                {
+                    let view = self
+                        .stmt
+                        .check_option_view
+                        .clone()
+                        .unwrap_or_else(|| self.stmt.table.name.clone());
+                    return Err(Error::new(
+                        ERR_VIEW_CHECK_FAILED,
+                        format!("CHECK OPTION failed '{view}'"),
+                    ));
+                }
                 apply_row_update(txn, &info, &scanned, new_values)?;
             }
             Ok(())

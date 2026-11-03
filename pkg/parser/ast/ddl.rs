@@ -482,10 +482,13 @@ impl CreateViewStmt {
         }
         ctx.write_str(" AS ");
         self.select.restore(ctx)?;
-        if !self.check_option.eq_ignore_ascii_case("CASCADED") {
+        if !self.check_option.is_empty() && !self.check_option.eq_ignore_ascii_case("NONE") {
             ctx.write_str(" WITH ");
-            ctx.write_str(&self.check_option);
-            ctx.write_str(" CHECK OPTION");
+            if !self.check_option.eq_ignore_ascii_case("CASCADED") {
+                ctx.write_str(&self.check_option);
+                ctx.write_str(" ");
+            }
+            ctx.write_str("CHECK OPTION");
         }
         Ok(())
     }

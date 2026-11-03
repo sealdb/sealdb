@@ -82,6 +82,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, seq_ops) = extract_sequence_ddl(&rewritten)?;
     // sqlparser has Hive LOAD DATA INPATH, not MySQL LOAD DATA INFILE.
     let (rewritten, load_ops) = extract_load_data(&rewritten)?;
+    // sqlparser comments on but does not capture MySQL `WITH [CASCADED|LOCAL] CHECK OPTION`.
+    let (rewritten, view_checks) = extract_view_check_option(&rewritten);
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -99,10 +101,16 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut misc_ops = misc_ops.into_iter();
     let mut seq_ops = seq_ops.into_iter();
     let mut load_ops = load_ops.into_iter();
+    let mut view_checks = view_checks.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
         let mut lowered = lower_statement(stmt)?;
+        if let Statement::CreateView(create) = &mut lowered
+            && let Some(Some(opt)) = view_checks.next()
+        {
+            create.check_option = opt;
+        }
         if let Statement::Begin(begin) = &mut lowered
             && flags.next() == Some(true)
         {
@@ -1982,6 +1990,64 @@ fn capture_raw_stmt(bytes: &[u8], start: usize) -> (String, usize) {
     let end = skip_stmt_tail(bytes, start);
     let raw_sql = String::from_utf8_lossy(&bytes[start..end]).trim().to_string();
     (raw_sql, end)
+}
+
+/// Strip MySQL `WITH [CASCADED|LOCAL] CHECK OPTION` from CREATE VIEW and
+/// return one optional option per CREATE VIEW (consumed when lowering).
+fn extract_view_check_option(sql: &str) -> (String, Vec<Option<String>>) {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut opts = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let create_start = i;
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            let mut k = after_create;
+            if keyword_at(bytes, k, "OR") {
+                let after_or = skip_ws(bytes, k + "OR".len());
+                if keyword_at(bytes, after_or, "REPLACE") {
+                    k = skip_ws(bytes, after_or + "REPLACE".len());
+                }
+            }
+            let mut view_at = None;
+            while k < bytes.len() && bytes[k] != b';' {
+                if keyword_at(bytes, k, "VIEW") {
+                    view_at = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            if view_at.is_some() {
+                let stmt_end = skip_stmt_tail(bytes, create_start);
+                let (stripped, opt) = strip_view_check_option(&bytes[create_start..stmt_end]);
+                opts.push(opt);
+                out.push_str(&stripped);
+                i = stmt_end;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, opts)
+}
+
+fn strip_view_check_option(stmt: &[u8]) -> (String, Option<String>) {
+    let trimmed = String::from_utf8_lossy(stmt).trim_end().to_string();
+    let upper = trimmed.to_ascii_uppercase();
+    for (suffix, opt) in [
+        ("WITH CASCADED CHECK OPTION", "CASCADED"),
+        ("WITH LOCAL CHECK OPTION", "LOCAL"),
+        ("WITH CHECK OPTION", "CASCADED"),
+    ] {
+        if upper.ends_with(suffix) {
+            let cut = trimmed.len().saturating_sub(suffix.len());
+            return (trimmed[..cut].trim_end().to_string(), Some(opt.to_string()));
+        }
+    }
+    (trimmed, None)
 }
 
 fn stmt_contains_keyword(bytes: &[u8], keyword: &str) -> bool {
@@ -4546,6 +4612,8 @@ fn lower_update(update: &Update) -> Result<Statement> {
         order_by,
         limit,
         with: None,
+        check_option_where: None,
+        check_option_view: None,
     }))
 }
 
@@ -5178,7 +5246,7 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
         algorithm,
         definer,
         security,
-        check_option: "CASCADED".to_string(),
+        check_option: "NONE".to_string(),
     }))
 }
 
