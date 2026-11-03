@@ -447,6 +447,59 @@ impl UpdateStmt {
     }
 }
 
+/// TiDB `ast.LoadDataStmt` (MVB: INFILE + field/line terminators + column list).
+#[derive(Clone, Debug)]
+pub struct LoadDataStmt {
+    pub local: bool,
+    pub path: String,
+    pub table: TableName,
+    pub fields_terminated_by: String,
+    pub lines_terminated_by: String,
+    pub ignore_lines: u64,
+    pub columns: Vec<String>,
+}
+
+impl LoadDataStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("LOAD DATA ");
+        if self.local {
+            ctx.write_str("LOCAL ");
+        }
+        ctx.write_str("INFILE ");
+        ctx.write_str(&format!("'{}'", self.path.replace('\'', "''")));
+        ctx.write_str(" INTO TABLE ");
+        self.table.restore(ctx)?;
+        if self.fields_terminated_by != "\t" {
+            ctx.write_str(" FIELDS TERMINATED BY ");
+            ctx.write_str(&format!(
+                "'{}'",
+                self.fields_terminated_by.replace('\'', "''")
+            ));
+        }
+        if self.lines_terminated_by != "\n" {
+            ctx.write_str(" LINES TERMINATED BY ");
+            ctx.write_str(&format!(
+                "'{}'",
+                self.lines_terminated_by.replace('\'', "''")
+            ));
+        }
+        if self.ignore_lines > 0 {
+            ctx.write_str(&format!(" IGNORE {} LINES", self.ignore_lines));
+        }
+        if !self.columns.is_empty() {
+            ctx.write_str(" (");
+            for (i, col) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        }
+        Ok(())
+    }
+}
+
 /// `DELETE` statement. `tables` is the delete list (`DELETE t1, t2 FROM ...`);
 /// empty means delete `table`. `join` is the FROM/USING join.
 #[derive(Clone, Debug)]

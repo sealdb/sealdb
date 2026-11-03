@@ -24,7 +24,6 @@ C1 `--check` requires open `unmapped` stmts to equal this set.
 
 - `ast.TraceStmt` → C6
 - `ast.ImportIntoStmt` → C6
-- `ast.LoadDataStmt` → C6
 - `ast.LoadStatsStmt` → C6
 - `ast.LockStatsStmt` → C6
 - `ast.UnlockStatsStmt` → C6

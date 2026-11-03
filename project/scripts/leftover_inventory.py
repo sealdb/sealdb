@@ -95,6 +95,7 @@ C6_CLOSED_STMTS: frozenset[str] = frozenset(
         "CreateSequenceStmt",
         "DropSequenceStmt",
         "AlterSequenceStmt",
+        "LoadDataStmt",
     }
 )
 

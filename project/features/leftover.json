@@ -47,10 +47,6 @@
       "owner": "C6"
     },
     {
-      "stmt": "ast.LoadDataStmt",
-      "owner": "C6"
-    },
-    {
       "stmt": "ast.LoadStatsStmt",
       "owner": "C6"
     },

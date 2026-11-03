@@ -109,6 +109,7 @@ impl PlanBuilder {
                 Ok(rewrite_semi_join_agg(rewrite_semi_join(plan)))
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
+            Statement::LoadData(_) => Ok(PhysicalPlan::Insert),
             Statement::Update(_) => Ok(PhysicalPlan::Update),
             Statement::Delete(_) => Ok(PhysicalPlan::Delete),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
