@@ -69,6 +69,18 @@ struct CopResponse {
     other_error: String,
 }
 
+/// Blocking wrapper around [`execute_cop_task`] for sync callers (executor).
+pub fn execute_cop_task_blocking(
+    pd_endpoints: &[String],
+    task: &CopTask,
+) -> Result<SelectResponse> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tokio runtime: {e}")))?;
+    rt.block_on(execute_cop_task(pd_endpoints, task))
+}
+
 /// Send one CopTask's tipb DAG to the Region leader via TiKV Coprocessor RPC.
 ///
 /// Multi-range tasks are issued one unary call per range (MVB). Responses are

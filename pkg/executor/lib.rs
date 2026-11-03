@@ -5,6 +5,7 @@ pub mod aggregate;
 pub mod analyze;
 pub mod batch_point_get;
 pub mod builder;
+pub mod cop_client;
 pub mod coprocessor;
 pub mod cte;
 pub mod ddl;

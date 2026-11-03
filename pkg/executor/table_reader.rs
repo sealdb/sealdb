@@ -9,9 +9,7 @@ use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::{ExprNode, TableName};
-use sealdb_tablecodec::{
-    decode_handle_from_row_key, decode_row, gen_table_record_prefix, next_prefix,
-};
+use sealdb_tablecodec::{decode_handle_from_row_key, decode_row};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
@@ -139,20 +137,21 @@ pub(crate) fn scan_table(
 ) -> Result<Vec<ScannedRow>> {
     handle.with_txn(|txn| {
         let mut rows = Vec::new();
+        let start_ts = 0;
         for physical_id in physical_ids {
-            let start = gen_table_record_prefix(*physical_id);
-            let end = next_prefix(start.as_bytes());
-            // Region-aware split via PD when store::open configured Tikv endpoints.
-            for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
-                let pairs = txn.scan_locked(&range.start, &range.end, lock, wait)?;
-                rows.extend(decode_scanned_rows(pairs, info, *physical_id)?);
-            }
+            // DistSQL / Cop scheduling: Region-split tipb TableScan tasks, then
+            // local KV execute (tipb chunk decode from TiKV RPC still deferred).
+            let tasks = crate::cop_client::build_table_cop_tasks(info, *physical_id, start_ts)?;
+            crate::cop_client::probe_cop_rpc(&tasks);
+            rows.extend(crate::cop_client::execute_cop_tasks_locally(
+                txn, info, *physical_id, &tasks, lock, wait,
+            )?);
         }
         Ok(rows)
     })
 }
 
-fn decode_scanned_rows(
+pub(crate) fn decode_scanned_rows(
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
     info: &TableInfo,
     physical_id: i64,
