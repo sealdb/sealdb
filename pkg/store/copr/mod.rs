@@ -33,9 +33,9 @@ pub use dag::{
 };
 pub use mpp::{MppClient, MppDispatchPlan};
 pub use mpp_exchange::{
-    DispatchTaskRequest, EstablishMppConnectionRequest, MppDataPacket, TaskMeta,
-    build_dispatch_request, dispatch_mpp_task, establish_mpp_connection, execute_mpp_root_gather,
-    task_meta_for,
+    CancelTaskRequest, CancelTaskResponse, DispatchTaskRequest, EstablishMppConnectionRequest,
+    MppDataPacket, MppError, TaskMeta, build_dispatch_request, cancel_mpp_task, dispatch_mpp_task,
+    establish_mpp_connection, execute_mpp_root_gather, task_meta_for,
 };
 pub use rpc::{
     build_store_batch_request, execute_batch_cop_task, execute_batch_cop_tasks_stream,
