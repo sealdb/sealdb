@@ -58,6 +58,7 @@ impl TikvStorage {
     }
 
     /// Build tipb TableScan CopTasks split by Region.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_table_scan_tasks(
         &self,
         start_ts: u64,

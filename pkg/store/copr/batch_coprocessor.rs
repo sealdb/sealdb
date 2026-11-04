@@ -174,7 +174,7 @@ pub fn build_batch_cop_tasks(
     }
 
     let mut tasks: Vec<BatchCopTask> = grouped.into_values().collect();
-    tasks.sort_by(|a, b| (a.store_id, a.region_id).cmp(&(b.store_id, b.region_id)));
+    tasks.sort_by_key(|t| (t.store_id, t.region_id));
     Ok(tasks)
 }
 

@@ -194,17 +194,17 @@ pub fn encode_table_scan_dag(
 pub fn decode_select_response(data: &[u8]) -> Result<SelectResponse> {
     let resp = SelectResponse::decode(data)
         .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tipb SelectResponse: {e}")))?;
-    if let Some(err) = &resp.error {
-        if err.code != 0 || !err.msg.is_empty() {
-            return Err(Error::new(
-                if err.code != 0 {
-                    err.code
-                } else {
-                    ERR_UNKNOWN_ERROR
-                },
-                format!("coprocessor: {}", err.msg),
-            ));
-        }
+    if let Some(err) = &resp.error
+        && (err.code != 0 || !err.msg.is_empty())
+    {
+        return Err(Error::new(
+            if err.code != 0 {
+                err.code
+            } else {
+                ERR_UNKNOWN_ERROR
+            },
+            format!("coprocessor: {}", err.msg),
+        ));
     }
     Ok(resp)
 }

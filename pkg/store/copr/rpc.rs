@@ -499,6 +499,7 @@ impl TikvCopClient {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn coprocessor(
         &mut self,
         request: Request<CopRequest>,
@@ -512,6 +513,7 @@ impl TikvCopClient {
         self.inner.unary(request, path, codec).await
     }
 
+    #[allow(clippy::result_large_err)]
     async fn batch_coprocessor(
         &mut self,
         request: Request<BatchRequest>,

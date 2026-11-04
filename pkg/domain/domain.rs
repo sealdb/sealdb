@@ -530,9 +530,7 @@ impl Domain {
         }
         let mut info = table.clone();
         let seq = info.sequence.as_mut().expect("is_sequence");
-        let value = seq
-            .next_val()
-            .map_err(|msg| sealdb_errno::Error::unsupported(msg))?;
+        let value = seq.next_val().map_err(sealdb_errno::Error::unsupported)?;
         inner.meta.update_table(db.id, &info)?;
         inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
         if !inner.defer_persist {
