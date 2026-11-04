@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6-D TiFlash store discovery；下一步 MPP dispatch / cascades）
+> 最后更新：2026-11-04（C6-D BatchCop/MPP dispatch plan；下一步 cascades / brie-remote）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C：PD/TiKV 客户端加深含 Cop RPC；下一步包对齐→D(TiFlash) |
+| C6 | `in-progress` | C/D：Cop RPC + TiFlash discovery + BatchCop/MPP plan；下一步 cascades / brie-remote / MPP stream |
 
 ---
 
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6-D BatchCop / MPP dispatch plan
+- **完成**:
+  - `BatchCopTask` + `build_batch_cop_tasks`（TiKV leader / TiFlash RR）+ `balance_batch_cop_tasks`
+  - `BatchRequestSender`：TiKV unary Cop 按 store 批执行；TiFlash 拒流式直至 BatchCop stream
+  - `MppClient::plan_dispatch` / `plan_tikv_batch`；`execute_batch_cop_task`
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib batch_`
+  - `cargo test -q -p sealdb-store --lib mpp::`
+- **下一步**:
+  - cascades hook；BatchCop stream / MPP exchange；brie-remote
 
 ### 2026-11-04
 

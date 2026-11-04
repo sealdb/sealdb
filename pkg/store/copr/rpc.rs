@@ -1,5 +1,6 @@
 //! TiKV Coprocessor unary RPC (`/tikvpb.Tikv/Coprocessor`) for tipb DAG tasks.
 
+use super::batch_coprocessor::BatchCopTask;
 use super::dag::{decode_select_response, SelectResponse, REQ_TYPE_DAG};
 use super::pd::{pd_get_region, pd_store_address, PdRegion};
 use super::task::CopTask;
@@ -107,6 +108,29 @@ pub async fn execute_cop_task(pd_endpoints: &[String], task: &CopTask) -> Result
     Ok(merged)
 }
 
+/// Execute a store-batched Cop task against its pre-assigned address (BatchCop MVB).
+pub async fn execute_batch_cop_task(task: &BatchCopTask) -> Result<SelectResponse> {
+    if task.ranges.is_empty() {
+        return Ok(SelectResponse::default());
+    }
+    let mut merged = SelectResponse::default();
+    for range in &task.ranges {
+        let part = execute_cop_on_store(task, range).await?;
+        if let Some(err) = part.error {
+            return Err(Error::new(
+                if err.code != 0 {
+                    err.code
+                } else {
+                    ERR_UNKNOWN_ERROR
+                },
+                format!("coprocessor: {}", err.msg),
+            ));
+        }
+        merged.chunks.extend(part.chunks);
+    }
+    Ok(merged)
+}
+
 async fn execute_cop_range(
     pd_endpoints: &[String],
     task: &CopTask,
@@ -182,6 +206,61 @@ fn build_cop_request(region: &PdRegion, task: &CopTask, range: &KeyRange) -> Cop
         }],
         start_ts: task.start_ts,
     }
+}
+
+async fn execute_cop_on_store(task: &BatchCopTask, range: &KeyRange) -> Result<SelectResponse> {
+    let endpoint = normalize_tikv_http(&task.store_addr);
+    let channel = Channel::from_shared(endpoint.clone())
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tikv endpoint {endpoint}: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tikv connect {endpoint}: {e}")))?;
+
+    let peer = if task.peer_id != 0 || task.store_id != 0 {
+        Some(Peer {
+            id: task.peer_id,
+            store_id: task.store_id,
+        })
+    } else {
+        None
+    };
+    let req = CopRequest {
+        context: Some(KvContext {
+            region_id: task.region_id,
+            region_epoch: Some(RegionEpoch {
+                conf_ver: task.region_epoch_conf_ver,
+                version: task.region_epoch_version,
+            }),
+            peer,
+        }),
+        tp: if task.tp != 0 {
+            task.tp
+        } else {
+            REQ_TYPE_DAG
+        },
+        data: task.data.clone(),
+        ranges: vec![CopKeyRange {
+            start: range.start.clone(),
+            end: range.end.clone(),
+        }],
+        start_ts: task.start_ts,
+    };
+    let mut client = TikvCopClient::new(channel);
+    let resp = client
+        .coprocessor(Request::new(req))
+        .await
+        .map_err(map_status)?
+        .into_inner();
+    if !resp.other_error.is_empty() {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!("coprocessor: {}", resp.other_error),
+        ));
+    }
+    if resp.data.is_empty() {
+        return Ok(SelectResponse::default());
+    }
+    decode_select_response(&resp.data)
 }
 
 fn normalize_tikv_http(address: &str) -> String {
