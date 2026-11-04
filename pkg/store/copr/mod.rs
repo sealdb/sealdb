@@ -31,7 +31,10 @@ pub use dag::{
     Selection, TableScan, TipbError, REQ_TYPE_DAG,
 };
 pub use mpp::{MppClient, MppDispatchPlan};
-pub use rpc::{execute_batch_cop_task, execute_cop_task, execute_cop_task_blocking};
+pub use rpc::{
+    build_store_batch_request, execute_batch_cop_task, execute_batch_cop_tasks_stream,
+    execute_batch_coprocessor_stream, execute_cop_task, execute_cop_task_blocking,
+};
 pub use task::{build_table_scan_tasks, CopTask};
 
 use pd::{decode_pd_key, pd_get_region};
