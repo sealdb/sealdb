@@ -106,7 +106,10 @@ impl PlanBuilder {
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
                 plan = wrap_output_projection(plan, select);
-                Ok(rewrite_semi_join_agg(rewrite_semi_join(plan)))
+                plan = rewrite_semi_join_agg(rewrite_semi_join(plan));
+                // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
+                let _ = crate::cascades::maybe_optimize("select")?;
+                Ok(plan)
             }
             Statement::Insert(_) => Ok(PhysicalPlan::Insert),
             Statement::LoadData(_) => Ok(PhysicalPlan::Insert),
