@@ -175,10 +175,7 @@ mod tests {
     #[test]
     fn test_parse_c6_flashback_and_rg() {
         let parser = Parser::new();
-        match parser
-            .parse_one_stmt("FLASHBACK TABLE t TO t2")
-            .unwrap()
-        {
+        match parser.parse_one_stmt("FLASHBACK TABLE t TO t2").unwrap() {
             crate::ast::Statement::FlashBackTable(_) => {}
             other => panic!("expected FlashBackTableStmt, got {other:?}"),
         }
@@ -196,10 +193,7 @@ mod tests {
             crate::ast::Statement::FlashBackToTimestamp(_) => {}
             other => panic!("expected FlashBackToTimestampStmt, got {other:?}"),
         }
-        match parser
-            .parse_one_stmt("RECOVER TABLE BY JOB 1")
-            .unwrap()
-        {
+        match parser.parse_one_stmt("RECOVER TABLE BY JOB 1").unwrap() {
             crate::ast::Statement::RecoverTable(_) => {}
             other => panic!("expected RecoverTableStmt, got {other:?}"),
         }

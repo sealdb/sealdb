@@ -1667,9 +1667,7 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
             (keys, false)
         }
         Statement::CreateTable(create) => (vec![mdl_table_key(&create.table, current_db)], true),
-        Statement::CreateView(create) => {
-            (vec![mdl_table_key(&create.view_name, current_db)], true)
-        }
+        Statement::CreateView(create) => (vec![mdl_table_key(&create.view_name, current_db)], true),
         Statement::CreateSequence(create) => (vec![mdl_table_key(&create.name, current_db)], true),
         Statement::DropSequence(drop) => (
             drop.sequences
@@ -1834,8 +1832,8 @@ fn rewrite_updatable_view_target(
         )));
     }
     let base = view_select.from.expect("checked above");
-    let enforce_check = !view.check_option.is_empty()
-        && !view.check_option.eq_ignore_ascii_case("NONE");
+    let enforce_check =
+        !view.check_option.is_empty() && !view.check_option.eq_ignore_ascii_case("NONE");
     if let Some(view_where) = view_select.selection {
         if enforce_check {
             *check_option_where = Some(view_where.clone());
@@ -1854,7 +1852,11 @@ fn rewrite_updatable_view_target(
     Ok(())
 }
 
-fn expand_views_in_select(select: &mut SelectStmt, is: &InfoSchema, current_db: &str) -> Result<()> {
+fn expand_views_in_select(
+    select: &mut SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
     if let Some(with) = select.with.as_mut() {
         for cte in &mut with.ctes {
             expand_views_in_select(&mut cte.query, is, current_db)?;
@@ -1906,11 +1908,7 @@ fn inject_view_cte(
     } else {
         CteMaterialize::Default
     };
-    let mut ctes = select
-        .with
-        .take()
-        .map(|w| w.ctes)
-        .unwrap_or_default();
+    let mut ctes = select.with.take().map(|w| w.ctes).unwrap_or_default();
     ctes.push(CommonTableExpression {
         name: name.clone(),
         query: Box::new(view_select),
@@ -1997,7 +1995,10 @@ fn load_data_to_insert(
         lines[skip..].to_vec()
     };
     let columns = if load.columns.is_empty() {
-        info.columns.iter().map(|c| c.name.o().to_string()).collect()
+        info.columns
+            .iter()
+            .map(|c| c.name.o().to_string())
+            .collect()
     } else {
         load.columns.clone()
     };
@@ -2053,15 +2054,12 @@ fn parse_load_field(raw: &str, eval_type: sealdb_types::EvalType) -> Result<seal
         return Ok(Datum::Null);
     }
     match eval_type {
-        EvalType::Int => trimmed
-            .parse::<i64>()
-            .map(Datum::I64)
-            .map_err(|_| {
-                sealdb_errno::Error::new(
-                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
-                    format!("Incorrect integer value: '{trimmed}'"),
-                )
-            }),
+        EvalType::Int => trimmed.parse::<i64>().map(Datum::I64).map_err(|_| {
+            sealdb_errno::Error::new(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Incorrect integer value: '{trimmed}'"),
+            )
+        }),
         EvalType::Real => trimmed.parse::<f64>().map(Datum::F64).map_err(|_| {
             sealdb_errno::Error::new(
                 sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
@@ -2666,9 +2664,7 @@ mod tests {
         session
             .execute_stmt("CREATE VIEW db1.v AS SELECT id, name FROM db1.t WHERE id = 1")
             .unwrap();
-        session
-            .execute_stmt("UPDATE db1.v SET name = 'x'")
-            .unwrap();
+        session.execute_stmt("UPDATE db1.v SET name = 'x'").unwrap();
         let rows = session
             .execute_stmt("SELECT * FROM db1.t ORDER BY id")
             .unwrap();
@@ -2707,9 +2703,7 @@ mod tests {
         session
             .execute_stmt("UPDATE db1.v SET name = 'ok'")
             .unwrap();
-        let err = session
-            .execute_stmt("UPDATE db1.v SET id = 2")
-            .unwrap_err();
+        let err = session.execute_stmt("UPDATE db1.v SET id = 2").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_VIEW_CHECK_FAILED);
         let rows = session
             .execute_stmt("SELECT * FROM db1.t WHERE id = 1")

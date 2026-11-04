@@ -12,17 +12,16 @@ use std::sync::Arc;
 pub use copr::mpp::MppClient;
 pub use copr::mpp_probe::MppProbe;
 pub use copr::pd::{
-    pd_get_region, pd_get_store, pd_list_stores, pd_scan_regions, pd_store_address, PdClient,
-    PdPeer, PdRegion, PdRegionEpoch, PdStoreInfo, PdStoreLabel,
+    PdClient, PdPeer, PdRegion, PdRegionEpoch, PdStoreInfo, PdStoreLabel, pd_get_region,
+    pd_get_store, pd_list_stores, pd_scan_regions, pd_store_address,
 };
 pub use copr::{
+    Chunk, ColumnInfo, CopTask, DagRequest, EncodeType, ExecType, Executor, IndexScan, KeyRange,
+    Limit, REQ_TYPE_DAG, RowMeta, SelectResponse, Selection, TableScan, TipbError,
     build_table_scan_tasks, clear_pd_endpoints, decode_default_rows, decode_select_response,
     decode_select_rows, encode_default_row, encode_select_response, encode_select_response_chunk,
-    encode_table_scan_dag,
-    execute_cop_task, execute_cop_task_blocking, pd_endpoints, set_pd_endpoints, split_key_ranges,
-    split_key_ranges_for_scan, split_key_ranges_via_pd, Chunk, ColumnInfo, CopTask, DagRequest,
-    EncodeType, ExecType, Executor, IndexScan, KeyRange, Limit, RowMeta, SelectResponse,
-    Selection, TableScan, TipbError, REQ_TYPE_DAG,
+    encode_table_scan_dag, execute_cop_task, execute_cop_task_blocking, pd_endpoints,
+    set_pd_endpoints, split_key_ranges, split_key_ranges_for_scan, split_key_ranges_via_pd,
 };
 pub use driver::TikvStorage as TikvStore;
 
@@ -61,7 +60,10 @@ mod tests {
         let storage = open(&Config::default()).unwrap();
         let a = storage.current_timestamp().unwrap();
         let b = storage.current_timestamp().unwrap();
-        assert!(b > a, "expected monotonic TSO-like counter, got {a} then {b}");
+        assert!(
+            b > a,
+            "expected monotonic TSO-like counter, got {a} then {b}"
+        );
     }
 
     #[test]

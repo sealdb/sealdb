@@ -2,13 +2,11 @@
 //! via KV scan, and optionally consume TiKV Coprocessor TypeDefault rows when
 //! `SEALDB_USE_COP_RPC=1`.
 
-use crate::table_reader::{decode_scanned_rows, ScannedRow};
+use crate::table_reader::{ScannedRow, decode_scanned_rows};
 use sealdb_errno::Result;
 use sealdb_kv::{LockWait, RowLock, Transaction};
 use sealdb_meta::TableInfo;
-use sealdb_store::{
-    build_table_scan_tasks, decode_select_rows, pd_endpoints, ColumnInfo, CopTask,
-};
+use sealdb_store::{ColumnInfo, CopTask, build_table_scan_tasks, decode_select_rows, pd_endpoints};
 use sealdb_tablecodec::{gen_table_record_prefix, next_prefix};
 use sealdb_types::Datum;
 

@@ -56,10 +56,7 @@ struct BackupTable {
 pub fn execute_brie(session: &Session, raw_sql: &str) -> Result<QueryResult> {
     let plan = parse_brie(raw_sql)?;
     match plan {
-        BrieOp::Backup {
-            database,
-            location,
-        } => match location {
+        BrieOp::Backup { database, location } => match location {
             BrieLocation::Local(path) => backup_database(session, &database, &path),
             BrieLocation::Http(url) => Err(Error::new(
                 ERR_UNSUPPORTED,
@@ -216,9 +213,8 @@ fn read_backup_json(location: &BrieLocation) -> Result<String> {
                     format!("http backup fetch {url}: status {}", resp.status()),
                 ));
             }
-            resp.text().map_err(|e| {
-                Error::new(ERR_UNKNOWN_ERROR, format!("http backup body {url}: {e}"))
-            })
+            resp.text()
+                .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("http backup body {url}: {e}")))
         }
     }
 }
@@ -231,10 +227,7 @@ fn backup_database(session: &Session, database: &str, path: &str) -> Result<Quer
             .filter_map(|r| r.into_iter().next())
             .filter(|n| {
                 let u = n.to_ascii_lowercase();
-                u != "information_schema"
-                    && u != "mysql"
-                    && u != "performance_schema"
-                    && u != "sys"
+                u != "information_schema" && u != "mysql" && u != "performance_schema" && u != "sys"
             })
             .collect()
     } else {
@@ -291,9 +284,8 @@ fn backup_database(session: &Session, database: &str, path: &str) -> Result<Quer
     };
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::new(ERR_UNKNOWN_ERROR, format!("create backup dir: {e}"))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("create backup dir: {e}")))?;
         }
     }
     let json = serde_json::to_string_pretty(&file)
@@ -435,10 +427,7 @@ mod tests {
 
     #[test]
     fn test_read_backup_json_local_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "sealdb-brie-http-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sealdb-brie-http-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dump.json");

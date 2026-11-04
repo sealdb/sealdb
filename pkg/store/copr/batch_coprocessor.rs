@@ -3,9 +3,9 @@
 //! Unary Cop per Region remains in `rpc`. This module builds store-batched tasks:
 //! Region-split ranges assigned to TiKV leaders or TiFlash stores (round-robin).
 
-use super::dag::REQ_TYPE_DAG;
-use super::pd::{decode_pd_key, pd_get_region, pd_store_address, PdRegion, PdStoreInfo};
 use super::KeyRange;
+use super::dag::REQ_TYPE_DAG;
+use super::pd::{PdRegion, PdStoreInfo, decode_pd_key, pd_get_region, pd_store_address};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use std::collections::HashMap;
 
@@ -174,9 +174,7 @@ pub fn build_batch_cop_tasks(
     }
 
     let mut tasks: Vec<BatchCopTask> = grouped.into_values().collect();
-    tasks.sort_by(|a, b| {
-        (a.store_id, a.region_id).cmp(&(b.store_id, b.region_id))
-    });
+    tasks.sort_by(|a, b| (a.store_id, a.region_id).cmp(&(b.store_id, b.region_id)));
     Ok(tasks)
 }
 

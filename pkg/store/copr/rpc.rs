@@ -1,11 +1,11 @@
 //! TiKV Coprocessor unary RPC (`/tikvpb.Tikv/Coprocessor`) and BatchCoprocessor
 //! stream (`/tikvpb.Tikv/BatchCoprocessor`) for tipb DAG tasks.
 
-use super::batch_coprocessor::BatchCopTask;
-use super::dag::{decode_select_response, SelectResponse, REQ_TYPE_DAG};
-use super::pd::{pd_get_region, pd_store_address, PdRegion};
-use super::task::CopTask;
 use super::KeyRange;
+use super::batch_coprocessor::BatchCopTask;
+use super::dag::{REQ_TYPE_DAG, SelectResponse, decode_select_response};
+use super::pd::{PdRegion, pd_get_region, pd_store_address};
+use super::task::CopTask;
 use prost::Message;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use std::collections::HashMap;
@@ -366,9 +366,7 @@ async fn execute_cop_range(
             .as_ref()
             .map(|p| p.store_id)
             .filter(|id| *id != 0)
-            .ok_or_else(|| {
-                Error::new(ERR_UNKNOWN_ERROR, "pd region missing leader store_id")
-            })?;
+            .ok_or_else(|| Error::new(ERR_UNKNOWN_ERROR, "pd region missing leader store_id"))?;
         let address = pd_store_address(&pd, store_id)?;
         Ok::<_, Error>((region, address))
     })
@@ -415,11 +413,7 @@ fn build_cop_request(region: &PdRegion, task: &CopTask, range: &KeyRange) -> Cop
             region_epoch: epoch,
             peer,
         }),
-        tp: if task.tp != 0 {
-            task.tp
-        } else {
-            REQ_TYPE_DAG
-        },
+        tp: if task.tp != 0 { task.tp } else { REQ_TYPE_DAG },
         data: task.data.clone(),
         ranges: vec![CopKeyRange {
             start: range.start.clone(),
@@ -454,11 +448,7 @@ async fn execute_cop_on_store(task: &BatchCopTask, range: &KeyRange) -> Result<S
             }),
             peer,
         }),
-        tp: if task.tp != 0 {
-            task.tp
-        } else {
-            REQ_TYPE_DAG
-        },
+        tp: if task.tp != 0 { task.tp } else { REQ_TYPE_DAG },
         data: task.data.clone(),
         ranges: vec![CopKeyRange {
             start: range.start.clone(),
@@ -494,10 +484,7 @@ fn normalize_tikv_http(address: &str) -> String {
 }
 
 fn map_status(status: Status) -> Error {
-    Error::new(
-        ERR_UNKNOWN_ERROR,
-        format!("tikv coprocessor rpc: {status}"),
-    )
+    Error::new(ERR_UNKNOWN_ERROR, format!("tikv coprocessor rpc: {status}"))
 }
 
 #[derive(Debug, Clone)]
@@ -516,28 +503,25 @@ impl TikvCopClient {
         &mut self,
         request: Request<CopRequest>,
     ) -> std::result::Result<tonic::Response<CopResponse>, Status> {
-        self.inner.ready().await.map_err(|e| {
-            Status::unknown(format!("Service was not ready: {e}"))
-        })?;
+        self.inner
+            .ready()
+            .await
+            .map_err(|e| Status::unknown(format!("Service was not ready: {e}")))?;
         let codec = tonic::codec::ProstCodec::default();
-        let path =
-            http::uri::PathAndQuery::from_static("/tikvpb.Tikv/Coprocessor");
+        let path = http::uri::PathAndQuery::from_static("/tikvpb.Tikv/Coprocessor");
         self.inner.unary(request, path, codec).await
     }
 
     async fn batch_coprocessor(
         &mut self,
         request: Request<BatchRequest>,
-    ) -> std::result::Result<
-        tonic::Response<tonic::Streaming<BatchResponse>>,
-        Status,
-    > {
-        self.inner.ready().await.map_err(|e| {
-            Status::unknown(format!("Service was not ready: {e}"))
-        })?;
+    ) -> std::result::Result<tonic::Response<tonic::Streaming<BatchResponse>>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|e| Status::unknown(format!("Service was not ready: {e}")))?;
         let codec = tonic::codec::ProstCodec::default();
-        let path =
-            http::uri::PathAndQuery::from_static("/tikvpb.Tikv/BatchCoprocessor");
+        let path = http::uri::PathAndQuery::from_static("/tikvpb.Tikv/BatchCoprocessor");
         self.inner.server_streaming(request, path, codec).await
     }
 }
@@ -545,9 +529,9 @@ impl TikvCopClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copr::dag::{encode_table_scan_dag, ColumnInfo};
-    use crate::copr::task::CopTask;
     use crate::copr::KeyRange;
+    use crate::copr::dag::{ColumnInfo, encode_table_scan_dag};
+    use crate::copr::task::CopTask;
 
     #[tokio::test]
     async fn test_execute_cop_task_if_available() {
@@ -558,11 +542,7 @@ mod tests {
             pk_handle: true,
         }];
         let data = encode_table_scan_dag(1, 1, &cols, &[0], None, Some(1));
-        let task = CopTask::dag(
-            vec![KeyRange::new(b"t".to_vec(), b"u".to_vec())],
-            data,
-            1,
-        );
+        let task = CopTask::dag(vec![KeyRange::new(b"t".to_vec(), b"u".to_vec())], data, 1);
         match execute_cop_task(&pd, &task).await {
             Ok(resp) => {
                 // Empty table / no rows is fine; presence of a response proves RPC.

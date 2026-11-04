@@ -148,7 +148,12 @@ pub(crate) fn scan_table(
                 rows.extend(remote);
             } else {
                 rows.extend(crate::cop_client::execute_cop_tasks_locally(
-                    txn, info, *physical_id, &tasks, lock, wait,
+                    txn,
+                    info,
+                    *physical_id,
+                    &tasks,
+                    lock,
+                    wait,
                 )?);
             }
         }

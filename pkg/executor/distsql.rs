@@ -120,8 +120,7 @@ impl Executor for IndexLookUpExecutor {
                     continue;
                 }
                 for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
-                    let pairs =
-                        txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
+                    let pairs = txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
                     for (key, value) in pairs {
                         let handle = index_handle(&index, &key, &value)?;
                         if self.covering {

@@ -1,9 +1,7 @@
 //! Cop task: Region-aligned ranges + tipb DAG payload (TiDB DistSQL / copr).
 
-use super::dag::{encode_table_scan_dag, ColumnInfo, Selection, REQ_TYPE_DAG};
-use super::{
-    split_key_ranges, split_key_ranges_via_pd, KeyRange,
-};
+use super::dag::{ColumnInfo, REQ_TYPE_DAG, Selection, encode_table_scan_dag};
+use super::{KeyRange, split_key_ranges, split_key_ranges_via_pd};
 use sealdb_errno::Result;
 
 /// One Coprocessor unit of work (ranges + encoded tipb DAG).
@@ -45,9 +43,8 @@ pub fn build_table_scan_tasks(
     let ranges = if pd_endpoints.is_empty() {
         split_key_ranges(start, end)
     } else {
-        split_key_ranges_via_pd(pd_endpoints, start, end).unwrap_or_else(|_| {
-            split_key_ranges(start, end)
-        })
+        split_key_ranges_via_pd(pd_endpoints, start, end)
+            .unwrap_or_else(|_| split_key_ranges(start, end))
     };
     if ranges.is_empty() {
         return Ok(Vec::new());
@@ -77,18 +74,8 @@ mod tests {
             tp: 8,
             pk_handle: true,
         }];
-        let tasks = build_table_scan_tasks(
-            &[],
-            1,
-            10,
-            &cols,
-            &[0],
-            b"t",
-            b"u",
-            None,
-            None,
-        )
-        .unwrap();
+        let tasks =
+            build_table_scan_tasks(&[], 1, 10, &cols, &[0], b"t", b"u", None, None).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].tp, REQ_TYPE_DAG);
         assert_eq!(tasks[0].ranges[0].start, b"t");

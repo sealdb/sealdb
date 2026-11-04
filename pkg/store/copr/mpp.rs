@@ -3,12 +3,12 @@
 //! Store discovery + BatchCop task planning / balance. Full MPP exchange /
 //! DispatchMPPTask gRPC remains deferred.
 
+use super::KeyRange;
 use super::batch_coprocessor::{
-    balance_batch_cop_tasks, build_batch_cop_tasks, BatchCopTask, BatchStorePrefer,
+    BatchCopTask, BatchStorePrefer, balance_batch_cop_tasks, build_batch_cop_tasks,
 };
 use super::mpp_probe::MppProbe;
 use super::pd::PdStoreInfo;
-use super::KeyRange;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 
 /// Planned MPP / BatchCop dispatch (no network send yet for TiFlash stream).
@@ -115,11 +115,7 @@ mod tests {
     #[test]
     fn test_plan_dispatch_requires_tiflash() {
         let client = MppClient::new(vec!["127.0.0.1:2379".to_string()]);
-        match client.plan_dispatch(
-            &[KeyRange::new(b"t".to_vec(), b"u".to_vec())],
-            vec![1],
-            1,
-        ) {
+        match client.plan_dispatch(&[KeyRange::new(b"t".to_vec(), b"u".to_vec())], vec![1], 1) {
             Ok(plan) => {
                 assert!(plan.tiflash_store_count > 0);
                 assert!(plan.tasks.iter().all(|t| t.is_tiflash));
@@ -138,11 +134,7 @@ mod tests {
     #[test]
     fn test_plan_tikv_batch_if_pd_available() {
         let client = MppClient::new(vec!["127.0.0.1:2379".to_string()]);
-        match client.plan_tikv_batch(
-            &[KeyRange::new(b"t".to_vec(), b"u".to_vec())],
-            vec![2],
-            3,
-        ) {
+        match client.plan_tikv_batch(&[KeyRange::new(b"t".to_vec(), b"u".to_vec())], vec![2], 3) {
             Ok(tasks) => {
                 assert!(!tasks.is_empty());
                 assert!(tasks.iter().all(|t| !t.is_tiflash));

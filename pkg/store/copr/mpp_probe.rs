@@ -1,6 +1,6 @@
 //! TiDB `pkg/store/copr/mpp_probe.go` — TiFlash availability via PD store labels.
 
-use super::pd::{pd_list_stores, PdStoreInfo};
+use super::pd::{PdStoreInfo, pd_list_stores};
 use sealdb_errno::Result;
 
 /// Probe TiFlash stores registered in PD (`engine=tiflash` label).
