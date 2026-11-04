@@ -3,8 +3,11 @@
 //! Production plans still come from RBO (`pkg/planner/core`). When
 //! `SEALDB_CASCADES=1`, PlanBuilder invokes this pass as an identity hook that
 //! seeds a memo, runs the task scheduler, and applies transformation rules
-//! (EliminateTrue/FalseSelection, DeduplicateGroupExprs, JoinToApply stubs).
+//! (EliminateTrue/FalseSelection, DeduplicateGroupExprs, JoinToApply stubs,
+//! plus ImplementationRules / EnforcerRules fingerprint MVB).
 
+use super::enforcer_rules::EnforcerRules;
+use super::implementation_rules::ImplementationRules;
 use super::memo::{Group, GroupExpr, Memo};
 use super::task::task_scheduler::TaskScheduler;
 use super::transformation_rules::TransformationRules;
@@ -14,6 +17,8 @@ use sealdb_errno::Result;
 #[derive(Clone, Debug, Default)]
 pub struct OptimizeResult {
     pub applied_rules: usize,
+    pub implemented: usize,
+    pub enforced: usize,
     pub memo_groups: usize,
     pub scheduled_tasks: usize,
 }
@@ -39,8 +44,12 @@ pub fn optimize(root: &str) -> Result<OptimizeResult> {
     let mut sched = TaskScheduler::default();
     let scheduled_tasks = sched.run_explore(&mut memo);
     let applied_rules = TransformationRules.apply_all(&mut memo);
+    let implemented = ImplementationRules.apply_all(&mut memo);
+    let enforced = EnforcerRules.apply_all(&mut memo);
     Ok(OptimizeResult {
         applied_rules,
+        implemented,
+        enforced,
         memo_groups: memo.groups.len(),
         scheduled_tasks,
     })
