@@ -3,7 +3,7 @@
 //! Production plans still come from RBO (`pkg/planner/core`). When
 //! `SEALDB_CASCADES=1`, PlanBuilder invokes this pass as an identity hook that
 //! seeds a memo, runs the task scheduler, and applies transformation rules
-//! (EliminateTrueSelection / JoinToApply stubs).
+//! (EliminateTrue/FalseSelection, DeduplicateGroupExprs, JoinToApply stubs).
 
 use super::memo::{Group, GroupExpr, Memo};
 use super::task::task_scheduler::TaskScheduler;

@@ -8,4 +8,8 @@ pub enum RuleType {
     JoinToApply,
     /// Drop tautology Selection (fingerprint of `"true"`).
     EliminateTrueSelection,
+    /// Drop always-false Selection (fingerprint of `"false"`).
+    EliminateFalseSelection,
+    /// Collapse duplicate fingerprints within a group.
+    DeduplicateGroupExprs,
 }
