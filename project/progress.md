@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 SEALDB_USE_MPP/BATCH_COP TableReader hook；下一步 br-agent）
+> 最后更新：2026-11-04（C6 br:// BR agent；下一步 tiflash-cluster-e2e）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：MPP/BatchCop TableReader hook + CancelMPPTask + BRIE；下一步 br-agent |
+| C6 | `in-progress` | C/D：br:// agent + MPP TableReader + remote BRIE；下一步 cluster e2e |
 
 ---
 
@@ -107,6 +107,16 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 BR agent (`br://`)
+- **完成**:
+  - `br://job` POST/GET via `SEALDB_BR_AGENT_ENDPOINT` `/v1/backup|restore/{job}`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib brie`
+- **下一步**:
+  - tiflash-cluster-e2e
 
 ### 2026-11-04
 
