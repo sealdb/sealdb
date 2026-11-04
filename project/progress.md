@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 cascades implement/enforce；下一步 tiflash-cluster-e2e）
+> 最后更新：2026-11-04（C6 tiflash-cluster-e2e：本地源码编译中；脚本+SEALDB_TIFLASH_E2E gate）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：cascades implement/enforce + br:// + MPP hook；下一步 cluster e2e |
+| C6 | `in-progress` | C/D：本地 TiFlash 源码编译 + e2e 脚本；gap=`tiflash-cluster-e2e` |
 
 ---
 
@@ -107,6 +107,18 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 TiFlash cluster e2e（本地编译）
+- **完成**:
+  - 脚本：`build_tiflash.sh` / `run_local_tiflash.sh` / `tiflash_cluster_e2e.sh`
+  - `SEALDB_TIFLASH_E2E=1` → `test_tiflash_cluster_e2e_plan_dispatch`
+  - 源码：`/Users/wslu/work/github/db/pingcap/tiflash` submodule init 进行中 → `cmake --preset release`
+- **验证**:
+  - 编译完成后：`SEALDB_TIFLASH_E2E=1 cargo test -p sealdb-store --lib test_tiflash_cluster_e2e`
+- **下一步**:
+  - 等 TiFlash 二进制；tiup playground PD/TiKV + 自建 TiFlash；跑 gate
 
 ### 2026-11-04
 

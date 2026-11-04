@@ -285,4 +285,31 @@ mod tests {
             "unexpected: {msg}"
         );
     }
+
+    /// Live cluster gate: set `SEALDB_TIFLASH_E2E=1` with PD+TiFlash up.
+    #[test]
+    fn test_tiflash_cluster_e2e_plan_dispatch() {
+        let enabled = std::env::var("SEALDB_TIFLASH_E2E")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let pd = std::env::var("SEALDB_PD").unwrap_or_else(|_| "127.0.0.1:2379".into());
+        let client = MppClient::new(vec![pd]);
+        let stores = client
+            .require_tiflash()
+            .expect("SEALDB_TIFLASH_E2E=1 requires a TiFlash store with engine=tiflash");
+        assert!(!stores.is_empty());
+        let plan = client
+            .plan_dispatch(
+                &[KeyRange::new(b"t".to_vec(), b"u".to_vec())],
+                vec![1, 2],
+                42,
+            )
+            .expect("plan_dispatch against live TiFlash");
+        assert!(plan.tiflash_store_count > 0);
+        assert!(!plan.tasks.is_empty());
+        assert!(plan.tasks.iter().all(|t| t.is_tiflash));
+    }
 }
