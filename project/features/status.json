@@ -33,6 +33,6 @@
     "C3": {"status": "core-ported", "phase": 10, "notes": "SchemaChecker 8028 + RC + MDL + schema lease 8027 + SERIALIZABLE→RR + SAVEPOINT (F12) + same-cluster TiKV cross-session if SEALDB_TIKV=1", "gaps": []},
     "C4": {"status": "core-ported", "phase": 10, "notes": "PREPARE/EXECUTE/DEALLOCATE + Domain-shared plan cache keyed by ? templates + COM_STMT_* + user vars + CREATE/DROP/SHOW BINDING", "gaps": []},
     "C5": {"status": "core-ported", "phase": 10, "notes": "SET NAMES/sql_mode/collation + general_ci + unicode_ci Latin + GBK/latin1 encode+collate subset + ONLY_FULL_GROUP_BY + SET GLOBAL Domain sysvars + leftover collation suites MVB", "gaps": []},
-    "C6": {"status": "in-progress", "phase": 10, "notes": "production parity; TableReader SEALDB_USE_MPP/BATCH_COP + CancelMPPTask + remote BRIE; next=br-agent + cluster e2e", "gaps": ["br-agent", "tiflash-cluster-e2e"]}
+    "C6": {"status": "in-progress", "phase": 10, "notes": "production parity; br:// agent + TableReader MPP/BatchCop + CancelMPPTask + remote BRIE MVB; next=tiflash-cluster-e2e", "gaps": ["tiflash-cluster-e2e"]}
   }
 }

@@ -2,7 +2,8 @@
 //!
 //! Local filesystem (`file://` optional), `http(s)://` restore, `s3://`
 //! (`SEALDB_S3_ENDPOINT` + optional SigV4), `gs://` (`SEALDB_GCS_ENDPOINT`),
-//! and `hdfs://` (WebHDFS / `SEALDB_HDFS_NAMENODE`). TiKV BR agent remains deferred.
+//! `hdfs://` (WebHDFS / `SEALDB_HDFS_NAMENODE`), and `br://`
+//! (`SEALDB_BR_AGENT_ENDPOINT`).
 
 use sealdb_errno::{ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_executor::QueryResult;
@@ -12,6 +13,7 @@ use std::fs;
 use std::path::Path;
 
 use super::Session;
+use super::brie_agent::{BrAgentUri, br_agent_get, br_agent_put, parse_br_agent_uri};
 use super::brie_gcs::{GcsUri, gcs_get_object, gcs_put_object, parse_gcs_uri};
 use super::brie_hdfs::{HdfsUri, hdfs_get_file, hdfs_put_file, parse_hdfs_uri};
 use super::brie_s3::{S3Uri, parse_s3_uri, s3_get_object, s3_put_object};
@@ -25,6 +27,7 @@ enum BrieLocation {
     S3(S3Uri),
     Gcs(GcsUri),
     Hdfs(HdfsUri),
+    BrAgent(BrAgentUri),
 }
 
 #[derive(Clone, Debug)]
@@ -64,12 +67,13 @@ pub fn execute_brie(session: &Session, raw_sql: &str) -> Result<QueryResult> {
     match plan {
         BrieOp::Backup { database, location } => match &location {
             BrieLocation::Local(path) => backup_database(session, &database, &location, path),
-            BrieLocation::S3(_) | BrieLocation::Gcs(_) | BrieLocation::Hdfs(_) => {
-                backup_database(session, &database, &location, "")
-            }
+            BrieLocation::S3(_)
+            | BrieLocation::Gcs(_)
+            | BrieLocation::Hdfs(_)
+            | BrieLocation::BrAgent(_) => backup_database(session, &database, &location, ""),
             BrieLocation::Http(url) => Err(Error::new(
                 ERR_UNSUPPORTED,
-                format!("BACKUP to remote URL '{url}' is not available; use local/s3/gs/hdfs"),
+                format!("BACKUP to remote URL '{url}' is not available; use local/s3/gs/hdfs/br"),
             )),
         },
         BrieOp::Restore { location } => restore_database(session, &location),
@@ -198,6 +202,9 @@ fn parse_brie_location(path: &str) -> Result<BrieLocation> {
     if p.starts_with("hdfs://") {
         return Ok(BrieLocation::Hdfs(parse_hdfs_uri(p)?));
     }
+    if p.starts_with("br://") {
+        return Ok(BrieLocation::BrAgent(parse_br_agent_uri(p)?));
+    }
     let p = p.strip_prefix("file://").unwrap_or(p);
     if p.is_empty() {
         return Err(Error::new(ERR_UNKNOWN_ERROR, "empty backup path"));
@@ -211,6 +218,7 @@ fn location_display(loc: &BrieLocation) -> String {
         BrieLocation::S3(u) => u.display(),
         BrieLocation::Gcs(u) => u.display(),
         BrieLocation::Hdfs(u) => u.display(),
+        BrieLocation::BrAgent(u) => u.display(),
     }
 }
 
@@ -234,6 +242,7 @@ fn read_backup_json(location: &BrieLocation) -> Result<String> {
         BrieLocation::S3(uri) => s3_get_object(uri),
         BrieLocation::Gcs(uri) => gcs_get_object(uri),
         BrieLocation::Hdfs(uri) => hdfs_get_file(uri),
+        BrieLocation::BrAgent(uri) => br_agent_get(uri),
     }
 }
 
@@ -253,6 +262,7 @@ fn write_backup_json(location: &BrieLocation, local_path: &str, json: &str) -> R
         BrieLocation::S3(uri) => s3_put_object(uri, json.as_bytes()),
         BrieLocation::Gcs(uri) => gcs_put_object(uri, json.as_bytes()),
         BrieLocation::Hdfs(uri) => hdfs_put_file(uri, json.as_bytes()),
+        BrieLocation::BrAgent(uri) => br_agent_put(uri, json.as_bytes()),
         BrieLocation::Http(_) => Err(Error::new(
             ERR_UNSUPPORTED,
             "BACKUP to http(s) is not available",
@@ -482,6 +492,14 @@ mod tests {
                 assert!(u.namenode.is_none());
                 assert_eq!(u.path, "/user/seal/x.json");
             }
+            other => panic!("{other:?}"),
+        }
+        let br = parse_brie("BACKUP DATABASE db1 TO 'br://cluster/job-9'").unwrap();
+        match br {
+            BrieOp::Backup {
+                location: BrieLocation::BrAgent(u),
+                ..
+            } => assert_eq!(u.job, "cluster/job-9"),
             other => panic!("{other:?}"),
         }
         let http = parse_brie("BACKUP DATABASE db1 TO 'http://example.com/x.json'").unwrap();
