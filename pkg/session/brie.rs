@@ -123,8 +123,8 @@ fn parse_brie(raw_sql: &str) -> Result<BrieOp> {
 
 fn take_ident_or_star(s: &str) -> Result<(String, &str)> {
     let s = s.trim_start();
-    if s.starts_with('*') {
-        return Ok(("*".into(), &s[1..]));
+    if let Some(rest) = s.strip_prefix('*') {
+        return Ok(("*".into(), rest));
     }
     let mut end = 0;
     let bytes = s.as_bytes();
@@ -282,11 +282,11 @@ fn backup_database(session: &Session, database: &str, path: &str) -> Result<Quer
         version: BACKUP_VERSION,
         databases,
     };
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("create backup dir: {e}")))?;
-        }
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("create backup dir: {e}")))?;
     }
     let json = serde_json::to_string_pretty(&file)
         .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("serialize backup: {e}")))?;

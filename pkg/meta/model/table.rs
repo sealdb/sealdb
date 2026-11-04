@@ -43,19 +43,20 @@ impl Default for SequenceInfo {
 
 impl SequenceInfo {
     pub fn with_defaults_for_increment(increment: i64) -> Self {
-        let mut info = Self::default();
-        info.increment = if increment == 0 { 1 } else { increment };
-        if info.increment > 0 {
-            info.min_value = 1;
-            info.max_value = 9223372036854775806;
-            info.start = 1;
+        let increment = if increment == 0 { 1 } else { increment };
+        let (start, min_value, max_value) = if increment > 0 {
+            (1, 1, 9223372036854775806)
         } else {
-            info.min_value = -9223372036854775807;
-            info.max_value = -1;
-            info.start = -1;
+            (-1, -9223372036854775807, -1)
+        };
+        Self {
+            start,
+            min_value,
+            max_value,
+            increment,
+            next_value: start,
+            ..Self::default()
         }
-        info.next_value = info.start;
-        info
     }
 
     /// Allocate and return the next sequence value.

@@ -7,6 +7,7 @@ use sealdb_errno::Result;
 use sealdb_store::{ColumnInfo, CopTask, Selection, build_table_scan_tasks};
 
 /// Build CopTasks for a table-range DistSQL Select (TableScan DAG).
+#[allow(clippy::too_many_arguments)]
 pub fn build_table_select_tasks(
     pd_endpoints: &[String],
     start_ts: u64,

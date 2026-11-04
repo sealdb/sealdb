@@ -16,6 +16,7 @@ impl CopStore {
         Self { pd_endpoints }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_table_scan_tasks(
         &self,
         start_ts: u64,

@@ -272,7 +272,7 @@ pub fn decode_pd_key(hex: &str) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     let h = hex.as_bytes();
-    if h.len() % 2 != 0 {
+    if !h.len().is_multiple_of(2) {
         return Err(Error::new(
             ERR_UNKNOWN_ERROR,
             format!("odd-length PD key hex: {hex}"),

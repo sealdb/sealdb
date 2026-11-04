@@ -29,6 +29,7 @@ impl CopTask {
 /// Build Region-split Cop tasks for a TableScan DAG over `[start, end)`.
 ///
 /// When `pd_endpoints` is empty, emits a single task covering the full span.
+#[allow(clippy::too_many_arguments)]
 pub fn build_table_scan_tasks(
     pd_endpoints: &[String],
     start_ts: u64,
