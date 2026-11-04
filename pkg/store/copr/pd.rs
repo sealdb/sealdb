@@ -50,6 +50,14 @@ struct PdStoreEntry {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct PdStoreLabel {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct PdStoreInfo {
     #[serde(default)]
     pub id: u64,
@@ -57,6 +65,23 @@ pub struct PdStoreInfo {
     pub address: String,
     #[serde(default)]
     pub state_name: String,
+    #[serde(default)]
+    pub labels: Vec<PdStoreLabel>,
+}
+
+impl PdStoreInfo {
+    /// TiFlash stores carry label `engine=tiflash` (TiDB / PD convention).
+    pub fn is_tiflash(&self) -> bool {
+        self.labels.iter().any(|l| {
+            l.key.eq_ignore_ascii_case("engine") && l.value.eq_ignore_ascii_case("tiflash")
+        })
+    }
+
+    pub fn is_up(&self) -> bool {
+        self.state_name.is_empty()
+            || self.state_name.eq_ignore_ascii_case("Up")
+            || self.state_name.eq_ignore_ascii_case("UP")
+    }
 }
 
 #[derive(Debug, Deserialize)]

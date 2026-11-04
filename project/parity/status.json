@@ -854,16 +854,16 @@
       "notes": "BatchCop sender deferred"
     },
     "pkg/store/copr/mpp.go": {
-      "status": "stub",
+      "status": "partial",
       "rust": "pkg/store/copr/mpp.rs",
       "phase": 10,
-      "notes": "C6-D TiFlash placeholder stub"
+      "notes": "TiFlash discovery via PD engine=tiflash label; MPP dispatch deferred"
     },
     "pkg/store/copr/mpp_probe.go": {
-      "status": "stub",
+      "status": "partial",
       "rust": "pkg/store/copr/mpp_probe.rs",
       "phase": 10,
-      "notes": "C6-D TiFlash placeholder stub"
+      "notes": "TiFlash discovery via PD engine=tiflash label; MPP dispatch deferred"
     },
     "pkg/distsql/distsql.go": {
       "status": "partial",

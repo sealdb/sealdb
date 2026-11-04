@@ -110,6 +110,11 @@ impl TikvStorage {
         crate::copr::pd::pd_scan_regions(&self.pd_endpoints, start_key, limit)
     }
 
+    /// TiFlash MPP helper (store discovery via PD labels).
+    pub fn mpp_client(&self) -> crate::copr::mpp::MppClient {
+        crate::copr::mpp::MppClient::new(self.pd_endpoints.clone())
+    }
+
     fn begin_txn(&self, pessimistic: bool) -> Result<Box<dyn Transaction>> {
         let txn = if pessimistic {
             self.rt
