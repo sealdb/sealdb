@@ -26,4 +26,5 @@ sealdb-store.workspace = true
 sealdb-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
 thiserror.workspace = true
