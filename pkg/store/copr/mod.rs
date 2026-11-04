@@ -20,13 +20,18 @@ pub mod rpc;
 pub mod store;
 pub mod task;
 
+pub use batch_coprocessor::{
+    balance_batch_cop_tasks, build_batch_cop_tasks, BatchCopTask, BatchStorePrefer,
+};
+pub use batch_request_sender::BatchRequestSender;
 pub use dag::{
     decode_default_rows, decode_select_response, decode_select_rows, encode_default_row,
     encode_select_response, encode_select_response_chunk, encode_table_scan_dag, Chunk, ColumnInfo,
     DagRequest, EncodeType, ExecType, Executor, IndexScan, Limit, RowMeta, SelectResponse,
     Selection, TableScan, TipbError, REQ_TYPE_DAG,
 };
-pub use rpc::{execute_cop_task, execute_cop_task_blocking};
+pub use mpp::{MppClient, MppDispatchPlan};
+pub use rpc::{execute_batch_cop_task, execute_cop_task, execute_cop_task_blocking};
 pub use task::{build_table_scan_tasks, CopTask};
 
 use pd::{decode_pd_key, pd_get_region};
