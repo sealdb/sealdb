@@ -9,6 +9,7 @@ use sealdb_errno::Result;
 use sealdb_kv::{MemStorage, Storage};
 use std::sync::Arc;
 
+pub use copr::batch_request_sender::BatchRequestSender;
 pub use copr::mpp::MppClient;
 pub use copr::mpp_probe::MppProbe;
 pub use copr::pd::{
