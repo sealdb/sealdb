@@ -13,4 +13,4 @@ pub mod stringer;
 pub mod task;
 pub mod transformation_rules;
 
-pub use optimize::{optimize, OptimizeResult};
+pub use optimize::{cascades_enabled, maybe_optimize, optimize, OptimizeResult};
