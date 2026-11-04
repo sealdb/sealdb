@@ -4,4 +4,8 @@
 pub enum RuleType {
     #[default]
     Unspecified,
+    /// Join → Apply (decorrelate) — stub match only.
+    JoinToApply,
+    /// Drop tautology Selection (fingerprint of `"true"`).
+    EliminateTrueSelection,
 }

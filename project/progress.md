@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 cascades identity hook；下一步 cascades rules / MPP stream / brie-remote）
+> 最后更新：2026-11-04（C6 cascades transformation rules MVB；下一步 MPP stream / brie-remote）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：Cop/BatchCop/MPP plan + cascades hook；下一步 rules / MPP stream / brie-remote |
+| C6 | `in-progress` | C/D：Cop/BatchCop/MPP plan + cascades rules MVB；下一步 MPP stream / brie-remote |
 
 ---
 
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 cascades transformation rules MVB
+- **完成**:
+  - `RuleType::{EliminateTrueSelection,JoinToApply}`；`TransformationRules::apply_all`
+  - `optimize` 跑 explore + transformation；真值 Selection 指纹可消除
+- **验证**:
+  - `cargo test -q -p sealdb-planner --lib cascades`
+- **下一步**:
+  - more rewrite rules；BatchCop stream / MPP exchange；brie-remote
 
 ### 2026-11-04
 
