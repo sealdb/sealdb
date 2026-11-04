@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6-C tipb TypeChunk decode；下一步 cascades/TiFlash）
+> 最后更新：2026-11-04（C6-D TiFlash store discovery；下一步 MPP dispatch / cascades）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6-D TiFlash store discovery
+- **完成**:
+  - PD `PdStoreInfo.labels`；`engine=tiflash` 识别
+  - `MppProbe` / `MppClient` 列 TiFlash store；`TikvStorage::mpp_client`
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib mpp`
+- **下一步**:
+  - MPP/BatchCop dispatch；cascades；brie-remote
 
 ### 2026-11-04
 
