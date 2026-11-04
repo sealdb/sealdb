@@ -1,4 +1,5 @@
-//! TiKV Coprocessor unary RPC (`/tikvpb.Tikv/Coprocessor`) for tipb DAG tasks.
+//! TiKV Coprocessor unary RPC (`/tikvpb.Tikv/Coprocessor`) and BatchCoprocessor
+//! stream (`/tikvpb.Tikv/BatchCoprocessor`) for tipb DAG tasks.
 
 use super::batch_coprocessor::BatchCopTask;
 use super::dag::{decode_select_response, SelectResponse, REQ_TYPE_DAG};
@@ -7,6 +8,7 @@ use super::task::CopTask;
 use super::KeyRange;
 use prost::Message;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
+use std::collections::HashMap;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
@@ -70,6 +72,41 @@ struct CopResponse {
     other_error: String,
 }
 
+/// `coprocessor.RegionInfo`
+#[derive(Clone, PartialEq, Message)]
+struct RegionInfo {
+    #[prost(uint64, tag = "1")]
+    region_id: u64,
+    #[prost(message, optional, tag = "2")]
+    region_epoch: Option<RegionEpoch>,
+    #[prost(message, repeated, tag = "3")]
+    ranges: Vec<CopKeyRange>,
+}
+
+/// `coprocessor.BatchRequest` (subset used by BatchCop / TiFlash).
+#[derive(Clone, PartialEq, Message)]
+struct BatchRequest {
+    #[prost(message, optional, tag = "1")]
+    context: Option<KvContext>,
+    #[prost(int64, tag = "2")]
+    tp: i64,
+    #[prost(bytes = "vec", tag = "3")]
+    data: Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    regions: Vec<RegionInfo>,
+    #[prost(uint64, tag = "5")]
+    start_ts: u64,
+}
+
+/// `coprocessor.BatchResponse` (data + errors only).
+#[derive(Clone, PartialEq, Message)]
+struct BatchResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    data: Vec<u8>,
+    #[prost(string, tag = "2")]
+    other_error: String,
+}
+
 /// Blocking wrapper around [`execute_cop_task`] for sync callers (executor).
 pub fn execute_cop_task_blocking(
     pd_endpoints: &[String],
@@ -126,6 +163,190 @@ pub async fn execute_batch_cop_task(task: &BatchCopTask) -> Result<SelectRespons
                 format!("coprocessor: {}", err.msg),
             ));
         }
+        merged.chunks.extend(part.chunks);
+    }
+    Ok(merged)
+}
+
+/// Build one `BatchRequest` for tasks that share a store (and DAG payload).
+pub fn build_store_batch_request(tasks: &[BatchCopTask]) -> Result<Vec<u8>> {
+    if tasks.is_empty() {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            "build_store_batch_request: empty tasks",
+        ));
+    }
+    let first = &tasks[0];
+    let mut regions = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        if t.store_id != first.store_id {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                "build_store_batch_request: mixed store_id",
+            ));
+        }
+        regions.push(RegionInfo {
+            region_id: t.region_id,
+            region_epoch: Some(RegionEpoch {
+                conf_ver: t.region_epoch_conf_ver,
+                version: t.region_epoch_version,
+            }),
+            ranges: t
+                .ranges
+                .iter()
+                .map(|r| CopKeyRange {
+                    start: r.start.clone(),
+                    end: r.end.clone(),
+                })
+                .collect(),
+        });
+    }
+    let peer = if first.peer_id != 0 || first.store_id != 0 {
+        Some(Peer {
+            id: first.peer_id,
+            store_id: first.store_id,
+        })
+    } else {
+        None
+    };
+    let req = BatchRequest {
+        context: Some(KvContext {
+            region_id: first.region_id,
+            region_epoch: Some(RegionEpoch {
+                conf_ver: first.region_epoch_conf_ver,
+                version: first.region_epoch_version,
+            }),
+            peer,
+        }),
+        tp: if first.tp != 0 {
+            first.tp
+        } else {
+            REQ_TYPE_DAG
+        },
+        data: first.data.clone(),
+        regions,
+        start_ts: first.start_ts,
+    };
+    let mut buf = Vec::new();
+    req.encode(&mut buf)
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("batch request encode: {e}")))?;
+    Ok(buf)
+}
+
+/// Open `/tikvpb.Tikv/BatchCoprocessor` against `store_addr` and merge responses.
+pub async fn execute_batch_coprocessor_stream(
+    store_addr: &str,
+    tasks: &[BatchCopTask],
+) -> Result<SelectResponse> {
+    if tasks.is_empty() {
+        return Ok(SelectResponse::default());
+    }
+    let endpoint = normalize_tikv_http(store_addr);
+    let channel = Channel::from_shared(endpoint.clone())
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tikv endpoint {endpoint}: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tikv connect {endpoint}: {e}")))?;
+
+    let first = &tasks[0];
+    let regions: Vec<RegionInfo> = tasks
+        .iter()
+        .map(|t| RegionInfo {
+            region_id: t.region_id,
+            region_epoch: Some(RegionEpoch {
+                conf_ver: t.region_epoch_conf_ver,
+                version: t.region_epoch_version,
+            }),
+            ranges: t
+                .ranges
+                .iter()
+                .map(|r| CopKeyRange {
+                    start: r.start.clone(),
+                    end: r.end.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let peer = if first.peer_id != 0 || first.store_id != 0 {
+        Some(Peer {
+            id: first.peer_id,
+            store_id: first.store_id,
+        })
+    } else {
+        None
+    };
+    let req = BatchRequest {
+        context: Some(KvContext {
+            region_id: first.region_id,
+            region_epoch: Some(RegionEpoch {
+                conf_ver: first.region_epoch_conf_ver,
+                version: first.region_epoch_version,
+            }),
+            peer,
+        }),
+        tp: if first.tp != 0 {
+            first.tp
+        } else {
+            REQ_TYPE_DAG
+        },
+        data: first.data.clone(),
+        regions,
+        start_ts: first.start_ts,
+    };
+
+    let mut client = TikvCopClient::new(channel);
+    let mut stream = client
+        .batch_coprocessor(Request::new(req))
+        .await
+        .map_err(map_status)?
+        .into_inner();
+
+    let mut merged = SelectResponse::default();
+    while let Some(resp) = stream.message().await.map_err(map_status)? {
+        if !resp.other_error.is_empty() {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("batch coprocessor: {}", resp.other_error),
+            ));
+        }
+        if resp.data.is_empty() {
+            continue;
+        }
+        let part = decode_select_response(&resp.data)?;
+        if let Some(err) = part.error {
+            return Err(Error::new(
+                if err.code != 0 {
+                    err.code
+                } else {
+                    ERR_UNKNOWN_ERROR
+                },
+                format!("batch coprocessor: {}", err.msg),
+            ));
+        }
+        merged.chunks.extend(part.chunks);
+    }
+    Ok(merged)
+}
+
+/// Group tasks by `store_id` and run BatchCoprocessor stream per store.
+pub async fn execute_batch_cop_tasks_stream(tasks: &[BatchCopTask]) -> Result<SelectResponse> {
+    if tasks.is_empty() {
+        return Ok(SelectResponse::default());
+    }
+    let mut by_store: HashMap<u64, Vec<BatchCopTask>> = HashMap::new();
+    for t in tasks {
+        by_store.entry(t.store_id).or_default().push(t.clone());
+    }
+    let mut merged = SelectResponse::default();
+    let mut store_ids: Vec<u64> = by_store.keys().copied().collect();
+    store_ids.sort_unstable();
+    for store_id in store_ids {
+        let group = by_store.remove(&store_id).unwrap_or_default();
+        let addr = group
+            .first()
+            .map(|t| t.store_addr.clone())
+            .unwrap_or_default();
+        let part = execute_batch_coprocessor_stream(&addr, &group).await?;
         merged.chunks.extend(part.chunks);
     }
     Ok(merged)
@@ -302,6 +523,22 @@ impl TikvCopClient {
         let path =
             http::uri::PathAndQuery::from_static("/tikvpb.Tikv/Coprocessor");
         self.inner.unary(request, path, codec).await
+    }
+
+    async fn batch_coprocessor(
+        &mut self,
+        request: Request<BatchRequest>,
+    ) -> std::result::Result<
+        tonic::Response<tonic::Streaming<BatchResponse>>,
+        Status,
+    > {
+        self.inner.ready().await.map_err(|e| {
+            Status::unknown(format!("Service was not ready: {e}"))
+        })?;
+        let codec = tonic::codec::ProstCodec::default();
+        let path =
+            http::uri::PathAndQuery::from_static("/tikvpb.Tikv/BatchCoprocessor");
+        self.inner.server_streaming(request, path, codec).await
     }
 }
 

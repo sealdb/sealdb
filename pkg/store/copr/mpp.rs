@@ -56,9 +56,7 @@ impl MppClient {
 
     /// Build balanced BatchCop tasks assigned to TiFlash stores (plan only).
     ///
-    /// Does not open BatchCoprocessor / MPP streams — callers inspect `tasks`
-    /// for routing. Use [`super::batch_request_sender::BatchRequestSender`] for
-    /// TiKV-leader unary execution.
+    /// Use [`dispatch_stream`] / [`BatchRequestSender`] to open BatchCoprocessor.
     pub fn plan_dispatch(
         &self,
         ranges: &[KeyRange],
@@ -79,6 +77,17 @@ impl MppClient {
             tiflash_store_count: stores.len(),
             tasks,
         })
+    }
+
+    /// Plan TiFlash BatchCop tasks and execute via BatchCoprocessor stream.
+    pub fn dispatch_stream_blocking(
+        &self,
+        ranges: &[KeyRange],
+        data: Vec<u8>,
+        start_ts: u64,
+    ) -> Result<super::dag::SelectResponse> {
+        let plan = self.plan_dispatch(ranges, data, start_ts)?;
+        super::batch_request_sender::BatchRequestSender::new().execute_blocking(&plan.tasks)
     }
 
     /// Plan TiKV-leader BatchCop grouping (no TiFlash required).
