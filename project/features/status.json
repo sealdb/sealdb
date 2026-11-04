@@ -33,6 +33,6 @@
     "C3": {"status": "core-ported", "phase": 10, "notes": "SchemaChecker 8028 + RC + MDL + schema lease 8027 + SERIALIZABLE→RR + SAVEPOINT (F12) + same-cluster TiKV cross-session if SEALDB_TIKV=1", "gaps": []},
     "C4": {"status": "core-ported", "phase": 10, "notes": "PREPARE/EXECUTE/DEALLOCATE + Domain-shared plan cache keyed by ? templates + COM_STMT_* + user vars + CREATE/DROP/SHOW BINDING", "gaps": []},
     "C5": {"status": "core-ported", "phase": 10, "notes": "SET NAMES/sql_mode/collation + general_ci + unicode_ci Latin + GBK/latin1 encode+collate subset + ONLY_FULL_GROUP_BY + SET GLOBAL Domain sysvars + leftover collation suites MVB", "gaps": []},
-    "C6": {"status": "in-progress", "phase": 10, "notes": "production parity; A/B/C deepened; D: BatchCoprocessor stream + cascades rules + HTTP BRIE; next=MPP-exchange/S3-BRIE/more-rules", "gaps": ["cascades-more-rules", "tiflash-mpp-exchange", "brie-s3"]}
+    "C6": {"status": "in-progress", "phase": 10, "notes": "production parity; A/B/C deepened; D: BatchCop stream + MPP Dispatch/Establish MVB + cascades/HTTP BRIE; next=S3-BRIE/more-rules/multi-sender", "gaps": ["cascades-more-rules", "brie-s3", "mpp-multi-sender"]}
   }
 }

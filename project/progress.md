@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 BatchCoprocessor stream；下一步 MPP exchange / S3 BRIE / more cascades rules）
+> 最后更新：2026-11-04（C6 MPP Dispatch/Establish exchange MVB；下一步 S3 BRIE / cascades more rules）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：BatchCop stream + cascades rules + HTTP BRIE；下一步 MPP exchange / S3 |
+| C6 | `in-progress` | C/D：BatchCop stream + MPP exchange MVB + cascades/HTTP BRIE；下一步 S3 BRIE / more rules |
 
 ---
 
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 MPP Dispatch / Establish exchange MVB
+- **完成**:
+  - `mpp_exchange`：`DispatchTaskRequest` / `EstablishMPPConnection` / `MPPDataPacket`
+  - `MppClient::{dispatch_mpp_tasks,establish_root_connection,execute_mpp_gather_blocking}`
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib mpp`
+- **下一步**:
+  - S3 BRIE；cascades more rules；multi-sender gather
 
 ### 2026-11-04
 
