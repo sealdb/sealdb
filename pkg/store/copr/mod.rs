@@ -13,6 +13,7 @@ pub mod coprocessor_cache;
 pub mod dag;
 pub mod key_ranges;
 pub mod mpp;
+pub mod mpp_exchange;
 pub mod mpp_probe;
 pub mod pd;
 pub mod region_cache;
@@ -31,6 +32,11 @@ pub use dag::{
     encode_select_response_chunk, encode_table_scan_dag,
 };
 pub use mpp::{MppClient, MppDispatchPlan};
+pub use mpp_exchange::{
+    DispatchTaskRequest, EstablishMppConnectionRequest, MppDataPacket, TaskMeta,
+    build_dispatch_request, dispatch_mpp_task, establish_mpp_connection, execute_mpp_root_gather,
+    task_meta_for,
+};
 pub use rpc::{
     build_store_batch_request, execute_batch_cop_task, execute_batch_cop_tasks_stream,
     execute_batch_coprocessor_stream, execute_cop_task, execute_cop_task_blocking,

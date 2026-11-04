@@ -1,15 +1,23 @@
 //! TiDB `pkg/store/copr/mpp.go` — MPP coordination over TiFlash stores.
 //!
-//! Store discovery + BatchCop task planning / balance. Full MPP exchange /
-//! DispatchMPPTask gRPC remains deferred.
+//! Store discovery, BatchCop planning, plus DispatchMPPTask /
+//! EstablishMPPConnection root-gather MVB (`mpp_exchange`).
 
 use super::KeyRange;
 use super::batch_coprocessor::{
     BatchCopTask, BatchStorePrefer, balance_batch_cop_tasks, build_batch_cop_tasks,
 };
+use super::dag::SelectResponse;
+use super::mpp_exchange::{
+    EstablishMppConnectionRequest, TaskMeta, build_dispatch_request, dispatch_mpp_task,
+    establish_mpp_connection, execute_mpp_root_gather, task_meta_for,
+};
 use super::mpp_probe::MppProbe;
 use super::pd::PdStoreInfo;
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GATHER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Planned MPP / BatchCop dispatch (no network send yet for TiFlash stream).
 #[derive(Clone, Debug, Default)]
@@ -85,7 +93,7 @@ impl MppClient {
         ranges: &[KeyRange],
         data: Vec<u8>,
         start_ts: u64,
-    ) -> Result<super::dag::SelectResponse> {
+    ) -> Result<SelectResponse> {
         let plan = self.plan_dispatch(ranges, data, start_ts)?;
         super::batch_request_sender::BatchRequestSender::new().execute_blocking(&plan.tasks)
     }
@@ -105,6 +113,72 @@ impl MppClient {
             data,
             start_ts,
         )
+    }
+
+    /// Allocate a gather id for one MPP query.
+    pub fn next_gather_id() -> u64 {
+        NEXT_GATHER_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// DispatchMPPTask for every planned TiFlash BatchCop fragment.
+    pub async fn dispatch_mpp_tasks(
+        &self,
+        tasks: &[BatchCopTask],
+        gather_id: u64,
+        schema_ver: i64,
+    ) -> Result<Vec<TaskMeta>> {
+        let mut metas = Vec::with_capacity(tasks.len());
+        for (i, task) in tasks.iter().enumerate() {
+            let task_id = (i + 1) as i64;
+            let req = build_dispatch_request(task, task_id, gather_id, schema_ver);
+            let _ = dispatch_mpp_task(&task.store_addr, req).await?;
+            metas.push(task_meta_for(task, task_id, gather_id));
+        }
+        Ok(metas)
+    }
+
+    /// EstablishMPPConnection root gather (receiver task_id = -1).
+    pub async fn establish_root_connection(
+        &self,
+        store_addr: &str,
+        sender: TaskMeta,
+        gather_id: u64,
+    ) -> Result<SelectResponse> {
+        let receiver = TaskMeta {
+            start_ts: sender.start_ts,
+            task_id: -1,
+            address: String::new(),
+            gather_id,
+            query_ts: sender.query_ts,
+            local_query_id: sender.local_query_id,
+            server_id: sender.server_id,
+            mpp_version: sender.mpp_version,
+        };
+        establish_mpp_connection(
+            store_addr,
+            EstablishMppConnectionRequest {
+                sender_meta: Some(sender),
+                receiver_meta: Some(receiver),
+            },
+        )
+        .await
+    }
+
+    /// Full root-gather path: plan → DispatchMPPTask → EstablishMPPConnection.
+    pub fn execute_mpp_gather_blocking(
+        &self,
+        ranges: &[KeyRange],
+        data: Vec<u8>,
+        start_ts: u64,
+        schema_ver: i64,
+    ) -> Result<SelectResponse> {
+        let plan = self.plan_dispatch(ranges, data, start_ts)?;
+        let gather_id = Self::next_gather_id();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("tokio runtime: {e}")))?;
+        rt.block_on(execute_mpp_root_gather(&plan.tasks, gather_id, schema_ver))
     }
 }
 
@@ -141,5 +215,23 @@ mod tests {
             }
             Err(err) => eprintln!("skip plan_tikv_batch: {err}"),
         }
+    }
+
+    #[test]
+    fn test_execute_mpp_gather_without_tiflash_errors() {
+        let client = MppClient::new(vec!["127.0.0.1:2379".to_string()]);
+        let err = client
+            .execute_mpp_gather_blocking(
+                &[KeyRange::new(b"t".to_vec(), b"u".to_vec())],
+                vec![1],
+                1,
+                1,
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TiFlash") || msg.contains("pd") || msg.contains("tiflash"),
+            "unexpected: {msg}"
+        );
     }
 }
