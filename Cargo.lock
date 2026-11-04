@@ -2118,6 +2118,7 @@ dependencies = [
 name = "sealdb-session"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "sealdb-bindinfo",
  "sealdb-config",
  "sealdb-domain",
