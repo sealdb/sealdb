@@ -1,8 +1,8 @@
 //! BRIE MVB: `BACKUP` / `RESTORE DATABASE … TO/FROM 'path'`.
 //!
-//! Local filesystem (`file://` optional), `http(s)://` restore, and `s3://`
-//! via `SEALDB_S3_ENDPOINT` (+ optional SigV4 keys). GCS/HDFS / TiKV BR agent
-//! remain deferred.
+//! Local filesystem (`file://` optional), `http(s)://` restore, `s3://`
+//! (`SEALDB_S3_ENDPOINT` + optional SigV4), `gs://` (`SEALDB_GCS_ENDPOINT`),
+//! and `hdfs://` (WebHDFS / `SEALDB_HDFS_NAMENODE`). TiKV BR agent remains deferred.
 
 use sealdb_errno::{ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result};
 use sealdb_executor::QueryResult;
@@ -12,6 +12,8 @@ use std::fs;
 use std::path::Path;
 
 use super::Session;
+use super::brie_gcs::{GcsUri, gcs_get_object, gcs_put_object, parse_gcs_uri};
+use super::brie_hdfs::{HdfsUri, hdfs_get_file, hdfs_put_file, parse_hdfs_uri};
 use super::brie_s3::{S3Uri, parse_s3_uri, s3_get_object, s3_put_object};
 
 const BACKUP_VERSION: u32 = 1;
@@ -21,6 +23,8 @@ enum BrieLocation {
     Local(String),
     Http(String),
     S3(S3Uri),
+    Gcs(GcsUri),
+    Hdfs(HdfsUri),
 }
 
 #[derive(Clone, Debug)]
@@ -60,10 +64,12 @@ pub fn execute_brie(session: &Session, raw_sql: &str) -> Result<QueryResult> {
     match plan {
         BrieOp::Backup { database, location } => match &location {
             BrieLocation::Local(path) => backup_database(session, &database, &location, path),
-            BrieLocation::S3(_) => backup_database(session, &database, &location, ""),
+            BrieLocation::S3(_) | BrieLocation::Gcs(_) | BrieLocation::Hdfs(_) => {
+                backup_database(session, &database, &location, "")
+            }
             BrieLocation::Http(url) => Err(Error::new(
                 ERR_UNSUPPORTED,
-                format!("BACKUP to remote URL '{url}' is not available; use a local path or s3://"),
+                format!("BACKUP to remote URL '{url}' is not available; use local/s3/gs/hdfs"),
             )),
         },
         BrieOp::Restore { location } => restore_database(session, &location),
@@ -186,11 +192,11 @@ fn parse_brie_location(path: &str) -> Result<BrieLocation> {
     if p.starts_with("s3://") {
         return Ok(BrieLocation::S3(parse_s3_uri(p)?));
     }
-    if p.starts_with("gs://") || p.starts_with("hdfs://") {
-        return Err(Error::new(
-            ERR_UNSUPPORTED,
-            format!("remote BRIE destination '{p}' is not available in this phase"),
-        ));
+    if p.starts_with("gs://") {
+        return Ok(BrieLocation::Gcs(parse_gcs_uri(p)?));
+    }
+    if p.starts_with("hdfs://") {
+        return Ok(BrieLocation::Hdfs(parse_hdfs_uri(p)?));
     }
     let p = p.strip_prefix("file://").unwrap_or(p);
     if p.is_empty() {
@@ -203,6 +209,8 @@ fn location_display(loc: &BrieLocation) -> String {
     match loc {
         BrieLocation::Local(p) | BrieLocation::Http(p) => p.clone(),
         BrieLocation::S3(u) => u.display(),
+        BrieLocation::Gcs(u) => u.display(),
+        BrieLocation::Hdfs(u) => u.display(),
     }
 }
 
@@ -224,6 +232,8 @@ fn read_backup_json(location: &BrieLocation) -> Result<String> {
                 .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("http backup body {url}: {e}")))
         }
         BrieLocation::S3(uri) => s3_get_object(uri),
+        BrieLocation::Gcs(uri) => gcs_get_object(uri),
+        BrieLocation::Hdfs(uri) => hdfs_get_file(uri),
     }
 }
 
@@ -241,6 +251,8 @@ fn write_backup_json(location: &BrieLocation, local_path: &str, json: &str) -> R
                 .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("write backup: {e}")))
         }
         BrieLocation::S3(uri) => s3_put_object(uri, json.as_bytes()),
+        BrieLocation::Gcs(uri) => gcs_put_object(uri, json.as_bytes()),
+        BrieLocation::Hdfs(uri) => hdfs_put_file(uri, json.as_bytes()),
         BrieLocation::Http(_) => Err(Error::new(
             ERR_UNSUPPORTED,
             "BACKUP to http(s) is not available",
@@ -451,8 +463,27 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        let err = parse_brie("BACKUP DATABASE db1 TO 'gs://bucket/x'").unwrap_err();
-        assert_eq!(err.code, ERR_UNSUPPORTED);
+        let gs = parse_brie("BACKUP DATABASE db1 TO 'gs://bucket/path/x.json'").unwrap();
+        match gs {
+            BrieOp::Backup {
+                location: BrieLocation::Gcs(u),
+                ..
+            } => {
+                assert_eq!(u.bucket, "bucket");
+                assert_eq!(u.object, "path/x.json");
+            }
+            other => panic!("{other:?}"),
+        }
+        let hdfs = parse_brie("RESTORE FROM 'hdfs:///user/seal/x.json'").unwrap();
+        match hdfs {
+            BrieOp::Restore {
+                location: BrieLocation::Hdfs(u),
+            } => {
+                assert!(u.namenode.is_none());
+                assert_eq!(u.path, "/user/seal/x.json");
+            }
+            other => panic!("{other:?}"),
+        }
         let http = parse_brie("BACKUP DATABASE db1 TO 'http://example.com/x.json'").unwrap();
         match http {
             BrieOp::Backup {

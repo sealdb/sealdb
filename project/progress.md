@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 mpp-multi-sender；下一步 brie-gcs-hdfs）
+> 最后更新：2026-11-04（C6 BRIE gs:// + hdfs://；C6 remote-location gaps closed）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：multi-sender gather + cascades Dedup + S3 BRIE；下一步 brie-gcs-hdfs |
+| C6 | `in-progress` | C/D：gs/hdfs BRIE + multi-sender + cascades；下一步 production-parity leftovers |
 
 ---
 
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 BRIE GCS / HDFS
+- **完成**:
+  - `gs://` JSON API media via `SEALDB_GCS_ENDPOINT` (+ optional bearer)
+  - `hdfs://` WebHDFS OPEN/CREATE via host or `SEALDB_HDFS_NAMENODE`
+- **验证**:
+  - `cargo test -q -p sealdb-session --lib brie`
+- **下一步**:
+  - C6 production-parity leftovers（TiFlash end-to-end / BR agent 等）
 
 ### 2026-11-04
 
