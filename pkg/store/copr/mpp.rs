@@ -9,8 +9,8 @@ use super::batch_coprocessor::{
 };
 use super::dag::SelectResponse;
 use super::mpp_exchange::{
-    EstablishMppConnectionRequest, TaskMeta, build_dispatch_request, dispatch_mpp_task,
-    establish_mpp_connection, execute_mpp_root_gather, task_meta_for,
+    TaskMeta, build_dispatch_request, dispatch_mpp_task, execute_mpp_root_gather,
+    gather_from_sender, task_meta_for,
 };
 use super::mpp_probe::MppProbe;
 use super::pd::PdStoreInfo;
@@ -144,24 +144,32 @@ impl MppClient {
         sender: TaskMeta,
         gather_id: u64,
     ) -> Result<SelectResponse> {
-        let receiver = TaskMeta {
-            start_ts: sender.start_ts,
-            task_id: -1,
-            address: String::new(),
-            gather_id,
-            query_ts: sender.query_ts,
-            local_query_id: sender.local_query_id,
-            server_id: sender.server_id,
-            mpp_version: sender.mpp_version,
-        };
-        establish_mpp_connection(
-            store_addr,
-            EstablishMppConnectionRequest {
-                sender_meta: Some(sender),
-                receiver_meta: Some(receiver),
-            },
-        )
-        .await
+        gather_from_sender(store_addr, sender, gather_id).await
+    }
+
+    /// Multi-sender root gather: DispatchMPPTask then EstablishMPPConnection to each meta.
+    pub async fn gather_from_senders(
+        &self,
+        tasks: &[BatchCopTask],
+        metas: &[TaskMeta],
+        gather_id: u64,
+    ) -> Result<SelectResponse> {
+        use super::mpp_exchange::merge_select_responses;
+        if tasks.len() != metas.len() {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!(
+                    "mpp multi-sender: tasks {} != metas {}",
+                    tasks.len(),
+                    metas.len()
+                ),
+            ));
+        }
+        let mut parts = Vec::with_capacity(metas.len());
+        for (task, sender) in tasks.iter().zip(metas.iter()) {
+            parts.push(gather_from_sender(&task.store_addr, sender.clone(), gather_id).await?);
+        }
+        Ok(merge_select_responses(parts))
     }
 
     /// Full root-gather path: plan → DispatchMPPTask → EstablishMPPConnection.

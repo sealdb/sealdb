@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 cascades more rules；下一步 mpp-multi-sender / GCS）
+> 最后更新：2026-11-04（C6 mpp-multi-sender；下一步 brie-gcs-hdfs）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：cascades EliminateFalse/Dedup + S3 BRIE + MPP exchange；下一步 multi-sender / GCS |
+| C6 | `in-progress` | C/D：multi-sender gather + cascades Dedup + S3 BRIE；下一步 brie-gcs-hdfs |
 
 ---
 
@@ -107,6 +107,17 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6 MPP multi-sender root gather
+- **完成**:
+  - `execute_mpp_root_gather` 对每个 sender `EstablishMPPConnection` 并 `merge_select_responses`
+  - `MppClient::gather_from_senders` / `gather_from_sender` API
+- **验证**:
+  - `cargo test -q -p sealdb-store --lib mpp`
+- **下一步**:
+  - brie-gcs-hdfs
 
 ### 2026-11-04
 

@@ -268,7 +268,45 @@ pub async fn establish_mpp_connection(
     Ok(merged)
 }
 
-/// Dispatch each BatchCopTask then gather from the first store via MPP exchange.
+/// Merge SelectResponse chunks from multiple gather legs.
+pub fn merge_select_responses(parts: impl IntoIterator<Item = SelectResponse>) -> SelectResponse {
+    let mut merged = SelectResponse::default();
+    for part in parts {
+        merged.chunks.extend(part.chunks);
+    }
+    merged
+}
+
+/// EstablishMPPConnection to one dispatched sender (receiver task_id = -1).
+pub async fn gather_from_sender(
+    store_addr: &str,
+    sender: TaskMeta,
+    gather_id: u64,
+) -> Result<SelectResponse> {
+    let receiver = TaskMeta {
+        start_ts: sender.start_ts,
+        task_id: -1,
+        address: String::new(),
+        gather_id,
+        query_ts: sender.query_ts,
+        local_query_id: sender.local_query_id,
+        server_id: sender.server_id,
+        mpp_version: sender.mpp_version,
+    };
+    establish_mpp_connection(
+        store_addr,
+        EstablishMppConnectionRequest {
+            sender_meta: Some(sender),
+            receiver_meta: Some(receiver),
+        },
+    )
+    .await
+}
+
+/// Dispatch each BatchCopTask then gather from **all** senders via MPP exchange.
+///
+/// Previously only the first store was connected; multi-sender merges every
+/// EstablishMPPConnection stream into one SelectResponse.
 pub async fn execute_mpp_root_gather(
     tasks: &[BatchCopTask],
     gather_id: u64,
@@ -284,26 +322,11 @@ pub async fn execute_mpp_root_gather(
         let _ = dispatch_mpp_task(&task.store_addr, req).await?;
         metas.push(task_meta_for(task, task_id, gather_id));
     }
-    // Root gather: connect to first dispatched task as sender; TiDB receiver task_id=-1.
-    let sender = metas[0].clone();
-    let receiver = TaskMeta {
-        start_ts: sender.start_ts,
-        task_id: -1,
-        address: String::new(),
-        gather_id,
-        query_ts: sender.query_ts,
-        local_query_id: sender.local_query_id,
-        server_id: sender.server_id,
-        mpp_version: sender.mpp_version,
-    };
-    establish_mpp_connection(
-        &tasks[0].store_addr,
-        EstablishMppConnectionRequest {
-            sender_meta: Some(sender),
-            receiver_meta: Some(receiver),
-        },
-    )
-    .await
+    let mut parts = Vec::with_capacity(metas.len());
+    for (task, sender) in tasks.iter().zip(metas) {
+        parts.push(gather_from_sender(&task.store_addr, sender, gather_id).await?);
+    }
+    Ok(merge_select_responses(parts))
 }
 
 #[derive(Debug, Clone)]
@@ -386,5 +409,34 @@ mod tests {
         assert_eq!(meta.task_id, 3);
         assert_eq!(meta.gather_id, 9);
         assert_eq!(meta.address, "127.0.0.1:3930");
+    }
+
+    #[test]
+    fn test_merge_select_responses_concatenates_chunks() {
+        use crate::copr::dag::Chunk;
+        let a = SelectResponse {
+            chunks: vec![Chunk {
+                rows_data: vec![1],
+                rows_meta: vec![],
+            }],
+            ..Default::default()
+        };
+        let b = SelectResponse {
+            chunks: vec![
+                Chunk {
+                    rows_data: vec![2],
+                    rows_meta: vec![],
+                },
+                Chunk {
+                    rows_data: vec![3],
+                    rows_meta: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        let merged = merge_select_responses([a, b]);
+        assert_eq!(merged.chunks.len(), 3);
+        assert_eq!(merged.chunks[0].rows_data, vec![1]);
+        assert_eq!(merged.chunks[2].rows_data, vec![3]);
     }
 }
