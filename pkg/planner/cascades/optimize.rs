@@ -66,9 +66,9 @@ fn fingerprint_label(root: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascades::transformation_rules::true_selection_fingerprint;
     use crate::cascades::memo::{Group, GroupExpr, Memo};
     use crate::cascades::transformation_rules::TransformationRules;
+    use crate::cascades::transformation_rules::true_selection_fingerprint;
 
     #[test]
     fn test_optimize_seeds_memo() {

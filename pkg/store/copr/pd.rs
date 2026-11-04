@@ -128,9 +128,9 @@ pub fn pd_get_region(pd_endpoints: &[String], key: &[u8]) -> Result<PdRegion> {
         let url = format!("{base}/pd/api/v1/region/key/{hex}");
         match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
-                return resp.json::<PdRegion>().map_err(|e| {
-                    Error::new(ERR_UNKNOWN_ERROR, format!("pd region decode: {e}"))
-                });
+                return resp
+                    .json::<PdRegion>()
+                    .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("pd region decode: {e}")));
             }
             Err(e) => last_err = Some(e),
         }
@@ -164,9 +164,9 @@ pub fn pd_get_store(pd_endpoints: &[String], store_id: u64) -> Result<PdStoreInf
         let url = format!("{base}/pd/api/v1/store/{store_id}");
         match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
-                let wrap = resp.json::<PdStoreWrap>().map_err(|e| {
-                    Error::new(ERR_UNKNOWN_ERROR, format!("pd store decode: {e}"))
-                })?;
+                let wrap = resp
+                    .json::<PdStoreWrap>()
+                    .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("pd store decode: {e}")))?;
                 return Ok(wrap.store);
             }
             Err(e) => last_err = Some(e),
@@ -191,9 +191,9 @@ pub fn pd_list_stores(pd_endpoints: &[String]) -> Result<Vec<PdStoreInfo>> {
         let url = format!("{base}/pd/api/v1/stores");
         match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
-                let wrap = resp.json::<PdStoresWrap>().map_err(|e| {
-                    Error::new(ERR_UNKNOWN_ERROR, format!("pd stores decode: {e}"))
-                })?;
+                let wrap = resp
+                    .json::<PdStoresWrap>()
+                    .map_err(|e| Error::new(ERR_UNKNOWN_ERROR, format!("pd stores decode: {e}")))?;
                 return Ok(wrap.stores.into_iter().map(|e| e.store).collect());
             }
             Err(e) => last_err = Some(e),

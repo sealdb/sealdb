@@ -285,17 +285,9 @@ mod tests {
     fn test_tipb_chunk_roundtrip_mixed() {
         let tps = [TYPE_LONG_LONG, TYPE_VAR_STRING, TYPE_DOUBLE];
         let rows = vec![
-            vec![
-                Datum::I64(1),
-                Datum::Bytes(b"a".to_vec()),
-                Datum::F64(1.5),
-            ],
+            vec![Datum::I64(1), Datum::Bytes(b"a".to_vec()), Datum::F64(1.5)],
             vec![Datum::Null, Datum::Bytes(b"bb".to_vec()), Datum::Null],
-            vec![
-                Datum::I64(-3),
-                Datum::Bytes(Vec::new()),
-                Datum::F64(-2.0),
-            ],
+            vec![Datum::I64(-3), Datum::Bytes(Vec::new()), Datum::F64(-2.0)],
         ];
         let bytes = encode_chunk(&tps, &rows).unwrap();
         let decoded = decode_chunk(&tps, &bytes).unwrap();

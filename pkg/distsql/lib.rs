@@ -7,4 +7,4 @@ pub mod select;
 pub mod select_result;
 
 pub use distsql::build_table_select_tasks;
-pub use select_result::{decode_select_response, Chunk, SelectResponse};
+pub use select_result::{Chunk, SelectResponse, decode_select_response};

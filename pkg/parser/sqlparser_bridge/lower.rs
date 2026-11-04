@@ -1988,7 +1988,9 @@ fn parse_binlog_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
 
 fn capture_raw_stmt(bytes: &[u8], start: usize) -> (String, usize) {
     let end = skip_stmt_tail(bytes, start);
-    let raw_sql = String::from_utf8_lossy(&bytes[start..end]).trim().to_string();
+    let raw_sql = String::from_utf8_lossy(&bytes[start..end])
+        .trim()
+        .to_string();
     (raw_sql, end)
 }
 
@@ -4832,10 +4834,7 @@ fn extract_load_data(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                             }
                             let (col, next) = read_ident(bytes, j);
                             if col.is_empty() {
-                                return Err(Error::new(
-                                    ERR_PARSE_ERROR,
-                                    "LOAD DATA column list",
-                                ));
+                                return Err(Error::new(ERR_PARSE_ERROR, "LOAD DATA column list"));
                             }
                             columns.push(col);
                             j = skip_ws(bytes, next);
@@ -5022,10 +5021,7 @@ fn extract_sequence_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     Ok((out, ops))
 }
 
-fn read_qualified_name(
-    bytes: &[u8],
-    start: usize,
-) -> Result<(Option<String>, String, usize)> {
+fn read_qualified_name(bytes: &[u8], start: usize) -> Result<(Option<String>, String, usize)> {
     let (first, after_first) = read_ident(bytes, start);
     if first.is_empty() {
         return Err(Error::new(ERR_PARSE_ERROR, "missing sequence name"));
@@ -5168,9 +5164,8 @@ fn read_signed_number(bytes: &[u8], start: usize) -> Result<(i64, usize)> {
     while j < bytes.len() && bytes[j].is_ascii_digit() {
         j += 1;
     }
-    let raw = std::str::from_utf8(&bytes[i..j]).map_err(|_| {
-        Error::new(ERR_PARSE_ERROR, "invalid sequence number")
-    })?;
+    let raw = std::str::from_utf8(&bytes[i..j])
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid sequence number"))?;
     let mut value: i64 = raw
         .parse()
         .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid sequence number {raw}")))?;

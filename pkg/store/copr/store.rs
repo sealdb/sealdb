@@ -1,7 +1,7 @@
 //! TiDB `pkg/store/copr/store.go` — Cop store handle over PD endpoints.
 
 use super::rpc::execute_cop_task;
-use super::task::{build_table_scan_tasks, CopTask};
+use super::task::{CopTask, build_table_scan_tasks};
 use super::{ColumnInfo, SelectResponse, Selection};
 use sealdb_errno::Result;
 

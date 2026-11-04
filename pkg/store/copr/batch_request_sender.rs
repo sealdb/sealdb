@@ -63,11 +63,9 @@ impl BatchRequestSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copr::batch_coprocessor::{
-        build_batch_cop_tasks, BatchStorePrefer,
-    };
-    use crate::copr::rpc::build_store_batch_request;
     use crate::copr::KeyRange;
+    use crate::copr::batch_coprocessor::{BatchStorePrefer, build_batch_cop_tasks};
+    use crate::copr::rpc::build_store_batch_request;
 
     #[test]
     fn test_sender_mixed_engines_rejected() {

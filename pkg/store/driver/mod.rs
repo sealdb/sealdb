@@ -189,10 +189,9 @@ impl TikvTransaction {
             let range_end = end.to_vec();
             let range_start = cursor.clone();
             let batch: Vec<(Vec<u8>, Vec<u8>)> = if let Some(snap) = self.read_snapshot.as_mut() {
-                let pairs = self.rt.block_on(snap.scan(
-                    Key::from(range_start)..Key::from(range_end),
-                    SCAN_LIMIT,
-                ));
+                let pairs = self
+                    .rt
+                    .block_on(snap.scan(Key::from(range_start)..Key::from(range_end), SCAN_LIMIT));
                 pairs.map_err(map_tikv_err)?.map(pair_owned).collect()
             } else {
                 let mut txn = self.take_txn()?;
@@ -267,18 +266,12 @@ impl Transaction for TikvTransaction {
         }
         let fetched: Vec<(Vec<u8>, Vec<u8>)> = if let Some(snap) = self.read_snapshot.as_mut() {
             let pairs = self.rt.block_on(snap.batch_get(miss));
-            pairs
-                .map_err(map_tikv_err)?
-                .map(pair_owned)
-                .collect()
+            pairs.map_err(map_tikv_err)?.map(pair_owned).collect()
         } else {
             let mut txn = self.take_txn()?;
             let pairs = self.rt.block_on(txn.batch_get(miss));
             self.put_txn(txn);
-            pairs
-                .map_err(map_tikv_err)?
-                .map(pair_owned)
-                .collect()
+            pairs.map_err(map_tikv_err)?.map(pair_owned).collect()
         };
         out.extend(fetched);
         Ok(out)
@@ -313,12 +306,7 @@ impl Transaction for TikvTransaction {
             let mut txn = self.take_txn()?;
             let pairs = self.rt.block_on(txn.batch_get_for_update(miss));
             self.put_txn(txn);
-            out.extend(
-                pairs
-                    .map_err(map_tikv_err)?
-                    .into_iter()
-                    .map(pair_owned),
-            );
+            out.extend(pairs.map_err(map_tikv_err)?.into_iter().map(pair_owned));
         }
         Ok(out)
     }

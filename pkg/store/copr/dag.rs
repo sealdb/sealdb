@@ -288,10 +288,7 @@ pub fn encode_select_response(rows: &[Vec<Datum>]) -> SelectResponse {
 }
 
 /// Build a SelectResponse with TypeChunk columnar encoding.
-pub fn encode_select_response_chunk(
-    col_tps: &[u8],
-    rows: &[Vec<Datum>],
-) -> Result<SelectResponse> {
+pub fn encode_select_response_chunk(col_tps: &[u8], rows: &[Vec<Datum>]) -> Result<SelectResponse> {
     let rows_data = sealdb_util::chunk::encode_chunk(col_tps, rows)?;
     Ok(SelectResponse {
         error: None,
@@ -371,11 +368,7 @@ mod tests {
             sealdb_types::TYPE_DOUBLE,
         ];
         let rows = vec![
-            vec![
-                Datum::I64(7),
-                Datum::Bytes(b"x".to_vec()),
-                Datum::F64(3.25),
-            ],
+            vec![Datum::I64(7), Datum::Bytes(b"x".to_vec()), Datum::F64(3.25)],
             vec![Datum::Null, Datum::Bytes(b"yz".to_vec()), Datum::Null],
         ];
         let resp = encode_select_response_chunk(&tps, &rows).unwrap();

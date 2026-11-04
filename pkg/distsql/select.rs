@@ -4,9 +4,7 @@
 //! module only builds task payloads matching TiDB DistSQL.
 
 use sealdb_errno::Result;
-use sealdb_store::{
-    build_table_scan_tasks, ColumnInfo, CopTask, Selection,
-};
+use sealdb_store::{ColumnInfo, CopTask, Selection, build_table_scan_tasks};
 
 /// Build CopTasks for a table-range DistSQL Select (TableScan DAG).
 pub fn build_table_select_tasks(
@@ -44,18 +42,9 @@ mod tests {
             tp: 8,
             pk_handle: true,
         }];
-        let tasks = build_table_select_tasks(
-            &[],
-            7,
-            99,
-            &cols,
-            &[0],
-            &[0x74],
-            &[0x75],
-            None,
-            Some(5),
-        )
-        .unwrap();
+        let tasks =
+            build_table_select_tasks(&[], 7, 99, &cols, &[0], &[0x74], &[0x75], None, Some(5))
+                .unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].start_ts, 7);
         assert_eq!(tasks[0].tp, sealdb_store::REQ_TYPE_DAG);

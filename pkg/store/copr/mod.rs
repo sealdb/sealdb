@@ -21,21 +21,21 @@ pub mod store;
 pub mod task;
 
 pub use batch_coprocessor::{
-    balance_batch_cop_tasks, build_batch_cop_tasks, BatchCopTask, BatchStorePrefer,
+    BatchCopTask, BatchStorePrefer, balance_batch_cop_tasks, build_batch_cop_tasks,
 };
 pub use batch_request_sender::BatchRequestSender;
 pub use dag::{
-    decode_default_rows, decode_select_response, decode_select_rows, encode_default_row,
-    encode_select_response, encode_select_response_chunk, encode_table_scan_dag, Chunk, ColumnInfo,
-    DagRequest, EncodeType, ExecType, Executor, IndexScan, Limit, RowMeta, SelectResponse,
-    Selection, TableScan, TipbError, REQ_TYPE_DAG,
+    Chunk, ColumnInfo, DagRequest, EncodeType, ExecType, Executor, IndexScan, Limit, REQ_TYPE_DAG,
+    RowMeta, SelectResponse, Selection, TableScan, TipbError, decode_default_rows,
+    decode_select_response, decode_select_rows, encode_default_row, encode_select_response,
+    encode_select_response_chunk, encode_table_scan_dag,
 };
 pub use mpp::{MppClient, MppDispatchPlan};
 pub use rpc::{
     build_store_batch_request, execute_batch_cop_task, execute_batch_cop_tasks_stream,
     execute_batch_coprocessor_stream, execute_cop_task, execute_cop_task_blocking,
 };
-pub use task::{build_table_scan_tasks, CopTask};
+pub use task::{CopTask, build_table_scan_tasks};
 
 use pd::{decode_pd_key, pd_get_region};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
@@ -57,10 +57,7 @@ pub fn clear_pd_endpoints() {
 
 /// Current process PD endpoints (empty for MemStorage).
 pub fn pd_endpoints() -> Vec<String> {
-    PD_ENDPOINTS
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    PD_ENDPOINTS.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Half-open key range `[start, end)`.
@@ -94,10 +91,7 @@ pub fn split_key_ranges(start: &[u8], end: &[u8]) -> Vec<KeyRange> {
 /// Prefer PD Region locate when endpoints are configured; otherwise single span.
 /// On PD errors, falls back to a single contiguous range so scans stay available.
 pub fn split_key_ranges_for_scan(start: &[u8], end: &[u8]) -> Vec<KeyRange> {
-    let endpoints = PD_ENDPOINTS
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let endpoints = PD_ENDPOINTS.lock().map(|g| g.clone()).unwrap_or_default();
     if endpoints.is_empty() {
         return split_key_ranges(start, end);
     }
@@ -186,11 +180,7 @@ mod tests {
 
     #[test]
     fn test_split_key_ranges_via_pd_if_available() {
-        let ranges = match split_key_ranges_via_pd(
-            &["127.0.0.1:2379".to_string()],
-            b"t",
-            b"u",
-        ) {
+        let ranges = match split_key_ranges_via_pd(&["127.0.0.1:2379".to_string()], b"t", b"u") {
             Ok(r) => r,
             Err(err) => {
                 eprintln!("skip pd region split: {err}");

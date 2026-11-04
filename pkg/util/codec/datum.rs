@@ -1,8 +1,8 @@
 //! TiDB `util/codec` EncodeValue / DecodeOne (TypeDefault Cop rows).
 
 use super::{
-    decode_bytes, decode_float, decode_int, decode_uint, decode_uvarint, decode_varint, encode_bytes,
-    encode_float, encode_int, encode_uint, encode_varint,
+    decode_bytes, decode_float, decode_int, decode_uint, decode_uvarint, decode_varint,
+    encode_bytes, encode_float, encode_int, encode_uint, encode_varint,
 };
 use sealdb_errno::{ERR_INVALID_KEY, Error, Result};
 use sealdb_types::Datum;
@@ -92,9 +92,8 @@ pub fn decode_one(b: &[u8]) -> Result<(&[u8], Datum)> {
         DECIMAL_FLAG => {
             let (rest, v) = decode_compact_bytes(rest)?;
             let s = String::from_utf8_lossy(&v);
-            let dec = sealdb_types::MyDecimal::parse(&s).map_err(|e| {
-                Error::new(ERR_INVALID_KEY, format!("decimal decode: {e}"))
-            })?;
+            let dec = sealdb_types::MyDecimal::parse(&s)
+                .map_err(|e| Error::new(ERR_INVALID_KEY, format!("decimal decode: {e}")))?;
             Ok((rest, Datum::Decimal(dec)))
         }
         DURATION_FLAG => {

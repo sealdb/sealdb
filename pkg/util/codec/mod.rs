@@ -6,7 +6,7 @@ pub mod number;
 pub use bytes::{
     decode_bytes, decode_bytes_desc, encode_bytes, encode_bytes_desc, encoded_bytes_length,
 };
-pub use datum::{decode_one, encode_value, BYTES_FLAG, INT_FLAG, NIL_FLAG, UINT_FLAG};
+pub use datum::{BYTES_FLAG, INT_FLAG, NIL_FLAG, UINT_FLAG, decode_one, encode_value};
 pub use float::{decode_float, decode_float_desc, encode_float, encode_float_desc};
 pub use number::{
     decode_int, decode_int_desc, decode_uint, decode_uint_desc, decode_uvarint, decode_varint,

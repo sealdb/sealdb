@@ -1,5 +1,7 @@
 use crate::table::resolve_name;
-use sealdb_errno::{ERR_BAD_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_WRONG_OBJECT, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_WRONG_OBJECT, Error, Result,
+};
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{Mutator, SequenceInfo, TableInfo};
 use sealdb_parser::ast::{
