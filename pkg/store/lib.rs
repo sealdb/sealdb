@@ -15,7 +15,8 @@ pub use copr::pd::{
 };
 pub use copr::{
     build_table_scan_tasks, clear_pd_endpoints, decode_default_rows, decode_select_response,
-    decode_select_rows, encode_default_row, encode_select_response, encode_table_scan_dag,
+    decode_select_rows, encode_default_row, encode_select_response, encode_select_response_chunk,
+    encode_table_scan_dag,
     execute_cop_task, execute_cop_task_blocking, pd_endpoints, set_pd_endpoints, split_key_ranges,
     split_key_ranges_for_scan, split_key_ranges_via_pd, Chunk, ColumnInfo, CopTask, DagRequest,
     EncodeType, ExecType, Executor, IndexScan, KeyRange, Limit, RowMeta, SelectResponse,
