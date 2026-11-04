@@ -9,8 +9,8 @@ use super::batch_coprocessor::{
 };
 use super::dag::SelectResponse;
 use super::mpp_exchange::{
-    TaskMeta, build_dispatch_request, dispatch_mpp_task, execute_mpp_root_gather,
-    gather_from_sender, task_meta_for,
+    CancelTaskRequest, MppError, TaskMeta, build_dispatch_request, cancel_mpp_task,
+    dispatch_mpp_task, execute_mpp_root_gather, gather_from_sender, task_meta_for,
 };
 use super::mpp_probe::MppProbe;
 use super::pd::PdStoreInfo;
@@ -145,6 +145,49 @@ impl MppClient {
         gather_id: u64,
     ) -> Result<SelectResponse> {
         gather_from_sender(store_addr, sender, gather_id).await
+    }
+
+    /// CancelMPPTask for one dispatched sender (best-effort abort).
+    pub async fn cancel_task(
+        &self,
+        store_addr: &str,
+        meta: TaskMeta,
+        code: i32,
+        msg: &str,
+    ) -> Result<()> {
+        let _ = cancel_mpp_task(
+            store_addr,
+            CancelTaskRequest {
+                meta: Some(meta),
+                error: Some(MppError {
+                    code,
+                    msg: msg.to_string(),
+                }),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// CancelMPPTask for every dispatched meta (stops on first error).
+    pub async fn cancel_tasks(
+        &self,
+        tasks: &[BatchCopTask],
+        metas: &[TaskMeta],
+        code: i32,
+        msg: &str,
+    ) -> Result<()> {
+        if tasks.len() != metas.len() {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("mpp cancel: tasks {} != metas {}", tasks.len(), metas.len()),
+            ));
+        }
+        for (task, meta) in tasks.iter().zip(metas.iter()) {
+            self.cancel_task(&task.store_addr, meta.clone(), code, msg)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Multi-sender root gather: DispatchMPPTask then EstablishMPPConnection to each meta.

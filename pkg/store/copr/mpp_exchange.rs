@@ -1,4 +1,5 @@
-//! TiDB MPP exchange RPCs: `DispatchMPPTask` + `EstablishMPPConnection`.
+//! TiDB MPP exchange RPCs: `DispatchMPPTask`, `EstablishMPPConnection`,
+//! `CancelMPPTask`.
 //!
 //! Subset of `mpp.proto` / `tikvpb.Tikv` used for C6-D root-gather MVB.
 
@@ -74,11 +75,11 @@ pub struct DispatchTaskRequest {
 
 /// `mpp.Error`
 #[derive(Clone, PartialEq, Message)]
-struct MppError {
+pub struct MppError {
     #[prost(int32, tag = "1")]
-    code: i32,
+    pub code: i32,
     #[prost(string, tag = "2")]
-    msg: String,
+    pub msg: String,
 }
 
 /// `mpp.DispatchTaskResponse` (subset).
@@ -106,6 +107,22 @@ pub struct MppDataPacket {
     error: Option<MppError>,
     #[prost(bytes = "vec", repeated, tag = "3")]
     pub chunks: Vec<Vec<u8>>,
+}
+
+/// `mpp.CancelTaskRequest` (subset).
+#[derive(Clone, PartialEq, Message)]
+pub struct CancelTaskRequest {
+    #[prost(message, optional, tag = "1")]
+    pub meta: Option<TaskMeta>,
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<MppError>,
+}
+
+/// `mpp.CancelTaskResponse` (subset).
+#[derive(Clone, PartialEq, Message)]
+pub struct CancelTaskResponse {
+    #[prost(message, optional, tag = "1")]
+    error: Option<MppError>,
 }
 
 /// Build TaskMeta for a store-assigned BatchCop fragment.
@@ -203,6 +220,48 @@ pub async fn dispatch_mpp_task(
                 ERR_UNKNOWN_ERROR
             },
             format!("DispatchMPPTask: {}", err.msg),
+        ));
+    }
+    Ok(resp)
+}
+
+/// Unary `CancelMPPTask` to a TiFlash store.
+pub async fn cancel_mpp_task(
+    store_addr: &str,
+    req: CancelTaskRequest,
+) -> Result<CancelTaskResponse> {
+    let endpoint = normalize_http(store_addr);
+    let channel = Channel::from_shared(endpoint.clone())
+        .map_err(|e| {
+            Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("tiflash endpoint {endpoint}: {e}"),
+            )
+        })?
+        .connect()
+        .await
+        .map_err(|e| {
+            Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("tiflash connect {endpoint}: {e}"),
+            )
+        })?;
+    let mut client = TikvMppClient::new(channel);
+    let resp = client
+        .cancel_mpp_task(Request::new(req))
+        .await
+        .map_err(map_status)?
+        .into_inner();
+    if let Some(err) = &resp.error
+        && (err.code != 0 || !err.msg.is_empty())
+    {
+        return Err(Error::new(
+            if err.code != 0 {
+                err.code
+            } else {
+                ERR_UNKNOWN_ERROR
+            },
+            format!("CancelMPPTask: {}", err.msg),
         ));
     }
     Ok(resp)
@@ -368,6 +427,20 @@ impl TikvMppClient {
         let path = http::uri::PathAndQuery::from_static("/tikvpb.Tikv/EstablishMPPConnection");
         self.inner.server_streaming(request, path, codec).await
     }
+
+    #[allow(clippy::result_large_err)]
+    async fn cancel_mpp_task(
+        &mut self,
+        request: Request<CancelTaskRequest>,
+    ) -> std::result::Result<tonic::Response<CancelTaskResponse>, Status> {
+        self.inner
+            .ready()
+            .await
+            .map_err(|e| Status::unknown(format!("Service was not ready: {e}")))?;
+        let codec = tonic::codec::ProstCodec::default();
+        let path = http::uri::PathAndQuery::from_static("/tikvpb.Tikv/CancelMPPTask");
+        self.inner.unary(request, path, codec).await
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +482,24 @@ mod tests {
         assert_eq!(meta.task_id, 3);
         assert_eq!(meta.gather_id, 9);
         assert_eq!(meta.address, "127.0.0.1:3930");
+    }
+
+    #[test]
+    fn test_cancel_task_request_encodes() {
+        let meta = task_meta_for(&sample_task(), 3, 9);
+        let req = CancelTaskRequest {
+            meta: Some(meta),
+            error: Some(MppError {
+                code: 1,
+                msg: "abort".into(),
+            }),
+        };
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+        let decoded = CancelTaskRequest::decode(buf.as_slice()).unwrap();
+        assert_eq!(decoded.meta.unwrap().task_id, 3);
+        assert_eq!(decoded.error.unwrap().msg, "abort");
     }
 
     #[test]
