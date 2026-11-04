@@ -6,7 +6,12 @@ pub mod mydecimal;
 pub mod time;
 
 pub use datum::Datum;
-pub use field_type::{EvalType, FieldType};
+pub use field_type::{
+    EvalType, FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DECIMAL, TYPE_DOUBLE,
+    TYPE_DURATION, TYPE_FLOAT, TYPE_INT24, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG,
+    TYPE_MEDIUM_BLOB, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY,
+    TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
+};
 pub use mydecimal::MyDecimal;
 pub use time::Time;
 

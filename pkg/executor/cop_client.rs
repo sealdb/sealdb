@@ -83,7 +83,8 @@ pub(crate) fn try_execute_cop_tasks_remote(
     if pd.is_empty() {
         return None;
     }
-    let col_count = info.columns.len();
+    let col_tps: Vec<u8> = info.columns.iter().map(|c| c.field_type.tp).collect();
+    let col_count = col_tps.len();
     let mut rows = Vec::new();
     for task in tasks {
         let resp = match sealdb_store::execute_cop_task_blocking(&pd, task) {
@@ -93,7 +94,7 @@ pub(crate) fn try_execute_cop_tasks_remote(
                 return None;
             }
         };
-        let decoded = match decode_select_rows(&resp, col_count) {
+        let decoded = match decode_select_rows(&resp, &col_tps) {
             Ok(r) => r,
             Err(err) => {
                 eprintln!("sealdb tipb decode: {err}; falling back to local scan");

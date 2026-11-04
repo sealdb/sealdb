@@ -237,24 +237,32 @@ pub fn decode_default_rows(rows_data: &[u8], col_count: usize) -> Result<Vec<Vec
     Ok(rows)
 }
 
-/// Decode all TypeDefault chunks in a SelectResponse.
-pub fn decode_select_rows(resp: &SelectResponse, col_count: usize) -> Result<Vec<Vec<Datum>>> {
-    if resp.encode_type != EncodeType::TypeDefault as i32 && resp.encode_type != 0 {
-        // encode_type 0 is Default; non-zero non-default still try Default layout for MVB.
-        if resp.encode_type == EncodeType::TypeChunk as i32
-            || resp.encode_type == EncodeType::TypeCHBlock as i32
-        {
-            return Err(Error::new(
-                ERR_UNKNOWN_ERROR,
-                format!("unsupported tipb encode_type {}", resp.encode_type),
-            ));
+/// Decode SelectResponse rows. `col_tps` is MySQL type codes (one per column).
+///
+/// Dispatches on `encode_type`: TypeDefault uses EncodeValue stream; TypeChunk
+/// uses columnar tipb chunk codec. TypeCHBlock is unsupported.
+pub fn decode_select_rows(resp: &SelectResponse, col_tps: &[u8]) -> Result<Vec<Vec<Datum>>> {
+    match resp.encode_type {
+        x if x == EncodeType::TypeCHBlock as i32 => Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            "unsupported tipb encode_type TypeCHBlock",
+        )),
+        x if x == EncodeType::TypeChunk as i32 => {
+            let mut out = Vec::new();
+            for chunk in &resp.chunks {
+                out.extend(sealdb_util::chunk::decode_chunk(col_tps, &chunk.rows_data)?);
+            }
+            Ok(out)
+        }
+        _ => {
+            // TypeDefault (0) and unknown → EncodeValue layout.
+            let mut out = Vec::new();
+            for chunk in &resp.chunks {
+                out.extend(decode_default_rows(&chunk.rows_data, col_tps.len())?);
+            }
+            Ok(out)
         }
     }
-    let mut out = Vec::new();
-    for chunk in &resp.chunks {
-        out.extend(decode_default_rows(&chunk.rows_data, col_count)?);
-    }
-    Ok(out)
 }
 
 /// Build a SelectResponse carrying TypeDefault-encoded rows (tests / local sim).
@@ -277,6 +285,22 @@ pub fn encode_select_response(rows: &[Vec<Datum>]) -> SelectResponse {
         }],
         encode_type: EncodeType::TypeDefault as i32,
     }
+}
+
+/// Build a SelectResponse with TypeChunk columnar encoding.
+pub fn encode_select_response_chunk(
+    col_tps: &[u8],
+    rows: &[Vec<Datum>],
+) -> Result<SelectResponse> {
+    let rows_data = sealdb_util::chunk::encode_chunk(col_tps, rows)?;
+    Ok(SelectResponse {
+        error: None,
+        chunks: vec![Chunk {
+            rows_data,
+            rows_meta: Vec::new(),
+        }],
+        encode_type: EncodeType::TypeChunk as i32,
+    })
 }
 
 #[cfg(test)]
@@ -331,10 +355,35 @@ mod tests {
             vec![Datum::I64(2), Datum::Null],
         ];
         let resp = encode_select_response(&rows);
-        let decoded = decode_select_rows(&resp, 2).unwrap();
+        let tps = [sealdb_types::TYPE_LONG_LONG, sealdb_types::TYPE_VAR_STRING];
+        let decoded = decode_select_rows(&resp, &tps).unwrap();
         assert_eq!(decoded, rows);
         let wire = resp.encode_to_vec();
         let parsed = decode_select_response(&wire).unwrap();
-        assert_eq!(decode_select_rows(&parsed, 2).unwrap(), rows);
+        assert_eq!(decode_select_rows(&parsed, &tps).unwrap(), rows);
+    }
+
+    #[test]
+    fn test_typechunk_select_roundtrip() {
+        let tps = [
+            sealdb_types::TYPE_LONG_LONG,
+            sealdb_types::TYPE_VAR_STRING,
+            sealdb_types::TYPE_DOUBLE,
+        ];
+        let rows = vec![
+            vec![
+                Datum::I64(7),
+                Datum::Bytes(b"x".to_vec()),
+                Datum::F64(3.25),
+            ],
+            vec![Datum::Null, Datum::Bytes(b"yz".to_vec()), Datum::Null],
+        ];
+        let resp = encode_select_response_chunk(&tps, &rows).unwrap();
+        assert_eq!(resp.encode_type, EncodeType::TypeChunk as i32);
+        let decoded = decode_select_rows(&resp, &tps).unwrap();
+        assert_eq!(decoded[0][0], Datum::I64(7));
+        assert_eq!(decoded[0][1], Datum::Bytes(b"x".to_vec()));
+        assert_eq!(decoded[1][0], Datum::Null);
+        assert_eq!(decoded[1][1], Datum::Bytes(b"yz".to_vec()));
     }
 }

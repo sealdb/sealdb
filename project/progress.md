@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-03（C6-C PD list stores / scan regions；下一步 TypeChunk / TiFlash）
+> 最后更新：2026-11-04（C6-C tipb TypeChunk decode；下一步 cascades/TiFlash）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -107,6 +107,19 @@
 ---
 
 ## 4. 当前工作与证据
+
+### 2026-11-04
+
+- **Phase**: C6-C tipb TypeChunk decode
+- **完成**:
+  - `util/chunk/tipb_codec`：列式 TypeChunk encode/decode（对齐 TiDB chunk.Codec）
+  - `decode_select_rows` 按 `encode_type` 分发 Default / Chunk
+  - TableReader 远程 Cop 路径传入列 MySQL type codes
+- **验证**:
+  - `cargo test -q -p sealdb-util --lib tipb_codec`
+  - `cargo test -q -p sealdb-store --lib`
+- **下一步**:
+  - cascades 实装；C6-D TiFlash；brie-remote
 
 ### 2026-11-03
 
