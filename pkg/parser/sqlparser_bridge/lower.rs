@@ -4730,8 +4730,7 @@ fn extract_load_data(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                     false
                 };
                 if !keyword_at(bytes, j, "INFILE") {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    i = push_sql_char(&mut out, sql, i);
                     continue;
                 }
                 j = skip_ws(bytes, j + "INFILE".len());
@@ -4866,8 +4865,7 @@ fn extract_load_data(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     Ok((out, ops))
 }
@@ -4883,7 +4881,7 @@ fn read_sql_string(bytes: &[u8], start: usize) -> Result<(String, usize)> {
     while j < bytes.len() {
         if bytes[j] == quote {
             if j + 1 < bytes.len() && bytes[j + 1] == quote {
-                out.push(quote as char);
+                out.push(char::from(quote));
                 j += 2;
                 continue;
             }
@@ -4896,13 +4894,16 @@ fn read_sql_string(bytes: &[u8], start: usize) -> Result<(String, usize)> {
                 b't' => out.push('\t'),
                 b'r' => out.push('\r'),
                 b'0' => out.push('\0'),
-                other => out.push(other as char),
+                other => out.push(char::from(other)),
             }
             j += 1;
             continue;
         }
-        out.push(bytes[j] as char);
-        j += 1;
+        let rest = std::str::from_utf8(&bytes[j..])
+            .map_err(|_| Error::new(ERR_PARSE_ERROR, "invalid UTF-8 in string literal"))?;
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        j += ch.len_utf8();
     }
     Err(Error::new(ERR_PARSE_ERROR, "unterminated string literal"))
 }
@@ -5015,8 +5016,7 @@ fn extract_sequence_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = push_sql_char(&mut out, sql, i);
     }
     Ok((out, ops))
 }
