@@ -48,6 +48,10 @@ sqlparser = "0.63"
 thiserror = "2"
 tikv-client = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+time = { version = "0.3", default-features = false, features = ["formatting", "std"] }
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 http = "1"
