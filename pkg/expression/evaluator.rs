@@ -5,7 +5,7 @@ use sealdb_errno::{
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
-    IsNullExpr, PatternLikeExpr, UnaryOpExpr,
+    InSubqueryExpr, IsNullExpr, PatternLikeExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
@@ -403,6 +403,13 @@ fn eval_logic(op: Op, left: &Datum, right: &Datum) -> Result<Datum> {
 }
 
 fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    // sqlparser always binds NOT below BETWEEN/IN/LIKE. Under HIGH_NOT_PRECEDENCE
+    // TiDB binds NOT tighter: `NOT x BETWEEN a AND b` → `(NOT x) BETWEEN a AND b`.
+    if matches!(expr.op, Op::Not | Op::Not2) && sql_mode_flag("HIGH_NOT_PRECEDENCE") {
+        if let Some(rewritten) = rewrite_high_not_precedence(expr.op, &expr.expr) {
+            return eval_expr_with_row(&rewritten, schema, row);
+        }
+    }
     let inner = eval_expr_with_row(&expr.expr, schema, row)?;
     if inner.is_null() {
         return Ok(Datum::Null);
@@ -428,6 +435,44 @@ fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Da
         Op::Not | Op::Not2 => Ok(bool_datum(!truthy(&inner).unwrap_or(false))),
         Op::Plus => Ok(inner),
         _ => Err(Error::unsupported(format!("unary {}", expr.op.restore()))),
+    }
+}
+
+fn rewrite_high_not_precedence(op: Op, inner: &ExprNode) -> Option<ExprNode> {
+    let not_inner = |e: ExprNode| {
+        ExprNode::Unary(UnaryOpExpr {
+            op,
+            expr: Box::new(e),
+        })
+    };
+    match inner {
+        ExprNode::Between(b) if !b.not => Some(ExprNode::Between(BetweenExpr {
+            expr: Box::new(not_inner((*b.expr).clone())),
+            not: false,
+            low: b.low.clone(),
+            high: b.high.clone(),
+        })),
+        ExprNode::Like(l) if !l.not => Some(ExprNode::Like(PatternLikeExpr {
+            expr: Box::new(not_inner((*l.expr).clone())),
+            not: false,
+            pattern: l.pattern.clone(),
+            ci: l.ci,
+        })),
+        ExprNode::InList(i) if !i.not => Some(ExprNode::InList(InListExpr {
+            expr: Box::new(not_inner((*i.expr).clone())),
+            not: false,
+            list: i.list.clone(),
+        })),
+        ExprNode::InSubquery(i) if !i.not => Some(ExprNode::InSubquery(InSubqueryExpr {
+            expr: Box::new(not_inner((*i.expr).clone())),
+            not: false,
+            query: i.query.clone(),
+        })),
+        ExprNode::IsNull(i) if !i.not => Some(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(not_inner((*i.expr).clone())),
+            not: false,
+        })),
+        _ => None,
     }
 }
 
@@ -883,6 +928,29 @@ mod unsigned_sub_tests {
                 eval_expr_with_row(&expr, &[], &[]).unwrap(),
                 Datum::I64(i64::MAX)
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod high_not_tests {
+    use super::*;
+    use sealdb_parser::Parser;
+    use sealdb_parser::ast::*;
+
+    fn eval_select(sql: &str) -> Datum {
+        let stmt = Parser::new().parse_one_stmt(sql).unwrap();
+        let Statement::Select(s) = stmt else { panic!() };
+        eval_expr_with_row(&s.fields[0].expr, &[], &[]).unwrap()
+    }
+
+    #[test]
+    fn not_between_default_and_high() {
+        with_sql_mode("", || {
+            assert_eq!(eval_select("SELECT NOT 1 BETWEEN -5 AND 5"), Datum::I64(0));
+        });
+        with_sql_mode("HIGH_NOT_PRECEDENCE", || {
+            assert_eq!(eval_select("SELECT NOT 1 BETWEEN -5 AND 5"), Datum::I64(1));
         });
     }
 }
