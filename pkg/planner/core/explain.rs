@@ -391,20 +391,19 @@ fn walk_with_parent(
         return;
     }
     let children = children_of(plan);
-    // `Projection → CARTESIAN HashJoin`: HashJoin is `└─` so its children need
-    // spaces (not `│`) at the join column — push `!last` instead of `!child_last`.
-    let cartesian_under_proj = matches!(
+    // `Projection → HashJoin` or Probe under `└─`: children get spaces at this
+    // column. Non-last Build readers re-introduce `│` in `bushy_cop_spine`.
+    let under_last_join = matches!(
         plan,
-        PhysicalPlan::HashJoin {
-            tp: super::physical_plans::JoinType::Cross,
-            ..
-        }
-    ) && matches!(parent, Some(PhysicalPlan::Projection { .. }));
+        PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+    ) && last
+        && (matches!(parent, Some(PhysicalPlan::Projection { .. }))
+            || spine.last() == Some(&false));
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
         let mut child_spine = spine.to_vec();
-        if cartesian_under_proj {
-            child_spine.push(!last);
+        if under_last_join {
+            child_spine.push(false);
         } else if matches!(
             plan,
             PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
@@ -490,9 +489,10 @@ fn emit_cop_children(
             } else {
                 "keep order:false".to_string()
             };
-            // Cop children inherit the TableReader's spine; the reader was already
-            // emitted with the correct │/space for HashJoin / PartitionUnion siblings.
-            let cop_spine = spine;
+            // Cop children inherit the TableReader spine; non-last Build readers
+            // need `│` at the reader column (see `bushy_cop_spine`).
+            let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+            let cop_spine = cop_owned.as_slice();
             if let Some(filter) = pushed.as_ref() {
                 push_explain_row_spine(
                     rows,
@@ -528,10 +528,9 @@ fn emit_cop_children(
                 );
             } else {
                 let mut scan_spine = cop_spine.to_vec();
-                // Projection→CARTESIAN path: reader last among siblings — pad spine
-                // so TableFullScan indents one more level than the reader.
+                // Pad so TableFullScan indents one more level than the reader.
                 if under_bushy && !cop_spine.is_empty() {
-                    scan_spine.push(!_parent_last);
+                    scan_spine.push(false);
                 }
                 push_explain_row_spine(
                     rows,
@@ -1470,8 +1469,13 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
                 super::physical_plans::JoinType::LeftOuter
                     | super::physical_plans::JoinType::RightOuter
             ) {
-                // Pseudo outer-join cardinality (TiDB unanalyzed ≈ max * 1.24875).
-                l.max(r) * 1.24875
+                // Pseudo outer-join cardinality (TiDB unanalyzed ≈ max * 1.24875);
+                // analyzed tables use max(left, right).
+                if is_pseudo_card(l) && is_pseudo_card(r) {
+                    l.max(r) * 1.24875
+                } else {
+                    l.max(r)
+                }
             } else if matches!(tp, super::physical_plans::JoinType::Semi)
                 && !semi_join_is_left_outer(on)
             {
@@ -1526,6 +1530,36 @@ fn tree_prefix_with_spine(spine: &[bool], depth: usize, last: bool) -> String {
     }
     prefix.push_str(if last { "└─" } else { "├─" });
     prefix
+}
+
+/// Cop subtree under a bushy TableReader. When the reader is not last among
+/// HashJoin siblings, put `│` at the reader column so Selection/Scan match TiDB.
+fn bushy_cop_spine(
+    spine: &[bool],
+    scan_depth: usize,
+    under_bushy: bool,
+    parent_last: bool,
+) -> Vec<bool> {
+    if !under_bushy {
+        return spine.to_vec();
+    }
+    let mut cop = spine.to_vec();
+    if parent_last {
+        return cop;
+    }
+    let need = scan_depth.saturating_sub(1);
+    while cop.len() < need {
+        cop.push(false);
+    }
+    if need > 0 {
+        cop[need - 1] = true;
+    }
+    cop
+}
+
+fn is_pseudo_card(rows: f64) -> bool {
+    // Pseudo table scan is 10000; null-reject Selection ≈ 9990.
+    rows >= 9_000.0
 }
 
 fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {
