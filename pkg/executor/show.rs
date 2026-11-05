@@ -34,11 +34,13 @@ impl Executor for ShowExec {
         let is = self.domain.infoschema();
         match self.stmt.kind {
             ShowStmtKind::Databases => {
-                self.schema = vec!["Database".to_string()];
+                self.schema = vec![show_column_header("Database", self.stmt.pattern.as_deref())];
                 self.rows = is
                     .all_schemas()
                     .into_iter()
-                    .map(|db| vec![Datum::Bytes(db.name.o().as_bytes().to_vec())])
+                    .map(|db| db.name.o().to_string())
+                    .filter(|name| show_like_ok(name, self.stmt.pattern.as_deref()))
+                    .map(|name| vec![Datum::Bytes(name.into_bytes())])
                     .collect();
             }
             ShowStmtKind::Tables => {
@@ -54,11 +56,16 @@ impl Executor for ShowExec {
                 if is.schema_by_name(&db).is_none() {
                     return Err(Error::new(ERR_BAD_DB, format!("Unknown database '{db}'")));
                 }
-                self.schema = vec![format!("Tables_in_{db}")];
+                self.schema = vec![show_column_header(
+                    &format!("Tables_in_{db}"),
+                    self.stmt.pattern.as_deref(),
+                )];
                 self.rows = is
                     .schema_tables(&db)
                     .into_iter()
-                    .map(|t| vec![Datum::Bytes(t.name.o().as_bytes().to_vec())])
+                    .map(|t| t.name.o().to_string())
+                    .filter(|name| show_like_ok(name, self.stmt.pattern.as_deref()))
+                    .map(|name| vec![Datum::Bytes(name.into_bytes())])
                     .collect();
             }
             ShowStmtKind::Grants => {
@@ -436,4 +443,42 @@ fn resolve_table(name: &TableName, current_db: &str) -> Result<(String, String)>
         return Err(Error::new(ERR_NO_DB, "No database selected"));
     }
     Ok((schema, table))
+}
+
+/// TiDB SHOW LIKE header: `Tables_in_db (pat)` / `Database (pat)`.
+fn show_column_header(base: &str, pattern: Option<&str>) -> String {
+    match pattern {
+        Some(pat) => format!("{base} ({pat})"),
+        None => base.to_string(),
+    }
+}
+
+fn show_like_ok(name: &str, pattern: Option<&str>) -> bool {
+    match pattern {
+        None => true,
+        Some(pat) => show_like_match(name.as_bytes(), pat.as_bytes()),
+    }
+}
+
+/// MySQL LIKE (`%` / `_`), case-insensitive for identifier SHOW filters.
+fn show_like_match(text: &[u8], pattern: &[u8]) -> bool {
+    show_like_at(text, 0, pattern, 0)
+}
+
+fn show_like_at(text: &[u8], ti: usize, pattern: &[u8], pi: usize) -> bool {
+    if pi == pattern.len() {
+        return ti == text.len();
+    }
+    match pattern[pi] {
+        b'%' => {
+            show_like_at(text, ti, pattern, pi + 1)
+                || (ti < text.len() && show_like_at(text, ti + 1, pattern, pi))
+        }
+        b'_' => ti < text.len() && show_like_at(text, ti + 1, pattern, pi + 1),
+        ch => {
+            ti < text.len()
+                && text[ti].eq_ignore_ascii_case(&ch)
+                && show_like_at(text, ti + 1, pattern, pi + 1)
+        }
+    }
 }

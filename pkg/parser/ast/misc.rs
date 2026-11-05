@@ -481,6 +481,8 @@ pub struct ShowStmt {
     pub table: Option<TableName>,
     pub user: Option<UserIdentity>,
     pub full: bool,
+    /// `SHOW … LIKE 'pat'` pattern (TiDB appends ` (pat)` to the column header).
+    pub pattern: Option<String>,
 }
 
 impl ShowStmt {

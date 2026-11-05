@@ -398,9 +398,11 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
         return Err(Error::unsupported(err.clone()));
     }
     let session = new_session(storage);
-    // TiDB integrationtest defaults to database `test` (mysql-tester convention).
-    let _ = session.execute_stmt("CREATE DATABASE IF NOT EXISTS test");
-    let _ = session.execute_stmt("USE test");
+    // TiDB mysql-tester: database name = suite path with `/` → `__`
+    // (`show` → `show`, `types/const` → `types__const`).
+    let db = suite.name.replace('/', "__");
+    let _ = session.execute_stmt(&format!("CREATE DATABASE IF NOT EXISTS `{db}`"));
+    let _ = session.execute_stmt(&format!("USE `{db}`"));
     let mut chunks = Vec::new();
     for step in &suite.steps {
         chunks.push(run_step(&session, step)?);
