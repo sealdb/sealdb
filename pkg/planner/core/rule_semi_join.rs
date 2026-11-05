@@ -218,6 +218,26 @@ fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Op
         Some(table) => qualify_table(expr.clone(), table),
         None => expr.clone(),
     };
+    // `a IN (SELECT outer.b + inner.b FROM inner)` → CARTESIAN semi + other cond.
+    if (!matches!(inner_expr, ExprNode::Column(_)) || !matches!(outer_expr, ExprNode::Column(_)))
+        && other_conds.is_empty()
+        && inner_filter.is_none()
+    {
+        let info = format!(
+            "CARTESIAN semi join, other cond:eq({}, {})",
+            explain_semi_pred(&outer_expr),
+            explain_semi_pred(&inner_expr),
+        );
+        return Some(SemiSpec {
+            tp: JoinType::Semi,
+            right_table: inner.name.clone(),
+            right: PhysicalPlan::table_reader(inner.name.clone(), Vec::new()),
+            on: ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(info.into_bytes()),
+            }),
+            outer_filter: None,
+        });
+    }
     if !matches!(inner_expr, ExprNode::Column(_)) || !matches!(outer_expr, ExprNode::Column(_)) {
         return None;
     }
@@ -398,15 +418,19 @@ fn explain_semi_pred(expr: &ExprNode) -> String {
                 Op::Le => "le",
                 Op::Eq => "eq",
                 Op::Ne => "ne",
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
                 _ => return expr.restore_string(),
             };
             format!(
                 "{op}({}, {})",
-                explain_semi_col(&bin.left),
-                explain_semi_col(&bin.right)
+                explain_semi_pred(&bin.left),
+                explain_semi_pred(&bin.right)
             )
         }
-        other => other.restore_string(),
+        other => explain_semi_col(other),
     }
 }
 
@@ -414,7 +438,12 @@ fn explain_semi_col(expr: &ExprNode) -> String {
     match expr {
         ExprNode::Column(c) => {
             let table = c.table.as_deref().unwrap_or("t");
-            format!("select.{table}.{}", c.name)
+            let schema = sealdb_expression::current_db_name();
+            if schema.is_empty() {
+                format!("select.{table}.{}", c.name)
+            } else {
+                format!("{schema}.{table}.{}", c.name)
+            }
         }
         other => other.restore_string(),
     }

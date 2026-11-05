@@ -7006,9 +7006,6 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             negated,
         } => {
             let query = lower_result_set(subquery)?;
-            if query.has_join() {
-                return Err(Error::unsupported("subquery JOIN"));
-            }
             Ok(ExprNode::InSubquery(InSubqueryExpr {
                 expr: Box::new(lower_expr(expr)?),
                 not: *negated,
