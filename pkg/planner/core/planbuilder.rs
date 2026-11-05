@@ -164,9 +164,12 @@ impl PlanBuilder {
                     // StreamAgg on an ordered index already yields group-by order;
                     // skip Sort when ORDER BY is a prefix of GROUP BY.
                     // Constant ORDER BY (`abs(2)`) is dropped (TiDB NominalSort/const prune).
+                    let merge_orders = matches!(plan, PhysicalPlan::MergeJoin { .. })
+                        && order_by_covered_by_merge_join(select, &plan);
                     let need_sort = !select.order_by.is_empty()
                         && !order_by_all_constant(select)
-                        && !(stream_keep_order && order_prefix_of_group_by(select));
+                        && !(stream_keep_order && order_prefix_of_group_by(select))
+                        && !merge_orders;
                     if need_sort && order_by_has_scalar_func(select) {
                         // TiDB InjectProjBelowSort: Projection → Sort → Projection.
                         plan = inject_proj_below_sort(plan, select, is, current_db);
@@ -661,7 +664,11 @@ impl PlanBuilder {
         Ok(plan)
     }
 
-    /// Left-deep MergeJoin chain for `STRAIGHT_JOIN` (no join reorder).
+    /// Left-deep MergeJoin chain for `STRAIGHT_JOIN` / `MERGE_JOIN` hint.
+    ///
+    /// With a CTE side, TiDB puts the CTE (inlined seed) as Build and wraps
+    /// non-PK sides in `not(isnull)` + Sort on the join key so ORDER BY on the
+    /// join columns needs no outer Sort.
     fn build_straight_merge_join(
         &self,
         select: &SelectStmt,
@@ -673,8 +680,34 @@ impl PlanBuilder {
         let first = &select.joins[0];
         let left = self.join_side(select, &first.left, is, current_db, stats, prune_mode)?;
         let right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
-        let (left_key, right_key) =
-            merge_join_key_labels(&first.left.name, &first.right.name, &first.on, &first.using_cols);
+        // children_of lists right(Build) then left(Probe). Keep SQL order so a
+        // CTE on the right becomes Build (TiDB CTE MERGE_JOIN goldens).
+        let (left_key, right_key) = merge_join_key_labels_for(
+            select,
+            current_db,
+            &first.left,
+            &first.right,
+            &first.on,
+            &first.using_cols,
+        );
+        let left = prepare_merge_join_side(
+            left,
+            select,
+            &first.left,
+            &first.on,
+            &left_key,
+            is,
+            current_db,
+        );
+        let right = prepare_merge_join_side(
+            right,
+            select,
+            &first.right,
+            &first.on,
+            &right_key,
+            is,
+            current_db,
+        );
         let mut plan = PhysicalPlan::MergeJoin {
             left: Box::new(left),
             right: Box::new(right),
@@ -685,9 +718,24 @@ impl PlanBuilder {
             on: first.on.clone(),
         };
         for join in select.joins.iter().skip(1) {
-            let right = self.join_side(select, &join.right, is, current_db, stats, prune_mode)?;
-            let (left_key, right_key) =
-                merge_join_key_labels(&join.left.name, &join.right.name, &join.on, &join.using_cols);
+            let mut right = self.join_side(select, &join.right, is, current_db, stats, prune_mode)?;
+            let (left_key, right_key) = merge_join_key_labels_for(
+                select,
+                current_db,
+                &join.left,
+                &join.right,
+                &join.on,
+                &join.using_cols,
+            );
+            right = prepare_merge_join_side(
+                right,
+                select,
+                &join.right,
+                &join.on,
+                &right_key,
+                is,
+                current_db,
+            );
             plan = PhysicalPlan::MergeJoin {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -1419,34 +1467,206 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
     }
 }
 
-/// TiDB MergeJoin ExplainInfo keys: `select.t1.id` / `select.t2.id`.
-fn merge_join_key_labels(
-    left_table: &str,
-    right_table: &str,
+/// Resolve MergeJoin key labels using OrigTblName (CTE seed / physical table).
+fn merge_join_key_labels_for(
+    select: &SelectStmt,
+    current_db: &str,
+    left: &TableName,
+    right: &TableName,
     on: &ExprNode,
     using_cols: &[String],
 ) -> (String, String) {
+    let left_phys = merge_join_orig_table(select, left);
+    let right_phys = merge_join_orig_table(select, right);
+    let schema = if current_db.is_empty() {
+        "select"
+    } else {
+        current_db
+    };
     if let Some(col) = using_cols.first() {
         return (
-            format!("select.{left_table}.{col}"),
-            format!("select.{right_table}.{col}"),
+            format!("{schema}.{left_phys}.{col}"),
+            format!("{schema}.{right_phys}.{col}"),
         );
     }
     if let ExprNode::Binary(bin) = on
         && bin.op == Op::Eq
         && let (ExprNode::Column(l), ExprNode::Column(r)) = (bin.left.as_ref(), bin.right.as_ref())
     {
-        let lt = l.table.as_deref().unwrap_or(left_table);
-        let rt = r.table.as_deref().unwrap_or(right_table);
+        let col_for = |side: &TableName, phys: &str| -> String {
+            let alias = side.name.as_str();
+            let resolved = side.resolve_name();
+            if l.table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(alias) || t.eq_ignore_ascii_case(resolved))
+            {
+                format!("{schema}.{phys}.{}", l.name)
+            } else if r
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(alias) || t.eq_ignore_ascii_case(resolved))
+            {
+                format!("{schema}.{phys}.{}", r.name)
+            } else {
+                format!("{schema}.{phys}.{}", l.name)
+            }
+        };
         return (
-            format!("select.{lt}.{}", l.name),
-            format!("select.{rt}.{}", r.name),
+            col_for(left, &left_phys),
+            col_for(right, &right_phys),
         );
     }
     (
-        format!("select.{left_table}.id"),
-        format!("select.{right_table}.id"),
+        format!("{schema}.{left_phys}.id"),
+        format!("{schema}.{right_phys}.id"),
     )
+}
+
+fn merge_join_orig_table(select: &SelectStmt, table: &TableName) -> String {
+    if let Some(with) = select.with.as_ref()
+        && let Some(cte) = with.find(table.resolve_name())
+    {
+        // Non-recursive CTE seed FROM table → OrigTblName for ExplainInfo.
+        if let Some(from) = cte.query.from.as_ref() {
+            return from.resolve_name().to_string();
+        }
+    }
+    table.resolve_name().to_string()
+}
+
+/// Null-reject + Sort for MergeJoin inputs that are not already PK-ordered.
+fn prepare_merge_join_side(
+    mut plan: PhysicalPlan,
+    select: &SelectStmt,
+    table: &TableName,
+    on: &ExprNode,
+    key_label: &str,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let phys = merge_join_orig_table(select, table);
+    let pk_ordered = merge_join_side_pk_ordered(select, table, on, is, current_db);
+    if !pk_ordered {
+        let filter = null_reject_on_inner(on, &table.name, &phys)
+            .or_else(|| null_reject_on_inner(on, table.resolve_name(), &phys));
+        if let Some(filter) = filter {
+            // Push through inline CTE seed so EXPLAIN shows cop Selection under
+            // TableReader (`data:Selection`), not a root Selection above CTE.
+            // Strip seed ORDER BY Sort — MergeJoin supplies its own Sort (#25674).
+            plan = match plan {
+                PhysicalPlan::CTE {
+                    name,
+                    columns,
+                    seed,
+                    inline: true,
+                } => {
+                    let seed = strip_cte_order_sort(*seed);
+                    PhysicalPlan::CTE {
+                        name,
+                        columns,
+                        seed: Box::new(predicate_push_down(seed, &filter, is, current_db)),
+                        inline: true,
+                    }
+                }
+                other => predicate_push_down(other, &filter, is, current_db),
+            };
+        } else if let PhysicalPlan::CTE {
+            name,
+            columns,
+            seed,
+            inline: true,
+        } = plan
+        {
+            plan = PhysicalPlan::CTE {
+                name,
+                columns,
+                seed: Box::new(strip_cte_order_sort(*seed)),
+                inline: true,
+            };
+        }
+        plan = PhysicalPlan::Sort {
+            child: Box::new(plan),
+            by_info: key_label.to_string(),
+        };
+    }
+    plan
+}
+
+fn strip_cte_order_sort(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Sort { child, .. } => strip_cte_order_sort(*child),
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(strip_cte_order_sort(*child)),
+        },
+        other => other,
+    }
+}
+
+fn merge_join_side_pk_ordered(
+    select: &SelectStmt,
+    table: &TableName,
+    on: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    let phys = merge_join_orig_table(select, table);
+    let Some(info) = is.and_then(|schema| schema.table_by_name(current_db, &phys)) else {
+        return false;
+    };
+    if !info.pk_is_handle {
+        return false;
+    }
+    let Some(handle) = info.handle_column() else {
+        return false;
+    };
+    let handle_name = handle.name.o();
+    join_on_mentions_col(on, &table.name, table.resolve_name(), handle_name)
+        || join_on_mentions_col(on, &phys, &phys, handle_name)
+}
+
+fn join_on_mentions_col(on: &ExprNode, alias: &str, phys: &str, col: &str) -> bool {
+    let ExprNode::Binary(bin) = on else {
+        return false;
+    };
+    if bin.op != Op::Eq {
+        return false;
+    }
+    for side in [bin.left.as_ref(), bin.right.as_ref()] {
+        if let ExprNode::Column(c) = side {
+            let tbl = c.table.as_deref().unwrap_or("");
+            if c.name.eq_ignore_ascii_case(col)
+                && (tbl.is_empty()
+                    || tbl.eq_ignore_ascii_case(alias)
+                    || tbl.eq_ignore_ascii_case(phys))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// TiDB: MergeJoin already orders by join keys; skip outer Sort when ORDER BY
+/// is ordinals or those same columns (`ORDER BY 1, 2` on equijoin output).
+fn order_by_covered_by_merge_join(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
+    let PhysicalPlan::MergeJoin {
+        left_key, right_key, ..
+    } = plan
+    else {
+        return false;
+    };
+    if select.order_by.is_empty() {
+        return false;
+    }
+    select.order_by.iter().all(|item| match &item.expr {
+        ExprNode::Value(v) => matches!(v.datum, Datum::I64(_) | Datum::U64(_)),
+        ExprNode::Column(c) => {
+            let name = c.name.as_str();
+            left_key.ends_with(&format!(".{name}")) || right_key.ends_with(&format!(".{name}"))
+        }
+        _ => false,
+    })
 }
 
 fn apply_order_limit(

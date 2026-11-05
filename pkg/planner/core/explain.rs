@@ -247,11 +247,20 @@ fn walk_with_parent(
     }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
     // Keep remapping projections (`Column#5->Column#6`) used after StreamAgg+ORDER BY.
+    // Also elide CTE seed column-name projections (`SELECT c1`) so MergeJoin
+    // Build/Probe labels land on the TableReader.
     if let PhysicalPlan::Projection { exprs, child, .. } = plan {
         let trivial = exprs.iter().all(|e| {
             e.starts_with("col") && !e.contains("->") && !e.contains("Column#")
         });
-        if trivial {
+        let cte_seed_cols = exprs
+            .iter()
+            .all(|e| !e.contains("->") && !e.contains('(') && !e.contains(',') && !e.is_empty())
+            && matches!(
+                parent,
+                Some(PhysicalPlan::MergeJoin { .. } | PhysicalPlan::Sort { .. })
+            );
+        if trivial || cte_seed_cols {
             return walk_with_parent(
                 child,
                 parent,
@@ -287,6 +296,7 @@ fn walk_with_parent(
     // TiDB labels `TableReader_30(Build)` — role suffix after the numeric id.
     // Inline CTEs unwrap before walk; compare against the resolved seed pointer.
     let join_role = match parent {
+        // HashJoin / MergeJoin: children_of lists right(Build) then left(Probe).
         Some(PhysicalPlan::HashJoin { left, right, .. })
         | Some(PhysicalPlan::MergeJoin { left, right, .. }) => {
             let left_p = explain_plan_ptr(left);
@@ -301,9 +311,12 @@ fn walk_with_parent(
                         | "Projection"
                         | "Selection"
                         | "IndexReader"
+                        | "IndexLookUp"
                         | "Limit"
                         | "UnionScan"
                         | "IndexJoin"
+                        | "Sort"
+                        | "CTE"
                 )
             {
                 "(Build)"
@@ -315,9 +328,12 @@ fn walk_with_parent(
                         | "Projection"
                         | "Selection"
                         | "IndexReader"
+                        | "IndexLookUp"
                         | "Limit"
                         | "UnionScan"
                         | "IndexJoin"
+                        | "Sort"
+                        | "CTE"
                 )
             {
                 "(Probe)"
@@ -519,8 +535,8 @@ fn walk_with_parent(
                 | PhysicalPlan::Union { .. }
         )
     );
-    // Projection/Selection/HashAgg/UnionScan/Limit→CARTESIAN: TableReader sits
-    // under a unary with a non-empty spine; still need bushy cop prefixes.
+    // Projection/Selection/Sort/HashAgg/UnionScan/Limit→CARTESIAN: TableReader
+    // sits under a unary with a non-empty spine; still need bushy cop prefixes.
     let under_bushy = under_bushy
         || (!spine.is_empty()
             && matches!(
@@ -528,6 +544,7 @@ fn walk_with_parent(
                 Some(
                     PhysicalPlan::Projection { .. }
                         | PhysicalPlan::Selection { .. }
+                        | PhysicalPlan::Sort { .. }
                         | PhysicalPlan::HashAgg { .. }
                         | PhysicalPlan::StreamAgg { .. }
                         | PhysicalPlan::UnionScan { .. }
@@ -616,6 +633,7 @@ fn walk_with_parent(
                 plan,
                 PhysicalPlan::Projection { .. }
                     | PhysicalPlan::Selection { .. }
+                    | PhysicalPlan::Sort { .. }
                     | PhysicalPlan::HashAgg { .. }
                     | PhysicalPlan::StreamAgg { .. }
             ) && matches!(
@@ -1048,7 +1066,7 @@ fn emit_cop_children(
             pushed,
         } => {
             let idx_access = index_access_cols(table, index, index_columns, partitions);
-            let (mut scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            let (mut scan_est, _) = index_scan_meta(pushed.as_ref());
             if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
                 scan_est = *row_count;
             }
@@ -1183,22 +1201,40 @@ fn emit_cop_children(
                 }
                 return true;
             }
-            if let Some(filter) = pushed.as_ref() {
-                info = format!("pushed:{}", filter.restore_string());
+            // Full index scan IndexLookUp (USE INDEX without range): TiDB shows
+            // IndexFullScan(Build) + TableRowIDScan(Probe) on cop[tikv].
+            let info = if let Some(filter) = pushed.as_ref() {
+                format!("pushed:{}", filter.restore_string())
+            } else if *row_count >= 9_000.0 {
+                "keep order:false, stats:pseudo".to_string()
+            } else {
+                "keep order:false".to_string()
+            };
+            let mut rowid_info = "keep order:false".to_string();
+            if *row_count >= 9_000.0 {
+                rowid_info.push_str(", stats:pseudo");
             }
+            let scan_est = if *row_count > 0.0 {
+                *row_count
+            } else {
+                scan_est
+            };
             push_explain_row(
                 rows,
                 depth,
                 false,
                 next_id,
                 CopRow {
-                    name: "IndexRangeScan",
+                    name: "IndexFullScan",
                     est: scan_est,
-                    task: "cop",
+                    task: "cop[tikv]",
                     access: idx_access,
                     info,
                 },
             );
+            if let Some(last) = rows.last_mut() {
+                last.id.push_str("(Build)");
+            }
             push_explain_row(
                 rows,
                 depth,
@@ -1207,11 +1243,14 @@ fn emit_cop_children(
                 CopRow {
                     name: "TableRowIDScan",
                     est: scan_est,
-                    task: "cop",
+                    task: "cop[tikv]",
                     access: table_access(table, &[]),
-                    info: "keep order:false".to_string(),
+                    info: rowid_info,
                 },
             );
+            if let Some(last) = rows.last_mut() {
+                last.id.push_str("(Probe)");
+            }
             true
         }
         PhysicalPlan::IndexMerge {
@@ -1797,6 +1836,15 @@ fn explain_plan_ptr(plan: &PhysicalPlan) -> *const PhysicalPlan {
             inline: true,
             ..
         } => explain_plan_ptr(seed),
+        // Column-name Projection over a scan (CTE seed `SELECT c1`) unwraps for
+        // Build/Probe pointer compare so TableReader gets the join role.
+        PhysicalPlan::Projection { child, exprs, .. }
+            if exprs
+                .iter()
+                .all(|e| !e.contains("->") && !e.contains('(') && !e.contains(',')) =>
+        {
+            explain_plan_ptr(child)
+        }
         other => other as *const _,
     }
 }
@@ -1926,15 +1974,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             format!("keys:{n_keys}"),
         ),
-        PhysicalPlan::IndexLookUpReader { pushed, .. } => (
+        PhysicalPlan::IndexLookUpReader { .. } => (
             "IndexLookUp".to_string(),
             String::new(),
-            // Under IndexJoin, TiDB shows empty info (children carry the shape).
-            if range_pushed(pushed.as_ref()).is_some() {
-                String::new()
-            } else {
-                "data:IndexRangeScan, TableRowIDScan".to_string()
-            },
+            // TiDB IndexLookUp root info is empty; Build/Probe children carry shape.
+            String::new(),
         ),
         PhysicalPlan::IndexReader { pushed, .. } => (
             "IndexReader".to_string(),
