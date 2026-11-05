@@ -345,6 +345,55 @@ fn walk_with_parent(
             deferred,
         );
     }
+    // Sort over HashJoin with join-col by_info: TiDB inserts Projection between.
+    if let PhysicalPlan::Sort {
+        child,
+        by_info,
+    } = plan
+        && by_info.contains('.')
+        && matches!(
+            child.as_ref(),
+            PhysicalPlan::HashJoin { .. } | PhysicalPlan::MergeJoin { .. }
+        )
+    {
+        let id = *next_id;
+        *next_id += 1;
+        let prefix = if spine.is_empty() {
+            tree_prefix(depth, last)
+        } else {
+            tree_prefix_with_spine(spine, depth, last)
+        };
+        let join_est = est_rows(child);
+        rows.push(ExplainRow {
+            id: format!("{prefix}Sort_{id}"),
+            est_rows: format!("{join_est:.2}"),
+            task: "root".to_string(),
+            access: String::new(),
+            info: by_info.clone(),
+        });
+        let proj_id = *next_id;
+        *next_id += 1;
+        rows.push(ExplainRow {
+            id: format!("{}Projection_{proj_id}", tree_prefix(depth + 1, true)),
+            est_rows: format!("{join_est:.2}"),
+            task: "root".to_string(),
+            access: String::new(),
+            info: by_info.clone(),
+        });
+        let mut child_spine = spine.to_vec();
+        child_spine.push(false);
+        return walk_with_parent(
+            child,
+            Some(plan),
+            depth + 2,
+            true,
+            next_id,
+            rows,
+            under_order_projection,
+            &child_spine,
+            deferred,
+        );
+    }
     let id = *next_id;
     *next_id += 1;
     let (name, access, mut info) = node_meta(plan);
@@ -372,6 +421,8 @@ fn walk_with_parent(
                         | "IndexJoin"
                         | "Sort"
                         | "CTE"
+                        | "Point_Get"
+                        | "PointGet"
                 )
             {
                 "(Build)"
@@ -389,6 +440,8 @@ fn walk_with_parent(
                         | "IndexJoin"
                         | "Sort"
                         | "CTE"
+                        | "Point_Get"
+                        | "PointGet"
                 )
             {
                 "(Probe)"

@@ -49,6 +49,17 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            // `pk = const` → PointGet (TiDB cte HASH_JOIN on PK CTE).
+            if residual.is_empty()
+                && pushed.is_none()
+                && let Some(handle) = pk_eq_handle(is, current_db, &table, &pushable)
+            {
+                return PhysicalPlan::PointGet {
+                    table,
+                    handle: Some(handle),
+                    index: None,
+                };
+            }
             wrap_residual(
                 PhysicalPlan::TableReader {
                     table,
@@ -229,8 +240,9 @@ fn push_into(
             inline,
             recursive,
         } if inline => {
-            // Output `columns` (AS aliases / col_name_list) may differ from seed
-            // internal names (`col0`, dual literals). Keep Selection above CTE.
+            // Empty columns: seed names match CTE outputs — push through.
+            // Named outputs may differ from seed; keep Selection above unless
+            // caller rewrote the filter onto seed columns (HASH_JOIN path).
             if columns.is_empty() {
                 PhysicalPlan::CTE {
                     name,
@@ -257,6 +269,32 @@ fn push_into(
             }
         }
         other => wrap_residual(other, conjuncts),
+    }
+}
+
+fn pk_eq_handle(
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    table: &str,
+    conjuncts: &[ExprNode],
+) -> Option<i64> {
+    if conjuncts.len() != 1 {
+        return None;
+    }
+    let (col, value) = conjuncts[0].eq_column_const()?;
+    let info = is?.table_by_name(current_db, table)?;
+    if !info.pk_is_handle {
+        return None;
+    }
+    let handle = info.handle_column()?;
+    if !handle.name.o().eq_ignore_ascii_case(&col) {
+        return None;
+    }
+    match value {
+        Datum::I64(v) => Some(v),
+        Datum::U64(v) => Some(v as i64),
+        Datum::Bytes(b) => std::str::from_utf8(&b).ok()?.trim().parse().ok(),
+        _ => None,
     }
 }
 

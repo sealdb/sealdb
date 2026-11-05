@@ -17,7 +17,7 @@ use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{
-    ColumnNameExpr, ExprNode, FuncCallExpr, IsNullExpr, UnaryOpExpr, ValueExpr,
+    BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, IsNullExpr, UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{
     CteMaterialize, JoinType as AstJoinType, ResultSetNode, SelectStmt, Statement, StmtNode,
@@ -170,6 +170,15 @@ impl PlanBuilder {
                         && !order_by_all_constant(select)
                         && !(stream_keep_order && order_prefix_of_group_by(select))
                         && !merge_orders;
+                    let join_ordinal_sort = need_sort
+                        && !select.joins.is_empty()
+                        && select.order_by.iter().all(|item| {
+                            matches!(
+                                &item.expr,
+                                ExprNode::Value(v)
+                                    if matches!(v.datum, Datum::I64(_) | Datum::U64(_))
+                            )
+                        });
                     if need_sort && order_by_has_scalar_func(select) {
                         // TiDB InjectProjBelowSort: Projection → Sort → Projection.
                         plan = inject_proj_below_sort(plan, select, is, current_db);
@@ -178,6 +187,16 @@ impl PlanBuilder {
                         } else if select.offset.is_some() {
                             plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), 0);
                         }
+                    } else if join_ordinal_sort {
+                        // Sort by join output labels (EXPLAIN synthesizes Projection).
+                        plan = apply_order_limit(
+                            plan,
+                            true,
+                            select.limit,
+                            select.offset,
+                            est_rows,
+                            topn_by_info(select, current_db),
+                        );
                     } else {
                         plan = apply_order_limit(
                             plan,
@@ -1750,7 +1769,8 @@ fn apply_order_limit(
 
 /// TiDB TopN ExplainInfo by-items: `select.<table>.<col>` (query-block prefix).
 /// Derived UNION duals use `Column#3:desc` (TiDB plan column id for set-op output).
-fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
+/// Join + ORDER BY ordinals use `{db}.{origTbl}.{col}` per output position.
+fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
     let table = select.from.as_ref().map(|t| t.name.as_str());
     let from_derived_union = select.with.as_ref().is_some_and(|w| {
         table.is_some_and(|t| {
@@ -1758,6 +1778,7 @@ fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
                 .is_some_and(|cte| !cte.set_rest.is_empty())
         })
     });
+    let join_labels = join_star_output_labels(select, current_db);
     select
         .order_by
         .iter()
@@ -1765,6 +1786,20 @@ fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
             let base = match (&table, &item.expr) {
                 (_, ExprNode::Column(_)) if from_derived_union => "Column#3".to_string(),
                 (Some(t), ExprNode::Column(col)) => format!("select.{t}.{}", col.name),
+                (_, ExprNode::Value(v))
+                    if matches!(v.datum, Datum::I64(_) | Datum::U64(_))
+                        && !join_labels.is_empty() =>
+                {
+                    let ord = match v.datum {
+                        Datum::I64(n) => n as usize,
+                        Datum::U64(n) => n as usize,
+                        _ => 0,
+                    };
+                    join_labels
+                        .get(ord.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or_else(|| item.expr.restore_string())
+                }
                 _ => item.expr.restore_string(),
             };
             if item.desc {
@@ -1775,6 +1810,35 @@ fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `SELECT *` join output labels for EXPLAIN Sort/Projection (`cte.t1.c1, cte.tpk.c1`).
+fn join_star_output_labels(select: &SelectStmt, current_db: &str) -> Vec<String> {
+    if select.joins.is_empty() || !is_star_select(select) {
+        return Vec::new();
+    }
+    let schema = if current_db.is_empty() {
+        "select"
+    } else {
+        current_db
+    };
+    let mut labels = Vec::new();
+    for tbl in select.join_tables() {
+        let phys = merge_join_orig_table(select, tbl);
+        // Single-column CTE/table cases in the cte suite; expand via seed fields.
+        if let Some(with) = select.with.as_ref()
+            && let Some(cte) = with.find(tbl.resolve_name())
+        {
+            for name in cte_seed_output_names(&cte.query) {
+                if !name.is_empty() {
+                    labels.push(format!("{schema}.{phys}.{name}"));
+                }
+            }
+            continue;
+        }
+        labels.push(format!("{schema}.{phys}.c1"));
+    }
+    labels
 }
 
 fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
@@ -1919,34 +1983,79 @@ fn push_single_side_on(
     if join_on_has_equijoin_local(&on) {
         return (left, right, on, tp);
     }
-    let ExprNode::Column(c) = &on else {
-        return (left, right, on, tp);
-    };
-    let on_left = c
-        .table
-        .as_deref()
-        .is_some_and(|t| t.eq_ignore_ascii_case(left_name));
-    let on_right = c
-        .table
-        .as_deref()
-        .is_some_and(|t| t.eq_ignore_ascii_case(right_name));
-    let (side_name, filter) = if on_left && !on_right {
-        match cte_field_expr(select, left_name, &c.name) {
-            Some(f) => (left_name, f),
-            None => return (left, right, on, tp),
+    // `ON dt2.c1 = 1` / `ON (derived.col)` — push into that side, leave CARTESIAN.
+    let (side_is_left, filter) = match &on {
+        ExprNode::Column(c) => {
+            let on_left = c
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(left_name));
+            let on_right = c
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(right_name));
+            if on_left && !on_right {
+                match cte_field_expr(select, left_name, &c.name) {
+                    Some(f) => (true, f),
+                    None => return (left, right, on, tp),
+                }
+            } else if on_right && !on_left {
+                match cte_field_expr(select, right_name, &c.name) {
+                    Some(f) => (false, f),
+                    None => return (left, right, on, tp),
+                }
+            } else {
+                return (left, right, on, tp);
+            }
         }
-    } else if on_right && !on_left {
-        match cte_field_expr(select, right_name, &c.name) {
-            Some(f) => (right_name, f),
-            None => return (left, right, on, tp),
+        ExprNode::Binary(bin) if bin.op == Op::Eq => {
+            let (col, val) = match (bin.left.as_ref(), bin.right.as_ref()) {
+                (ExprNode::Column(c), v @ ExprNode::Value(_)) => (c, v.clone()),
+                (v @ ExprNode::Value(_), ExprNode::Column(c)) => (c, v.clone()),
+                _ => return (left, right, on, tp),
+            };
+            let on_left = col
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(left_name));
+            let on_right = col
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(right_name));
+            let side_left = if on_left && !on_right {
+                true
+            } else if on_right && !on_left {
+                false
+            } else {
+                return (left, right, on, tp);
+            };
+            let side_name = if side_left { left_name } else { right_name };
+            let side_tbl = select
+                .join_tables()
+                .into_iter()
+                .find(|t| {
+                    t.name.eq_ignore_ascii_case(side_name)
+                        || t.resolve_name().eq_ignore_ascii_case(side_name)
+                });
+            let phys = side_tbl
+                .as_ref()
+                .map(|t| merge_join_orig_table(select, t))
+                .unwrap_or_else(|| side_name.to_string());
+            let mut col = col.clone();
+            col.table = Some(phys);
+            let filter = ExprNode::Binary(BinaryOpExpr {
+                op: Op::Eq,
+                left: Box::new(ExprNode::Column(col)),
+                right: Box::new(val),
+            });
+            (side_left, filter)
         }
-    } else {
-        return (left, right, on, tp);
+        _ => return (left, right, on, tp),
     };
     let true_on = ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
         datum: sealdb_types::Datum::I64(1),
     });
-    if side_name.eq_ignore_ascii_case(left_name) {
+    if side_is_left {
         let left = push_filter_under_projection(left, &filter, is, current_db);
         (left, right, true_on, JoinType::Cross)
     } else {
@@ -2023,36 +2132,45 @@ fn push_filter_under_projection(
             columns,
             seed,
             recursive_plan,
+            inline: true,
+            recursive,
+        } => {
+            // Inline CTE: push into seed so HASH_JOIN `ON cte.col = const` becomes
+            // TableReader data:Selection / PointGet (TiDB cte suite).
+            PhysicalPlan::CTE {
+                name,
+                alias,
+                columns,
+                seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
+                recursive_plan,
+                inline: true,
+                recursive,
+            }
+        }
+        PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed,
+            recursive_plan,
             inline,
             recursive,
         } => {
-            if columns.is_empty() {
+            // Materialized / recursive: keep filter above.
+            predicate_push_down(
                 PhysicalPlan::CTE {
                     name,
                     alias,
                     columns,
-                    seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
+                    seed,
                     recursive_plan,
                     inline,
                     recursive,
-                }
-            } else {
-                // Named CTE outputs: keep filter above (seed names may differ).
-                predicate_push_down(
-                    PhysicalPlan::CTE {
-                        name,
-                        alias,
-                        columns,
-                        seed,
-                        recursive_plan,
-                        inline,
-                        recursive,
-                    },
-                    filter,
-                    is,
-                    current_db,
-                )
-            }
+                },
+                filter,
+                is,
+                current_db,
+            )
         }
         other => predicate_push_down(other, filter, is, current_db),
     }
