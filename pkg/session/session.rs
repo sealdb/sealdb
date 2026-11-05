@@ -2685,6 +2685,39 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_index_nullsafe_dst_warnings() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE IF NOT EXISTS tzidx").unwrap();
+        session.execute_stmt("USE tzidx").unwrap();
+        session.execute_stmt("SET time_zone='UTC'").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
+        session
+            .execute_stmt("CREATE TABLE t (id int primary key, ts TIMESTAMP)")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES (1, '2025-03-30 00:59:59')")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES (2, '2025-03-30 01:00:00')")
+            .unwrap();
+        session.execute_stmt("ALTER TABLE t ADD INDEX idx_ts (ts)").unwrap();
+        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        let eq = session
+            .execute_stmt(
+                "SELECT /*+ USE_INDEX(t, idx_ts) */ * FROM t WHERE ts = '2025-03-30 02:00:00'",
+            )
+            .unwrap();
+        assert_eq!(eq.warnings.len(), 4, "eq {:?}", eq.warnings);
+        let ok = session
+            .execute_stmt(
+                "SELECT /*+ USE_INDEX(t, idx_ts) */ * FROM t WHERE ts <=> '2025-03-30 02:00:00'",
+            )
+            .unwrap();
+        assert_eq!(ok.rows.len(), 0, "{ok:?}");
+        assert_eq!(ok.warnings.len(), 4, "nullsafe {:?}", ok.warnings);
+    }
+
+    #[test]
     fn test_timestamp_column_tz_display() {
         let session = Session::new();
         session.execute_stmt("CREATE DATABASE IF NOT EXISTS tz").unwrap();

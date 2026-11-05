@@ -2535,7 +2535,7 @@
     {
       "name": "types/time",
       "wave": "R1",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/types/time.test",
       "result": "r/types/time.result",
       "has_result": true,

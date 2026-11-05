@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select`/`show`/`types/const` → `green`**；下一步 `types/time` |
+| R1 | select, show, types/* | `in_progress` | **`select`/`show`/`types/const`/`types/time` → `green`**；下一步其余 `types/*` |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -76,10 +76,10 @@
 | IGNORE_SPACE CREATE TABLE | `COUNT(a)`/`COUNT (a)` 1064 | session `reject_create_table_func_call` | types/const IGNORE_SPACE 段已绿（HIGH_NOT 前） |
 | HIGH_NOT_PRECEDENCE | `NOT x BETWEEN` → `(NOT x) BETWEEN` | eval rewrite under sql_mode | types/const HIGH_NOT 段已绿 |
 | NO_BACKSLASH_ESCAPES | `\\` 字面反斜杠 | parse 前加倍 `\` 喂 sqlparser | types/const → `green`（Mem+TiKV） |
-| itest `--enable_warnings` | 解析指令（警告输出后续） | `parse_test` suite flag | types/time 可开工 |
-| TIMESTAMP/DATE/TIME literals | TypedString + timestampPattern；ODBC `{d|t|ts}` | `types::parse_*_literal`；errno 1292/22007 | types/time 字面量段已过；下：TIMESTAMPADD/DST |
-| SET time_zone | session 时区变量 | `Session.time_zone` + @@ readout | types/time SET 已接受 |
-| DATE_ADD / TIMESTAMPADD | INTERVAL lower；字符串算术 | eval DATE_ADD/SUB、TIMESTAMPADD/DIFF | 字面量段绿；列 TIMESTAMP/DST 待办 |
+| itest `--enable_warnings` | 解析 + 结果后打印警告 | `QueryResult.warnings` + runner | types/time DST 警告对齐 |
+| TIMESTAMP/DATE/TIME literals | TypedString + timestampPattern；ODBC `{d|t|ts}` | `types::parse_*_literal`；errno 1292/22007 | types/time 字面量 header 绿 |
+| SET time_zone | session 时区变量 | `Session.time_zone` + TLS | UTC 存储 / session 显示 |
+| DATE_ADD / TIMESTAMPADD / DIFF | INTERVAL；DST 8179；索引路径 | eval + covering rehydrate；`<=>` | types/time → `green`（Mem+TiKV） |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

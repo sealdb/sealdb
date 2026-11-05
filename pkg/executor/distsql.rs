@@ -149,11 +149,13 @@ impl Executor for IndexLookUpExecutor {
             }
             Ok(rows)
         })?;
-        self.rows = filter_rows(
-            std::mem::take(&mut self.rows),
-            &self.schema,
-            self.pushed.as_ref(),
-        )?;
+        self.rows = sealdb_expression::with_index_dst_double(|| {
+            filter_rows(
+                std::mem::take(&mut self.rows),
+                &self.schema,
+                self.pushed.as_ref(),
+            )
+        })?;
         Ok(())
     }
 
@@ -420,7 +422,9 @@ fn covering_row(
     let mut row = vec![Datum::Null; info.columns.len()];
     for (col, value) in index.columns.iter().zip(values) {
         if let Some(slot) = row.get_mut(col.offset as usize) {
-            *slot = value;
+            // Index keys store Time as display bytes; rehydrate FieldType so
+            // TIMESTAMP keeps UTC semantics (do not session_local_to_utc again).
+            *slot = rehydrate_index_datum(info, col.offset as usize, value)?;
         }
     }
     if let Some(handle_col) = info.handle_column()
@@ -432,4 +436,43 @@ fn covering_row(
         *slot = Datum::I64(handle);
     }
     Ok(row)
+}
+
+fn rehydrate_index_datum(
+    info: &TableInfo,
+    offset: usize,
+    value: Datum,
+) -> Result<Datum> {
+    let Some(col) = info.columns.get(offset) else {
+        return Ok(value);
+    };
+    match value {
+        Datum::Bytes(b) if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP => {
+            let s = String::from_utf8_lossy(&b);
+            let mut t = sealdb_types::parse_timestamp_literal(&s)?;
+            // Bytes already hold UTC wall clock from storage — do not local→UTC.
+            t.tp = sealdb_types::TimeType::Timestamp;
+            Ok(Datum::Time(t))
+        }
+        Datum::Bytes(b)
+            if matches!(
+                col.field_type.tp,
+                sealdb_types::TYPE_DATETIME | sealdb_types::TYPE_DATE
+            ) =>
+        {
+            let s = String::from_utf8_lossy(&b);
+            let mut t = if col.field_type.tp == sealdb_types::TYPE_DATE {
+                sealdb_types::parse_date_literal(&s)?
+            } else {
+                sealdb_types::parse_timestamp_literal(&s)?
+            };
+            t.tp = if col.field_type.tp == sealdb_types::TYPE_DATE {
+                sealdb_types::TimeType::Date
+            } else {
+                sealdb_types::TimeType::Datetime
+            };
+            Ok(Datum::Time(t))
+        }
+        other => Ok(other),
+    }
 }

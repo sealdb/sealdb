@@ -95,11 +95,22 @@ impl Executor for MemTableExec {
 pub struct SelectionExec {
     filter: ExprNode,
     child: Box<dyn Executor>,
+    /// Double DST gap warnings when filtering above an index plan (types/time).
+    index_dst_double: bool,
 }
 
 impl SelectionExec {
     pub fn new(filter: ExprNode, child: Box<dyn Executor>) -> Self {
-        Self { filter, child }
+        Self {
+            filter,
+            child,
+            index_dst_double: false,
+        }
+    }
+
+    pub fn with_index_dst_double(mut self, on: bool) -> Self {
+        self.index_dst_double = on;
+        self
     }
 }
 
@@ -118,7 +129,14 @@ impl Executor for SelectionExec {
             let mut out = Chunk::new(chunk.num_cols(), chunk.num_rows());
             for i in 0..chunk.num_rows() {
                 let row = chunk.get_row(i);
-                if eval_filter(&self.filter, schema, &row)? {
+                let pass = if self.index_dst_double {
+                    sealdb_expression::with_index_dst_double(|| {
+                        eval_filter(&self.filter, schema, &row)
+                    })?
+                } else {
+                    eval_filter(&self.filter, schema, &row)?
+                };
+                if pass {
                     out.append_row(row);
                 }
             }

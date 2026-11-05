@@ -103,10 +103,18 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::Selection { child, filter } => Ok(Box::new(SelectionExec::new(
-                filter.clone(),
-                Self::build(child, stmt, domain, current_db, txn)?,
-            ))),
+            PhysicalPlan::Selection { child, filter } => {
+                let under_index = matches!(
+                    child.as_ref(),
+                    PhysicalPlan::IndexReader { .. }
+                        | PhysicalPlan::IndexLookUpReader { .. }
+                        | PhysicalPlan::IndexMerge { .. }
+                );
+                Ok(Box::new(SelectionExec::new(
+                    filter.clone(),
+                    Self::build(child, stmt, domain, current_db, txn)?,
+                ).with_index_dst_double(under_index)))
+            }
             PhysicalPlan::Distinct { keys, child } => Ok(Box::new(DistinctExec::new(
                 keys.clone(),
                 Self::build(child, stmt, domain, current_db, txn)?,
@@ -804,29 +812,38 @@ fn index_access(
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
     let column = index.columns.first()?.name.o().to_string();
-    if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
-        return Some(IndexAccess::Equal(value));
-    }
-    if let Some(range) = selection.and_then(|expr| {
-        expr.column_ranges()
-            .into_iter()
-            .find(|range| range.column.eq_ignore_ascii_case(&column))
-    }) {
-        if range.low.is_some() || range.high.is_some() {
-            return Some(IndexAccess::Range {
-                low: range.low.as_ref().map(|(value, _)| value.clone()),
-                low_inclusive: range
-                    .low
-                    .as_ref()
-                    .map(|(_, inclusive)| *inclusive)
-                    .unwrap_or(true),
-                high: range.high.as_ref().map(|(value, _)| value.clone()),
-                high_inclusive: range
-                    .high
-                    .as_ref()
-                    .map(|(_, inclusive)| *inclusive)
-                    .unwrap_or(true),
-            });
+    // TIMESTAMP index keys are UTC; session-local string ranges (esp. DST gap)
+    // cannot be pushed as byte seeks — full scan + Selection filter.
+    let ts_index = index.columns.first().is_some_and(|c| {
+        info.columns
+            .get(c.offset as usize)
+            .is_some_and(|col| col.field_type.tp == sealdb_types::TYPE_TIMESTAMP)
+    });
+    if !ts_index {
+        if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
+            return Some(IndexAccess::Equal(value));
+        }
+        if let Some(range) = selection.and_then(|expr| {
+            expr.column_ranges()
+                .into_iter()
+                .find(|range| range.column.eq_ignore_ascii_case(&column))
+        }) {
+            if range.low.is_some() || range.high.is_some() {
+                return Some(IndexAccess::Range {
+                    low: range.low.as_ref().map(|(value, _)| value.clone()),
+                    low_inclusive: range
+                        .low
+                        .as_ref()
+                        .map(|(_, inclusive)| *inclusive)
+                        .unwrap_or(true),
+                    high: range.high.as_ref().map(|(value, _)| value.clone()),
+                    high_inclusive: range
+                        .high
+                        .as_ref()
+                        .map(|(_, inclusive)| *inclusive)
+                        .unwrap_or(true),
+                });
+            }
         }
     }
     // USE INDEX / covering IndexReader with no predicate → IndexFullScan.

@@ -120,7 +120,8 @@ impl ExprNode {
         let ExprNode::Binary(bin) = self else {
             return None;
         };
-        if bin.op != Op::Eq {
+        // `=` and null-safe `<=>` both drive index equality access (TiDB).
+        if !matches!(bin.op, Op::Eq | Op::NullSafeEq) {
             return None;
         }
         match (bin.left.as_ref(), bin.right.as_ref()) {
