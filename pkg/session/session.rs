@@ -655,10 +655,17 @@ impl Session {
             .lock()
             .expect("session sql_mode lock")
             .clone();
+        let time_zone = self
+            .time_zone
+            .lock()
+            .expect("session time_zone lock")
+            .clone();
         let mode = sealdb_expression::CollateMode::from_name(&coll.name);
         let result = sealdb_expression::with_sql_mode(sql_mode, || {
-            sealdb_expression::with_current_db(current_db.as_str(), || {
-                sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+            sealdb_expression::with_time_zone(time_zone, || {
+                sealdb_expression::with_current_db(current_db.as_str(), || {
+                    sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+                })
             })
         });
         if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
@@ -2607,6 +2614,24 @@ mod tests {
         ERR_DATA_OUT_OF_RANGE, ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
     };
     use sealdb_types::Datum;
+
+    #[test]
+    fn test_date_add_timestampadd_strings() {
+        let session = Session::new();
+        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        let ok = session
+            .execute_stmt("SELECT DATE_ADD('2025-03-30 02:30:00', INTERVAL 1 HOUR)")
+            .unwrap();
+        assert_eq!(ok.rows[0][0].display(), "2025-03-30 03:30:00");
+        let ok = session
+            .execute_stmt("SELECT TIMESTAMPADD(HOUR, 1, '2025-03-30 02:30:00')")
+            .unwrap();
+        assert_eq!(ok.rows[0][0].display(), "2025-03-30 03:30:00");
+        let ok = session
+            .execute_stmt("SELECT TIMESTAMPDIFF(HOUR, '2025-03-30 01:59:59', '2025-03-30 02:30:00')")
+            .unwrap();
+        assert_eq!(ok.rows, vec![vec![Datum::I64(0)]]);
+    }
 
     #[test]
     fn test_no_backslash_escapes() {
