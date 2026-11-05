@@ -74,7 +74,14 @@ impl QueryResult {
     pub fn display_rows(&self) -> Vec<Vec<String>> {
         self.rows
             .iter()
-            .map(|row| row.iter().map(Datum::display).collect())
+            .map(|row| {
+                row.iter()
+                    .map(|d| match d {
+                        Datum::Time(t) => sealdb_expression::format_timestamp_display(*t),
+                        other => other.display(),
+                    })
+                    .collect()
+            })
             .collect()
     }
 }

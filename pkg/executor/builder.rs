@@ -642,13 +642,33 @@ impl ExecutorBuilder {
             let mut rows = Vec::new();
             while let Some(chunk) = exec.next()? {
                 for i in 0..chunk.num_rows() {
-                    rows.push(chunk.get_row(i));
+                    rows.push(localize_timestamp_row(chunk.get_row(i)));
                 }
             }
             exec.close()?;
             Ok(QueryResult { columns, rows })
         })
     }
+}
+
+/// TIMESTAMP is stored UTC; convert to session TZ for result rows (TiDB display).
+fn localize_timestamp_row(row: Vec<sealdb_types::Datum>) -> Vec<sealdb_types::Datum> {
+    row.into_iter()
+        .map(|d| match d {
+            sealdb_types::Datum::Time(t)
+                if matches!(t.tp, sealdb_types::TimeType::Timestamp) =>
+            {
+                match sealdb_expression::utc_to_session_local(t) {
+                    Ok(mut local) => {
+                        local.tp = sealdb_types::TimeType::Timestamp;
+                        sealdb_types::Datum::Time(local)
+                    }
+                    Err(_) => sealdb_types::Datum::Time(t),
+                }
+            }
+            other => other,
+        })
+        .collect()
 }
 
 fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {

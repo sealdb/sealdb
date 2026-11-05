@@ -2674,6 +2674,33 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_column_tz_display() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE IF NOT EXISTS tz").unwrap();
+        session.execute_stmt("USE tz").unwrap();
+        session.execute_stmt("SET time_zone='UTC'").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
+        session
+            .execute_stmt("CREATE TABLE t (id int primary key, ts TIMESTAMP)")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES (1, '2025-03-30 00:59:59')")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES (2, '2025-03-30 01:00:00')")
+            .unwrap();
+        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        let ok = session
+            .execute_stmt("SELECT *, UNIX_TIMESTAMP(ts) FROM t")
+            .unwrap();
+        let rows = ok.display_rows();
+        assert_eq!(rows[0][1], "2025-03-30 01:59:59", "{rows:?}");
+        assert_eq!(rows[1][1], "2025-03-30 03:00:00", "{rows:?}");
+        assert_eq!(rows[0][2], "1743296399");
+        assert_eq!(rows[1][2], "1743296400");
+    }
+
+    #[test]
     fn test_no_backslash_escapes() {
         let session = Session::new();
         let def = session.execute_stmt("SELECT '\\\\'").unwrap();
