@@ -45,7 +45,7 @@
     {
       "name": "agg_predicate_pushdown",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/agg_predicate_pushdown.test",
       "result": "r/agg_predicate_pushdown.result",
       "has_result": true,
