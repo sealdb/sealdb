@@ -285,12 +285,18 @@ fn walk_with_parent(
                 name = "HashJoin(Build)".to_string();
             } else if name == "TableReader" {
                 name = "TableReader(Build)".to_string();
+            } else if name == "StreamAgg" {
+                name = "StreamAgg(Build)".to_string();
+            } else if name == "Projection" {
+                name = "Projection(Build)".to_string();
             }
         } else if std::ptr::eq(plan as *const _, left.as_ref() as *const _) {
             if name == "HashJoin" {
                 name = "HashJoin(Probe)".to_string();
             } else if name == "TableReader" {
                 name = "TableReader(Probe)".to_string();
+            } else if name == "Projection" {
+                name = "Projection(Probe)".to_string();
             }
         }
     }
@@ -340,7 +346,17 @@ fn walk_with_parent(
     let row_est = if let Some((_, _, count)) = topn_parent {
         count as f64
     } else if let Some((_, _, est)) = stream_parent {
-        est
+        // Partial StreamAgg est applies to the DistSQL reader, not Projection.
+        if matches!(
+            plan,
+            PhysicalPlan::TableReader { .. }
+                | PhysicalPlan::IndexReader { .. }
+                | PhysicalPlan::IndexLookUpReader { .. }
+        ) {
+            est
+        } else {
+            est_rows(plan)
+        }
     } else {
         est_rows(plan)
     };
@@ -357,6 +373,10 @@ fn walk_with_parent(
         parent,
         Some(PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. })
     );
+    // Projection→CARTESIAN: TableReader sits under Projection with a non-empty
+    // spine; still need bushy cop prefixes for TableFullScan.
+    let under_bushy = under_bushy
+        || (matches!(parent, Some(PhysicalPlan::Projection { .. })) && !spine.is_empty());
     if emit_cop_children(
         plan,
         topn_parent,
@@ -371,15 +391,29 @@ fn walk_with_parent(
         return;
     }
     let children = children_of(plan);
+    // `Projection → CARTESIAN HashJoin`: HashJoin is `└─` so its children need
+    // spaces (not `│`) at the join column — push `!last` instead of `!child_last`.
+    let cartesian_under_proj = matches!(
+        plan,
+        PhysicalPlan::HashJoin {
+            tp: super::physical_plans::JoinType::Cross,
+            ..
+        }
+    ) && matches!(parent, Some(PhysicalPlan::Projection { .. }));
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
         let mut child_spine = spine.to_vec();
-        if matches!(
+        if cartesian_under_proj {
+            child_spine.push(!last);
+        } else if matches!(
             plan,
             PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
-        ) || !spine.is_empty()
-        {
+        ) {
             child_spine.push(!child_last);
+        } else if !spine.is_empty() {
+            // Under bushy ancestor: whether *this* node continues (e.g. StreamAgg
+            // not-last under HashJoin → `│` for its Projection child).
+            child_spine.push(!last);
         }
         walk_with_parent(
             child,
@@ -486,6 +520,12 @@ fn emit_cop_children(
                     if under_bushy { &scan_spine } else { &[] },
                 );
             } else {
+                let mut scan_spine = cop_spine.to_vec();
+                // Projection→CARTESIAN path: reader last among siblings — pad spine
+                // so TableFullScan indents one more level than the reader.
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(!_parent_last);
+                }
                 push_explain_row_spine(
                     rows,
                     scan_depth,
@@ -498,7 +538,15 @@ fn emit_cop_children(
                         access: scan_access,
                         info: scan_info,
                     },
-                    if under_bushy { cop_spine } else { &[] },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
                 );
             }
             true
@@ -1447,6 +1495,12 @@ fn hash_join_explain_info(
         JoinType::Semi => "semi join",
         JoinType::Anti => "anti join",
     };
+    // Pure CARTESIAN Cross with stub ON — no left-cond decoration.
+    if matches!(tp, JoinType::Cross)
+        && matches!(on, sealdb_parser::ast::expressions::ExprNode::Value(_))
+    {
+        return "CARTESIAN inner join".to_string();
+    }
     if !join_on_has_equijoin(on) {
         let cond = explain_join_cond(on);
         return format!("CARTESIAN {outer}, left cond:[{cond}]");
