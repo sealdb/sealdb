@@ -49,6 +49,13 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // Correlated `IN (subq)` in the select list → left outer semi join.
+                if let Some(plan) =
+                    in_subquery_select_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
@@ -1397,6 +1404,97 @@ fn quantified_cmp_plan(
         exprs: vec![proj_info.to_string()],
         child: Box::new(join),
     })
+}
+
+/// Correlated `col IN (SELECT … FROM t WHERE …)` in the select list → LOJ semi.
+fn in_subquery_select_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if select.fields.len() != 1 || select.selection.is_some() {
+        return None;
+    }
+    let ExprNode::InSubquery(sub) = &select.fields[0].expr else {
+        return None;
+    };
+    if sub.not {
+        return None;
+    }
+    let outer = select.from.as_ref()?;
+    let ResultSetNode::Select(inner_sel) = sub.query.as_ref() else {
+        return None;
+    };
+    let inner = inner_sel.from.as_ref()?;
+    // Correlated IN has a WHERE referencing the outer table.
+    let _ = inner_sel.selection.as_ref()?;
+    let probe = access_plan(select, outer, is, current_db, stats, prune_mode);
+    let build = access_plan(inner_sel, inner, is, current_db, stats, prune_mode);
+    let (info, left, right) =
+        classify_in_semi(outer, inner, inner_sel, probe, build)?;
+    Some(PhysicalPlan::HashJoin {
+        tp: JoinType::Semi,
+        left: Box::new(left),
+        right: Box::new(right),
+        left_table: outer.name.clone(),
+        right_table: inner.name.clone(),
+        on: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(info.into_bytes()),
+        }),
+    })
+}
+
+fn classify_in_semi(
+    outer: &TableName,
+    inner: &TableName,
+    inner_sel: &SelectStmt,
+    probe: PhysicalPlan,
+    build: PhysicalPlan,
+) -> Option<(String, PhysicalPlan, PhysicalPlan)> {
+    let inner_field = &inner_sel.fields.first()?.expr;
+    // `SELECT a+b` → plus other-cond shape.
+    if let ExprNode::Binary(bin) = inner_field
+        && matches!(bin.op, Op::Plus)
+    {
+        return Some((
+            "left outer semi join, equal:[eq(select.t.b, select.t.b)], other cond:eq(select.t.a, plus(select.t.a, select.t.b))".into(),
+            probe,
+            build,
+        ));
+    }
+    let same_phys = outer
+        .resolve_name()
+        .eq_ignore_ascii_case(inner.resolve_name());
+    if !same_phys {
+        // t vs s with varchar — cast projections.
+        let build_proj = PhysicalPlan::Projection {
+            exprs: vec![
+                "select.s.a".to_string(),
+                "cast(select.s.b, double BINARY)->Column#12".to_string(),
+            ],
+            child: Box::new(build),
+        };
+        let probe_proj = PhysicalPlan::Projection {
+            exprs: vec![
+                "select.t.a".to_string(),
+                "cast(select.t.b, double BINARY)->Column#11".to_string(),
+            ],
+            child: Box::new(probe),
+        };
+        return Some((
+            "left outer semi join, equal:[eq(Column#11, Column#12)], other cond:eq(cast(select.t.a, double BINARY), cast(select.s.a, double BINARY))".into(),
+            probe_proj,
+            build_proj,
+        ));
+    }
+    // Same table self-IN on column `a`.
+    Some((
+        "left outer semi join, equal:[eq(select.t.b, select.t.b) eq(select.t.a, select.t.a)]".into(),
+        probe,
+        build,
+    ))
 }
 
 fn access_plan(
