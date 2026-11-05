@@ -601,7 +601,12 @@ fn strip_explain_id_suffix(id: &str) -> String {
         name_start = i + ch.len_utf8();
     }
     let (prefix, name) = id.split_at(name_start);
-    let trimmed = name
+    // `TableReader_30(Build)` → strip `_30` before the role suffix.
+    let (stem, role) = match name.find('(') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    let stem = stem
         .rsplit_once('_')
         .and_then(|(head, tail)| {
             if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
@@ -610,8 +615,8 @@ fn strip_explain_id_suffix(id: &str) -> String {
                 None
             }
         })
-        .unwrap_or(name);
-    format!("{prefix}{trimmed}")
+        .unwrap_or(stem);
+    format!("{prefix}{stem}{role}")
 }
 
 fn strip_embedded_op_ids(rest: &str) -> String {

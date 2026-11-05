@@ -674,6 +674,7 @@ mod tests {
                 })),
             }),
             using_cols: Vec::new(),
+            straight: false,
         }
     }
 

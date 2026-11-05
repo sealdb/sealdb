@@ -69,7 +69,12 @@ fn brief_operator_id(id: &str) -> String {
         prefix_end = idx + ch.len_utf8();
     }
     let (prefix, name) = id.split_at(prefix_end);
-    let trimmed = name
+    // `TableReader_30(Build)` → `TableReader(Build)` for FORMAT=brief.
+    let (stem, role) = match name.find('(') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    let stem = stem
         .rsplit_once('_')
         .and_then(|(head, tail)| {
             if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
@@ -78,8 +83,8 @@ fn brief_operator_id(id: &str) -> String {
                 None
             }
         })
-        .unwrap_or(name);
-    format!("{prefix}{trimmed}")
+        .unwrap_or(stem);
+    format!("{prefix}{stem}{role}")
 }
 
 /// TiDB-shaped EXPLAIN ANALYZE columns. MVB attributes measured root
@@ -278,28 +283,30 @@ fn walk_with_parent(
     }
     let id = *next_id;
     *next_id += 1;
-    let (mut name, access, mut info) = node_meta(plan);
-    if let Some(PhysicalPlan::HashJoin { left, right, .. }) = parent {
-        if std::ptr::eq(plan as *const _, right.as_ref() as *const _) {
-            if name == "HashJoin" {
-                name = "HashJoin(Build)".to_string();
-            } else if name == "TableReader" {
-                name = "TableReader(Build)".to_string();
-            } else if name == "StreamAgg" {
-                name = "StreamAgg(Build)".to_string();
-            } else if name == "Projection" {
-                name = "Projection(Build)".to_string();
-            }
-        } else if std::ptr::eq(plan as *const _, left.as_ref() as *const _) {
-            if name == "HashJoin" {
-                name = "HashJoin(Probe)".to_string();
-            } else if name == "TableReader" {
-                name = "TableReader(Probe)".to_string();
-            } else if name == "Projection" {
-                name = "Projection(Probe)".to_string();
+    let (name, access, mut info) = node_meta(plan);
+    // TiDB labels `TableReader_30(Build)` — role suffix after the numeric id.
+    let join_role = match parent {
+        Some(PhysicalPlan::HashJoin { left, right, .. })
+        | Some(PhysicalPlan::MergeJoin { left, right, .. }) => {
+            let left_p = left.as_ref() as *const _;
+            let right_p = right.as_ref() as *const _;
+            if std::ptr::eq(plan as *const _, right_p)
+                && matches!(
+                    name.as_str(),
+                    "HashJoin" | "TableReader" | "StreamAgg" | "Projection"
+                )
+            {
+                "(Build)"
+            } else if std::ptr::eq(plan as *const _, left_p)
+                && matches!(name.as_str(), "HashJoin" | "TableReader" | "Projection")
+            {
+                "(Probe)"
+            } else {
+                ""
             }
         }
-    }
+        _ => "",
+    };
     // TopN → IndexReader: `index:TopN` + cop TopN.
     // StreamAgg → TableReader: `data:StreamAgg` + cop StreamAgg.
     // StreamAgg → IndexReader: `index:StreamAgg` + cop StreamAgg keep order:true.
@@ -333,10 +340,16 @@ fn walk_with_parent(
     }
     let bushy = matches!(
         plan,
-        PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+        PhysicalPlan::HashJoin { .. }
+            | PhysicalPlan::MergeJoin { .. }
+            | PhysicalPlan::PartitionUnion { .. }
     ) || matches!(
         parent,
-        Some(PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. })
+        Some(
+            PhysicalPlan::HashJoin { .. }
+                | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::PartitionUnion { .. }
+        )
     );
     let prefix = if bushy || !spine.is_empty() {
         tree_prefix_with_spine(spine, depth, last)
@@ -361,7 +374,7 @@ fn walk_with_parent(
         est_rows(plan)
     };
     rows.push(ExplainRow {
-        id: format!("{prefix}{name}_{id}"),
+        id: format!("{prefix}{name}_{id}{join_role}"),
         est_rows: format!("{row_est:.2}"),
         task: task_of(plan).to_string(),
         access,
@@ -371,17 +384,23 @@ fn walk_with_parent(
     // IndexRangeScan / TableRowIDScan) so EXPLAIN shows task=cop estRows.
     let under_bushy = matches!(
         parent,
-        Some(PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. })
+        Some(
+            PhysicalPlan::HashJoin { .. }
+                | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::PartitionUnion { .. }
+        )
     );
     // Projection→CARTESIAN: TableReader sits under Projection with a non-empty
     // spine; still need bushy cop prefixes for TableFullScan.
     let under_bushy = under_bushy
         || (matches!(parent, Some(PhysicalPlan::Projection { .. })) && !spine.is_empty());
+    let under_merge_join = matches!(parent, Some(PhysicalPlan::MergeJoin { .. }));
     if emit_cop_children(
         plan,
         topn_parent,
         stream_parent,
         under_bushy,
+        under_merge_join,
         depth + 1,
         next_id,
         rows,
@@ -396,7 +415,9 @@ fn walk_with_parent(
     // `true` for Probe `│`; TableReader Selection uses `bushy_cop_spine`.
     let under_last_join = matches!(
         plan,
-        PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+        PhysicalPlan::HashJoin { .. }
+            | PhysicalPlan::MergeJoin { .. }
+            | PhysicalPlan::PartitionUnion { .. }
     ) && last
         && (matches!(parent, Some(PhysicalPlan::Projection { .. }))
             || spine.last() == Some(&false));
@@ -408,14 +429,18 @@ fn walk_with_parent(
             if !child_last
                 && matches!(
                     child,
-                    PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+                    PhysicalPlan::HashJoin { .. }
+                        | PhysicalPlan::MergeJoin { .. }
+                        | PhysicalPlan::PartitionUnion { .. }
                 )
             {
                 child_spine.push(true);
             }
         } else if matches!(
             plan,
-            PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+            PhysicalPlan::HashJoin { .. }
+                | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::PartitionUnion { .. }
         ) {
             child_spine.push(!child_last);
         } else if !spine.is_empty() {
@@ -450,6 +475,7 @@ fn emit_cop_children(
     topn_parent: Option<(&str, u64, u64)>,
     stream_parent: Option<(&str, &str, f64)>,
     under_bushy: bool,
+    under_merge_join: bool,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
@@ -493,7 +519,14 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            let scan_info = if *stats_pseudo {
+            // MergeJoin needs ordered PK input → keep order:true (TiDB).
+            let scan_info = if under_merge_join {
+                if *stats_pseudo {
+                    "keep order:true, stats:pseudo".to_string()
+                } else {
+                    "keep order:true".to_string()
+                }
+            } else if *stats_pseudo {
                 "keep order:false, stats:pseudo".to_string()
             } else {
                 "keep order:false".to_string()
@@ -1191,8 +1224,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
-        // TiDB HashJoin lists Build (right) before Probe (left).
-        PhysicalPlan::HashJoin { left, right, .. } => {
+        // TiDB HashJoin / MergeJoin lists Build (right) before Probe (left).
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. } => {
             vec![right.as_ref(), left.as_ref()]
         }
         PhysicalPlan::Union { left, right, .. } => {
@@ -1360,6 +1394,15 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             let info = hash_join_explain_info(*tp, on, left, right);
             ("HashJoin".to_string(), String::new(), info)
         }
+        PhysicalPlan::MergeJoin {
+            left_key,
+            right_key,
+            ..
+        } => (
+            "MergeJoin".to_string(),
+            String::new(),
+            format!("inner join, left key:{left_key}, right key:{right_key}"),
+        ),
         PhysicalPlan::Apply { filter, .. } => {
             ("Apply".to_string(), String::new(), filter.restore_string())
         }
@@ -1456,6 +1499,16 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             }
         }
         PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
+        PhysicalPlan::MergeJoin { left, right, .. } => {
+            // TiDB unanalyzed MergeJoin est ≈ probe * 1.25 (10000 → 12500).
+            let l = est_rows(left);
+            let r = est_rows(right);
+            if is_pseudo_card(l) && is_pseudo_card(r) {
+                l.max(r) * 1.25
+            } else {
+                l.max(r)
+            }
+        }
         PhysicalPlan::HashJoin {
             tp,
             left,

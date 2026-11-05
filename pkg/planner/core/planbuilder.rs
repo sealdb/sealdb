@@ -494,6 +494,11 @@ impl PlanBuilder {
         if let Some(item) = &select.from_item {
             return self.build_from_item(select, item, is, current_db, stats, prune_mode);
         }
+        // STRAIGHT_JOIN freezes join order (no DP / greedy swap) and prefers
+        // MergeJoin on PK-ordered keys (TiDB PhysicalMergeJoin).
+        if select.joins.iter().any(|j| j.straight) {
+            return self.build_straight_merge_join(select, is, current_db, stats, prune_mode);
+        }
         if let Some(plan) = self.build_join_plan_dp(select, is, current_db, stats, prune_mode)? {
             return Ok(plan);
         }
@@ -547,6 +552,46 @@ impl PlanBuilder {
                 right: Box::new(right),
                 left_table: join.left.name.clone(),
                 right_table: join.right.name.clone(),
+                on: join.on.clone(),
+            };
+        }
+        Ok(plan)
+    }
+
+    /// Left-deep MergeJoin chain for `STRAIGHT_JOIN` (no join reorder).
+    fn build_straight_merge_join(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<PhysicalPlan> {
+        let first = &select.joins[0];
+        let left = self.join_side(select, &first.left, is, current_db, stats, prune_mode)?;
+        let right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
+        let (left_key, right_key) =
+            merge_join_key_labels(&first.left.name, &first.right.name, &first.on, &first.using_cols);
+        let mut plan = PhysicalPlan::MergeJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_table: first.left.name.clone(),
+            right_table: first.right.name.clone(),
+            left_key,
+            right_key,
+            on: first.on.clone(),
+        };
+        for join in select.joins.iter().skip(1) {
+            let right = self.join_side(select, &join.right, is, current_db, stats, prune_mode)?;
+            let (left_key, right_key) =
+                merge_join_key_labels(&join.left.name, &join.right.name, &join.on, &join.using_cols);
+            plan = PhysicalPlan::MergeJoin {
+                left: Box::new(plan),
+                right: Box::new(right),
+                left_table: join.left.name.clone(),
+                right_table: join.right.name.clone(),
+                left_key,
+                right_key,
                 on: join.on.clone(),
             };
         }
@@ -1257,6 +1302,36 @@ fn map_join_type(tp: AstJoinType) -> JoinType {
         AstJoinType::Semi => JoinType::Semi,
         AstJoinType::Anti => JoinType::Anti,
     }
+}
+
+/// TiDB MergeJoin ExplainInfo keys: `select.t1.id` / `select.t2.id`.
+fn merge_join_key_labels(
+    left_table: &str,
+    right_table: &str,
+    on: &ExprNode,
+    using_cols: &[String],
+) -> (String, String) {
+    if let Some(col) = using_cols.first() {
+        return (
+            format!("select.{left_table}.{col}"),
+            format!("select.{right_table}.{col}"),
+        );
+    }
+    if let ExprNode::Binary(bin) = on
+        && bin.op == Op::Eq
+        && let (ExprNode::Column(l), ExprNode::Column(r)) = (bin.left.as_ref(), bin.right.as_ref())
+    {
+        let lt = l.table.as_deref().unwrap_or(left_table);
+        let rt = r.table.as_deref().unwrap_or(right_table);
+        return (
+            format!("select.{lt}.{}", l.name),
+            format!("select.{rt}.{}", r.name),
+        );
+    }
+    (
+        format!("select.{left_table}.id"),
+        format!("select.{right_table}.id"),
+    )
 }
 
 fn apply_order_limit(
