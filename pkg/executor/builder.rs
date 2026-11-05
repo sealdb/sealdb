@@ -646,7 +646,11 @@ impl ExecutorBuilder {
                 }
             }
             exec.close()?;
-            Ok(QueryResult { columns, rows })
+            Ok(QueryResult {
+                columns,
+                rows,
+                warnings: sealdb_expression::take_warnings(),
+            })
         })
     }
 }

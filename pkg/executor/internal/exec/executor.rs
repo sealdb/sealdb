@@ -59,6 +59,8 @@ impl Executor for VecExec {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Datum>>,
+    /// TiDB-style warnings `(code, message)` for `--enable_warnings` / SHOW WARNINGS.
+    pub warnings: Vec<(i32, String)>,
 }
 
 impl QueryResult {
