@@ -3094,6 +3094,99 @@ mod tests {
         assert_eq!(rows.display_rows(), vec![vec!["1".to_string()]]);
     }
 
+
+    #[test]
+    fn test_unnamed_key_index_name_and_cte_binding() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte; \
+                 CREATE TABLE t(a INT, b INT, KEY (b))",
+            )
+            .unwrap();
+        // TiDB: unnamed `KEY (b)` → index name `b` (not `idx_b`).
+        let idx = session.execute_stmt("SHOW INDEX FROM t").unwrap();
+        assert_eq!(idx.display_rows()[0][2], "b", "{:?}", idx.display_rows());
+        let direct = session
+            .execute_stmt("DESC SELECT * FROM t USE INDEX(b)")
+            .unwrap();
+        let direct_text = direct
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            direct_text.contains("IndexLookUp") || direct_text.contains("IndexFullScan"),
+            "{direct_text}"
+        );
+        session
+            .execute_stmt(
+                "CREATE SESSION BINDING FOR WITH cte AS (SELECT * FROM t) SELECT * FROM cte \
+                 USING WITH cte AS (SELECT * FROM t USE INDEX(b)) SELECT * FROM cte",
+            )
+            .unwrap();
+        let after = session
+            .execute_stmt("DESC WITH cte AS (SELECT * FROM t) SELECT * FROM cte")
+            .unwrap();
+        let after_text = after
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            after_text.contains("IndexLookUp") || after_text.contains("IndexFullScan"),
+            "{after_text}"
+        );
+    }
+
+    #[test]
+    fn test_merge_join_hint_with_cte_inline() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte; \
+                 CREATE TABLE t1(c1 INT); INSERT INTO t1 VALUES (1),(2),(1),(2);",
+            )
+            .unwrap();
+        let plan = session
+            .execute_stmt(
+                "EXPLAIN FORMAT='brief' WITH cte1 AS (SELECT c1 FROM t1) \
+                 SELECT /*+ MERGE_JOIN(dt1, dt2) */ * FROM t1 dt1 \
+                 INNER JOIN cte1 dt2 ON dt2.c1 = dt1.c1 ORDER BY 1, 2",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let text = plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("MergeJoin"), "{text}");
+        assert!(!text.contains("CTE"), "{text}");
+        let rows = session
+            .execute_stmt(
+                "WITH cte1 AS (SELECT c1 FROM t1) \
+                 SELECT /*+ MERGE_JOIN(dt1, dt2) */ * FROM t1 dt1 \
+                 INNER JOIN cte1 dt2 ON dt2.c1 = dt1.c1 ORDER BY 1, 2",
+            )
+            .unwrap_or_else(|e| panic!("exec: {e}"));
+        assert_eq!(
+            rows.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "1".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+                vec!["2".to_string(), "2".to_string()],
+            ]
+        );
+    }
+
     #[test]
     fn test_scalar_with_chained_cte_and_alias() {
         let session = Session::new();
@@ -3103,7 +3196,6 @@ mod tests {
                  CREATE TABLE t1 (a INT); INSERT INTO t1 VALUES (1);",
             )
             .unwrap();
-        // Sibling CTE cols must stay inner under Apply (not outer `a` → 3).
         let scalar = session
             .execute_stmt(
                 "SELECT (WITH qn AS (SELECT 10*a AS a FROM t1), \
@@ -3116,7 +3208,6 @@ mod tests {
             "TiDB MaxAliasIdentifierLen: {}",
             scalar.columns[0].len()
         );
-        // Empty CTE + GROUP BY peer col (TiDB allows under ONLY_FULL_GROUP_BY).
         session
             .execute_stmt("DROP TABLE IF EXISTS t1; CREATE TABLE t1 (a INT, b INT)")
             .unwrap();
@@ -3125,7 +3216,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("CTE GROUP BY: {e}"));
         assert_eq!(grouped.columns, vec!["b".to_string()]);
         assert!(grouped.display_rows().is_empty());
-        // Nested same-name recursive + aliased outer ref (was 1146).
         session
             .execute_stmt(
                 "DROP TABLE IF EXISTS tbl_1; \
@@ -4093,7 +4183,7 @@ mod tests {
             .map(|r| r.join("|"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(unique_text.contains("PointGet"), "{unique_text}");
+        assert!(unique_text.contains("Point_Get"), "{unique_text}");
         assert!(!unique_text.contains("IndexLookUp"), "{unique_text}");
         let unique_hit = session
             .execute_stmt("SELECT * FROM db1.u WHERE name = 'a'")
@@ -4694,7 +4784,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            unique_cover_text.contains("PointGet"),
+            unique_cover_text.contains("Point_Get"),
             "{unique_cover_text}"
         );
         let unique_lookup = session
@@ -7615,7 +7705,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("PointGet") || text.contains("TableReader") || text.contains("Selection"),
+            text.contains("Point_Get") || text.contains("TableReader") || text.contains("Selection"),
             "{text}"
         );
         assert!(

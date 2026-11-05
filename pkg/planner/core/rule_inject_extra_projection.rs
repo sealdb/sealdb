@@ -13,12 +13,12 @@ pub fn order_by_all_constant(select: &SelectStmt) -> bool {
     !select.order_by.is_empty() && select.order_by.iter().all(|item| is_const_order_expr(&item.expr))
 }
 
-/// True when any ORDER BY item is a scalar function (not a bare column).
+/// True when any ORDER BY item is a scalar function (not a bare column or
+/// select-list ordinal — ordinals sort by output position in SortExec).
 pub fn order_by_has_scalar_func(select: &SelectStmt) -> bool {
-    select
-        .order_by
-        .iter()
-        .any(|item| !matches!(item.expr, ExprNode::Column(_)))
+    select.order_by.iter().any(|item| {
+        !matches!(item.expr, ExprNode::Column(_)) && !is_order_by_ordinal(&item.expr)
+    })
 }
 
 /// InjectProjBelowSort: Projection(select cols) → Sort(Column#N) →
@@ -153,8 +153,22 @@ fn explain_scalar_expr(table: &str, expr: &ExprNode) -> String {
     }
 }
 
+/// MySQL/TiDB `ORDER BY n` — 1-based select-list ordinal, not a foldable const.
+fn is_order_by_ordinal(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Value(v) => match &v.datum {
+            sealdb_types::Datum::I64(n) => *n > 0,
+            sealdb_types::Datum::U64(n) => *n > 0,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn is_const_order_expr(expr: &ExprNode) -> bool {
     match expr {
+        // Ordinals sort by output position; do not elide Sort (`ORDER BY 1, 2`).
+        ExprNode::Value(_) if is_order_by_ordinal(expr) => false,
         ExprNode::Value(_) => true,
         ExprNode::Column(_) => false,
         ExprNode::Func(f) => {

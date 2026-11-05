@@ -545,8 +545,19 @@ impl PlanBuilder {
                 right: Box::new(right),
             };
         }
+        // TiDB: non-recursive CTEs inline by default unless AS MATERIALIZED or
+        // referenced more than once (shared CTETableReader).
+        let cte_name = from.name.as_str();
+        let multi_ref = select
+            .join_tables()
+            .into_iter()
+            .filter(|t| t.resolve_name().eq_ignore_ascii_case(cte_name))
+            .count()
+            > 1;
         let inline = cte.is_some_and(|cte| {
-            cte.materialize == CteMaterialize::NotMaterialized && cte.recursive.is_none()
+            cte.materialize != CteMaterialize::Materialized
+                && cte.recursive.is_none()
+                && !multi_ref
         }) || seed_is_dual_projection(&seed)
             // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
             || seed_is_union_of_dual(&seed);
@@ -572,9 +583,9 @@ impl PlanBuilder {
         if let Some(item) = &select.from_item {
             return self.build_from_item(select, item, is, current_db, stats, prune_mode);
         }
-        // STRAIGHT_JOIN freezes join order (no DP / greedy swap) and prefers
-        // MergeJoin on PK-ordered keys (TiDB PhysicalMergeJoin).
-        if select.joins.iter().any(|j| j.straight) {
+        // STRAIGHT_JOIN / /*+ MERGE_JOIN(...) */ freeze join order and prefer
+        // MergeJoin on equality keys (TiDB PhysicalMergeJoin).
+        if select.joins.iter().any(|j| j.straight) || select_has_merge_join_hint(select) {
             return self.build_straight_merge_join(select, is, current_db, stats, prune_mode);
         }
         if let Some(plan) = self.build_join_plan_dp(select, is, current_db, stats, prune_mode)? {
@@ -1339,6 +1350,11 @@ fn is_information_schema(from: &TableName, current_db: &str) -> bool {
 
 fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
+}
+
+/// `/*+ MERGE_JOIN(t1, t2) */` in restored select text (TiDB hint parser MVB).
+fn select_has_merge_join_hint(select: &SelectStmt) -> bool {
+    select.text.to_ascii_lowercase().contains("merge_join")
 }
 
 fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectStmt {

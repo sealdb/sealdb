@@ -7804,7 +7804,8 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
     }
     let name = match &create.name {
         Some(name) => object_name_last(name)?,
-        None => format!("idx_{}", columns.join("_")),
+        // MySQL/TiDB: unnamed index → first column name (not `idx_…`).
+        None => columns[0].clone(),
     };
     Ok(Statement::CreateIndex(CreateIndexStmt {
         if_not_exists: create.if_not_exists,
@@ -7962,7 +7963,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     .name
                     .as_ref()
                     .map(|ident| ident.value.clone())
-                    .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+                    .unwrap_or_else(|| columns[0].clone());
                 Ok(AlterTableSpec::AddIndex(IndexDef {
                     name,
                     columns,
@@ -8001,7 +8002,8 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     .name
                     .as_ref()
                     .map(|ident| ident.value.clone())
-                    .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+                    // MySQL/TiDB: `KEY (b)` → index name `b`.
+                    .unwrap_or_else(|| columns[0].clone());
                 indices.push(IndexDef {
                     name,
                     columns,
@@ -8044,7 +8046,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         .as_ref()
         .or(idx.name.as_ref())
         .map(|ident| ident.value.clone())
-        .unwrap_or_else(|| format!("idx_{}", columns.join("_")));
+        .unwrap_or_else(|| columns[0].clone());
     Ok(IndexDef {
         name,
         columns,

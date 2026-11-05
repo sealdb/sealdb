@@ -212,7 +212,12 @@ impl TableInfo {
             .iter()
             .map(|col| col.name.o().to_string())
             .collect();
-        if let Some(handle) = self.handle_column() {
+        // Only an integer PRIMARY KEY handle is free with the index key.
+        // Non-PK tables use `_tidb_rowid`; first INT is not covered by a
+        // secondary index (`KEY (b)` + `SELECT *` → IndexLookUp, not IndexReader).
+        if self.pk_is_handle
+            && let Some(handle) = self.handle_column()
+        {
             let handle_name = handle.name.o();
             if !names
                 .iter()
