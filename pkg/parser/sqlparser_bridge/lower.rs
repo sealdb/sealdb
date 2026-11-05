@@ -4979,9 +4979,6 @@ fn lower_select(
         resolve_named_window(&mut field.expr, &windows)?;
     }
     let (from, joins, from_item, derived) = lower_from(&select.from)?;
-    if !joins.is_empty() && !derived.is_empty() {
-        return Err(Error::unsupported("subquery JOIN"));
-    }
     let selection = select.selection.as_ref().map(lower_expr).transpose()?;
     let having = select.having.as_ref().map(lower_expr).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
@@ -5068,19 +5065,14 @@ fn lower_from(
         let joins = flatten_from_item_joins(&item);
         return Ok((first, joins, Some(item), ctes));
     }
-    let (first, mut joins, ctes) = lower_table_with_joins(&from[0])?;
-    if from.len() > 1 && !ctes.is_empty() {
-        return Err(Error::unsupported("subquery JOIN"));
-    }
+    let (first, mut joins, mut ctes) = lower_table_with_joins(&from[0])?;
     let mut prev = joins
         .last()
         .map(|j| j.right.clone())
         .unwrap_or_else(|| first.clone());
     for extra in &from[1..] {
         let (right, extra_joins, extra_ctes) = lower_table_with_joins(extra)?;
-        if !extra_ctes.is_empty() {
-            return Err(Error::unsupported("subquery JOIN"));
-        }
+        ctes.extend(extra_ctes);
         joins.push(Join {
             left: prev,
             right: right.clone(),
@@ -5108,9 +5100,6 @@ fn lower_from_item_list(
     let (mut item, mut ctes) = lower_table_with_joins_item(&from[0])?;
     for extra in &from[1..] {
         let (right, extra_ctes) = lower_table_with_joins_item(extra)?;
-        if !extra_ctes.is_empty() {
-            return Err(Error::unsupported("subquery JOIN"));
-        }
         ctes.extend(extra_ctes);
         item = crate::ast::FromItem::Join {
             left: Box::new(item),
@@ -5128,9 +5117,6 @@ fn lower_table_with_joins_item(
     let (mut left, mut ctes) = table_factor_item(&table.relation)?;
     for join in &table.joins {
         let (right, right_ctes) = table_factor_item(&join.relation)?;
-        if !right_ctes.is_empty() {
-            return Err(Error::unsupported("subquery JOIN"));
-        }
         ctes.extend(right_ctes);
         let (tp, on) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
@@ -5270,21 +5256,16 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
 fn lower_table_with_joins(
     table: &TableWithJoins,
 ) -> Result<(TableName, Vec<Join>, Vec<CommonTableExpression>)> {
-    let (left, left_alias, ctes) = table_factor(&table.relation)?;
+    let (left, left_alias, mut ctes) = table_factor(&table.relation)?;
     if table.joins.is_empty() {
         return Ok((left, Vec::new(), ctes));
-    }
-    if !ctes.is_empty() {
-        return Err(Error::unsupported("subquery JOIN"));
     }
     let mut out = Vec::new();
     let mut prev = left.clone();
     let mut prev_alias = left_alias;
     for join in &table.joins {
         let (right, right_alias, right_ctes) = table_factor(&join.relation)?;
-        if !right_ctes.is_empty() {
-            return Err(Error::unsupported("subquery JOIN"));
-        }
+        ctes.extend(right_ctes);
         let (tp, on, using_cols) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
             | JoinOperator::Inner(JoinConstraint::On(expr))
@@ -5361,7 +5342,7 @@ fn lower_table_with_joins(
         prev = right;
         prev_alias = right_alias;
     }
-    Ok((left, out, Vec::new()))
+    Ok((left, out, ctes))
 }
 
 fn using_column_names(names: &[ObjectName]) -> Result<Vec<String>> {
@@ -5528,17 +5509,24 @@ fn table_factor(
             let alias = alias
                 .as_ref()
                 .ok_or_else(|| Error::unsupported("derived table without alias"))?;
-            let mut query = lower_query(subquery)?;
-            let mut ctes = query.with.take().map(|with| with.ctes).unwrap_or_default();
             let name = alias.name.value.clone();
-            if ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(&name)) {
-                return Err(Error::unsupported("duplicate CTE name"));
-            }
             let col_name_list: Vec<String> = alias
                 .columns
                 .iter()
                 .map(|col| col.name.value.clone())
                 .collect();
+            // Derived may be SELECT or UNION ALL — flatten into CTE seed + set_rest.
+            let (mut query, set_rest) = match subquery.body.as_ref() {
+                SetExpr::SetOperation { .. } => flatten_set_expr(subquery.body.as_ref())?,
+                _ => {
+                    let q = lower_query(subquery)?;
+                    (q, Vec::new())
+                }
+            };
+            let mut ctes = query.with.take().map(|with| with.ctes).unwrap_or_default();
+            if ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(&name)) {
+                return Err(Error::unsupported("duplicate CTE name"));
+            }
             // TiDB/MySQL: derived table column names must be unique (errno 1060).
             let names = if col_name_list.is_empty() {
                 derived_select_names(&query)?
@@ -5551,7 +5539,7 @@ fn table_factor(
                 query: Box::new(query),
                 col_name_list,
                 recursive: None,
-                set_rest: Vec::new(),
+                set_rest,
                 materialize: CteMaterialize::Default,
             });
             // CTE physical name is the alias; ON refs already use that name.

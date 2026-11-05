@@ -1565,10 +1565,16 @@ mod tests {
             aliased.as_select().unwrap().with.as_ref().unwrap().ctes[0].col_name_list,
             vec!["x".to_string()]
         );
-        let err = parser
+        let joined = parser
             .parse_one_stmt("SELECT * FROM t1 JOIN (SELECT 1 AS id) d ON t1.id = d.id")
-            .unwrap_err();
-        assert!(err.message.contains("subquery JOIN"));
+            .unwrap();
+        let joined_sel = joined.as_select().unwrap();
+        assert_eq!(joined_sel.joins.len(), 1);
+        assert_eq!(joined_sel.joins[0].right.name, "d");
+        assert_eq!(
+            joined_sel.with.as_ref().unwrap().ctes[0].name,
+            "d"
+        );
     }
 
     #[test]
