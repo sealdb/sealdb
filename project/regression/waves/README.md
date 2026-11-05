@@ -2,6 +2,8 @@
 
 Progress unit = **suite `green`** against TiDB v8.5.8 goldens (`r/*.result`), not package `core-ported`.
 
+**Discipline:** [parity-discipline.md](../../parity-discipline.md) — 1:1 same-named ports, TDD, production maturity before `green`.
+
 | Wave | Focus | Manifest |
 |---|---|---|
 | R1 | select / show / types — expression + executor | `wave=R1` |
@@ -14,7 +16,8 @@ Progress unit = **suite `green`** against TiDB v8.5.8 goldens (`r/*.result`), no
 
 ```bash
 ./project/scripts/triage_itest.sh --wave R1 --status in_progress -s memory
-# map fail → TiDB pkg/file → port same-named .rs → re-run suite
+# map fail → TiDB pkg/file → port same-named .rs → unit test + suite
+# Mem + TiKV same golden → mark green → update project/progress.md same day
 ```
 
 ## Rules
@@ -23,3 +26,4 @@ Progress unit = **suite `green`** against TiDB v8.5.8 goldens (`r/*.result`), no
 - SealDB `--record` forbidden except `t/local/` + `SEALDB_ITEST_ALLOW_SEALDB_RECORD=1`.
 - Gate A: result set + errno. Gate B: EXPLAIN shape (same suite, no long exemption).
 - No `ported` in parity without a `green` suite citing the file.
+- A feature is not “done” until [parity-discipline.md §4](../../parity-discipline.md) checklist passes.

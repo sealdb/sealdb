@@ -1,7 +1,8 @@
 # 编码与移植规范（Conventions）
 
 > 目标：让不同人/Agent 产出的代码**可读、可对齐、可回归**。  
-> 与本文冲突的写法，必须在评审中说明理由；长期偏差写入 ADR。
+> 与本文冲突的写法，必须在评审中说明理由；长期偏差写入 ADR。  
+> **产品对齐总纪律**（TDD、一比一、生产级成熟度）：[parity-discipline.md](./parity-discipline.md)。
 
 ---
 
@@ -53,9 +54,12 @@
 ### 2.4 收尾
 
 - [ ] `cargo fmt` / `clippy` / `test` 通过
-- [ ] 更新 `progress.md` 与 `parity-matrix.md`
-- [ ] 记录已知差异
+- [ ] 相关 integrationtest suite Gate A(+B) 绿；Mem + TiKV 同金样（或已登记 `skip_tikv`）
+- [ ] 对照 TiDB 同名文件：关键路径无静默缺口；达 [parity-discipline.md](./parity-discipline.md) §4 生产级清单
+- [ ] **实时**更新 `progress.md`（改动文件、证据命令、下一缺口）与 `parity-matrix.md`
+- [ ] 记录已知差异（PARITY_NOTES / progress）
 - [ ] 如引入新依赖，说明 License 与替代方案
+- [ ] Commit 禁止 `Co-authored-by` trailer
 
 ---
 
