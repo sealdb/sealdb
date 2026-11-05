@@ -13,7 +13,7 @@ use sealdb_types::field_type::FieldType;
 use sealdb_types::time::{parse_timestamp_literal, Time, TimeType};
 use sealdb_types::Datum;
 use sealdb_util::collate::{CollateMode, compare_bytes};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
@@ -106,6 +106,16 @@ fn current_time_zone() -> String {
 
 thread_local! {
     static CURRENT_DB: RefCell<String> = const { RefCell::new(String::new()) };
+    /// TiDB `tidb_window_concurrency` (default 5; suite sets 1 / 4).
+    static WINDOW_CONCURRENCY: Cell<u64> = const { Cell::new(5) };
+}
+
+pub fn set_window_concurrency(n: u64) {
+    WINDOW_CONCURRENCY.with(|c| c.set(n.max(1)));
+}
+
+pub fn window_concurrency() -> u64 {
+    WINDOW_CONCURRENCY.with(|c| c.get())
 }
 
 pub fn with_current_db<T>(db: impl Into<String>, f: impl FnOnce() -> T) -> T {

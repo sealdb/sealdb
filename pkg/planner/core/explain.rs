@@ -328,6 +328,11 @@ fn walk_with_parent(
         }) => Some((info.as_str(), cop_info.as_str(), *est_rows)),
         _ => None,
     };
+    let window_keep_order = match parent {
+        Some(PhysicalPlan::Window { info, .. }) => info.contains("partition by"),
+        _ => false,
+    };
+    let under_window = matches!(parent, Some(PhysicalPlan::Window { .. }));
     let under_stream_agg = stream_parent.is_some();
     if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:TopN".to_string();
@@ -337,6 +342,9 @@ fn walk_with_parent(
     }
     if under_stream_agg && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:StreamAgg".to_string();
+    }
+    if under_window && matches!(plan, PhysicalPlan::IndexReader { .. }) {
+        info = "index:IndexFullScan".to_string();
     }
     let bushy = matches!(
         plan,
@@ -414,6 +422,8 @@ fn walk_with_parent(
         stream_parent,
         under_bushy,
         under_merge_join,
+        under_window,
+        window_keep_order,
         depth + 1,
         next_id,
         rows,
@@ -498,6 +508,8 @@ fn emit_cop_children(
     stream_parent: Option<(&str, &str, f64)>,
     under_bushy: bool,
     under_merge_join: bool,
+    under_window: bool,
+    window_keep_order: bool,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
@@ -677,7 +689,14 @@ fn emit_cop_children(
                 // GROUP BY StreamAgg needs ordered index input.
                 scan_info = "keep order:true, stats:pseudo".to_string();
             }
-            let scan_task = if topn_parent.is_some() || under_stream_agg {
+            if under_window {
+                scan_info = if window_keep_order {
+                    "keep order:true, stats:pseudo".to_string()
+                } else {
+                    "keep order:false, stats:pseudo".to_string()
+                };
+            }
+            let scan_task = if topn_parent.is_some() || under_stream_agg || under_window {
                 "cop[tikv]"
             } else {
                 "cop"

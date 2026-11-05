@@ -2565,7 +2565,7 @@
     {
       "name": "window_function",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/window_function.test",
       "result": "r/window_function.result",
       "has_result": true,

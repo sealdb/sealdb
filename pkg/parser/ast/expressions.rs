@@ -694,6 +694,9 @@ pub enum WindowFrameBound {
     CurrentRow,
     Following(u64),
     UnboundedFollowing,
+    /// `INTERVAL '2:30' MINUTE_SECOND PRECEDING` (TiDB window RANGE).
+    IntervalPreceding { value: String, unit: String },
+    IntervalFollowing { value: String, unit: String },
 }
 
 impl WindowFrameBound {
@@ -710,6 +713,20 @@ impl WindowFrameBound {
                 ctx.write_str(" FOLLOWING");
             }
             WindowFrameBound::UnboundedFollowing => ctx.write_str("UNBOUNDED FOLLOWING"),
+            WindowFrameBound::IntervalPreceding { value, unit } => {
+                ctx.write_str("INTERVAL ");
+                ctx.write_str(value);
+                ctx.write_str(" ");
+                ctx.write_str(unit);
+                ctx.write_str(" PRECEDING");
+            }
+            WindowFrameBound::IntervalFollowing { value, unit } => {
+                ctx.write_str("INTERVAL ");
+                ctx.write_str(value);
+                ctx.write_str(" ");
+                ctx.write_str(unit);
+                ctx.write_str(" FOLLOWING");
+            }
         }
     }
 }

@@ -71,6 +71,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // sqlparser rejects `((SELECT…) UNION ALL (SELECT…)) alias`; unwrap arm parens
     // before paren-from (which would otherwise strip the outer derived parens).
     let rewritten = rewrite_mysql_union_derived_parens(&rewritten);
+    // sqlparser rejects `INTERVAL '2:30' MINUTE_SECOND`; rewrite for parse and
+    // recover TiDB ExplainInfo in frame lowering.
+    let rewritten = rewrite_mysql_interval_minute_second(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
     let rewritten = rewrite_show_grants(&rewritten)?;
@@ -1921,6 +1924,55 @@ fn rewrite_mysql_bang(sql: &str) -> String {
                 i += ch.len_utf8();
             }
         }
+    }
+    out
+}
+
+/// `INTERVAL '2:30' MINUTE_SECOND` → `INTERVAL 'SEALDB_MS:2:30' MINUTE` for sqlparser.
+fn rewrite_mysql_interval_minute_second(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0;
+    let bytes = sql.as_bytes();
+    while i < bytes.len() {
+        if lower[i..].starts_with("interval") {
+            // Copy INTERVAL keyword as-is.
+            out.push_str(&sql[i..i + 8]);
+            i += 8;
+            let after = skip_ws_and_comments(bytes, i);
+            out.push_str(&sql[i..after]);
+            i = after;
+            // Quoted literal.
+            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+                let quote = bytes[i];
+                out.push(quote as char);
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                let lit = &sql[start..i];
+                out.push_str("SEALDB_MS:");
+                out.push_str(lit);
+                if i < bytes.len() {
+                    out.push(quote as char);
+                    i += 1;
+                }
+                let after_lit = skip_ws_and_comments(bytes, i);
+                out.push_str(&sql[i..after_lit]);
+                i = after_lit;
+                // Replace minute_second unit with minute.
+                if lower[i..].starts_with("minute_second") {
+                    out.push_str("MINUTE");
+                    i += "minute_second".len();
+                    continue;
+                }
+            }
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -6677,20 +6729,40 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     if refer_table.is_some() && (!create.columns.is_empty() || !create.constraints.is_empty()) {
         return Err(Error::unsupported("CREATE TABLE LIKE with column list"));
     }
-    let cols = create
-        .columns
-        .iter()
-        .map(|col| {
-            Ok(ColumnDef {
-                name: col.name.value.clone(),
-                type_name: col.data_type.to_string(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut cols = Vec::with_capacity(create.columns.len());
+    let mut col_primary: Option<String> = None;
+    for col in &create.columns {
+        cols.push(ColumnDef {
+            name: col.name.value.clone(),
+            type_name: col.data_type.to_string(),
+        });
+        for opt in &col.options {
+            if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)) {
+                if col_primary.is_some() {
+                    return Err(Error::unsupported("multiple column PRIMARY KEY"));
+                }
+                col_primary = Some(col.name.value.clone());
+            }
+        }
+    }
     if cols.is_empty() && refer_table.is_none() && select.is_none() {
         return Err(Error::unsupported("CREATE TABLE without columns"));
     }
-    let indices = lower_table_indices(&create.constraints)?;
+    let mut indices = lower_table_indices(&create.constraints)?;
+    // `a int primary key` → synthetic PRIMARY KEY index (TiDB pk_is_handle).
+    if let Some(name) = col_primary {
+        if !indices.iter().any(|i| i.primary) {
+            indices.insert(
+                0,
+                IndexDef {
+                    name: "PRIMARY".into(),
+                    columns: vec![name],
+                    unique: true,
+                    primary: true,
+                },
+            );
+        }
+    }
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
         table: object_table_name(&create.name)?,
@@ -7278,20 +7350,6 @@ fn lower_window_frame(frame: &sqlparser::ast::WindowFrame) -> Result<WindowFrame
         Some(bound) => lower_frame_bound(bound)?,
         None => WindowFrameBound::CurrentRow,
     };
-    if units == WindowFrameUnits::Range
-        && matches!(
-            (&start, &end),
-            (
-                WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_),
-                _
-            ) | (
-                _,
-                WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_)
-            )
-        )
-    {
-        return Err(Error::unsupported("RANGE offset frame"));
-    }
     Ok(WindowFrameSpec { units, start, end })
 }
 
@@ -7300,23 +7358,54 @@ fn lower_frame_bound(bound: &SqlWindowFrameBound) -> Result<WindowFrameBound> {
         SqlWindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
         SqlWindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
         SqlWindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
-        SqlWindowFrameBound::Preceding(Some(expr)) => {
-            Ok(WindowFrameBound::Preceding(literal_frame_offset(expr)?))
-        }
-        SqlWindowFrameBound::Following(Some(expr)) => {
-            Ok(WindowFrameBound::Following(literal_frame_offset(expr)?))
-        }
+        SqlWindowFrameBound::Preceding(Some(expr)) => lower_frame_offset(expr, true),
+        SqlWindowFrameBound::Following(Some(expr)) => lower_frame_offset(expr, false),
     }
 }
 
-fn literal_frame_offset(expr: &Expr) -> Result<u64> {
+fn lower_frame_offset(expr: &Expr, preceding: bool) -> Result<WindowFrameBound> {
+    // INTERVAL '2:30' MINUTE_SECOND
+    if let Expr::Interval(iv) = expr {
+        let raw = match iv.value.as_ref() {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+                other => format!("{other:?}"),
+            },
+            other => format!("{other:?}"),
+        };
+        // Recover `INTERVAL '2:30' MINUTE_SECOND` from SEALDB_MS rewrite.
+        let (value, unit) = if let Some(rest) = raw.strip_prefix("SEALDB_MS:") {
+            (format!("\"{rest}\""), "\"MINUTE_SECOND\"".to_string())
+        } else {
+            let unit = format!("{:?}", iv.leading_field).to_ascii_uppercase();
+            let unit = match unit.as_str() {
+                "MINUTE" => "\"MINUTE\"".into(),
+                "SECOND" => "\"SECOND\"".into(),
+                other => format!("\"{}\"", other.trim_matches('"')),
+            };
+            (format!("\"{raw}\""), unit)
+        };
+        return Ok(if preceding {
+            WindowFrameBound::IntervalPreceding { value, unit }
+        } else {
+            WindowFrameBound::IntervalFollowing { value, unit }
+        });
+    }
     match lower_expr(expr)? {
         ExprNode::Value(ValueExpr {
             datum: Datum::I64(n),
-        }) if n >= 0 => Ok(n as u64),
+        }) if n >= 0 => Ok(if preceding {
+            WindowFrameBound::Preceding(n as u64)
+        } else {
+            WindowFrameBound::Following(n as u64)
+        }),
         ExprNode::Value(ValueExpr {
             datum: Datum::U64(n),
-        }) => Ok(n),
+        }) => Ok(if preceding {
+            WindowFrameBound::Preceding(n)
+        } else {
+            WindowFrameBound::Following(n)
+        }),
         other => Err(Error::unsupported(format!("frame offset {other:?}"))),
     }
 }
