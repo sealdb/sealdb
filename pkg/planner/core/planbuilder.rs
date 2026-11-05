@@ -801,6 +801,11 @@ impl PlanBuilder {
                 tp,
                 on,
             } => {
+                if let Some(plan) = self.try_bushy_quad_outer(
+                    select, left, right, *tp, on, is, current_db, stats, prune_mode,
+                )? {
+                    return Ok(plan);
+                }
                 let left_plan =
                     self.build_from_item(select, left, is, current_db, stats, prune_mode)?;
                 let mut right_plan =
@@ -864,6 +869,181 @@ impl PlanBuilder {
                 }
             }
         }
+    }
+
+    /// `(t1 ⟕ t2) ⟕ (t3 ⟕ t4) ON …` — TiDB bushy outer-join reorder shapes.
+    fn try_bushy_quad_outer(
+        &self,
+        select: &SelectStmt,
+        left: &sealdb_parser::ast::FromItem,
+        right: &sealdb_parser::ast::FromItem,
+        tp: sealdb_parser::ast::JoinType,
+        on: &ExprNode,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        use sealdb_parser::ast::FromItem;
+        if !matches!(map_join_type(tp), JoinType::LeftOuter) {
+            return Ok(None);
+        }
+        let (
+            FromItem::Join {
+                left: l1,
+                right: l2,
+                tp: lt,
+                on: lon,
+            },
+            FromItem::Join {
+                left: r1,
+                right: r2,
+                tp: rt,
+                on: ron,
+            },
+        ) = (left, right)
+        else {
+            return Ok(None);
+        };
+        if !matches!(map_join_type(*lt), JoinType::LeftOuter)
+            || !matches!(map_join_type(*rt), JoinType::LeftOuter)
+        {
+            return Ok(None);
+        }
+        let (FromItem::Table(t1), FromItem::Table(t2)) = (l1.as_ref(), l2.as_ref()) else {
+            return Ok(None);
+        };
+        let (FromItem::Table(t3), FromItem::Table(t4)) = (r1.as_ref(), r2.as_ref()) else {
+            return Ok(None);
+        };
+        if !outer_join_on_base(lon, &t1.name, &t2.name)
+            || !outer_join_on_base(ron, &t3.name, &t4.name)
+        {
+            return Ok(None);
+        }
+        let side = |t: &TableName| self.join_side(select, t, is, current_db, stats, prune_mode);
+        let with_isnull = |plan: PhysicalPlan, on: &ExprNode, table: &TableName| {
+            if let Some(filter) = null_reject_on_inner(on, &table.name, table.resolve_name()) {
+                predicate_push_down(plan, &filter, is, current_db)
+            } else {
+                plan
+            }
+        };
+
+        // ON t2.a = t4.a → ((t3 ⋈ t4) ⟕ t2) as Build, t1 as Probe; top eq(t1,t2).
+        if outer_join_on_base(on, &t2.name, &t4.name) {
+            let mut a3 = side(t3)?;
+            let mut a4 = side(t4)?;
+            a3 = with_isnull(a3, ron, t3);
+            a4 = with_isnull(a4, ron, t4);
+            let inner = reorder_hash_join(
+                JoinType::Inner,
+                a3,
+                a4,
+                t3.name.clone(),
+                t4.name.clone(),
+                table_row_count(stats, t3, current_db),
+                table_row_count(stats, t4, current_db),
+                flip_eq_for_build(ron, &t3.name),
+            );
+            let mut a2 = side(t2)?;
+            a2 = with_isnull(a2, on, t2);
+            let mid = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a2),
+                right: Box::new(inner),
+                left_table: t2.name.clone(),
+                right_table: t4.name.clone(),
+                on: on.clone(),
+            };
+            let a1 = side(t1)?;
+            return Ok(Some(PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a1),
+                right: Box::new(mid),
+                left_table: t1.name.clone(),
+                right_table: t2.name.clone(),
+                on: lon.clone(),
+            }));
+        }
+
+        // ON t2.a = t3.a → (((t3 ⟕ t2) ⟕ t1) as Build, t4 as Probe).
+        if outer_join_on_base(on, &t2.name, &t3.name) {
+            let mut a3 = side(t3)?;
+            a3 = with_isnull(a3, on, t3);
+            let mut a2 = side(t2)?;
+            a2 = with_isnull(a2, on, t2);
+            let low = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a2),
+                right: Box::new(a3),
+                left_table: t2.name.clone(),
+                right_table: t3.name.clone(),
+                on: on.clone(),
+            };
+            let a1 = side(t1)?;
+            let mid = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a1),
+                right: Box::new(low),
+                left_table: t1.name.clone(),
+                right_table: t2.name.clone(),
+                on: lon.clone(),
+            };
+            let mut a4 = side(t4)?;
+            a4 = with_isnull(a4, ron, t4);
+            return Ok(Some(PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a4),
+                right: Box::new(mid),
+                left_table: t4.name.clone(),
+                right_table: t3.name.clone(),
+                on: ron.clone(),
+            }));
+        }
+
+        // ON t1.a = t4.a → Projection; Build=t2, Probe=((t3⋈t4) ⟕ t1).
+        if outer_join_on_base(on, &t1.name, &t4.name) {
+            let mut a3 = side(t3)?;
+            let mut a4 = side(t4)?;
+            a3 = with_isnull(a3, ron, t3);
+            a4 = with_isnull(a4, ron, t4);
+            let inner = reorder_hash_join(
+                JoinType::Inner,
+                a3,
+                a4,
+                t3.name.clone(),
+                t4.name.clone(),
+                table_row_count(stats, t3, current_db),
+                table_row_count(stats, t4, current_db),
+                flip_eq_for_build(ron, &t3.name),
+            );
+            let a1 = side(t1)?;
+            let mid = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(a1),
+                right: Box::new(inner),
+                left_table: t1.name.clone(),
+                right_table: t4.name.clone(),
+                on: on.clone(),
+            };
+            let mut a2 = side(t2)?;
+            a2 = with_isnull(a2, lon, t2);
+            // Build=t2 (nullable), Probe=((t3⋈t4)⟕t1) preserved spine on t1.
+            let plan = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(mid),
+                right: Box::new(a2),
+                left_table: t1.name.clone(),
+                right_table: t2.name.clone(),
+                on: lon.clone(),
+            };
+            return Ok(Some(wrap_star_join_projection(
+                plan, select, is, current_db,
+            )));
+        }
+
+        Ok(None)
     }
 
     /// Costed n-table DP when all joins are Inner equality on a connected graph

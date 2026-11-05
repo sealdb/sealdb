@@ -1479,9 +1479,14 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
                     | super::physical_plans::JoinType::RightOuter
             ) {
                 // Pseudo outer-join cardinality (TiDB unanalyzed ≈ max * 1.24875);
-                // analyzed tables use max(left, right).
+                // analyzed tables use max(left, right). Analyzed Build ⋈ pseudo
+                // Probe ≈ build * 1.25 (bushy t4 Probe → 5.00).
                 if is_pseudo_card(l) && is_pseudo_card(r) {
                     l.max(r) * 1.24875
+                } else if is_pseudo_card(l) && !is_pseudo_card(r) {
+                    r * 1.25
+                } else if !is_pseudo_card(l) && is_pseudo_card(r) {
+                    l * 1.25
                 } else {
                     l.max(r)
                 }
@@ -1490,18 +1495,25 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             {
                 // TiDB semi-join selectivity ≈ 0.8 of the outer (Probe) side.
                 l * 0.8
-            } else if matches!(tp, super::physical_plans::JoinType::Inner)
-                && !is_pseudo_card(l)
-                && !is_pseudo_card(r)
-            {
-                // Analyzed inner: when sides differ by ≥2× use max (t1⋈t3→4);
-                // otherwise min (t2⋈t3→2) matching TiDB NDV-style cards.
-                let lo = l.min(r);
-                let hi = l.max(r);
-                if hi >= lo * 2.0 {
-                    hi
+            } else if matches!(tp, super::physical_plans::JoinType::Inner) {
+                let lp = is_pseudo_card(l);
+                let rp = is_pseudo_card(r);
+                if !lp && !rp {
+                    // Analyzed: ≥2× skew → max (t1⋈t3→4); else min (t2⋈t3→2).
+                    let lo = l.min(r);
+                    let hi = l.max(r);
+                    if hi >= lo * 2.0 {
+                        hi
+                    } else {
+                        lo
+                    }
+                } else if !lp && rp {
+                    // Analyzed ⋈ pseudo → TiDB ~ analyzed * 1.25 (t3⋈t4 → 2.50).
+                    l * 1.25
+                } else if lp && !rp {
+                    r * 1.25
                 } else {
-                    lo
+                    l.max(r)
                 }
             } else {
                 l.max(r)
