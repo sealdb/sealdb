@@ -2525,7 +2525,7 @@
     {
       "name": "types/const",
       "wave": "R1",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/types/const.test",
       "result": "r/types/const.result",
       "has_result": true,
