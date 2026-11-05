@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` nested join EXPLAIN 已绿**。下一缺口：`Point_Get` 命名 + `a='1'` 整型常量折叠（`select-triage` ~350） |
+| R1 | select, show, types/* | `in_progress` | **`select` 推进至分区 EXPLAIN**：Point_Get/`a='1'`/dual Projection 已绿；卡在 `PartitionUnion` / `partition:pN`（`select-triage` ~365） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -52,7 +52,9 @@
 | SELECT DISTINCT | Dedup | `SelectStmt.distinct` + `Distinct` / outer HashAgg | `SELECT DISTINCT c1,c2 … LIMIT 1` → `(1,1)` |
 | covering IndexReader | 非 PK 表不覆盖索引列 | `covering_row` 仅在 Null 时填 handle | `USE INDEX` / group-by count 结果正确 |
 | NestedJoin bushy HashJoin | `(t1⋈t2)⋈(t3⋈t4)` | `FromItem` 树 + Build/Probe + CARTESIAN left cond + null-reject | nested join brief 段已绿 |
-| **下一缺口** | `Point_Get` / `a='1'` coerce | PointGet 命名；字符串→handle | `select-triage.txt` ~350 |
+| Point_Get + `a='1'` | handle 常量折叠 | `Point_Get` id；string→i64；absorb residual | desc Point_Get 段已绿 |
+| dual Projection | `sysdate()->Column#N` | dual Projection exprs；itest 归一化 `_N` | desc sysdate 段已绿 |
+| **下一缺口** | 分区 prune EXPLAIN (`PartitionUnion` / `pN`) | partition processor + explain | `select-triage.txt` ~365 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

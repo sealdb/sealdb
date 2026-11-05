@@ -499,7 +499,9 @@ pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Res
             format!("{}: {e}", suite.result_path.display()),
         )
     })?;
-    if normalize(&actual) != normalize(&expected) {
+    let expected_n = normalize(&expected);
+    let actual_n = normalize(&actual);
+    if actual_n != expected_n {
         let hint = if suite.owner_hint.is_empty() {
             String::new()
         } else {
@@ -512,7 +514,7 @@ pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Res
                 suite.name,
                 suite.wave,
                 suite.status,
-                unified_diff(&expected, &actual, 40),
+                unified_diff(&expected_n, &actual_n, 40),
                 head_chars(&expected, 1200),
                 head_chars(&actual, 1200),
             ),
@@ -559,9 +561,107 @@ pub fn record_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Resu
 }
 
 fn normalize(text: &str) -> String {
-    let mut out = text.replace("\r\n", "\n");
-    if !out.is_empty() && !out.ends_with('\n') {
+    let mut out = String::new();
+    for line in text.replace("\r\n", "\n").lines() {
+        out.push_str(&normalize_line(line));
         out.push('\n');
+    }
+    if out.is_empty() && !text.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Gate B: strip unstable EXPLAIN operator id suffixes (`Projection_3` → `Projection`)
+/// and normalize partition physical id lists.
+fn normalize_line(line: &str) -> String {
+    let Some((id, rest)) = line.split_once('\t') else {
+        return line.to_string();
+    };
+    let Some((est, _)) = rest.split_once('\t') else {
+        return line.to_string();
+    };
+    // Only rewrite explain/desc body rows (numeric estRows).
+    if est.parse::<f64>().is_err() {
+        return line.to_string();
+    }
+    let id = strip_explain_id_suffix(id);
+    let rest = strip_embedded_op_ids(rest);
+    let rest = normalize_partition_ids(&rest);
+    format!("{id}\t{rest}")
+}
+
+fn strip_explain_id_suffix(id: &str) -> String {
+    let mut name_start = 0;
+    for (i, ch) in id.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '(' || ch == ')' {
+            name_start = i;
+            break;
+        }
+        name_start = i + ch.len_utf8();
+    }
+    let (prefix, name) = id.split_at(name_start);
+    let trimmed = name
+        .rsplit_once('_')
+        .and_then(|(head, tail)| {
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                Some(head)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(name);
+    format!("{prefix}{trimmed}")
+}
+
+fn strip_embedded_op_ids(rest: &str) -> String {
+    // `data:Selection_8` → `data:Selection`
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '_' {
+            let mut digits = String::new();
+            while let Some(d) = chars.peek().copied() {
+                if d.is_ascii_digit() {
+                    digits.push(d);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if digits.is_empty() {
+                continue;
+            }
+            // Keep `_digits` unless it looks like an operator id suffix
+            // (followed by tab/end/comma/space or end of token).
+            let next = chars.peek().copied();
+            if next.is_none_or(|n| matches!(n, '\t' | ' ' | ',' | ')' | ']')) {
+                out.pop(); // drop '_'
+                          // drop digits (already consumed)
+            } else {
+                out.push_str(&digits);
+            }
+        }
+    }
+    out
+}
+
+fn normalize_partition_ids(rest: &str) -> String {
+    // `partition:[123, 456]` or `partition:p2` — keep named `pN`, scrub numeric lists.
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if out.ends_with("partition:[") {
+            for d in chars.by_ref() {
+                if d == ']' {
+                    out.push('…');
+                    out.push(']');
+                    break;
+                }
+            }
+        }
     }
     out
 }

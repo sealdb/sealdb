@@ -52,11 +52,19 @@ impl PlanBuilder {
                         access_plan(select, from, is, current_db, stats, prune_mode)
                     }
                 } else {
+                    // TiDB dual Projection ExplainInfo: `sysdate()->Column#1, …`.
                     let exprs = select
                         .fields
                         .iter()
                         .enumerate()
-                        .map(|(i, _)| format!("col{i}"))
+                        .map(|(i, f)| {
+                            let text = f
+                                .orig_text
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| f.expr.restore_string());
+                            format!("{text}->Column#{}", i + 1)
+                        })
                         .collect();
                     PhysicalPlan::Projection {
                         exprs,
