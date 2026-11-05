@@ -1015,7 +1015,11 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
                     }
                 }
             }
-            other => format!("{other:?}"),
+            // TIMESTAMP/DATE/TIME literals: TiDB uses field.Text().
+            sealdb_types::Datum::Time(_) => orig_text
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| tidb_expr_display_name(inner)),
         },
         ExprNode::Column(_) => tidb_expr_display_name(inner),
         _ => {

@@ -13,7 +13,7 @@ pub use field_type::{
     TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
 };
 pub use mydecimal::MyDecimal;
-pub use time::Time;
+pub use time::{Time, TimeType, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 
 #[cfg(test)]
 mod tests {
