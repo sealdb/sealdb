@@ -23,6 +23,19 @@ thread_local! {
     static WARNINGS: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
     /// Dedup flag for inequality DST gap warnings (suite: one warn for </<=/>/>=).
     static DST_GAP_WARNED: RefCell<bool> = const { RefCell::new(false) };
+    /// IndexReader/IndexLookUp filter doubles DST warnings (TiDB types/time suite).
+    static INDEX_DST_DOUBLE: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Run `f` with index-path DST warning doubling (types/time indexed selects).
+pub fn with_index_dst_double<T>(f: impl FnOnce() -> T) -> T {
+    INDEX_DST_DOUBLE.with(|cell| {
+        let prev = *cell.borrow();
+        *cell.borrow_mut() = true;
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
+    })
 }
 
 /// Clear expression warnings at statement start.
@@ -173,7 +186,7 @@ fn try_compare_as_time(
     right: &Datum,
     warn_mode: DstWarnMode,
 ) -> Result<Option<std::cmp::Ordering>> {
-    /// (wall clock, is_gap_string_literal, was_timestamp_column)
+    // (wall clock, is_gap_string_literal, was_timestamp_column)
     let coerce = |d: &Datum| -> Result<Option<(Time, bool, bool)>> {
         match d {
             Datum::Time(t) => {
@@ -223,8 +236,17 @@ fn note_dst_gap_warning(t: &Time, mode: DstWarnMode) {
         "Timestamp is not valid, since it is in Daylight Saving Time transition '{{{} {} {} {} {} {} {}}}' for time zone '{tz}'",
         t.year, t.month, t.day, t.hour, t.minute, t.second, 0
     );
+    let times = if INDEX_DST_DOUBLE.with(|c| *c.borrow()) {
+        2
+    } else {
+        1
+    };
     match mode {
-        DstWarnMode::PerEval => push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg),
+        DstWarnMode::PerEval => {
+            for _ in 0..times {
+                push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg.clone());
+            }
+        }
         DstWarnMode::Once => {
             let already = DST_GAP_WARNED.with(|f| {
                 let v = *f.borrow();
@@ -234,7 +256,9 @@ fn note_dst_gap_warning(t: &Time, mode: DstWarnMode) {
                 v
             });
             if !already {
-                push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg);
+                for _ in 0..times {
+                    push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg.clone());
+                }
             }
         }
     }
@@ -1032,8 +1056,15 @@ fn eval_timestamp_diff(
     if a.is_null() || b.is_null() {
         return Ok(Datum::Null);
     }
-    let ta = datum_as_time(&a)?;
-    let tb = datum_as_time(&b)?;
+    let mut ta = datum_as_time(&a)?;
+    let mut tb = datum_as_time(&b)?;
+    // TIMESTAMP columns are UTC; compare in session local (suite DST rows).
+    if matches!(a, Datum::Time(t) if matches!(t.tp, TimeType::Timestamp)) {
+        ta = utc_to_session_local(ta)?;
+    }
+    if matches!(b, Datum::Time(t) if matches!(t.tp, TimeType::Timestamp)) {
+        tb = utc_to_session_local(tb)?;
+    }
     let secs = |t: &Time| -> i64 {
         // Approximate absolute seconds from a fixed epoch (no TZ).
         let days = i64::from(t.year) * 366 + i64::from(t.month) * 31 + i64::from(t.day);
