@@ -225,12 +225,28 @@ fn push_into(
             columns,
             seed,
             inline,
-        } if inline => PhysicalPlan::CTE {
-            name,
-            columns,
-            seed: Box::new(push_into(*seed, conjuncts, is, current_db)),
-            inline,
-        },
+        } if inline => {
+            // Output `columns` (AS aliases / col_name_list) may differ from seed
+            // internal names (`col0`, dual literals). Keep Selection above CTE.
+            if columns.is_empty() {
+                PhysicalPlan::CTE {
+                    name,
+                    columns,
+                    seed: Box::new(push_into(*seed, conjuncts, is, current_db)),
+                    inline,
+                }
+            } else {
+                wrap_residual(
+                    PhysicalPlan::CTE {
+                        name,
+                        columns,
+                        seed,
+                        inline,
+                    },
+                    conjuncts,
+                )
+            }
+        }
         other => wrap_residual(other, conjuncts),
     }
 }

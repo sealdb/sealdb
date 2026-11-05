@@ -1500,6 +1500,17 @@ mod tests {
         let cte = &rec.as_select().unwrap().with.as_ref().unwrap().ctes[0];
         assert!(cte.recursive.is_some());
         assert!(rec.as_select().unwrap().with.as_ref().unwrap().is_recursive);
+        let lim = parser
+            .parse_one_stmt(
+                "WITH RECURSIVE cte1 AS (SELECT 1 UNION ALL (SELECT 1 FROM cte1 LIMIT 10)) SELECT * FROM cte1",
+            )
+            .unwrap();
+        let lim_rec = &lim.as_select().unwrap().with.as_ref().unwrap().ctes[0]
+            .recursive
+            .as_ref()
+            .unwrap()
+            .1;
+        assert_eq!(lim_rec.limit, Some(10), "paren LIMIT must survive set-op lower");
         let mat = parser
             .parse_one_stmt("WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c")
             .unwrap();

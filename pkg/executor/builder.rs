@@ -672,7 +672,17 @@ impl ExecutorBuilder {
     pub fn run(mut exec: Box<dyn Executor>) -> Result<QueryResult> {
         with_shared_ctes(|| {
             exec.open()?;
-            let columns = exec.schema().to_vec();
+            // Join schemas may keep `alias.col` for ORDER BY/WHERE; TiDB SELECT *
+            // result headers are bare (duplicates allowed).
+            let columns = exec
+                .schema()
+                .iter()
+                .map(|c| {
+                    c.rsplit_once('.')
+                        .map(|(_, name)| name.to_string())
+                        .unwrap_or_else(|| c.clone())
+                })
+                .collect();
             let mut rows = Vec::new();
             while let Some(chunk) = exec.next()? {
                 for i in 0..chunk.num_rows() {

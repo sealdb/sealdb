@@ -6257,6 +6257,117 @@ mod tests {
             union_cte.display_rows(),
             vec![vec!["1".to_string()], vec!["2".to_string()]]
         );
+        let seed_names = session
+            .execute_stmt(
+                "WITH RECURSIVE cte2 AS (SELECT 1 AS col_1, 2 AS col_2) SELECT * FROM cte2",
+            )
+            .unwrap();
+        assert_eq!(
+            seed_names.display_rows(),
+            vec![vec!["1".to_string(), "2".to_string()]]
+        );
+        let where_bare = session
+            .execute_stmt(
+                "WITH RECURSIVE cte2 AS (SELECT 1 AS col_1, 2 AS col_2) SELECT col_1, col_2 FROM cte2 WHERE col_2 = 2",
+            )
+            .unwrap();
+        assert_eq!(
+            where_bare.display_rows(),
+            vec![vec!["1".to_string(), "2".to_string()]]
+        );
+        let self_join = session
+            .execute_stmt(
+                "WITH RECURSIVE cte2 AS (SELECT 1 AS col_1, 2 AS col_2) SELECT c1.col_1, c2.col_2 FROM cte2 AS c1, cte2 AS c2 WHERE c2.col_2 = 1",
+            )
+            .unwrap();
+        assert!(
+            self_join.display_rows().is_empty(),
+            "self-join WHERE should filter all rows: {:?}",
+            self_join.display_rows()
+        );
+        let mutual = session
+            .execute_stmt(
+                "WITH RECURSIVE cte (c1) AS (SELECT 1), cte1 (c2) AS (SELECT 1 UNION SELECT c1 + 1 FROM cte, cte1) SELECT * FROM cte, cte1",
+            )
+            .unwrap();
+        assert_eq!(
+            mutual.display_rows(),
+            vec![
+                vec!["1".to_string(), "1".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+            ]
+        );
+        let no_self_ref = session
+            .execute_stmt(
+                "WITH RECURSIVE qn AS (SELECT 1 FROM DUAL UNION ALL SELECT 1 FROM DUAL) SELECT * FROM qn",
+            )
+            .unwrap();
+        assert_eq!(
+            no_self_ref.display_rows(),
+            vec![vec!["1".to_string()], vec!["1".to_string()]]
+        );
+        let group_only = session
+            .execute_stmt("SELECT 1 AS a FROM DUAL GROUP BY a")
+            .unwrap();
+        assert_eq!(group_only.display_rows(), vec![vec!["1".to_string()]]);
+        let group_seed_only = session
+            .execute_stmt(
+                "WITH RECURSIVE qn AS (SELECT 1 AS a FROM DUAL GROUP BY a) SELECT * FROM qn",
+            )
+            .unwrap();
+        assert_eq!(group_seed_only.display_rows(), vec![vec!["1".to_string()]]);
+        let group_seed = session
+            .execute_stmt(
+                "WITH RECURSIVE qn AS (SELECT 1 AS a FROM DUAL GROUP BY a UNION ALL SELECT a+1 FROM qn WHERE a<3) SELECT * FROM qn",
+            )
+            .unwrap();
+        assert_eq!(
+            group_seed.display_rows(),
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+            ]
+        );
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.employees (ID INT PRIMARY KEY, NAME VARCHAR(100), MANAGER_ID INT); INSERT INTO db1.employees VALUES (333, 'Yasmina', NULL), (198, 'John', 333), (29, 'Pedro', 198), (72, 'Pierre', 29)",
+            )
+            .unwrap();
+        let hierarchy = session
+            .execute_stmt(
+                "WITH RECURSIVE employees_extended AS (SELECT ID, NAME, MANAGER_ID, CAST(ID AS CHAR(200)) AS PATH FROM db1.employees WHERE NAME='Pierre' UNION ALL SELECT S.ID, S.NAME, S.MANAGER_ID, CONCAT(M.PATH, ',', S.ID) FROM employees_extended M JOIN db1.employees S ON M.MANAGER_ID=S.ID) SELECT ID, NAME, MANAGER_ID, PATH FROM employees_extended",
+            )
+            .unwrap();
+        assert_eq!(
+            hierarchy.display_rows(),
+            vec![
+                vec![
+                    "72".to_string(),
+                    "Pierre".to_string(),
+                    "29".to_string(),
+                    "72".to_string(),
+                ],
+                vec![
+                    "29".to_string(),
+                    "Pedro".to_string(),
+                    "198".to_string(),
+                    "72,29".to_string(),
+                ],
+                vec![
+                    "198".to_string(),
+                    "John".to_string(),
+                    "333".to_string(),
+                    "72,29,198".to_string(),
+                ],
+                vec![
+                    "333".to_string(),
+                    "Yasmina".to_string(),
+                    "NULL".to_string(),
+                    "72,29,198,333".to_string(),
+                ],
+            ]
+        );
         let joined = session
             .execute_stmt(
                 "WITH c AS (SELECT * FROM db1.t WHERE id = 1) SELECT t.id, t.name FROM db1.t JOIN c ON t.id = c.id",
@@ -6329,6 +6440,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_VIEW_WRONG_LIST);
     }
+
 
     #[test]
     fn test_derived_table() {

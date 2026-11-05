@@ -5,8 +5,8 @@ use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-    Error, Result,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_UNSUPPORTED, ERR_VIEW_WRONG_LIST,
+    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
@@ -123,6 +123,11 @@ pub fn working_cte(name: &str) -> Option<CteWorking> {
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.clone())
     })
+}
+
+/// Recursive working set, else statement-shared CTE (sibling CTEs in mutual recursion).
+pub fn lookup_cte_rows(name: &str) -> Option<CteWorking> {
+    working_cte(name).or_else(|| shared_cte(name))
 }
 
 fn with_working_cte<T>(
@@ -257,9 +262,9 @@ impl Executor for CTEExec {
         if !self.columns.is_empty() {
             self.schema = self.columns.clone();
         }
-        if self.share {
-            store_shared_cte(&self.name, self.schema.clone(), self.rows.clone());
-        }
+        // Always publish for sibling refs (mutual recursion). `share` only
+        // gates reuse on a later open of the same CTE name.
+        store_shared_cte(&self.name, self.schema.clone(), self.rows.clone());
         Ok(())
     }
 
@@ -301,10 +306,31 @@ fn iterate_recursive(
     current_db: &str,
     txn: &Arc<TxnHandle>,
 ) -> Result<Vec<Vec<Datum>>> {
+    // TiDB rejects ORDER BY / LIMIT / DISTINCT in the recursive arm.
+    if rec.limit.is_some() || !rec.order_by.is_empty() || rec.distinct {
+        return Err(Error::new(
+            ERR_UNSUPPORTED,
+            "This version of TiDB doesn't yet support 'ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression'",
+        ));
+    }
     let distinct = op.is_distinct();
-    let mut all = seed;
+    // UNION (distinct) also collapses duplicate seed rows (TiDB / MySQL).
+    let (mut all, mut seen) = if distinct {
+        let mut uniq = Vec::new();
+        let mut seen = HashSet::new();
+        for row in seed {
+            if seen.insert(row_key(&row)) {
+                uniq.push(row);
+            }
+        }
+        (uniq, seen)
+    } else {
+        let seen: HashSet<Vec<String>> = seed.iter().map(|row| row_key(row)).collect();
+        (seed, seen)
+    };
     let mut working = all.clone();
-    let mut seen: HashSet<Vec<String>> = all.iter().map(|row| row_key(row)).collect();
+    // TiDB/MySQL: recursive arm that never reads this CTE runs once (not forever).
+    let self_ref = select_refs_table(&rec, name);
     for iter in 0..=MAX_RECURSION {
         if working.is_empty() {
             break;
@@ -334,9 +360,19 @@ fn iterate_recursive(
             break;
         }
         all.extend(step.clone());
+        if !self_ref {
+            break;
+        }
         working = step;
     }
     Ok(all)
+}
+
+fn select_refs_table(select: &SelectStmt, name: &str) -> bool {
+    select
+        .join_tables()
+        .into_iter()
+        .any(|t| t.resolve_name().eq_ignore_ascii_case(name))
 }
 
 fn run_select(

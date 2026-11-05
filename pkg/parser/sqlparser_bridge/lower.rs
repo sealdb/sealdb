@@ -5404,8 +5404,12 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
 /// left-deep `(first, rest)` list. Mixed-operator parentheses are evaluated
 /// left-to-right (INTERSECT-tighter-than-UNION stays a later leftover).
 fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, SelectStmt)>)> {
-    let expr = unwrap_set_query(expr);
     match expr {
+        // Keep LIMIT/ORDER BY on `(SELECT … LIMIT n)` — do not peel before lower.
+        SetExpr::Query(query) => match query.body.as_ref() {
+            SetExpr::SetOperation { .. } => flatten_set_expr(query.body.as_ref()),
+            _ => Ok((lower_query(query)?, Vec::new())),
+        },
         SetExpr::SetOperation {
             left,
             op,
@@ -5433,6 +5437,23 @@ fn unwrap_set_query(expr: &SetExpr) -> &SetExpr {
 }
 
 fn lower_set_operand(expr: &SetExpr) -> Result<SelectStmt> {
+    // Prefer `lower_query` for parenthesized operands so LIMIT/ORDER BY on
+    // `(SELECT … LIMIT n)` is preserved (TiDB recursive CTE 1235).
+    match expr {
+        SetExpr::Query(query) => return lower_query(query),
+        SetExpr::Select(select) => {
+            return lower_select(
+                select,
+                None,
+                None,
+                None,
+                SelectLock::None,
+                SelectLockWait::Block,
+                select.to_string(),
+            );
+        }
+        _ => {}
+    }
     match unwrap_set_query(expr) {
         SetExpr::Select(select) => lower_select(
             select,
@@ -7990,9 +8011,8 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
             TableConstraint::PrimaryKey(idx) => indices.push(lower_primary_key(idx)?),
-            TableConstraint::ForeignKey(_) => {
-                return Err(Error::unsupported("FOREIGN KEY"));
-            }
+            // Accept FK syntax as no-op for now (TiDB stores; enforcement is separate).
+            TableConstraint::ForeignKey(_) => {}
             TableConstraint::Check(_) => return Err(Error::unsupported("CHECK constraint")),
             TableConstraint::FulltextOrSpatial(_) => {
                 return Err(Error::unsupported("FULLTEXT / SPATIAL INDEX"));
@@ -8056,6 +8076,22 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
 fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {
     match &col.column.expr {
         Expr::Identifier(ident) => Ok(ident.value.clone()),
+        // MySQL prefix index `col(N)` parses as a function call; keep the name
+        // (prefix length is applied later in DDL / IndexColumn.length).
+        Expr::Function(f) => {
+            let raw = f
+                .name
+                .0
+                .last()
+                .map(|p| p.to_string())
+                .unwrap_or_default();
+            // ObjectName Display may keep MySQL backticks (`col`).
+            let name = raw.trim_matches('`').trim_matches('"').to_string();
+            if name.is_empty() {
+                return Err(Error::unsupported(format!("INDEX column {f}")));
+            }
+            Ok(name)
+        }
         other => Err(Error::unsupported(format!("INDEX column {other}"))),
     }
 }

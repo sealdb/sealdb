@@ -67,16 +67,18 @@ impl Executor for HashJoinV1Exec {
         validate_using_cols(&self.join.using_cols, &left_raw, &right_raw)?;
         // Semi/Anti keep the probe (left) schema so SELECT * FROM t1 WHERE EXISTS
         // still returns t1 columns rather than a concatenated join row.
-        // TiDB SELECT * headers use bare column names (duplicates allowed at
-        // top level; derived tables reject them with errno 1060).
+        // Always keep `alias.col` on inner/cross joins so nested joins and
+        // ORDER BY `cte_as_3.col_19` retain table identity (qualifying the whole
+        // left with join.left.name would mis-label earlier tables). Display
+        // strips to bare names in ExecutorBuilder::run (TiDB SELECT * headers).
         // USING coalesces shared names: emit left once, drop matching right cols.
         self.schema = if self.join.tp.is_semi_anti() {
             left_raw.clone()
         } else if self.join.using_cols.is_empty() {
-            left_raw
+            left_schema
                 .iter()
                 .cloned()
-                .chain(right_raw.iter().cloned())
+                .chain(right_schema.iter().cloned())
                 .collect()
         } else {
             coalesce_using_schema(&left_raw, &right_raw, &self.join.using_cols)

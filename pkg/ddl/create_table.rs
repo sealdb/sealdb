@@ -305,6 +305,12 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: parse_len(type_name).unwrap_or(-1),
             ..string_ft()
         },
+        // ENUM/SET stored as string for now (TiDB TYPE_ENUM value path later).
+        "ENUM" | "SET" => FieldType {
+            tp: TYPE_VAR_STRING,
+            flen: -1,
+            ..string_ft()
+        },
         "BLOB" => FieldType {
             tp: TYPE_BLOB,
             flen: -1,
