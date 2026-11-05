@@ -452,11 +452,26 @@ impl ExecutorBuilder {
                 right_table,
                 on,
             } => {
+                let using_cols = stmt
+                    .as_select()
+                    .map(|select| {
+                        select
+                            .joins
+                            .iter()
+                            .find(|j| {
+                                j.left.name.eq_ignore_ascii_case(left_table)
+                                    && j.right.name.eq_ignore_ascii_case(right_table)
+                            })
+                            .map(|j| j.using_cols.clone())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                 let join = sealdb_parser::ast::Join {
                     left: sealdb_parser::ast::TableName::new(None, left_table.clone()),
                     right: sealdb_parser::ast::TableName::new(None, right_table.clone()),
                     tp: ast_join_type(*tp),
                     on: on.clone(),
+                    using_cols,
                 };
                 Ok(Box::new(HashJoinV1Exec::new(
                     join,
@@ -742,12 +757,58 @@ fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
     {
         return name.clone();
     }
-    match &field.expr {
-        ExprNode::Column(col) => match &col.table {
-            Some(table) => format!("{table}.{}", col.name),
-            None => col.name.clone(),
+    tidb_expr_display_name(&field.expr)
+}
+
+/// TiDB select-list display names: bare idents for top-level columns,
+/// keep `t.c1` inside compound expressions, no spaces around `=`.
+fn tidb_expr_display_name(expr: &ExprNode) -> String {
+    tidb_expr_display_name_inner(expr, false)
+}
+
+fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> String {
+    match expr {
+        ExprNode::Column(col) => {
+            if keep_table_qual {
+                match &col.table {
+                    Some(table) => format!("{table}.{}", col.name),
+                    None => col.name.clone(),
+                }
+            } else {
+                // Top-level `SELECT t.c1` → column name `c1`.
+                col.name.clone()
+            }
+        }
+        ExprNode::Value(v) => match &v.datum {
+            sealdb_types::Datum::I64(n) => n.to_string(),
+            sealdb_types::Datum::U64(n) => n.to_string(),
+            sealdb_types::Datum::F64(n) => n.to_string(),
+            sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            sealdb_types::Datum::Null => "NULL".into(),
+            other => format!("{other:?}"),
         },
+        ExprNode::Binary(b) => {
+            let op = match b.op {
+                sealdb_parser::opcode::Op::Eq => "=".to_string(),
+                sealdb_parser::opcode::Op::Ne => "!=".to_string(),
+                sealdb_parser::opcode::Op::Lt => "<".to_string(),
+                sealdb_parser::opcode::Op::Le => "<=".to_string(),
+                sealdb_parser::opcode::Op::Gt => ">".to_string(),
+                sealdb_parser::opcode::Op::Ge => ">=".to_string(),
+                sealdb_parser::opcode::Op::Plus => " + ".to_string(),
+                sealdb_parser::opcode::Op::Minus => " - ".to_string(),
+                sealdb_parser::opcode::Op::Mul => " * ".to_string(),
+                sealdb_parser::opcode::Op::Div => " / ".to_string(),
+                other => format!(" {} ", other.restore()),
+            };
+            format!(
+                "{}{}{}",
+                tidb_expr_display_name_inner(&b.left, true),
+                op,
+                tidb_expr_display_name_inner(&b.right, true)
+            )
+        }
         other if other.has_subquery() => other.restore_string(),
-        _ => field.as_name.clone().unwrap_or_default(),
+        other => other.restore_string(),
     }
 }

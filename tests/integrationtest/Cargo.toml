@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sealdb-config.workspace = true
 sealdb-domain.workspace = true
 sealdb-errno.workspace = true

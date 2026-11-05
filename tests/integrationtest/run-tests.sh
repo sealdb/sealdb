@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # TiDB-shaped wrapper around sealdb-itest.
-#   ./run-tests.sh                 MemStorage + TiKV (skip TiKV if PD down)
-#   ./run-tests.sh -s memory       MemStorage only
-#   ./run-tests.sh -s tikv         TiKV only
-#   ./run-tests.sh --require-tikv  fail if PD/TiKV is unreachable
-#   ./run-tests.sh -t basic        one suite on both stores
-#   ./run-tests.sh -r              record goldens from MemStorage, verify TiKV
+#
+# Default runs manifest statuses green+local (CI gate).
+# Authoritative goldens: ../project/scripts/record_tidb_itest.sh (TiDB binary).
+# SealDB --record requires SEALDB_ITEST_ALLOW_SEALDB_RECORD=1 and local/ only.
+#
+#   ./run-tests.sh                      MemStorage + TiKV (skip TiKV if PD down)
+#   ./run-tests.sh -s memory
+#   ./run-tests.sh -t local/basic
+#   ./run-tests.sh --wave R1 --status pending   # TDD triage (expect red)
+#   ./run-tests.sh --status in_progress
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CARGO_BIN="${CARGO_BIN:-$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/cargo}"
 export PATH="$(dirname "$CARGO_BIN"):$PATH"
 export RUSTC="${RUSTC:-$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin/rustc}"
@@ -19,6 +23,8 @@ CASE=""
 STORE="both"
 REQUIRE_TIKV=0
 PD=""
+STATUS=""
+WAVE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,8 +33,10 @@ while [[ $# -gt 0 ]]; do
     -s) STORE="${2:-both}"; shift 2 ;;
     -k|--require-tikv) REQUIRE_TIKV=1; shift ;;
     --pd) PD="${2:-}"; shift 2 ;;
+    --status) STATUS="${2:-}"; shift 2 ;;
+    --wave) WAVE="${2:-}"; shift 2 ;;
     -h|--help)
-      sed -n '2,9p' "$0"
+      sed -n '2,14p' "$0"
       exit 0
       ;;
     *)
@@ -51,6 +59,12 @@ fi
 if [[ -n "$PD" ]]; then
   ARGS+=(--pd "$PD")
 fi
+if [[ -n "$STATUS" ]]; then
+  ARGS+=(--status "$STATUS")
+fi
+if [[ -n "$WAVE" ]]; then
+  ARGS+=(--wave "$WAVE")
+fi
 
 cd "$ROOT"
-exec cargo "${ARGS[@]}"
+exec "$CARGO_BIN" "${ARGS[@]}"

@@ -40,6 +40,16 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
         }
         let idx_id = (offset as i64) + 1;
+        // Single integer PRIMARY KEY → clustered int handle (TiDB pk_is_handle).
+        if index.primary
+            && idx_cols.len() == 1
+            && info.columns.iter().any(|c| {
+                c.offset == idx_cols[0].offset
+                    && c.field_type.eval_type() == sealdb_types::field_type::EvalType::Int
+            })
+        {
+            info.pk_is_handle = true;
+        }
         info.indices.push(
             IndexInfo::new(idx_id, index.name.clone(), info.name.o(), idx_cols)
                 .with_flags(index.unique, index.primary),

@@ -1,4 +1,6 @@
-use sealdb_errno::{ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_FUNCTION, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
+};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
     BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
@@ -45,14 +47,59 @@ pub fn collation_ci() -> bool {
     collation_mode().is_ci()
 }
 
-fn compare_datums(left: &Datum, right: &Datum) -> std::cmp::Ordering {
+fn compare_datums(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
     if matches!((left, right), (Datum::Bytes(_), Datum::Bytes(_))) {
+        let lb = left.as_bytes();
+        let rb = right.as_bytes();
+        let l_ok = std::str::from_utf8(&lb).is_ok();
+        let r_ok = std::str::from_utf8(&rb).is_ok();
+        // TiDB: comparing a utf8 string column with a binary literal that is
+        // not valid utf8mb4 fails (select.test `a > 0x80`). Pure binary vs
+        // binary stays byte-ordered.
+        if l_ok != r_ok {
+            if !l_ok {
+                ensure_utf8mb4_convertible(&lb)?;
+            }
+            if !r_ok {
+                ensure_utf8mb4_convertible(&rb)?;
+            }
+        }
         let mode = collation_mode();
         if mode != CollateMode::Bin {
-            return compare_bytes(mode, &left.as_bytes(), &right.as_bytes());
+            return Ok(compare_bytes(mode, &lb, &rb));
         }
     }
-    left.compare(right)
+    Ok(left.compare(right))
+}
+
+/// Format invalid bytes like TiDB `formatInvalidChars` (`\x80`).
+fn format_invalid_chars(src: &[u8]) -> String {
+    let mut out = String::new();
+    for (i, b) in src.iter().enumerate() {
+        if i > 5 {
+            out.push_str("...");
+            break;
+        }
+        if *b > 0x7f {
+            out.push_str(&format!("\\x{b:X}"));
+        } else {
+            out.push(*b as char);
+        }
+    }
+    out
+}
+
+fn ensure_utf8mb4_convertible(bytes: &[u8]) -> Result<()> {
+    if std::str::from_utf8(bytes).is_err() {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!(
+                "Cannot convert string '{}' from binary to utf8mb4",
+                format_invalid_chars(bytes)
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn eval_expr(expr: &ExprNode) -> Result<Datum> {
@@ -83,6 +130,62 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
 
 pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
     Ok(truthy(&eval_expr_with_row(expr, schema, row)?).unwrap_or(false))
+}
+
+/// Reject binary literals that cannot convert to utf8mb4 when compared to a
+/// column (TiDB charset convert), even if the scan yields no rows.
+pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {
+    match expr {
+        ExprNode::Binary(b) if matches!(b.op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
+            check_col_vs_bytes_literal(&b.left, &b.right)?;
+            check_col_vs_bytes_literal(&b.right, &b.left)?;
+            validate_string_cmp_literals(&b.left)?;
+            validate_string_cmp_literals(&b.right)
+        }
+        ExprNode::Binary(b) => {
+            validate_string_cmp_literals(&b.left)?;
+            validate_string_cmp_literals(&b.right)
+        }
+        ExprNode::Unary(u) => validate_string_cmp_literals(&u.expr),
+        ExprNode::Func(f) => {
+            for arg in &f.args {
+                validate_string_cmp_literals(arg)?;
+            }
+            Ok(())
+        }
+        ExprNode::InList(i) => {
+            validate_string_cmp_literals(&i.expr)?;
+            for item in &i.list {
+                validate_string_cmp_literals(item)?;
+            }
+            Ok(())
+        }
+        ExprNode::Between(b) => {
+            validate_string_cmp_literals(&b.expr)?;
+            validate_string_cmp_literals(&b.low)?;
+            validate_string_cmp_literals(&b.high)
+        }
+        ExprNode::Like(l) => {
+            validate_string_cmp_literals(&l.expr)?;
+            validate_string_cmp_literals(&l.pattern)
+        }
+        ExprNode::IsNull(i) => validate_string_cmp_literals(&i.expr),
+        ExprNode::Cast(c) => validate_string_cmp_literals(&c.expr),
+        _ => Ok(()),
+    }
+}
+
+fn check_col_vs_bytes_literal(col_side: &ExprNode, lit_side: &ExprNode) -> Result<()> {
+    if !matches!(col_side, ExprNode::Column(_)) {
+        return Ok(());
+    }
+    let ExprNode::Value(v) = lit_side else {
+        return Ok(());
+    };
+    if let Datum::Bytes(b) = &v.datum {
+        ensure_utf8mb4_convertible(b)?;
+    }
+    Ok(())
 }
 
 /// Locate the physical partition id for `values`, evaluating expression keys.
@@ -195,12 +298,12 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                 }
             },
         ),
-        Op::Eq => Ok(bool_datum(compare_datums(&left, &right).is_eq())),
-        Op::Ne => Ok(bool_datum(!compare_datums(&left, &right).is_eq())),
-        Op::Lt => Ok(bool_datum(compare_datums(&left, &right).is_lt())),
-        Op::Le => Ok(bool_datum(compare_datums(&left, &right).is_le())),
-        Op::Gt => Ok(bool_datum(compare_datums(&left, &right).is_gt())),
-        Op::Ge => Ok(bool_datum(compare_datums(&left, &right).is_ge())),
+        Op::Eq => Ok(bool_datum(compare_datums(&left, &right)?.is_eq())),
+        Op::Ne => Ok(bool_datum(!compare_datums(&left, &right)?.is_eq())),
+        Op::Lt => Ok(bool_datum(compare_datums(&left, &right)?.is_lt())),
+        Op::Le => Ok(bool_datum(compare_datums(&left, &right)?.is_le())),
+        Op::Gt => Ok(bool_datum(compare_datums(&left, &right)?.is_gt())),
+        Op::Ge => Ok(bool_datum(compare_datums(&left, &right)?.is_ge())),
         _ => Err(Error::unsupported(format!("binary {}", expr.op.restore()))),
     }
 }
@@ -270,6 +373,61 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Ok(first)
             }
         }
+        "COALESCE" => {
+            if func.args.is_empty() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "COALESCE requires at least 1 argument",
+                ));
+            }
+            for arg in &func.args {
+                let v = eval_expr_with_row(arg, schema, row)?;
+                if !v.is_null() {
+                    return Ok(v);
+                }
+            }
+            Ok(Datum::Null)
+        }
+        "ISNULL" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ISNULL requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            Ok(bool_datum(v.is_null()))
+        }
+        "GREATEST" | "LEAST" => {
+            if func.args.len() < 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires at least 2 arguments", func.name),
+                ));
+            }
+            let want_greatest = func.name.eq_ignore_ascii_case("GREATEST");
+            let mut best: Option<Datum> = None;
+            for arg in &func.args {
+                let v = eval_expr_with_row(arg, schema, row)?;
+                if v.is_null() {
+                    return Ok(Datum::Null);
+                }
+                best = Some(match best {
+                    None => v,
+                    Some(cur) => {
+                        let ord = compare_datums(&cur, &v)?;
+                        if want_greatest {
+                            if ord.is_lt() { v } else { cur }
+                        } else if ord.is_gt() {
+                            v
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+            Ok(best.unwrap_or(Datum::Null))
+        }
         "ABS" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -294,7 +452,6 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         )),
     }
 }
-
 fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let left = eval_expr_with_row(&expr.expr, schema, row)?;
     if left.is_null() {
@@ -307,7 +464,7 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
             saw_null = true;
             continue;
         }
-        if compare_datums(&left, &value).is_eq() {
+        if compare_datums(&left, &value)?.is_eq() {
             return Ok(bool_datum(!expr.not));
         }
     }
@@ -325,7 +482,8 @@ fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<
     if value.is_null() || low.is_null() || high.is_null() {
         return Ok(Datum::Null);
     }
-    let inside = compare_datums(&value, &low).is_ge() && compare_datums(&value, &high).is_le();
+    let inside =
+        compare_datums(&value, &low)?.is_ge() && compare_datums(&value, &high)?.is_le();
     Ok(bool_datum(if expr.not { !inside } else { inside }))
 }
 
@@ -466,5 +624,32 @@ mod tests {
         assert!(
             !eval_filter(expr, &schema, &[Datum::I64(2), Datum::Bytes(b"a".to_vec())]).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod hex_cmp_tests {
+    use super::*;
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ValueExpr};
+    use sealdb_parser::opcode::Op;
+
+    #[test]
+    fn char_gt_hex_errors() {
+        let schema = vec!["a".into()];
+        let row = vec![Datum::Bytes(b"a".to_vec())];
+        let expr = ExprNode::Binary(BinaryOpExpr {
+            op: Op::Gt,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: "a".into(),
+            })),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(vec![0x80]),
+            })),
+        });
+        let err = eval_expr_with_row(&expr, &schema, &row).unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_ERROR);
+        assert!(err.message.contains("Cannot convert string"), "{}", err.message);
     }
 }

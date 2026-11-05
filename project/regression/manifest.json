@@ -1,0 +1,2576 @@
+{
+  "baseline": "tidb-v8.5.8-integrationtest",
+  "tidb_root": "/Users/wslu/work/github/db/pingcap/tidb",
+  "imported_at": "2026-11-05T14:45:52Z",
+  "policy": {
+    "golden_source": "tidb",
+    "sealdb_record": "forbidden unless SEALDB_ITEST_ALLOW_SEALDB_RECORD=1",
+    "ci_runs": [
+      "green",
+      "local"
+    ],
+    "dev_in_progress": "SEALDB_ITEST_RUN_IN_PROGRESS=1 or --status in_progress"
+  },
+  "counts": {
+    "total": 254,
+    "by_status": {
+      "in_progress": 55,
+      "pending": 189,
+      "deferred": 2,
+      "local": 8
+    },
+    "by_wave": {
+      "R3": 48,
+      "R2": 22,
+      "R7": 110,
+      "R4": 13,
+      "R5": 12,
+      "R6": 35,
+      "D": 2,
+      "local": 8,
+      "R1": 4
+    }
+  },
+  "suites": [
+    {
+      "name": "access_path_selection",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/access_path_selection.test",
+      "result": "r/access_path_selection.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "agg_predicate_pushdown",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/agg_predicate_pushdown.test",
+      "result": "r/agg_predicate_pushdown.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "bindinfo/bind",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/bindinfo/bind.test",
+      "result": "r/bindinfo/bind.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "bindinfo/session_handle",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/bindinfo/session_handle.test",
+      "result": "r/bindinfo/session_handle.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "bindinfo/temptable",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/bindinfo/temptable.test",
+      "result": "r/bindinfo/temptable.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "black_list",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/black_list.test",
+      "result": "r/black_list.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "clustered_index",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/clustered_index.test",
+      "result": "r/clustered_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "collation_agg_func",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/collation_agg_func.test",
+      "result": "r/collation_agg_func.result",
+      "has_result": false,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "collation_check_use_collation",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/collation_check_use_collation.test",
+      "result": "r/collation_check_use_collation.result",
+      "has_result": false,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "collation_misc",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/collation_misc.test",
+      "result": "r/collation_misc.result",
+      "has_result": false,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "collation_pointget",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/collation_pointget.test",
+      "result": "r/collation_pointget.result",
+      "has_result": false,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "common_collation",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/common_collation.test",
+      "result": "r/common_collation.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "cte",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/cte.test",
+      "result": "r/cte.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "db_integration",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/db_integration.test",
+      "result": "r/db_integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "ddl/affinity",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/affinity.test",
+      "result": "r/ddl/affinity.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/attributes_sql",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/attributes_sql.test",
+      "result": "r/ddl/attributes_sql.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/bdr_mode",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/bdr_mode.test",
+      "result": "r/ddl/bdr_mode.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/column",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/column.test",
+      "result": "r/ddl/column.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/column_change",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/column_change.test",
+      "result": "r/ddl/column_change.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/column_modify",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/column_modify.test",
+      "result": "r/ddl/column_modify.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/column_type_change",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/column_type_change.test",
+      "result": "r/ddl/column_type_change.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/constraint",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/constraint.test",
+      "result": "r/ddl/constraint.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db.test",
+      "result": "r/ddl/db.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db_cache",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db_cache.test",
+      "result": "r/ddl/db_cache.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db_change",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db_change.test",
+      "result": "r/ddl/db_change.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db_foreign_key",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db_foreign_key.test",
+      "result": "r/ddl/db_foreign_key.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db_integration",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/ddl/db_integration.test",
+      "result": "r/ddl/db_integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "ddl/db_partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/ddl/db_partition.test",
+      "result": "r/ddl/db_partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "ddl/db_rename",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db_rename.test",
+      "result": "r/ddl/db_rename.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/db_table",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/db_table.test",
+      "result": "r/ddl/db_table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/ddl_error",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/ddl_error.test",
+      "result": "r/ddl/ddl_error.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/ddl_tiflash",
+      "wave": "D",
+      "status": "deferred",
+      "test": "t/ddl/ddl_tiflash.test",
+      "result": "r/ddl/ddl_tiflash.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "tiflash/mpp deferred"
+    },
+    {
+      "name": "ddl/default_as_expression",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/default_as_expression.test",
+      "result": "r/ddl/default_as_expression.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/exchange_partition_global_index",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/ddl/exchange_partition_global_index.test",
+      "result": "r/ddl/exchange_partition_global_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "ddl/fail_db",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/fail_db.test",
+      "result": "r/ddl/fail_db.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/foreign_key",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/foreign_key.test",
+      "result": "r/ddl/foreign_key.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/index_modify",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/index_modify.test",
+      "result": "r/ddl/index_modify.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/integration",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/integration.test",
+      "result": "r/ddl/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/modify_column",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/modify_column.test",
+      "result": "r/ddl/modify_column.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/multi_schema_change",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/multi_schema_change.test",
+      "result": "r/ddl/multi_schema_change.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/ddl/partition.test",
+      "result": "r/ddl/partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "ddl/primary_key_handle",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/primary_key_handle.test",
+      "result": "r/ddl/primary_key_handle.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/reorg_partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/ddl/reorg_partition.test",
+      "result": "r/ddl/reorg_partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "ddl/resource_group",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/resource_group.test",
+      "result": "r/ddl/resource_group.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/sequence",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/sequence.test",
+      "result": "r/ddl/sequence.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/serial",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/serial.test",
+      "result": "r/ddl/serial.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "ddl/table_modify",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/ddl/table_modify.test",
+      "result": "r/ddl/table_modify.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "executor/adapter",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/adapter.test",
+      "result": "r/executor/adapter.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/admin",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/admin.test",
+      "result": "r/executor/admin.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/aggregate",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/aggregate.test",
+      "result": "r/executor/aggregate.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/analyze",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/analyze.test",
+      "result": "r/executor/analyze.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/autoid",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/autoid.test",
+      "result": "r/executor/autoid.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/batch_point_get",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/batch_point_get.test",
+      "result": "r/executor/batch_point_get.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/charset",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/charset.test",
+      "result": "r/executor/charset.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/chunk_reuse",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/chunk_reuse.test",
+      "result": "r/executor/chunk_reuse.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/cluster_table",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/cluster_table.test",
+      "result": "r/executor/cluster_table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/compact_table",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/compact_table.test",
+      "result": "r/executor/compact_table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/cte",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/executor/cte.test",
+      "result": "r/executor/cte.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "executor/ddl",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/ddl.test",
+      "result": "r/executor/ddl.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/delete",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/delete.test",
+      "result": "r/executor/delete.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/distsql",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/distsql.test",
+      "result": "r/executor/distsql.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/executor",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/executor.test",
+      "result": "r/executor/executor.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/executor_txn",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/executor_txn.test",
+      "result": "r/executor/executor_txn.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/expand",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/expand.test",
+      "result": "r/executor/expand.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/explain",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/explain.test",
+      "result": "r/executor/explain.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/explainfor",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/executor/explainfor.test",
+      "result": "r/executor/explainfor.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/foreign_key",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/foreign_key.test",
+      "result": "r/executor/foreign_key.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/grant",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/grant.test",
+      "result": "r/executor/grant.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/import_into",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/import_into.test",
+      "result": "r/executor/import_into.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/index_advise",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/index_advise.test",
+      "result": "r/executor/index_advise.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/index_lookup_join",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/index_lookup_join.test",
+      "result": "r/executor/index_lookup_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/index_lookup_merge_join",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/index_lookup_merge_join.test",
+      "result": "r/executor/index_lookup_merge_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/index_lookup_pushdown",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/index_lookup_pushdown.test",
+      "result": "r/executor/index_lookup_pushdown.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/index_lookup_pushdown_partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/executor/index_lookup_pushdown_partition.test",
+      "result": "r/executor/index_lookup_pushdown_partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/index_merge_reader",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/index_merge_reader.test",
+      "result": "r/executor/index_merge_reader.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/infoschema_reader",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/infoschema_reader.test",
+      "result": "r/executor/infoschema_reader.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/insert",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/insert.test",
+      "result": "r/executor/insert.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/inspection_common",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/inspection_common.test",
+      "result": "r/executor/inspection_common.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/issues",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/issues.test",
+      "result": "r/executor/issues.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/jointest/hash_join",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/executor/jointest/hash_join.test",
+      "result": "r/executor/jointest/hash_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "executor/jointest/join",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/executor/jointest/join.test",
+      "result": "r/executor/jointest/join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "executor/kv",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/kv.test",
+      "result": "r/executor/kv.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/merge_join",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/merge_join.test",
+      "result": "r/executor/merge_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/parallel_apply",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/parallel_apply.test",
+      "result": "r/executor/parallel_apply.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/partition/issues",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/partition/issues.test",
+      "result": "r/executor/partition/issues.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/partition/partition_boundaries",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/partition/partition_boundaries.test",
+      "result": "r/executor/partition/partition_boundaries.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/partition/partition_with_expression",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/partition/partition_with_expression.test",
+      "result": "r/executor/partition/partition_with_expression.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/partition/table",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/partition/table.test",
+      "result": "r/executor/partition/table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/partition/write",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/partition/write.test",
+      "result": "r/executor/partition/write.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/password_management",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/password_management.test",
+      "result": "r/executor/password_management.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/point_get",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/executor/point_get.test",
+      "result": "r/executor/point_get.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "executor/prepared",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/executor/prepared.test",
+      "result": "r/executor/prepared.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "executor/revoke",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/revoke.test",
+      "result": "r/executor/revoke.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/rowid",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/rowid.test",
+      "result": "r/executor/rowid.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/sample",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/sample.test",
+      "result": "r/executor/sample.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/set",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/set.test",
+      "result": "r/executor/set.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/show",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/show.test",
+      "result": "r/executor/show.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/simple",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/simple.test",
+      "result": "r/executor/simple.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/split_table",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/split_table.test",
+      "result": "r/executor/split_table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/stale_txn",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/stale_txn.test",
+      "result": "r/executor/stale_txn.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/statement_context",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/statement_context.test",
+      "result": "r/executor/statement_context.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/union_scan",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/executor/union_scan.test",
+      "result": "r/executor/union_scan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "executor/update",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/update.test",
+      "result": "r/executor/update.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "executor/window",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/executor/window.test",
+      "result": "r/executor/window.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "executor/write",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/executor/write.test",
+      "result": "r/executor/write.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "explain-non-select-stmt",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain-non-select-stmt.test",
+      "result": "r/explain-non-select-stmt.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain.test",
+      "result": "r/explain.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_complex",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_complex.test",
+      "result": "r/explain_complex.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_complex_stats",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_complex_stats.test",
+      "result": "r/explain_complex_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_cte",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/explain_cte.test",
+      "result": "r/explain_cte.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "explain_easy",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_easy.test",
+      "result": "r/explain_easy.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_easy_stats",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_easy_stats.test",
+      "result": "r/explain_easy_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_foreign_key",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_foreign_key.test",
+      "result": "r/explain_foreign_key.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_generate_column_substitute",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_generate_column_substitute.test",
+      "result": "r/explain_generate_column_substitute.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_indexmerge_stats",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_indexmerge_stats.test",
+      "result": "r/explain_indexmerge_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_join_stats",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_join_stats.test",
+      "result": "r/explain_join_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_shard_index",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_shard_index.test",
+      "result": "r/explain_shard_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_stats",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/explain_stats.test",
+      "result": "r/explain_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "explain_union_scan",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/explain_union_scan.test",
+      "result": "r/explain_union_scan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "expression/builtin",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/builtin.test",
+      "result": "r/expression/builtin.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/cast",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/cast.test",
+      "result": "r/expression/cast.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/charset_and_collation",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/expression/charset_and_collation.test",
+      "result": "r/expression/charset_and_collation.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "expression/constant_fold",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/constant_fold.test",
+      "result": "r/expression/constant_fold.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/enum_set",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/enum_set.test",
+      "result": "r/expression/enum_set.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/explain",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/expression/explain.test",
+      "result": "r/expression/explain.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "expression/format",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/format.test",
+      "result": "r/expression/format.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/issues",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/issues.test",
+      "result": "r/expression/issues.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/json",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/json.test",
+      "result": "r/expression/json.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/misc",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/misc.test",
+      "result": "r/expression/misc.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/multi_valued_index",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/multi_valued_index.test",
+      "result": "r/expression/multi_valued_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/noop_functions",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/noop_functions.test",
+      "result": "r/expression/noop_functions.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/plan_cache",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/expression/plan_cache.test",
+      "result": "r/expression/plan_cache.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "expression/time",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/time.test",
+      "result": "r/expression/time.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "expression/vitess_hash",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/expression/vitess_hash.test",
+      "result": "r/expression/vitess_hash.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "generated_columns",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/generated_columns.test",
+      "result": "r/generated_columns.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/aggregate",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/globalindex/aggregate.test",
+      "result": "r/globalindex/aggregate.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "globalindex/analyze",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/analyze.test",
+      "result": "r/globalindex/analyze.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/ddl",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/ddl.test",
+      "result": "r/globalindex/ddl.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/expression_index",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/expression_index.test",
+      "result": "r/globalindex/expression_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/index_join",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/globalindex/index_join.test",
+      "result": "r/globalindex/index_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "globalindex/information_schema",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/information_schema.test",
+      "result": "r/globalindex/information_schema.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/insert",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/insert.test",
+      "result": "r/globalindex/insert.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/mem_index_lookup",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/mem_index_lookup.test",
+      "result": "r/globalindex/mem_index_lookup.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/mem_index_merge",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/globalindex/mem_index_merge.test",
+      "result": "r/globalindex/mem_index_merge.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "globalindex/mem_index_merge_non_unique",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/globalindex/mem_index_merge_non_unique.test",
+      "result": "r/globalindex/mem_index_merge_non_unique.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "globalindex/mem_index_non_unique",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/mem_index_non_unique.test",
+      "result": "r/globalindex/mem_index_non_unique.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/mem_index_reader",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/mem_index_reader.test",
+      "result": "r/globalindex/mem_index_reader.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/misc",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/misc.test",
+      "result": "r/globalindex/misc.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/multi_valued_index",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/multi_valued_index.test",
+      "result": "r/globalindex/multi_valued_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "globalindex/point_get",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/globalindex/point_get.test",
+      "result": "r/globalindex/point_get.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "globalindex/update",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/globalindex/update.test",
+      "result": "r/globalindex/update.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "imdbload",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/imdbload.test",
+      "result": "r/imdbload.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "index_join",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/index_join.test",
+      "result": "r/index_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "index_merge",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/index_merge.test",
+      "result": "r/index_merge.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "infoschema/cluster_tables",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/infoschema/cluster_tables.test",
+      "result": "r/infoschema/cluster_tables.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "infoschema/infoschema",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/infoschema/infoschema.test",
+      "result": "r/infoschema/infoschema.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "infoschema/tables",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/infoschema/tables.test",
+      "result": "r/infoschema/tables.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "infoschema/v2",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/infoschema/v2.test",
+      "result": "r/infoschema/v2.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "local/agg",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/agg.test",
+      "result": "r/local/agg.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/basic",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/basic.test",
+      "result": "r/local/basic.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/dml",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/dml.test",
+      "result": "r/local/dml.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/errors",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/errors.test",
+      "result": "r/local/errors.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/infoschema",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/infoschema.test",
+      "result": "r/local/infoschema.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/join",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/join.test",
+      "result": "r/local/join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/predicate",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/predicate.test",
+      "result": "r/local/predicate.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "local/txn",
+      "wave": "local",
+      "status": "local",
+      "test": "t/local/txn.test",
+      "result": "r/local/txn.result",
+      "has_result": true,
+      "skip_tikv": true,
+      "owner_hint": "sealdb smoke (non-TiDB golden)"
+    },
+    {
+      "name": "naaj",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/naaj.test",
+      "result": "r/naaj.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "new_character_set",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/new_character_set.test",
+      "result": "r/new_character_set.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "new_character_set_builtin",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/new_character_set_builtin.test",
+      "result": "r/new_character_set_builtin.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "new_character_set_invalid",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/new_character_set_invalid.test",
+      "result": "r/new_character_set_invalid.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "null_rejected",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/null_rejected.test",
+      "result": "r/null_rejected.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "parser/integration",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/parser/integration.test",
+      "result": "r/parser/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/partition.test",
+      "result": "r/partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/cardinality/selectivity",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/cardinality/selectivity.test",
+      "result": "r/planner/cardinality/selectivity.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/cardinality/trace",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/cardinality/trace.test",
+      "result": "r/planner/cardinality/trace.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/cascades/integration",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/cascades/integration.test",
+      "result": "r/planner/cascades/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/binary_plan",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/binary_plan.test",
+      "result": "r/planner/core/binary_plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/expression_rewriter",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/expression_rewriter.test",
+      "result": "r/planner/core/casetest/expression_rewriter.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/hint/hint",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/hint/hint.test",
+      "result": "r/planner/core/casetest/hint/hint.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/index/index",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/index/index.test",
+      "result": "r/planner/core/casetest/index/index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/index/partialindex",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/index/partialindex.test",
+      "result": "r/planner/core/casetest/index/partialindex.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/integration",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/integration.test",
+      "result": "r/planner/core/casetest/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/partition/integration_partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/casetest/partition/integration_partition.test",
+      "result": "r/planner/core/casetest/partition/integration_partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/casetest/partition/partition_pruner",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/casetest/partition/partition_pruner.test",
+      "result": "r/planner/core/casetest/partition/partition_pruner.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/casetest/physicalplantest/physical_plan",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/casetest/physicalplantest/physical_plan.test",
+      "result": "r/planner/core/casetest/physicalplantest/physical_plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/casetest/point_get_plan",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/planner/core/casetest/point_get_plan.test",
+      "result": "r/planner/core/casetest/point_get_plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/casetest/predicate_simplification",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/predicate_simplification.test",
+      "result": "r/planner/core/casetest/predicate_simplification.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/pushdown/push_down",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/pushdown/push_down.test",
+      "result": "r/planner/core/casetest/pushdown/push_down.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/rule/rule_derive_topn_from_window",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/planner/core/casetest/rule/rule_derive_topn_from_window.test",
+      "result": "r/planner/core/casetest/rule/rule_derive_topn_from_window.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "planner/core/casetest/rule/rule_join_reorder",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/rule/rule_join_reorder.test",
+      "result": "r/planner/core/casetest/rule/rule_join_reorder.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/casetest/rule/rule_result_reorder",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/casetest/rule/rule_result_reorder.test",
+      "result": "r/planner/core/casetest/rule/rule_result_reorder.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/cbo",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/cbo.test",
+      "result": "r/planner/core/cbo.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/enforce_mpp",
+      "wave": "D",
+      "status": "deferred",
+      "test": "t/planner/core/enforce_mpp.test",
+      "result": "r/planner/core/enforce_mpp.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "tiflash/mpp deferred"
+    },
+    {
+      "name": "planner/core/expression_rewriter",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/expression_rewriter.test",
+      "result": "r/planner/core/expression_rewriter.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/grouped_ranges_order_by",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/grouped_ranges_order_by.test",
+      "result": "r/planner/core/grouped_ranges_order_by.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/indexjoin",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/indexjoin.test",
+      "result": "r/planner/core/indexjoin.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/indexmerge_intersection",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/indexmerge_intersection.test",
+      "result": "r/planner/core/indexmerge_intersection.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/indexmerge_path",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/indexmerge_path.test",
+      "result": "r/planner/core/indexmerge_path.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/integration",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/integration.test",
+      "result": "r/planner/core/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/integration_partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/integration_partition.test",
+      "result": "r/planner/core/integration_partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/issuetest/planner_issue",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/issuetest/planner_issue.test",
+      "result": "r/planner/core/issuetest/planner_issue.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/join_reorder2",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/planner/core/join_reorder2.test",
+      "result": "r/planner/core/join_reorder2.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "planner/core/join_reorder_through_projection",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/planner/core/join_reorder_through_projection.test",
+      "result": "r/planner/core/join_reorder_through_projection.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "planner/core/lateral_join",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/lateral_join.test",
+      "result": "r/planner/core/lateral_join.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/memtable_predicate_extractor",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/memtable_predicate_extractor.test",
+      "result": "r/planner/core/memtable_predicate_extractor.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/partial_order_topn",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/partial_order_topn.test",
+      "result": "r/planner/core/partial_order_topn.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/partition_pruner",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/partition_pruner.test",
+      "result": "r/planner/core/partition_pruner.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/physical_plan",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/physical_plan.test",
+      "result": "r/planner/core/physical_plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/plan",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/plan.test",
+      "result": "r/planner/core/plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/plan_cache",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/planner/core/plan_cache.test",
+      "result": "r/planner/core/plan_cache.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "planner/core/plan_cost_ver2",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/planner/core/plan_cost_ver2.test",
+      "result": "r/planner/core/plan_cost_ver2.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/point_get_plan",
+      "wave": "R3",
+      "status": "in_progress",
+      "test": "t/planner/core/point_get_plan.test",
+      "result": "r/planner/core/point_get_plan.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "planner/core/preprocess",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/preprocess.test",
+      "result": "r/planner/core/preprocess.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/range_scan_for_like",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/range_scan_for_like.test",
+      "result": "r/planner/core/range_scan_for_like.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/rule_constant_propagation",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/rule_constant_propagation.test",
+      "result": "r/planner/core/rule_constant_propagation.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/rule_join_reorder",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/rule_join_reorder.test",
+      "result": "r/planner/core/rule_join_reorder.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/rule_outer2inner",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/rule_outer2inner.test",
+      "result": "r/planner/core/rule_outer2inner.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/rule_result_reorder",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/core/rule_result_reorder.test",
+      "result": "r/planner/core/rule_result_reorder.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "planner/core/tests/prepare/issue",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/planner/core/tests/prepare/issue.test",
+      "result": "r/planner/core/tests/prepare/issue.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "planner/core/tests/prepare/prepare",
+      "wave": "R4",
+      "status": "pending",
+      "test": "t/planner/core/tests/prepare/prepare.test",
+      "result": "r/planner/core/tests/prepare/prepare.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/plan_cache*,session,util/collate"
+    },
+    {
+      "name": "planner/funcdep/only_full_group_by",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/planner/funcdep/only_full_group_by.test",
+      "result": "r/planner/funcdep/only_full_group_by.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "privilege/privileges",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/privilege/privileges.test",
+      "result": "r/privilege/privileges.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "select",
+      "wave": "R1",
+      "status": "in_progress",
+      "test": "t/select.test",
+      "result": "r/select.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "expression,types,executor,session"
+    },
+    {
+      "name": "session/bootstrap_upgrade",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/bootstrap_upgrade.test",
+      "result": "r/session/bootstrap_upgrade.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/clustered_index",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/session/clustered_index.test",
+      "result": "r/session/clustered_index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "session/common",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/common.test",
+      "result": "r/session/common.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/nontransactional",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/nontransactional.test",
+      "result": "r/session/nontransactional.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/privileges",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/privileges.test",
+      "result": "r/session/privileges.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/session",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/session.test",
+      "result": "r/session/session.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/temporary_table",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/temporary_table.test",
+      "result": "r/session/temporary_table.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/txn",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/txn.test",
+      "result": "r/session/txn.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/variable",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/variable.test",
+      "result": "r/session/variable.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "session/vars",
+      "wave": "R5",
+      "status": "pending",
+      "test": "t/session/vars.test",
+      "result": "r/session/vars.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "sessiontxn,domain,kv"
+    },
+    {
+      "name": "sessionctx/setvar",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/sessionctx/setvar.test",
+      "result": "r/sessionctx/setvar.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "sessiontxn/externals",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/sessiontxn/externals.test",
+      "result": "r/sessiontxn/externals.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "show",
+      "wave": "R1",
+      "status": "in_progress",
+      "test": "t/show.test",
+      "result": "r/show.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "expression,types,executor,session"
+    },
+    {
+      "name": "statistics/handle",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/statistics/handle.test",
+      "result": "r/statistics/handle.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "statistics/integration",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/statistics/integration.test",
+      "result": "r/statistics/integration.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "statistics/lock_table_stats",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/statistics/lock_table_stats.test",
+      "result": "r/statistics/lock_table_stats.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "statistics/overflow_calc",
+      "wave": "R6",
+      "status": "pending",
+      "test": "t/statistics/overflow_calc.test",
+      "result": "r/statistics/overflow_calc.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "ddl,meta,infoschema"
+    },
+    {
+      "name": "subquery",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/subquery.test",
+      "result": "r/subquery.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "table/cache",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/table/cache.test",
+      "result": "r/table/cache.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "table/index",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/table/index.test",
+      "result": "r/table/index.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "table/partition",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/table/partition.test",
+      "result": "r/table/partition.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "table/tables",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/table/tables.test",
+      "result": "r/table/tables.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "table/temptable",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/table/temptable.test",
+      "result": "r/table/temptable.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "topn_push_down",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/topn_push_down.test",
+      "result": "r/topn_push_down.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "topn_pushdown",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/topn_pushdown.test",
+      "result": "r/topn_pushdown.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    },
+    {
+      "name": "tpch",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/tpch.test",
+      "result": "r/tpch.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "types/const",
+      "wave": "R1",
+      "status": "in_progress",
+      "test": "t/types/const.test",
+      "result": "r/types/const.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "expression,types,executor,session"
+    },
+    {
+      "name": "types/time",
+      "wave": "R1",
+      "status": "in_progress",
+      "test": "t/types/time.test",
+      "result": "r/types/time.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "expression,types,executor,session"
+    },
+    {
+      "name": "util/admin",
+      "wave": "R7",
+      "status": "pending",
+      "test": "t/util/admin.test",
+      "result": "r/util/admin.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner,statistics"
+    },
+    {
+      "name": "util/ranger",
+      "wave": "R3",
+      "status": "pending",
+      "test": "t/util/ranger.test",
+      "result": "r/util/ranger.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core,distsql,store/copr"
+    },
+    {
+      "name": "window_function",
+      "wave": "R2",
+      "status": "in_progress",
+      "test": "t/window_function.test",
+      "result": "r/window_function.result",
+      "has_result": true,
+      "skip_tikv": false,
+      "owner_hint": "planner/core/rule_*,executor/{join,aggregate,window}"
+    }
+  ]
+}

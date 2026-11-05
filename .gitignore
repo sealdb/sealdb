@@ -45,3 +45,12 @@ Thumbs.db
 *.profraw
 coverage/
 __pycache__/
+
+# TiDB integrationtest stats (extract via import_tidb_itest.sh from s.zip)
+tests/integrationtest/s/
+
+# Local tool path caches (do not commit)
+.tiflash-bin-path
+
+# itest triage scratch output
+project/regression/waves/*-triage.txt

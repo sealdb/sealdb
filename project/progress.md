@@ -1,73 +1,54 @@
 # 进度看板（Progress）
 
-> **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-05（C6 本地 PD+TiKV 联通验证；TiFlash 编译暂缓）
-> 功能级状态：[features/status.json](./features/status.json)
+> **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
+> 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
+> 最后更新：2026-11-05（TDD：TiDB integrationtest 全量导入；R1–R3 `in_progress`）  
+> 测试规范：[testing.md](./testing.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
 
-## 1. 状态图例
+## 1. 状态图例（suite）
 
 | 状态 | 含义 |
 |---|---|
-| `not-started` | 尚未开始 |
-| `in-progress` | 进行中（必须写负责人/下一步） |
-| `blocked` | 被阻塞（必须写阻塞原因/解除条件） |
-| `review` | 开发完成，等待 Gate 评审 |
-| `done` | Gate 通过，有证据 |
-| `deferred` | 本阶段不做（记录到后续阶段） |
+| `pending` | 已导入 TiDB 语料，未开工 |
+| `in_progress` | 当前 TDD 波，CI 默认不跑 |
+| `green` | Gate A+B 对 TiDB 金样通过（Mem + TiKV） |
+| `local` | SealDB smoke（非 TiDB 权威金样） |
+| `deferred` | TiFlash / MPP / TiSpark |
 
 ---
 
-## 2. 阶段状态
+## 2. TDD 回归波（现行进度）
 
-| Phase | 名称 | 状态 | 开始 | 完成 | Gate 证据 | 备注 |
-|---|---|---|---|---|---|---|
-| 0 | 地基与规范 | `done` | 2026-10-19 | 2026-11-01 | U0 | workspace/CI/parity/spike 书面结论 |
-| 1 | 核心类型与编码 | `done` | 2026-11-01 | 2026-11-01 | U1 | int/uint/float/bytes + row/index key；Decimal/Time 核心路径 |
-| 2 | 解析器 + Mock 链路 | `done` | 2026-11-01 | 2026-11-01 | U2/U3/F01 | 核心路径 `core-ported`；parser 全量边角留完整性波 |
-| 3 | 元数据与 Bootstrap | `done` | 2026-11-01 | 2026-11-01 | F02/F11 | SHOW/DESC 走内存 InfoSchema |
-| 4 | Planner v1（RBO） | `done` | 2026-11-01 | 2026-11-02 | F03–F10 | F03–F10 `core-ported` |
-| 5 | Executor v1 | `done` | 2026-11-01 | 2026-11-02 | F03–F10 | 默认 MemStorage，`--store tikv` 可写真实集群 |
-| 6 | 事务与 Session | `done` | 2026-11-01 | 2026-11-02 | F12/F13 | F12 乐观 RR + F13 悲观 FOR UPDATE 已通 |
-| 7 | CBO 与统计 | `done` | 2026-11-01 | 2026-11-03 | F21 | ANALYZE + 直方图/TopN + persist + auto-analyze + join cost；gaps `[]` |
-| 8 | DDL 与高级 SQL | `done` | 2026-11-01 | 2026-11-02 | F14–F20 | F14–F20 `core-ported`；gaps `[]` |
-| 9 | MySQL 协议与运维 | `done` | 2026-11-01 | 2026-11-03 | F22 | SSL/compress/COM_STMT/auth/multi-resultset；gaps `[]` |
-| 10 | 完整性 + C6 生产对齐 | `in-progress` | 2026-11-03 | — | C1–C5；C6 进行中 | C1–C5 gaps `[]`；C6-B PlanBuilder stmts 收口；下一步 C(PD+TiKV 全量)→D(TiFlash) |
+| Wave | 代表套件 | 状态 | 证据 / 下一步 |
+|---|---|---|---|
+| infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
+| R1 | select, show, types/* | `in_progress` | 同名 expression/executor 修复中；`triage_itest.sh -t select` |
+| R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
+| R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress` |
+| R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
+| D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
-### 2.1 功能波进度
+实现纪律：失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一复刻；禁止改权威 `r/*.result`。
+
+### 2.1 历史阶段（归档，不作为对齐进度）
+
+下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
+
+| Phase | 名称 | 归档状态 | 备注 |
+|---|---|---|---|
+| 0–9 | 地基→协议 | `done`（历史） | 见下方旧表 |
+| 10 / C6 | 完整性 + PD/TiKV | 基础设施仍有效 | TiFlash 编译暂缓；对齐改走 TDD 套件 |
+
+<details><summary>旧功能波 core-ported 表（归档）</summary>
 
 | ID | 状态 | 证据 |
 |---|---|---|
-| U0–U3 | `core-ported` | workspace / codec tests / `--parse` / `SELECT 1` |
-| F01 | `core-ported` | `project/reports/features/F01/` |
-| F02 | `core-ported` | `project/reports/features/F02/` |
-| F11 | `core-ported` | `project/reports/features/F11/` |
-| F03 | `core-ported` | `project/reports/features/F03/` |
-| F04 | `core-ported` | `project/reports/features/F04/` |
-| F05 | `core-ported` | `project/reports/features/F05/` |
-| F06 | `core-ported` | `project/reports/features/F06/` |
-| F07 | `core-ported` | `project/reports/features/F07/` |
-| F08 | `core-ported` | `project/reports/features/F08/` |
-| F09 | `core-ported` | `project/reports/features/F09/` |
-| F10 | `core-ported` | `project/reports/features/F10/` |
-| F12 | `core-ported` | `project/reports/features/F12/` |
-| F13 | `core-ported` | `project/reports/features/F13/` |
-| F14 | `core-ported` | `project/reports/features/F14/` |
-| F15 | `core-ported` | `project/reports/features/F15/` |
-| F16 | `core-ported` | `project/reports/features/F16/` |
-| F17 | `core-ported` | `project/reports/features/F17/` |
-| F18 | `core-ported` | `project/reports/features/F18/` |
-| F19 | `core-ported` | `project/reports/features/F19/` |
-| F20 | `core-ported` | `project/reports/features/F20/` |
-| F21 | `core-ported` | `project/reports/features/F21/` |
-| F22 | `core-ported` | `project/reports/features/F22/` |
-| C1 | `core-ported` | `project/reports/features/C1/` |
-| C2 | `core-ported` | `project/reports/features/C2/` |
-| C3 | `core-ported` | `project/reports/features/C3/` |
-| C4 | `core-ported` | `project/reports/features/C4/` |
-| C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C：本地 PD+TiKV（tiup v8.5.0）联通；TiFlash 编译暂缓 |
+| U0–U3 / F01–F22 / C1–C5 | `core-ported`（历史） | `project/reports/features/` |
+| C6 | 本地 PD+TiKV 联通 | tiup v8.5.0；非 suite green |
+
+</details>
 
 ---
 
@@ -108,9 +89,22 @@
 
 ## 4. 当前工作与证据
 
-### 2026-11-05
+### 2026-11-05 — TDD TiDB 回归全量对齐
 
-- **Phase**: C6 本地 PD + TiKV 联通（TiFlash 暂缓）
+- **进度单位**: suite `green`（见 `project/regression/manifest.json`）
+- **完成**:
+  - 导入 TiDB v8.5.8 `integrationtest` `t/r` + manifest（TiFlash/MPP → `deferred`）
+  - `record_tidb_itest.sh` / 禁默认 SealDB record；runner fail-lock + status 过滤
+  - R1/R2/R3 套件标 `in_progress`；select 路径：1060 派生表、hex→utf8mb4、STRAIGHT_JOIN USING、session vars
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory`（green+local）
+  - `./project/scripts/triage_itest.sh -t select --status in_progress`
+- **下一步**:
+  - R1 `select` 下一失败：`select !(1 + 2)`（sqlparser `!` 一元）与 unary 显示名；heap/`pk_is_handle` 已修
+  - 继续 R1 → green，再扫 R2/R3 triage 红灯同名移植
+
+### 2026-11-05 — C6 本地 PD + TiKV 联通（TiFlash 暂缓）
+
 - **完成**:
   - `run_local_pd_tikv.sh` / `verify_pd_tikv.sh`（tiup `pd/tikv` v8.5.0）
   - PD HTTP `no_proxy` 客户端；空 key region 走 scan

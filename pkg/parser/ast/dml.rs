@@ -47,6 +47,9 @@ pub struct Join {
     pub right: TableName,
     pub tp: JoinType,
     pub on: ExprNode,
+    /// Columns from `USING (...)`; empty when the join used `ON` / CROSS.
+    /// SELECT * coalesces these names (emit left only).
+    pub using_cols: Vec<String>,
 }
 
 impl Join {

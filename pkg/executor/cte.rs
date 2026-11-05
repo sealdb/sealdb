@@ -4,7 +4,7 @@
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
-use sealdb_errno::{ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_errno::{ERR_DUP_FIELDNAME, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
@@ -56,6 +56,26 @@ fn store_shared_cte(name: &str, schema: Vec<String>, rows: Vec<Vec<Datum>>) {
     SHARED.with(|cell| {
         cell.borrow_mut().1.insert(name.to_string(), (schema, rows));
     });
+}
+
+fn check_duplicate_field_names(names: &[String]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for name in names {
+        // Join schemas may still carry `table.col`; TiDB derived-table
+        // uniqueness is on the bare column name.
+        let bare = name.rsplit('.').next().unwrap_or(name.as_str());
+        let key = bare.to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if !seen.insert(key) {
+            return Err(Error::new(
+                ERR_DUP_FIELDNAME,
+                format!("Duplicate column name '{bare}'"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate `SELECT * FROM cte` against `with` (INSERT/UPDATE/DELETE JOIN sides).
@@ -191,6 +211,9 @@ impl Executor for CTEExec {
             }
             self.schema = self.columns.clone();
         }
+        // TiDB/MySQL: derived-table / CTE output names must be unique (errno 1060),
+        // including after `SELECT *` expands join schemas with overlapping names.
+        check_duplicate_field_names(&self.schema)?;
         if let Some((op, rec)) = self.recursive.clone() {
             self.rows = iterate_recursive(
                 &self.name,
