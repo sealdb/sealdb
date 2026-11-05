@@ -368,12 +368,14 @@ fn collect_tests(
 
 fn suite_allowed(suite: &Suite, opts: &RunOptions) -> bool {
     if let Some(filter) = opts.filter.as_deref() {
-        // Exact name, path suffix, or basename match — avoid `-t select`
-        // accidentally matching `access_path_selection`.
+        // Exact name, or path suffix when filter contains `/`.
+        // Bare `-t index_join` must not also match `globalindex/index_join`.
         let name = suite.name.as_str();
-        let ok = name == filter
-            || name.ends_with(&format!("/{filter}"))
-            || name.rsplit('/').next() == Some(filter);
+        let ok = if filter.contains('/') {
+            name == filter || name.ends_with(filter) || name.ends_with(&format!("/{filter}"))
+        } else {
+            name == filter
+        };
         if !ok {
             return false;
         }

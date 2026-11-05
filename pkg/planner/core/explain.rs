@@ -329,14 +329,26 @@ fn walk_with_parent(
             if self_p == build_p
                 && matches!(
                     name.as_str(),
-                    "TableReader" | "IndexReader" | "StreamAgg" | "Selection" | "HashJoin" | "IndexJoin"
+                    "TableReader"
+                        | "IndexReader"
+                        | "IndexLookUp"
+                        | "StreamAgg"
+                        | "Selection"
+                        | "HashJoin"
+                        | "IndexJoin"
                 )
             {
                 "(Build)"
             } else if self_p == probe_p
                 && matches!(
                     name.as_str(),
-                    "TableReader" | "IndexReader" | "StreamAgg" | "Selection" | "HashJoin" | "IndexJoin"
+                    "TableReader"
+                        | "IndexReader"
+                        | "IndexLookUp"
+                        | "StreamAgg"
+                        | "Selection"
+                        | "HashJoin"
+                        | "IndexJoin"
                 )
             {
                 "(Probe)"
@@ -380,16 +392,19 @@ fn walk_with_parent(
         _ => false,
     };
     let under_window = matches!(parent, Some(PhysicalPlan::Window { .. }));
-    let _under_stream_agg = stream_parent.is_some();
     if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:TopN".to_string();
     }
-    if let Some((agg_name, _, _, _)) = stream_parent {
-        if matches!(plan, PhysicalPlan::TableReader { .. }) {
+    if let Some((agg_name, _, cop_info, _)) = stream_parent {
+        if matches!(plan, PhysicalPlan::TableReader { .. }) && !cop_info.is_empty() {
             info = format!("data:{agg_name}");
         }
         if matches!(plan, PhysicalPlan::IndexReader { .. }) && agg_name == "StreamAgg" {
-            info = "index:StreamAgg".to_string();
+            if cop_info.is_empty() {
+                info = "index:IndexFullScan".to_string();
+            } else {
+                info = "index:StreamAgg".to_string();
+            }
         }
     }
     // RANGE: marker → TableRangeScan / IndexRangeScan access (overrides Selection).
@@ -444,14 +459,16 @@ fn walk_with_parent(
         } else {
             est_rows(plan)
         }
-    } else if let Some((_, _, _, est)) = stream_parent {
-        // Partial StreamAgg/HashAgg est applies to the DistSQL reader, not Projection.
-        if matches!(
-            plan,
-            PhysicalPlan::TableReader { .. }
-                | PhysicalPlan::IndexReader { .. }
-                | PhysicalPlan::IndexLookUpReader { .. }
-        ) {
+    } else if let Some((_, _, cop_info, est)) = stream_parent {
+        // Partial agg est applies to DistSQL reader only when cop push is active.
+        if !cop_info.is_empty()
+            && matches!(
+                plan,
+                PhysicalPlan::TableReader { .. }
+                    | PhysicalPlan::IndexReader { .. }
+                    | PhysicalPlan::IndexLookUpReader { .. }
+            )
+        {
             est
         } else {
             est_rows(plan)
@@ -647,28 +664,29 @@ fn emit_cop_children(
             // Cop children inherit the TableReader spine; non-last Build readers
             // need `│` at the reader column (see `bushy_cop_spine`).
             if let Some((agg_name, _, cop_info, est)) = stream_parent {
-                // TiDB partial StreamAgg/HashAgg pushed into TableReader.
-                let info = if cop_info.is_empty() {
-                    format!("funcs:count(select.{table}.a)->Column#13")
-                } else {
-                    cop_info.to_string()
-                };
-                let agg_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
-                push_explain_row_spine(
-                    rows,
-                    depth,
-                    true,
-                    next_id,
-                    CopRow {
-                        name: agg_name,
-                        est,
-                        task: "cop[tikv]",
-                        access: String::new(),
-                        info,
-                    },
-                    if under_bushy { agg_owned.as_slice() } else { &[] },
-                );
-                scan_depth = depth + 1;
+                if !cop_info.is_empty() {
+                    // TiDB partial StreamAgg/HashAgg pushed into TableReader.
+                    let agg_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: agg_name,
+                            est,
+                            task: "cop[tikv]",
+                            access: String::new(),
+                            info: cop_info.to_string(),
+                        },
+                        if under_bushy {
+                            agg_owned.as_slice()
+                        } else {
+                            &[]
+                        },
+                    );
+                    scan_depth = depth + 1;
+                }
             }
             // RANGE: marker → TableRangeScan (no Selection row).
             if let Some(range_info) = range_pushed(pushed.as_ref()) {
@@ -795,8 +813,10 @@ fn emit_cop_children(
         } => {
             let access = index_access_cols(table, index, index_columns, partitions);
             let (mut scan_est, mut scan_info) = index_scan_meta(pushed.as_ref());
-            // Analyzed IndexReader overrides pseudo index_scan_meta est.
-            if *row_count < 9_000.0 {
+            // Explicit IndexReader.row_count / RANGE overrides pseudo est.
+            if range_pushed(pushed.as_ref()).is_some()
+                || (*row_count - 10_000.0).abs() > f64::EPSILON
+            {
                 scan_est = *row_count;
             }
             let mut scan_depth = depth;
@@ -819,22 +839,24 @@ fn emit_cop_children(
                 scan_depth = depth + 1;
             }
             if let Some((agg_name, _, cop_info, est)) = stream_parent {
-                push_explain_row(
-                    rows,
-                    depth,
-                    true,
-                    next_id,
-                    CopRow {
-                        name: agg_name,
-                        est,
-                        task: "cop[tikv]",
-                        access: String::new(),
-                        info: cop_info.to_string(),
-                    },
-                );
-                scan_depth = depth + 1;
                 // GROUP BY StreamAgg needs ordered index input.
                 scan_info = "keep order:true, stats:pseudo".to_string();
+                if !cop_info.is_empty() {
+                    push_explain_row(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: agg_name,
+                            est,
+                            task: "cop[tikv]",
+                            access: String::new(),
+                            info: cop_info.to_string(),
+                        },
+                    );
+                    scan_depth = depth + 1;
+                }
             }
             if under_window {
                 scan_info = if window_keep_order {
@@ -850,7 +872,11 @@ fn emit_cop_children(
                 } else {
                     "cop"
                 };
-                let keep = format!("range: {range_info}, keep order:false");
+                let keep = if *row_count >= 9_000.0 {
+                    format!("range: {range_info}, keep order:false, stats:pseudo")
+                } else {
+                    format!("range: {range_info}, keep order:false")
+                };
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
                 let mut scan_spine = cop_spine.to_vec();
@@ -903,6 +929,8 @@ fn emit_cop_children(
                     }
                 })
                 .unwrap_or(1.0);
+            let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+            let cop_spine = cop_owned.as_slice();
             if let Some(filter) = pushed.as_ref() {
                 let sel_est = if under_stream_agg {
                     (10_000.0 / 3.0) * limit_scale
@@ -919,7 +947,7 @@ fn emit_cop_children(
                 if under_stream_agg {
                     scan_est = 10_000.0 * limit_scale;
                 }
-                push_explain_row(
+                push_explain_row_spine(
                     rows,
                     scan_depth,
                     true,
@@ -931,8 +959,13 @@ fn emit_cop_children(
                         access: String::new(),
                         info: filter_info,
                     },
+                    if under_bushy { cop_spine } else { &[] },
                 );
-                push_explain_row(
+                let mut leaf_spine = cop_spine.to_vec();
+                if under_bushy {
+                    leaf_spine.push(false);
+                }
+                push_explain_row_spine(
                     rows,
                     scan_depth + 1,
                     true,
@@ -944,9 +977,14 @@ fn emit_cop_children(
                         access,
                         info: scan_info,
                     },
+                    if under_bushy { &leaf_spine } else { &[] },
                 );
             } else {
-                push_explain_row(
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
                     rows,
                     scan_depth,
                     true,
@@ -958,6 +996,15 @@ fn emit_cop_children(
                         access,
                         info: scan_info,
                     },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
                 );
             }
             true
@@ -967,10 +1014,108 @@ fn emit_cop_children(
             index,
             index_columns,
             partitions,
+            row_count,
+            selection_info,
             pushed,
         } => {
             let idx_access = index_access_cols(table, index, index_columns, partitions);
-            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            let (mut scan_est, mut info) = index_scan_meta(pushed.as_ref());
+            if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
+                scan_est = *row_count;
+            }
+            // IndexJoin probe IndexLookUp: optional Selection(Build)+range / rowid.
+            if let Some(range_info) = range_pushed(pushed.as_ref()) {
+                let task = if under_index_join { "cop[tikv]" } else { "cop" };
+                let mut range_info_full = format!("range: {range_info}, keep order:false");
+                let mut rowid_info = "keep order:false".to_string();
+                if *row_count >= 9_000.0 {
+                    range_info_full.push_str(", stats:pseudo");
+                    rowid_info.push_str(", stats:pseudo");
+                }
+                let cop_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut build_spine = cop_spine.to_vec();
+                if under_bushy {
+                    build_spine.push(true);
+                }
+                let scan_depth = if selection_info.is_some() {
+                    // Selection(Build) → IndexRangeScan; TableRowIDScan(Probe) sibling.
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: scan_est,
+                            task,
+                            access: String::new(),
+                            info: selection_info.clone().unwrap_or_default(),
+                        },
+                        if under_bushy { &build_spine } else { &[] },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    let mut child_spine = build_spine.clone();
+                    if under_bushy {
+                        child_spine.push(false);
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: scan_est,
+                            task,
+                            access: idx_access.clone(),
+                            info: range_info_full.clone(),
+                        },
+                        if under_bushy { &child_spine } else { &[] },
+                    );
+                    depth
+                } else {
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: scan_est,
+                            task,
+                            access: idx_access.clone(),
+                            info: range_info_full.clone(),
+                        },
+                        if under_bushy { &build_spine } else { &[] },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    depth
+                };
+                let _ = scan_depth;
+                push_explain_row_spine(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRowIDScan",
+                        est: scan_est,
+                        task,
+                        access: table_access(table, &[]),
+                        info: rowid_info,
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
+                return true;
+            }
             if let Some(filter) = pushed.as_ref() {
                 info = format!("pushed:{}", filter.restore_string());
             }
@@ -1479,6 +1624,7 @@ fn collect_dot_cop_children(
             index_columns,
             partitions,
             pushed,
+            ..
         } => {
             let idx_access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
@@ -1694,10 +1840,15 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             format!("keys:{n_keys}"),
         ),
-        PhysicalPlan::IndexLookUpReader { .. } => (
+        PhysicalPlan::IndexLookUpReader { pushed, .. } => (
             "IndexLookUp".to_string(),
             String::new(),
-            "data:IndexRangeScan, TableRowIDScan".to_string(),
+            // Under IndexJoin, TiDB shows empty info (children carry the shape).
+            if range_pushed(pushed.as_ref()).is_some() {
+                String::new()
+            } else {
+                "data:IndexRangeScan, TableRowIDScan".to_string()
+            },
         ),
         PhysicalPlan::IndexReader { pushed, .. } => (
             "IndexReader".to_string(),
@@ -1923,6 +2074,12 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             ..
         } if range_pushed(Some(filter)).is_some() => *row_count,
         PhysicalPlan::IndexReader { row_count, pushed: None, .. } => *row_count,
+        PhysicalPlan::IndexLookUpReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if range_pushed(Some(filter)).is_some() => *row_count,
+        PhysicalPlan::IndexLookUpReader { row_count, pushed: None, .. } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
         }

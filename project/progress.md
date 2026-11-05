@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（R2 `subquery` Mem+TiKV 已绿）  
+> 最后更新：2026-11-06（R2 `index_join` Mem+TiKV 已绿）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` green |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `index_join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
