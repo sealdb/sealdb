@@ -141,7 +141,31 @@ impl Datum {
                 let d = MyDecimal::parse(&self.display())?.with_frac(ft.decimal);
                 Ok(Datum::Decimal(d))
             }
-            EvalType::Datetime => Ok(self.clone()),
+            EvalType::Datetime => match self {
+                Datum::Time(t) => Ok(Datum::Time(*t)),
+                Datum::Bytes(b) => {
+                    let s = String::from_utf8_lossy(b);
+                    let mut t = crate::time::parse_timestamp_literal(&s).or_else(|_| {
+                        if s.contains(' ') {
+                            crate::time::parse_timestamp_literal(&s)
+                        } else {
+                            crate::time::parse_timestamp_literal(&format!("{s} 00:00:00"))
+                        }
+                    })?;
+                    if ft.tp == crate::field_type::TYPE_TIMESTAMP {
+                        t.tp = crate::time::TimeType::Timestamp;
+                    } else if ft.tp == crate::field_type::TYPE_DATE {
+                        t.tp = crate::time::TimeType::Date;
+                    } else {
+                        t.tp = crate::time::TimeType::Datetime;
+                    }
+                    Ok(Datum::Time(t))
+                }
+                other => Err(Error::new(
+                    ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Incorrect datetime value: '{}'", other.display()),
+                )),
+            },
         }
     }
 

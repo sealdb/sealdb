@@ -2041,3 +2041,17 @@ mod date_add_parse {
         }
     }
 }
+
+#[cfg(test)]
+mod orig_text_timestamp {
+    use super::*;
+    #[test]
+    fn keeps_orig() {
+        let stmt = Parser::new()
+            .parse_one_stmt("select timestamp '2024-01-01 14:00:00'")
+            .unwrap();
+        let f = &stmt.as_select().unwrap().fields[0];
+        eprintln!("orig={:?}", f.orig_text);
+        assert!(f.orig_text.as_ref().unwrap().to_ascii_lowercase().contains("timestamp"));
+    }
+}

@@ -1828,7 +1828,20 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                     .as_name
                     .clone()
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| literal_field_name(&v.datum));
+                    .unwrap_or_else(|| {
+                        // TIMESTAMP/DATE/TIME literals: TiDB uses field.Text().
+                        if matches!(v.datum, sealdb_types::Datum::Time(_)) {
+                            if let Some(text) = field
+                                .orig_text
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                return text.to_string();
+                            }
+                        }
+                        literal_field_name(&v.datum)
+                    });
                 columns.push(name);
                 row.push(v.datum.clone());
             }
@@ -1879,7 +1892,8 @@ fn literal_field_name(datum: &sealdb_types::Datum) -> String {
         sealdb_types::Datum::F64(n) => n.to_string(),
         sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         sealdb_types::Datum::Null => "NULL".into(),
-        other => format!("{other:?}"),
+        sealdb_types::Datum::Time(t) => t.to_string(),
+        sealdb_types::Datum::Decimal(d) => d.to_string(),
     }
 }
 
@@ -2616,6 +2630,16 @@ mod tests {
     use sealdb_types::Datum;
 
     #[test]
+    fn test_timestamp_literal_header() {
+        let session = Session::new();
+        let ok = session
+            .execute_stmt("SELECT TIMESTAMP '2024-01-01 14:00:00'")
+            .unwrap();
+        assert_eq!(ok.columns[0], "TIMESTAMP '2024-01-01 14:00:00'", "{:?}", ok.columns);
+        assert_eq!(ok.rows[0][0].display(), "2024-01-01 14:00:00");
+    }
+
+    #[test]
     fn test_date_add_timestampadd_strings() {
         let session = Session::new();
         session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
@@ -2631,6 +2655,22 @@ mod tests {
             .execute_stmt("SELECT TIMESTAMPDIFF(HOUR, '2025-03-30 01:59:59', '2025-03-30 02:30:00')")
             .unwrap();
         assert_eq!(ok.rows, vec![vec![Datum::I64(0)]]);
+    }
+
+    #[test]
+    fn test_timestampadd_column_dst_8179() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE IF NOT EXISTS dst").unwrap();
+        session.execute_stmt("USE dst").unwrap();
+        session.execute_stmt("SET time_zone='UTC'").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
+        session.execute_stmt("CREATE TABLE t (id int primary key, ts TIMESTAMP)").unwrap();
+        session.execute_stmt("INSERT INTO t VALUES (1, '2025-03-30 00:59:59')").unwrap();
+        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        let err = session
+            .execute_stmt("SELECT TIMESTAMPADD(HOUR, 1, ts) FROM t")
+            .expect_err("dst");
+        assert_eq!(err.code, 8179, "{err}");
     }
 
     #[test]
