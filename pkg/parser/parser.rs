@@ -1511,6 +1511,21 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(lim_rec.limit, Some(10), "paren LIMIT must survive set-op lower");
+        let exists = parser
+            .parse_one_stmt(
+                "SELECT * FROM t dt WHERE EXISTS (WITH RECURSIVE qn AS (SELECT 1 AS b UNION ALL SELECT b+1 FROM qn WHERE b=0) SELECT * FROM qn WHERE b=1)",
+            )
+            .unwrap();
+        match &exists.as_select().unwrap().selection {
+            Some(crate::ast::ExprNode::Exists(ex)) => match ex.query.as_ref() {
+                crate::ast::ResultSetNode::Select(s) => {
+                    assert!(s.with.is_some(), "EXISTS subquery must keep WITH");
+                    assert_eq!(s.with.as_ref().unwrap().ctes[0].name, "qn");
+                }
+                other => panic!("expected Select, got {other:?}"),
+            },
+            other => panic!("expected EXISTS, got {other:?}"),
+        }
         let mat = parser
             .parse_one_stmt("WITH c AS MATERIALIZED (SELECT 1) SELECT * FROM c")
             .unwrap();

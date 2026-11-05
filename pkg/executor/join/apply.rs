@@ -14,7 +14,9 @@ use sealdb_parser::ast::expressions::{
     InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
     UnaryOpExpr, ValueExpr,
 };
-use sealdb_parser::ast::{ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement};
+use sealdb_parser::ast::{
+    ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement, WithClause,
+};
 use sealdb_parser::opcode::Op;
 use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
@@ -465,8 +467,29 @@ fn bind_result_set(query: &ResultSetNode, ctx: &ApplyCtx) -> Result<ResultSetNod
 
 fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
     let inner_table = select.from.as_ref().map(|t| t.name.clone());
-    let inner_cols = inner_columns(select, ctx);
+    let mut inner_cols = inner_columns(select, ctx);
+    // CTE output names count as inner so `WHERE b=a` keeps `b` on the CTE.
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            if !cte.col_name_list.is_empty() {
+                inner_cols.extend(cte.col_name_list.iter().cloned());
+            } else {
+                for field in &cte.query.fields {
+                    if let Some(name) = &field.as_name
+                        && !name.is_empty()
+                    {
+                        inner_cols.push(name.clone());
+                    } else if let ExprNode::Column(c) = &field.expr {
+                        inner_cols.push(c.name.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut out = select.clone();
+    if let Some(with) = &select.with {
+        out.with = Some(bind_with(with, ctx)?);
+    }
     out.fields = select
         .fields
         .iter()
@@ -493,6 +516,27 @@ fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
         item.expr = bind_expr(&item.expr, ctx, inner_table.as_deref(), &inner_cols);
     }
     Ok(out)
+}
+
+fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
+    let mut ctes = Vec::with_capacity(with.ctes.len());
+    for cte in &with.ctes {
+        let mut bound = cte.clone();
+        bound.query = Box::new(bind_select(&cte.query, ctx)?);
+        if let Some((op, rec)) = &cte.recursive {
+            bound.recursive = Some((*op, bind_select(rec, ctx)?));
+        }
+        let mut rest = Vec::with_capacity(cte.set_rest.len());
+        for (op, select) in &cte.set_rest {
+            rest.push((*op, bind_select(select, ctx)?));
+        }
+        bound.set_rest = rest;
+        ctes.push(bound);
+    }
+    Ok(WithClause {
+        is_recursive: with.is_recursive,
+        ctes,
+    })
 }
 
 fn inner_columns(select: &SelectStmt, ctx: &ApplyCtx) -> Vec<String> {
