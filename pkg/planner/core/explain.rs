@@ -892,17 +892,27 @@ fn seed_orig_table(plan: &PhysicalPlan) -> Option<String> {
 fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<ExplainRow>) {
     // TiDB Seed Part is always a TableReader; column Projection / Selection sit
     // in the cop subtree (`data:Projection` / `data:Selection` / `data:TableFullScan`).
+    // Remap projections (`col0` / bare names from build_cte_plan) are unwrap-only.
+    let is_remap = |exprs: &[String]| {
+        exprs
+            .iter()
+            .all(|e| !e.contains('.') && !e.contains("->") && !e.contains('('))
+    };
     let (proj_exprs, selection, reader) = match plan {
+        PhysicalPlan::Projection { exprs, child, .. } if is_remap(exprs) => match child.as_ref() {
+            PhysicalPlan::Selection {
+                filter,
+                child: scan,
+                ..
+            } => (None, Some(filter), scan.as_ref()),
+            other => (None, None, other),
+        },
         PhysicalPlan::Projection { exprs, child, .. } => match child.as_ref() {
             PhysicalPlan::Selection {
                 filter,
                 child: scan,
                 ..
-            } => (
-                Some(exprs.as_slice()),
-                Some(filter),
-                scan.as_ref(),
-            ),
+            } => (Some(exprs.as_slice()), Some(filter), scan.as_ref()),
             other => (Some(exprs.as_slice()), None, other),
         },
         PhysicalPlan::Selection { filter, child, .. } => (None, Some(filter), child.as_ref()),
