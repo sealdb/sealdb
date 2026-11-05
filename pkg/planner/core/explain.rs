@@ -343,12 +343,14 @@ fn walk_with_parent(
         PhysicalPlan::HashJoin { .. }
             | PhysicalPlan::MergeJoin { .. }
             | PhysicalPlan::PartitionUnion { .. }
+            | PhysicalPlan::Union { .. }
     ) || matches!(
         parent,
         Some(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
                 | PhysicalPlan::PartitionUnion { .. }
+                | PhysicalPlan::Union { .. }
         )
     );
     let prefix = if bushy || !spine.is_empty() {
@@ -356,8 +358,18 @@ fn walk_with_parent(
     } else {
         tree_prefix(depth, last)
     };
+    // TopN count only overrides DistSQL reader est (pushed TopN), not Union/etc.
     let row_est = if let Some((_, _, count)) = topn_parent {
-        count as f64
+        if matches!(
+            plan,
+            PhysicalPlan::IndexReader { .. }
+                | PhysicalPlan::TableReader { .. }
+                | PhysicalPlan::IndexLookUpReader { .. }
+        ) {
+            count as f64
+        } else {
+            est_rows(plan)
+        }
     } else if let Some((_, _, est)) = stream_parent {
         // Partial StreamAgg est applies to the DistSQL reader, not Projection.
         if matches!(
@@ -388,6 +400,7 @@ fn walk_with_parent(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
                 | PhysicalPlan::PartitionUnion { .. }
+                | PhysicalPlan::Union { .. }
         )
     );
     // Projection→CARTESIAN: TableReader sits under Projection with a non-empty
@@ -413,14 +426,19 @@ fn walk_with_parent(
     // Under `└─` (Projection→HashJoin, or Probe whose spine ends in space):
     // children get spaces at this column. Nested HashJoin builds keep a leftover
     // `true` for Probe `│`; TableReader Selection uses `bushy_cop_spine`.
+    // Under `└─` (TopN→Union, Projection→HashJoin, …): children get spaces at
+    // this column so we render `  ├─` not `│ ├─`.
     let under_last_join = matches!(
         plan,
         PhysicalPlan::HashJoin { .. }
             | PhysicalPlan::MergeJoin { .. }
             | PhysicalPlan::PartitionUnion { .. }
+            | PhysicalPlan::Union { .. }
     ) && last
-        && (matches!(parent, Some(PhysicalPlan::Projection { .. }))
-            || spine.last() == Some(&false));
+        && (matches!(
+            parent,
+            Some(PhysicalPlan::Projection { .. } | PhysicalPlan::TopN { .. })
+        ) || spine.last() == Some(&false));
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
         let mut child_spine = spine.to_vec();
@@ -432,6 +450,7 @@ fn walk_with_parent(
                     PhysicalPlan::HashJoin { .. }
                         | PhysicalPlan::MergeJoin { .. }
                         | PhysicalPlan::PartitionUnion { .. }
+                        | PhysicalPlan::Union { .. }
                 )
             {
                 child_spine.push(true);
@@ -441,12 +460,15 @@ fn walk_with_parent(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
                 | PhysicalPlan::PartitionUnion { .. }
+                | PhysicalPlan::Union { .. }
         ) {
             child_spine.push(!child_last);
         } else if !spine.is_empty() {
             // StreamAgg under CARTESIAN: push whether *this* node continues.
             // Projection under HashJoin: push whether the child has siblings
             // (Projection is usually unary → spaces under `│`).
+            // Projection under Union: push `!last` so Dual keeps `│` when the
+            // Projection is a non-last Union arm (`  ├─` / `  │ └─`).
             if matches!(plan, PhysicalPlan::Projection { .. })
                 && matches!(parent, Some(PhysicalPlan::HashJoin { .. }))
             {
@@ -1458,7 +1480,13 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             ("Apply".to_string(), String::new(), filter.restore_string())
         }
         PhysicalPlan::Union { op, .. } => {
-            ("Union".to_string(), String::new(), op.restore().to_string())
+            // TiDB brief: UnionAll shows empty info; DISTINCT union shows UNION.
+            let info = if matches!(op, sealdb_parser::ast::SetOprType::UnionAll) {
+                String::new()
+            } else {
+                op.restore().to_string()
+            };
+            ("Union".to_string(), String::new(), info)
         }
         PhysicalPlan::Window { info, .. } => {
             ("Window".to_string(), String::new(), info.clone())

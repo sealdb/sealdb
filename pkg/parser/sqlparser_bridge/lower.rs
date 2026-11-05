@@ -68,6 +68,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     // TiDB `!` SimpleExpr → opcode.Not2; sqlparser rejects bare `!`.
     let rewritten = rewrite_mysql_bang(&rewritten);
+    // sqlparser rejects `((SELECT…) UNION ALL (SELECT…)) alias`; unwrap arm parens
+    // before paren-from (which would otherwise strip the outer derived parens).
+    let rewritten = rewrite_mysql_union_derived_parens(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
     let rewritten = rewrite_show_grants(&rewritten)?;
@@ -1920,6 +1923,145 @@ fn rewrite_mysql_bang(sql: &str) -> String {
         }
     }
     out
+}
+
+/// Unwrap `((SELECT …) UNION [ALL] (SELECT …))` → `(SELECT … UNION [ALL] SELECT …)`
+/// so sqlparser accepts the derived table (TiDB/MySQL allow the parenthesized form).
+fn rewrite_mysql_union_derived_parens(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq || in_dq || in_bt {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            if in_sq && c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if in_dq && c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if in_bt && c == b'`' {
+                in_bt = false;
+            } else if (in_sq || in_dq) && c == b'\\' && i + 1 < bytes.len() {
+                let esc = sql[i + 1..].chars().next().unwrap();
+                out.push(esc);
+                i += 1 + esc.len_utf8();
+                continue;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_sq = true;
+                out.push('\'');
+                i += 1;
+                continue;
+            }
+            b'"' => {
+                in_dq = true;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            b'`' => {
+                in_bt = true;
+                out.push('`');
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                if let Some((rewritten, end)) = try_unwrap_union_derived(sql, bytes, i) {
+                    out.push_str(&rewritten);
+                    i = end;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// If `sql[start..]` is `((SELECT…) UNION… (SELECT…))`, return unwrapped form + end idx.
+fn try_unwrap_union_derived(sql: &str, bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'(') {
+        return None;
+    }
+    let close = skip_balanced(bytes, start);
+    if close <= start + 1 {
+        return None;
+    }
+    let inner = sql[start + 1..close - 1].trim();
+    let ib = inner.as_bytes();
+    let mut pos = skip_ws_and_comments(ib, 0);
+    // Require leading `(SELECT…)`
+    if pos >= ib.len() || ib[pos] != b'(' {
+        return None;
+    }
+    let arm1_close = skip_balanced(ib, pos);
+    if arm1_close <= pos + 1 {
+        return None;
+    }
+    let arm1 = inner[pos + 1..arm1_close - 1].trim();
+    if !keyword_at(arm1.as_bytes(), skip_ws_and_comments(arm1.as_bytes(), 0), "SELECT") {
+        return None;
+    }
+    pos = skip_ws_and_comments(ib, arm1_close);
+    if !keyword_at(ib, pos, "UNION") {
+        return None;
+    }
+    let union_kw_end = pos + 5;
+    let after_union = skip_ws_and_comments(ib, union_kw_end);
+    let (all_kw, after_all) = if keyword_at(ib, after_union, "ALL") {
+        (true, skip_ws_and_comments(ib, after_union + 3))
+    } else if keyword_at(ib, after_union, "DISTINCT") {
+        (false, skip_ws_and_comments(ib, after_union + 8))
+    } else {
+        (false, after_union)
+    };
+    if after_all >= ib.len() || ib[after_all] != b'(' {
+        return None;
+    }
+    let arm2_close = skip_balanced(ib, after_all);
+    if arm2_close <= after_all + 1 {
+        return None;
+    }
+    let arm2 = inner[after_all + 1..arm2_close - 1].trim();
+    if !keyword_at(arm2.as_bytes(), skip_ws_and_comments(arm2.as_bytes(), 0), "SELECT") {
+        return None;
+    }
+    // Only rewrite when the rest of the inner is trailing whitespace (binary UNION).
+    let rest = skip_ws_and_comments(ib, arm2_close);
+    if rest < ib.len() {
+        return None;
+    }
+    let mut rewritten = String::from("(");
+    rewritten.push_str(arm1);
+    rewritten.push_str(if all_kw {
+        " union all "
+    } else {
+        " union "
+    });
+    rewritten.push_str(arm2);
+    rewritten.push(')');
+    Some((rewritten, close))
 }
 
 /// Strip MySQL parenthesized table refs that are not subqueries.
@@ -7738,6 +7880,21 @@ mod paren_from_tests {
         parse_sql("select * from (t)").expect("FROM (t)");
         parse_sql("select * from (t as a, t2 as b)").expect("FROM (t, t2)");
         parse_sql("select * from (t as a cross join t2 as b)").expect("FROM (t JOIN t2)");
+    }
+
+    #[test]
+    fn unwraps_union_derived_arm_parens() {
+        let sql =
+            "select * from ((select 4 as a) union all (select 33 as a)) tmp order by a desc limit 1";
+        let rewritten = rewrite_mysql_union_derived_parens(sql);
+        assert!(
+            rewritten.contains("select 4 as a union all select 33 as a"),
+            "rewrite failed: {rewritten}"
+        );
+        parse_sql(&rewritten).expect("rewritten union derived");
+        parse_sql(sql).expect("union derived with arm parens");
+        parse_sql("select * from ((select 4 as a) union all (select 33 as a)) as tmp")
+            .expect("union derived with AS");
     }
 
     #[test]

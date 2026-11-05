@@ -461,24 +461,39 @@ impl PlanBuilder {
                 child: Box::new(seed),
             };
         }
+        let union_col = if !with.set_rest(&from.name)?.is_empty() {
+            // TiDB set-op output column ids for dual constants start at #3.
+            Some(3usize)
+        } else {
+            None
+        };
+        if let Some(col) = union_col {
+            seed = remap_dual_projection_column(seed, col);
+        }
         for (op, select) in with.set_rest(&from.name)? {
+            let mut right = self.build_with_schema(
+                &Statement::Select(select),
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            )?;
+            if let Some(col) = union_col {
+                right = remap_dual_projection_column(right, col);
+            }
             seed = PhysicalPlan::Union {
                 op,
                 left: Box::new(seed),
-                right: Box::new(self.build_with_schema(
-                    &Statement::Select(select),
-                    is,
-                    current_db,
-                    stats,
-                    prune_mode,
-                )?),
+                right: Box::new(right),
             };
         }
         let cte = with.find(&from.name);
         let columns = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
         let inline = cte.is_some_and(|cte| {
             cte.materialize == CteMaterialize::NotMaterialized && cte.recursive.is_none()
-        }) || seed_is_dual_projection(&seed);
+        }) || seed_is_dual_projection(&seed)
+            // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
+            || seed_is_union_of_dual(&seed);
         Ok(Some(PhysicalPlan::CTE {
             name: from.name.clone(),
             columns,
@@ -1382,14 +1397,29 @@ fn apply_order_limit(
 }
 
 /// TiDB TopN ExplainInfo by-items: `select.<table>.<col>` (query-block prefix).
+/// Derived UNION duals use `Column#3:desc` (TiDB plan column id for set-op output).
 fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
     let table = select.from.as_ref().map(|t| t.name.as_str());
+    let from_derived_union = select.with.as_ref().is_some_and(|w| {
+        table.is_some_and(|t| {
+            w.find(t)
+                .is_some_and(|cte| !cte.set_rest.is_empty())
+        })
+    });
     select
         .order_by
         .iter()
-        .map(|item| match (&table, &item.expr) {
-            (Some(t), ExprNode::Column(col)) => format!("select.{t}.{}", col.name),
-            _ => item.expr.restore_string(),
+        .map(|item| {
+            let base = match (&table, &item.expr) {
+                (_, ExprNode::Column(_)) if from_derived_union => "Column#3".to_string(),
+                (Some(t), ExprNode::Column(col)) => format!("select.{t}.{}", col.name),
+                _ => item.expr.restore_string(),
+            };
+            if item.desc {
+                format!("{base}:desc")
+            } else {
+                base
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -1433,6 +1463,35 @@ fn seed_is_dual_projection(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::TableDual { .. } => true,
         PhysicalPlan::Projection { child, .. } => seed_is_dual_projection(child),
+        _ => false,
+    }
+}
+
+/// Remap dual Projection `text->Column#N` to a shared UNION output column id.
+fn remap_dual_projection_column(plan: PhysicalPlan, col: usize) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs: exprs
+                .into_iter()
+                .map(|e| match e.rsplit_once("->Column#") {
+                    Some((prefix, _)) => format!("{prefix}->Column#{col}"),
+                    None => e,
+                })
+                .collect(),
+            child,
+        },
+        other => other,
+    }
+}
+
+fn seed_is_union_of_dual(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Union { left, right, .. } => {
+            seed_is_dual_projection(left) && seed_is_dual_projection(right)
+                || seed_is_union_of_dual(left) && seed_is_dual_projection(right)
+                || seed_is_dual_projection(left) && seed_is_union_of_dual(right)
+                || seed_is_union_of_dual(left) && seed_is_union_of_dual(right)
+        }
         _ => false,
     }
 }

@@ -2505,7 +2505,7 @@
     {
       "name": "topn_pushdown",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/topn_pushdown.test",
       "result": "r/topn_pushdown.result",
       "has_result": true,
