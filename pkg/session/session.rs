@@ -1525,7 +1525,13 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                 *session.sql_mode.lock().expect("session sql_mode lock") = value;
             }
             "tidb_partition_prune_mode" => {
-                let mode = PartitionPruneMode::parse(&value).ok_or_else(|| {
+                // `SET … = DEFAULT` resets to TiDB's default (dynamic).
+                let raw = if value.eq_ignore_ascii_case("DEFAULT") {
+                    "dynamic"
+                } else {
+                    value.as_str()
+                };
+                let mode = PartitionPruneMode::parse(raw).ok_or_else(|| {
                     sealdb_errno::Error::new(
                         sealdb_errno::ERR_WRONG_ARGUMENTS,
                         format!("Variable 'tidb_partition_prune_mode' can't be set to the value of '{value}'"),

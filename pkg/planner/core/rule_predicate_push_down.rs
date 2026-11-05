@@ -41,6 +41,10 @@ fn push_into(
         PhysicalPlan::TableReader {
             table,
             partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
             pushed,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
@@ -49,11 +53,21 @@ fn push_into(
                 PhysicalPlan::TableReader {
                     table,
                     partitions,
+                    partition_names,
+                    partition_access,
+                    row_count,
+                    stats_pseudo,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
                 },
                 residual,
             )
         }
+        PhysicalPlan::PartitionUnion { children } => PhysicalPlan::PartitionUnion {
+            children: children
+                .into_iter()
+                .map(|c| push_into(c, conjuncts.clone(), is, current_db))
+                .collect(),
+        },
         PhysicalPlan::IndexLookUpReader {
             table,
             index,

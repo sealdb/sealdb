@@ -1813,6 +1813,15 @@ mod tests {
         }
         let err = parser.parse_one_stmt("ANALYZE TABLE t (id)").unwrap_err();
         assert!(err.message.contains("column") || err.message.contains("ANALYZE"));
+        match parser
+            .parse_one_stmt("ANALYZE TABLE th ALL COLUMNS")
+            .unwrap()
+        {
+            crate::ast::Statement::AnalyzeTable(analyze) => {
+                assert_eq!(analyze.table.name, "th");
+            }
+            other => panic!("expected AnalyzeTableStmt, got {other:?}"),
+        }
     }
 
     #[test]

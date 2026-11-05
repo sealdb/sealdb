@@ -165,8 +165,10 @@ impl PartitionInfo {
         let Some(v) = datum_i64(value) else {
             return Err(no_partition());
         };
-        let n = self.definitions.len() as i64;
-        let idx = ((v % n) + n) % n;
+        // TiDB / MySQL HASH: reinterpret signed value as uint64 before MOD
+        // so `a = -2` with 3 partitions lands in p2 (`(2^64-2) % 3 == 2`).
+        let n = self.definitions.len() as u64;
+        let idx = (v as u64) % n;
         Ok(self.definitions[idx as usize].id)
     }
 
@@ -237,14 +239,12 @@ impl PartitionInfo {
     }
 
     fn prune_cmp(&self, op: Op, left: &ExprNode, right: &ExprNode) -> Option<Vec<i64>> {
-        let (col, value, flipped) = match (left, right) {
-            (ExprNode::Column(col), ExprNode::Value(ValueExpr { datum })) => {
-                (col.name.as_str(), datum, false)
-            }
-            (ExprNode::Value(ValueExpr { datum }), ExprNode::Column(col)) => {
-                (col.name.as_str(), datum, true)
-            }
-            _ => return None,
+        let (col, value, flipped) = match (as_column(left), const_datum(right)) {
+            (Some(col), Some(datum)) => (col, datum, false),
+            _ => match (const_datum(left), as_column(right)) {
+                (Some(datum), Some(col)) => (col, datum, true),
+                _ => return None,
+            },
         };
         if !col.eq_ignore_ascii_case(self.column()) {
             return None;
@@ -255,9 +255,9 @@ impl PartitionInfo {
                 if op != Op::Eq {
                     return None;
                 }
-                self.locate(value).ok().map(|id| vec![id])
+                self.locate(&value).ok().map(|id| vec![id])
             }
-            PartitionType::Range => Some(self.prune_range(op, value)),
+            PartitionType::Range => Some(self.prune_range(op, &value)),
         }
     }
 
@@ -411,6 +411,33 @@ fn datum_i64(value: &Datum) -> Option<i64> {
     match value {
         Datum::I64(v) => Some(*v),
         Datum::U64(v) => i64::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+fn as_column(expr: &ExprNode) -> Option<&str> {
+    match expr {
+        ExprNode::Column(col) => Some(col.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Fold `Value` / `UnaryMinus(Value)` into a Datum for partition prune.
+fn const_datum(expr: &ExprNode) -> Option<Datum> {
+    match expr {
+        ExprNode::Value(ValueExpr { datum }) => Some(datum.clone()),
+        ExprNode::Unary(u) if u.op == Op::UnaryMinus => match u.expr.as_ref() {
+            ExprNode::Value(ValueExpr {
+                datum: Datum::I64(v),
+            }) => Some(Datum::I64(-*v)),
+            ExprNode::Value(ValueExpr {
+                datum: Datum::U64(v),
+            }) => Some(Datum::I64(-(*v as i64))),
+            ExprNode::Value(ValueExpr {
+                datum: Datum::F64(v),
+            }) => Some(Datum::F64(-*v)),
+            _ => None,
+        },
         _ => None,
     }
 }
