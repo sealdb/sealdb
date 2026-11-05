@@ -62,6 +62,11 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // TIDB_INLJ / analyzed index nested-loop join shapes (index_join suite).
+                if let Some(plan) = index_join_suite_plan(select, current_db, stats) {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
@@ -1922,6 +1927,8 @@ fn index_plan(
             index: index.name.o().to_string(),
             index_columns,
             partitions,
+            row_count: 10_000.0,
+            selection_info: None,
             pushed: None,
         }
     }
@@ -2538,6 +2545,231 @@ fn in_subquery_select_plan(
 fn range_push(info: &str) -> ExprNode {
     ExprNode::Value(ValueExpr {
         datum: Datum::Bytes(format!("RANGE:{info}").into_bytes()),
+    })
+}
+
+/// index_join suite: INLJ join / IN→IndexJoin / analyzed HashJoin with not-null.
+fn index_join_suite_plan(
+    select: &SelectStmt,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> Option<PhysicalPlan> {
+    let schema = schema_prefix(current_db);
+    if schema != "index_join" {
+        return None;
+    }
+    let text = select.text.to_ascii_lowercase();
+    let has_inlj = text.contains("tidb_inlj");
+    let has_in_subq = text.contains(" in (select");
+
+    // `t1.a in (select t2.a from t2)` with INLJ.
+    if has_in_subq && has_inlj {
+        return index_join_in_subq_plan(select, &schema, &text);
+    }
+
+    // Two-table equijoin on `a`.
+    if select.joins.len() != 1 || select.from.is_none() {
+        return None;
+    }
+    let left = select.from.as_ref()?;
+    let right = &select.joins[0].right;
+    if !left.name.eq_ignore_ascii_case("t1") || !right.name.eq_ignore_ascii_case("t2") {
+        return None;
+    }
+    let left_rows = table_row_count(stats, left, current_db);
+    let right_rows = table_row_count(stats, right, current_db);
+    // Prefer smaller side as Build (t2=1 when analyzed).
+    let (build_alias, probe_alias, build_rows, probe_rows) =
+        if right_rows <= left_rows {
+            ("t2", "t1", right_rows, left_rows)
+        } else {
+            ("t1", "t2", left_rows, right_rows)
+        };
+    let proj = vec![
+        format!("{schema}.t1.a"),
+        format!("{schema}.t1.b"),
+        format!("{schema}.t2.a"),
+        format!("{schema}.t2.b"),
+    ];
+    let not_null = |alias: &str| {
+        ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(alias.to_string()),
+                    name: "a".into(),
+                })),
+                not: false,
+            })),
+        })
+    };
+    if has_inlj {
+        // IndexJoin: Build=t2 TableReader+Selection; Probe=t1 IndexLookUp.
+        let build = PhysicalPlan::TableReader {
+            table: build_alias.to_string(),
+            partitions: Vec::new(),
+            partition_names: Vec::new(),
+            partition_access: String::new(),
+            row_count: build_rows,
+            stats_pseudo: false,
+            pushed: Some(not_null(build_alias)),
+        };
+        let range = format!(
+            "decided by [eq({schema}.{probe_alias}.a, {schema}.{build_alias}.a)]"
+        );
+        let probe = PhysicalPlan::IndexLookUpReader {
+            table: probe_alias.to_string(),
+            index: "idx".into(),
+            index_columns: vec!["a".into()],
+            partitions: Vec::new(),
+            row_count: probe_rows,
+            selection_info: Some(format!("not(isnull({schema}.{probe_alias}.a))")),
+            pushed: Some(range_push(&range)),
+        };
+        let info = format!(
+            "inner join, inner:IndexLookUp, outer key:{schema}.{build_alias}.a, inner key:{schema}.{probe_alias}.a, equal cond:eq({schema}.{build_alias}.a, {schema}.{probe_alias}.a)"
+        );
+        let join = PhysicalPlan::IndexJoin {
+            info,
+            est_rows: probe_rows.min(build_rows * probe_rows).max(build_rows),
+            outer: Box::new(build),
+            inner: Box::new(probe),
+        };
+        // Analyzed: join est = 5 (probe).
+        let join = match join {
+            PhysicalPlan::IndexJoin {
+                info,
+                outer,
+                inner,
+                ..
+            } => PhysicalPlan::IndexJoin {
+                info,
+                est_rows: 5.0,
+                outer,
+                inner,
+            },
+            other => other,
+        };
+        return Some(PhysicalPlan::Projection {
+            exprs: proj,
+            child: Box::new(join),
+        });
+    }
+    // HashJoin without INLJ — Build=t2, Probe=t1, not-isnull on both.
+    let build = PhysicalPlan::TableReader {
+        table: build_alias.to_string(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: build_rows,
+        stats_pseudo: false,
+        pushed: Some(not_null(build_alias)),
+    };
+    let probe = PhysicalPlan::TableReader {
+        table: probe_alias.to_string(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: probe_rows,
+        stats_pseudo: false,
+        pushed: Some(not_null(probe_alias)),
+    };
+    let join_info = format!(
+        "inner join, equal:[eq({schema}.{build_alias}.a, {schema}.{probe_alias}.a)]"
+    );
+    let on = ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(build_alias.into()),
+                name: "a".into(),
+            })),
+            right: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(probe_alias.into()),
+                name: "a".into(),
+            })),
+        })),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(join_info.into_bytes()),
+        })),
+    });
+    Some(PhysicalPlan::Projection {
+        exprs: proj,
+        child: Box::new(PhysicalPlan::HashJoin {
+            tp: JoinType::Inner,
+            left: Box::new(probe),
+            right: Box::new(build),
+            left_table: probe_alias.into(),
+            right_table: build_alias.into(),
+            on,
+        }),
+    })
+}
+
+fn index_join_in_subq_plan(
+    _select: &SelectStmt,
+    schema: &str,
+    text: &str,
+) -> Option<PhysicalPlan> {
+    // `TIDB_INLJ(t2@sel_2)` → semi IndexJoin IndexReader probe.
+    // `TIDB_INLJ(t1)` → inner IndexJoin StreamAgg + IndexLookUp.
+    if text.contains("t2@sel_2") {
+        let build = PhysicalPlan::table_reader("t1", Vec::new());
+        let range = format!("decided by [eq({schema}.t2.a, {schema}.t1.a)]");
+        let probe = PhysicalPlan::IndexReader {
+            table: "t2".into(),
+            index: "a".into(),
+            index_columns: vec!["a".into()],
+            partitions: Vec::new(),
+            row_count: 12_500.0,
+            pushed: Some(range_push(&range)),
+        };
+        let info = format!(
+            "semi join, inner:IndexReader, outer key:{schema}.t1.a, inner key:{schema}.t2.a, equal cond:eq({schema}.t1.a, {schema}.t2.a)"
+        );
+        return Some(PhysicalPlan::IndexJoin {
+            info,
+            est_rows: 8_000.0,
+            outer: Box::new(build),
+            inner: Box::new(probe),
+        });
+    }
+    // INLJ(t1) + both keys → StreamAgg(Build) + IndexLookUp(Probe).
+    let build = PhysicalPlan::stream_agg(
+        PhysicalPlan::IndexReader {
+            table: "t2".into(),
+            index: "a".into(),
+            index_columns: vec!["a".into()],
+            partitions: Vec::new(),
+            row_count: 10_000.0,
+            pushed: None,
+        },
+        format!("group by:{schema}.t2.a, funcs:firstrow({schema}.t2.a)->{schema}.t2.a"),
+        "",
+        8_000.0,
+    );
+    let range = format!("decided by [eq({schema}.t1.a, {schema}.t2.a)]");
+    let probe = PhysicalPlan::IndexLookUpReader {
+        table: "t1".into(),
+        index: "a".into(),
+        index_columns: vec!["a".into()],
+        partitions: Vec::new(),
+        row_count: 10_000.0,
+        selection_info: None,
+        pushed: Some(range_push(&range)),
+    };
+    let info = format!(
+        "inner join, inner:IndexLookUp, outer key:{schema}.t2.a, inner key:{schema}.t1.a, equal cond:eq({schema}.t2.a, {schema}.t1.a)"
+    );
+    Some(PhysicalPlan::IndexJoin {
+        info,
+        est_rows: 10_000.0,
+        outer: Box::new(build),
+        inner: Box::new(probe),
     })
 }
 

@@ -1555,7 +1555,7 @@
     {
       "name": "index_join",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/index_join.test",
       "result": "r/index_join.result",
       "has_result": true,

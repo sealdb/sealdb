@@ -78,6 +78,11 @@ pub enum PhysicalPlan {
         index: String,
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// Analyzed / pseudo cardinality for EXPLAIN estRows.
+        row_count: f64,
+        /// When set, EXPLAIN Selection under IndexRangeScan uses this info
+        /// (e.g. `not(isnull(index_join.t1.a))`).
+        selection_info: Option<String>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
