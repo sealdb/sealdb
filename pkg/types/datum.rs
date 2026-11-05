@@ -102,10 +102,8 @@ impl Datum {
                 if ft.is_unsigned() {
                     match self {
                         Datum::U64(v) => Ok(Datum::U64(*v)),
-                        Datum::I64(v) if *v >= 0 => Ok(Datum::U64(*v as u64)),
-                        Datum::I64(_) => {
-                            Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"))
-                        }
+                        // MySQL/TiDB: CAST(negative AS UNSIGNED) wraps (e.g. -1 → u64::MAX).
+                        Datum::I64(v) => Ok(Datum::U64(*v as u64)),
                         Datum::Decimal(d) => {
                             let s = d.to_string();
                             if s.starts_with('-') {

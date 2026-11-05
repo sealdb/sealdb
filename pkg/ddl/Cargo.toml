@@ -17,3 +17,4 @@ sealdb-parser.workspace = true
 sealdb-tablecodec.workspace = true
 sealdb-types.workspace = true
 thiserror.workspace = true
+sealdb-expression.workspace = true

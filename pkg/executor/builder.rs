@@ -890,11 +890,50 @@ fn expand_projection_fields(
                 names.push(col.clone());
             }
         } else {
-            exprs.push(field.expr.clone());
+            let expr = match &select.from {
+                Some(from) if select.joins.is_empty() => {
+                    qualify_expr_table(field.expr.clone(), &from.name)
+                }
+                _ => field.expr.clone(),
+            };
+            exprs.push(expr);
             names.push(field_output_name(field));
         }
     }
     (exprs, names)
+}
+
+/// Attach FROM table name onto bare columns so overflow messages match TiDB
+/// (`db.table.col`).
+fn qualify_expr_table(expr: ExprNode, table: &str) -> ExprNode {
+    match expr {
+        ExprNode::Column(mut c) if c.table.is_none() => {
+            c.table = Some(table.to_string());
+            ExprNode::Column(c)
+        }
+        ExprNode::Binary(mut b) => {
+            b.left = Box::new(qualify_expr_table(*b.left, table));
+            b.right = Box::new(qualify_expr_table(*b.right, table));
+            ExprNode::Binary(b)
+        }
+        ExprNode::Unary(mut u) => {
+            u.expr = Box::new(qualify_expr_table(*u.expr, table));
+            ExprNode::Unary(u)
+        }
+        ExprNode::Func(mut f) => {
+            f.args = f
+                .args
+                .into_iter()
+                .map(|a| qualify_expr_table(a, table))
+                .collect();
+            ExprNode::Func(f)
+        }
+        ExprNode::Cast(mut c) => {
+            c.expr = Box::new(qualify_expr_table(*c.expr, table));
+            ExprNode::Cast(c)
+        }
+        other => other,
+    }
 }
 
 /// Column names visible to `SELECT *` from the FROM/JOIN clause.

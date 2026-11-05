@@ -273,6 +273,15 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
                 ..numeric_ft()
             }
         }
+        "REAL" if sealdb_expression::sql_mode_flag("REAL_AS_FLOAT") => {
+            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((12, -1));
+            FieldType {
+                tp: TYPE_FLOAT,
+                flen,
+                decimal,
+                ..numeric_ft()
+            }
+        }
         "DOUBLE" | "REAL" => {
             let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((22, -1));
             FieldType {

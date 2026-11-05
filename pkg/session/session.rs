@@ -146,6 +146,12 @@ impl Session {
 
     /// Execute every statement in `sql` and return each result ( multi-resultset).
     pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        let mode = self
+            .sql_mode
+            .lock()
+            .expect("session sql_mode lock")
+            .clone();
+        reject_create_table_func_call(sql, &mode)?;
         let stmts = self.parser.parse_sql(sql)?;
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
@@ -638,7 +644,9 @@ impl Session {
             .clone();
         let mode = sealdb_expression::CollateMode::from_name(&coll.name);
         let result = sealdb_expression::with_sql_mode(sql_mode, || {
-            sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+            sealdb_expression::with_current_db(current_db.as_str(), || {
+                sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+            })
         });
         if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
             self.txn
@@ -1182,6 +1190,108 @@ fn sql_mode_has(mode: &str, flag: &str) -> bool {
     mode.split(',')
         .map(|p| p.trim())
         .any(|p| p.eq_ignore_ascii_case(flag))
+}
+
+/// TiDB IGNORE_SPACE / bare function-name CREATE TABLE: `COUNT(a)` is a
+/// syntax error; `COUNT (a)` is OK unless IGNORE_SPACE; quoted / qualified OK.
+fn reject_create_table_func_call(sql: &str, sql_mode: &str) -> Result<()> {
+    let ignore_space = sql_mode_has(sql_mode, "IGNORE_SPACE");
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !keyword_at_ci(bytes, i, b"CREATE") {
+            i += 1;
+            continue;
+        }
+        let mut j = skip_ws_bytes(bytes, i + 6);
+        if !keyword_at_ci(bytes, j, b"TABLE") {
+            i += 1;
+            continue;
+        }
+        j = skip_ws_bytes(bytes, j + 5);
+        if keyword_at_ci(bytes, j, b"IF") {
+            j = skip_ws_bytes(bytes, j + 2);
+            if keyword_at_ci(bytes, j, b"NOT") {
+                j = skip_ws_bytes(bytes, j + 3);
+                if keyword_at_ci(bytes, j, b"EXISTS") {
+                    j = skip_ws_bytes(bytes, j + 6);
+                }
+            }
+        }
+        // Backtick-quoted name is always allowed.
+        if j < bytes.len() && bytes[j] == b'`' {
+            i = j + 1;
+            continue;
+        }
+        // Qualified `db.name` — TiDB allows function names after the dot.
+        let name_start = j;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if name_start == j {
+            i += 1;
+            continue;
+        }
+        let name = std::str::from_utf8(&bytes[name_start..j]).unwrap_or("");
+        if j < bytes.len() && bytes[j] == b'.' {
+            i = j + 1;
+            continue;
+        }
+        if !is_create_table_func_name(name) {
+            i = j;
+            continue;
+        }
+        let after_name = j;
+        let after_ws = skip_ws_bytes(bytes, after_name);
+        if after_ws >= bytes.len() || bytes[after_ws] != b'(' {
+            i = j;
+            continue;
+        }
+        let had_space = after_ws > after_name;
+        // No space → always error; space → error only with IGNORE_SPACE.
+        if !had_space || ignore_space {
+            let near = sql[name_start..].trim_end_matches(';').trim_end();
+            // TiDB reports the 0-based offset of `(`.
+            let col = after_ws;
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_PARSE_ERROR,
+                format!(
+                    "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line 1 column {col} near \"{near};\""
+                ),
+            ));
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+fn is_create_table_func_name(name: &str) -> bool {
+    // TiDB treats built-in function identifiers specially for CREATE TABLE.
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "BIT_AND" | "BIT_OR" | "BIT_XOR" | "NOW" | "SUM" | "AVG" | "MAX" | "MIN"
+            | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME"
+            | "LOCALTIMESTAMP" | "UTC_DATE" | "UTC_TIME" | "UTC_TIMESTAMP"
+    ) || sealdb_expression::lookup(name).is_some()
+}
+
+fn keyword_at_ci(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    if i + kw.len() > bytes.len() {
+        return false;
+    }
+    if !bytes[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    let end = i + kw.len();
+    end == bytes.len()
+        || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+}
+
+fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
@@ -2409,22 +2519,34 @@ impl Default for Session {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use sealdb_errno::{
+        ERR_DATA_OUT_OF_RANGE, ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
+    };
+    use sealdb_types::Datum;
+
     #[test]
     fn test_bigint_sub_overflow_1690() {
         let session = Session::new();
-        session.execute_stmt("CREATE DATABASE IF NOT EXISTS itest").unwrap();
-        session.execute_stmt("USE itest").unwrap();
-        session.execute_stmt("SET sql_mode='NO_UNSIGNED_SUBTRACTION'").unwrap();
-        session.execute_stmt("DROP TABLE IF EXISTS tb5").unwrap();
-        session.execute_stmt("CREATE TABLE tb5(a bigint, b bigint)").unwrap();
-        session.execute_stmt("INSERT INTO tb5 VALUES (10, -9223372036854775808)").unwrap();
-        let err = session.execute_stmt("SELECT a - b FROM tb5").unwrap_err();
-        assert_eq!(err.code, 1690, "{err:?}");
+        session
+            .execute_stmt("SET sql_mode='NO_UNSIGNED_SUBTRACTION'")
+            .unwrap();
+        let ok = session
+            .execute_stmt("SELECT CAST(0 as UNSIGNED) - 1")
+            .unwrap();
+        assert_eq!(ok.rows, vec![vec![Datum::I64(-1)]]);
+        let err = session
+            .execute_stmt(
+                "SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)",
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
+        assert!(
+            err.message.contains("18446744073709551615"),
+            "{}",
+            err.message
+        );
     }
-
-    use super::*;
-    use sealdb_errno::{ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS};
-    use sealdb_types::Datum;
 
     #[test]
     fn test_select_one() {
