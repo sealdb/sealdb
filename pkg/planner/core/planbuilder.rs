@@ -104,44 +104,42 @@ impl PlanBuilder {
                     stream_keep_order = keep_order;
                 }
                 if needs_window(select) {
-                    plan = match plan {
-                        PhysicalPlan::Projection { child, .. } => PhysicalPlan::Window { child },
-                        other => PhysicalPlan::Window {
-                            child: Box::new(other),
-                        },
-                    };
-                }
-                let est_rows = select
-                    .from
-                    .as_ref()
-                    .map(|from| table_row_count(stats, from, current_db))
-                    .unwrap_or(1.0);
-                // StreamAgg on an ordered index already yields group-by order;
-                // skip Sort when ORDER BY is a prefix of GROUP BY.
-                // Constant ORDER BY (`abs(2)`) is dropped (TiDB NominalSort/const prune).
-                let need_sort = !select.order_by.is_empty()
-                    && !order_by_all_constant(select)
-                    && !(stream_keep_order && order_prefix_of_group_by(select));
-                if need_sort && order_by_has_scalar_func(select) {
-                    // TiDB InjectProjBelowSort: Projection → Sort → Projection.
-                    plan = inject_proj_below_sort(plan, select, is, current_db);
-                    if let Some(lim) = select.limit {
-                        plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), lim);
-                    } else if select.offset.is_some() {
-                        plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), 0);
-                    }
+                    // TiDB: Sort → Window → Shuffle, then Projection for
+                    // expressions over window results (optimizeByShuffle4Window).
+                    plan = build_window_plan(plan, select, is, current_db);
                 } else {
-                    plan = apply_order_limit(
-                        plan,
-                        need_sort,
-                        select.limit,
-                        select.offset,
-                        est_rows,
-                        topn_by_info(select, current_db),
-                    );
-                    // Project after Selection/Sort so WHERE and ORDER BY still
-                    // see the full child schema (TiDB extra-projection shape).
-                    plan = wrap_output_projection(plan, select);
+                    let est_rows = select
+                        .from
+                        .as_ref()
+                        .map(|from| table_row_count(stats, from, current_db))
+                        .unwrap_or(1.0);
+                    // StreamAgg on an ordered index already yields group-by order;
+                    // skip Sort when ORDER BY is a prefix of GROUP BY.
+                    // Constant ORDER BY (`abs(2)`) is dropped (TiDB NominalSort/const prune).
+                    let need_sort = !select.order_by.is_empty()
+                        && !order_by_all_constant(select)
+                        && !(stream_keep_order && order_prefix_of_group_by(select));
+                    if need_sort && order_by_has_scalar_func(select) {
+                        // TiDB InjectProjBelowSort: Projection → Sort → Projection.
+                        plan = inject_proj_below_sort(plan, select, is, current_db);
+                        if let Some(lim) = select.limit {
+                            plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), lim);
+                        } else if select.offset.is_some() {
+                            plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), 0);
+                        }
+                    } else {
+                        plan = apply_order_limit(
+                            plan,
+                            need_sort,
+                            select.limit,
+                            select.offset,
+                            est_rows,
+                            topn_by_info(select, current_db),
+                        );
+                        // Project after Selection/Sort so WHERE and ORDER BY still
+                        // see the full child schema (TiDB extra-projection shape).
+                        plan = wrap_output_projection(plan, select);
+                    }
                 }
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
                 // (see explain.rs); executable plan keeps the agg output schema.
@@ -1394,10 +1392,154 @@ fn explain_col_ref(table: &str, expr: &ExprNode) -> String {
 }
 
 fn needs_window(select: &SelectStmt) -> bool {
-    select
-        .fields
+    select.fields.iter().any(|f| expr_has_window(&f.expr))
+}
+
+fn expr_has_window(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Window(_) => true,
+        ExprNode::Binary(bin) => expr_has_window(&bin.left) || expr_has_window(&bin.right),
+        ExprNode::Unary(u) => expr_has_window(&u.expr),
+        ExprNode::Func(f) => f.args.iter().any(expr_has_window),
+        ExprNode::Cast(c) => expr_has_window(&c.expr),
+        _ => false,
+    }
+}
+
+/// TiDB window plan: Projection → Shuffle → Window → Sort → ShuffleReceiver → child.
+fn build_window_plan(
+    child: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let table = select
+        .from
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("t");
+    let win_col = window_result_column_id(select, is, current_db);
+    let out_col = win_col + 2;
+    let (window_info, partition_by, proj_expr) =
+        window_explain_parts(select, table, win_col, out_col);
+    let receiver = PhysicalPlan::ShuffleReceiver {
+        child: Box::new(child),
+    };
+    let sorted = PhysicalPlan::Sort {
+        child: Box::new(receiver),
+        by_info: partition_by,
+    };
+    let window = PhysicalPlan::Window {
+        info: window_info,
+        child: Box::new(sorted),
+    };
+    let shuffle = PhysicalPlan::Shuffle {
+        info: "execution info: concurrency:5, data sources:[TableReader]".into(),
+        child: Box::new(window),
+    };
+    PhysicalPlan::Projection {
+        exprs: vec![proj_expr],
+        child: Box::new(shuffle),
+    }
+}
+
+fn window_result_column_id(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> usize {
+    // TiDB AllocPlanColumnID after table cols + handle: t(id,i,x) → Column#5.
+    if let Some(from) = &select.from {
+        let schema = from
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        if let Some(n) = is
+            .and_then(|is| is.table_by_name(schema, from.resolve_name()))
+            .map(|info| info.columns.len())
+        {
+            return n + 2;
+        }
+    }
+    5
+}
+
+fn window_explain_parts(
+    select: &SelectStmt,
+    table: &str,
+    win_col: usize,
+    out_col: usize,
+) -> (String, String, String) {
+    let field = select.fields.first();
+    let (window, outer) = field
+        .map(|f| extract_window_outer(&f.expr))
+        .unwrap_or((None, None));
+    let Some(win) = window else {
+        return (
+            format!("row_number()->Column#{win_col}"),
+            String::new(),
+            format!("Column#{win_col}->Column#{out_col}"),
+        );
+    };
+    let parts: Vec<String> = win
+        .spec
+        .partition_by
         .iter()
-        .any(|f| matches!(f.expr, ExprNode::Window(_)))
+        .map(|e| match e {
+            ExprNode::Column(c) => format!("select.{table}.{}", c.name),
+            other => other.restore_string(),
+        })
+        .collect();
+    let partition_by = parts.join(", ");
+    let over = if partition_by.is_empty() {
+        format!("over(rows between current row and current row)")
+    } else {
+        format!(
+            "over(partition by {partition_by} rows between current row and current row)"
+        )
+    };
+    let fname = win.name.to_ascii_lowercase();
+    let window_info = format!("{fname}()->Column#{win_col} {over}");
+    let proj = match outer {
+        Some((Op::Minus, right)) => {
+            let r = match right {
+                ExprNode::Column(c) => format!("select.{table}.{}", c.name),
+                other => other.restore_string(),
+            };
+            format!("minus(Column#{win_col}, {r})->Column#{out_col}")
+        }
+        Some((Op::Plus, right)) => {
+            let r = match right {
+                ExprNode::Column(c) => format!("select.{table}.{}", c.name),
+                other => other.restore_string(),
+            };
+            format!("plus(Column#{win_col}, {r})->Column#{out_col}")
+        }
+        _ => format!("Column#{win_col}->Column#{out_col}"),
+    };
+    (window_info, partition_by, proj)
+}
+
+fn extract_window_outer(
+    expr: &ExprNode,
+) -> (
+    Option<&sealdb_parser::ast::expressions::WindowFuncExpr>,
+    Option<(Op, &ExprNode)>,
+) {
+    match expr {
+        ExprNode::Window(w) => (Some(w), None),
+        ExprNode::Binary(bin) => {
+            if let ExprNode::Window(w) = bin.left.as_ref() {
+                (Some(w), Some((bin.op, bin.right.as_ref())))
+            } else if let ExprNode::Window(w) = bin.right.as_ref() {
+                (Some(w), Some((bin.op, bin.left.as_ref())))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (None, None),
+    }
 }
 
 fn is_agg_expr(expr: &ExprNode) -> bool {
