@@ -80,9 +80,10 @@ pub enum PhysicalPlan {
         partitions: Vec<i64>,
         /// Analyzed / pseudo cardinality for EXPLAIN estRows.
         row_count: f64,
-        /// When set, EXPLAIN Selection under IndexRangeScan uses this info
-        /// (e.g. `not(isnull(index_join.t1.a))`).
+        /// When set, EXPLAIN Selection(Build) wraps IndexRangeScan.
         selection_info: Option<String>,
+        /// When set, EXPLAIN Selection(Probe) wraps TableRowIDScan.
+        probe_selection_info: Option<String>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -192,6 +193,13 @@ pub enum PhysicalPlan {
         est_rows: f64,
         outer: Box<PhysicalPlan>,
         inner: Box<PhysicalPlan>,
+    },
+    /// Dirty-read gather over snapshot + uncommitted writes (TiDB PhysicalUnionScan).
+    UnionScan {
+        /// ExplainInfo (filters); empty for Build-side bare UnionScan.
+        info: String,
+        est_rows: f64,
+        child: Box<PhysicalPlan>,
     },
     Union {
         op: SetOprType,
@@ -396,6 +404,9 @@ impl PhysicalPlan {
             PhysicalPlan::IndexJoin {
                 outer, inner, info, ..
             } => format!("IndexJoin({info}, {}, {})", outer.explain(), inner.explain()),
+            PhysicalPlan::UnionScan { child, info, .. } => {
+                format!("UnionScan({info}) -> {}", child.explain())
+            }
             PhysicalPlan::Union { op, left, right } => {
                 format!(
                     "Union_{}({}, {})",

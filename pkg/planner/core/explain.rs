@@ -301,13 +301,23 @@ fn walk_with_parent(
                         | "Projection"
                         | "Selection"
                         | "IndexReader"
+                        | "Limit"
+                        | "UnionScan"
+                        | "IndexJoin"
                 )
             {
                 "(Build)"
             } else if self_p == left_p
                 && matches!(
                     name.as_str(),
-                    "HashJoin" | "TableReader" | "Projection" | "Selection" | "IndexReader"
+                    "HashJoin"
+                        | "TableReader"
+                        | "Projection"
+                        | "Selection"
+                        | "IndexReader"
+                        | "Limit"
+                        | "UnionScan"
+                        | "IndexJoin"
                 )
             {
                 "(Probe)"
@@ -336,6 +346,8 @@ fn walk_with_parent(
                         | "Selection"
                         | "HashJoin"
                         | "IndexJoin"
+                        | "UnionScan"
+                        | "Limit"
                 )
             {
                 "(Build)"
@@ -349,6 +361,8 @@ fn walk_with_parent(
                         | "Selection"
                         | "HashJoin"
                         | "IndexJoin"
+                        | "UnionScan"
+                        | "Limit"
                 )
             {
                 "(Probe)"
@@ -440,6 +454,8 @@ fn walk_with_parent(
                 | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
                 | PhysicalPlan::Union { .. }
+                | PhysicalPlan::UnionScan { .. }
+                | PhysicalPlan::Limit { .. }
         )
     );
     let prefix = if bushy || !spine.is_empty() {
@@ -473,6 +489,13 @@ fn walk_with_parent(
         } else {
             est_rows(plan)
         }
+    } else if let Some(PhysicalPlan::Limit { count, .. }) = parent {
+        // TiDB Limit above HashJoin clamps join estRows to the limit count.
+        if *count > 0 {
+            est_rows(plan).min(*count as f64)
+        } else {
+            est_rows(plan)
+        }
     } else {
         est_rows(plan)
     };
@@ -496,8 +519,8 @@ fn walk_with_parent(
                 | PhysicalPlan::Union { .. }
         )
     );
-    // Projection/Selection/HashAgg→CARTESIAN: TableReader sits under a unary
-    // with a non-empty spine; still need bushy cop prefixes for TableFullScan.
+    // Projection/Selection/HashAgg/UnionScan/Limit→CARTESIAN: TableReader sits
+    // under a unary with a non-empty spine; still need bushy cop prefixes.
     let under_bushy = under_bushy
         || (!spine.is_empty()
             && matches!(
@@ -507,6 +530,8 @@ fn walk_with_parent(
                         | PhysicalPlan::Selection { .. }
                         | PhysicalPlan::HashAgg { .. }
                         | PhysicalPlan::StreamAgg { .. }
+                        | PhysicalPlan::UnionScan { .. }
+                        | PhysicalPlan::Limit { .. }
                 )
             ));
     let under_merge_join = matches!(parent, Some(PhysicalPlan::MergeJoin { .. }));
@@ -550,6 +575,7 @@ fn walk_with_parent(
                     | PhysicalPlan::TopN { .. }
                     | PhysicalPlan::StreamAgg { .. }
                     | PhysicalPlan::Apply { .. }
+                    | PhysicalPlan::Limit { .. }
             )
         ) || spine.last() == Some(&false));
     for (i, child) in children.iter().enumerate() {
@@ -601,8 +627,10 @@ fn walk_with_parent(
                         | PhysicalPlan::Apply { probe: Some(_), .. }
                 )
             ) {
+                // Unary under Build: spaces under the │ (no further siblings).
                 child_spine.push(!child_last);
             } else {
+                // Limit/UnionScan Build under HashJoin: keep │ for Probe sibling.
                 child_spine.push(!last);
             }
         }
@@ -1016,6 +1044,7 @@ fn emit_cop_children(
             partitions,
             row_count,
             selection_info,
+            probe_selection_info,
             pushed,
         } => {
             let idx_access = index_access_cols(table, index, index_columns, partitions);
@@ -1023,9 +1052,13 @@ fn emit_cop_children(
             if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
                 scan_est = *row_count;
             }
-            // IndexJoin probe IndexLookUp: optional Selection(Build)+range / rowid.
+            // IndexJoin/UnionScan IndexLookUp: RANGE + optional Selection sides.
             if let Some(range_info) = range_pushed(pushed.as_ref()) {
-                let task = if under_index_join { "cop[tikv]" } else { "cop" };
+                let task = if under_index_join || under_bushy {
+                    "cop[tikv]"
+                } else {
+                    "cop"
+                };
                 let mut range_info_full = format!("range: {range_info}, keep order:false");
                 let mut rowid_info = "keep order:false".to_string();
                 if *row_count >= 9_000.0 {
@@ -1038,8 +1071,7 @@ fn emit_cop_children(
                 if under_bushy {
                     build_spine.push(true);
                 }
-                let scan_depth = if selection_info.is_some() {
-                    // Selection(Build) → IndexRangeScan; TableRowIDScan(Probe) sibling.
+                if selection_info.is_some() {
                     push_explain_row_spine(
                         rows,
                         depth,
@@ -1075,7 +1107,6 @@ fn emit_cop_children(
                         },
                         if under_bushy { &child_spine } else { &[] },
                     );
-                    depth
                 } else {
                     push_explain_row_spine(
                         rows,
@@ -1094,25 +1125,61 @@ fn emit_cop_children(
                     if let Some(last) = rows.last_mut() {
                         last.id.push_str("(Build)");
                     }
-                    depth
-                };
-                let _ = scan_depth;
-                push_explain_row_spine(
-                    rows,
-                    depth,
-                    true,
-                    next_id,
-                    CopRow {
-                        name: "TableRowIDScan",
-                        est: scan_est,
-                        task,
-                        access: table_access(table, &[]),
-                        info: rowid_info,
-                    },
-                    if under_bushy { cop_spine } else { &[] },
-                );
-                if let Some(last) = rows.last_mut() {
-                    last.id.push_str("(Probe)");
+                }
+                if let Some(probe_sel) = probe_selection_info.as_ref() {
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: scan_est,
+                            task,
+                            access: String::new(),
+                            info: probe_sel.clone(),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                    let mut child_spine = cop_spine.to_vec();
+                    if under_bushy {
+                        child_spine.push(false);
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TableRowIDScan",
+                            est: scan_est,
+                            task,
+                            access: table_access(table, &[]),
+                            info: rowid_info,
+                        },
+                        if under_bushy { &child_spine } else { &[] },
+                    );
+                } else {
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TableRowIDScan",
+                            est: scan_est,
+                            task,
+                            access: table_access(table, &[]),
+                            info: rowid_info,
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
                 }
                 return true;
             }
@@ -1352,6 +1419,17 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
     parts.join(", ")
 }
 
+fn pushed_is_bytes_info(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_types::Datum;
+    matches!(
+        filter,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(_),
+        })
+    )
+}
+
 /// `RANGE:…` Bytes marker on TableReader/IndexReader pushed filter.
 fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
@@ -1458,8 +1536,15 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
 
 /// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
 fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
-    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    if let ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(b),
+    }) = filter
+    {
+        return String::from_utf8_lossy(b).into_owned();
+    }
     if is_not_isnull(filter) {
         return explain_selection_info(filter);
     }
@@ -1725,6 +1810,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Limit { child, .. }
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
+        | PhysicalPlan::UnionScan { child, .. }
         | PhysicalPlan::Window { child, .. }
         | PhysicalPlan::Shuffle { child, .. }
         | PhysicalPlan::ShuffleReceiver { child }
@@ -1942,6 +2028,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::IndexJoin { info, .. } => {
             ("IndexJoin".to_string(), String::new(), info.clone())
         }
+        PhysicalPlan::UnionScan { info, .. } => {
+            ("UnionScan".to_string(), String::new(), info.clone())
+        }
         PhysicalPlan::Union { op, .. } => {
             // TiDB brief: UnionAll shows empty info; DISTINCT union shows UNION.
             let info = if matches!(op, sealdb_parser::ast::SetOprType::UnionAll) {
@@ -2059,7 +2148,11 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(filter),
             row_count,
             ..
-        } if range_pushed(Some(filter)).is_some() => *row_count,
+        } if range_pushed(Some(filter)).is_some()
+            || pushed_is_bytes_info(filter) =>
+        {
+            *row_count
+        }
         PhysicalPlan::TableReader {
             pushed: Some(_),
             row_count,
@@ -2183,6 +2276,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             *e
         }
         PhysicalPlan::IndexJoin { est_rows: e, .. } => *e,
+        PhysicalPlan::UnionScan { est_rows: e, .. } => *e,
         PhysicalPlan::Apply {
             child,
             probe: Some(probe),

@@ -468,6 +468,13 @@ impl ExecutorBuilder {
                 current_db,
                 txn,
             ),
+            PhysicalPlan::UnionScan { child, .. } => Self::build(
+                child,
+                stmt,
+                domain,
+                current_db,
+                txn,
+            ),
             PhysicalPlan::CTE {
                 name,
                 columns,
