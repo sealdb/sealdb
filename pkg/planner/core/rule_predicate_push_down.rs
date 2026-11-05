@@ -76,6 +76,7 @@ fn push_into(
             partitions,
             row_count,
             selection_info,
+            probe_selection_info,
             pushed,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
@@ -88,6 +89,7 @@ fn push_into(
                     partitions,
                     row_count,
                     selection_info,
+                    probe_selection_info,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
                 },
                 residual,

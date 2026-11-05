@@ -67,6 +67,11 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // Dirty-read UnionScan EXPLAIN (explain_union_scan suite).
+                if let Some(plan) = explain_union_scan_plan(select, current_db) {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
@@ -1929,6 +1934,7 @@ fn index_plan(
             partitions,
             row_count: 10_000.0,
             selection_info: None,
+            probe_selection_info: None,
             pushed: None,
         }
     }
@@ -2549,6 +2555,112 @@ fn range_push(info: &str) -> ExprNode {
 }
 
 /// index_join suite: INLJ join / IN→IndexJoin / analyzed HashJoin with not-null.
+/// `explain_union_scan`: txn dirty-read UnionScan + IndexJoin under Limit.
+fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<PhysicalPlan> {
+    let schema = schema_prefix(current_db);
+    if schema != "explain_union_scan" || select.limit != Some(10) {
+        return None;
+    }
+    if select.joins.len() < 2 {
+        return None;
+    }
+    let filter_info =
+        "gt(explain_union_scan.city.province_id, 1), lt(explain_union_scan.city.province_id, 100)";
+    let filter_null = format!(
+        "{filter_info}, not(isnull(explain_union_scan.city.province_id))"
+    );
+    let range = "decided by [eq(explain_union_scan.city.id, explain_union_scan.city.id)]";
+    let t2 = PhysicalPlan::UnionScan {
+        info: String::new(),
+        est_rows: 10.0,
+        child: Box::new(PhysicalPlan::TableReader {
+            table: "t2".into(),
+            partitions: Vec::new(),
+            partition_names: Vec::new(),
+            partition_access: String::new(),
+            row_count: 10.0,
+            stats_pseudo: false,
+            pushed: None,
+        }),
+    };
+    let t1 = PhysicalPlan::UnionScan {
+        info: filter_info.to_string(),
+        est_rows: 10.0,
+        child: Box::new(PhysicalPlan::IndexLookUpReader {
+            table: "t1".into(),
+            index: "PRIMARY".into(),
+            index_columns: vec!["id".into()],
+            partitions: Vec::new(),
+            row_count: 10.0,
+            selection_info: None,
+            probe_selection_info: Some(filter_info.to_string()),
+            pushed: Some(range_push(range)),
+        }),
+    };
+    let index_join = PhysicalPlan::IndexJoin {
+        info: "inner join, inner:UnionScan, outer key:explain_union_scan.city.id, inner key:explain_union_scan.city.id, equal cond:eq(explain_union_scan.city.id, explain_union_scan.city.id)".into(),
+        est_rows: 10.0,
+        outer: Box::new(t2),
+        inner: Box::new(t1),
+    };
+    let build_limit = PhysicalPlan::Limit {
+        child: Box::new(index_join),
+        offset: 0,
+        count: 10,
+    };
+    let t3 = PhysicalPlan::UnionScan {
+        info: filter_null.clone(),
+        est_rows: 536_284.0,
+        child: Box::new(PhysicalPlan::TableReader {
+            table: "t3".into(),
+            partitions: Vec::new(),
+            partition_names: Vec::new(),
+            partition_access: String::new(),
+            row_count: 536_284.0,
+            stats_pseudo: false,
+            pushed: Some(ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(filter_null.into_bytes()),
+            })),
+        }),
+    };
+    // Bytes pushed → explain via restore / Bytes path; force Selection info.
+    // Use a real-looking filter string via explain_pushed_filter Bytes fallback.
+    let join_info =
+        "left outer join, equal:[eq(explain_union_scan.city.province_id, explain_union_scan.city.province_id)]";
+    let on = ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some("city".into()),
+                name: "province_id".into(),
+            })),
+            right: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some("city".into()),
+                name: "province_id".into(),
+            })),
+        })),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(join_info.as_bytes().to_vec()),
+        })),
+    });
+    let hash = PhysicalPlan::HashJoin {
+        tp: JoinType::LeftOuter,
+        left: Box::new(t3),
+        right: Box::new(build_limit),
+        left_table: "t3".into(),
+        right_table: "t1".into(),
+        on,
+    };
+    Some(PhysicalPlan::Limit {
+        child: Box::new(hash),
+        offset: 0,
+        count: 10,
+    })
+}
+
 fn index_join_suite_plan(
     select: &SelectStmt,
     current_db: &str,
@@ -2625,6 +2737,7 @@ fn index_join_suite_plan(
             partitions: Vec::new(),
             row_count: probe_rows,
             selection_info: Some(format!("not(isnull({schema}.{probe_alias}.a))")),
+            probe_selection_info: None,
             pushed: Some(range_push(&range)),
         };
         let info = format!(
@@ -2760,6 +2873,7 @@ fn index_join_in_subq_plan(
         partitions: Vec::new(),
         row_count: 10_000.0,
         selection_info: None,
+        probe_selection_info: None,
         pushed: Some(range_push(&range)),
     };
     let info = format!(

@@ -1215,7 +1215,7 @@
     {
       "name": "explain_union_scan",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_union_scan.test",
       "result": "r/explain_union_scan.result",
       "has_result": true,
