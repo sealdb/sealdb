@@ -152,6 +152,16 @@ impl Session {
             .expect("session sql_mode lock")
             .clone();
         reject_create_table_func_call(sql, &mode)?;
+        // sqlparser always applies MySQL backslash escapes. Under
+        // NO_BACKSLASH_ESCAPES, double `\` inside quotes so the unescaped
+        // value matches TiDB (literal backslash).
+        let rewritten;
+        let sql = if sql_mode_has(&mode, "NO_BACKSLASH_ESCAPES") {
+            rewritten = double_backslashes_in_sql_strings(sql);
+            rewritten.as_str()
+        } else {
+            sql
+        };
         let stmts = self.parser.parse_sql(sql)?;
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
@@ -1293,6 +1303,62 @@ fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Double each `\` inside `'...'` / `"..."` so sqlparser's unescape yields
+/// literal backslashes (TiDB `NO_BACKSLASH_ESCAPES`).
+fn double_backslashes_in_sql_strings(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' || c == b'"' {
+            let quote = c;
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == quote {
+                    out.push(quote as char);
+                    if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                        out.push(quote as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                if b == b'\\' {
+                    out.push('\\');
+                    out.push('\\');
+                    i += 1;
+                    continue;
+                }
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if c == b'`' {
+            out.push('`');
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == '`' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
@@ -2525,6 +2591,19 @@ mod tests {
         ERR_DATA_OUT_OF_RANGE, ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
     };
     use sealdb_types::Datum;
+
+    #[test]
+    fn test_no_backslash_escapes() {
+        let session = Session::new();
+        let def = session.execute_stmt("SELECT '\\\\'").unwrap();
+        assert_eq!(def.rows, vec![vec![Datum::Bytes(b"\\".to_vec())]]);
+        session
+            .execute_stmt("SET sql_mode='NO_BACKSLASH_ESCAPES'")
+            .unwrap();
+        // Source `\\` must stay two backslashes under NO_BACKSLASH_ESCAPES.
+        let nb = session.execute_stmt("SELECT '\\\\'").unwrap();
+        assert_eq!(nb.rows, vec![vec![Datum::Bytes(b"\\\\".to_vec())]]);
+    }
 
     #[test]
     fn test_bigint_sub_overflow_1690() {
