@@ -9,6 +9,7 @@ pub mod plan_cache_param;
 pub mod plan_cost;
 pub mod plan_cost_ver2;
 pub mod planbuilder;
+pub mod rule_inject_extra_projection;
 pub mod rule_join_reorder;
 pub mod rule_join_reorder_dp;
 pub mod rule_partition_processor;

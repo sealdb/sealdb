@@ -8,6 +8,9 @@ use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension,
 use super::rule_partition_processor::{
     PartitionPruneMode, plan_partitions, resolve_partitions,
 };
+use super::rule_inject_extra_projection::{
+    inject_proj_below_sort, order_by_all_constant, order_by_has_scalar_func,
+};
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
@@ -115,19 +118,31 @@ impl PlanBuilder {
                     .unwrap_or(1.0);
                 // StreamAgg on an ordered index already yields group-by order;
                 // skip Sort when ORDER BY is a prefix of GROUP BY.
+                // Constant ORDER BY (`abs(2)`) is dropped (TiDB NominalSort/const prune).
                 let need_sort = !select.order_by.is_empty()
+                    && !order_by_all_constant(select)
                     && !(stream_keep_order && order_prefix_of_group_by(select));
-                plan = apply_order_limit(
-                    plan,
-                    need_sort,
-                    select.limit,
-                    select.offset,
-                    est_rows,
-                    topn_by_info(select, current_db),
-                );
-                // Project after Selection/Sort so WHERE and ORDER BY still
-                // see the full child schema (TiDB extra-projection shape).
-                plan = wrap_output_projection(plan, select);
+                if need_sort && order_by_has_scalar_func(select) {
+                    // TiDB InjectProjBelowSort: Projection → Sort → Projection.
+                    plan = inject_proj_below_sort(plan, select, is, current_db);
+                    if let Some(lim) = select.limit {
+                        plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), lim);
+                    } else if select.offset.is_some() {
+                        plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), 0);
+                    }
+                } else {
+                    plan = apply_order_limit(
+                        plan,
+                        need_sort,
+                        select.limit,
+                        select.offset,
+                        est_rows,
+                        topn_by_info(select, current_db),
+                    );
+                    // Project after Selection/Sort so WHERE and ORDER BY still
+                    // see the full child schema (TiDB extra-projection shape).
+                    plan = wrap_output_projection(plan, select);
+                }
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
                 // (see explain.rs); executable plan keeps the agg output schema.
                 plan = rewrite_semi_join_agg(rewrite_semi_join(plan));
@@ -458,7 +473,7 @@ impl PlanBuilder {
         let columns = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
         let inline = cte.is_some_and(|cte| {
             cte.materialize == CteMaterialize::NotMaterialized && cte.recursive.is_none()
-        });
+        }) || seed_is_dual_projection(&seed);
         Ok(Some(PhysicalPlan::CTE {
             name: from.name.clone(),
             columns,
@@ -794,12 +809,14 @@ fn apply_order_limit(
         }
         plan = PhysicalPlan::Sort {
             child: Box::new(plan),
+            by_info,
         };
         return PhysicalPlan::limit(plan, off, lim);
     }
     if ordered {
         plan = PhysicalPlan::Sort {
             child: Box::new(plan),
+            by_info,
         };
     }
     if let Some(lim) = limit {
@@ -832,15 +849,50 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     {
         return plan;
     }
+    let col_base = projection_column_base(&plan);
     let exprs = select
         .fields
         .iter()
         .enumerate()
-        .map(|(i, _)| format!("col{i}"))
+        .map(|(i, f)| {
+            let text = f
+                .orig_text
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| f.expr.restore_string());
+            // Constants / funcs use TiDB `text->Column#N`; bare columns stay
+            // `colN` so EXPLAIN elides the remapping Projection (TopN/Limit).
+            if matches!(&f.expr, ExprNode::Value(_) | ExprNode::Func(_)) {
+                format!("{text}->Column#{}", col_base + i)
+            } else {
+                format!("col{i}")
+            }
+        })
         .collect();
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(plan),
+    }
+}
+
+fn seed_is_dual_projection(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableDual { .. } => true,
+        PhysicalPlan::Projection { child, .. } => seed_is_dual_projection(child),
+        _ => false,
+    }
+}
+
+fn projection_column_base(plan: &PhysicalPlan) -> usize {
+    match plan {
+        PhysicalPlan::CTE {
+            seed,
+            inline: true,
+            ..
+        } => projection_column_base(seed),
+        PhysicalPlan::Projection { exprs, .. } => exprs.len() + 1,
+        PhysicalPlan::TableDual { .. } => 1,
+        _ => 1,
     }
 }
 
