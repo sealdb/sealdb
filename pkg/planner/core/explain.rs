@@ -391,8 +391,9 @@ fn walk_with_parent(
         return;
     }
     let children = children_of(plan);
-    // `Projection → HashJoin` or Probe under `└─`: children get spaces at this
-    // column. Non-last Build readers re-introduce `│` in `bushy_cop_spine`.
+    // Under `└─` (Projection→HashJoin, or Probe whose spine ends in space):
+    // children get spaces at this column. Nested HashJoin builds keep a leftover
+    // `true` for Probe `│`; TableReader Selection uses `bushy_cop_spine`.
     let under_last_join = matches!(
         plan,
         PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
@@ -404,6 +405,14 @@ fn walk_with_parent(
         let mut child_spine = spine.to_vec();
         if under_last_join {
             child_spine.push(false);
+            if !child_last
+                && matches!(
+                    child,
+                    PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+                )
+            {
+                child_spine.push(true);
+            }
         } else if matches!(
             plan,
             PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
@@ -1481,6 +1490,19 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             {
                 // TiDB semi-join selectivity ≈ 0.8 of the outer (Probe) side.
                 l * 0.8
+            } else if matches!(tp, super::physical_plans::JoinType::Inner)
+                && !is_pseudo_card(l)
+                && !is_pseudo_card(r)
+            {
+                // Analyzed inner: when sides differ by ≥2× use max (t1⋈t3→4);
+                // otherwise min (t2⋈t3→2) matching TiDB NDV-style cards.
+                let lo = l.min(r);
+                let hi = l.max(r);
+                if hi >= lo * 2.0 {
+                    hi
+                } else {
+                    lo
+                }
             } else {
                 l.max(r)
             }
@@ -1532,8 +1554,8 @@ fn tree_prefix_with_spine(spine: &[bool], depth: usize, last: bool) -> String {
     prefix
 }
 
-/// Cop subtree under a bushy TableReader. When the reader is not last among
-/// HashJoin siblings, put `│` at the reader column so Selection/Scan match TiDB.
+/// Cop subtree under a bushy TableReader. Pad to the Selection depth; when the
+/// reader is not last among HashJoin siblings, put `│` at the reader column.
 fn bushy_cop_spine(
     spine: &[bool],
     scan_depth: usize,
@@ -1544,14 +1566,11 @@ fn bushy_cop_spine(
         return spine.to_vec();
     }
     let mut cop = spine.to_vec();
-    if parent_last {
-        return cop;
-    }
     let need = scan_depth.saturating_sub(1);
     while cop.len() < need {
         cop.push(false);
     }
-    if need > 0 {
+    if !parent_last && need > 0 {
         cop[need - 1] = true;
     }
     cop
