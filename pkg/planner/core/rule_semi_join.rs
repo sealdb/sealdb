@@ -25,8 +25,16 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::Sort { child } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join(*child)),
         },
-        PhysicalPlan::TopN { child } => PhysicalPlan::TopN {
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
             child: Box::new(rewrite_semi_join(*child)),
+            by_info,
+            offset,
+            count,
         },
         PhysicalPlan::Limit { child } => PhysicalPlan::Limit {
             child: Box::new(rewrite_semi_join(*child)),
@@ -378,8 +386,16 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::Sort { child } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
-        PhysicalPlan::TopN { child } => PhysicalPlan::TopN {
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
             child: Box::new(rewrite_semi_join_agg(*child)),
+            by_info,
+            offset,
+            count,
         },
         PhysicalPlan::Limit { child } => PhysicalPlan::Limit {
             child: Box::new(rewrite_semi_join_agg(*child)),

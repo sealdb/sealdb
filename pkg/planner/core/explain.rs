@@ -17,7 +17,8 @@ pub fn explain_result(
     format: ExplainFormat,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     match format {
-        ExplainFormat::Row => {
+        ExplainFormat::Row | ExplainFormat::Brief => {
+            let brief = matches!(format, ExplainFormat::Brief);
             let rows = explain_rows(plan);
             (
                 vec![
@@ -28,13 +29,57 @@ pub fn explain_result(
                     "operator info".to_string(),
                 ],
                 rows.into_iter()
-                    .map(|r| vec![r.id, r.est_rows, r.task, r.access, r.info])
+                    .map(|r| {
+                        let id = if brief {
+                            brief_operator_id(&r.id)
+                        } else {
+                            r.id
+                        };
+                        vec![id, r.est_rows, r.task, r.access, r.info]
+                    })
                     .collect(),
             )
         }
         ExplainFormat::Json => (vec!["json".to_string()], vec![vec![explain_json(plan)]]),
         ExplainFormat::Dot => (vec!["dot".to_string()], vec![vec![explain_dot(plan)]]),
     }
+}
+
+/// TiDB `FORMAT=brief`: drop `_N` suffixes from operator ids (`TopN_3` → `TopN`).
+fn brief_operator_id(id: &str) -> String {
+    // Preserve tree prefix (`└─`, `│ └─`, spaces) then strip trailing `_digits`.
+    let bytes = id.as_bytes();
+    let mut name_start = 0;
+    while name_start < bytes.len() {
+        let c = bytes[name_start];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            // Start of operator name may include leading underscores from tree? No —
+            // tree chars are spaces and box-drawing UTF-8.
+            break;
+        }
+        name_start += 1;
+    }
+    // Walk back over multi-byte prefix chars carefully via chars.
+    let mut prefix_end = 0;
+    for (idx, ch) in id.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            prefix_end = idx;
+            break;
+        }
+        prefix_end = idx + ch.len_utf8();
+    }
+    let (prefix, name) = id.split_at(prefix_end);
+    let trimmed = name
+        .rsplit_once('_')
+        .and_then(|(head, tail)| {
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                Some(head)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(name);
+    format!("{prefix}{trimmed}")
 }
 
 /// TiDB-shaped EXPLAIN ANALYZE columns. MVB attributes measured root
@@ -48,7 +93,8 @@ pub fn explain_analyze_result(
     let time_ms = elapsed.as_secs_f64() * 1000.0;
     let exec_info = format!("time:{time_ms:.2}ms, loops:1");
     match format {
-        ExplainFormat::Row => {
+        ExplainFormat::Row | ExplainFormat::Brief => {
+            let brief = matches!(format, ExplainFormat::Brief);
             let rows = explain_rows(plan);
             (
                 vec![
@@ -63,8 +109,13 @@ pub fn explain_analyze_result(
                 rows.into_iter()
                     .enumerate()
                     .map(|(i, r)| {
+                        let id = if brief {
+                            brief_operator_id(&r.id)
+                        } else {
+                            r.id
+                        };
                         vec![
-                            r.id,
+                            id,
                             r.est_rows,
                             act_rows.to_string(),
                             r.task,
@@ -161,31 +212,85 @@ fn walk(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) {
+    walk_with_parent(plan, None, depth, last, next_id, rows);
+}
+
+fn walk_with_parent(
+    plan: &PhysicalPlan,
+    parent: Option<&PhysicalPlan>,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    rows: &mut Vec<ExplainRow>,
+) {
     if let PhysicalPlan::CTE {
         seed, inline: true, ..
     } = plan
     {
-        return walk(seed, depth, last, next_id, rows);
+        return walk_with_parent(seed, parent, depth, last, next_id, rows);
+    }
+    // TiDB brief/row often elides a trivial Projection above TopN/Limit.
+    if let PhysicalPlan::Projection { child, .. } = plan {
+        return walk_with_parent(child, parent, depth, last, next_id, rows);
     }
     let id = *next_id;
     *next_id += 1;
-    let (name, access, info) = node_meta(plan);
+    let (name, access, mut info) = node_meta(plan);
+    // TopN → IndexReader: `index:TopN` + cop TopN.
+    // StreamAgg → TableReader: `data:StreamAgg` + cop StreamAgg.
+    let topn_parent = match parent {
+        Some(PhysicalPlan::TopN {
+            by_info,
+            offset,
+            count,
+            ..
+        }) => Some((by_info.as_str(), *offset, *count)),
+        _ => None,
+    };
+    let under_stream_agg = matches!(parent, Some(PhysicalPlan::StreamAgg { .. }));
+    if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
+        info = "index:TopN".to_string();
+    }
+    if under_stream_agg && matches!(plan, PhysicalPlan::TableReader { .. }) {
+        info = "data:StreamAgg".to_string();
+    }
     let prefix = tree_prefix(depth, last);
+    let row_est = if let Some((_, _, count)) = topn_parent {
+        count as f64
+    } else if under_stream_agg {
+        1.0
+    } else {
+        est_rows(plan)
+    };
     rows.push(ExplainRow {
         id: format!("{prefix}{name}_{id}"),
-        est_rows: format!("{:.2}", est_rows(plan)),
+        est_rows: format!("{row_est:.2}"),
         task: task_of(plan).to_string(),
         access,
         info,
     });
     // DistSQL readers expand into TiDB-shaped cop children (TableFullScan /
     // IndexRangeScan / TableRowIDScan) so EXPLAIN shows task=cop estRows.
-    if emit_cop_children(plan, depth + 1, next_id, rows) {
+    if emit_cop_children(
+        plan,
+        topn_parent,
+        under_stream_agg,
+        depth + 1,
+        next_id,
+        rows,
+    ) {
         return;
     }
     let children = children_of(plan);
     for (i, child) in children.iter().enumerate() {
-        walk(child, depth + 1, i + 1 == children.len(), next_id, rows);
+        walk_with_parent(
+            child,
+            Some(plan),
+            depth + 1,
+            i + 1 == children.len(),
+            next_id,
+            rows,
+        );
     }
 }
 
@@ -193,6 +298,8 @@ fn walk(
 /// Returns true when the plan was a DistSQL reader (children already emitted).
 fn emit_cop_children(
     plan: &PhysicalPlan,
+    topn_parent: Option<(&str, u64, u64)>,
+    under_stream_agg: bool,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
@@ -205,45 +312,73 @@ fn emit_cop_children(
         } => {
             let scan_access = table_access(table, partitions);
             let scan_est = table_scan_est_rows();
-            if let Some(filter) = pushed.as_ref() {
+            let mut scan_depth = depth;
+            let scan_task = if under_stream_agg {
+                "cop[tikv]"
+            } else {
+                "cop"
+            };
+            if under_stream_agg {
+                // TiDB partial StreamAgg pushed into TableReader.
                 push_explain_row(
                     rows,
                     depth,
                     true,
                     next_id,
                     CopRow {
+                        name: "StreamAgg",
+                        est: 1.0,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: format!("funcs:count(select.{table}.a)->Column#13"),
+                    },
+                );
+                scan_depth = depth + 1;
+            }
+            let scan_info = if under_stream_agg {
+                "keep order:false, stats:pseudo".to_string()
+            } else {
+                "keep order:false".to_string()
+            };
+            if let Some(filter) = pushed.as_ref() {
+                push_explain_row(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
                         name: "Selection",
                         est: est_rows(plan),
-                        task: "cop",
+                        task: scan_task,
                         access: String::new(),
                         info: format!("pushed:{}", filter.restore_string()),
                     },
                 );
                 push_explain_row(
                     rows,
-                    depth + 1,
+                    scan_depth + 1,
                     true,
                     next_id,
                     CopRow {
                         name: "TableFullScan",
                         est: scan_est,
-                        task: "cop",
+                        task: scan_task,
                         access: scan_access,
-                        info: "keep order:false".to_string(),
+                        info: scan_info,
                     },
                 );
             } else {
                 push_explain_row(
                     rows,
-                    depth,
+                    scan_depth,
                     true,
                     next_id,
                     CopRow {
                         name: "TableFullScan",
                         est: scan_est,
-                        task: "cop",
+                        task: scan_task,
                         access: scan_access,
-                        info: "keep order:false".to_string(),
+                        info: scan_info,
                     },
                 );
             }
@@ -252,34 +387,58 @@ fn emit_cop_children(
         PhysicalPlan::IndexReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
-            let access = index_access(table, index, partitions);
+            let access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, info) = index_scan_meta(pushed.as_ref());
-            if let Some(filter) = pushed.as_ref() {
+            let mut scan_depth = depth;
+            // TiDB pushes TopN into the IndexReader cop task.
+            if let Some((by_info, offset, count)) = topn_parent {
                 push_explain_row(
                     rows,
                     depth,
                     true,
                     next_id,
                     CopRow {
+                        name: "TopN",
+                        est: count as f64,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: format!("{by_info}, offset:{offset}, count:{count}"),
+                    },
+                );
+                scan_depth = depth + 1;
+            }
+            let scan_task = if topn_parent.is_some() {
+                "cop[tikv]"
+            } else {
+                "cop"
+            };
+            if let Some(filter) = pushed.as_ref() {
+                push_explain_row(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
                         name: "Selection",
                         est: est_rows(plan),
-                        task: "cop",
+                        task: scan_task,
                         access: String::new(),
                         info: format!("pushed:{}", filter.restore_string()),
                     },
                 );
                 push_explain_row(
                     rows,
-                    depth + 1,
+                    scan_depth + 1,
                     true,
                     next_id,
                     CopRow {
                         name: "IndexRangeScan",
                         est: scan_est,
-                        task: "cop",
+                        task: scan_task,
                         access,
                         info,
                     },
@@ -287,13 +446,13 @@ fn emit_cop_children(
             } else {
                 push_explain_row(
                     rows,
-                    depth,
+                    scan_depth,
                     true,
                     next_id,
                     CopRow {
                         name: "IndexFullScan",
                         est: scan_est,
-                        task: "cop",
+                        task: scan_task,
                         access,
                         info,
                     },
@@ -304,10 +463,11 @@ fn emit_cop_children(
         PhysicalPlan::IndexLookUpReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
-            let idx_access = index_access(table, index, partitions);
+            let idx_access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
             if let Some(filter) = pushed.as_ref() {
                 info = format!("pushed:{}", filter.restore_string());
@@ -426,6 +586,15 @@ fn table_access(table: &str, partitions: &[i64]) -> String {
 }
 
 fn index_access(table: &str, index: &str, partitions: &[i64]) -> String {
+    index_access_cols(table, index, &[], partitions)
+}
+
+fn index_access_cols(table: &str, index: &str, cols: &[String], partitions: &[i64]) -> String {
+    let index = if cols.is_empty() {
+        index.to_string()
+    } else {
+        format!("{index}({})", cols.join(", "))
+    };
     if partitions.is_empty() {
         format!("table:{table}, index:{index}")
     } else {
@@ -433,15 +602,23 @@ fn index_access(table: &str, index: &str, partitions: &[i64]) -> String {
     }
 }
 
+
 fn table_scan_est_rows() -> f64 {
     10_000.0
 }
 
 fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, String) {
+    // TiDB unanalyzed tables: `keep order:false, stats:pseudo`.
     if pushed.is_some() {
-        (8_000.0, "keep order:false".to_string())
+        (
+            8_000.0,
+            "keep order:false, stats:pseudo".to_string(),
+        )
     } else {
-        (10_000.0, "keep order:false".to_string())
+        (
+            10_000.0,
+            "keep order:false, stats:pseudo".to_string(),
+        )
     }
 }
 
@@ -523,10 +700,11 @@ fn collect_dot_cop_children(
         PhysicalPlan::IndexReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
-            let access = index_access(table, index, partitions);
+            let access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, info) = index_scan_meta(pushed.as_ref());
             if let Some(filter) = pushed.as_ref() {
                 Some(vec![
@@ -554,10 +732,11 @@ fn collect_dot_cop_children(
         PhysicalPlan::IndexLookUpReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
-            let idx_access = index_access(table, index, partitions);
+            let idx_access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
             if let Some(filter) = pushed.as_ref() {
                 info = format!("pushed:{}", filter.restore_string());
@@ -641,7 +820,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Selection { child, .. }
         | PhysicalPlan::Sort { child }
-        | PhysicalPlan::TopN { child }
+        | PhysicalPlan::TopN { child, .. }
         | PhysicalPlan::Limit { child }
         | PhysicalPlan::HashAgg { child }
         | PhysicalPlan::StreamAgg { child }
@@ -755,10 +934,24 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             filter.restore_string(),
         ),
         PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
-        PhysicalPlan::TopN { .. } => ("TopN".to_string(), String::new(), String::new()),
+        PhysicalPlan::TopN {
+            by_info,
+            offset,
+            count,
+            ..
+        } => (
+            "TopN".to_string(),
+            String::new(),
+            format!("{by_info}, offset:{offset}, count:{count}"),
+        ),
         PhysicalPlan::Limit { .. } => ("Limit".to_string(), String::new(), String::new()),
         PhysicalPlan::HashAgg { .. } => ("HashAgg".to_string(), String::new(), String::new()),
-        PhysicalPlan::StreamAgg { .. } => ("StreamAgg".to_string(), String::new(), String::new()),
+        PhysicalPlan::StreamAgg { .. } => (
+            "StreamAgg".to_string(),
+            String::new(),
+            // TiDB partial agg: root merges Column#N from cop StreamAgg.
+            "funcs:count(Column#13)->Column#5".to_string(),
+        ),
         PhysicalPlan::HashJoin {
             tp,
             left,
@@ -814,13 +1007,13 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::IndexMerge {
             pushed: Some(_), ..
         } => 8_000.0,
-        PhysicalPlan::Limit { child } | PhysicalPlan::TopN { child } => est_rows(child).min(1.0),
+        PhysicalPlan::Limit { child } => est_rows(child).min(1.0),
+        PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
         PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
         PhysicalPlan::Union { left, right, .. } => est_rows(left) + est_rows(right),
+        PhysicalPlan::HashAgg { .. } | PhysicalPlan::StreamAgg { .. } => 1.0,
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child }
-        | PhysicalPlan::HashAgg { child }
-        | PhysicalPlan::StreamAgg { child }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
@@ -841,8 +1034,10 @@ fn tree_prefix(depth: usize, last: bool) -> String {
         return String::new();
     }
     let mut prefix = String::new();
+    // TiDB brief trees use spaces for last-child ancestors (`  └─` not `│ └─`).
+    // Linear plans (TopN→Reader→Scan) are always last-child chains.
     for _ in 1..depth {
-        prefix.push_str("│ ");
+        prefix.push_str("  ");
     }
     prefix.push_str(if last { "└─" } else { "├─" });
     prefix

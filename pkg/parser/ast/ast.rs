@@ -307,6 +307,8 @@ impl Statement {
 pub enum ExplainFormat {
     #[default]
     Row,
+    /// TiDB `FORMAT = 'brief'`: same tree as Row but operator ids omit `_N` suffixes.
+    Brief,
     Dot,
     Json,
 }
@@ -326,6 +328,7 @@ impl ExplainStmt {
         }
         match self.format {
             ExplainFormat::Row => {}
+            ExplainFormat::Brief => ctx.write_str("FORMAT = 'brief' "),
             ExplainFormat::Dot => ctx.write_str("FORMAT = 'dot' "),
             ExplainFormat::Json => ctx.write_str("FORMAT = 'json' "),
         }

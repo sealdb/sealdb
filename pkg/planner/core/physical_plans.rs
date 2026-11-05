@@ -64,6 +64,7 @@ pub enum PhysicalPlan {
     IndexLookUpReader {
         table: String,
         index: String,
+        index_columns: Vec<String>,
         partitions: Vec<i64>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
@@ -71,6 +72,8 @@ pub enum PhysicalPlan {
     IndexReader {
         table: String,
         index: String,
+        /// Index column names for EXPLAIN `index:idx(b, c)`.
+        index_columns: Vec<String>,
         partitions: Vec<i64>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
@@ -94,6 +97,10 @@ pub enum PhysicalPlan {
     },
     TopN {
         child: Box<PhysicalPlan>,
+        /// TiDB ExplainInfo: `select.t.a, offset:0, count:5`.
+        by_info: String,
+        offset: u64,
+        count: u64,
     },
     Limit {
         child: Box<PhysicalPlan>,
@@ -222,6 +229,7 @@ impl PhysicalPlan {
                 index,
                 partitions,
                 pushed,
+                ..
             } => index_plan_name(
                 "IndexLookUpReader",
                 table,
@@ -234,6 +242,7 @@ impl PhysicalPlan {
                 index,
                 partitions,
                 pushed,
+                ..
             } => index_plan_name("IndexReader", table, index, partitions, pushed.as_ref()),
             PhysicalPlan::IndexMerge {
                 table,
@@ -261,7 +270,12 @@ impl PhysicalPlan {
             }
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
             PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
-            PhysicalPlan::TopN { child } => format!("TopN -> {}", child.explain()),
+            PhysicalPlan::TopN {
+                child,
+                by_info,
+                offset,
+                count,
+            } => format!("TopN({by_info},offset:{offset},count:{count}) -> {}", child.explain()),
             PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
             PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
             PhysicalPlan::StreamAgg { child } => format!("StreamAgg -> {}", child.explain()),

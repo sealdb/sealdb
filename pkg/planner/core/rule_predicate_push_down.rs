@@ -57,6 +57,7 @@ fn push_into(
         PhysicalPlan::IndexLookUpReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
@@ -66,6 +67,7 @@ fn push_into(
                 PhysicalPlan::IndexLookUpReader {
                     table,
                     index,
+                    index_columns,
                     partitions,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
                 },
@@ -75,6 +77,7 @@ fn push_into(
         PhysicalPlan::IndexReader {
             table,
             index,
+            index_columns,
             partitions,
             pushed,
         } => {
@@ -84,6 +87,7 @@ fn push_into(
                 PhysicalPlan::IndexReader {
                     table,
                     index,
+                    index_columns,
                     partitions,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
                 },

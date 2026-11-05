@@ -51,19 +51,18 @@ impl ExecutorBuilder {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
-                let exprs = select.fields.iter().map(|f| f.expr.clone()).collect();
-                let names = select.fields.iter().map(field_output_name).collect();
-                let mut exec = ProjectionExec::new(
-                    exprs,
-                    names,
-                    Self::build(
-                        child,
-                        stmt,
-                        Arc::clone(&domain),
-                        current_db,
-                        Arc::clone(&txn),
-                    )?,
-                );
+                // Child schema is empty until open(); resolve FROM columns via infoschema
+                // for star expansion (`SELECT *, 1 FROM t` → c1, c2, 1).
+                let from_cols = select_from_column_names(select, &domain, current_db);
+                let child_exec = Self::build(
+                    child,
+                    stmt,
+                    Arc::clone(&domain),
+                    current_db,
+                    Arc::clone(&txn),
+                )?;
+                let (exprs, names) = expand_projection_fields(select, &from_cols);
+                let mut exec = ProjectionExec::new(exprs, names, child_exec);
                 if select.fields.iter().any(|field| field.expr.has_subquery()) {
                     exec = exec.with_subquery(SubqueryEvalCtx::new(
                         domain,
@@ -82,7 +81,7 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::TopN { child } => {
+            PhysicalPlan::TopN { child, .. } => {
                 let by = stmt_order_by(stmt)
                     .ok_or_else(|| Error::unsupported("topn without ORDER BY"))?;
                 let (limit, offset) =
@@ -689,26 +688,34 @@ fn index_access(
     if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
         return Some(IndexAccess::Equal(value));
     }
-    let range = selection?
-        .column_ranges()
-        .into_iter()
-        .find(|range| range.column.eq_ignore_ascii_case(&column))?;
-    if range.low.is_none() && range.high.is_none() {
-        return None;
+    if let Some(range) = selection.and_then(|expr| {
+        expr.column_ranges()
+            .into_iter()
+            .find(|range| range.column.eq_ignore_ascii_case(&column))
+    }) {
+        if range.low.is_some() || range.high.is_some() {
+            return Some(IndexAccess::Range {
+                low: range.low.as_ref().map(|(value, _)| value.clone()),
+                low_inclusive: range
+                    .low
+                    .as_ref()
+                    .map(|(_, inclusive)| *inclusive)
+                    .unwrap_or(true),
+                high: range.high.as_ref().map(|(value, _)| value.clone()),
+                high_inclusive: range
+                    .high
+                    .as_ref()
+                    .map(|(_, inclusive)| *inclusive)
+                    .unwrap_or(true),
+            });
+        }
     }
+    // USE INDEX / covering IndexReader with no predicate → IndexFullScan.
     Some(IndexAccess::Range {
-        low: range.low.as_ref().map(|(value, _)| value.clone()),
-        low_inclusive: range
-            .low
-            .as_ref()
-            .map(|(_, inclusive)| *inclusive)
-            .unwrap_or(true),
-        high: range.high.as_ref().map(|(value, _)| value.clone()),
-        high_inclusive: range
-            .high
-            .as_ref()
-            .map(|(_, inclusive)| *inclusive)
-            .unwrap_or(true),
+        low: None,
+        low_inclusive: true,
+        high: None,
+        high_inclusive: true,
     })
 }
 
@@ -757,7 +764,126 @@ fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
     {
         return name.clone();
     }
-    tidb_expr_display_name(&field.expr)
+    // TiDB `buildProjectionFieldNameFromExpressions` (logical_plan_builder.go).
+    tidb_projection_field_name(&field.expr, field.orig_text.as_deref())
+}
+
+fn is_star_expr(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Value(v) if matches!(&v.datum, sealdb_types::Datum::Bytes(b) if b == b"*")
+    )
+}
+
+/// Expand select-list stars against the FROM schema (TiDB ResolveFields).
+fn expand_projection_fields(
+    select: &sealdb_parser::ast::SelectStmt,
+    from_cols: &[String],
+) -> (Vec<ExprNode>, Vec<String>) {
+    let mut exprs = Vec::new();
+    let mut names = Vec::new();
+    for field in &select.fields {
+        if is_star_expr(&field.expr) {
+            for col in from_cols {
+                exprs.push(ExprNode::Column(
+                    sealdb_parser::ast::expressions::ColumnNameExpr {
+                        schema: None,
+                        table: None,
+                        name: col.clone(),
+                    },
+                ));
+                names.push(col.clone());
+            }
+        } else {
+            exprs.push(field.expr.clone());
+            names.push(field_output_name(field));
+        }
+    }
+    (exprs, names)
+}
+
+/// Column names visible to `SELECT *` from the FROM/JOIN clause.
+fn select_from_column_names(
+    select: &sealdb_parser::ast::SelectStmt,
+    domain: &Domain,
+    current_db: &str,
+) -> Vec<String> {
+    let is = domain.infoschema();
+    let mut cols = Vec::new();
+    let mut push_table = |table: &TableName| {
+        let (schema, name) = table.qualified(current_db);
+        if let Some(info) = is.table_by_name(&schema, &name) {
+            for c in &info.columns {
+                cols.push(c.name.o().to_string());
+            }
+        }
+    };
+    if let Some(from) = &select.from {
+        push_table(from);
+    }
+    for join in &select.joins {
+        push_table(&join.right);
+    }
+    cols
+}
+
+/// TiDB projection naming: unwrap unary `+` / parens, then literal rules or `field.Text()`.
+fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> String {
+    let inner = unwrap_paren_and_unary_plus(expr);
+    match inner {
+        ExprNode::Value(v) => match &v.datum {
+            sealdb_types::Datum::Bytes(b) => {
+                // String literal: content with leading non-graph trimmed (TiDB #3686/#3994).
+                let s = String::from_utf8_lossy(b);
+                s.trim_start_matches(|c: char| {
+                    !(c.is_ascii_alphanumeric()
+                        || (c as u32 > 0x20 && c as u32 <= 0x7e && !c.is_ascii_whitespace()))
+                })
+                .to_string()
+            }
+            sealdb_types::Datum::Null => "NULL".into(),
+            sealdb_types::Datum::I64(_)
+            | sealdb_types::Datum::U64(_)
+            | sealdb_types::Datum::F64(_)
+            | sealdb_types::Datum::Decimal(_) => {
+                // Trim leading `+(` / whitespace and trailing `)` from original text.
+                let raw = orig_text.unwrap_or("").trim();
+                let trimmed = raw
+                    .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | ' ' | '+' | '('))
+                    .trim_end_matches(|c: char| matches!(c, '\t' | '\n' | ' ' | ')'));
+                if trimmed.is_empty() {
+                    tidb_expr_display_name(inner)
+                } else {
+                    // Preserve TRUE/FALSE spelling from original when boolean literals.
+                    let upper = trimmed.to_ascii_uppercase();
+                    if upper == "TRUE" || upper == "FALSE" || upper == "NULL" {
+                        upper
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+            }
+            other => format!("{other:?}"),
+        },
+        ExprNode::Column(_) => tidb_expr_display_name(inner),
+        _ => {
+            // Non-literal: TiDB uses field.Text() (comments stripped).
+            if let Some(text) = orig_text {
+                text.trim().to_string()
+            } else {
+                tidb_expr_display_name(expr)
+            }
+        }
+    }
+}
+
+fn unwrap_paren_and_unary_plus(expr: &ExprNode) -> &ExprNode {
+    match expr {
+        ExprNode::Unary(u) if matches!(u.op, sealdb_parser::opcode::Op::Plus) => {
+            unwrap_paren_and_unary_plus(&u.expr)
+        }
+        other => other,
+    }
 }
 
 /// TiDB select-list display names: bare idents for top-level columns,

@@ -102,6 +102,7 @@ impl PlanBuilder {
                     select.limit,
                     select.offset,
                     est_rows,
+                    topn_by_info(select, current_db),
                 );
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
@@ -366,6 +367,7 @@ impl PlanBuilder {
                     set.limit,
                     set.offset,
                     Table::PSEUDO_ROW_COUNT as f64,
+                    String::new(),
                 );
                 Ok(plan)
             }
@@ -655,12 +657,18 @@ fn apply_order_limit(
     limit: Option<u64>,
     offset: Option<u64>,
     est_rows: f64,
+    by_info: String,
 ) -> PhysicalPlan {
     if ordered && let Some(lim) = limit {
         // join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
-        if offset.unwrap_or(0) == 0 && prefer_topn(est_rows, lim) {
+        // TiDB still uses TopN when offset=0; prefer_topn may also allow small offsets.
+        let off = offset.unwrap_or(0);
+        if off == 0 && prefer_topn(est_rows, lim) {
             return PhysicalPlan::TopN {
                 child: Box::new(plan),
+                by_info,
+                offset: off,
+                count: lim,
             };
         }
         plan = PhysicalPlan::Sort {
@@ -681,6 +689,20 @@ fn apply_order_limit(
         };
     }
     plan
+}
+
+/// TiDB TopN ExplainInfo by-items: `select.<table>.<col>` (query-block prefix).
+fn topn_by_info(select: &SelectStmt, _current_db: &str) -> String {
+    let table = select.from.as_ref().map(|t| t.name.as_str());
+    select
+        .order_by
+        .iter()
+        .map(|item| match (&table, &item.expr) {
+            (Some(t), ExprNode::Column(col)) => format!("select.{t}.{}", col.name),
+            _ => item.expr.restore_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
@@ -790,10 +812,16 @@ fn index_plan(
     prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
     let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
     if select_covers_index(select, info, index) {
         PhysicalPlan::IndexReader {
             table: from.name.clone(),
             index: index.name.o().to_string(),
+            index_columns,
             partitions,
             pushed: None,
         }
@@ -801,6 +829,7 @@ fn index_plan(
         PhysicalPlan::IndexLookUpReader {
             table: from.name.clone(),
             index: index.name.o().to_string(),
+            index_columns,
             partitions,
             pushed: None,
         }
@@ -940,6 +969,18 @@ fn access_plan(
         let (db, table) = from.qualified(current_db);
         schema.table_by_name(&db, &table)
     }) {
+        // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
+        if !from.use_indexes.is_empty() {
+            for hint in &from.use_indexes {
+                if let Some(index) = info
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(hint))
+                {
+                    return index_plan(select, from, info, index, prune_mode);
+                }
+            }
+        }
         let eqs = eq_column_consts(select.selection.as_ref());
         if let Some(first) = info.columns.first()
             && let Some((_, Datum::I64(handle))) = eqs

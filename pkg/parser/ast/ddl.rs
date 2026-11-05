@@ -6,6 +6,8 @@ use sealdb_errno::Result;
 pub struct TableName {
     pub schema: Option<String>,
     pub name: String,
+    /// `USE INDEX` / `FORCE INDEX` names (TiDB index hints on the table factor).
+    pub use_indexes: Vec<String>,
 }
 
 impl TableName {
@@ -13,6 +15,7 @@ impl TableName {
         Self {
             schema,
             name: name.into(),
+            use_indexes: Vec::new(),
         }
     }
 
