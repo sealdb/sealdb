@@ -631,8 +631,15 @@ impl Session {
             .lock()
             .expect("session collation lock")
             .clone();
+        let sql_mode = self
+            .sql_mode
+            .lock()
+            .expect("session sql_mode lock")
+            .clone();
         let mode = sealdb_expression::CollateMode::from_name(&coll.name);
-        let result = sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec));
+        let result = sealdb_expression::with_sql_mode(sql_mode, || {
+            sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+        });
         if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
             self.txn
                 .lock()
@@ -2402,6 +2409,19 @@ impl Default for Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_bigint_sub_overflow_1690() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE IF NOT EXISTS itest").unwrap();
+        session.execute_stmt("USE itest").unwrap();
+        session.execute_stmt("SET sql_mode='NO_UNSIGNED_SUBTRACTION'").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS tb5").unwrap();
+        session.execute_stmt("CREATE TABLE tb5(a bigint, b bigint)").unwrap();
+        session.execute_stmt("INSERT INTO tb5 VALUES (10, -9223372036854775808)").unwrap();
+        let err = session.execute_stmt("SELECT a - b FROM tb5").unwrap_err();
+        assert_eq!(err.code, 1690, "{err:?}");
+    }
+
     use super::*;
     use sealdb_errno::{ERR_DB_CREATE_EXISTS, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS};
     use sealdb_types::Datum;

@@ -1,5 +1,6 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
+    ERR_BAD_FIELD, ERR_DATA_OUT_OF_RANGE, ERR_DIVISION_BY_ZERO, ERR_UNKNOWN_ERROR,
+    ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
@@ -15,6 +16,7 @@ use std::cell::RefCell;
 
 thread_local! {
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
+    static SQL_MODE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
@@ -24,6 +26,25 @@ pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
         let out = f();
         *cell.borrow_mut() = prev;
         out
+    })
+}
+
+/// Run `f` under the session `sql_mode` (TiDB unsigned arithmetic flags).
+pub fn with_sql_mode<T>(mode: impl Into<String>, f: impl FnOnce() -> T) -> T {
+    SQL_MODE.with(|cell| {
+        let prev = cell.borrow().clone();
+        *cell.borrow_mut() = mode.into();
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
+    })
+}
+
+fn sql_mode_flag(flag: &str) -> bool {
+    SQL_MODE.with(|cell| {
+        cell.borrow()
+            .split(',')
+            .any(|m| m.trim().eq_ignore_ascii_case(flag))
     })
 }
 
@@ -260,7 +281,29 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
     }
     match expr.op {
         Op::Plus => num_bin(&left, &right, |a, b| Ok(a + b), |a, b| Ok(a + b)),
-        Op::Minus => num_bin(&left, &right, |a, b| Ok(a - b), |a, b| Ok(a - b)),
+        Op::Minus => {
+            // TiDB: either operand UNSIGNED → unsigned result unless
+            // sql_mode NO_UNSIGNED_SUBTRACTION (then signed).
+            if !sql_mode_flag("NO_UNSIGNED_SUBTRACTION")
+                && (matches!(left, Datum::U64(_)) || matches!(right, Datum::U64(_)))
+            {
+                unsigned_minus(&left, &right)
+            } else {
+                num_bin(
+                    &left,
+                    &right,
+                    |a, b| {
+                        a.checked_sub(b).ok_or_else(|| {
+                            Error::new(
+                                ERR_DATA_OUT_OF_RANGE,
+                                format!("BIGINT value is out of range in '({a} - {b})'"),
+                            )
+                        })
+                    },
+                    |a, b| Ok(a - b),
+                )
+            }
+        }
         Op::Mul => num_bin(&left, &right, |a, b| Ok(a * b), |a, b| Ok(a * b)),
         Op::Div => num_bin(
             &left,
@@ -333,7 +376,19 @@ fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Da
     }
     match expr.op {
         Op::UnaryMinus | Op::Minus => match inner {
-            Datum::I64(v) => Ok(Datum::I64(-v)),
+            Datum::I64(v) => v.checked_neg().map(Datum::I64).ok_or_else(|| {
+                Error::new(
+                    ERR_DATA_OUT_OF_RANGE,
+                    format!("BIGINT value is out of range in '(-{v})'"),
+                )
+            }),
+            // `-9223372036854775808` parses as UnaryMinus(U64(2^63)).
+            Datum::U64(v) if v == 1u64 << 63 => Ok(Datum::I64(i64::MIN)),
+            Datum::U64(v) if v <= i64::MAX as u64 => Ok(Datum::I64(-(v as i64))),
+            Datum::U64(v) => Err(Error::new(
+                ERR_DATA_OUT_OF_RANGE,
+                format!("BIGINT UNSIGNED value is out of range in '(-{v})'"),
+            )),
             Datum::F64(v) => Ok(Datum::F64(-v)),
             other => Ok(Datum::I64(-other.as_i64()?)),
         },
@@ -567,6 +622,39 @@ fn num_bin(
     }
 }
 
+fn datum_as_u64(d: &Datum) -> Result<u64> {
+    match d {
+        Datum::U64(v) => Ok(*v),
+        Datum::I64(v) if *v >= 0 => Ok(*v as u64),
+        Datum::I64(_) => Err(Error::new(
+            ERR_DATA_OUT_OF_RANGE,
+            "BIGINT UNSIGNED value is out of range",
+        )),
+        other => {
+            let v = other.as_i64()?;
+            if v < 0 {
+                return Err(Error::new(
+                    ERR_DATA_OUT_OF_RANGE,
+                    "BIGINT UNSIGNED value is out of range",
+                ));
+            }
+            Ok(v as u64)
+        }
+    }
+}
+
+fn unsigned_minus(left: &Datum, right: &Datum) -> Result<Datum> {
+    let l = datum_as_u64(left)?;
+    let r = datum_as_u64(right)?;
+    if l < r {
+        return Err(Error::new(
+            ERR_DATA_OUT_OF_RANGE,
+            format!("BIGINT UNSIGNED value is out of range in '({l} - {r})'"),
+        ));
+    }
+    Ok(Datum::U64(l - r))
+}
+
 fn truthy(d: &Datum) -> Option<bool> {
     if d.is_null() {
         return None;
@@ -651,5 +739,35 @@ mod hex_cmp_tests {
         let err = eval_expr_with_row(&expr, &schema, &row).unwrap_err();
         assert_eq!(err.code, ERR_UNKNOWN_ERROR);
         assert!(err.message.contains("Cannot convert string"), "{}", err.message);
+    }
+}
+#[cfg(test)]
+mod unsigned_sub_tests {
+    use super::*;
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, FuncCastExpr, ValueExpr};
+    use sealdb_types::Datum;
+
+    #[test]
+    fn minus_unsigned_overflow() {
+        let expr = ExprNode::Binary(BinaryOpExpr {
+            op: Op::Minus,
+            left: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::I64(12),
+            })),
+            right: Box::new(ExprNode::Cast(FuncCastExpr {
+                expr: Box::new(ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(15),
+                })),
+                target: "UNSIGNED".to_string(),
+            })),
+        });
+        with_sql_mode("", || {
+            let err = eval_expr_with_row(&expr, &[], &[]).unwrap_err();
+            assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
+        });
+        with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
+            let v = eval_expr_with_row(&expr, &[], &[]).unwrap();
+            assert_eq!(v, Datum::I64(-3));
+        });
     }
 }
