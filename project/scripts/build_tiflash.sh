@@ -32,12 +32,16 @@ if [[ -z "${TIFLASH_SRC:-}" || ! -f "${TIFLASH_SRC}/CMakeLists.txt" ]]; then
 fi
 
 PRESET=${PRESET:-release}
-# Prefer Homebrew cmake (≥3.23); system cmake on some Macs is too old.
-export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+# Prefer Homebrew cmake (≥3.23) and LLVM (CLT libc++ is often incomplete).
+export PATH="/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:/usr/local/bin:${PATH}"
+if [[ -x /opt/homebrew/opt/llvm/bin/clang ]]; then
+  export CC=${CC:-/opt/homebrew/opt/llvm/bin/clang}
+  export CXX=${CXX:-/opt/homebrew/opt/llvm/bin/clang++}
+fi
 
 CMAKE=$(command -v cmake)
 CMAKE_VER=$("$CMAKE" --version | head -1 | awk '{print $3}')
-echo "using cmake=$CMAKE ($CMAKE_VER) preset=$PRESET src=$TIFLASH_SRC"
+echo "using cmake=$CMAKE ($CMAKE_VER) cxx=${CXX:-default} preset=$PRESET src=$TIFLASH_SRC"
 
 cd "$TIFLASH_SRC"
 
@@ -45,9 +49,29 @@ if [[ ! -f contrib/tiflash-proxy/Cargo.toml ]]; then
   echo "initializing git submodules (one-time, large)…"
   git submodule update --init --recursive -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 fi
+# Nested deps that --recursive sometimes skips after transient SSL failures.
+git submodule update --init --recursive contrib/usearch contrib/prometheus-cpp 2>/dev/null || true
+if [[ -d contrib/grpc ]]; then
+  git -C contrib/grpc submodule update --init third_party/cares/cares third_party/protobuf \
+    third_party/abseil-cpp third_party/boringssl-with-bazel third_party/googleapis third_party/xds \
+    2>/dev/null || true
+fi
 
-cmake --preset "$PRESET"
-cmake --build --preset "$PRESET" --target tiflash
+BUILD_DIR="cmake-build-${PRESET}"
+if [[ "$PRESET" == "release" ]]; then BUILD_DIR=cmake-build-release; fi
+if [[ "$PRESET" == "dev" ]]; then BUILD_DIR=cmake-build-debug; fi
+
+if [[ ! -f "${BUILD_DIR}/build.ninja" ]]; then
+  cmake -S . -B "$BUILD_DIR" -GNinja \
+    -DCMAKE_BUILD_TYPE=$([[ "$PRESET" == "dev" ]] && echo DEBUG || echo RELWITHDEBINFO) \
+    -DENABLE_TESTS=$([[ "$PRESET" == "dev" ]] && echo ON || echo OFF) \
+    ${CC:+-DCMAKE_C_COMPILER="$CC"} \
+    ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"}
+fi
+
+JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}
+if [[ "$JOBS" -gt 8 ]]; then JOBS=8; fi
+cmake --build "$BUILD_DIR" --target tiflash -j"$JOBS"
 
 BIN="${TIFLASH_SRC}/cmake-build-${PRESET}/dbms/src/Server/tiflash"
 # release preset binaryDir is cmake-build-release
