@@ -5436,7 +5436,12 @@ fn table_factor(
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
                 }
             }
+            // TiDB EXPLAIN uses the table alias as the scan name (`table:t1`).
             let alias = alias.as_ref().map(|a| a.name.value.clone());
+            if let Some(a) = &alias {
+                physical.physical = Some(physical.name.clone());
+                physical.name = a.clone();
+            }
             Ok((physical, alias, Vec::new()))
         }
         TableFactor::Derived {

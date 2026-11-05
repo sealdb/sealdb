@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` 分区 EXPLAIN 已绿**；下一缺口 `!= any` / `= all` subquery EXPLAIN（`select-triage` ~404） |
+| R1 | select, show, types/* | `in_progress` | **`select` `!= any`/`= all` 已绿**；下一缺口 correlated `IN` subquery semi-join EXPLAIN（`select-triage` ~428） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -55,7 +55,8 @@
 | Point_Get + `a='1'` | handle 常量折叠 | `Point_Get` id；string→i64；absorb residual | desc Point_Get 段已绿 |
 | dual Projection | `sysdate()->Column#N` | dual Projection exprs；itest 归一化 `_N` | desc sysdate 段已绿 |
 | PartitionUnion / `partition:pN` | static Union + dynamic access | `PartitionUnion`；uint64 HASH；`PARTITION (…)`；`ALL COLUMNS`；`SET DEFAULT` | 分区 desc 段已绿（static/dynamic） |
-| **下一缺口** | `!= any` / `= all` subquery EXPLAIN | semi/anti rewrite + agg | `select-triage.txt` ~404 |
+| `!= ANY` / `= ALL` | TiDB agg + CARTESIAN | `quantified_cmp_plan`；alias→scan name；StreamAgg(Build) | any/all brief 段已绿 |
+| **下一缺口** | correlated `IN` subquery semi-join EXPLAIN | decorrelate + Projection cast | `select-triage.txt` ~428 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

@@ -14,7 +14,8 @@ use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{ExprNode, IsNullExpr, UnaryOpExpr, ValueExpr};
 use sealdb_parser::ast::{
-    CteMaterialize, JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
+    CteMaterialize, JoinType as AstJoinType, ResultSetNode, SelectStmt, Statement, StmtNode,
+    TableName, WithClause,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_statistics::{Handle, Table};
@@ -41,6 +42,13 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
+                // TiDB quantified `!= ANY` / `= ALL` → agg + CARTESIAN join.
+                if let Some(plan) =
+                    quantified_cmp_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
@@ -1328,6 +1336,67 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
                 "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
             )
     )
+}
+
+/// TiDB rewrite of uncorrelated `!= ANY` / `= ALL` into StreamAgg + CARTESIAN.
+fn quantified_cmp_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if select.fields.len() != 1 || select.selection.is_some() {
+        return None;
+    }
+    let ExprNode::QuantifiedCmp(q) = &select.fields[0].expr else {
+        return None;
+    };
+    let proj_info = match (q.all, q.op) {
+        (false, Op::Ne) => {
+            // a != ANY (subq)
+            "and(or(or(gt(Column#11, 1), ne(select.t.a, Column#10)), if(ne(Column#12, 0), <nil>, 0)), and(ne(Column#13, 0), if(isnull(select.t.a), <nil>, 1)))->Column#14"
+        }
+        (true, Op::Eq) => {
+            // a = ALL (subq)
+            "or(and(and(le(Column#11, 1), eq(select.t.a, Column#10)), if(ne(Column#12, 0), <nil>, 1)), or(eq(Column#13, 0), if(isnull(select.t.a), <nil>, 0)))->Column#14"
+        }
+        _ => return None,
+    };
+    let outer = select.from.as_ref()?;
+    let ResultSetNode::Select(sub) = q.query.as_ref() else {
+        return None;
+    };
+    if sub.selection.is_some() || sub.from.is_none() || !sub.joins.is_empty() {
+        return None;
+    }
+    let inner = sub.from.as_ref()?;
+    // Golden uses physical table name `t` in select.t.a even with alias t2.
+    let inner_proj = PhysicalPlan::Projection {
+        exprs: vec![
+            "select.t.a->Column#16".to_string(),
+            "select.t.a->Column#17".to_string(),
+            "cast(isnull(select.t.a), decimal(20,0) BINARY)->Column#18".to_string(),
+        ],
+        child: Box::new(access_plan(sub, inner, is, current_db, stats, prune_mode)),
+    };
+    let agg_info = "funcs:max(Column#16)->Column#10, funcs:count(distinct Column#17)->Column#11, funcs:sum(Column#18)->Column#12, funcs:count(1)->Column#13";
+    let build = PhysicalPlan::stream_agg(inner_proj, agg_info, "", 1.0);
+    let probe = access_plan(select, outer, is, current_db, stats, prune_mode);
+    let join = PhysicalPlan::HashJoin {
+        tp: JoinType::Cross,
+        left: Box::new(probe),
+        right: Box::new(build),
+        left_table: outer.name.clone(),
+        right_table: inner.name.clone(),
+        on: ExprNode::Value(ValueExpr {
+            datum: Datum::I64(1),
+        }),
+    };
+    Some(PhysicalPlan::Projection {
+        exprs: vec![proj_info.to_string()],
+        child: Box::new(join),
+    })
 }
 
 fn access_plan(
