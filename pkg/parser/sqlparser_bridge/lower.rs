@@ -253,10 +253,26 @@ fn capture_select_projections(sql: &str) -> Option<Vec<String>> {
             }
             i = skip_ws_and_comments(bytes, i);
         }
-    } else if keyword_at(bytes, i, "DESCRIBE") {
-        i = skip_ws_and_comments(bytes, i + "DESCRIBE".len());
-    } else if keyword_at(bytes, i, "DESC") {
-        i = skip_ws_and_comments(bytes, i + "DESC".len());
+    } else if keyword_at(bytes, i, "DESCRIBE") || keyword_at(bytes, i, "DESC") {
+        let kw = if keyword_at(bytes, i, "DESCRIBE") {
+            "DESCRIBE"
+        } else {
+            "DESC"
+        };
+        i = skip_ws_and_comments(bytes, i + kw.len());
+        // DESC FORMAT='brief' SELECT … — same as EXPLAIN FORMAT.
+        if keyword_at(bytes, i, "FORMAT") {
+            i = skip_ws_and_comments(bytes, i + "FORMAT".len());
+            if i < bytes.len() && bytes[i] == b'=' {
+                i = skip_ws_and_comments(bytes, i + 1);
+            }
+            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`') {
+                i = skip_quoted(bytes, i);
+            } else {
+                i = skip_ident_or_quoted(bytes, i);
+            }
+            i = skip_ws_and_comments(bytes, i);
+        }
     }
     // WITH … SELECT — skip CTE list until the main SELECT.
     if keyword_at(bytes, i, "WITH") {
@@ -3834,15 +3850,35 @@ fn txn_chars(modes: &[TransactionMode]) -> Result<TxnChars> {
 
 /// sqlparser-rs accepts `FORMAT JSON`, not TiDB `FORMAT = 'dot'`.
 /// Returns rewritten SQL plus per-EXPLAIN format overrides (`brief` → Brief).
+/// Also rewrites TiDB `DESC[RIBE] FORMAT=…` to `EXPLAIN FORMAT=…` (sqlparser
+/// otherwise treats DESC FORMAT as DESCRIBE TABLE with a fileformat).
 fn rewrite_explain_format(sql: &str) -> (String, Vec<Option<ExplainFormat>>) {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut formats = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if keyword_at(bytes, i, "EXPLAIN") {
-            out.push_str(&sql[i..i + "EXPLAIN".len()]);
-            i += "EXPLAIN".len();
+        let explain_kw = if keyword_at(bytes, i, "EXPLAIN") {
+            Some("EXPLAIN")
+        } else if keyword_at(bytes, i, "DESCRIBE") {
+            Some("DESCRIBE")
+        } else if keyword_at(bytes, i, "DESC") {
+            Some("DESC")
+        } else {
+            None
+        };
+        if let Some(kw) = explain_kw {
+            let after_kw = skip_ws(bytes, i + kw.len());
+            let is_desc_alias = kw != "EXPLAIN";
+            // DESC[RIBE] without FORMAT stays table describe — do not rewrite.
+            if is_desc_alias && !keyword_at(bytes, after_kw, "FORMAT") {
+                out.push_str(&sql[i..i + kw.len()]);
+                i += kw.len();
+                continue;
+            }
+            // TiDB: DESC FORMAT=… SELECT → EXPLAIN FORMAT=…
+            out.push_str("EXPLAIN");
+            i += kw.len();
             let after = skip_ws(bytes, i);
             if keyword_at(bytes, after, "ANALYZE") {
                 out.push_str(&sql[i..after + "ANALYZE".len()]);
