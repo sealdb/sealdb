@@ -564,6 +564,12 @@ impl PlanBuilder {
                     .first()
                     .map(|t| t.name.clone())
                     .unwrap_or_default();
+                // TiDB ExplainInfo uses OrigTblName (`select.t.a` for `t t4`).
+                let right_physical = right
+                    .tables()
+                    .first()
+                    .map(|t| t.resolve_name().to_string())
+                    .unwrap_or_else(|| right_table.clone());
                 let join_tp = map_join_type(*tp);
                 // TiDB null-reject: push not(isnull(join_key)) into the inner
                 // (build) side of outer joins.
@@ -571,7 +577,9 @@ impl PlanBuilder {
                     join_tp,
                     JoinType::LeftOuter | JoinType::RightOuter
                 ) {
-                    if let Some(filter) = null_reject_on_inner(on, &right_table) {
+                    if let Some(filter) =
+                        null_reject_on_inner(on, &right_table, &right_physical)
+                    {
                         right_plan = predicate_push_down(right_plan, &filter, is, current_db);
                     }
                 }
@@ -739,14 +747,18 @@ fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectSt
 }
 
 /// `not(isnull(inner.join_key))` for TiDB outer-join null rejection on the build side.
-fn null_reject_on_inner(on: &ExprNode, inner_alias: &str) -> Option<ExprNode> {
+fn null_reject_on_inner(
+    on: &ExprNode,
+    inner_alias: &str,
+    inner_physical: &str,
+) -> Option<ExprNode> {
     let ExprNode::Binary(bin) = on else {
         return None;
     };
     if bin.op != Op::Eq {
         return None;
     }
-    let col = match (bin.left.as_ref(), bin.right.as_ref()) {
+    let mut col = match (bin.left.as_ref(), bin.right.as_ref()) {
         (ExprNode::Column(c), _)
             if c.table
                 .as_deref()
@@ -767,6 +779,8 @@ fn null_reject_on_inner(on: &ExprNode, inner_alias: &str) -> Option<ExprNode> {
         (ExprNode::Column(_), ExprNode::Column(c)) => c.clone(),
         _ => return None,
     };
+    // OrigTblName for ExplainInfo (`t t4` → select.t.a).
+    col.table = Some(inner_physical.to_string());
     Some(ExprNode::Unary(UnaryOpExpr {
         op: Op::Not,
         expr: Box::new(ExprNode::IsNull(IsNullExpr {

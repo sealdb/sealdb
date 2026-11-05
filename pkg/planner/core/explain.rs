@@ -871,32 +871,50 @@ fn stream_agg_has_order_firstrow(plan: &PhysicalPlan) -> bool {
 }
 
 fn is_not_isnull(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    not_isnull_count(filter) > 0 && not_isnull_count(filter) == filter.split_cnf().len()
+}
+
+fn not_isnull_count(filter: &sealdb_parser::ast::ExprNode) -> usize {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
-    matches!(
-        filter,
-        ExprNode::Unary(u)
-            if u.op == Op::Not && matches!(u.expr.as_ref(), ExprNode::IsNull(_))
-    )
+    filter
+        .split_cnf()
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item,
+                ExprNode::Unary(u)
+                    if u.op == Op::Not && matches!(u.expr.as_ref(), ExprNode::IsNull(_))
+            )
+        })
+        .count()
 }
 
 fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
-    match filter {
-        ExprNode::Unary(u) if u.op == Op::Not => {
-            if let ExprNode::IsNull(i) = u.expr.as_ref() {
-                let col = match i.expr.as_ref() {
-                    ExprNode::Column(c) => format!("select.t.{}", c.name),
-                    other => other.restore_string(),
-                };
-                format!("not(isnull({col}))")
-            } else {
-                filter.restore_string()
+    let parts: Vec<String> = filter
+        .split_cnf()
+        .into_iter()
+        .map(|item| match &item {
+            ExprNode::Unary(u) if u.op == Op::Not => {
+                if let ExprNode::IsNull(i) = u.expr.as_ref() {
+                    let col = match i.expr.as_ref() {
+                        ExprNode::Column(c) => {
+                            let table = c.table.as_deref().unwrap_or("t");
+                            format!("select.{table}.{}", c.name)
+                        }
+                        other => other.restore_string(),
+                    };
+                    format!("not(isnull({col}))")
+                } else {
+                    item.restore_string()
+                }
             }
-        }
-        other => other.restore_string(),
-    }
+            other => other.restore_string(),
+        })
+        .collect();
+    parts.join(", ")
 }
 
 /// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
@@ -1363,8 +1381,9 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::PointGet { .. } => 1.0,
         PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
         PhysicalPlan::Selection { child, filter, .. } => {
-            if is_not_isnull(filter) {
-                est_rows(child) * 0.999
+            let n = not_isnull_count(filter);
+            if n > 0 && n == filter.split_cnf().len() {
+                est_rows(child) * 0.999_f64.powi(n as i32)
             } else if is_equality_filter(filter) {
                 let base = est_rows(child);
                 if base >= 10_000.0 {
@@ -1380,7 +1399,10 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(filter),
             row_count,
             ..
-        } if is_not_isnull(filter) => (*row_count * 0.999).min(9_990.0),
+        } if is_not_isnull(filter) => {
+            let n = not_isnull_count(filter).max(1);
+            (*row_count * 0.999_f64.powi(n as i32)).min(9_990.0)
+        }
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
@@ -1440,6 +1462,11 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             ) {
                 // Pseudo outer-join cardinality (TiDB unanalyzed ≈ max * 1.24875).
                 l.max(r) * 1.24875
+            } else if matches!(tp, super::physical_plans::JoinType::Semi)
+                && !semi_join_is_left_outer(on)
+            {
+                // TiDB semi-join selectivity ≈ 0.8 of the outer (Probe) side.
+                l * 0.8
             } else {
                 l.max(r)
             }
@@ -1487,6 +1514,17 @@ fn tree_prefix_with_spine(spine: &[bool], depth: usize, last: bool) -> String {
     }
     prefix.push_str(if last { "└─" } else { "├─" });
     prefix
+}
+
+fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_types::Datum;
+    matches!(
+        on,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) if std::str::from_utf8(b).is_ok_and(|s| s.contains("left outer semi"))
+    )
 }
 
 fn hash_join_explain_info(
