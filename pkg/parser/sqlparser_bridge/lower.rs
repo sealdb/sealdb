@@ -66,6 +66,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
     let projection_texts = capture_select_projections(sql);
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
+    let rewritten = rewrite_mysql_version_comments(&rewritten);
     // TiDB `!` SimpleExpr → opcode.Not2; sqlparser rejects bare `!`.
     let rewritten = rewrite_mysql_bang(&rewritten);
     // sqlparser rejects `((SELECT…) UNION ALL (SELECT…)) alias`; unwrap arm parens
@@ -1818,6 +1820,114 @@ fn apply_with_materialize(
 const SEALDB_BANG_FN: &str = "__sealdb_bang";
 
 /// Rewrite MySQL/TiDB unary `! (` to `__sealdb_bang(` (sqlparser has no bang).
+/// Expand MySQL executable version comments `/*!NNNNN body */` → ` body `.
+/// Conditionally-compiled MySQL options (e.g. `PARTITION BY`) must be real SQL
+/// for sqlparser; SealDB always enables them (TiDB/MySQL ≥ 5.1 behavior).
+fn rewrite_mysql_version_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            out.push(sql[i..].chars().next().unwrap());
+            i += sql[i..].chars().next().unwrap().len_utf8();
+            if c == b'\'' {
+                if i < bytes.len() && bytes[i] == b'\'' {
+                    out.push('\'');
+                    i += 1;
+                } else {
+                    in_sq = false;
+                }
+            } else if c == b'\\' && i < bytes.len() {
+                out.push(sql[i..].chars().next().unwrap());
+                i += sql[i..].chars().next().unwrap().len_utf8();
+            }
+            continue;
+        }
+        if in_dq {
+            out.push(sql[i..].chars().next().unwrap());
+            i += sql[i..].chars().next().unwrap().len_utf8();
+            if c == b'"' {
+                if i < bytes.len() && bytes[i] == b'"' {
+                    out.push('"');
+                    i += 1;
+                } else {
+                    in_dq = false;
+                }
+            }
+            continue;
+        }
+        if in_bt {
+            out.push(sql[i..].chars().next().unwrap());
+            i += sql[i..].chars().next().unwrap().len_utf8();
+            if c == b'`' {
+                in_bt = false;
+            }
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_sq = true;
+                out.push('\'');
+                i += 1;
+            }
+            b'"' => {
+                in_dq = true;
+                out.push('"');
+                i += 1;
+            }
+            b'`' => {
+                in_bt = true;
+                out.push('`');
+                i += 1;
+            }
+            b'/' if i + 2 < bytes.len() && bytes[i + 1] == b'*' && bytes[i + 2] == b'!' => {
+                // `/*!` or `/*!NNNNN`
+                i += 3;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(' ');
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                if i + 1 < bytes.len() {
+                    i += 2; // skip */
+                }
+                out.push(' ');
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Ordinary block comment — keep verbatim.
+                out.push('/');
+                out.push('*');
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                if i + 1 < bytes.len() {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                }
+            }
+            _ => {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 /// Skips `!=`, strings, backticks, and MySQL version comments `/*! ... */`.
 fn rewrite_mysql_bang(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len() + 16);
@@ -4497,12 +4607,15 @@ fn extract_create_table_partitions(sql: &str) -> Result<(String, Vec<Option<Part
                     && let Some(close) = matching_paren(bytes, after_name)
                 {
                     let after_cols = skip_ws(bytes, close + 1);
-                    if keyword_at(bytes, after_cols, "PARTITION") {
-                        let after_part = skip_ws(bytes, after_cols + "PARTITION".len());
+                    // Table options (ENGINE/CHARSET/…) may precede PARTITION BY,
+                    // including after expanding `/*!50100 PARTITION … */`.
+                    let part_at = find_partition_by_after_create_cols(bytes, after_cols);
+                    if let Some(part_kw) = part_at {
+                        let after_part = skip_ws(bytes, part_kw + "PARTITION".len());
                         if keyword_at(bytes, after_part, "BY") {
                             let start = after_part + "BY".len();
                             let (opt, end) = parse_partition_by(bytes, skip_ws(bytes, start))?;
-                            out.push_str(&sql[i..after_cols]);
+                            out.push_str(&sql[i..part_kw]);
                             opts.push(Some(opt));
                             i = end;
                             continue;
@@ -4519,6 +4632,44 @@ fn extract_create_table_partitions(sql: &str) -> Result<(String, Vec<Option<Part
         i += sql[i..].chars().next().unwrap().len_utf8();
     }
     Ok((out, opts))
+}
+
+/// Byte index of `PARTITION` for `PARTITION BY` after CREATE TABLE column list,
+/// skipping intervening table options. `None` if not found before `;` / EOF.
+fn find_partition_by_after_create_cols(bytes: &[u8], mut i: usize) -> Option<usize> {
+    while i < bytes.len() {
+        i = skip_ws(bytes, i);
+        if i >= bytes.len() || bytes[i] == b';' {
+            return None;
+        }
+        if keyword_at(bytes, i, "PARTITION") {
+            let after = skip_ws(bytes, i + "PARTITION".len());
+            if keyword_at(bytes, after, "BY") {
+                return Some(i);
+            }
+        }
+        // Skip one table-option token / parenthesized value.
+        if bytes[i] == b'(' {
+            i = matching_paren(bytes, i)?.saturating_add(1);
+            continue;
+        }
+        if bytes[i] == b'=' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'`' || bytes[i] == b'\'' || bytes[i] == b'"' {
+            i = skip_ident_or_quoted(bytes, i);
+            continue;
+        }
+        if is_ident_byte(bytes[i]) {
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn skip_create_table_name(bytes: &[u8], mut i: usize) -> usize {

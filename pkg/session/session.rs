@@ -6226,8 +6226,12 @@ mod tests {
             .execute_stmt("WITH c AS NOT MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
             .unwrap();
         assert_eq!(inline.display_rows(), vec![vec!["1".to_string()]]);
+        // Dual seeds always inline in EXPLAIN (seed_is_dual_projection), even
+        // with AS MATERIALIZED; table-backed MATERIALIZED keeps the CTE node.
         let mat_plan = session
-            .execute_stmt("EXPLAIN WITH c AS MATERIALIZED (SELECT 1 AS n) SELECT * FROM c")
+            .execute_stmt(
+                "EXPLAIN WITH c AS MATERIALIZED (SELECT id FROM db1.t WHERE id = 1) SELECT * FROM c",
+            )
             .unwrap();
         let mat_text = mat_plan
             .display_rows()
@@ -6310,13 +6314,20 @@ mod tests {
             .execute_stmt("SELECT COUNT(*) FROM db1.t WHERE id = 4")
             .unwrap();
         assert_eq!(deleted.display_rows(), vec![vec!["0".to_string()]]);
+        session.execute_stmt("DROP TABLE IF EXISTS db1.tbl_0").unwrap();
+        session
+            .execute_stmt("CREATE TABLE db1.tbl_0(a int)")
+            .unwrap();
+        session.execute_stmt("USE db1").unwrap();
+        let shadow_err = session.execute_stmt(
+            "with recursive tbl_0 (col_943,col_944,col_945,col_946,col_947) AS ( with recursive tbl_0 (col_948,col_949,col_950,col_951,col_952) AS ( select 1, 2,3,4,5 UNION ALL select col_948 + 1,col_949 + 1,col_950 + 1,col_951 + 1,col_952 + 1 from tbl_0 where col_948 < 5 ) select col_948,col_949,col_951,col_950,col_952 from tbl_0 UNION ALL select col_943 + 1,col_944 + 1,col_945 + 1,col_946 + 1,col_947 + 1 from tbl_0 where col_943 < 5 ) select * from tbl_0",
+        ).expect_err("same-name nested WITH should errno 1054");
+        assert_eq!(shadow_err.code, 1054, "{shadow_err:?}");
+        assert!(shadow_err.message.contains("col_943"), "{shadow_err:?}");
         let err = session
             .execute_stmt("WITH c(a, b) AS (SELECT 1) SELECT * FROM c")
             .unwrap_err();
-        assert_eq!(
-            err.code,
-            sealdb_errno::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT
-        );
+        assert_eq!(err.code, sealdb_errno::ERR_VIEW_WRONG_LIST);
     }
 
     #[test]

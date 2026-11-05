@@ -1164,7 +1164,7 @@ impl PlanBuilder {
         }
         if tables
             .iter()
-            .any(|t| named_cte(select.with.as_ref(), &t.name))
+            .any(|t| named_cte(select.with.as_ref(), t.resolve_name()))
         {
             return Ok(None);
         }
@@ -1262,9 +1262,16 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
-        if named_cte(select.with.as_ref(), &table.name) {
-            self.build_cte_plan(select, table, is, current_db, stats, prune_mode)?
-                .ok_or_else(|| Error::unsupported(format!("unknown CTE {}", table.name)))
+        if named_cte(select.with.as_ref(), table.resolve_name()) {
+            let mut cte_from = table.clone();
+            if table.physical.is_some() {
+                cte_from.name = table.resolve_name().to_string();
+                cte_from.physical = Some(table.name.clone());
+            }
+            self.build_cte_plan(select, &cte_from, is, current_db, stats, prune_mode)?
+                .ok_or_else(|| {
+                    Error::unsupported(format!("unknown CTE {}", table.resolve_name()))
+                })
         } else {
             Ok(access_plan(
                 select,
