@@ -196,11 +196,19 @@ impl TableInfo {
             .collect()
     }
 
-    /// Integer handle column is the original first INT (id == 1), so AFTER/FIRST
-    /// reordering does not steal the row key. Used for covering-index completeness
-    /// (`pk_is_handle` / common-handle heuristics); decode must not overwrite
-    /// values already filled from the index key (see `covering_row`).
+    /// Integer clustered PRIMARY KEY column (`pk_is_handle`). Prefer the
+    /// PRIMARY KEY index column; fall back to first INT for legacy tables.
     pub fn handle_column(&self) -> Option<&ColumnInfo> {
+        if self.pk_is_handle
+            && let Some(pk) = self.indices.iter().find(|idx| idx.primary)
+            && let Some(col) = pk.columns.first()
+        {
+            return self
+                .columns
+                .iter()
+                .find(|c| c.offset == col.offset)
+                .filter(|c| c.field_type.eval_type() == EvalType::Int);
+        }
         self.columns
             .iter()
             .find(|col| col.id == 1 && col.field_type.eval_type() == EvalType::Int)

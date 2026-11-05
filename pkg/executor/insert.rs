@@ -173,11 +173,18 @@ fn write_row(
 ) -> Result<()> {
     let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
     // Integer primary-key handle only when `pk_is_handle`; otherwise allocate
-    // a unique _tidb_rowid (TiDB heap table). Using the first INT column as
-    // handle collapses rows that share the same c1 (select.test bool field).
+    // a unique _tidb_rowid (TiDB heap table). The handle is the PRIMARY KEY
+    // column value (not always column 0 — e.g. `wkey, pkey PRIMARY KEY(pkey)`).
     let handle = if info.pk_is_handle {
-        match values.first() {
+        let pk_offset = info
+            .indices
+            .iter()
+            .find(|idx| idx.primary)
+            .and_then(|idx| idx.columns.first())
+            .map(|c| c.offset as usize);
+        match pk_offset.and_then(|off| values.get(off)) {
             Some(Datum::I64(v)) => *v,
+            Some(Datum::U64(v)) => *v as i64,
             _ => domain.next_handle(info.id)?,
         }
     } else {
