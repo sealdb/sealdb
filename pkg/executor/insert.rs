@@ -126,7 +126,7 @@ fn map_insert_row(
         // Cast literals to column FieldType (UNSIGNED BIGINT / DECIMAL scale).
         let mut values = Vec::with_capacity(info.columns.len());
         for (col, v) in info.columns.iter().zip(row.iter()) {
-            values.push(v.cast(&col.field_type)?);
+            values.push(cast_for_column(v, col)?);
         }
         return Ok(values);
     }
@@ -142,12 +142,27 @@ fn map_insert_row(
             .iter()
             .position(|c| c.eq_ignore_ascii_case(col.name.o()))
         {
-            values.push(row[idx].cast(&col.field_type)?);
+            values.push(cast_for_column(&row[idx], col)?);
         } else {
             values.push(Datum::Null);
         }
     }
     Ok(values)
+}
+
+fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    let mut out = v.cast(&col.field_type)?;
+    // TIMESTAMP columns store UTC; session wall clock → UTC on write.
+    if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
+        && let Datum::Time(t) = out
+    {
+        let mut t = t;
+        t.tp = sealdb_types::TimeType::Timestamp;
+        t = sealdb_expression::session_local_to_utc(t)?;
+        t.tp = sealdb_types::TimeType::Timestamp;
+        out = Datum::Time(t);
+    }
+    Ok(out)
 }
 
 fn write_row(

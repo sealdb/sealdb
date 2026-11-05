@@ -7,7 +7,7 @@ use sealdb_types::field_type::{
     TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
     TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
 };
-use sealdb_types::{Datum, MyDecimal, Time};
+use sealdb_types::{Datum, MyDecimal, Time, TimeType};
 
 /// Decode a v128 row. The new format has no type tags, so each requested column
 /// needs a `FieldType`. An empty `columns` list returns every stored value as
@@ -65,7 +65,14 @@ fn decode_value(data: &[u8], ft: &FieldType) -> Datum {
                 .unwrap_or_else(|_| MyDecimal::from_i64(0)),
         ),
         TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION => {
-            Datum::Time(Time::from_packed_u64(decode_uint(data)))
+            let mut t = Time::from_packed_u64(decode_uint(data));
+            t.tp = match ft.tp {
+                TYPE_DATE => TimeType::Date,
+                TYPE_TIMESTAMP => TimeType::Timestamp,
+                TYPE_DURATION => TimeType::Time,
+                _ => TimeType::Datetime,
+            };
+            Datum::Time(t)
         }
         TYPE_BIT | TYPE_ENUM | TYPE_SET => Datum::U64(decode_uint(data)),
         TYPE_VAR_STRING | TYPE_VARCHAR | TYPE_STRING | TYPE_BLOB | TYPE_TINY_BLOB
