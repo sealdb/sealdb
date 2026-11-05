@@ -78,6 +78,7 @@
 | NO_BACKSLASH_ESCAPES | `\\` 字面反斜杠 | parse 前加倍 `\` 喂 sqlparser | types/const → `green`（Mem+TiKV） |
 | itest `--enable_warnings` | 解析指令（警告输出后续） | `parse_test` suite flag | types/time 可开工 |
 | TIMESTAMP/DATE/TIME literals | TypedString + timestampPattern；ODBC `{d|t|ts}` | `types::parse_*_literal`；errno 1292/22007 | types/time 字面量段已过；下：TIMESTAMPADD/DST |
+| SET time_zone | session 时区变量 | `Session.time_zone` + @@ readout | types/time SET 已接受 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

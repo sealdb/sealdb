@@ -37,6 +37,8 @@ pub struct Session {
     plan_cache_key: Mutex<Option<String>>,
     collation: Mutex<Collation>,
     sql_mode: Mutex<String>,
+    /// TiDB `time_zone` (default `SYSTEM`).
+    time_zone: Mutex<String>,
     /// Session user variables (`SET @a = …` / `SELECT @a`).
     user_vars: Mutex<HashMap<String, sealdb_types::Datum>>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
@@ -80,6 +82,7 @@ impl Session {
                 &globals.character_set_connection,
             )),
             sql_mode: Mutex::new(globals.sql_mode),
+            time_zone: Mutex::new("SYSTEM".to_string()),
             user_vars: Mutex::new(HashMap::new()),
             partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
             active_roles: Mutex::new(Vec::new()),
@@ -1753,6 +1756,14 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .expect("session auto analyze ratio lock") = ratio;
             }
             "autocommit" | "unique_checks" | "foreign_key_checks" => {}
+            // Session time zone (DST / TIMESTAMP display). Value stored for later
+            // conversion; offset literals like '+00:00' / named zones accepted.
+            "time_zone" => {
+                *session
+                    .time_zone
+                    .lock()
+                    .expect("session time_zone lock") = value;
+            }
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, concurrency, …).
             other if other.starts_with("tidb_") => {}
@@ -1871,6 +1882,11 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .sql_mode
             .lock()
             .expect("session sql_mode lock")
+            .clone(),
+        "time_zone" => session
+            .time_zone
+            .lock()
+            .expect("session time_zone lock")
             .clone(),
         "collation_connection" => session
             .collation
