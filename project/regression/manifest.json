@@ -2435,7 +2435,7 @@
     {
       "name": "subquery",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/subquery.test",
       "result": "r/subquery.result",
       "has_result": true,

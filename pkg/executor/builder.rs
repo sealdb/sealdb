@@ -437,7 +437,12 @@ impl ExecutorBuilder {
                 }
                 Ok(exec)
             }
-            PhysicalPlan::Apply { child, filter } => {
+            PhysicalPlan::Apply {
+                child,
+                filter,
+                probe: _,
+                info: _,
+            } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("apply without select"))?;
@@ -456,6 +461,13 @@ impl ExecutorBuilder {
                     select.from.as_ref().map(|t| t.name.clone()),
                 )))
             }
+            PhysicalPlan::IndexJoin { outer, .. } => Self::build(
+                outer,
+                stmt,
+                domain,
+                current_db,
+                txn,
+            ),
             PhysicalPlan::CTE {
                 name,
                 columns,

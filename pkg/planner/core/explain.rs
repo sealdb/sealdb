@@ -295,12 +295,49 @@ fn walk_with_parent(
             if self_p == right_p
                 && matches!(
                     name.as_str(),
-                    "HashJoin" | "TableReader" | "StreamAgg" | "Projection"
+                    "HashJoin"
+                        | "TableReader"
+                        | "StreamAgg"
+                        | "Projection"
+                        | "Selection"
+                        | "IndexReader"
                 )
             {
                 "(Build)"
             } else if self_p == left_p
-                && matches!(name.as_str(), "HashJoin" | "TableReader" | "Projection")
+                && matches!(
+                    name.as_str(),
+                    "HashJoin" | "TableReader" | "Projection" | "Selection" | "IndexReader"
+                )
+            {
+                "(Probe)"
+            } else {
+                ""
+            }
+        }
+        Some(PhysicalPlan::Apply {
+            child, probe: Some(probe), ..
+        })
+        | Some(PhysicalPlan::IndexJoin {
+            outer: child,
+            inner: probe,
+            ..
+        }) => {
+            let build_p = explain_plan_ptr(child);
+            let probe_p = explain_plan_ptr(probe);
+            let self_p = explain_plan_ptr(plan);
+            if self_p == build_p
+                && matches!(
+                    name.as_str(),
+                    "TableReader" | "IndexReader" | "StreamAgg" | "Selection" | "HashJoin" | "IndexJoin"
+                )
+            {
+                "(Build)"
+            } else if self_p == probe_p
+                && matches!(
+                    name.as_str(),
+                    "TableReader" | "IndexReader" | "StreamAgg" | "Selection" | "HashJoin" | "IndexJoin"
+                )
             {
                 "(Probe)"
             } else {
@@ -327,7 +364,15 @@ fn walk_with_parent(
             cop_info,
             est_rows,
             ..
-        }) => Some((info.as_str(), cop_info.as_str(), *est_rows)),
+        }) => Some(("StreamAgg", info.as_str(), cop_info.as_str(), *est_rows)),
+        Some(PhysicalPlan::HashAgg {
+            info,
+            cop_info,
+            est_rows,
+            ..
+        }) if !cop_info.is_empty() => {
+            Some(("HashAgg", info.as_str(), cop_info.as_str(), *est_rows))
+        }
         _ => None,
     };
     let window_keep_order = match parent {
@@ -335,15 +380,30 @@ fn walk_with_parent(
         _ => false,
     };
     let under_window = matches!(parent, Some(PhysicalPlan::Window { .. }));
-    let under_stream_agg = stream_parent.is_some();
+    let _under_stream_agg = stream_parent.is_some();
     if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:TopN".to_string();
     }
-    if under_stream_agg && matches!(plan, PhysicalPlan::TableReader { .. }) {
-        info = "data:StreamAgg".to_string();
+    if let Some((agg_name, _, _, _)) = stream_parent {
+        if matches!(plan, PhysicalPlan::TableReader { .. }) {
+            info = format!("data:{agg_name}");
+        }
+        if matches!(plan, PhysicalPlan::IndexReader { .. }) && agg_name == "StreamAgg" {
+            info = "index:StreamAgg".to_string();
+        }
     }
-    if under_stream_agg && matches!(plan, PhysicalPlan::IndexReader { .. }) {
-        info = "index:StreamAgg".to_string();
+    // RANGE: marker → TableRangeScan / IndexRangeScan access (overrides Selection).
+    if let Some(range) = range_marker(plan) {
+        match plan {
+            PhysicalPlan::TableReader { .. } => {
+                info = "data:TableRangeScan".to_string();
+                let _ = range;
+            }
+            PhysicalPlan::IndexReader { .. } => {
+                info = "index:IndexRangeScan".to_string();
+            }
+            _ => {}
+        }
     }
     if under_window && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:IndexFullScan".to_string();
@@ -352,6 +412,8 @@ fn walk_with_parent(
         plan,
         PhysicalPlan::HashJoin { .. }
             | PhysicalPlan::MergeJoin { .. }
+            | PhysicalPlan::IndexJoin { .. }
+            | PhysicalPlan::Apply { probe: Some(_), .. }
             | PhysicalPlan::PartitionUnion { .. }
             | PhysicalPlan::Union { .. }
     ) || matches!(
@@ -359,6 +421,8 @@ fn walk_with_parent(
         Some(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::IndexJoin { .. }
+                | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
                 | PhysicalPlan::Union { .. }
         )
@@ -380,8 +444,8 @@ fn walk_with_parent(
         } else {
             est_rows(plan)
         }
-    } else if let Some((_, _, est)) = stream_parent {
-        // Partial StreamAgg est applies to the DistSQL reader, not Projection.
+    } else if let Some((_, _, _, est)) = stream_parent {
+        // Partial StreamAgg/HashAgg est applies to the DistSQL reader, not Projection.
         if matches!(
             plan,
             PhysicalPlan::TableReader { .. }
@@ -409,21 +473,34 @@ fn walk_with_parent(
         Some(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::IndexJoin { .. }
+                | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
                 | PhysicalPlan::Union { .. }
         )
     );
-    // Projection→CARTESIAN: TableReader sits under Projection with a non-empty
-    // spine; still need bushy cop prefixes for TableFullScan.
+    // Projection/Selection/HashAgg→CARTESIAN: TableReader sits under a unary
+    // with a non-empty spine; still need bushy cop prefixes for TableFullScan.
     let under_bushy = under_bushy
-        || (matches!(parent, Some(PhysicalPlan::Projection { .. })) && !spine.is_empty());
+        || (!spine.is_empty()
+            && matches!(
+                parent,
+                Some(
+                    PhysicalPlan::Projection { .. }
+                        | PhysicalPlan::Selection { .. }
+                        | PhysicalPlan::HashAgg { .. }
+                        | PhysicalPlan::StreamAgg { .. }
+                )
+            ));
     let under_merge_join = matches!(parent, Some(PhysicalPlan::MergeJoin { .. }));
+    let under_index_join = matches!(parent, Some(PhysicalPlan::IndexJoin { .. }));
     if emit_cop_children(
         plan,
         topn_parent,
         stream_parent,
         under_bushy,
         under_merge_join,
+        under_index_join,
         under_window,
         window_keep_order,
         depth + 1,
@@ -444,12 +521,19 @@ fn walk_with_parent(
         plan,
         PhysicalPlan::HashJoin { .. }
             | PhysicalPlan::MergeJoin { .. }
+            | PhysicalPlan::IndexJoin { .. }
+            | PhysicalPlan::Apply { probe: Some(_), .. }
             | PhysicalPlan::PartitionUnion { .. }
             | PhysicalPlan::Union { .. }
     ) && last
         && (matches!(
             parent,
-            Some(PhysicalPlan::Projection { .. } | PhysicalPlan::TopN { .. })
+            Some(
+                PhysicalPlan::Projection { .. }
+                    | PhysicalPlan::TopN { .. }
+                    | PhysicalPlan::StreamAgg { .. }
+                    | PhysicalPlan::Apply { .. }
+            )
         ) || spine.last() == Some(&false));
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
@@ -461,6 +545,8 @@ fn walk_with_parent(
                     child,
                     PhysicalPlan::HashJoin { .. }
                         | PhysicalPlan::MergeJoin { .. }
+                        | PhysicalPlan::IndexJoin { .. }
+                        | PhysicalPlan::Apply { probe: Some(_), .. }
                         | PhysicalPlan::PartitionUnion { .. }
                         | PhysicalPlan::Union { .. }
                 )
@@ -471,19 +557,33 @@ fn walk_with_parent(
             plan,
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::IndexJoin { .. }
+                | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
                 | PhysicalPlan::Union { .. }
         ) {
             child_spine.push(!child_last);
         } else if !spine.is_empty() {
             // StreamAgg under CARTESIAN: push whether *this* node continues.
-            // Projection under HashJoin: push whether the child has siblings
-            // (Projection is usually unary → spaces under `│`).
+            // Unary ops under HashJoin Build (Selection/HashAgg/Projection):
+            // push whether *their* child has siblings → spaces under `│`.
             // Projection under Union: push `!last` so Dual keeps `│` when the
             // Projection is a non-last Union arm (`  ├─` / `  │ └─`).
-            if matches!(plan, PhysicalPlan::Projection { .. })
-                && matches!(parent, Some(PhysicalPlan::HashJoin { .. }))
-            {
+            if matches!(
+                plan,
+                PhysicalPlan::Projection { .. }
+                    | PhysicalPlan::Selection { .. }
+                    | PhysicalPlan::HashAgg { .. }
+                    | PhysicalPlan::StreamAgg { .. }
+            ) && matches!(
+                parent,
+                Some(
+                    PhysicalPlan::HashJoin { .. }
+                        | PhysicalPlan::MergeJoin { .. }
+                        | PhysicalPlan::IndexJoin { .. }
+                        | PhysicalPlan::Apply { probe: Some(_), .. }
+                )
+            ) {
                 child_spine.push(!child_last);
             } else {
                 child_spine.push(!last);
@@ -507,9 +607,10 @@ fn walk_with_parent(
 fn emit_cop_children(
     plan: &PhysicalPlan,
     topn_parent: Option<(&str, u64, u64)>,
-    stream_parent: Option<(&str, &str, f64)>,
+    stream_parent: Option<(&str, &str, &str, f64)>,
     under_bushy: bool,
     under_merge_join: bool,
+    under_index_join: bool,
     under_window: bool,
     window_keep_order: bool,
     depth: usize,
@@ -543,27 +644,68 @@ fn emit_cop_children(
             let mut scan_depth = depth;
             // TiDB always labels DistSQL scans `cop[tikv]` for TableFullScan.
             let scan_task = "cop[tikv]";
-            if let Some((_, cop_info, est)) = stream_parent {
-                // TiDB partial StreamAgg pushed into TableReader.
+            // Cop children inherit the TableReader spine; non-last Build readers
+            // need `│` at the reader column (see `bushy_cop_spine`).
+            if let Some((agg_name, _, cop_info, est)) = stream_parent {
+                // TiDB partial StreamAgg/HashAgg pushed into TableReader.
                 let info = if cop_info.is_empty() {
                     format!("funcs:count(select.{table}.a)->Column#13")
                 } else {
                     cop_info.to_string()
                 };
-                push_explain_row(
+                let agg_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
+                push_explain_row_spine(
                     rows,
                     depth,
                     true,
                     next_id,
                     CopRow {
-                        name: "StreamAgg",
+                        name: agg_name,
                         est,
                         task: "cop[tikv]",
                         access: String::new(),
                         info,
                     },
+                    if under_bushy { agg_owned.as_slice() } else { &[] },
                 );
                 scan_depth = depth + 1;
+            }
+            // RANGE: marker → TableRangeScan (no Selection row).
+            if let Some(range_info) = range_pushed(pushed.as_ref()) {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                let keep = if *stats_pseudo {
+                    format!("range: {range_info}, keep order:false, stats:pseudo")
+                } else {
+                    format!("range: {range_info}, keep order:false")
+                };
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRangeScan",
+                        est: scan_est,
+                        task: scan_task,
+                        access: scan_access,
+                        info: keep,
+                    },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
+                );
+                return true;
             }
             // MergeJoin needs ordered PK input → keep order:true (TiDB).
             let scan_info = if under_merge_join {
@@ -577,8 +719,6 @@ fn emit_cop_children(
             } else {
                 "keep order:false".to_string()
             };
-            // Cop children inherit the TableReader spine; non-last Build readers
-            // need `│` at the reader column (see `bushy_cop_spine`).
             let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
             let cop_spine = cop_owned.as_slice();
             if let Some(filter) = pushed.as_ref() {
@@ -650,12 +790,17 @@ fn emit_cop_children(
             index,
             index_columns,
             partitions,
+            row_count,
             pushed,
         } => {
             let access = index_access_cols(table, index, index_columns, partitions);
             let (mut scan_est, mut scan_info) = index_scan_meta(pushed.as_ref());
+            // Analyzed IndexReader overrides pseudo index_scan_meta est.
+            if *row_count < 9_000.0 {
+                scan_est = *row_count;
+            }
             let mut scan_depth = depth;
-            let stream_est = stream_parent.map(|(_, _, e)| e);
+            let stream_est = stream_parent.map(|(_, _, _, e)| e);
             // TiDB pushes TopN into the IndexReader cop task.
             if let Some((by_info, offset, count)) = topn_parent {
                 push_explain_row(
@@ -673,14 +818,14 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            if let Some((_, cop_info, est)) = stream_parent {
+            if let Some((agg_name, _, cop_info, est)) = stream_parent {
                 push_explain_row(
                     rows,
                     depth,
                     true,
                     next_id,
                     CopRow {
-                        name: "StreamAgg",
+                        name: agg_name,
                         est,
                         task: "cop[tikv]",
                         access: String::new(),
@@ -698,7 +843,49 @@ fn emit_cop_children(
                     "keep order:false, stats:pseudo".to_string()
                 };
             }
-            let scan_task = if topn_parent.is_some() || under_stream_agg || under_window {
+            // RANGE: marker → IndexRangeScan with decided-by info.
+            if let Some(range_info) = range_pushed(pushed.as_ref()) {
+                let task = if under_index_join || under_stream_agg {
+                    "cop[tikv]"
+                } else {
+                    "cop"
+                };
+                let keep = format!("range: {range_info}, keep order:false");
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexRangeScan",
+                        est: scan_est,
+                        task,
+                        access,
+                        info: keep,
+                    },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
+                );
+                return true;
+            }
+            let scan_task = if topn_parent.is_some()
+                || under_stream_agg
+                || under_window
+                || under_index_join
+            {
                 "cop[tikv]"
             } else {
                 "cop"
@@ -981,8 +1168,16 @@ fn not_isnull_count(filter: &sealdb_parser::ast::ExprNode) -> usize {
 }
 
 fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
-    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    // Bytes marker: full ExplainInfo override (e.g. `not(isnull(Column#9))`).
+    if let ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(b),
+    }) = filter
+    {
+        return String::from_utf8_lossy(b).into_owned();
+    }
     let parts: Vec<String> = filter
         .split_cnf()
         .into_iter()
@@ -992,7 +1187,12 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
                     let col = match i.expr.as_ref() {
                         ExprNode::Column(c) => {
                             let table = c.table.as_deref().unwrap_or("t");
-                            format!("select.{table}.{}", c.name)
+                            let schema = sealdb_expression::current_db_name();
+                            if schema.is_empty() {
+                                format!("select.{table}.{}", c.name)
+                            } else {
+                                format!("{schema}.{table}.{}", c.name)
+                            }
                         }
                         other => other.restore_string(),
                     };
@@ -1005,6 +1205,30 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
         })
         .collect();
     parts.join(", ")
+}
+
+/// `RANGE:…` Bytes marker on TableReader/IndexReader pushed filter.
+fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_types::Datum;
+    match pushed? {
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) => {
+            let s = String::from_utf8_lossy(b);
+            s.strip_prefix("RANGE:").map(|rest| rest.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn range_marker(plan: &PhysicalPlan) -> Option<String> {
+    match plan {
+        PhysicalPlan::TableReader { pushed, .. } | PhysicalPlan::IndexReader { pushed, .. } => {
+            range_pushed(pushed.as_ref())
+        }
+        _ => None,
+    }
 }
 
 /// TiDB-style scalar: `gt(Column#5, 3)` / `or(and(…), …)`.
@@ -1222,6 +1446,7 @@ fn collect_dot_cop_children(
             index_columns,
             partitions,
             pushed,
+            ..
         } => {
             let access = index_access_cols(table, index, index_columns, partitions);
             let (scan_est, info) = index_scan_meta(pushed.as_ref());
@@ -1354,17 +1579,26 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Limit { child, .. }
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
-        | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child, .. }
         | PhysicalPlan::Shuffle { child, .. }
         | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
+        PhysicalPlan::Apply {
+            child,
+            probe: Some(probe),
+            ..
+        } => vec![child.as_ref(), probe.as_ref()],
+        PhysicalPlan::Apply { child, .. } => vec![child.as_ref()],
         // TiDB HashJoin / MergeJoin lists Build (right) before Probe (left).
         PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::MergeJoin { left, right, .. } => {
             vec![right.as_ref(), left.as_ref()]
+        }
+        // IndexJoin lists outer (Build) then inner (Probe).
+        PhysicalPlan::IndexJoin { outer, inner, .. } => {
+            vec![outer.as_ref(), inner.as_ref()]
         }
         PhysicalPlan::Union { left, right, .. } => {
             vec![left.as_ref(), right.as_ref()]
@@ -1408,7 +1642,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if pushed.is_some() {
+            if range_pushed(pushed.as_ref()).is_some() {
+                "data:TableRangeScan".to_string()
+            } else if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
                 "data:TableFullScan".to_string()
@@ -1466,7 +1702,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::IndexReader { pushed, .. } => (
             "IndexReader".to_string(),
             String::new(),
-            if pushed.is_some() {
+            if range_pushed(pushed.as_ref()).is_some() {
+                "index:IndexRangeScan".to_string()
+            } else if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
                 "data:IndexFullScan".to_string()
@@ -1540,8 +1778,18 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("inner join, left key:{left_key}, right key:{right_key}"),
         ),
-        PhysicalPlan::Apply { filter, .. } => {
-            ("Apply".to_string(), String::new(), filter.restore_string())
+        PhysicalPlan::Apply {
+            filter,
+            info,
+            ..
+        } => {
+            let info = info
+                .clone()
+                .unwrap_or_else(|| filter.restore_string());
+            ("Apply".to_string(), String::new(), info)
+        }
+        PhysicalPlan::IndexJoin { info, .. } => {
+            ("IndexJoin".to_string(), String::new(), info.clone())
         }
         PhysicalPlan::Union { op, .. } => {
             // TiDB brief: UnionAll shows empty info; DISTINCT union shows UNION.
@@ -1657,6 +1905,11 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             }
         }
         PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if range_pushed(Some(filter)).is_some() => *row_count,
+        PhysicalPlan::TableReader {
             pushed: Some(_),
             row_count,
             ..
@@ -1664,6 +1917,12 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::TableReader { row_count, .. } if *row_count < 0.0 => -*row_count,
         PhysicalPlan::TableReader { row_count, .. } => *row_count,
         PhysicalPlan::PartitionUnion { children } => children.iter().map(est_rows).sum(),
+        PhysicalPlan::IndexReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if range_pushed(Some(filter)).is_some() => *row_count,
+        PhysicalPlan::IndexReader { row_count, pushed: None, .. } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
         }
@@ -1725,10 +1984,12 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
                 } else {
                     l.max(r)
                 }
-            } else if matches!(tp, super::physical_plans::JoinType::Semi)
-                && !semi_join_is_left_outer(on)
+            } else if matches!(
+                tp,
+                super::physical_plans::JoinType::Semi | super::physical_plans::JoinType::Anti
+            ) && !semi_join_is_left_outer(on)
             {
-                // TiDB semi-join selectivity ≈ 0.8 of the outer (Probe) side.
+                // TiDB semi/anti selectivity ≈ 0.8 of the outer (Probe) side.
                 l * 0.8
             } else if matches!(tp, super::physical_plans::JoinType::Cross)
                 || (matches!(tp, super::physical_plans::JoinType::Inner)
@@ -1764,6 +2025,12 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::HashAgg { est_rows: e, .. } | PhysicalPlan::StreamAgg { est_rows: e, .. } => {
             *e
         }
+        PhysicalPlan::IndexJoin { est_rows: e, .. } => *e,
+        PhysicalPlan::Apply {
+            child,
+            probe: Some(probe),
+            ..
+        } => est_rows(child).max(est_rows(probe)),
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }
@@ -1835,14 +2102,35 @@ fn is_pseudo_card(rows: f64) -> bool {
 }
 
 fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {
+    semi_explain_override(on).is_some_and(|s| s.contains("left outer semi"))
+}
+
+/// Bytes marker with a full TiDB join ExplainInfo, possibly AND'd with Eq.
+fn semi_explain_override(on: &sealdb_parser::ast::ExprNode) -> Option<String> {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
-    matches!(
-        on,
+    match on {
         ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(b),
-        }) if std::str::from_utf8(b).is_ok_and(|s| s.contains("left outer semi"))
-    )
+        }) => {
+            let s = std::str::from_utf8(b).ok()?;
+            if s.contains("semi join")
+                || s.contains("anti join")
+                || s.contains("inner join")
+                || s.contains("outer join")
+                || s.starts_with("CARTESIAN")
+            {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        }
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            semi_explain_override(&bin.left).or_else(|| semi_explain_override(&bin.right))
+        }
+        _ => None,
+    }
 }
 
 fn hash_join_explain_info(
@@ -1852,16 +2140,11 @@ fn hash_join_explain_info(
     _right: &PhysicalPlan,
 ) -> String {
     use super::physical_plans::JoinType;
-    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
-    use sealdb_types::Datum;
-    // Marker: Value(Bytes) holding a full TiDB ExplainInfo override.
-    if let ExprNode::Value(ValueExpr {
-        datum: Datum::Bytes(b),
-    }) = on
-        && let Ok(s) = std::str::from_utf8(b)
-        && (s.contains("semi join") || s.contains("anti join"))
-    {
-        return s.to_string();
+    use sealdb_parser::ast::expressions::ExprNode;
+    // Marker: Value(Bytes) holding a full TiDB ExplainInfo override
+    // (alone or AND'd with the executable equijoin key).
+    if let Some(s) = semi_explain_override(on) {
+        return s;
     }
     let outer = match tp {
         JoinType::LeftOuter => "left outer join",

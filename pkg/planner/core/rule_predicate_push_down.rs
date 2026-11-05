@@ -94,6 +94,7 @@ fn push_into(
             index,
             index_columns,
             partitions,
+            row_count,
             pushed,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
@@ -104,6 +105,7 @@ fn push_into(
                     index,
                     index_columns,
                     partitions,
+                    row_count,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
                 },
                 residual,
@@ -235,6 +237,8 @@ fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
         PhysicalPlan::Apply {
             child: Box::new(plan),
             filter,
+            probe: None,
+            info: None,
         }
     } else {
         PhysicalPlan::Selection {

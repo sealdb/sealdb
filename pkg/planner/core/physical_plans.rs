@@ -87,6 +87,8 @@ pub enum PhysicalPlan {
         /// Index column names for EXPLAIN `index:idx(b, c)`.
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// Analyzed / pseudo cardinality for EXPLAIN estRows.
+        row_count: f64,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -125,6 +127,9 @@ pub enum PhysicalPlan {
         child: Box<PhysicalPlan>,
         /// TiDB ExplainInfo (`group by:…, funcs:…`).
         info: String,
+        /// Coprocessor partial HashAgg ExplainInfo under TableReader (`data:HashAgg`).
+        /// Empty = no cop push.
+        cop_info: String,
         est_rows: f64,
     },
     StreamAgg {
@@ -167,9 +172,21 @@ pub enum PhysicalPlan {
         child: Box<PhysicalPlan>,
     },
     Apply {
+        /// Build / outer child.
         child: Box<PhysicalPlan>,
         #[serde(skip)]
         filter: ExprNode,
+        /// Probe side when dual-child Apply (TiDB correlated left outer semi).
+        probe: Option<Box<PhysicalPlan>>,
+        /// ExplainInfo override (CARTESIAN left outer semi join, …).
+        info: Option<String>,
+    },
+    /// Index nested-loop join (TiDB PhysicalIndexJoin). Outer listed first (Build).
+    IndexJoin {
+        info: String,
+        est_rows: f64,
+        outer: Box<PhysicalPlan>,
+        inner: Box<PhysicalPlan>,
     },
     Union {
         op: SetOprType,
@@ -367,7 +384,13 @@ impl PhysicalPlan {
                 let tag = if *analyze { "Analyze" } else { "" };
                 format!("Explain{tag}_{format:?} -> {}", child.explain())
             }
-            PhysicalPlan::Apply { child, .. } => format!("Apply -> {}", child.explain()),
+            PhysicalPlan::Apply { child, probe, .. } => match probe {
+                Some(p) => format!("Apply({}, {})", child.explain(), p.explain()),
+                None => format!("Apply -> {}", child.explain()),
+            },
+            PhysicalPlan::IndexJoin {
+                outer, inner, info, ..
+            } => format!("IndexJoin({info}, {}, {})", outer.explain(), inner.explain()),
             PhysicalPlan::Union { op, left, right } => {
                 format!(
                     "Union_{}({}, {})",
@@ -435,6 +458,21 @@ impl PhysicalPlan {
         PhysicalPlan::HashAgg {
             child: Box::new(child),
             info: info.into(),
+            cop_info: String::new(),
+            est_rows,
+        }
+    }
+
+    pub fn hash_agg_cop(
+        child: PhysicalPlan,
+        info: impl Into<String>,
+        cop_info: impl Into<String>,
+        est_rows: f64,
+    ) -> Self {
+        PhysicalPlan::HashAgg {
+            child: Box::new(child),
+            info: info.into(),
+            cop_info: cop_info.into(),
             est_rows,
         }
     }

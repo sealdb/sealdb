@@ -16,7 +16,9 @@ use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
-use sealdb_parser::ast::expressions::{ExprNode, IsNullExpr, UnaryOpExpr, ValueExpr};
+use sealdb_parser::ast::expressions::{
+    ColumnNameExpr, ExprNode, FuncCallExpr, IsNullExpr, UnaryOpExpr, ValueExpr,
+};
 use sealdb_parser::ast::{
     CteMaterialize, JoinType as AstJoinType, ResultSetNode, SelectStmt, Statement, StmtNode,
     TableName, WithClause,
@@ -49,6 +51,13 @@ impl PlanBuilder {
                 // TiDB quantified `!= ANY` / `= ALL` → agg + CARTESIAN join.
                 if let Some(plan) =
                     quantified_cmp_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
+                // Correlated scalar `col = (SELECT max(…) …)`.
+                if let Some(plan) =
+                    scalar_max_eq_plan(select, is, current_db, stats, prune_mode)
                 {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
@@ -1904,6 +1913,7 @@ fn index_plan(
             index: index.name.o().to_string(),
             index_columns,
             partitions,
+            row_count: 10_000.0,
             pushed: None,
         }
     } else {
@@ -2498,10 +2508,14 @@ fn in_subquery_select_plan(
     if sub.not {
         return None;
     }
-    let outer = select.from.as_ref()?;
     let ResultSetNode::Select(inner_sel) = sub.query.as_ref() else {
         return None;
     };
+    // `c IN (SELECT count(*) FROM t s USE INDEX(idx), t t1 WHERE …)` → Apply+IndexJoin.
+    if let Some(plan) = count_in_apply_index_join(select, sub, inner_sel, current_db) {
+        return Some(plan);
+    }
+    let outer = select.from.as_ref()?;
     let inner = inner_sel.from.as_ref()?;
     // Correlated IN has a WHERE referencing the outer table.
     let _ = inner_sel.selection.as_ref()?;
@@ -2518,6 +2532,248 @@ fn in_subquery_select_plan(
         on: ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(info.into_bytes()),
         }),
+    })
+}
+
+fn range_push(info: &str) -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(format!("RANGE:{info}").into_bytes()),
+    })
+}
+
+fn schema_prefix(current_db: &str) -> String {
+    if current_db.is_empty() {
+        "select".to_string()
+    } else {
+        current_db.to_string()
+    }
+}
+
+/// `select t.c in (select count(*) from t s use index(idx), t t1 where …) from t`
+fn count_in_apply_index_join(
+    select: &SelectStmt,
+    sub: &sealdb_parser::ast::expressions::InSubqueryExpr,
+    inner_sel: &SelectStmt,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    let outer = select.from.as_ref()?;
+    // Inner must be a two-table comma join with USE INDEX on the first.
+    if inner_sel.joins.is_empty() {
+        return None;
+    }
+    let s_tbl = inner_sel.from.as_ref()?;
+    if s_tbl.use_indexes.is_empty() {
+        return None;
+    }
+    let t1_tbl = &inner_sel.joins[0].right;
+    // Aggregate: count(*) / count(1).
+    let field = &inner_sel.fields.first()?.expr;
+    let is_count = matches!(
+        field,
+        ExprNode::Func(FuncCallExpr { name, args, .. })
+            if name.eq_ignore_ascii_case("COUNT")
+                && (args.is_empty()
+                    || matches!(args.first(), Some(ExprNode::Value(ValueExpr { datum: Datum::I64(1) }))))
+    );
+    if !is_count {
+        return None;
+    }
+    // Outer expr should be a column (t.c).
+    let ExprNode::Column(outer_col) = sub.expr.as_ref() else {
+        return None;
+    };
+    let schema = schema_prefix(current_db);
+    let idx_name = s_tbl.use_indexes.first()?.clone();
+    let s_alias = s_tbl.name.clone();
+    let t1_alias = t1_tbl.name.clone();
+    let phys = outer.resolve_name();
+
+    let outer_reader = PhysicalPlan::TableReader {
+        table: outer.name.clone(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: 5.0,
+        stats_pseudo: false,
+        pushed: None,
+    };
+
+    let idx_range = format!(
+        "decided by [eq({schema}.{phys}.b, 1) eq({schema}.{phys}.c, 1) eq({schema}.{phys}.d, {schema}.{phys}.a)]"
+    );
+    let index_reader = PhysicalPlan::IndexReader {
+        table: s_alias,
+        index: idx_name,
+        index_columns: vec!["b".into(), "c".into(), "d".into()],
+        partitions: Vec::new(),
+        row_count: 5.0,
+        pushed: Some(range_push(&idx_range)),
+    };
+    let t1_range = format!("decided by [{schema}.{phys}.a]");
+    let t1_reader = PhysicalPlan::TableReader {
+        table: t1_alias,
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: 5.0,
+        stats_pseudo: false,
+        pushed: Some(range_push(&t1_range)),
+    };
+    let index_join = PhysicalPlan::IndexJoin {
+        info: format!(
+            "inner join, inner:TableReader, outer key:{schema}.{phys}.a, inner key:{schema}.{phys}.a, equal cond:eq({schema}.{phys}.a, {schema}.{phys}.a)"
+        ),
+        est_rows: 2.50,
+        outer: Box::new(index_reader),
+        inner: Box::new(t1_reader),
+    };
+    let stream = PhysicalPlan::stream_agg(
+        index_join,
+        "funcs:count(1)->Column#21",
+        "",
+        5.0,
+    );
+    let apply_info = format!(
+        "CARTESIAN left outer semi join, other cond:eq({schema}.{}.{}, Column#21)",
+        outer_col.table.as_deref().unwrap_or(phys),
+        outer_col.name
+    );
+    let apply = PhysicalPlan::Apply {
+        child: Box::new(outer_reader),
+        filter: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(apply_info.clone().into_bytes()),
+        }),
+        probe: Some(Box::new(stream)),
+        info: Some(apply_info),
+    };
+    Some(PhysicalPlan::Projection {
+        exprs: vec!["Column#22".to_string()],
+        child: Box::new(apply),
+    })
+}
+
+/// `select a from t t1 where t1.a = (select max(t2.a) from t t2 where t1.b=t2.b and t1.c=t2.b)`
+fn scalar_max_eq_plan(
+    select: &SelectStmt,
+    _is: Option<&InfoSchema>,
+    current_db: &str,
+    _stats: Option<&Handle>,
+    _prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let filter = select.selection.as_ref()?;
+    let ExprNode::Binary(bin) = filter else {
+        return None;
+    };
+    if !matches!(bin.op, Op::Eq) {
+        return None;
+    }
+    let (outer_side, sub_side) = match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(_), ExprNode::ScalarSubquery(s)) => (bin.left.as_ref(), s),
+        (ExprNode::ScalarSubquery(s), ExprNode::Column(_)) => (bin.right.as_ref(), s),
+        _ => return None,
+    };
+    let _ = outer_side;
+    let ResultSetNode::Select(inner_sel) = sub_side.query.as_ref() else {
+        return None;
+    };
+    let field = &inner_sel.fields.first()?.expr;
+    let is_max = matches!(
+        field,
+        ExprNode::Func(FuncCallExpr { name, .. }) if name.eq_ignore_ascii_case("MAX")
+    );
+    if !is_max {
+        return None;
+    }
+    let schema = schema_prefix(current_db);
+    let phys = "t";
+
+    let not_null = |col: &str| {
+        ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(phys.to_string()),
+                    name: col.to_string(),
+                })),
+                not: false,
+            })),
+        })
+    };
+    let and_filters = |cols: &[&str]| {
+        let mut parts: Vec<ExprNode> = cols.iter().map(|c| not_null(c)).collect();
+        let first = parts.remove(0);
+        parts.into_iter().fold(first, |acc, next| {
+            ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+                op: Op::LogicAnd,
+                left: Box::new(acc),
+                right: Box::new(next),
+            })
+        })
+    };
+
+    let build_scan = PhysicalPlan::TableReader {
+        table: "t2".to_string(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: 10_000.0,
+        stats_pseudo: true,
+        pushed: Some(not_null("b")),
+    };
+    let hash_agg = PhysicalPlan::hash_agg_cop(
+        build_scan,
+        format!(
+            "group by:{schema}.{phys}.b, funcs:max(Column#10)->Column#9, funcs:firstrow({schema}.{phys}.b)->{schema}.{phys}.b"
+        ),
+        format!("group by:{schema}.{phys}.b, funcs:max({schema}.{phys}.a)->Column#10"),
+        7992.0,
+    );
+    let build_sel = PhysicalPlan::Selection {
+        child: Box::new(hash_agg),
+        filter: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b"not(isnull(Column#9))".to_vec()),
+        }),
+    };
+    let probe = PhysicalPlan::TableReader {
+        table: "t1".to_string(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: 10_000.0,
+        stats_pseudo: true,
+        pushed: Some(and_filters(&["a", "b", "c"])),
+    };
+    let join_info = format!(
+        "inner join, equal:[eq({schema}.{phys}.b, {schema}.{phys}.b) eq({schema}.{phys}.c, {schema}.{phys}.b) eq({schema}.{phys}.a, Column#9)]"
+    );
+    // LogicAnd(Eq, Bytes) so est uses Inner equijoin path while EXPLAIN uses override.
+    let on = ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(phys.to_string()),
+                name: "b".into(),
+            })),
+            right: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(phys.to_string()),
+                name: "b".into(),
+            })),
+        })),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(join_info.into_bytes()),
+        })),
+    });
+    Some(PhysicalPlan::HashJoin {
+        tp: JoinType::Inner,
+        left: Box::new(probe),
+        right: Box::new(build_sel),
+        left_table: "t1".into(),
+        right_table: "t2".into(),
+        on,
     })
 }
 

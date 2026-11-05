@@ -16,7 +16,26 @@ use sealdb_types::Datum;
 /// predicate with a left-deep HashJoin Semi or Anti.
 pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::Apply { child, filter } => rewrite_apply(rewrite_semi_join(*child), filter),
+        PhysicalPlan::Apply {
+            child,
+            filter,
+            probe,
+            info,
+        } => {
+            let child = rewrite_semi_join(*child);
+            let probe = probe.map(|p| Box::new(rewrite_semi_join(*p)));
+            // Dual-child Apply (count IN IndexJoin) keeps its shape.
+            if probe.is_some() || info.is_some() {
+                PhysicalPlan::Apply {
+                    child: Box::new(child),
+                    filter,
+                    probe,
+                    info,
+                }
+            } else {
+                rewrite_apply(child, filter)
+            }
+        },
         PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join(*child)),
             filter,
@@ -52,10 +71,12 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::HashAgg {
             child,
             info,
+            cop_info,
             est_rows,
         } => PhysicalPlan::HashAgg {
             child: Box::new(rewrite_semi_join(*child)),
             info,
+            cop_info,
             est_rows,
         },
         PhysicalPlan::StreamAgg {
@@ -94,6 +115,17 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             left_table,
             right_table,
             on,
+        },
+        PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer,
+            inner,
+        } => PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer: Box::new(rewrite_semi_join(*outer)),
+            inner: Box::new(rewrite_semi_join(*inner)),
         },
         PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {
             op,
@@ -169,6 +201,8 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
         PhysicalPlan::Apply {
             child: Box::new(plan),
             filter,
+            probe: None,
+            info: None,
         }
     } else {
         PhysicalPlan::Selection {
@@ -184,10 +218,14 @@ fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
             .query
             .as_select()
             .and_then(|query| from_exists(exists.not, query)),
-        ExprNode::InSubquery(sub) if !sub.not => sub
-            .query
-            .as_select()
-            .and_then(|query| from_in(&sub.expr, query, plan_table(outer).as_deref())),
+        ExprNode::InSubquery(sub) => sub.query.as_select().and_then(|query| {
+            from_in(
+                &sub.expr,
+                query,
+                plan_table(outer).as_deref(),
+                sub.not,
+            )
+        }),
         _ => None,
     }
 }
@@ -209,7 +247,14 @@ fn from_exists(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
 
 /// `outer_col IN (SELECT inner_col FROM t [WHERE …])`.
 /// Correlated WHERE preds become `other cond`; ORDER BY is ignored (semi).
-fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Option<SemiSpec> {
+fn from_in(
+    expr: &ExprNode,
+    query: &SelectStmt,
+    outer_table: Option<&str>,
+    not: bool,
+) -> Option<SemiSpec> {
+    let join_tp = if not { JoinType::Anti } else { JoinType::Semi };
+    let join_label = if not { "anti semi join" } else { "semi join" };
     let inner = simple_inner(query)?;
     // ORDER BY in an IN subquery is meaningless for semi-join and is dropped.
     let (inner_filter, other_conds) = split_in_selection(query.selection.as_ref(), &inner.name)?;
@@ -223,18 +268,67 @@ fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Op
         && other_conds.is_empty()
         && inner_filter.is_none()
     {
+        let cart = if not {
+            "CARTESIAN anti semi join"
+        } else {
+            "CARTESIAN semi join"
+        };
         let info = format!(
-            "CARTESIAN semi join, other cond:eq({}, {})",
+            "{cart}, other cond:eq({}, {})",
             explain_semi_pred(&outer_expr),
             explain_semi_pred(&inner_expr),
         );
         return Some(SemiSpec {
-            tp: JoinType::Semi,
+            tp: join_tp,
             right_table: inner.name.clone(),
             right: PhysicalPlan::table_reader(inner.name.clone(), Vec::new()),
             on: ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(info.into_bytes()),
             }),
+            outer_filter: None,
+        });
+    }
+    // `name NOT IN (SELECT const FROM exam WHERE exam.stu_id = stu.id)`:
+    // equal on correlated keys; other cond:eq(outer_col, const).
+    // ON = LogicAnd(Eq, Bytes(explain)) so HashJoin can probe on the key
+    // while EXPLAIN still prints the full anti/semi info string.
+    if matches!(inner_expr, ExprNode::Value(_)) && !other_conds.is_empty() {
+        let _outer = outer_table?;
+        let equals: Vec<&ExprNode> = other_conds
+            .iter()
+            .filter(|c| is_eq_across_tables_any(c, &inner.name))
+            .collect();
+        if equals.is_empty() {
+            return None;
+        }
+        let equal_info = equals
+            .iter()
+            .map(|e| explain_semi_eq_outer_first(e, &inner.name))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let other = format!(
+            "eq({}, {})",
+            explain_semi_pred(&outer_expr),
+            explain_semi_pred(&inner_expr)
+        );
+        let info = format!("{join_label}, equal:[{equal_info}], other cond:{other}");
+        let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+        if let Some(filter) = inner_filter {
+            right = push_isnull_filter(right, filter);
+        }
+        let eq = (*equals.first()?).clone();
+        let on = ExprNode::Binary(BinaryOpExpr {
+            op: Op::LogicAnd,
+            left: Box::new(eq),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(info.into_bytes()),
+            })),
+        });
+        return Some(SemiSpec {
+            tp: join_tp,
+            right_table: inner.name.clone(),
+            right,
+            on,
             outer_filter: None,
         });
     }
@@ -247,7 +341,7 @@ fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Op
     let equal = eq_expr(outer_expr.clone(), inner_expr.clone());
     if other_conds.is_empty() {
         return Some(build_spec(
-            JoinType::Semi,
+            join_tp,
             inner.name.clone(),
             inner_filter,
             equal,
@@ -265,7 +359,7 @@ fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Op
         right = push_isnull_filter(right, filter);
     }
     let info = format!(
-        "semi join, equal:[{}], other cond:{}",
+        "{join_label}, equal:[{}], other cond:{}",
         explain_semi_eq(&outer_expr, &inner_expr),
         other_conds
             .iter()
@@ -274,7 +368,7 @@ fn from_in(expr: &ExprNode, query: &SelectStmt, outer_table: Option<&str>) -> Op
             .join(", ")
     );
     Some(SemiSpec {
-        tp: JoinType::Semi,
+        tp: join_tp,
         right_table: inner.name.clone(),
         right,
         on: ExprNode::Value(ValueExpr {
@@ -408,6 +502,20 @@ fn explain_semi_eq(left: &ExprNode, right: &ExprNode) -> String {
     )
 }
 
+/// TiDB EXPLAIN prints outer column first in semi/anti equal lists.
+fn explain_semi_eq_outer_first(eq: &ExprNode, inner: &str) -> String {
+    let ExprNode::Binary(bin) = eq else {
+        return explain_semi_pred(eq);
+    };
+    let (outer, inn) =
+        if col_table(&bin.left).is_some_and(|t| t.eq_ignore_ascii_case(inner)) {
+            (bin.right.as_ref(), bin.left.as_ref())
+        } else {
+            (bin.left.as_ref(), bin.right.as_ref())
+        };
+    explain_semi_eq(outer, inn)
+}
+
 fn explain_semi_pred(expr: &ExprNode) -> String {
     match expr {
         ExprNode::Binary(bin) => {
@@ -445,8 +553,25 @@ fn explain_semi_col(expr: &ExprNode) -> String {
                 format!("{schema}.{table}.{}", c.name)
             }
         }
+        // TiDB EXPLAIN uses double-quoted string literals.
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) => format!("\"{}\"", String::from_utf8_lossy(b).replace('\"', "\\\"")),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::I64(v),
+        }) => v.to_string(),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::U64(v),
+        }) => v.to_string(),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Null,
+        }) => "NULL".into(),
         other => other.restore_string(),
     }
+}
+
+fn is_eq_across_tables_any(expr: &ExprNode, inner: &str) -> bool {
+    is_join_eq(expr, inner)
 }
 
 /// Single-table subquery with no grouping, limit, CTE, or extra joins.
@@ -605,9 +730,16 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
                 }
             }
         }
-        PhysicalPlan::Apply { child, filter } => PhysicalPlan::Apply {
+        PhysicalPlan::Apply {
+            child,
+            filter,
+            probe,
+            info,
+        } => PhysicalPlan::Apply {
             child: Box::new(rewrite_semi_join_agg(*child)),
             filter,
+            probe: probe.map(|p| Box::new(rewrite_semi_join_agg(*p))),
+            info,
         },
         PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join_agg(*child)),
@@ -644,11 +776,24 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::HashAgg {
             child,
             info,
+            cop_info,
             est_rows,
         } => PhysicalPlan::HashAgg {
             child: Box::new(rewrite_semi_join_agg(*child)),
             info,
+            cop_info,
             est_rows,
+        },
+        PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer,
+            inner,
+        } => PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer: Box::new(rewrite_semi_join_agg(*outer)),
+            inner: Box::new(rewrite_semi_join_agg(*inner)),
         },
         PhysicalPlan::StreamAgg {
             child,
