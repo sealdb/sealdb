@@ -1596,6 +1596,13 @@ fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
     }
 }
 
+fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> String {
+    // OrigTblName: alias of physical `t` stays `select.t.a`; real tables use
+    // their name (`select.t1.a`).
+    let table = col.table.as_deref().unwrap_or("t");
+    format!("select.{table}.{}", col.name)
+}
+
 fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
@@ -1603,13 +1610,11 @@ fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
     match on {
         ExprNode::Binary(bin) if bin.op == Op::Eq => {
             let left = match bin.left.as_ref() {
-                // TiDB join ExplainInfo uses the base table identity (`select.t.a`),
-                // not the alias; aliases still appear on TableFullScan access.
-                ExprNode::Column(c) => format!("select.t.{}", c.name),
+                ExprNode::Column(c) => explain_join_col(c),
                 other => other.restore_string(),
             };
             let right = match bin.right.as_ref() {
-                ExprNode::Column(c) => format!("select.t.{}", c.name),
+                ExprNode::Column(c) => explain_join_col(c),
                 ExprNode::Value(ValueExpr {
                     datum: Datum::I64(v),
                 }) => v.to_string(),

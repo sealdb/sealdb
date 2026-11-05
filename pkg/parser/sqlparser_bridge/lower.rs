@@ -5159,6 +5159,15 @@ fn lower_table_with_joins_item(
                 )));
             }
         };
+        // OrigTblName for ExplainInfo: `t t1` → select.t.a (not select.t1.a).
+        let mut alias_map = Vec::new();
+        collect_from_item_aliases(&left, &mut alias_map);
+        collect_from_item_aliases(&right, &mut alias_map);
+        let on = if alias_map.is_empty() {
+            on
+        } else {
+            rewrite_join_on_aliases(on, &alias_map)
+        };
         left = crate::ast::FromItem::Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -5167,6 +5176,20 @@ fn lower_table_with_joins_item(
         };
     }
     Ok((left, ctes))
+}
+
+fn collect_from_item_aliases(item: &crate::ast::FromItem, out: &mut Vec<(String, String)>) {
+    match item {
+        crate::ast::FromItem::Table(t) => {
+            if let Some(physical) = &t.physical {
+                out.push((t.name.clone(), physical.clone()));
+            }
+        }
+        crate::ast::FromItem::Join { left, right, .. } => {
+            collect_from_item_aliases(left, out);
+            collect_from_item_aliases(right, out);
+        }
+    }
 }
 
 fn table_factor_item(
