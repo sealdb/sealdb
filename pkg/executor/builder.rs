@@ -1016,10 +1016,14 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
                 }
             }
             // TIMESTAMP/DATE/TIME literals: TiDB uses field.Text().
-            sealdb_types::Datum::Time(_) => orig_text
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| tidb_expr_display_name(inner)),
+            sealdb_types::Datum::Time(t) => {
+                let raw = orig_text.unwrap_or("").trim();
+                if raw.is_empty() {
+                    t.to_string()
+                } else {
+                    raw.to_string()
+                }
+            }
         },
         ExprNode::Column(_) => tidb_expr_display_name(inner),
         _ => {
@@ -1067,7 +1071,8 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
             sealdb_types::Datum::F64(n) => n.to_string(),
             sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
             sealdb_types::Datum::Null => "NULL".into(),
-            other => format!("{other:?}"),
+            sealdb_types::Datum::Time(t) => t.to_string(),
+            sealdb_types::Datum::Decimal(d) => d.to_string(),
         },
         ExprNode::Binary(b) => {
             let op = match b.op {
