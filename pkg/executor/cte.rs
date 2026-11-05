@@ -4,10 +4,13 @@
 use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
-use sealdb_errno::{ERR_DUP_FIELDNAME, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+    Error, Result,
+};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
 use sealdb_parser::ast::{
     SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprType, Statement, WithClause,
 };
@@ -152,6 +155,8 @@ pub struct CTEExec {
     current_db: String,
     txn: Arc<TxnHandle>,
     share: bool,
+    /// Seed nested WITH reuses `name`; recursive working names stay seed output.
+    shadow_same_name: bool,
     from_cache: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
@@ -169,6 +174,7 @@ impl CTEExec {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         share: bool,
+        shadow_same_name: bool,
     ) -> Self {
         Self {
             columns,
@@ -179,6 +185,7 @@ impl CTEExec {
             current_db: current_db.into(),
             txn,
             share,
+            shadow_same_name,
             from_cache: false,
             schema: Vec::new(),
             rows: Vec::new(),
@@ -198,7 +205,8 @@ impl Executor for CTEExec {
             return Ok(());
         }
         self.seed.open()?;
-        self.schema = self.seed.schema().to_vec();
+        let seed_schema = self.seed.schema().to_vec();
+        self.schema = seed_schema.clone();
         self.rows = collect_rows(&mut self.seed)?;
         if !self.columns.is_empty() {
             let width = self
@@ -208,16 +216,33 @@ impl Executor for CTEExec {
                 .unwrap_or(self.schema.len());
             if width != 0 && self.columns.len() != width {
                 return Err(Error::new(
-                    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-                    "The used SELECT statements have a different number of columns",
+                    ERR_VIEW_WRONG_LIST,
+                    "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts",
                 ));
             }
-            self.schema = self.columns.clone();
+            // Remap output names; recursive working set may keep seed names when
+            // a same-name nested WITH shadowed the CTE (TiDB errno 1054).
+            if !self.shadow_same_name {
+                self.schema = self.columns.clone();
+            }
         }
         // TiDB/MySQL: derived-table / CTE output names must be unique (errno 1060),
         // including after `SELECT *` expands join schemas with overlapping names.
         check_duplicate_field_names(&self.schema)?;
         if let Some((op, rec)) = self.recursive.clone() {
+            // TiDB: same-name nested WITH keeps recursive names as seed output;
+            // outer col_name_list refs in the recursive arm → errno 1054.
+            if self.shadow_same_name {
+                if let Some(bad) =
+                    unknown_outer_col_in_recursive(&rec, &self.schema, &self.columns)
+                {
+                    let _ = self.seed.close();
+                    return Err(Error::new(
+                        ERR_BAD_FIELD,
+                        format!("Unknown column '{bad}' in 'where clause'"),
+                    ));
+                }
+            }
             self.rows = iterate_recursive(
                 &self.name,
                 self.schema.clone(),
@@ -228,6 +253,9 @@ impl Executor for CTEExec {
                 &self.current_db,
                 &self.txn,
             )?;
+        }
+        if !self.columns.is_empty() {
+            self.schema = self.columns.clone();
         }
         if self.share {
             store_shared_cte(&self.name, self.schema.clone(), self.rows.clone());
@@ -287,6 +315,14 @@ fn iterate_recursive(
         let next = with_working_cte(name, schema.clone(), working.clone(), || {
             run_select(&rec, domain, current_db, txn)
         })?;
+        if let Some(row) = next.rows.first() {
+            if row.len() != schema.len() {
+                return Err(Error::new(
+                    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                    "The used SELECT statements have a different number of columns",
+                ));
+            }
+        }
         let mut step = Vec::new();
         for row in next.rows {
             if distinct && !seen.insert(row_key(&row)) {
@@ -340,4 +376,81 @@ fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {
 
 fn row_key(row: &[Datum]) -> Vec<String> {
     row.iter().map(Datum::display).collect()
+}
+
+/// First outer `col_name_list` name referenced by the recursive arm that is not
+/// present in the seed output schema (TiDB same-name nested WITH shadowing).
+fn unknown_outer_col_in_recursive(
+    rec: &SelectStmt,
+    seed_schema: &[String],
+    outer_cols: &[String],
+) -> Option<String> {
+    if outer_cols.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    let mut visit = |col: &ColumnNameExpr| {
+        if found.is_some() {
+            return;
+        }
+        let is_outer = outer_cols
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&col.name));
+        if !is_outer {
+            return;
+        }
+        let in_seed = seed_schema.iter().any(|s| {
+            let bare = s.rsplit('.').next().unwrap_or(s.as_str());
+            bare.eq_ignore_ascii_case(&col.name) || s.eq_ignore_ascii_case(&col.name)
+        });
+        if !in_seed {
+            found = Some(col.name.clone());
+        }
+    };
+    if let Some(sel) = &rec.selection {
+        walk_expr_columns(sel, &mut visit);
+    }
+    for field in &rec.fields {
+        walk_expr_columns(&field.expr, &mut visit);
+    }
+    found
+}
+
+fn walk_expr_columns(expr: &ExprNode, visit: &mut impl FnMut(&ColumnNameExpr)) {
+    match expr {
+        ExprNode::Column(c) => visit(c),
+        ExprNode::Binary(b) => {
+            walk_expr_columns(&b.left, visit);
+            walk_expr_columns(&b.right, visit);
+        }
+        ExprNode::Unary(u) => walk_expr_columns(&u.expr, visit),
+        ExprNode::Func(f) => {
+            for arg in &f.args {
+                walk_expr_columns(arg, visit);
+            }
+        }
+        ExprNode::Cast(c) => walk_expr_columns(&c.expr, visit),
+        ExprNode::InList(i) => {
+            walk_expr_columns(&i.expr, visit);
+            for e in &i.list {
+                walk_expr_columns(e, visit);
+            }
+        }
+        ExprNode::Between(b) => {
+            walk_expr_columns(&b.expr, visit);
+            walk_expr_columns(&b.low, visit);
+            walk_expr_columns(&b.high, visit);
+        }
+        ExprNode::Like(l) => {
+            walk_expr_columns(&l.expr, visit);
+            walk_expr_columns(&l.pattern, visit);
+        }
+        ExprNode::IsNull(i) => walk_expr_columns(&i.expr, visit),
+        ExprNode::Value(_)
+        | ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_)
+        | ExprNode::Window(_) => {}
+    }
 }

@@ -29,6 +29,8 @@ pub const ERR_LOCK_NOWAIT: i32 = 3572;
 pub const ERR_LOCK_DEADLOCK: i32 = 1213;
 pub const ERR_SUBQUERY_NO_1_ROW: i32 = 1242;
 pub const ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT: i32 = 1222;
+/// CTE / derived / VIEW: SELECT list vs column names list (MySQL ER_VIEW_WRONG_LIST).
+pub const ERR_VIEW_WRONG_LIST: i32 = 1353;
 pub const ERR_DUP_FIELDNAME: i32 = 1060;
 pub const ERR_DUP_KEYNAME: i32 = 1061;
 pub const ERR_CANT_DROP_FIELD_OR_KEY: i32 = 1091;

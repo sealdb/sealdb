@@ -485,6 +485,12 @@ impl ExecutorBuilder {
                     .with_clause()
                     .ok_or_else(|| Error::unsupported("CTE without WITH"))?;
                 let first = with.seed_select(name)?;
+                // TiDB: same-name nested WITH keeps recursive working-table names
+                // as the seed output (not outer col_name_list) → errno 1054.
+                let shadow_same_name = first
+                    .with
+                    .as_ref()
+                    .is_some_and(|nested| nested.find(name).is_some());
                 let rest = with.set_rest(name)?;
                 let seed_stmt = if rest.is_empty() {
                     Statement::Select(first)
@@ -509,6 +515,7 @@ impl ExecutorBuilder {
                     current_db,
                     txn,
                     share,
+                    shadow_same_name,
                 )))
             }
             PhysicalPlan::HashJoin {

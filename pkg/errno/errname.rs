@@ -31,6 +31,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_LOCK_DEADLOCK => "ErrLockDeadlock",
         errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "ErrWrongNumberOfColumnsInSelect",
+        errcode::ERR_VIEW_WRONG_LIST => "ErrViewWrongList",
         errcode::ERR_DUP_FIELDNAME => "ErrDupFieldName",
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
