@@ -6649,6 +6649,26 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             target: data_type_name(data_type),
         })),
         Expr::TypedString(ts) => lower_typed_string(ts),
+        Expr::Interval(iv) => {
+            // Bare INTERVAL is only meaningful inside DATE_ADD/DATE_SUB; keep as
+            // a 2-arg synthetic call for restore/eval diagnostics.
+            let value = lower_expr(&iv.value)?;
+            let unit = iv
+                .leading_field
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "DAY".to_string());
+            Ok(ExprNode::Func(FuncCallExpr {
+                name: "__sealdb_interval".to_string(),
+                args: vec![
+                    value,
+                    ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(unit.into_bytes()),
+                    }),
+                ],
+                distinct: false,
+            }))
+        }
         Expr::Function(func) => lower_function(func),
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("null") => {
             Ok(ExprNode::Value(ValueExpr { datum: Datum::Null }))
@@ -6786,6 +6806,23 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
     }
 }
 
+fn lower_function_arg(arg: &FunctionArg) -> Result<ExprNode> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } => lower_expr(expr),
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        | FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
+            Ok(ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(b"*".to_vec()),
+            }))
+        }
+        _ => Err(Error::unsupported("function argument form")),
+    }
+}
+
 fn lower_typed_string(ts: &TypedString) -> Result<ExprNode> {
     let raw = ts
         .value
@@ -6812,36 +6849,69 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         return lower_window_func(func, over);
     }
     let name = func.name.to_string();
+    let upper = name.to_ascii_uppercase();
+    // DATE_ADD/DATE_SUB(expr, INTERVAL n UNIT) → Func(expr, n, unit)
+    if matches!(
+        upper.as_str(),
+        "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE"
+    ) {
+        if let FunctionArguments::List(list) = &func.args
+            && list.args.len() == 2
+            && let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Interval(iv))) = &list.args[1]
+        {
+            let expr = lower_function_arg(&list.args[0])?;
+            let value = lower_expr(&iv.value)?;
+            let unit = iv
+                .leading_field
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "DAY".to_string());
+            let fname = if upper == "ADDDATE" {
+                "DATE_ADD"
+            } else if upper == "SUBDATE" {
+                "DATE_SUB"
+            } else {
+                upper.as_str()
+            };
+            return Ok(ExprNode::Func(FuncCallExpr {
+                name: fname.to_string(),
+                args: vec![
+                    expr,
+                    value,
+                    ExprNode::Value(ValueExpr {
+                        datum: Datum::Bytes(unit.into_bytes()),
+                    }),
+                ],
+                distinct: false,
+            }));
+        }
+    }
     let distinct = match &func.args {
         FunctionArguments::List(list) => {
             matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
         }
         _ => false,
     };
-    let args = match &func.args {
+    let mut args = match &func.args {
         FunctionArguments::List(list) => list
             .args
             .iter()
-            .map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                | FunctionArg::Named {
-                    arg: FunctionArgExpr::Expr(expr),
-                    ..
-                } => lower_expr(expr),
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                | FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
-                    Ok(ExprNode::Value(ValueExpr {
-                        datum: Datum::Bytes(b"*".to_vec()),
-                    }))
-                }
-                _ => Err(Error::unsupported("function argument form")),
-            })
+            .map(lower_function_arg)
             .collect::<Result<Vec<_>>>()?,
         FunctionArguments::None => Vec::new(),
         FunctionArguments::Subquery(_) => {
             return Err(Error::unsupported("function subquery argument"));
         }
     };
+    // TIMESTAMPADD/TIMESTAMPDIFF: unit keyword lowers as Column → Bytes.
+    if matches!(upper.as_str(), "TIMESTAMPADD" | "TIMESTAMPDIFF")
+        && let Some(ExprNode::Column(c)) = args.first()
+    {
+        let unit = c.name.clone();
+        args[0] = ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(unit.into_bytes()),
+        });
+    }
     // TiDB opcode.Not2 (`!`): rewritten as `__sealdb_bang(expr)`.
     if name.eq_ignore_ascii_case(SEALDB_BANG_FN) {
         if args.len() != 1 {

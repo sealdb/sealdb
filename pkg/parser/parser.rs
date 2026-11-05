@@ -2012,3 +2012,32 @@ mod timestamp_lit_parse {
         assert!(matches!(d, sealdb_types::Datum::Time(_)), "{d:?}");
     }
 }
+
+#[cfg(test)]
+mod date_add_parse {
+    use super::*;
+    use crate::ast::ExprNode;
+    #[test]
+    fn parse_date_add_and_timestampadd() {
+        let stmt = Parser::new()
+            .parse_one_stmt("SELECT DATE_ADD('2025-03-30 02:30:00', INTERVAL 1 HOUR)")
+            .unwrap();
+        match &stmt.as_select().unwrap().fields[0].expr {
+            ExprNode::Func(f) => {
+                assert_eq!(f.name, "DATE_ADD");
+                assert_eq!(f.args.len(), 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        let stmt = Parser::new()
+            .parse_one_stmt("SELECT TIMESTAMPADD(HOUR, 1, ts)")
+            .unwrap();
+        match &stmt.as_select().unwrap().fields[0].expr {
+            ExprNode::Func(f) => {
+                assert_eq!(f.name, "TIMESTAMPADD");
+                assert!(matches!(f.args[0], ExprNode::Value(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
