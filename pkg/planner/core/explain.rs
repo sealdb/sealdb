@@ -325,8 +325,13 @@ fn walk_with_parent(
     if under_stream_agg && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:StreamAgg".to_string();
     }
-    let bushy = matches!(plan, PhysicalPlan::HashJoin { .. })
-        || matches!(parent, Some(PhysicalPlan::HashJoin { .. }));
+    let bushy = matches!(
+        plan,
+        PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+    ) || matches!(
+        parent,
+        Some(PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. })
+    );
     let prefix = if bushy || !spine.is_empty() {
         tree_prefix_with_spine(spine, depth, last)
     } else {
@@ -348,12 +353,15 @@ fn walk_with_parent(
     });
     // DistSQL readers expand into TiDB-shaped cop children (TableFullScan /
     // IndexRangeScan / TableRowIDScan) so EXPLAIN shows task=cop estRows.
-    let under_hash_join = matches!(parent, Some(PhysicalPlan::HashJoin { .. }));
+    let under_bushy = matches!(
+        parent,
+        Some(PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. })
+    );
     if emit_cop_children(
         plan,
         topn_parent,
         stream_parent,
-        under_hash_join,
+        under_bushy,
         depth + 1,
         next_id,
         rows,
@@ -366,7 +374,11 @@ fn walk_with_parent(
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
         let mut child_spine = spine.to_vec();
-        if matches!(plan, PhysicalPlan::HashJoin { .. }) || !spine.is_empty() {
+        if matches!(
+            plan,
+            PhysicalPlan::HashJoin { .. } | PhysicalPlan::PartitionUnion { .. }
+        ) || !spine.is_empty()
+        {
             child_spine.push(!child_last);
         }
         walk_with_parent(
@@ -388,7 +400,7 @@ fn emit_cop_children(
     plan: &PhysicalPlan,
     topn_parent: Option<(&str, u64, u64)>,
     stream_parent: Option<(&str, &str, f64)>,
-    under_hash_join: bool,
+    under_bushy: bool,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
@@ -399,17 +411,17 @@ fn emit_cop_children(
     match plan {
         PhysicalPlan::TableReader {
             table,
-            partitions,
+            partition_names,
+            row_count,
+            stats_pseudo,
             pushed,
+            ..
         } => {
-            let scan_access = table_access(table, partitions);
-            let scan_est = table_scan_est_rows();
+            let scan_access = table_access(table, partition_names);
+            let scan_est = *row_count;
             let mut scan_depth = depth;
-            let scan_task = if under_stream_agg || under_hash_join {
-                "cop[tikv]"
-            } else {
-                "cop"
-            };
+            // TiDB always labels DistSQL scans `cop[tikv]` for TableFullScan.
+            let scan_task = "cop[tikv]";
             if let Some((_, cop_info, est)) = stream_parent {
                 // TiDB partial StreamAgg pushed into TableReader.
                 let info = if cop_info.is_empty() {
@@ -432,13 +444,13 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            let scan_info = if under_stream_agg || under_hash_join {
+            let scan_info = if *stats_pseudo {
                 "keep order:false, stats:pseudo".to_string()
             } else {
                 "keep order:false".to_string()
             };
             // Cop children inherit the TableReader's spine; the reader was already
-            // emitted with the correct │/space for HashJoin siblings.
+            // emitted with the correct │/space for HashJoin / PartitionUnion siblings.
             let cop_spine = spine;
             if let Some(filter) = pushed.as_ref() {
                 push_explain_row_spine(
@@ -453,10 +465,10 @@ fn emit_cop_children(
                         access: String::new(),
                         info: explain_pushed_filter(table, filter),
                     },
-                    if under_hash_join { cop_spine } else { &[] },
+                    if under_bushy { cop_spine } else { &[] },
                 );
                 let mut scan_spine = cop_spine.to_vec();
-                if under_hash_join {
+                if under_bushy {
                     scan_spine.push(false);
                 }
                 push_explain_row_spine(
@@ -471,7 +483,7 @@ fn emit_cop_children(
                         access: scan_access,
                         info: scan_info,
                     },
-                    if under_hash_join { &scan_spine } else { &[] },
+                    if under_bushy { &scan_spine } else { &[] },
                 );
             } else {
                 push_explain_row_spine(
@@ -486,7 +498,7 @@ fn emit_cop_children(
                         access: scan_access,
                         info: scan_info,
                     },
-                    if under_hash_join { cop_spine } else { &[] },
+                    if under_bushy { cop_spine } else { &[] },
                 );
             }
             true
@@ -652,7 +664,7 @@ fn emit_cop_children(
                     name: "TableRowIDScan",
                     est: scan_est,
                     task: "cop",
-                    access: table_access(table, partitions),
+                    access: table_access(table, &[]),
                     info: "keep order:false".to_string(),
                 },
             );
@@ -699,7 +711,7 @@ fn emit_cop_children(
                     name: "TableRowIDScan",
                     est: scan_est,
                     task: "cop",
-                    access: table_access(table, partitions),
+                    access: table_access(table, &[]),
                     info: "keep order:false".to_string(),
                 },
             );
@@ -751,11 +763,13 @@ fn push_explain_row_spine(
     });
 }
 
-fn table_access(table: &str, partitions: &[i64]) -> String {
-    if partitions.is_empty() {
+fn table_access(table: &str, partition_names: &[String]) -> String {
+    if partition_names.is_empty() {
         format!("table:{table}")
+    } else if partition_names.len() == 1 {
+        format!("table:{table}, partition:{}", partition_names[0])
     } else {
-        format!("table:{table}, partition:{partitions:?}")
+        format!("table:{table}, partition:{}", partition_names.join(","))
     }
 }
 
@@ -774,11 +788,6 @@ fn index_access_cols(table: &str, index: &str, cols: &[String], partitions: &[i6
     } else {
         format!("table:{table}, index:{index}, partition:{partitions:?}")
     }
-}
-
-
-fn table_scan_est_rows() -> f64 {
-    10_000.0
 }
 
 fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, String) {
@@ -863,6 +872,25 @@ fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> 
             let right = match bin.right.as_ref() {
                 ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
                 ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+                ExprNode::Unary(u)
+                    if u.op == Op::UnaryMinus
+                        && matches!(
+                            u.expr.as_ref(),
+                            ExprNode::Value(ValueExpr {
+                                datum: Datum::I64(_) | Datum::U64(_),
+                            })
+                        ) =>
+                {
+                    match u.expr.as_ref() {
+                        ExprNode::Value(ValueExpr {
+                            datum: Datum::I64(v),
+                        }) => format!("-{}", v),
+                        ExprNode::Value(ValueExpr {
+                            datum: Datum::U64(v),
+                        }) => format!("-{}", v),
+                        _ => unreachable!(),
+                    }
+                }
                 other => other.restore_string(),
             };
             format!("{op}({left}, {right})")
@@ -911,11 +939,13 @@ fn collect_dot_cop_children(
     match plan {
         PhysicalPlan::TableReader {
             table,
-            partitions,
+            partition_names,
+            row_count,
             pushed,
+            ..
         } => {
-            let scan_access = table_access(table, partitions);
-            let scan_est = table_scan_est_rows();
+            let scan_access = table_access(table, partition_names);
+            let scan_est = *row_count;
             if let Some(filter) = pushed.as_ref() {
                 Some(vec![
                     push_dot_node(
@@ -1003,7 +1033,7 @@ fn collect_dot_cop_children(
                 nodes,
                 "TableRowIDScan",
                 scan_est,
-                &table_access(table, partitions),
+                &table_access(table, &[]),
                 "keep order:false",
             );
             Some(vec![idx, row])
@@ -1039,7 +1069,7 @@ fn collect_dot_cop_children(
                 nodes,
                 "TableRowIDScan",
                 scan_est,
-                &table_access(table, partitions),
+                &table_access(table, &[]),
                 "keep order:false",
             ));
             Some(ids)
@@ -1085,6 +1115,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::Union { left, right, .. } => {
             vec![left.as_ref(), right.as_ref()]
         }
+        PhysicalPlan::PartitionUnion { children } => children.iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -1112,14 +1143,27 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         ),
         PhysicalPlan::Update => ("Update".to_string(), String::new(), String::new()),
         PhysicalPlan::Delete => ("Delete".to_string(), String::new(), String::new()),
-        PhysicalPlan::TableReader { pushed, .. } => (
+        PhysicalPlan::TableReader {
+            pushed,
+            partition_access,
+            ..
+        } => (
             "TableReader".to_string(),
-            String::new(),
+            if partition_access.is_empty() {
+                String::new()
+            } else {
+                format!("partition:{partition_access}")
+            },
             if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
                 "data:TableFullScan".to_string()
             },
+        ),
+        PhysicalPlan::PartitionUnion { .. } => (
+            "PartitionUnion".to_string(),
+            String::new(),
+            String::new(),
         ),
         PhysicalPlan::PointGet {
             table,
@@ -1250,6 +1294,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
     }
 }
 
+fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    matches!(filter, ExprNode::Binary(bin) if bin.op == Op::Eq)
+}
+
 fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
@@ -1258,18 +1308,41 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::Selection { child, filter, .. } => {
             if is_not_isnull(filter) {
                 est_rows(child) * 0.999
+            } else if is_equality_filter(filter) {
+                let base = est_rows(child);
+                if base >= 10_000.0 {
+                    10.0
+                } else {
+                    1.0
+                }
             } else {
                 est_rows(child) * 0.8
             }
         }
         PhysicalPlan::TableReader {
             pushed: Some(filter),
+            row_count,
             ..
-        } if is_not_isnull(filter) => 9_990.0,
+        } if is_not_isnull(filter) => (*row_count * 0.999).min(9_990.0),
         PhysicalPlan::TableReader {
-            pushed: Some(_), ..
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if is_equality_filter(filter) => {
+            if *row_count >= 10_000.0 {
+                10.0
+            } else {
+                1.0
+            }
         }
-        | PhysicalPlan::IndexLookUpReader {
+        PhysicalPlan::TableReader {
+            pushed: Some(_),
+            row_count,
+            ..
+        } => *row_count * 0.8,
+        PhysicalPlan::TableReader { row_count, .. } => *row_count,
+        PhysicalPlan::PartitionUnion { children } => children.iter().map(est_rows).sum(),
+        PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
         }
         | PhysicalPlan::IndexReader {

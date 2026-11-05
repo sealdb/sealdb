@@ -316,6 +316,7 @@ impl ExecutorBuilder {
                 table,
                 partitions,
                 pushed,
+                ..
             } => {
                 let from = resolve_reader_table(stmt, table)?;
                 Ok(Box::new(TableReaderExec::new(
@@ -328,6 +329,24 @@ impl ExecutorBuilder {
                     partitions.clone(),
                     pushed.clone(),
                 )))
+            }
+            PhysicalPlan::PartitionUnion { children } => {
+                let mut iter = children.iter();
+                let first = iter
+                    .next()
+                    .ok_or_else(|| Error::unsupported("empty PartitionUnion"))?;
+                let mut exec =
+                    Self::build(first, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?;
+                for child in iter {
+                    let right =
+                        Self::build(child, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?;
+                    exec = Box::new(UnionExec::new(
+                        exec,
+                        right,
+                        sealdb_parser::ast::SetOprType::UnionAll,
+                    ));
+                }
+                Ok(exec)
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
             PhysicalPlan::HashAgg { child, .. } => {

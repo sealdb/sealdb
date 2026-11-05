@@ -5,7 +5,9 @@ use super::plan_cost::{
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension, eq_join_edge};
-use super::rule_partition_processor::{PartitionPruneMode, plan_partitions};
+use super::rule_partition_processor::{
+    PartitionPruneMode, plan_partitions, resolve_partitions,
+};
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
@@ -906,6 +908,80 @@ fn point_or_batch(
     }
 }
 
+/// Build a TableReader / PartitionUnion for a (possibly partitioned) table.
+fn partitioned_table_reader(
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    selection: Option<&ExprNode>,
+    prune_mode: PartitionPruneMode,
+    stats: Option<&Handle>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let planned = resolve_partitions(info, selection, &from.partition_names, prune_mode);
+    let row_count = table_row_count(stats, from, current_db);
+    let (db, table) = from.qualified(current_db);
+    let stats_pseudo = !stats
+        .and_then(|h| h.table(&db, &table))
+        .is_some_and(|t| t.version > 0);
+    // Per-partition est for static PartitionUnion children.
+    let part_rows = if planned.ids.len() > 1 && stats_pseudo {
+        10_000.0
+    } else if planned.ids.len() > 1 {
+        (row_count / planned.ids.len() as f64).max(1.0)
+    } else {
+        row_count
+    };
+
+    match prune_mode {
+        PartitionPruneMode::Static if planned.ids.len() > 1 => {
+            let children = planned
+                .ids
+                .iter()
+                .zip(planned.names.iter())
+                .map(|(id, name)| {
+                    PhysicalPlan::table_reader_parts(
+                        from.name.clone(),
+                        vec![*id],
+                        vec![name.clone()],
+                        String::new(),
+                        part_rows,
+                        stats_pseudo,
+                    )
+                })
+                .collect();
+            PhysicalPlan::PartitionUnion { children }
+        }
+        PartitionPruneMode::Static => PhysicalPlan::table_reader_parts(
+            from.name.clone(),
+            planned.ids,
+            planned.names,
+            String::new(),
+            row_count,
+            stats_pseudo,
+        ),
+        PartitionPruneMode::Dynamic => {
+            // Dynamic: executor prunes; EXPLAIN shows partition access on reader.
+            let access = if info.partition.as_ref().is_some_and(|p| p.enable) {
+                if planned.all {
+                    "all".to_string()
+                } else {
+                    planned.names.join(",")
+                }
+            } else {
+                String::new()
+            };
+            PhysicalPlan::table_reader_parts(
+                from.name.clone(),
+                Vec::new(),
+                Vec::new(),
+                access,
+                row_count,
+                stats_pseudo,
+            )
+        }
+    }
+}
+
 fn index_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -1314,13 +1390,19 @@ fn access_plan(
                         index: Some(index.name.o().to_string()),
                     };
                 }
-                let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
                 // unanalyzed tables keep the index path.
                 // after ANALYZE, TopN/NDV drives TableReader vs index.
                 if let Some(eq_rows) = eq_row_count_value(stats, from, current_db, column, value) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
-                        return PhysicalPlan::table_reader(from.name.clone(), partitions);
+                        return partitioned_table_reader(
+                            from,
+                            info,
+                            select.selection.as_ref(),
+                            prune_mode,
+                            stats,
+                            current_db,
+                        );
                     }
                 }
                 return index_plan(select, from, info, index, prune_mode);
@@ -1350,9 +1432,13 @@ fn access_plan(
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {
             return plan;
         }
-        return PhysicalPlan::table_reader(
-            from.name.clone(),
-            plan_partitions(info, select.selection.as_ref(), prune_mode),
+        return partitioned_table_reader(
+            from,
+            info,
+            select.selection.as_ref(),
+            prune_mode,
+            stats,
+            current_db,
         );
     }
     if let Some((_, value)) = eq_column_consts(select.selection.as_ref()).into_iter().next()

@@ -47,8 +47,20 @@ pub enum PhysicalPlan {
     TableReader {
         table: String,
         partitions: Vec<i64>,
+        /// Static EXPLAIN names on TableFullScan (`partition:p2`).
+        partition_names: Vec<String>,
+        /// Dynamic EXPLAIN access on TableReader (`all` / `p1,p2`). Empty = omit.
+        partition_access: String,
+        /// Scan cardinality (pseudo 10000 or analyzed count).
+        row_count: f64,
+        /// When true, EXPLAIN shows `stats:pseudo` on the cop scan.
+        stats_pseudo: bool,
         #[serde(skip)]
         pushed: Option<ExprNode>,
+    },
+    /// Static-mode multi-partition gather (TiDB `PartitionUnion`).
+    PartitionUnion {
+        children: Vec<PhysicalPlan>,
     },
     PointGet {
         table: String,
@@ -196,6 +208,7 @@ impl PhysicalPlan {
                 table,
                 partitions,
                 pushed,
+                ..
             } => {
                 let mut name = if partitions.is_empty() {
                     format!("TableReader_{table}")
@@ -213,6 +226,16 @@ impl PhysicalPlan {
                     name.push_str(&format!("[{}]", filter.restore_string()));
                 }
                 name
+            }
+            PhysicalPlan::PartitionUnion { children } => {
+                format!(
+                    "PartitionUnion({})",
+                    children
+                        .iter()
+                        .map(|c| c.explain())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
             }
             PhysicalPlan::PointGet {
                 table,
@@ -341,6 +364,29 @@ impl PhysicalPlan {
         PhysicalPlan::TableReader {
             table: table.into(),
             partitions,
+            partition_names: Vec::new(),
+            partition_access: String::new(),
+            row_count: 10_000.0,
+            stats_pseudo: true,
+            pushed: None,
+        }
+    }
+
+    pub fn table_reader_parts(
+        table: impl Into<String>,
+        partitions: Vec<i64>,
+        partition_names: Vec<String>,
+        partition_access: impl Into<String>,
+        row_count: f64,
+        stats_pseudo: bool,
+    ) -> Self {
+        PhysicalPlan::TableReader {
+            table: table.into(),
+            partitions,
+            partition_names,
+            partition_access: partition_access.into(),
+            row_count,
+            stats_pseudo,
             pushed: None,
         }
     }

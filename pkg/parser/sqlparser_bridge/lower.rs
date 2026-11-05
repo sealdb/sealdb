@@ -1433,11 +1433,12 @@ fn parse_quoted_or_ident(bytes: &[u8], i: usize) -> Result<(String, usize)> {
 }
 
 fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
-    // gaps: ANALYZE INDEX, PARTITION, columns, NOSCAN, COMPUTE STATISTICS extras.
+    // gaps: ANALYZE INDEX, PARTITION, named column lists, NOSCAN, COMPUTE STATISTICS.
     if analyze.partitions.as_ref().is_some_and(|p| !p.is_empty()) {
         return Err(Error::unsupported("ANALYZE PARTITION"));
     }
-    if analyze.for_columns || !analyze.columns.is_empty() {
+    // TiDB `ANALYZE TABLE t ALL COLUMNS` sets `for_columns` with an empty list.
+    if !analyze.columns.is_empty() {
         return Err(Error::unsupported("ANALYZE columns"));
     }
     if analyze.noscan || analyze.cache_metadata {
@@ -2128,6 +2129,16 @@ fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)
                     indexes.push(Some(names));
                     i = k;
                     continue;
+                }
+                // TiDB `ANALYZE TABLE t ALL COLUMNS` — strip; full-table analyze.
+                if keyword_at(bytes, j, "ALL") {
+                    let after_all = skip_ws(bytes, j + "ALL".len());
+                    if keyword_at(bytes, after_all, "COLUMNS") {
+                        out.push_str(&sql[i..j]);
+                        indexes.push(None);
+                        i = skip_ws(bytes, after_all + "COLUMNS".len());
+                        continue;
+                    }
                 }
                 out.push_str(&sql[i..j]);
                 indexes.push(None);
@@ -5129,9 +5140,11 @@ fn table_factor_item(
             name,
             alias,
             index_hints,
+            partitions,
             ..
         } => {
             let mut physical = object_table_name(name)?;
+            physical.partition_names = partitions.iter().map(|p| p.value.clone()).collect();
             for hint in index_hints {
                 if matches!(
                     hint.hint_type,
@@ -5406,9 +5419,11 @@ fn table_factor(
             name,
             alias,
             index_hints,
+            partitions,
             ..
         } => {
             let mut physical = object_table_name(name)?;
+            physical.partition_names = partitions.iter().map(|p| p.value.clone()).collect();
             // TiDB USE/FORCE INDEX — drive access_path selection in the planner.
             for hint in index_hints {
                 if matches!(

@@ -9,8 +9,11 @@ pub const SORT_FACTOR: f64 = 2.0;
 
 pub fn table_row_count(stats: Option<&Handle>, from: &TableName, current_db: &str) -> f64 {
     let (db, table) = from.qualified(current_db);
+    // DML `add_modify` may create a zero-count stub; only ANALYZE (`version > 0`)
+    // replaces TiDB pseudo cardinality.
     stats
         .and_then(|handle| handle.table(&db, &table))
+        .filter(|t| t.version > 0)
         .map(|t| t.count as f64)
         .unwrap_or(Table::PSEUDO_ROW_COUNT as f64)
 }
@@ -24,6 +27,7 @@ pub fn eq_row_count(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
+        .filter(|t| t.version > 0)
         .map(|t| t.eq_row_count(column) as f64)
 }
 
@@ -38,6 +42,7 @@ pub fn eq_row_count_value(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
+        .filter(|t| t.version > 0)
         .map(|t| t.eq_row_count_value(column, value) as f64)
 }
 
