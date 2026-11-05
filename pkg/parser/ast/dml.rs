@@ -142,6 +142,9 @@ pub struct CommonTableExpression {
     pub set_rest: Vec<(SetOprType, SelectStmt)>,
     /// `AS MATERIALIZED` / `AS NOT MATERIALIZED`; default leaves planner choice.
     pub materialize: CteMaterialize,
+    /// Outer `LIMIT` / `OFFSET` on a recursive CTE body (`… UNION ALL … LIMIT n`).
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

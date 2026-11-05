@@ -505,7 +505,10 @@ impl ExecutorBuilder {
                         with: None,
                     })
                 };
-                let recursive = with.find(name).and_then(|cte| cte.recursive.clone());
+                let cte = with.find(name);
+                let recursive = cte.and_then(|c| c.recursive.clone());
+                let limit = cte.and_then(|c| c.limit);
+                let offset = cte.and_then(|c| c.offset);
                 let share = !inline;
                 Ok(Box::new(CTEExec::new(
                     columns.clone(),
@@ -517,6 +520,8 @@ impl ExecutorBuilder {
                     txn,
                     share,
                     shadow_same_name,
+                    limit,
+                    offset,
                 )))
             }
             PhysicalPlan::HashJoin {
@@ -744,9 +749,20 @@ fn resolve_reader_table(stmt: &Statement, table: &str) -> Result<sealdb_parser::
     let select = stmt
         .as_select()
         .ok_or_else(|| Error::unsupported("table reader without FROM"))?;
-    find_table_in_select(select, table)
-        .or_else(|| select.from.clone())
-        .ok_or_else(|| Error::unsupported("table reader without FROM"))
+    if let Some(found) = find_table_in_select(select, table) {
+        return Ok(found);
+    }
+    // Decorrelated EXISTS/IN over `WITH cte AS (SELECT … FROM t2 …)` keeps a
+    // TableReader for `t2` that is not the outer FROM. Never fall back to the
+    // outer table — that scanned t1 on both HashJoin sides (false EXISTS hits).
+    if select
+        .from
+        .as_ref()
+        .is_some_and(|from| from.name.eq_ignore_ascii_case(table))
+    {
+        return Ok(select.from.clone().unwrap());
+    }
+    Ok(TableName::new(None, table.to_string()))
 }
 
 fn find_table_in_result_set(query: &ResultSetNode, table: &str) -> Option<TableName> {
@@ -756,20 +772,44 @@ fn find_table_in_result_set(query: &ResultSetNode, table: &str) -> Option<TableN
         .find_map(|select| find_table_in_select(select, table))
 }
 
-/// Resolve a TableReader name against FROM, JOIN, or a subquery in WHERE
-/// (EXISTS / IN rewritten to HashJoin Semi still need the inner table).
+/// Resolve a TableReader name against FROM, JOIN, WITH CTEs, or a subquery in
+/// WHERE (EXISTS / IN rewritten to HashJoin Semi still need the inner table).
 fn find_table_in_select(select: &SelectStmt, table: &str) -> Option<TableName> {
     if let Some(from) = &select.from
-        && from.name.eq_ignore_ascii_case(table)
+        && (from.name.eq_ignore_ascii_case(table)
+            || from
+                .resolve_name()
+                .eq_ignore_ascii_case(table))
     {
         return Some(from.clone());
     }
     for join in &select.joins {
-        if join.left.name.eq_ignore_ascii_case(table) {
+        if join.left.name.eq_ignore_ascii_case(table)
+            || join.left.resolve_name().eq_ignore_ascii_case(table)
+        {
             return Some(join.left.clone());
         }
-        if join.right.name.eq_ignore_ascii_case(table) {
+        if join.right.name.eq_ignore_ascii_case(table)
+            || join.right.resolve_name().eq_ignore_ascii_case(table)
+        {
             return Some(join.right.clone());
+        }
+    }
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            if let Some(found) = find_table_in_select(cte.query.as_ref(), table) {
+                return Some(found);
+            }
+            if let Some((_, rec)) = &cte.recursive
+                && let Some(found) = find_table_in_select(rec, table)
+            {
+                return Some(found);
+            }
+            for (_, arm) in &cte.set_rest {
+                if let Some(found) = find_table_in_select(arm, table) {
+                    return Some(found);
+                }
+            }
         }
     }
     select

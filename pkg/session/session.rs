@@ -2448,6 +2448,8 @@ fn inject_view_cte(
         recursive: None,
         set_rest: Vec::new(),
         materialize,
+        limit: None,
+        offset: None,
     });
     select.with = Some(sealdb_parser::ast::WithClause {
         is_recursive: false,
@@ -3139,6 +3141,65 @@ mod tests {
             after_text.contains("IndexLookUp") || after_text.contains("IndexFullScan"),
             "{after_text}"
         );
+    }
+
+    #[test]
+    fn test_exists_cte_decorrelates_to_semi_join() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte;                  CREATE TABLE t1(c1 INT, c2 INT); INSERT INTO t1 VALUES (2,1),(2,2);                  CREATE TABLE t2(c1 INT, c2 INT); INSERT INTO t2 VALUES (1,1),(3,2);",
+            )
+            .unwrap();
+        let plan = session
+            .execute_stmt(
+                "EXPLAIN FORMAT='brief' SELECT * FROM t1 WHERE EXISTS(                  WITH cte1 AS (SELECT c1 FROM t2 WHERE t2.c2 = t1.c2) SELECT c1 FROM cte1)",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let text = plan
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("HashJoin"), "{text}");
+        assert!(text.contains("semi join"), "{text}");
+        assert!(!text.contains("Apply"), "{text}");
+        session
+            .execute_stmt("INSERT INTO t1 VALUES (2, 3)")
+            .unwrap();
+        let rows = session
+            .execute_stmt(
+                "SELECT * FROM t1 WHERE EXISTS(WITH cte1 AS (SELECT c1 FROM t2 WHERE t2.c2 = t1.c2) SELECT c1 FROM cte1) ORDER BY c1, c2",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let got: Vec<String> = rows
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join(","))
+            .collect();
+        assert_eq!(got, vec!["2,1".to_string(), "2,2".to_string()], "{got:?}");
+    }
+
+    #[test]
+    fn test_recursive_cte_limit_under_all() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte;                  CREATE TABLE t1(c1 INT, c2 INT); INSERT INTO t1 VALUES (2,1),(2,2),(2,3);                  CREATE TABLE t2(c1 INT, c2 INT); INSERT INTO t2 VALUES (1,1),(3,2);",
+            )
+            .unwrap();
+        let rows = session
+            .execute_stmt(
+                "SELECT * FROM t1 WHERE c1 > ALL(WITH RECURSIVE cte1 AS (                    SELECT c1 FROM t2 WHERE t2.c2 = t1.c2                    UNION ALL SELECT c1+1 AS c1 FROM cte1 LIMIT 1) SELECT c1 FROM cte1) ORDER BY c1, c2",
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        let got: Vec<String> = rows
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join(","))
+            .collect();
+        assert_eq!(got, vec!["2,1".to_string(), "2,3".to_string()], "{got:?}");
     }
 
     #[test]

@@ -5356,8 +5356,13 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     // Strip WITH before lowering the body so lower_query does not re-attach it.
     let mut query_ast = cte.query.clone();
     query_ast.with = None;
-    let (mut query, recursive_arm, set_rest) = match query_ast.body.as_ref() {
-        SetExpr::Select(_) => (lower_query(&query_ast)?, None, Vec::new()),
+    let (mut query, recursive_arm, set_rest, limit, offset) = match query_ast.body.as_ref() {
+        SetExpr::Select(_) => {
+            let q = lower_query(&query_ast)?;
+            let limit = q.limit;
+            let offset = q.offset;
+            (q, None, Vec::new(), limit, offset)
+        }
         SetExpr::SetOperation { .. } if recursive => {
             let set = lower_set_opr(&query_ast)?;
             if set.rest.len() != 1
@@ -5367,11 +5372,17 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
                     "recursive CTE requires a single UNION / UNION ALL",
                 ));
             }
-            (set.first, Some(set.rest[0].clone()), Vec::new())
+            (
+                set.first,
+                Some(set.rest[0].clone()),
+                Vec::new(),
+                set.limit,
+                set.offset,
+            )
         }
         SetExpr::SetOperation { .. } => {
             let set = lower_set_opr(&query_ast)?;
-            (set.first, None, set.rest)
+            (set.first, None, set.rest, set.limit, set.offset)
         }
         other => return Err(Error::unsupported(format!("CTE body {other}"))),
     };
@@ -5397,6 +5408,8 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             Some(CteAsMaterialized::NotMaterialized) => CteMaterialize::NotMaterialized,
             None => CteMaterialize::Default,
         },
+        limit,
+        offset,
     })
 }
 
@@ -6136,6 +6149,8 @@ fn table_factor(
                 set_rest,
                 // Derived tables merge into the parent plan (TiDB default).
                 materialize: CteMaterialize::NotMaterialized,
+                limit: None,
+                offset: None,
             });
             // CTE physical name is the alias; ON refs already use that name.
             Ok((TableName::new(None, name), None, ctes))
