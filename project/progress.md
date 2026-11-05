@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（R1 `select` group-by StreamAgg→IndexReader Gate A+B 已绿）  
+> 最后更新：2026-11-06（R2 `agg_predicate_pushdown` Mem+TiKV 已绿）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` 已 green；继续 triage 红灯 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -80,6 +80,16 @@
 | TIMESTAMP/DATE/TIME literals | TypedString + timestampPattern；ODBC `{d|t|ts}` | `types::parse_*_literal`；errno 1292/22007 | types/time 字面量 header 绿 |
 | SET time_zone | session 时区变量 | `Session.time_zone` + TLS | UTC 存储 / session 显示 |
 | DATE_ADD / TIMESTAMPADD / DIFF | INTERVAL；DST 8179；索引路径 | eval + covering rehydrate；`<=>` | types/time → `green`（Mem+TiKV） |
+
+### 2.0b R2 `agg_predicate_pushdown`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| HAVING group-by 下推 | PushSelDownAggregation | `rule_having_push_down` CNF 拆分 + DNF extract | 残差 avg 留 Selection |
+| avg cast Projection | Column#13–16 + firstrow | inject Projection under HashAgg | brief 树形对齐 |
+| 部分 OR 下推 | 纯 agg 臂不 extract | `extract_pushable_dnf` | Q4 仅 `a<3`；Q5 `or(a>1,a<3)` |
+| pseudo estRows | `pseudoLessRate` / null=10 | LT→3323.33；covering OR→9990 | Mem+TiKV Gate B |
+| suite green | Gate A+B | manifest `green` | `agg_predicate_pushdown` |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

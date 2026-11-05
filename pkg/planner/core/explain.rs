@@ -493,7 +493,17 @@ fn emit_cop_children(
             ..
         } => {
             let scan_access = table_access(table, partition_names);
-            let scan_est = *row_count;
+            // Negative row_count encodes HAVING-push filtered est (|row_count|);
+            // TableFullScan stays at the pseudo/analyzed scan cardinality.
+            let scan_est = if *row_count < 0.0 {
+                if *stats_pseudo {
+                    10_000.0
+                } else {
+                    -*row_count
+                }
+            } else {
+                *row_count
+            };
             let mut scan_depth = depth;
             // TiDB always labels DistSQL scans `cop[tikv]` for TableFullScan.
             let scan_task = "cop[tikv]";
@@ -1087,11 +1097,20 @@ fn collect_dot_cop_children(
             table,
             partition_names,
             row_count,
+            stats_pseudo,
             pushed,
             ..
         } => {
             let scan_access = table_access(table, partition_names);
-            let scan_est = *row_count;
+            let scan_est = if *row_count < 0.0 {
+                if *stats_pseudo {
+                    10_000.0
+                } else {
+                    -*row_count
+                }
+            } else {
+                *row_count
+            };
             if let Some(filter) = pushed.as_ref() {
                 Some(vec![
                     push_dot_node(
@@ -1492,6 +1511,15 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(filter),
             row_count,
             ..
+        } if *row_count < 0.0 => {
+            // HAVING pushdown: filtered est encoded as -est (scan stays 10000).
+            let _ = filter;
+            -*row_count
+        }
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
         } if is_not_isnull(filter) => {
             let n = not_isnull_count(filter).max(1);
             (*row_count * 0.999_f64.powi(n as i32)).min(9_990.0)
@@ -1512,6 +1540,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } => *row_count * 0.8,
+        PhysicalPlan::TableReader { row_count, .. } if *row_count < 0.0 => -*row_count,
         PhysicalPlan::TableReader { row_count, .. } => *row_count,
         PhysicalPlan::PartitionUnion { children } => children.iter().map(est_rows).sum(),
         PhysicalPlan::IndexLookUpReader {
