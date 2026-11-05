@@ -45,6 +45,13 @@ pub fn create_table(
             built.cols = columns_from_select(is, select, current_db)?;
         }
         let mut info = build_table_info(&built, table_id)?;
+        if let Some(ttl) = &built.ttl {
+            info.ttl = Some(sealdb_meta::TtlInfo {
+                expr: ttl.expr.clone(),
+                enable: ttl.enable,
+                job_interval: ttl.job_interval.clone(),
+            });
+        }
         if let Some(spec) = &built.partition {
             crate::partition::attach_partitions(meta, &mut info, spec)?;
         }

@@ -386,10 +386,18 @@ fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
 }
 
 fn render_create_table(info: &TableInfo) -> String {
+    // MySQL NotNullFlag — omit DEFAULT NULL when set.
+    const NOT_NULL_FLAG: u32 = 1;
     let mut cols: Vec<String> = info
         .columns
         .iter()
-        .map(|col| format!("  `{}` {}", col.name.o(), col.field_type.type_name()))
+        .map(|col| {
+            let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
+            if col.field_type.flag & NOT_NULL_FLAG == 0 {
+                line.push_str(" DEFAULT NULL");
+            }
+            line
+        })
         .collect();
     for idx in &info.indices {
         let key = if idx.primary {
@@ -407,11 +415,74 @@ fn render_create_table(info: &TableInfo) -> String {
             .join(", ");
         cols.push(format!("  {key} `{}` ({parts})", idx.name.o()));
     }
-    format!(
-        "CREATE TABLE `{}` (\n{}\n)",
+    let mut out = format!(
+        "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET={} COLLATE={}",
         info.name.o(),
-        cols.join(",\n")
-    )
+        cols.join(",\n"),
+        info.charset,
+        info.collate
+    );
+    if let Some(ttl) = &info.ttl {
+        let enable = if ttl.enable { "ON" } else { "OFF" };
+        out.push_str(&format!(
+            " /*T![ttl] TTL={} */ /*T![ttl] TTL_ENABLE='{enable}' */ /*T![ttl] TTL_JOB_INTERVAL='{}' */",
+            ttl.expr, ttl.job_interval
+        ));
+    }
+    if let Some(part) = &info.partition {
+        out.push('\n');
+        out.push_str(&render_partition_clause(part));
+    }
+    out
+}
+
+fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
+    use sealdb_meta::PartitionType;
+    let key = if part.columns.len() > 1
+        || (part.tp == PartitionType::Range && !part.columns.is_empty() && part.expr.contains(','))
+    {
+        let cols = part
+            .columns
+            .iter()
+            .map(|c| format!("`{}`", c.o()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("RANGE COLUMNS({cols})")
+    } else if part.tp == PartitionType::Range && part.columns.len() == 1 {
+        // TiDB RANGE COLUMNS(single) still prints COLUMNS when created as such.
+        // Heuristic: expr equals column name → RANGE COLUMNS(`col`) for COLUMNS form
+        // stored via with_columns.
+        format!("RANGE COLUMNS(`{}`)", part.columns[0].o())
+    } else {
+        match part.tp {
+            PartitionType::Range => format!("RANGE (`{}`)", part.expr),
+            PartitionType::Hash => format!("HASH ({})", part.expr),
+            PartitionType::List => format!("LIST (`{}`)", part.expr),
+            PartitionType::Key => format!("KEY (`{}`)", part.expr),
+        }
+    };
+    let mut defs = Vec::new();
+    for def in &part.definitions {
+        let bound = if !def.in_values.is_empty() {
+            let vals = def
+                .in_values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("VALUES IN ({vals})")
+        } else {
+            let lt = def
+                .less_than
+                .iter()
+                .map(|v| v.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("VALUES LESS THAN ({lt})")
+        };
+        defs.push(format!("PARTITION `{}` {bound}", def.name.o()));
+    }
+    format!("PARTITION BY {key}\n({})", defs.join(","))
 }
 
 fn render_create_view(info: &TableInfo, view: &sealdb_meta::ViewInfo) -> String {

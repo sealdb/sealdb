@@ -11,5 +11,6 @@ pub use meta::{
 pub use model::{
     ColumnInfo, DBInfo, IndexColumn, IndexInfo, Job, JobState, PartitionDefinition, PartitionInfo,
     PartitionType, STATE_DELETE_ONLY, STATE_DELETE_REORGANIZATION, STATE_NONE, STATE_PUBLIC,
-    STATE_WRITE_ONLY, STATE_WRITE_REORGANIZATION, SchemaState, SequenceInfo, TableInfo, ViewInfo,
+    STATE_WRITE_ONLY, STATE_WRITE_REORGANIZATION, SchemaState, SequenceInfo, TableInfo, TtlInfo,
+    ViewInfo,
 };
