@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select`/`show` → `green`**；下一：`types/*` triage |
+| R1 | select, show, types/* | `in_progress` | **`select`/`show` → `green`**；`types/const` 推进中（UNSIGNED/BIGINT 溢出已对齐） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -71,6 +71,7 @@
 | MergeJoin + USING | STRAIGHT_JOIN EXPLAIN；USING 列合并；DROP 清 stats | `PhysicalPlan::MergeJoin`；`keep order:true`；`TableReader_N(Build)`；Handle::delete | `select` → `green`（Mem+TiKV） |
 | SHOW LIKE + suite DB | `Tables_in_show (%xx)`；suite 名作库名 | ShowStmt.pattern；itest `path/→__` | show LIKE 段已绿 |
 | CREATE TTL + SHOW CREATE | TTL 表选项；RANGE COLUMNS 渲染 | extract TTL；TableInfo.ttl；ENGINE/CHARSET/PARTITION | `show` → `green`（Mem+TiKV） |
+| UNSIGNED / BIGINT overflow | 1690；`NO_UNSIGNED_SUBTRACTION`；`-i64::MIN` | sql_mode TLS；unsigned_minus；UnaryMinus(U64(2^63)) | types/const 至 overflow 段已绿 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
