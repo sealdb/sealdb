@@ -472,6 +472,8 @@ pub enum ShowStmtKind {
     DdlJobs,
     /// `SHOW BINDINGS`
     Bindings,
+    /// `SHOW WARNINGS`
+    Warnings,
 }
 
 #[derive(Clone, Debug)]
@@ -541,6 +543,7 @@ impl ShowStmt {
             ShowStmtKind::Collation => ctx.write_str("SHOW COLLATION"),
             ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
             ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
+            ShowStmtKind::Warnings => ctx.write_str("SHOW WARNINGS"),
         }
         Ok(())
     }

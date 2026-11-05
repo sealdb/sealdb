@@ -84,9 +84,22 @@ impl Executor for HashJoinV1Exec {
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
         self.spilled = false;
-        // CROSS JOIN has no equality key, so skip hash index and partition spill.
-        if self.join.tp == JoinType::Cross {
+        // CROSS JOIN / non-equality ON (e.g. `ON (sub.col)` truthiness) →
+        // cartesian product then filter; no hash keys.
+        if self.join.tp == JoinType::Cross || !join_on_is_equijoin(&self.join.on) {
             self.rows = probe_cross(&left_rows, &right_rows);
+            if !is_trivial_on_true(&self.join.on) {
+                let full_schema: Vec<String> = left_schema
+                    .iter()
+                    .cloned()
+                    .chain(right_schema.iter().cloned())
+                    .collect();
+                self.rows = filter_rows_by_on(
+                    std::mem::take(&mut self.rows),
+                    &full_schema,
+                    &self.join.on,
+                )?;
+            }
             if !self.join.using_cols.is_empty() {
                 self.rows = project_using_rows(
                     std::mem::take(&mut self.rows),
@@ -376,6 +389,49 @@ fn project_using_rows(
     rows.into_iter()
         .map(|row| keep.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)).collect())
         .collect()
+}
+
+fn join_on_is_equijoin(on: &ExprNode) -> bool {
+    match on {
+        ExprNode::Binary(bin) if bin.op == Op::Eq => {
+            matches!(
+                (bin.left.as_ref(), bin.right.as_ref()),
+                (ExprNode::Column(_), ExprNode::Column(_))
+            )
+        }
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            join_on_is_equijoin(&bin.left) || join_on_is_equijoin(&bin.right)
+        }
+        _ => false,
+    }
+}
+
+fn is_trivial_on_true(on: &ExprNode) -> bool {
+    matches!(
+        on,
+        ExprNode::Value(v) if matches!(v.datum, Datum::I64(1) | Datum::U64(1))
+    )
+}
+
+fn filter_rows_by_on(
+    rows: Vec<Vec<Datum>>,
+    schema: &[String],
+    on: &ExprNode,
+) -> Result<Vec<Vec<Datum>>> {
+    let mut out = Vec::new();
+    for row in rows {
+        let v = eval_expr_with_row(on, schema, &row)?;
+        if v.is_null() {
+            continue;
+        }
+        match v {
+            Datum::I64(n) if n != 0 => out.push(row),
+            Datum::U64(n) if n != 0 => out.push(row),
+            Datum::Bytes(b) if !b.is_empty() => out.push(row),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn split_join_eq(

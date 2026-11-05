@@ -57,7 +57,8 @@ fn push_into(
                     partition_access,
                     row_count,
                     stats_pseudo,
-                    pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                    // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
+                    pushed: and_opt(ExprNode::compose_cnf(pushable), pushed),
                 },
                 residual,
             )

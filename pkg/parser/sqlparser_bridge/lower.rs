@@ -81,6 +81,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_show_bindings(&rewritten);
+    let rewritten = rewrite_show_warnings(&rewritten);
     let rewritten = rewrite_rename_index(&rewritten);
     let (rewritten, explain_formats) = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
@@ -149,6 +150,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             decode_show_index(show);
             decode_show_ddl_jobs(show);
             decode_show_bindings(show);
+            decode_show_warnings(show);
         }
         if let Statement::CreateTable(create) = &mut lowered {
             create.ttl = ttls.next().flatten();
@@ -975,6 +977,7 @@ const SHOW_CREATE_DB_SCHEMA: &str = "__sealdb_db__";
 const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
 const SHOW_BINDINGS_SCHEMA: &str = "__sealdb_bindings__";
+const SHOW_WARNINGS_SCHEMA: &str = "__sealdb_warnings__";
 const RENAME_INDEX_MARKER: &str = "__sealdb_rename_index__";
 const RENAME_INDEX_SEP: char = '\u{1f}';
 
@@ -1095,6 +1098,39 @@ fn decode_show_bindings(show: &mut ShowStmt) {
             .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_BINDINGS_SCHEMA))
     {
         show.kind = ShowStmtKind::Bindings;
+        show.db_name = None;
+    }
+}
+
+/// sqlparser has no `SHOW WARNINGS`; rewrite to SHOW TABLES FROM a marker schema.
+fn rewrite_show_warnings(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "WARNINGS") {
+                out.push_str("SHOW TABLES FROM `");
+                out.push_str(SHOW_WARNINGS_SCHEMA);
+                out.push('`');
+                i = after_show + "WARNINGS".len();
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+fn decode_show_warnings(show: &mut ShowStmt) {
+    if show.kind == ShowStmtKind::Tables
+        && show
+            .db_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_WARNINGS_SCHEMA))
+    {
+        show.kind = ShowStmtKind::Warnings;
         show.db_name = None;
     }
 }
@@ -5915,7 +5951,8 @@ fn table_factor(
                 col_name_list,
                 recursive: None,
                 set_rest,
-                materialize: CteMaterialize::Default,
+                // Derived tables merge into the parent plan (TiDB default).
+                materialize: CteMaterialize::NotMaterialized,
             });
             // CTE physical name is the alias; ON refs already use that name.
             Ok((TableName::new(None, name), None, ctes))
