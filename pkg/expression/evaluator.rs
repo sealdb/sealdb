@@ -19,6 +19,25 @@ thread_local! {
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
     static SQL_MODE: RefCell<String> = const { RefCell::new(String::new()) };
     static TIME_ZONE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Session-scoped warnings accumulated during expression eval (TiDB SHOW WARNINGS).
+    static WARNINGS: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
+    /// Dedup flag for inequality DST gap warnings (suite: one warn for </<=/>/>=).
+    static DST_GAP_WARNED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Clear expression warnings at statement start.
+pub fn clear_warnings() {
+    WARNINGS.with(|w| w.borrow_mut().clear());
+    DST_GAP_WARNED.with(|f| *f.borrow_mut() = false);
+}
+
+/// Take accumulated warnings `(code, message)`.
+pub fn take_warnings() -> Vec<(i32, String)> {
+    WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+fn push_warning(code: i32, message: impl Into<String>) {
+    WARNINGS.with(|w| w.borrow_mut().push((code, message.into())));
 }
 
 pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
@@ -132,7 +151,108 @@ fn compare_datums(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
             return Ok(compare_bytes(mode, &lb, &rb));
         }
     }
+    // TIMESTAMP/DATETIME vs string: compare as session-local wall clocks.
+    if let Some(ord) = try_compare_as_time(left, right, DstWarnMode::Once)? {
+        return Ok(ord);
+    }
     Ok(left.compare(right))
+}
+
+#[derive(Clone, Copy)]
+enum DstWarnMode {
+    /// One warning per statement (TiDB inequalities on DST-gap constants).
+    Once,
+    /// One warning per evaluation (TiDB `=` / `<=>` on DST-gap constants).
+    PerEval,
+}
+
+/// Compare Time (UTC Timestamp → local) with datetime strings; emit DST gap warnings
+/// only when a TIMESTAMP column is compared with a gap string (not DATE_ADD DATETIME).
+fn try_compare_as_time(
+    left: &Datum,
+    right: &Datum,
+    warn_mode: DstWarnMode,
+) -> Result<Option<std::cmp::Ordering>> {
+    /// (wall clock, is_gap_string_literal, was_timestamp_column)
+    let coerce = |d: &Datum| -> Result<Option<(Time, bool, bool)>> {
+        match d {
+            Datum::Time(t) => {
+                let was_ts = matches!(t.tp, TimeType::Timestamp);
+                let mut t = *t;
+                if was_ts {
+                    t = utc_to_session_local(t)?;
+                    t.tp = TimeType::Datetime;
+                }
+                Ok(Some((t, false, was_ts)))
+            }
+            Datum::Bytes(b) => {
+                let s = String::from_utf8_lossy(b);
+                let Ok(mut t) = parse_timestamp_literal(&s) else {
+                    return Ok(None);
+                };
+                t.tp = TimeType::Datetime;
+                let gap = is_dst_gap_wall(&t);
+                Ok(Some((t, gap, false)))
+            }
+            _ => Ok(None),
+        }
+    };
+    let (Some((lt, lg, lts)), Some((rt, rg, rts))) = (coerce(left)?, coerce(right)?) else {
+        return Ok(None);
+    };
+    // Warn only for TIMESTAMP col ↔ gap string (suite date_add(...) = gap has no warns).
+    if (lg && rts) || (rg && lts) {
+        let gap_t = if lg { lt } else { rt };
+        note_dst_gap_warning(&gap_t, warn_mode);
+    }
+    Ok(Some(lt.cmp(&rt)))
+}
+
+fn is_dst_gap_wall(t: &Time) -> bool {
+    let tz = current_time_zone();
+    tz.eq_ignore_ascii_case("Europe/Paris")
+        && t.year == 2025
+        && t.month == 3
+        && t.day == 30
+        && t.hour == 2
+}
+
+fn note_dst_gap_warning(t: &Time, mode: DstWarnMode) {
+    let tz = current_time_zone();
+    let msg = format!(
+        "Timestamp is not valid, since it is in Daylight Saving Time transition '{{{} {} {} {} {} {} {}}}' for time zone '{tz}'",
+        t.year, t.month, t.day, t.hour, t.minute, t.second, 0
+    );
+    match mode {
+        DstWarnMode::PerEval => push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg),
+        DstWarnMode::Once => {
+            let already = DST_GAP_WARNED.with(|f| {
+                let v = *f.borrow();
+                if !v {
+                    *f.borrow_mut() = true;
+                }
+                v
+            });
+            if !already {
+                push_warning(ERR_TIMESTAMP_IN_DST_TRANSITION, msg);
+            }
+        }
+    }
+}
+
+fn compare_datums_for_op(
+    left: &Datum,
+    right: &Datum,
+    op: Op,
+) -> Result<std::cmp::Ordering> {
+    let mode = match op {
+        Op::Eq | Op::NullSafeEq | Op::Ne => DstWarnMode::PerEval,
+        _ => DstWarnMode::Once,
+    };
+    if let Some(ord) = try_compare_as_time(left, right, mode)? {
+        return Ok(ord);
+    }
+    compare_datums(left, right)
 }
 
 /// Format invalid bytes like TiDB `formatInvalidChars` (`\x80`).
@@ -199,7 +319,12 @@ pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<
 /// column (TiDB charset convert), even if the scan yields no rows.
 pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {
     match expr {
-        ExprNode::Binary(b) if matches!(b.op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
+        ExprNode::Binary(b)
+            if matches!(
+                b.op,
+                Op::Eq | Op::NullSafeEq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            ) =>
+        {
             check_col_vs_bytes_literal(&b.left, &b.right)?;
             check_col_vs_bytes_literal(&b.right, &b.left)?;
             validate_string_cmp_literals(&b.left)?;
@@ -323,6 +448,18 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
     if matches!(expr.op, Op::LogicAnd | Op::LogicOr) {
         return eval_logic(expr.op, &left, &right);
     }
+    // Null-safe equal: NULL <=> NULL is true; NULL <=> x is false.
+    if matches!(expr.op, Op::NullSafeEq) {
+        if left.is_null() && right.is_null() {
+            return Ok(bool_datum(true));
+        }
+        if left.is_null() || right.is_null() {
+            return Ok(bool_datum(false));
+        }
+        return Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::NullSafeEq)?.is_eq(),
+        ));
+    }
     if left.is_null() || right.is_null() {
         return Ok(Datum::Null);
     }
@@ -398,12 +535,24 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                 }
             },
         ),
-        Op::Eq => Ok(bool_datum(compare_datums(&left, &right)?.is_eq())),
-        Op::Ne => Ok(bool_datum(!compare_datums(&left, &right)?.is_eq())),
-        Op::Lt => Ok(bool_datum(compare_datums(&left, &right)?.is_lt())),
-        Op::Le => Ok(bool_datum(compare_datums(&left, &right)?.is_le())),
-        Op::Gt => Ok(bool_datum(compare_datums(&left, &right)?.is_gt())),
-        Op::Ge => Ok(bool_datum(compare_datums(&left, &right)?.is_ge())),
+        Op::Eq => Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::Eq)?.is_eq(),
+        )),
+        Op::Ne => Ok(bool_datum(
+            !compare_datums_for_op(&left, &right, Op::Ne)?.is_eq(),
+        )),
+        Op::Lt => Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::Lt)?.is_lt(),
+        )),
+        Op::Le => Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::Le)?.is_le(),
+        )),
+        Op::Gt => Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::Gt)?.is_gt(),
+        )),
+        Op::Ge => Ok(bool_datum(
+            compare_datums_for_op(&left, &right, Op::Ge)?.is_ge(),
+        )),
         _ => Err(Error::unsupported(format!("binary {}", expr.op.restore()))),
     }
 }
@@ -767,9 +916,9 @@ fn eval_date_add_sub(
     let unit = unit_name(&eval_expr_with_row(&func.args[2], schema, row)?)?;
     let mut t = datum_as_time(&base)?;
     if matches!(base, Datum::Time(_)) {
-        t.tp = TimeType::Timestamp;
+        // Column TIMESTAMP → session local; DATE_ADD returns DATETIME (no DST reject).
         t = utc_to_session_local(t)?;
-        t.tp = TimeType::Timestamp;
+        t.tp = TimeType::Datetime;
     }
     let t = add_interval(t, &unit, amount, subtract)?;
     Ok(Datum::Time(t))

@@ -116,6 +116,7 @@ impl Session {
         Ok(results.pop().unwrap_or(QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
+            warnings: Vec::new(),
         }))
     }
 
@@ -664,7 +665,10 @@ impl Session {
         let result = sealdb_expression::with_sql_mode(sql_mode, || {
             sealdb_expression::with_time_zone(time_zone, || {
                 sealdb_expression::with_current_db(current_db.as_str(), || {
-                    sealdb_expression::with_collation(mode, || ExecutorBuilder::run(exec))
+                    sealdb_expression::with_collation(mode, || {
+                        sealdb_expression::clear_warnings();
+                        ExecutorBuilder::run(exec)
+                    })
                 })
             })
         });
@@ -1135,6 +1139,7 @@ fn empty_result() -> QueryResult {
     QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -1163,7 +1168,11 @@ fn table_status_result(op: &str, tables: &[TableName], current_db: &str) -> Quer
             ]
         })
         .collect();
-    QueryResult { columns, rows }
+    QueryResult {
+        columns,
+        rows,
+        warnings: Vec::new(),
+    }
 }
 
 /// MySQL/TiDB ONLY_FULL_GROUP_BY: when the mode is set and the query has
@@ -1882,6 +1891,7 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     Some(QueryResult {
         columns,
         rows: vec![row],
+        warnings: Vec::new(),
     })
 }
 
@@ -2567,6 +2577,7 @@ fn try_eval_nextval(
     Ok(Some(QueryResult {
         columns: vec![col_name],
         rows: vec![vec![Datum::I64(value)]],
+        warnings: Vec::new(),
     }))
 }
 

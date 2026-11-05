@@ -452,6 +452,12 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                     lines.push(row.join("\t"));
                 }
             }
+            if step.show_warnings && !qr.warnings.is_empty() {
+                lines.push("Level\tCode\tMessage".into());
+                for (code, msg) in &qr.warnings {
+                    lines.push(format!("Warning\t{code}\t{msg}"));
+                }
+            }
             Ok(lines.join("\n"))
         }
         (Err(err), _) => Ok(format!(

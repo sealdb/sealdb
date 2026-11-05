@@ -7268,6 +7268,7 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::Divide => Op::Div,
         BinaryOperator::Modulo => Op::Mod,
         BinaryOperator::Eq => Op::Eq,
+        BinaryOperator::Spaceship => Op::NullSafeEq,
         BinaryOperator::NotEq => Op::Ne,
         BinaryOperator::Lt => Op::Lt,
         BinaryOperator::LtEq => Op::Le,

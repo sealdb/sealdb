@@ -6,6 +6,8 @@ pub enum Op {
     Div,
     Mod,
     Eq,
+    /// MySQL/TiDB null-safe equal `<=>`.
+    NullSafeEq,
     Ne,
     Lt,
     Le,
@@ -29,6 +31,7 @@ impl Op {
             Op::Div => "/",
             Op::Mod => "%",
             Op::Eq => "=",
+            Op::NullSafeEq => "<=>",
             Op::Ne => "!=",
             Op::Lt => "<",
             Op::Le => "<=",
