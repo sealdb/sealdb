@@ -236,6 +236,8 @@ pub struct SelectStmt {
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// `SELECT DISTINCT` (TiDB HashAgg firstrow rewrite over StreamAgg).
+    pub distinct: bool,
     pub lock: SelectLock,
     pub lock_wait: SelectLockWait,
     pub with: Option<WithClause>,

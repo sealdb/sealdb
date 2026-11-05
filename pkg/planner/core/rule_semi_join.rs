@@ -36,14 +36,34 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         },
-        PhysicalPlan::Limit { child } => PhysicalPlan::Limit {
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
             child: Box::new(rewrite_semi_join(*child)),
+            offset,
+            count,
         },
-        PhysicalPlan::HashAgg { child } => PhysicalPlan::HashAgg {
+        PhysicalPlan::HashAgg {
+            child,
+            info,
+            est_rows,
+        } => PhysicalPlan::HashAgg {
             child: Box::new(rewrite_semi_join(*child)),
+            info,
+            est_rows,
         },
-        PhysicalPlan::StreamAgg { child } => PhysicalPlan::StreamAgg {
+        PhysicalPlan::StreamAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } => PhysicalPlan::StreamAgg {
             child: Box::new(rewrite_semi_join(*child)),
+            info,
+            cop_info,
+            est_rows,
         },
         PhysicalPlan::Window { child } => PhysicalPlan::Window {
             child: Box::new(rewrite_semi_join(*child)),
@@ -397,14 +417,34 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         },
-        PhysicalPlan::Limit { child } => PhysicalPlan::Limit {
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
             child: Box::new(rewrite_semi_join_agg(*child)),
+            offset,
+            count,
         },
-        PhysicalPlan::HashAgg { child } => PhysicalPlan::HashAgg {
+        PhysicalPlan::HashAgg {
+            child,
+            info,
+            est_rows,
+        } => PhysicalPlan::HashAgg {
             child: Box::new(rewrite_semi_join_agg(*child)),
+            info,
+            est_rows,
         },
-        PhysicalPlan::StreamAgg { child } => PhysicalPlan::StreamAgg {
+        PhysicalPlan::StreamAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } => PhysicalPlan::StreamAgg {
             child: Box::new(rewrite_semi_join_agg(*child)),
+            info,
+            cop_info,
+            est_rows,
         },
         PhysicalPlan::Window { child } => PhysicalPlan::Window {
             child: Box::new(rewrite_semi_join_agg(*child)),

@@ -41,7 +41,8 @@ use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
     CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
-    DescribeAlias, DuplicateTreatment, Expr, FlushType, FromTable, Function, FunctionArg,
+    DescribeAlias, Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable,
+    Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
     LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
@@ -4928,6 +4929,7 @@ fn lower_select(
     let having = select.having.as_ref().map(lower_expr).transpose()?;
     let group_by = lower_group_by(&select.group_by)?;
     let order_by = lower_order_by(order_by)?;
+    let distinct = matches!(select.distinct, Some(SqlDistinct::Distinct));
     Ok(SelectStmt {
         fields,
         from,
@@ -4938,6 +4940,7 @@ fn lower_select(
         order_by,
         limit,
         offset,
+        distinct,
         lock,
         lock_wait,
         with: with_from_derived(derived),

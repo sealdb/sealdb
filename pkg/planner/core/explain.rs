@@ -212,7 +212,7 @@ fn walk(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) {
-    walk_with_parent(plan, None, depth, last, next_id, rows);
+    walk_with_parent(plan, None, depth, last, next_id, rows, false);
 }
 
 fn walk_with_parent(
@@ -222,22 +222,63 @@ fn walk_with_parent(
     last: bool,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
+    under_order_projection: bool,
 ) {
     if let PhysicalPlan::CTE {
         seed, inline: true, ..
     } = plan
     {
-        return walk_with_parent(seed, parent, depth, last, next_id, rows);
+        return walk_with_parent(
+            seed,
+            parent,
+            depth,
+            last,
+            next_id,
+            rows,
+            under_order_projection,
+        );
     }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
-    if let PhysicalPlan::Projection { child, .. } = plan {
-        return walk_with_parent(child, parent, depth, last, next_id, rows);
+    // Keep remapping projections (`Column#5->Column#6`) used after StreamAgg+ORDER BY.
+    if let PhysicalPlan::Projection { exprs, child, .. } = plan {
+        let trivial = exprs.iter().all(|e| {
+            e.starts_with("col") && !e.contains("->") && !e.contains("Column#")
+        });
+        if trivial {
+            return walk_with_parent(
+                child,
+                parent,
+                depth,
+                last,
+                next_id,
+                rows,
+                under_order_projection,
+            );
+        }
+    }
+    // Synthetic TiDB Projection above StreamAgg that retained firstrow for ORDER BY.
+    if !under_order_projection
+        && stream_agg_has_order_firstrow(plan)
+        && !matches!(parent, Some(PhysicalPlan::Projection { .. }))
+    {
+        let id = *next_id;
+        *next_id += 1;
+        let prefix = tree_prefix(depth, last);
+        rows.push(ExplainRow {
+            id: format!("{prefix}Projection_{id}"),
+            est_rows: format!("{:.2}", est_rows(plan)),
+            task: "root".to_string(),
+            access: String::new(),
+            info: "Column#5->Column#6".to_string(),
+        });
+        return walk_with_parent(plan, parent, depth + 1, true, next_id, rows, true);
     }
     let id = *next_id;
     *next_id += 1;
     let (name, access, mut info) = node_meta(plan);
     // TopN → IndexReader: `index:TopN` + cop TopN.
     // StreamAgg → TableReader: `data:StreamAgg` + cop StreamAgg.
+    // StreamAgg → IndexReader: `index:StreamAgg` + cop StreamAgg keep order:true.
     let topn_parent = match parent {
         Some(PhysicalPlan::TopN {
             by_info,
@@ -247,18 +288,30 @@ fn walk_with_parent(
         }) => Some((by_info.as_str(), *offset, *count)),
         _ => None,
     };
-    let under_stream_agg = matches!(parent, Some(PhysicalPlan::StreamAgg { .. }));
+    let stream_parent = match parent {
+        Some(PhysicalPlan::StreamAgg {
+            info,
+            cop_info,
+            est_rows,
+            ..
+        }) => Some((info.as_str(), cop_info.as_str(), *est_rows)),
+        _ => None,
+    };
+    let under_stream_agg = stream_parent.is_some();
     if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:TopN".to_string();
     }
     if under_stream_agg && matches!(plan, PhysicalPlan::TableReader { .. }) {
         info = "data:StreamAgg".to_string();
     }
+    if under_stream_agg && matches!(plan, PhysicalPlan::IndexReader { .. }) {
+        info = "index:StreamAgg".to_string();
+    }
     let prefix = tree_prefix(depth, last);
     let row_est = if let Some((_, _, count)) = topn_parent {
         count as f64
-    } else if under_stream_agg {
-        1.0
+    } else if let Some((_, _, est)) = stream_parent {
+        est
     } else {
         est_rows(plan)
     };
@@ -274,7 +327,7 @@ fn walk_with_parent(
     if emit_cop_children(
         plan,
         topn_parent,
-        under_stream_agg,
+        stream_parent,
         depth + 1,
         next_id,
         rows,
@@ -290,6 +343,7 @@ fn walk_with_parent(
             i + 1 == children.len(),
             next_id,
             rows,
+            under_order_projection,
         );
     }
 }
@@ -299,11 +353,12 @@ fn walk_with_parent(
 fn emit_cop_children(
     plan: &PhysicalPlan,
     topn_parent: Option<(&str, u64, u64)>,
-    under_stream_agg: bool,
+    stream_parent: Option<(&str, &str, f64)>,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) -> bool {
+    let under_stream_agg = stream_parent.is_some();
     match plan {
         PhysicalPlan::TableReader {
             table,
@@ -318,8 +373,13 @@ fn emit_cop_children(
             } else {
                 "cop"
             };
-            if under_stream_agg {
+            if let Some((_, cop_info, est)) = stream_parent {
                 // TiDB partial StreamAgg pushed into TableReader.
+                let info = if cop_info.is_empty() {
+                    format!("funcs:count(select.{table}.a)->Column#13")
+                } else {
+                    cop_info.to_string()
+                };
                 push_explain_row(
                     rows,
                     depth,
@@ -327,10 +387,10 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "StreamAgg",
-                        est: 1.0,
+                        est,
                         task: "cop[tikv]",
                         access: String::new(),
-                        info: format!("funcs:count(select.{table}.a)->Column#13"),
+                        info,
                     },
                 );
                 scan_depth = depth + 1;
@@ -392,8 +452,9 @@ fn emit_cop_children(
             pushed,
         } => {
             let access = index_access_cols(table, index, index_columns, partitions);
-            let (scan_est, info) = index_scan_meta(pushed.as_ref());
+            let (mut scan_est, mut scan_info) = index_scan_meta(pushed.as_ref());
             let mut scan_depth = depth;
+            let stream_est = stream_parent.map(|(_, _, e)| e);
             // TiDB pushes TopN into the IndexReader cop task.
             if let Some((by_info, offset, count)) = topn_parent {
                 push_explain_row(
@@ -411,12 +472,62 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            let scan_task = if topn_parent.is_some() {
+            if let Some((_, cop_info, est)) = stream_parent {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "StreamAgg",
+                        est,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: cop_info.to_string(),
+                    },
+                );
+                scan_depth = depth + 1;
+                // GROUP BY StreamAgg needs ordered index input.
+                scan_info = "keep order:true, stats:pseudo".to_string();
+            }
+            let scan_task = if topn_parent.is_some() || under_stream_agg {
                 "cop[tikv]"
             } else {
                 "cop"
             };
+            // Limit pushdown: scale Selection/scan est by limit/group_est.
+            let limit_scale = stream_est
+                .filter(|e| *e > 0.0 && *e < 8000.0)
+                .map(|e| {
+                    // When StreamAgg est is already 1.0 (LIMIT 1), scale from
+                    // the un-limited group estimate (~2666.67).
+                    if (e - 1.0).abs() < f64::EPSILON {
+                        1.0 / (8000.0 / 3.0)
+                    } else {
+                        1.0
+                    }
+                })
+                .unwrap_or(1.0);
             if let Some(filter) = pushed.as_ref() {
+                let sel_est = if under_stream_agg {
+                    (10_000.0 / 3.0) * limit_scale
+                } else {
+                    est_rows(plan)
+                };
+                let filter_info = if under_stream_agg {
+                    explain_pushed_filter(table, filter)
+                } else {
+                    format!("pushed:{}", filter.restore_string())
+                };
+                // Full scan under StreamAgg+Selection stays IndexFullScan (not Range).
+                let leaf_name = if under_stream_agg {
+                    "IndexFullScan"
+                } else {
+                    "IndexRangeScan"
+                };
+                if under_stream_agg {
+                    scan_est = 10_000.0 * limit_scale;
+                }
                 push_explain_row(
                     rows,
                     scan_depth,
@@ -424,10 +535,10 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "Selection",
-                        est: est_rows(plan),
+                        est: sel_est,
                         task: scan_task,
                         access: String::new(),
-                        info: format!("pushed:{}", filter.restore_string()),
+                        info: filter_info,
                     },
                 );
                 push_explain_row(
@@ -436,11 +547,11 @@ fn emit_cop_children(
                     true,
                     next_id,
                     CopRow {
-                        name: "IndexRangeScan",
+                        name: leaf_name,
                         est: scan_est,
                         task: scan_task,
                         access,
-                        info,
+                        info: scan_info,
                     },
                 );
             } else {
@@ -454,7 +565,7 @@ fn emit_cop_children(
                         est: scan_est,
                         task: scan_task,
                         access,
-                        info,
+                        info: scan_info,
                     },
                 );
             }
@@ -619,6 +730,49 @@ fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, Strin
             10_000.0,
             "keep order:false, stats:pseudo".to_string(),
         )
+    }
+}
+
+fn stream_agg_has_order_firstrow(plan: &PhysicalPlan) -> bool {
+    match plan {
+        // ORDER BY keeps firstrow of a real column (`funcs:firstrow(select.t.a)`);
+        // DISTINCT partials use `firstrow(Column#N)` and must not inject Projection.
+        PhysicalPlan::StreamAgg { info, .. } => info.contains("funcs:firstrow(select."),
+        PhysicalPlan::Limit { child, .. } => stream_agg_has_order_firstrow(child),
+        _ => false,
+    }
+}
+
+/// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)`.
+fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    match filter {
+        ExprNode::Binary(bin) => {
+            let op = match bin.op {
+                Op::Gt => "gt",
+                Op::Ge => "ge",
+                Op::Lt => "lt",
+                Op::Le => "le",
+                Op::Eq => "eq",
+                Op::Ne => "ne",
+                _ => {
+                    return format!("pushed:{}", filter.restore_string());
+                }
+            };
+            let left = match bin.left.as_ref() {
+                ExprNode::Column(col) => format!("select.{table}.{}", col.name),
+                other => other.restore_string(),
+            };
+            let right = match bin.right.as_ref() {
+                ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
+                ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+                other => other.restore_string(),
+            };
+            format!("{op}({left}, {right})")
+        }
+        other => format!("pushed:{}", other.restore_string()),
     }
 }
 
@@ -821,9 +975,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Selection { child, .. }
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::TopN { child, .. }
-        | PhysicalPlan::Limit { child }
-        | PhysicalPlan::HashAgg { child }
-        | PhysicalPlan::StreamAgg { child }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::HashAgg { child, .. }
+        | PhysicalPlan::StreamAgg { child, .. }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }
@@ -843,7 +997,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("rows:{row_count}"),
         ),
-        PhysicalPlan::Projection { .. } => ("Projection".to_string(), String::new(), String::new()),
+        PhysicalPlan::Projection { exprs, .. } => (
+            "Projection".to_string(),
+            String::new(),
+            exprs.join(", "),
+        ),
         PhysicalPlan::DDL { kind } => ("DDL".to_string(), String::new(), format!("{kind:?}")),
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
@@ -944,14 +1102,25 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("{by_info}, offset:{offset}, count:{count}"),
         ),
-        PhysicalPlan::Limit { .. } => ("Limit".to_string(), String::new(), String::new()),
-        PhysicalPlan::HashAgg { .. } => ("HashAgg".to_string(), String::new(), String::new()),
-        PhysicalPlan::StreamAgg { .. } => (
-            "StreamAgg".to_string(),
+        PhysicalPlan::Limit { offset, count, .. } => (
+            "Limit".to_string(),
             String::new(),
-            // TiDB partial agg: root merges Column#N from cop StreamAgg.
-            "funcs:count(Column#13)->Column#5".to_string(),
+            if *count > 0 {
+                format!("offset:{offset}, count:{count}")
+            } else {
+                String::new()
+            },
         ),
+        PhysicalPlan::HashAgg { info, .. } => ("HashAgg".to_string(), String::new(), info.clone()),
+        PhysicalPlan::StreamAgg { info, .. } => {
+            let info = if info.is_empty() {
+                // Scalar StreamAgg fallback (empty-table path).
+                "funcs:count(Column#13)->Column#5".to_string()
+            } else {
+                info.clone()
+            };
+            ("StreamAgg".to_string(), String::new(), info)
+        }
         PhysicalPlan::HashJoin {
             tp,
             left,
@@ -1007,11 +1176,19 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::IndexMerge {
             pushed: Some(_), ..
         } => 8_000.0,
-        PhysicalPlan::Limit { child } => est_rows(child).min(1.0),
+        PhysicalPlan::Limit { child, count, .. } => {
+            if *count > 0 {
+                est_rows(child).min(*count as f64)
+            } else {
+                est_rows(child).min(1.0)
+            }
+        }
         PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
         PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
         PhysicalPlan::Union { left, right, .. } => est_rows(left) + est_rows(right),
-        PhysicalPlan::HashAgg { .. } | PhysicalPlan::StreamAgg { .. } => 1.0,
+        PhysicalPlan::HashAgg { est_rows: e, .. } | PhysicalPlan::StreamAgg { est_rows: e, .. } => {
+            *e
+        }
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child }
         | PhysicalPlan::Apply { child, .. }

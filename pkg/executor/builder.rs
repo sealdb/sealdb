@@ -94,7 +94,7 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::Limit { child } => {
+            PhysicalPlan::Limit { child, .. } => {
                 let (limit, offset) =
                     stmt_limit(stmt).ok_or_else(|| Error::unsupported("limit without select"))?;
                 Ok(Box::new(LimitExec::new(
@@ -330,16 +330,32 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
-            PhysicalPlan::HashAgg { child } => {
+            PhysicalPlan::HashAgg { child, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("hash agg without select"))?;
-                Ok(Box::new(HashAggExec::new(
-                    select,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )?))
+                let built = Self::build(child, stmt, domain, current_db, txn)?;
+                // Outer DISTINCT HashAgg over StreamAgg: dedup projected columns.
+                if matches!(
+                    child.as_ref(),
+                    PhysicalPlan::StreamAgg { .. } | PhysicalPlan::HashAgg { .. }
+                ) {
+                    let keys = select
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            f.as_name
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| f.orig_text.clone())
+                                .unwrap_or_else(|| f.expr.restore_string())
+                        })
+                        .collect();
+                    return Ok(Box::new(DistinctExec::new(keys, built)));
+                }
+                Ok(Box::new(HashAggExec::new(select, built)?))
             }
-            PhysicalPlan::StreamAgg { child } => {
+            PhysicalPlan::StreamAgg { child, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("stream agg without select"))?;

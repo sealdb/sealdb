@@ -185,7 +185,9 @@ impl TableInfo {
     }
 
     /// Integer handle column is the original first INT (id == 1), so AFTER/FIRST
-    /// reordering does not steal the row key.
+    /// reordering does not steal the row key. Used for covering-index completeness
+    /// (`pk_is_handle` / common-handle heuristics); decode must not overwrite
+    /// values already filled from the index key (see `covering_row`).
     pub fn handle_column(&self) -> Option<&ColumnInfo> {
         self.columns
             .iter()

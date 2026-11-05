@@ -102,6 +102,7 @@ pub fn eval_named_cte(
         order_by: Vec::new(),
         limit: None,
         offset: None,
+        distinct: false,
         lock: SelectLock::None,
         lock_wait: SelectLockWait::Block,
         with: Some(with.clone()),

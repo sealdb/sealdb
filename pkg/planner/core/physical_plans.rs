@@ -104,12 +104,22 @@ pub enum PhysicalPlan {
     },
     Limit {
         child: Box<PhysicalPlan>,
+        offset: u64,
+        count: u64,
     },
     HashAgg {
         child: Box<PhysicalPlan>,
+        /// TiDB ExplainInfo (`group by:…, funcs:…`).
+        info: String,
+        est_rows: f64,
     },
     StreamAgg {
         child: Box<PhysicalPlan>,
+        /// TiDB ExplainInfo (`group by:…, funcs:…`).
+        info: String,
+        /// Coprocessor partial StreamAgg ExplainInfo under IndexReader/TableReader.
+        cop_info: String,
+        est_rows: f64,
     },
     /// Left-deep hash join. `on` is skipped in explain JSON; `Cross` has no
     /// equality keys; `Semi`/`Anti` emit the left schema only.
@@ -276,9 +286,19 @@ impl PhysicalPlan {
                 offset,
                 count,
             } => format!("TopN({by_info},offset:{offset},count:{count}) -> {}", child.explain()),
-            PhysicalPlan::Limit { child } => format!("Limit -> {}", child.explain()),
-            PhysicalPlan::HashAgg { child } => format!("HashAgg -> {}", child.explain()),
-            PhysicalPlan::StreamAgg { child } => format!("StreamAgg -> {}", child.explain()),
+            PhysicalPlan::Limit {
+                child,
+                offset,
+                count,
+            } => format!("Limit(offset:{offset},count:{count}) -> {}", child.explain()),
+            PhysicalPlan::HashAgg { child, info, .. } => {
+                format!("HashAgg({info}) -> {}", child.explain())
+            }
+            PhysicalPlan::StreamAgg {
+                child, info, ..
+            } => {
+                format!("StreamAgg({info}) -> {}", child.explain())
+            }
             PhysicalPlan::HashJoin {
                 tp, left, right, ..
             } => {
@@ -322,6 +342,36 @@ impl PhysicalPlan {
             table: table.into(),
             partitions,
             pushed: None,
+        }
+    }
+
+    pub fn hash_agg(child: PhysicalPlan, info: impl Into<String>, est_rows: f64) -> Self {
+        PhysicalPlan::HashAgg {
+            child: Box::new(child),
+            info: info.into(),
+            est_rows,
+        }
+    }
+
+    pub fn stream_agg(
+        child: PhysicalPlan,
+        info: impl Into<String>,
+        cop_info: impl Into<String>,
+        est_rows: f64,
+    ) -> Self {
+        PhysicalPlan::StreamAgg {
+            child: Box::new(child),
+            info: info.into(),
+            cop_info: cop_info.into(),
+            est_rows,
+        }
+    }
+
+    pub fn limit(child: PhysicalPlan, offset: u64, count: u64) -> Self {
+        PhysicalPlan::Limit {
+            child: Box::new(child),
+            offset,
+            count,
         }
     }
 }

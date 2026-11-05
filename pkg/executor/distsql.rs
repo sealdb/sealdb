@@ -425,6 +425,9 @@ fn covering_row(
     }
     if let Some(handle_col) = info.handle_column()
         && let Some(slot) = row.get_mut(handle_col.offset as usize)
+        // Index already decoded this column (e.g. KEY(a,b,c) on non-PK table);
+        // do not clobber with the artificial/common handle.
+        && matches!(slot, Datum::Null)
     {
         *slot = Datum::I64(handle);
     }
