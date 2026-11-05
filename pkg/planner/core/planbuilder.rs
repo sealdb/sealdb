@@ -3357,17 +3357,10 @@ fn access_plan(
             current_db,
         );
     }
-    if let Some((_, value)) = eq_column_consts(select.selection.as_ref()).into_iter().next()
-        && let Some(handle) = datum_as_handle(&value)
-    {
-        PhysicalPlan::PointGet {
-            table: from.name.clone(),
-            handle: Some(handle),
-            index: None,
-        }
-    } else {
-        PhysicalPlan::table_reader(from.name.clone(), Vec::new())
-    }
+    // Unknown physical table (CTE / recursive working set): always TableReader
+    // so execute-time `lookup_cte_rows` can resolve. PointGet here would 1146
+    // on `FROM cte WHERE col = const` in recursive arms (TiDB cte suite).
+    PhysicalPlan::table_reader(from.name.clone(), Vec::new())
 }
 
 /// TiDB constant folding: int handle accepts string/float numeric literals (`a = '1'`).

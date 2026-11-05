@@ -3042,6 +3042,29 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn test_exists_with_recursive_cte_correlated() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte;                  CREATE TABLE t1(a INT); INSERT INTO t1 VALUES (1),(2);",
+            )
+            .unwrap();
+        let filtered = session
+            .execute_stmt(
+                "WITH RECURSIVE qn AS (SELECT 1 AS b UNION ALL SELECT b+1 FROM qn WHERE b=0)                  SELECT * FROM qn WHERE b=1",
+            )
+            .unwrap_or_else(|e| panic!("filtered recursive failed: {e}"));
+        assert_eq!(filtered.display_rows(), vec![vec!["1".to_string()]]);
+        let rows = session
+            .execute_stmt(
+                "SELECT * FROM t1 dt WHERE EXISTS(                    WITH RECURSIVE qn AS (SELECT a*0 AS b UNION ALL SELECT b+1 FROM qn WHERE b=0)                    SELECT * FROM qn WHERE b=a)",
+            )
+            .unwrap_or_else(|e| panic!("EXISTS recursive CTE failed: {e}"));
+        assert_eq!(rows.display_rows(), vec![vec!["1".to_string()]]);
+    }
+
     #[test]
     fn test_schema_persists_across_domain() {
         let storage: Arc<dyn sealdb_kv::Storage> = Arc::new(sealdb_kv::MemStorage::new());
