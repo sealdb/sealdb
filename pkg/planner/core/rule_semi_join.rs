@@ -134,14 +134,20 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         },
         PhysicalPlan::CTE {
             name,
+            alias,
             columns,
             seed,
+            recursive_plan,
             inline,
+            recursive,
         } => PhysicalPlan::CTE {
             name,
+            alias,
             columns,
             seed: Box::new(rewrite_semi_join(*seed)),
+            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join(*p))),
             inline,
+            recursive,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,
@@ -824,14 +830,20 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         },
         PhysicalPlan::CTE {
             name,
+            alias,
             columns,
             seed,
+            recursive_plan,
             inline,
+            recursive,
         } => PhysicalPlan::CTE {
             name,
+            alias,
             columns,
             seed: Box::new(rewrite_semi_join_agg(*seed)),
+            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_agg(*p))),
             inline,
+            recursive,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,

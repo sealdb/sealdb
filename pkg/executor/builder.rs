@@ -480,6 +480,7 @@ impl ExecutorBuilder {
                 columns,
                 seed,
                 inline,
+                ..
             } => {
                 let with = stmt
                     .with_clause()

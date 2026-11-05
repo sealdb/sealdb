@@ -557,6 +557,18 @@ impl PlanBuilder {
             .filter(|t| t.resolve_name().eq_ignore_ascii_case(cte_name))
             .count()
             > 1;
+        let recursive = cte.is_some_and(|cte| cte.recursive.is_some());
+        let recursive_plan = if let Some((_, rec)) = cte.and_then(|c| c.recursive.clone()) {
+            Some(Box::new(self.build_with_schema(
+                &Statement::Select(rec),
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            )?))
+        } else {
+            None
+        };
         let inline = cte.is_some_and(|cte| {
             cte.materialize != CteMaterialize::Materialized
                 && cte.recursive.is_none()
@@ -564,11 +576,19 @@ impl PlanBuilder {
         }) || seed_is_dual_projection(&seed)
             // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
             || seed_is_union_of_dual(&seed);
+        // `cte1 AS dt2` → name=cte1, physical=dt2 after join_side remap.
+        let alias = from
+            .physical
+            .clone()
+            .filter(|a| !a.eq_ignore_ascii_case(&from.name));
         Ok(Some(PhysicalPlan::CTE {
             name: from.name.clone(),
+            alias,
             columns,
             seed: Box::new(seed),
+            recursive_plan,
             inline,
+            recursive,
         }))
     }
 
@@ -1546,42 +1566,52 @@ fn prepare_merge_join_side(
 ) -> PhysicalPlan {
     let phys = merge_join_orig_table(select, table);
     let pk_ordered = merge_join_side_pk_ordered(select, table, on, is, current_db);
+    // Strip CTE ORDER BY Sort — MergeJoin supplies order (#25674), including PK.
+    plan = match plan {
+        PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed,
+            recursive_plan,
+            inline: true,
+            recursive,
+        } => PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed: Box::new(strip_cte_order_sort(*seed)),
+            recursive_plan,
+            inline: true,
+            recursive,
+        },
+        other => other,
+    };
     if !pk_ordered {
         let filter = null_reject_on_inner(on, &table.name, &phys)
             .or_else(|| null_reject_on_inner(on, table.resolve_name(), &phys));
         if let Some(filter) = filter {
             // Push through inline CTE seed so EXPLAIN shows cop Selection under
             // TableReader (`data:Selection`), not a root Selection above CTE.
-            // Strip seed ORDER BY Sort — MergeJoin supplies its own Sort (#25674).
             plan = match plan {
                 PhysicalPlan::CTE {
                     name,
+                    alias,
                     columns,
                     seed,
+                    recursive_plan,
                     inline: true,
-                } => {
-                    let seed = strip_cte_order_sort(*seed);
-                    PhysicalPlan::CTE {
-                        name,
-                        columns,
-                        seed: Box::new(predicate_push_down(seed, &filter, is, current_db)),
-                        inline: true,
-                    }
-                }
+                    recursive,
+                } => PhysicalPlan::CTE {
+                    name,
+                    alias,
+                    columns,
+                    seed: Box::new(predicate_push_down(*seed, &filter, is, current_db)),
+                    recursive_plan,
+                    inline: true,
+                    recursive,
+                },
                 other => predicate_push_down(other, &filter, is, current_db),
-            };
-        } else if let PhysicalPlan::CTE {
-            name,
-            columns,
-            seed,
-            inline: true,
-        } = plan
-        {
-            plan = PhysicalPlan::CTE {
-                name,
-                columns,
-                seed: Box::new(strip_cte_order_sort(*seed)),
-                inline: true,
             };
         }
         plan = PhysicalPlan::Sort {
@@ -1610,6 +1640,15 @@ fn merge_join_side_pk_ordered(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> bool {
+    // Recursive CTE working sets are not PK-ordered even when the seed is.
+    if select
+        .with
+        .as_ref()
+        .and_then(|w| w.find(table.resolve_name()))
+        .is_some_and(|cte| cte.recursive.is_some())
+    {
+        return false;
+    }
     let phys = merge_join_orig_table(select, table);
     let Some(info) = is.and_then(|schema| schema.table_by_name(current_db, &phys)) else {
         return false;
@@ -1980,25 +2019,34 @@ fn push_filter_under_projection(
         },
         PhysicalPlan::CTE {
             name,
+            alias,
             columns,
             seed,
+            recursive_plan,
             inline,
+            recursive,
         } => {
             if columns.is_empty() {
                 PhysicalPlan::CTE {
                     name,
+                    alias,
                     columns,
                     seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
+                    recursive_plan,
                     inline,
+                    recursive,
                 }
             } else {
                 // Named CTE outputs: keep filter above (seed names may differ).
                 predicate_push_down(
                     PhysicalPlan::CTE {
                         name,
+                        alias,
                         columns,
                         seed,
+                        recursive_plan,
                         inline,
+                        recursive,
                     },
                     filter,
                     is,

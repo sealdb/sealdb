@@ -222,11 +222,17 @@ pub enum PhysicalPlan {
     },
     CTE {
         name: String,
+        /// FROM alias when different from `name` (`cte1 AS dt2` → alias dt2).
+        alias: Option<String>,
         columns: Vec<String>,
         seed: Box<PhysicalPlan>,
+        /// Recursive UNION arm plan for EXPLAIN (Seed Part / Recursive Part).
+        recursive_plan: Option<Box<PhysicalPlan>>,
         /// `AS NOT MATERIALIZED` inlines filters into `seed` and omits the CTE
         /// operator from EXPLAIN; recursive CTEs stay materialized.
         inline: bool,
+        /// WITH RECURSIVE — EXPLAIN shows CTEFullScan + separate producer tree.
+        recursive: bool,
     },
     /// Dedup child rows by `keys` (TiDB SemiJoinRewriter inner aggregation).
     Distinct {
@@ -425,10 +431,16 @@ impl PhysicalPlan {
                 format!("ShuffleReceiver -> {}", child.explain())
             }
             PhysicalPlan::CTE {
-                name, seed, inline, ..
+                name,
+                seed,
+                inline,
+                recursive,
+                ..
             } => {
                 if *inline {
                     seed.explain()
+                } else if *recursive {
+                    format!("CTEFullScan_{name}")
                 } else {
                     format!("CTE_{name} -> {}", seed.explain())
                 }
