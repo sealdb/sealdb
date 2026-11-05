@@ -336,34 +336,18 @@ fn build_recursive_all_probe(
         ExprNode::Column(c) => c.name.clone(),
         _ => "c1".into(),
     };
-    let mut seed_plan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
+    // TiDB Seed Part: TableReader → cop Projection → Selection → TableFullScan.
+    let mut scan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
     if let Some(sel) = &seed.selection {
-        seed_plan = match seed_plan {
-            PhysicalPlan::TableReader {
-                table,
-                partitions,
-                partition_names,
-                partition_access,
-                row_count,
-                stats_pseudo,
-                ..
-            } => PhysicalPlan::TableReader {
-                table,
-                partitions,
-                partition_names,
-                partition_access,
-                row_count,
-                stats_pseudo,
-                pushed: Some(sel.clone()),
-            },
-            other => other,
-        };
-        // Projection under TableReader for seed SELECT c1 — EXPLAIN unwraps.
-        seed_plan = PhysicalPlan::Projection {
-            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
-            child: Box::new(seed_plan),
+        scan = PhysicalPlan::Selection {
+            child: Box::new(scan),
+            filter: sel.clone(),
         };
     }
+    let seed_plan = PhysicalPlan::Projection {
+        exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+        child: Box::new(scan),
+    };
     let rec_plan = build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), schema);
     let cte_plan = PhysicalPlan::CTE {
         name: cte.name.clone(),
@@ -473,33 +457,17 @@ fn recursive_exists_cte_apply(
         ExprNode::Column(c) => c.name.clone(),
         _ => "c1".into(),
     };
-    let mut seed_plan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
+    let mut scan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
     if let Some(sel) = &seed.selection {
-        seed_plan = match seed_plan {
-            PhysicalPlan::TableReader {
-                table,
-                partitions,
-                partition_names,
-                partition_access,
-                row_count,
-                stats_pseudo,
-                ..
-            } => PhysicalPlan::TableReader {
-                table,
-                partitions,
-                partition_names,
-                partition_access,
-                row_count,
-                stats_pseudo,
-                pushed: Some(sel.clone()),
-            },
-            other => other,
-        };
-        seed_plan = PhysicalPlan::Projection {
-            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
-            child: Box::new(seed_plan),
+        scan = PhysicalPlan::Selection {
+            child: Box::new(scan),
+            filter: sel.clone(),
         };
     }
+    let seed_plan = PhysicalPlan::Projection {
+        exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+        child: Box::new(scan),
+    };
     let rec_plan = match &cte.recursive {
         Some((_, rec)) => build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema),
         None => PhysicalPlan::table_reader("CTE_0", Vec::new()),
@@ -528,7 +496,7 @@ fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
         ExprNode::Exists(exists) => exists
             .query
             .as_select()
-            .and_then(|query| from_exists(exists.not, query)),
+            .and_then(|query| from_exists(exists.not, query, plan_table(outer).as_deref())),
         ExprNode::InSubquery(sub) => sub.query.as_select().and_then(|query| {
             from_in(
                 &sub.expr,
@@ -543,7 +511,7 @@ fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
 
 /// Correlated `EXISTS` / `NOT EXISTS` with a single equality that mentions
 /// both the inner table and some outer table.
-fn from_exists(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
+fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Option<SemiSpec> {
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
         let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
@@ -557,10 +525,14 @@ fn from_exists(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
     }
     // `EXISTS (WITH cte AS (SELECT … FROM t2 WHERE corr) SELECT FROM cte)` —
     // TiDB inlines the CTE seed and decorrelates to a semi HashJoin (cte suite).
-    from_exists_cte(not, query)
+    from_exists_cte(not, query, outer_table)
 }
 
-fn from_exists_cte(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
+fn from_exists_cte(
+    not: bool,
+    query: &SelectStmt,
+    outer_table: Option<&str>,
+) -> Option<SemiSpec> {
     let with = query.with.as_ref()?;
     if with.ctes.len() != 1 || with.is_recursive {
         return None;
@@ -584,14 +556,69 @@ fn from_exists_cte(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
     let seed = cte.query.as_ref();
     let inner = simple_inner(seed)?;
     let selection = seed.selection.as_ref()?;
-    let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
-    Some(build_spec(
-        if not { JoinType::Anti } else { JoinType::Semi },
-        inner.name.clone(),
-        inner_filter,
+    let (eq, inner_only) = split_semi_pred(selection, &inner.name)?;
+    let outer_tbl = outer_table.unwrap_or("t1");
+    // TiDB: null-reject both sides; EXPLAIN equal lists outer col first; no Distinct.
+    let join_label = if not { "anti semi join" } else { "semi join" };
+    let equal = explain_semi_eq_outer_first(&eq, &inner.name);
+    let info = format!("{join_label}, equal:[{equal}]");
+    let on = ExprNode::Binary(BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(eq.clone()),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(info.into_bytes()),
+        })),
+    });
+    let right_nulls = not_isnull_for_eq(&eq, &inner.name);
+    let left_nulls = not_isnull_for_eq(&eq, outer_tbl);
+    let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+    if let Some(filter) = merge_filters(inner_only, right_nulls) {
+        right = push_isnull_filter(right, filter);
+    }
+    Some(SemiSpec {
+        tp: if not { JoinType::Anti } else { JoinType::Semi },
+        right_table: inner.name.clone(),
+        right,
         on,
-        None,
-    ))
+        outer_filter: left_nulls,
+    })
+}
+
+fn not_isnull_for_eq(on: &ExprNode, table: &str) -> Option<ExprNode> {
+    let eq = match on {
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            if matches!(bin.left.as_ref(), ExprNode::Binary(_)) {
+                bin.left.as_ref()
+            } else {
+                bin.right.as_ref()
+            }
+        }
+        other => other,
+    };
+    let ExprNode::Binary(bin) = eq else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    for side in [&bin.left, &bin.right] {
+        if let ExprNode::Column(c) = side.as_ref()
+            && c.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(table))
+        {
+            return Some(ExprNode::Unary(UnaryOpExpr {
+                op: Op::Not,
+                expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                    expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                        schema: None,
+                        table: Some(table.to_string()),
+                        name: c.name.clone(),
+                    })),
+                    not: false,
+                })),
+            }));
+        }
+    }
+    None
 }
 
 /// `outer_col IN (SELECT inner_col FROM t [WHERE …])`.
@@ -1054,6 +1081,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         } => {
             let left = rewrite_semi_join_agg(*left);
             let right = rewrite_semi_join_agg(*right);
+            // LogicAnd(Eq, Bytes explain) — used by CTE EXISTS — skips Distinct
+            // (join_key_on_table only matches bare Eq); TiDB has no HashAgg here.
             if tp == JoinType::Semi
                 && let Some(key) = join_key_on_table(&on, &right_table)
             {

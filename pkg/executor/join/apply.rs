@@ -34,6 +34,8 @@ pub struct NestedLoopApplyExec {
     current_db: String,
     txn: Arc<TxnHandle>,
     outer_table: Option<String>,
+    /// Outer SELECT WITH — EXISTS/IN bodies that reference those CTEs need it.
+    outer_with: Option<WithClause>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -47,6 +49,7 @@ impl NestedLoopApplyExec {
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         outer_table: Option<String>,
+        outer_with: Option<WithClause>,
     ) -> Self {
         Self {
             filter,
@@ -55,6 +58,7 @@ impl NestedLoopApplyExec {
             current_db: current_db.into(),
             txn,
             outer_table,
+            outer_with,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -80,6 +84,7 @@ impl Executor for NestedLoopApplyExec {
             &self.current_db,
             &self.txn,
             &self.outer_table,
+            self.outer_with.as_ref(),
         )?;
         Ok(())
     }
@@ -123,6 +128,7 @@ fn filter_outer_rows(
     current_db: &str,
     txn: &Arc<TxnHandle>,
     outer_table: &Option<String>,
+    outer_with: Option<&WithClause>,
 ) -> Result<Vec<Vec<Datum>>> {
     let workers = apply_concurrency().min(rows.len().max(1));
     if workers <= 1 {
@@ -134,6 +140,7 @@ fn filter_outer_rows(
             current_db,
             txn,
             outer_table,
+            outer_with,
         );
     }
     let chunk_len = rows.len().div_ceil(workers);
@@ -152,6 +159,7 @@ fn filter_outer_rows(
         let current_db = current_db.to_string();
         let txn = Arc::clone(txn);
         let outer_table = outer_table.clone();
+        let outer_with = outer_with.cloned();
         handles.push(thread::spawn(move || {
             with_collation(mode, || {
                 filter_outer_rows_serial(
@@ -162,6 +170,7 @@ fn filter_outer_rows(
                     &current_db,
                     &txn,
                     &outer_table,
+                    outer_with.as_ref(),
                 )
             })
         }));
@@ -185,6 +194,7 @@ fn filter_outer_rows_serial(
     current_db: &str,
     txn: &Arc<TxnHandle>,
     outer_table: &Option<String>,
+    outer_with: Option<&WithClause>,
 ) -> Result<Vec<Vec<Datum>>> {
     let mut cache = HashMap::new();
     let mut kept = Vec::new();
@@ -194,6 +204,7 @@ fn filter_outer_rows_serial(
             current_db: current_db.to_string(),
             txn: Arc::clone(txn),
             outer_table: outer_table.clone(),
+            outer_with: outer_with.cloned(),
             outer_schema: schema.to_vec(),
             outer_row: row.clone(),
         };
@@ -210,6 +221,7 @@ struct ApplyCtx {
     current_db: String,
     txn: Arc<TxnHandle>,
     outer_table: Option<String>,
+    outer_with: Option<WithClause>,
     outer_schema: Vec<String>,
     outer_row: Vec<Datum>,
 }
@@ -254,6 +266,7 @@ impl SubqueryEvalCtx {
             current_db: self.current_db.clone(),
             txn: Arc::clone(&self.txn),
             outer_table: self.outer_table.clone(),
+            outer_with: None,
             outer_schema: schema.to_vec(),
             outer_row: row.to_vec(),
         };
@@ -488,8 +501,21 @@ fn bind_select_with_cte_schemas(
         }
     }
     let mut out = select.clone();
-    if let Some(with) = &select.with {
-        out.with = Some(bind_with(with, ctx)?);
+    // Attach outer WITH when the subquery references those CTEs (no_decorrelate
+    // EXISTS over a WITH recursive cte1 defined on the outer SELECT).
+    out.with = match (&select.with, &ctx.outer_with) {
+        (Some(inner), Some(outer)) => Some(bind_with(
+            &merge_with_clauses(outer, inner),
+            ctx,
+        )?),
+        (Some(inner), None) => Some(bind_with(inner, ctx)?),
+        (None, Some(outer)) => Some(bind_with(outer, ctx)?),
+        (None, None) => None,
+    };
+    if let Some(with) = &out.with {
+        for cte in &with.ctes {
+            inner_cols.extend(cte_output_names(cte));
+        }
     }
     out.fields = select
         .fields
@@ -517,6 +543,22 @@ fn bind_select_with_cte_schemas(
         item.expr = bind_expr(&item.expr, ctx, inner_table.as_deref(), &inner_cols);
     }
     Ok(out)
+}
+
+fn merge_with_clauses(outer: &WithClause, inner: &WithClause) -> WithClause {
+    let mut ctes = outer.ctes.clone();
+    for cte in &inner.ctes {
+        if !ctes
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&cte.name))
+        {
+            ctes.push(cte.clone());
+        }
+    }
+    WithClause {
+        is_recursive: outer.is_recursive || inner.is_recursive,
+        ctes,
+    }
 }
 
 fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
