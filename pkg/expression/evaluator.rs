@@ -509,7 +509,7 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             if !sql_mode_flag("NO_UNSIGNED_SUBTRACTION")
                 && (matches!(left, Datum::U64(_)) || matches!(right, Datum::U64(_)))
             {
-                unsigned_minus(&left, &right)
+                unsigned_minus(&expr.left, &left, &expr.right, &right)
             } else {
                 // Signed BIGINT result (also under NO_UNSIGNED_SUBTRACTION).
                 // Use i128 so U64 magnitudes stay positive — wrapping U64→i64
@@ -1377,13 +1377,24 @@ fn datum_as_u64(d: &Datum) -> Result<u64> {
     }
 }
 
-fn unsigned_minus(left: &Datum, right: &Datum) -> Result<Datum> {
+fn unsigned_minus(
+    left_expr: &ExprNode,
+    left: &Datum,
+    right_expr: &ExprNode,
+    right: &Datum,
+) -> Result<Datum> {
     let l = datum_as_u64(left)?;
     let r = datum_as_u64(right)?;
     if l < r {
+        // TiDB labels column refs (`cte.t1.c1`) and literal values (`1`).
+        let label = format!(
+            "({} - {})",
+            minus_operand_label(left_expr, left),
+            minus_operand_label(right_expr, right)
+        );
         return Err(Error::new(
             ERR_DATA_OUT_OF_RANGE,
-            format!("BIGINT UNSIGNED value is out of range in '({l} - {r})'"),
+            format!("BIGINT UNSIGNED value is out of range in '{label}'"),
         ));
     }
     Ok(Datum::U64(l - r))

@@ -15,7 +15,8 @@ use sealdb_parser::ast::expressions::{
     UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{
-    ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement, WithClause,
+    CommonTableExpression, ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement,
+    WithClause,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_planner::PlanBuilder;
@@ -466,24 +467,23 @@ fn bind_result_set(query: &ResultSetNode, ctx: &ApplyCtx) -> Result<ResultSetNod
 }
 
 fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
-    let inner_table = select.from.as_ref().map(|t| t.name.clone());
-    let mut inner_cols = inner_columns(select, ctx);
+    bind_select_with_cte_schemas(select, ctx, &HashMap::new())
+}
+
+fn bind_select_with_cte_schemas(
+    select: &SelectStmt,
+    ctx: &ApplyCtx,
+    prior_ctes: &HashMap<String, Vec<String>>,
+) -> Result<SelectStmt> {
+    let inner_table = select.from.as_ref().map(|t| {
+        // Prefer physical name so `FROM qn AS a` still matches CTE `qn`.
+        t.resolve_name().to_string()
+    });
+    let mut inner_cols = inner_columns(select, ctx, prior_ctes);
     // CTE output names count as inner so `WHERE b=a` keeps `b` on the CTE.
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            if !cte.col_name_list.is_empty() {
-                inner_cols.extend(cte.col_name_list.iter().cloned());
-            } else {
-                for field in &cte.query.fields {
-                    if let Some(name) = &field.as_name
-                        && !name.is_empty()
-                    {
-                        inner_cols.push(name.clone());
-                    } else if let ExprNode::Column(c) = &field.expr {
-                        inner_cols.push(c.name.clone());
-                    }
-                }
-            }
+            inner_cols.extend(cte_output_names(cte));
         }
     }
     let mut out = select.clone();
@@ -520,17 +520,21 @@ fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
 
 fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
     let mut ctes = Vec::with_capacity(with.ctes.len());
+    // Sibling CTEs: later bodies see earlier output cols as inner so
+    // `qn2 AS (SELECT 3*a FROM qn)` keeps `a` on qn (not outer correlation).
+    let mut prior: HashMap<String, Vec<String>> = HashMap::new();
     for cte in &with.ctes {
         let mut bound = cte.clone();
-        bound.query = Box::new(bind_select(&cte.query, ctx)?);
+        bound.query = Box::new(bind_select_with_cte_schemas(&cte.query, ctx, &prior)?);
         if let Some((op, rec)) = &cte.recursive {
-            bound.recursive = Some((*op, bind_select(rec, ctx)?));
+            bound.recursive = Some((*op, bind_select_with_cte_schemas(rec, ctx, &prior)?));
         }
         let mut rest = Vec::with_capacity(cte.set_rest.len());
         for (op, select) in &cte.set_rest {
-            rest.push((*op, bind_select(select, ctx)?));
+            rest.push((*op, bind_select_with_cte_schemas(select, ctx, &prior)?));
         }
         bound.set_rest = rest;
+        prior.insert(cte.name.to_ascii_lowercase(), cte_output_names(&bound));
         ctes.push(bound);
     }
     Ok(WithClause {
@@ -539,10 +543,40 @@ fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
     })
 }
 
-fn inner_columns(select: &SelectStmt, ctx: &ApplyCtx) -> Vec<String> {
+fn cte_output_names(cte: &CommonTableExpression) -> Vec<String> {
+    if !cte.col_name_list.is_empty() {
+        return cte.col_name_list.clone();
+    }
+    let mut names = Vec::new();
+    for field in &cte.query.fields {
+        if let Some(name) = &field.as_name
+            && !name.is_empty()
+        {
+            names.push(name.clone());
+        } else if let ExprNode::Column(c) = &field.expr {
+            names.push(c.name.clone());
+        }
+    }
+    names
+}
+
+fn inner_columns(
+    select: &SelectStmt,
+    ctx: &ApplyCtx,
+    prior_ctes: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
     let Some(from) = &select.from else {
         return Vec::new();
     };
+    let cte_key = from.resolve_name().to_ascii_lowercase();
+    if let Some(cols) = prior_ctes.get(&cte_key) {
+        return cols.clone();
+    }
+    if let Some(with) = &select.with
+        && let Some(cte) = with.find(from.resolve_name())
+    {
+        return cte_output_names(cte);
+    }
     let (schema, name) = from.qualified(&ctx.current_db);
     ctx.domain
         .infoschema()
