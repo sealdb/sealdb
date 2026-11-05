@@ -333,6 +333,15 @@ impl Executor for ShowExec {
                     })
                     .collect();
             }
+            // Handled in session before plan build; keep match exhaustive.
+            ShowStmtKind::Warnings => {
+                self.schema = vec![
+                    "Level".to_string(),
+                    "Code".to_string(),
+                    "Message".to_string(),
+                ];
+                self.rows = Vec::new();
+            }
         }
         Ok(())
     }

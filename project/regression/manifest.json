@@ -105,7 +105,7 @@
     {
       "name": "collation_agg_func",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "pending",
       "test": "t/collation_agg_func.test",
       "result": "r/collation_agg_func.result",
       "has_result": false,
@@ -1735,7 +1735,7 @@
     {
       "name": "null_rejected",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/null_rejected.test",
       "result": "r/null_rejected.result",
       "has_result": true,

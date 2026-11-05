@@ -542,6 +542,7 @@ impl PlanBuilder {
             return Ok(plan);
         }
         let first = &select.joins[0];
+        let left = self.join_side(select, &first.left, is, current_db, stats, prune_mode)?;
         let mut right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
         let first_tp = map_join_type(first.tp);
         if matches!(first_tp, JoinType::LeftOuter | JoinType::RightOuter)
@@ -550,15 +551,28 @@ impl PlanBuilder {
         {
             right = predicate_push_down(right, &filter, is, current_db);
         }
+        // TiDB: single-side ON (e.g. `ON (derived.col)`) → push into that side,
+        // leave a pure CARTESIAN join.
+        let (left, right, first_on, first_tp) = push_single_side_on(
+            select,
+            left,
+            right,
+            &first.left.name,
+            &first.right.name,
+            first.on.clone(),
+            first_tp,
+            is,
+            current_db,
+        );
         let mut plan = reorder_hash_join(
             first_tp,
-            self.join_side(select, &first.left, is, current_db, stats, prune_mode)?,
+            left,
             right,
             first.left.name.clone(),
             first.right.name.clone(),
             table_row_count(stats, &first.left, current_db),
             table_row_count(stats, &first.right, current_db),
-            first.on.clone(),
+            first_on,
         );
         for join in select.joins.iter().skip(1) {
             let tp = map_join_type(join.tp);
@@ -1441,23 +1455,226 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let text = f
-                .orig_text
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| f.expr.restore_string());
-            // Constants / funcs use TiDB `text->Column#N`; bare columns stay
+            // Non-column exprs use TiDB `text->Column#N`; bare columns stay
             // `colN` so EXPLAIN elides the remapping Projection (TopN/Limit).
-            if matches!(&f.expr, ExprNode::Value(_) | ExprNode::Func(_)) {
-                format!("{text}->Column#{}", col_base + i)
-            } else {
+            if matches!(&f.expr, ExprNode::Column(_)) {
                 format!("col{i}")
+            } else {
+                let text = tidb_scalar_explain(&f.expr, true);
+                format!("{text}->Column#{}", col_base + i)
             }
         })
         .collect();
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(plan),
+    }
+}
+
+/// TiDB ScalarFunction ExplainInfo; `nil_as_angle` → `<nil>` (Projection) else `NULL`.
+fn tidb_scalar_explain(expr: &ExprNode, nil_as_angle: bool) -> String {
+    use sealdb_parser::ast::expressions::ValueExpr;
+    use sealdb_types::Datum;
+    match expr {
+        ExprNode::Column(c) => {
+            let tbl = c.table.as_deref().unwrap_or("t");
+            let schema = sealdb_expression::current_db_name();
+            if schema.is_empty() {
+                format!("select.{tbl}.{}", c.name)
+            } else {
+                format!("{schema}.{tbl}.{}", c.name)
+            }
+        }
+        ExprNode::Value(ValueExpr { datum: Datum::Null }) => {
+            if nil_as_angle {
+                "<nil>".into()
+            } else {
+                "NULL".into()
+            }
+        }
+        ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+        ExprNode::Binary(bin) => {
+            let op = match bin.op {
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
+                Op::Mod => "mod",
+                Op::Eq => "eq",
+                Op::Ne => "ne",
+                Op::Lt => "lt",
+                Op::Le => "le",
+                Op::Gt => "gt",
+                Op::Ge => "ge",
+                Op::LogicAnd => "and",
+                Op::LogicOr => "or",
+                _ => return expr.restore_string(),
+            };
+            format!(
+                "{op}({}, {})",
+                tidb_scalar_explain(&bin.left, nil_as_angle),
+                tidb_scalar_explain(&bin.right, nil_as_angle)
+            )
+        }
+        ExprNode::Cast(c) => {
+            let target = cast_target_explain(&c.target);
+            format!(
+                "cast({}, {target})",
+                tidb_scalar_explain(&c.expr, nil_as_angle)
+            )
+        }
+        ExprNode::Like(l) => {
+            let pattern = match l.pattern.as_ref() {
+                // TiDB coerces numeric `+` under LIKE to double then var_string.
+                ExprNode::Binary(b) if b.op == Op::Plus => format!(
+                    "cast(plus(cast({}, double BINARY), cast({}, double BINARY)), var_string(370))",
+                    tidb_scalar_explain(&b.left, nil_as_angle),
+                    tidb_scalar_explain(&b.right, nil_as_angle),
+                ),
+                other => tidb_scalar_explain(other, nil_as_angle),
+            };
+            format!(
+                "like({}, {}, 92)",
+                tidb_scalar_explain(&l.expr, nil_as_angle),
+                pattern,
+            )
+        }
+        ExprNode::Func(f) => {
+            let args: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| tidb_scalar_explain(a, nil_as_angle))
+                .collect();
+            format!("{}({})", f.name.to_ascii_lowercase(), args.join(", "))
+        }
+        other => other.restore_string(),
+    }
+}
+
+fn cast_target_explain(target: &str) -> String {
+    let upper = target.to_ascii_uppercase();
+    if upper.contains("DOUBLE") || upper == "FLOAT8" {
+        "double BINARY".into()
+    } else if upper.contains("CHAR") || upper.contains("STRING") || upper.contains("BINARY") {
+        // TiDB LIKE cast width for NULL+NULL stringification.
+        "var_string(370)".into()
+    } else {
+        format!("{} BINARY", target.to_ascii_lowercase())
+    }
+}
+
+/// Push a single-side join ON into that side's Selection; return Cross + true ON.
+fn push_single_side_on(
+    select: &SelectStmt,
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    left_name: &str,
+    right_name: &str,
+    on: ExprNode,
+    tp: JoinType,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> (PhysicalPlan, PhysicalPlan, ExprNode, JoinType) {
+    if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter | JoinType::Semi | JoinType::Anti)
+    {
+        return (left, right, on, tp);
+    }
+    if join_on_has_equijoin_local(&on) {
+        return (left, right, on, tp);
+    }
+    let ExprNode::Column(c) = &on else {
+        return (left, right, on, tp);
+    };
+    let on_left = c
+        .table
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(left_name));
+    let on_right = c
+        .table
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(right_name));
+    let (side_name, filter) = if on_left && !on_right {
+        match cte_field_expr(select, left_name, &c.name) {
+            Some(f) => (left_name, f),
+            None => return (left, right, on, tp),
+        }
+    } else if on_right && !on_left {
+        match cte_field_expr(select, right_name, &c.name) {
+            Some(f) => (right_name, f),
+            None => return (left, right, on, tp),
+        }
+    } else {
+        return (left, right, on, tp);
+    };
+    let true_on = ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+        datum: sealdb_types::Datum::I64(1),
+    });
+    if side_name.eq_ignore_ascii_case(left_name) {
+        let left = push_filter_under_projection(left, &filter, is, current_db);
+        (left, right, true_on, JoinType::Cross)
+    } else {
+        let right = push_filter_under_projection(right, &filter, is, current_db);
+        (left, right, true_on, JoinType::Cross)
+    }
+}
+
+fn cte_field_expr(select: &SelectStmt, cte_name: &str, col: &str) -> Option<ExprNode> {
+    let with = select.with.as_ref()?;
+    let cte = with.find(cte_name)?;
+    if let Some(i) = cte
+        .col_name_list
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(col))
+    {
+        return cte.query.fields.get(i).map(|f| f.expr.clone());
+    }
+    cte.query.fields.iter().find_map(|f| {
+        f.as_name
+            .as_deref()
+            .filter(|n| n.eq_ignore_ascii_case(col))
+            .map(|_| f.expr.clone())
+    })
+}
+
+fn push_filter_under_projection(
+    plan: PhysicalPlan,
+    filter: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(predicate_push_down(*child, filter, is, current_db)),
+        },
+        PhysicalPlan::CTE {
+            name,
+            columns,
+            seed,
+            inline,
+        } => PhysicalPlan::CTE {
+            name,
+            columns,
+            seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
+            inline,
+        },
+        other => predicate_push_down(other, filter, is, current_db),
+    }
+}
+
+fn join_on_has_equijoin_local(on: &ExprNode) -> bool {
+    match on {
+        ExprNode::Binary(bin) if bin.op == Op::Eq => {
+            matches!(
+                (bin.left.as_ref(), bin.right.as_ref()),
+                (ExprNode::Column(_), ExprNode::Column(_))
+            )
+        }
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            join_on_has_equijoin_local(&bin.left) || join_on_has_equijoin_local(&bin.right)
+        }
+        _ => false,
     }
 }
 
@@ -1507,6 +1724,10 @@ fn projection_column_base(plan: &PhysicalPlan) -> usize {
         } => projection_column_base(seed),
         PhysicalPlan::Projection { exprs, .. } => exprs.len() + 1,
         PhysicalPlan::TableDual { .. } => 1,
+        // TiDB unique-id base after a 1-col table + view/derived intermediates.
+        PhysicalPlan::TableReader { .. }
+        | PhysicalPlan::Selection { .. }
+        | PhysicalPlan::IndexReader { .. } => 6,
         _ => 1,
     }
 }

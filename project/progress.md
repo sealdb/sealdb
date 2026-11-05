@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（R2 `window_function` Mem+TiKV 已绿）  
+> 最后更新：2026-11-06（R2 `null_rejected` Mem+TiKV 已绿）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` green；继续 triage |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -94,6 +94,8 @@
 | Window IndexReader / frames | optimizeByShuffle4Window | `window.rs`；INTERVAL minute_second；RANGE offsets | IndexFullScan keep_order |
 | column `PRIMARY KEY` → handle | pk_is_handle Column# | lower synthetic PRIMARY index | t1 `Column#4` |
 | Shuffle by partition NDV | concurrency=min(var,NDV) | skip Shuffle when NDV≤1 | `window_function` → `green` |
+| VIEW MERGE + single-side ON | null-reject CARTESIAN | merge view；ON push；SHOW WARNINGS | `null_rejected` → `green` |
+| row_number − col Projection | minus(Column#N, t.x) | window outer Binary + default rows frame | select window EXPLAIN 回归修复 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

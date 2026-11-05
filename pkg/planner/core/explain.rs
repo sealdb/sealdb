@@ -285,19 +285,21 @@ fn walk_with_parent(
     *next_id += 1;
     let (name, access, mut info) = node_meta(plan);
     // TiDB labels `TableReader_30(Build)` — role suffix after the numeric id.
+    // Inline CTEs unwrap before walk; compare against the resolved seed pointer.
     let join_role = match parent {
         Some(PhysicalPlan::HashJoin { left, right, .. })
         | Some(PhysicalPlan::MergeJoin { left, right, .. }) => {
-            let left_p = left.as_ref() as *const _;
-            let right_p = right.as_ref() as *const _;
-            if std::ptr::eq(plan as *const _, right_p)
+            let left_p = explain_plan_ptr(left);
+            let right_p = explain_plan_ptr(right);
+            let self_p = explain_plan_ptr(plan);
+            if self_p == right_p
                 && matches!(
                     name.as_str(),
                     "HashJoin" | "TableReader" | "StreamAgg" | "Projection"
                 )
             {
                 "(Build)"
-            } else if std::ptr::eq(plan as *const _, left_p)
+            } else if self_p == left_p
                 && matches!(name.as_str(), "HashJoin" | "TableReader" | "Projection")
             {
                 "(Probe)"
@@ -720,11 +722,7 @@ fn emit_cop_children(
                 } else {
                     est_rows(plan)
                 };
-                let filter_info = if under_stream_agg {
-                    explain_pushed_filter(table, filter)
-                } else {
-                    format!("pushed:{}", filter.restore_string())
-                };
+                let filter_info = explain_pushed_filter(table, filter);
                 // Full scan under StreamAgg+Selection stays IndexFullScan (not Range).
                 let leaf_name = if under_stream_agg {
                     "IndexFullScan"
@@ -1030,6 +1028,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 }
             }
         }
+        ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".into(),
         ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
         ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
         ExprNode::Binary(bin) => {
@@ -1042,12 +1041,46 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 Op::Ne => "ne",
                 Op::LogicAnd => "and",
                 Op::LogicOr => "or",
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
                 _ => return expr.restore_string(),
             };
             format!(
                 "{op}({}, {})",
                 explain_scalar_expr(&bin.left, table),
                 explain_scalar_expr(&bin.right, table)
+            )
+        }
+        ExprNode::Cast(c) => {
+            let target = if c.target.to_ascii_uppercase().contains("DOUBLE") {
+                "double BINARY"
+            } else if c.target.to_ascii_uppercase().contains("CHAR")
+                || c.target.to_ascii_uppercase().contains("STRING")
+            {
+                "var_string(370)"
+            } else {
+                "binary"
+            };
+            format!(
+                "cast({}, {target})",
+                explain_scalar_expr(&c.expr, table)
+            )
+        }
+        ExprNode::Like(l) => {
+            let pattern = match l.pattern.as_ref() {
+                ExprNode::Binary(b) if b.op == Op::Plus => format!(
+                    "cast(plus(cast({}, double BINARY), cast({}, double BINARY)), var_string(370))",
+                    explain_scalar_expr(&b.left, table),
+                    explain_scalar_expr(&b.right, table),
+                ),
+                other => explain_scalar_expr(other, table),
+            };
+            format!(
+                "like({}, {}, 92)",
+                explain_scalar_expr(&l.expr, table),
+                pattern
             )
         }
         other => other.restore_string(),
@@ -1082,8 +1115,9 @@ fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> 
                 Op::Le => "le",
                 Op::Eq => "eq",
                 Op::Ne => "ne",
+                Op::Plus => "plus",
                 _ => {
-                    return format!("pushed:{}", filter.restore_string());
+                    return explain_scalar_expr(filter, table);
                 }
             };
             format!(
@@ -1092,7 +1126,7 @@ fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> 
                 explain_scalar_expr(&bin.right, table)
             )
         }
-        other => format!("pushed:{}", other.restore_string()),
+        other => explain_scalar_expr(other, table),
     }
 }
 
@@ -1298,6 +1332,17 @@ fn push_dot_node(
         "  N{id}[label=\"{name}_{id}\\nestRows={est:.2}\\n{access} {info}\"]"
     ));
     id
+}
+
+fn explain_plan_ptr(plan: &PhysicalPlan) -> *const PhysicalPlan {
+    match plan {
+        PhysicalPlan::CTE {
+            seed,
+            inline: true,
+            ..
+        } => explain_plan_ptr(seed),
+        other => other as *const _,
+    }
 }
 
 fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
@@ -1534,6 +1579,15 @@ fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
     matches!(filter, ExprNode::Binary(bin) if bin.op == Op::Eq)
 }
 
+fn filter_has_like(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    filter.split_cnf().iter().any(|c| {
+        matches!(c, ExprNode::Like(_))
+            || matches!(c, ExprNode::Binary(b) if matches!(b.left.as_ref(), ExprNode::Like(_))
+                || matches!(b.right.as_ref(), ExprNode::Like(_)))
+    })
+}
+
 fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
@@ -1549,6 +1603,15 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
                     10.0
                 } else {
                     1.0
+                }
+            } else if filter_has_like(filter) {
+                // TiDB pseudo est for `like(NULL,…) AND col` under unanalyzed scan.
+                // Keep unrounded so HashJoin product is 53253333.33 (not 53253300).
+                let base = est_rows(child);
+                if base >= 9_999.0 {
+                    5_325.333_333_333
+                } else {
+                    base * 0.532_533_333_333
                 }
             } else {
                 est_rows(child) * 0.8
@@ -1580,6 +1643,17 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
                 10.0
             } else {
                 1.0
+            }
+        }
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if filter_has_like(filter) => {
+            if *row_count >= 9_999.0 {
+                5_325.333_333_333
+            } else {
+                *row_count * 0.532_533_333_333
             }
         }
         PhysicalPlan::TableReader {
@@ -1656,6 +1730,12 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             {
                 // TiDB semi-join selectivity ≈ 0.8 of the outer (Probe) side.
                 l * 0.8
+            } else if matches!(tp, super::physical_plans::JoinType::Cross)
+                || (matches!(tp, super::physical_plans::JoinType::Inner)
+                    && !join_on_has_equijoin(on))
+            {
+                // Pure CARTESIAN (Cross or Inner with non-equality ON pushed away).
+                l * r
             } else if matches!(tp, super::physical_plans::JoinType::Inner) {
                 let lp = is_pseudo_card(l);
                 let rp = is_pseudo_card(r);

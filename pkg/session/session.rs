@@ -49,6 +49,8 @@ pub struct Session {
     enable_auto_analyze: Mutex<bool>,
     /// TiDB `tidb_auto_analyze_ratio` (default 0.5).
     auto_analyze_ratio: Mutex<f64>,
+    /// Last statement warnings for `SHOW WARNINGS`.
+    last_warnings: Mutex<Vec<(i32, String)>>,
 }
 
 impl Session {
@@ -88,6 +90,7 @@ impl Session {
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
+            last_warnings: Mutex::new(Vec::new()),
         }
     }
 
@@ -581,6 +584,12 @@ impl Session {
             drop(mdl_guard);
             return Ok(result);
         }
+        if let Statement::Show(show) = stmt
+            && show.kind == sealdb_parser::ast::ShowStmtKind::Warnings
+        {
+            drop(mdl_guard);
+            return Ok(show_warnings_result(self));
+        }
         check_only_full_group_by(self, stmt)?;
         if let Some(result) = system_var_result(self, stmt) {
             return Ok(result);
@@ -694,6 +703,12 @@ impl Session {
             maybe_auto_analyze(self, stmt)?;
         }
         drop(mdl_guard);
+        if let Ok(qr) = &result {
+            *self
+                .last_warnings
+                .lock()
+                .expect("session last_warnings lock") = qr.warnings.clone();
+        }
         result
     }
 
@@ -1139,6 +1154,32 @@ fn empty_result() -> QueryResult {
     QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+fn show_warnings_result(session: &Session) -> QueryResult {
+    let warnings = session
+        .last_warnings
+        .lock()
+        .expect("session last_warnings lock")
+        .clone();
+    QueryResult {
+        columns: vec![
+            "Level".to_string(),
+            "Code".to_string(),
+            "Message".to_string(),
+        ],
+        rows: warnings
+            .into_iter()
+            .map(|(code, msg)| {
+                vec![
+                    sealdb_types::Datum::Bytes(b"Warning".to_vec()),
+                    sealdb_types::Datum::I64(code as i64),
+                    sealdb_types::Datum::Bytes(msg.into_bytes()),
+                ]
+            })
+            .collect(),
         warnings: Vec::new(),
     }
 }
@@ -2353,6 +2394,17 @@ fn inject_view_cte(
         ));
     };
     expand_views_in_select(&mut view_select, is, current_db)?;
+    // TiDB MERGE / UNDEFINED: inline simple single-table views.
+    if !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
+        && try_merge_simple_view(
+            select,
+            &name,
+            &view_select,
+            &view.cols.iter().map(|c| c.o().to_string()).collect::<Vec<_>>(),
+        )?
+    {
+        return Ok(());
+    }
     let materialize = if view.algorithm.eq_ignore_ascii_case("TEMPTABLE") {
         CteMaterialize::Materialized
     } else if view.algorithm.eq_ignore_ascii_case("MERGE") {
@@ -2376,6 +2428,165 @@ fn inject_view_cte(
     // CTE names are unqualified; strip schema so planner hits the injected CTE.
     strip_table_schema(select, &name);
     Ok(())
+}
+
+/// Merge a simple VIEW into the referencing SELECT (TiDB `algorithm=MERGE`).
+fn try_merge_simple_view(
+    select: &mut SelectStmt,
+    view_name: &str,
+    view_select: &SelectStmt,
+    view_cols: &[String],
+) -> Result<bool> {
+    use sealdb_parser::ast::expressions::BinaryOpExpr;
+    use sealdb_parser::opcode::Op;
+    use std::collections::HashMap;
+
+    if !view_select.joins.is_empty()
+        || view_select.from.is_none()
+        || !view_select.group_by.is_empty()
+        || view_select.having.is_some()
+        || view_select.with.is_some()
+        || view_select.distinct
+        || view_select.limit.is_some()
+        || !view_select.order_by.is_empty()
+    {
+        return Ok(false);
+    }
+    let base = view_select.from.clone().expect("checked above");
+    let col_names: Vec<String> = if view_cols.is_empty() {
+        view_select
+            .fields
+            .iter()
+            .map(|f| {
+                f.as_name
+                    .clone()
+                    .or_else(|| f.orig_text.clone())
+                    .unwrap_or_else(|| match &f.expr {
+                        sealdb_parser::ast::expressions::ExprNode::Column(c) => c.name.clone(),
+                        _ => String::new(),
+                    })
+            })
+            .collect()
+    } else {
+        view_cols.to_vec()
+    };
+    if col_names.len() != view_select.fields.len() || col_names.iter().any(|n| n.is_empty()) {
+        return Ok(false);
+    }
+    let mapping: HashMap<String, sealdb_parser::ast::expressions::ExprNode> = col_names
+        .iter()
+        .zip(view_select.fields.iter())
+        .map(|(n, f)| (n.to_ascii_lowercase(), f.expr.clone()))
+        .collect();
+
+    let replace_table = |t: &mut TableName| {
+        if t.name.eq_ignore_ascii_case(view_name)
+            || t.resolve_name().eq_ignore_ascii_case(view_name)
+        {
+            // Column refs are rewritten to view exprs; expose the base table
+            // name so EXPLAIN / DistSQL use `table:t1` (TiDB MERGE).
+            *t = base.clone();
+            true
+        } else {
+            false
+        }
+    };
+    let mut replaced = false;
+    if let Some(from) = select.from.as_mut() {
+        replaced |= replace_table(from);
+    }
+    for join in &mut select.joins {
+        replaced |= replace_table(&mut join.left);
+        replaced |= replace_table(&mut join.right);
+    }
+    if !replaced {
+        return Ok(false);
+    }
+
+    for field in &mut select.fields {
+        rewrite_merged_view_cols(&mut field.expr, view_name, &mapping);
+    }
+    if let Some(sel) = select.selection.as_mut() {
+        rewrite_merged_view_cols(sel, view_name, &mapping);
+    }
+    for join in &mut select.joins {
+        rewrite_merged_view_cols(&mut join.on, view_name, &mapping);
+    }
+    if let Some(view_where) = &view_select.selection {
+        select.selection = Some(match select.selection.take() {
+            Some(user) => sealdb_parser::ast::expressions::ExprNode::Binary(BinaryOpExpr {
+                op: Op::LogicAnd,
+                left: Box::new(view_where.clone()),
+                right: Box::new(user),
+            }),
+            None => view_where.clone(),
+        });
+    }
+    Ok(true)
+}
+
+fn rewrite_merged_view_cols(
+    expr: &mut sealdb_parser::ast::expressions::ExprNode,
+    view_name: &str,
+    mapping: &std::collections::HashMap<String, sealdb_parser::ast::expressions::ExprNode>,
+) {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::Column(c) => {
+            let from_view = c
+                .table
+                .as_deref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(view_name));
+            if from_view
+                && let Some(mapped) = mapping.get(&c.name.to_ascii_lowercase())
+            {
+                *expr = mapped.clone();
+            }
+        }
+        ExprNode::Binary(b) => {
+            rewrite_merged_view_cols(&mut b.left, view_name, mapping);
+            rewrite_merged_view_cols(&mut b.right, view_name, mapping);
+        }
+        ExprNode::Unary(u) => rewrite_merged_view_cols(&mut u.expr, view_name, mapping),
+        ExprNode::Func(f) => {
+            for arg in &mut f.args {
+                rewrite_merged_view_cols(arg, view_name, mapping);
+            }
+        }
+        ExprNode::Cast(c) => rewrite_merged_view_cols(&mut c.expr, view_name, mapping),
+        ExprNode::InList(i) => {
+            rewrite_merged_view_cols(&mut i.expr, view_name, mapping);
+            for e in &mut i.list {
+                rewrite_merged_view_cols(e, view_name, mapping);
+            }
+        }
+        ExprNode::Between(b) => {
+            rewrite_merged_view_cols(&mut b.expr, view_name, mapping);
+            rewrite_merged_view_cols(&mut b.low, view_name, mapping);
+            rewrite_merged_view_cols(&mut b.high, view_name, mapping);
+        }
+        ExprNode::Like(l) => {
+            rewrite_merged_view_cols(&mut l.expr, view_name, mapping);
+            rewrite_merged_view_cols(&mut l.pattern, view_name, mapping);
+        }
+        ExprNode::IsNull(i) => rewrite_merged_view_cols(&mut i.expr, view_name, mapping),
+        ExprNode::Window(w) => {
+            for arg in &mut w.args {
+                rewrite_merged_view_cols(arg, view_name, mapping);
+            }
+            for p in &mut w.spec.partition_by {
+                rewrite_merged_view_cols(p, view_name, mapping);
+            }
+            for o in &mut w.spec.order_by {
+                rewrite_merged_view_cols(&mut o.expr, view_name, mapping);
+            }
+        }
+        ExprNode::Value(_)
+        | ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => {}
+    }
 }
 
 fn strip_table_schema(select: &mut SelectStmt, name: &str) {

@@ -31,8 +31,7 @@ pub fn build_window_plan(
         current_db.to_string()
     };
     let win_col = window_result_column_id(select, is, current_db);
-    let out_col = win_col + 1;
-    let (win, _) = select
+    let (win, outer) = select
         .fields
         .first()
         .map(|f| extract_window_outer(&f.expr))
@@ -84,8 +83,32 @@ pub fn build_window_plan(
         window
     };
 
+    let proj = match outer {
+        Some((Op::Minus, rhs)) => {
+            let rhs = match rhs {
+                ExprNode::Column(c) => {
+                    let tbl = c.table.as_deref().unwrap_or(table);
+                    format!("{schema}.{tbl}.{}", c.name)
+                }
+                other => other.restore_string(),
+            };
+            // TiDB allocates an extra id for the arithmetic result.
+            format!("minus(Column#{win_col}, {rhs})->Column#{}", win_col + 2)
+        }
+        Some((Op::Plus, rhs)) => {
+            let rhs = match rhs {
+                ExprNode::Column(c) => {
+                    let tbl = c.table.as_deref().unwrap_or(table);
+                    format!("{schema}.{tbl}.{}", c.name)
+                }
+                other => other.restore_string(),
+            };
+            format!("plus(Column#{win_col}, {rhs})->Column#{}", win_col + 2)
+        }
+        _ => format!("Column#{win_col}->Column#{}", win_col + 1),
+    };
     PhysicalPlan::Projection {
-        exprs: vec![format!("Column#{win_col}->Column#{out_col}")],
+        exprs: vec![proj],
         child: Box::new(body),
     }
 }
@@ -142,16 +165,20 @@ fn window_shape(
     }
 
     let over = format_over(&part_qual, &order_qual, win);
-    let arg = win
-        .args
-        .first()
-        .map(|a| match a {
-            ExprNode::Column(c) => format!("cast({}, decimal(10,0) BINARY)", qual(&c.name)),
-            other => other.restore_string(),
-        })
-        .unwrap_or_else(|| "1".into());
     let fname = win.name.to_ascii_lowercase();
-    let window_info = format!("{fname}({arg})->Column#{win_col} {over}");
+    let window_info = if fname == "row_number" && win.args.is_empty() {
+        format!("row_number()->Column#{win_col} {over}")
+    } else {
+        let arg = win
+            .args
+            .first()
+            .map(|a| match a {
+                ExprNode::Column(c) => format!("cast({}, decimal(10,0) BINARY)", qual(&c.name)),
+                other => other.restore_string(),
+            })
+            .unwrap_or_else(|| "1".into());
+        format!("{fname}({arg})->Column#{win_col} {over}")
+    };
 
     // idx(a): empty over() → unordered IndexFullScan; partition by a only → ordered.
     let only_a_part = part_cols == ["a"] && order_cols.is_empty();
@@ -205,6 +232,12 @@ fn format_over(part: &[String], order: &[String], win: &WindowFuncExpr) -> Strin
             s.push(' ');
         }
         s.push_str("range between unbounded preceding and current row");
+    } else if !part.is_empty() && win.name.eq_ignore_ascii_case("row_number") {
+        // TiDB default frame for partition-only row_number.
+        if !first {
+            s.push(' ');
+        }
+        s.push_str("rows between current row and current row");
     }
     s.push(')');
     s
