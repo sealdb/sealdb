@@ -467,11 +467,13 @@ fn walk_with_parent(
                         | "IndexReader"
                         | "IndexLookUp"
                         | "StreamAgg"
+                        | "HashAgg"
                         | "Selection"
                         | "HashJoin"
                         | "IndexJoin"
                         | "UnionScan"
                         | "Limit"
+                        | "CTEFullScan"
                 )
             {
                 "(Build)"
@@ -482,11 +484,13 @@ fn walk_with_parent(
                         | "IndexReader"
                         | "IndexLookUp"
                         | "StreamAgg"
+                        | "HashAgg"
                         | "Selection"
                         | "HashJoin"
                         | "IndexJoin"
                         | "UnionScan"
                         | "Limit"
+                        | "CTEFullScan"
                 )
             {
                 "(Probe)"
@@ -832,6 +836,8 @@ fn emit_recursive_cte_producer(
         seed,
         recursive_plan,
         recursive: true,
+        limit,
+        offset,
         ..
     } = plan
     else {
@@ -840,12 +846,20 @@ fn emit_recursive_cte_producer(
     let id = *next_id;
     *next_id += 1;
     let est = est_rows(plan);
+    let info = match (limit, offset) {
+        (Some(count), Some(off)) => {
+            format!("Recursive CTE, limit(offset:{off}, count:{count})")
+        }
+        (Some(count), None) => format!("Recursive CTE, limit(offset:0, count:{count})"),
+        (None, Some(off)) => format!("Recursive CTE, limit(offset:{off}, count:0)"),
+        (None, None) => "Recursive CTE".to_string(),
+    };
     rows.push(ExplainRow {
         id: format!("CTE_0_{id}"),
         est_rows: format!("{est:.2}"),
         task: "root".to_string(),
         access: String::new(),
-        info: "Recursive CTE".to_string(),
+        info,
     });
     let seed_part = match seed.as_ref() {
         PhysicalPlan::Union { left, .. } => left.as_ref(),

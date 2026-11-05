@@ -4,6 +4,7 @@
 // Completeness wave / not this feature: subquery JOIN. Derived tables
 // flatten to CTEs. SELECT-list scalar subqueries reuse SubqueryEvalCtx.
 use crate::builder::ExecutorBuilder;
+use crate::cte::with_isolated_shared_ctes;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, ERR_UNKNOWN_ERROR, Error, Result};
@@ -742,7 +743,9 @@ fn run_result_set(
         &ctx.current_db,
         Arc::clone(&ctx.txn),
     )?;
-    let result = ExecutorBuilder::run(exec)?;
+    // Fresh CTE share per outer row — correlated recursive CTEs must not reuse
+    // a prior row's materialization under the same CTE name.
+    let result = with_isolated_shared_ctes(|| ExecutorBuilder::run(exec))?;
     cache.insert(key, result.clone());
     Ok(result)
 }

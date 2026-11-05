@@ -214,6 +214,9 @@ impl PlanBuilder {
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
                 // (see explain.rs); executable plan keeps the agg output schema.
                 plan = rewrite_semi_join_agg(rewrite_semi_join(plan));
+                // TiDB wraps quantified ALL Apply in a remapping Projection for
+                // `SELECT *` (cte suite: Projection → Apply → StreamAgg/HashAgg).
+                plan = wrap_quantified_all_projection(plan, select, is, current_db);
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
                 Ok(plan)
@@ -600,6 +603,8 @@ impl PlanBuilder {
             .physical
             .clone()
             .filter(|a| !a.eq_ignore_ascii_case(&from.name));
+        let limit = cte.and_then(|c| c.limit);
+        let offset = cte.and_then(|c| c.offset);
         Ok(Some(PhysicalPlan::CTE {
             name: from.name.clone(),
             alias,
@@ -608,6 +613,8 @@ impl PlanBuilder {
             recursive_plan,
             inline,
             recursive,
+            limit,
+            offset,
         }))
     }
 
@@ -1595,6 +1602,8 @@ fn prepare_merge_join_side(
             recursive_plan,
             inline: true,
             recursive,
+            limit,
+            offset,
         } => PhysicalPlan::CTE {
             name,
             alias,
@@ -1603,6 +1612,8 @@ fn prepare_merge_join_side(
             recursive_plan,
             inline: true,
             recursive,
+            limit,
+            offset,
         },
         other => other,
     };
@@ -1621,6 +1632,8 @@ fn prepare_merge_join_side(
                     recursive_plan,
                     inline: true,
                     recursive,
+                    limit,
+                    offset,
                 } => PhysicalPlan::CTE {
                     name,
                     alias,
@@ -1629,6 +1642,8 @@ fn prepare_merge_join_side(
                     recursive_plan,
                     inline: true,
                     recursive,
+                    limit,
+                    offset,
                 },
                 other => predicate_push_down(other, &filter, is, current_db),
             };
@@ -1839,6 +1854,49 @@ fn join_star_output_labels(select: &SelectStmt, current_db: &str) -> Vec<String>
         labels.push(format!("{schema}.{phys}.c1"));
     }
     labels
+}
+
+/// `SELECT * … WHERE col > ALL (WITH …)` — TiDB EXPLAIN shows Projection over Apply.
+fn wrap_quantified_all_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    if !is_star_select(select) || matches!(plan, PhysicalPlan::Projection { .. }) {
+        return plan;
+    }
+    let PhysicalPlan::Apply {
+        info: Some(info), ..
+    } = &plan
+    else {
+        return plan;
+    };
+    if !info.contains("CARTESIAN inner join, other cond:") {
+        return plan;
+    }
+    let Some(from) = &select.from else {
+        return plan;
+    };
+    let schema = schema_prefix(current_db);
+    let table = from.name.as_str();
+    let cols: Vec<String> = is
+        .and_then(|is| is.table_by_name(current_db, table))
+        .map(|info| {
+            info.columns
+                .iter()
+                .map(|c| c.name.o().to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["c1".into(), "c2".into()]);
+    let exprs = cols
+        .into_iter()
+        .map(|c| format!("{schema}.{table}.{c}"))
+        .collect();
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+    }
 }
 
 fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
@@ -2134,6 +2192,8 @@ fn push_filter_under_projection(
             recursive_plan,
             inline: true,
             recursive,
+            limit,
+            offset,
         } => {
             // Inline CTE: push into seed so HASH_JOIN `ON cte.col = const` becomes
             // TableReader data:Selection / PointGet (TiDB cte suite).
@@ -2145,6 +2205,8 @@ fn push_filter_under_projection(
                 recursive_plan,
                 inline: true,
                 recursive,
+                limit,
+                offset,
             }
         }
         PhysicalPlan::CTE {
@@ -2155,6 +2217,8 @@ fn push_filter_under_projection(
             recursive_plan,
             inline,
             recursive,
+            limit,
+            offset,
         } => {
             // Materialized / recursive: keep filter above.
             predicate_push_down(
@@ -2166,6 +2230,8 @@ fn push_filter_under_projection(
                     recursive_plan,
                     inline,
                     recursive,
+                    limit,
+                    offset,
                 },
                 filter,
                 is,

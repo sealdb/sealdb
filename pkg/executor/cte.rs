@@ -45,6 +45,28 @@ pub fn with_shared_ctes<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Isolate CTE share for correlated Apply subqueries so a recursive CTE bound
+/// to outer row N cannot be reused for outer row N+1 (same CTE name, different
+/// seed filter).
+pub fn with_isolated_shared_ctes<T>(f: impl FnOnce() -> T) -> T {
+    let saved = SHARED.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        (guard.0, std::mem::take(&mut guard.1))
+    });
+    SHARED.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.0 = 0;
+        guard.1.clear();
+    });
+    let out = with_shared_ctes(f);
+    SHARED.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.0 = saved.0;
+        guard.1 = saved.1;
+    });
+    out
+}
+
 fn shared_cte(name: &str) -> Option<CteWorking> {
     SHARED.with(|cell| {
         cell.borrow()
@@ -162,6 +184,9 @@ pub struct CTEExec {
     share: bool,
     /// Seed nested WITH reuses `name`; recursive working names stay seed output.
     shadow_same_name: bool,
+    /// Outer LIMIT/OFFSET on a recursive CTE body.
+    limit: Option<u64>,
+    offset: Option<u64>,
     from_cache: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
@@ -180,6 +205,8 @@ impl CTEExec {
         txn: Arc<TxnHandle>,
         share: bool,
         shadow_same_name: bool,
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> Self {
         Self {
             columns,
@@ -191,6 +218,8 @@ impl CTEExec {
             txn,
             share,
             shadow_same_name,
+            limit,
+            offset,
             from_cache: false,
             schema: Vec::new(),
             rows: Vec::new(),
@@ -257,7 +286,11 @@ impl Executor for CTEExec {
                 &self.domain,
                 &self.current_db,
                 &self.txn,
+                self.limit,
+                self.offset,
             )?;
+        } else if self.limit.is_some() || self.offset.is_some() {
+            self.rows = apply_cte_limit(std::mem::take(&mut self.rows), self.limit, self.offset);
         }
         if !self.columns.is_empty() {
             self.schema = self.columns.clone();
@@ -305,6 +338,8 @@ fn iterate_recursive(
     domain: &Arc<Domain>,
     current_db: &str,
     txn: &Arc<TxnHandle>,
+    limit: Option<u64>,
+    offset: Option<u64>,
 ) -> Result<Vec<Vec<Datum>>> {
     // TiDB rejects ORDER BY / LIMIT / DISTINCT in the recursive arm.
     if rec.limit.is_some() || !rec.order_by.is_empty() || rec.distinct {
@@ -328,6 +363,13 @@ fn iterate_recursive(
         let seen: HashSet<Vec<String>> = seed.iter().map(|row| row_key(row)).collect();
         (seed, seen)
     };
+    // Outer CTE LIMIT applies to the whole result (seed + recursive).
+    if let Some(lim) = limit {
+        let need = lim.saturating_add(offset.unwrap_or(0)) as usize;
+        if all.len() >= need {
+            return Ok(apply_cte_limit(all, limit, offset));
+        }
+    }
     let mut working = all.clone();
     // TiDB/MySQL: recursive arm that never reads this CTE runs once (not forever).
     let self_ref = select_refs_table(&rec, name);
@@ -360,12 +402,39 @@ fn iterate_recursive(
             break;
         }
         all.extend(step.clone());
+        if let Some(lim) = limit {
+            let need = lim.saturating_add(offset.unwrap_or(0)) as usize;
+            if all.len() >= need {
+                return Ok(apply_cte_limit(all, limit, offset));
+            }
+        }
         if !self_ref {
             break;
         }
         working = step;
     }
-    Ok(all)
+    Ok(apply_cte_limit(all, limit, offset))
+}
+
+fn apply_cte_limit(
+    mut rows: Vec<Vec<Datum>>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Vec<Vec<Datum>> {
+    let off = offset.unwrap_or(0) as usize;
+    if off > 0 {
+        if off >= rows.len() {
+            return Vec::new();
+        }
+        rows = rows.split_off(off);
+    }
+    if let Some(lim) = limit {
+        let n = lim as usize;
+        if rows.len() > n {
+            rows.truncate(n);
+        }
+    }
+    rows
 }
 
 fn select_refs_table(select: &SelectStmt, name: &str) -> bool {

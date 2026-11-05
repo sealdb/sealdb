@@ -233,6 +233,9 @@ pub enum PhysicalPlan {
         inline: bool,
         /// WITH RECURSIVE — EXPLAIN shows CTEFullScan + separate producer tree.
         recursive: bool,
+        /// Outer LIMIT/OFFSET on a recursive CTE (`… UNION ALL … LIMIT n`).
+        limit: Option<u64>,
+        offset: Option<u64>,
     },
     /// Dedup child rows by `keys` (TiDB SemiJoinRewriter inner aggregation).
     Distinct {

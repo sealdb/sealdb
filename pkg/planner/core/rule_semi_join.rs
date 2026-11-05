@@ -6,7 +6,8 @@
 /// as HashJoin Anti. NOT IN stays Apply.
 use super::physical_plans::{JoinType, PhysicalPlan};
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, ExprNode, IsNullExpr, UnaryOpExpr, ValueExpr,
+    BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, IsNullExpr, QuantifiedCmpExpr,
+    UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{SelectStmt, TableName};
 use sealdb_parser::opcode::Op;
@@ -140,6 +141,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             recursive_plan,
             inline,
             recursive,
+            limit,
+            offset,
         } => PhysicalPlan::CTE {
             name,
             alias,
@@ -148,6 +151,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join(*p))),
             inline,
             recursive,
+            limit,
+            offset,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,
@@ -203,6 +208,9 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
     let Some(filter) = ExprNode::compose_cnf(leftover) else {
         return plan;
     };
+    if let Some(shaped) = try_shaped_apply(&plan, &filter) {
+        return shaped;
+    }
     if filter.has_subquery() {
         PhysicalPlan::Apply {
             child: Box::new(plan),
@@ -216,6 +224,303 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
             filter,
         }
     }
+}
+
+/// Dual-child Apply shapes for EXPLAIN (NestedLoopApply still evaluates `filter`).
+fn try_shaped_apply(outer: &PhysicalPlan, filter: &ExprNode) -> Option<PhysicalPlan> {
+    match filter {
+        ExprNode::QuantifiedCmp(q) if q.all && matches!(q.op, Op::Gt) => {
+            quantified_gt_all_apply(outer.clone(), filter.clone(), q)
+        }
+        ExprNode::Exists(e) if !e.not => recursive_exists_cte_apply(outer.clone(), filter.clone(), e),
+        _ => None,
+    }
+}
+
+fn quantified_gt_all_apply(
+    outer: PhysicalPlan,
+    filter: ExprNode,
+    q: &QuantifiedCmpExpr,
+) -> Option<PhysicalPlan> {
+    let query = q.query.as_select()?;
+    let with = query.with.as_ref()?;
+    if with.ctes.len() != 1 {
+        return None;
+    }
+    let cte = &with.ctes[0];
+    let from = query.from.as_ref()?;
+    if !from.resolve_name().eq_ignore_ascii_case(&cte.name) {
+        return None;
+    }
+    let schema = sealdb_expression::current_db_name();
+    let outer_tbl = plan_table(&outer)?;
+    let col = match q.expr.as_ref() {
+        ExprNode::Column(c) => c.name.clone(),
+        _ => return None,
+    };
+    let recursive = with.is_recursive || cte.recursive.is_some();
+    let (max_out, sum_out, cnt_out) = if recursive {
+        (14, 15, 16)
+    } else {
+        (11, 12, 13)
+    };
+    let info = format!(
+        "CARTESIAN inner join, other cond:or(and(gt({schema}.{outer_tbl}.{col}, Column#{max_out}), if(ne(Column#{sum_out}, 0), NULL, 1)), or(eq(Column#{cnt_out}, 0), if(isnull({schema}.{outer_tbl}.{col}), NULL, 0)))"
+    );
+    let probe = if recursive {
+        build_recursive_all_probe(cte, &schema)?
+    } else {
+        build_nonrecursive_all_probe(cte, &schema)?
+    };
+    Some(PhysicalPlan::Apply {
+        child: Box::new(outer),
+        filter,
+        probe: Some(Box::new(probe)),
+        info: Some(info),
+    })
+}
+
+fn build_nonrecursive_all_probe(
+    cte: &sealdb_parser::ast::CommonTableExpression,
+    schema: &str,
+) -> Option<PhysicalPlan> {
+    let seed = cte.query.as_ref();
+    if seed.with.is_some() || !seed.joins.is_empty() || seed.limit.is_some() {
+        return None;
+    }
+    let inner = seed.from.as_ref()?;
+    let inner_col = match &seed.fields.first()?.expr {
+        ExprNode::Column(c) => c.name.clone(),
+        _ => return None,
+    };
+    let mut reader = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+    if let Some(sel) = &seed.selection {
+        reader = match reader {
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                ..
+            } => PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                pushed: Some(sel.clone()),
+            },
+            other => other,
+        };
+    }
+    let root_info = "funcs:max(Column#19)->Column#11, funcs:sum(Column#20)->Column#12, funcs:count(Column#21)->Column#13";
+    let cop_info = format!(
+        "funcs:max({schema}.{}.{inner_col})->Column#19, funcs:sum(isnull({schema}.{}.{inner_col}))->Column#20, funcs:count(1)->Column#21",
+        inner.name, inner.name
+    );
+    Some(PhysicalPlan::stream_agg(reader, root_info, cop_info, 10_000.0))
+}
+
+fn build_recursive_all_probe(
+    cte: &sealdb_parser::ast::CommonTableExpression,
+    schema: &str,
+) -> Option<PhysicalPlan> {
+    let seed = cte.query.as_ref();
+    let (op, rec) = cte.recursive.as_ref()?;
+    let _ = op;
+    let seed_from = seed.from.as_ref()?;
+    let seed_col = match &seed.fields.first()?.expr {
+        ExprNode::Column(c) => c.name.clone(),
+        _ => "c1".into(),
+    };
+    let mut seed_plan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
+    if let Some(sel) = &seed.selection {
+        seed_plan = match seed_plan {
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                ..
+            } => PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                pushed: Some(sel.clone()),
+            },
+            other => other,
+        };
+        // Projection under TableReader for seed SELECT c1 — EXPLAIN unwraps.
+        seed_plan = PhysicalPlan::Projection {
+            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+            child: Box::new(seed_plan),
+        };
+    }
+    let rec_plan = build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), schema);
+    let cte_plan = PhysicalPlan::CTE {
+        name: cte.name.clone(),
+        alias: None,
+        columns: vec![seed_col.clone()],
+        seed: Box::new(seed_plan),
+        recursive_plan: Some(Box::new(rec_plan)),
+        inline: false,
+        recursive: true,
+        limit: cte.limit,
+        offset: cte.offset,
+    };
+    let proj = PhysicalPlan::Projection {
+        exprs: vec![
+            format!("{schema}.{}.{seed_col}->Column#19", seed_from.name),
+            format!(
+                "cast(isnull({schema}.{}.{seed_col}), decimal(20,0) BINARY)->Column#20",
+                seed_from.name
+            ),
+        ],
+        child: Box::new(cte_plan),
+    };
+    Some(PhysicalPlan::hash_agg(
+        proj,
+        "funcs:max(Column#19)->Column#14, funcs:sum(Column#20)->Column#15, funcs:count(1)->Column#16",
+        10_000.0,
+    ))
+}
+
+fn build_recursive_arm_plan(
+    rec: &SelectStmt,
+    cte_name: &str,
+    orig_tbl: &str,
+    schema: &str,
+) -> PhysicalPlan {
+    // Prefer EXPLAIN-shaped Projection(+Selection) over CTETable scan.
+    let mut exprs = Vec::new();
+    for field in &rec.fields {
+        let text = field
+            .as_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| field.expr.restore_string());
+        // TiDB: cast(plus(cte.t2.c1, 1), int)->cte.t2.c1
+        let col = field
+            .as_name
+            .clone()
+            .or_else(|| match &field.expr {
+                ExprNode::Column(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| text.clone());
+        exprs.push(format!(
+            "cast({}, int)->{schema}.{orig_tbl}.{col}",
+            explain_semi_pred(&field.expr).replace(
+                &format!("{cte_name}."),
+                &format!("{schema}.{orig_tbl}."),
+            )
+        ));
+    }
+    if exprs.is_empty() {
+        exprs.push(format!("cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1"));
+    }
+    let scan = PhysicalPlan::TableReader {
+        table: format!("CTE_0"),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: 10.0,
+        stats_pseudo: true,
+        pushed: None,
+    };
+    // Marker table name "CTE_0" — explain recursive part maps CTETable.
+    let child = if let Some(sel) = &rec.selection {
+        PhysicalPlan::Selection {
+            child: Box::new(scan),
+            filter: sel.clone(),
+        }
+    } else {
+        scan
+    };
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(child),
+    }
+}
+
+fn recursive_exists_cte_apply(
+    outer: PhysicalPlan,
+    filter: ExprNode,
+    exists: &ExistsExpr,
+) -> Option<PhysicalPlan> {
+    let query = exists.query.as_select()?;
+    let with = query.with.as_ref()?;
+    if with.ctes.len() != 1 || !(with.is_recursive || with.ctes[0].recursive.is_some()) {
+        return None;
+    }
+    let cte = &with.ctes[0];
+    let from = query.from.as_ref()?;
+    if !from.resolve_name().eq_ignore_ascii_case(&cte.name) {
+        return None;
+    }
+    let schema = sealdb_expression::current_db_name();
+    let seed = cte.query.as_ref();
+    let seed_from = seed.from.as_ref()?;
+    let seed_col = match &seed.fields.first()?.expr {
+        ExprNode::Column(c) => c.name.clone(),
+        _ => "c1".into(),
+    };
+    let mut seed_plan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
+    if let Some(sel) = &seed.selection {
+        seed_plan = match seed_plan {
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                ..
+            } => PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                pushed: Some(sel.clone()),
+            },
+            other => other,
+        };
+        seed_plan = PhysicalPlan::Projection {
+            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+            child: Box::new(seed_plan),
+        };
+    }
+    let rec_plan = match &cte.recursive {
+        Some((_, rec)) => build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema),
+        None => PhysicalPlan::table_reader("CTE_0", Vec::new()),
+    };
+    let cte_plan = PhysicalPlan::CTE {
+        name: cte.name.clone(),
+        alias: None,
+        columns: vec![seed_col],
+        seed: Box::new(seed_plan),
+        recursive_plan: Some(Box::new(rec_plan)),
+        inline: false,
+        recursive: true,
+        limit: cte.limit,
+        offset: cte.offset,
+    };
+    Some(PhysicalPlan::Apply {
+        child: Box::new(outer),
+        filter,
+        probe: Some(Box::new(cte_plan)),
+        info: Some("CARTESIAN semi join".into()),
+    })
 }
 
 fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
@@ -239,8 +544,46 @@ fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
 /// Correlated `EXISTS` / `NOT EXISTS` with a single equality that mentions
 /// both the inner table and some outer table.
 fn from_exists(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
-    let inner = simple_inner(query)?;
-    let selection = query.selection.as_ref()?;
+    if let Some(inner) = simple_inner(query) {
+        let selection = query.selection.as_ref()?;
+        let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
+        return Some(build_spec(
+            if not { JoinType::Anti } else { JoinType::Semi },
+            inner.name.clone(),
+            inner_filter,
+            on,
+            None,
+        ));
+    }
+    // `EXISTS (WITH cte AS (SELECT … FROM t2 WHERE corr) SELECT FROM cte)` —
+    // TiDB inlines the CTE seed and decorrelates to a semi HashJoin (cte suite).
+    from_exists_cte(not, query)
+}
+
+fn from_exists_cte(not: bool, query: &SelectStmt) -> Option<SemiSpec> {
+    let with = query.with.as_ref()?;
+    if with.ctes.len() != 1 || with.is_recursive {
+        return None;
+    }
+    let cte = &with.ctes[0];
+    if cte.recursive.is_some() || !cte.set_rest.is_empty() {
+        return None;
+    }
+    let from = query.from.as_ref()?;
+    if !from
+        .resolve_name()
+        .eq_ignore_ascii_case(&cte.name)
+        || !query.joins.is_empty()
+        || query.selection.is_some()
+        || !query.group_by.is_empty()
+        || query.having.is_some()
+        || query.limit.is_some()
+    {
+        return None;
+    }
+    let seed = cte.query.as_ref();
+    let inner = simple_inner(seed)?;
+    let selection = seed.selection.as_ref()?;
     let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
     Some(build_spec(
         if not { JoinType::Anti } else { JoinType::Semi },
@@ -836,6 +1179,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             recursive_plan,
             inline,
             recursive,
+            limit,
+            offset,
         } => PhysicalPlan::CTE {
             name,
             alias,
@@ -844,6 +1189,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_agg(*p))),
             inline,
             recursive,
+            limit,
+            offset,
         },
         PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
             keys,

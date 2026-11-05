@@ -239,6 +239,8 @@ fn push_into(
             recursive_plan,
             inline,
             recursive,
+            limit,
+            offset,
         } if inline => {
             // Empty columns: seed names match CTE outputs — push through.
             // Named outputs may differ from seed; keep Selection above unless
@@ -252,6 +254,8 @@ fn push_into(
                     recursive_plan,
                     inline,
                     recursive,
+                    limit,
+                    offset,
                 }
             } else {
                 wrap_residual(
@@ -263,6 +267,8 @@ fn push_into(
                         recursive_plan,
                         inline,
                         recursive,
+                        limit,
+                        offset,
                     },
                     conjuncts,
                 )
