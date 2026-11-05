@@ -497,11 +497,24 @@ impl PlanBuilder {
         if let Some(plan) = self.build_join_plan_dp(select, is, current_db, stats, prune_mode)? {
             return Ok(plan);
         }
+        if let Some(plan) =
+            self.build_left_outer_chain(select, is, current_db, stats, prune_mode)?
+        {
+            return Ok(plan);
+        }
         let first = &select.joins[0];
+        let mut right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
+        let first_tp = map_join_type(first.tp);
+        if matches!(first_tp, JoinType::LeftOuter | JoinType::RightOuter)
+            && let Some(filter) =
+                null_reject_on_inner(&first.on, &first.right.name, first.right.resolve_name())
+        {
+            right = predicate_push_down(right, &filter, is, current_db);
+        }
         let mut plan = reorder_hash_join(
-            map_join_type(first.tp),
+            first_tp,
             self.join_side(select, &first.left, is, current_db, stats, prune_mode)?,
-            self.join_side(select, &first.right, is, current_db, stats, prune_mode)?,
+            right,
             first.left.name.clone(),
             first.right.name.clone(),
             table_row_count(stats, &first.left, current_db),
@@ -509,23 +522,87 @@ impl PlanBuilder {
             first.on.clone(),
         );
         for join in select.joins.iter().skip(1) {
+            let tp = map_join_type(join.tp);
+            let mut right =
+                self.join_side(select, &join.right, is, current_db, stats, prune_mode)?;
+            if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter)
+                && let Some(filter) =
+                    null_reject_on_inner(&join.on, &join.right.name, join.right.resolve_name())
+            {
+                right = predicate_push_down(right, &filter, is, current_db);
+            }
             plan = PhysicalPlan::HashJoin {
-                tp: map_join_type(join.tp),
+                tp,
                 left: Box::new(plan),
-                right: Box::new(self.join_side(
-                    select,
-                    &join.right,
-                    is,
-                    current_db,
-                    stats,
-                    prune_mode,
-                )?),
+                right: Box::new(right),
                 left_table: join.left.name.clone(),
                 right_table: join.right.name.clone(),
                 on: join.on.clone(),
             };
         }
         Ok(plan)
+    }
+
+    /// TiDB outer-join reorder (`tidb_enable_outer_join_reorder`): a left-deep
+    /// chain `base ⟕ r1 ⟕ r2` whose ON keys only mention `base` can reorder
+    /// the right sides by ascending cardinality.
+    fn build_left_outer_chain(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        if select.joins.len() < 2
+            || !select
+                .joins
+                .iter()
+                .all(|j| matches!(map_join_type(j.tp), JoinType::LeftOuter))
+        {
+            return Ok(None);
+        }
+        let base = &select.joins[0].left;
+        let base_name = base.name.clone();
+        let mut rights: Vec<(TableName, ExprNode, f64)> = Vec::new();
+        for join in &select.joins {
+            if !outer_join_on_base(&join.on, &base_name, &join.right.name) {
+                return Ok(None);
+            }
+            rights.push((
+                join.right.clone(),
+                join.on.clone(),
+                table_row_count(stats, &join.right, current_db),
+            ));
+        }
+        rights.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        let mut plan = self.join_side(select, base, is, current_db, stats, prune_mode)?;
+        let mut left_table = base_name.clone();
+        for (right_table, on, _) in rights {
+            let mut right =
+                self.join_side(select, &right_table, is, current_db, stats, prune_mode)?;
+            if let Some(filter) =
+                null_reject_on_inner(&on, &right_table.name, right_table.resolve_name())
+            {
+                right = predicate_push_down(right, &filter, is, current_db);
+            }
+            plan = PhysicalPlan::HashJoin {
+                tp: JoinType::LeftOuter,
+                left: Box::new(plan),
+                right: Box::new(right),
+                left_table: left_table.clone(),
+                right_table: right_table.name.clone(),
+                on,
+            };
+            left_table = base_name.clone();
+        }
+        Ok(Some(wrap_star_join_projection(
+            plan,
+            select,
+            is,
+            current_db,
+            false,
+        )))
     }
 
     fn build_from_item(
@@ -1400,6 +1477,72 @@ fn explain_col_ref(table: &str, expr: &ExprNode) -> String {
 
 fn needs_window(select: &SelectStmt) -> bool {
     select.fields.iter().any(|f| expr_has_window(&f.expr))
+}
+
+/// True when ON is an equality between `base` and `right` columns only.
+fn outer_join_on_base(on: &ExprNode, base: &str, right: &str) -> bool {
+    let ExprNode::Binary(bin) = on else {
+        return false;
+    };
+    if bin.op != Op::Eq {
+        return false;
+    }
+    match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(a), ExprNode::Column(b)) => {
+            let at = a.table.as_deref().unwrap_or("");
+            let bt = b.table.as_deref().unwrap_or("");
+            (at.eq_ignore_ascii_case(base) && bt.eq_ignore_ascii_case(right))
+                || (at.eq_ignore_ascii_case(right) && bt.eq_ignore_ascii_case(base))
+        }
+        _ => false,
+    }
+}
+
+/// TiDB projects `select.*` column list above multi-table joins (FROM order).
+fn wrap_star_join_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    _reordered: bool,
+) -> PhysicalPlan {
+    if !is_star_select(select) {
+        return plan;
+    }
+    let mut tables = Vec::new();
+    if let Some(from) = &select.from {
+        tables.push(from.clone());
+    }
+    for join in &select.joins {
+        if !tables
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&join.left.name))
+        {
+            tables.push(join.left.clone());
+        }
+        tables.push(join.right.clone());
+    }
+    let mut exprs = Vec::new();
+    for table in &tables {
+        let schema = table
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        let Some(info) = is.and_then(|is| is.table_by_name(schema, table.resolve_name())) else {
+            continue;
+        };
+        for col in &info.columns {
+            exprs.push(format!("select.{}.{}", table.name, col.name.o()));
+        }
+    }
+    if exprs.is_empty() {
+        return plan;
+    }
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+    }
 }
 
 fn expr_has_window(expr: &ExprNode) -> bool {
