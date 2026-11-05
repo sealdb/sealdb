@@ -74,6 +74,7 @@
 | REAL_AS_FLOAT / PIPES_AS_CONCAT | REAL→FLOAT；`||` 拼接 | ddl `sql_mode_flag`；LogicOr concat | types/const 段已绿 |
 | UNSIGNED / BIGINT overflow | 1690；`NO_UNSIGNED_SUBTRACTION`；CAST wrap | i128 有符号差；U64 标签；`qualify_expr_table` | types/const 至 overflow 段已绿 |
 | IGNORE_SPACE CREATE TABLE | `COUNT(a)`/`COUNT (a)` 1064 | session `reject_create_table_func_call` | types/const IGNORE_SPACE 段已绿（HIGH_NOT 前） |
+| HIGH_NOT_PRECEDENCE | `NOT x BETWEEN` → `(NOT x) BETWEEN` | eval rewrite under sql_mode | types/const HIGH_NOT 段已绿 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

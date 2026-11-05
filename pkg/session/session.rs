@@ -1256,7 +1256,8 @@ fn reject_create_table_func_call(sql: &str, sql_mode: &str) -> Result<()> {
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_PARSE_ERROR,
                 format!(
-                    "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line 1 column {col} near \"{near};\""
+                    // TiDB's mysql err message keeps a trailing space after the quote.
+                    "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line 1 column {col} near \"{near};\" "
                 ),
             ));
         }
