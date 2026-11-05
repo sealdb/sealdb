@@ -41,7 +41,38 @@ impl Executor for AnalyzeExec {
         let Statement::AnalyzeTable(analyze) = &self.stmt else {
             return Ok(());
         };
-        let (schema, name) = analyze.table.qualified(&self.current_db);
+        let indexes = analyze.indexes.clone();
+        let tables: Vec<_> = analyze
+            .all_tables()
+            .into_iter()
+            .cloned()
+            .collect();
+        for table in &tables {
+            self.analyze_one(table, &indexes)?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema(&self) -> &[String] {
+        &[]
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        Ok(None)
+    }
+}
+
+impl AnalyzeExec {
+    fn analyze_one(
+        &self,
+        table: &sealdb_parser::ast::TableName,
+        indexes: &[String],
+    ) -> Result<()> {
+        let (schema, name) = table.qualified(&self.current_db);
         if schema.is_empty() {
             return Err(Error::new(ERR_NO_DB, "No database selected"));
         }
@@ -59,7 +90,7 @@ impl Executor for AnalyzeExec {
             LockWait::Block,
             &info.physical_ids(),
         )?;
-        let index_cols = resolve_index_columns(&info, &analyze.indexes)?;
+        let index_cols = resolve_index_columns(&info, indexes)?;
         let columns = collect_column_stats(&info, &rows, index_cols.as_ref());
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
             if index_cols.is_some() {
@@ -96,18 +127,6 @@ impl Executor for AnalyzeExec {
         self.domain.stats().update(&schema, &name, stats);
         self.domain.persist_stats()?;
         Ok(())
-    }
-
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn schema(&self) -> &[String] {
-        &[]
     }
 }
 
