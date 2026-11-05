@@ -237,7 +237,21 @@ fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> 
 }
 
 fn is_handle_eq(expr: &ExprNode, handle: i64) -> bool {
-    matches!(expr.eq_column_const(), Some((_, Datum::I64(value))) if value == handle)
+    expr.eq_column_const()
+        .and_then(|(_, value)| datum_as_i64(&value))
+        .is_some_and(|v| v == handle)
+}
+
+fn datum_as_i64(value: &Datum) -> Option<i64> {
+    match value {
+        Datum::I64(v) => Some(*v),
+        Datum::U64(v) => Some(*v as i64),
+        Datum::F64(v) if v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64 => {
+            Some(*v as i64)
+        }
+        Datum::Bytes(b) => std::str::from_utf8(b).ok()?.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn is_in_list_on(expr: &ExprNode, column: &str) -> bool {

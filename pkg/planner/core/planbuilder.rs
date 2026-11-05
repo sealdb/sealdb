@@ -1282,14 +1282,15 @@ fn access_plan(
         }
         let eqs = eq_column_consts(select.selection.as_ref());
         if let Some(first) = info.columns.first()
-            && let Some((_, Datum::I64(handle))) = eqs
+            && let Some((_, value)) = eqs
                 .iter()
                 .find(|(column, _)| first.name.o().eq_ignore_ascii_case(column))
+            && let Some(handle) = datum_as_handle(value)
         {
             let _ = point_get_cost();
             return PhysicalPlan::PointGet {
                 table: from.name.clone(),
-                handle: Some(*handle),
+                handle: Some(handle),
                 index: None,
             };
         }
@@ -1346,9 +1347,8 @@ fn access_plan(
             plan_partitions(info, select.selection.as_ref(), prune_mode),
         );
     }
-    if let Some((_, Datum::I64(handle))) = eq_column_consts(select.selection.as_ref())
-        .into_iter()
-        .find(|(_, value)| matches!(value, Datum::I64(_)))
+    if let Some((_, value)) = eq_column_consts(select.selection.as_ref()).into_iter().next()
+        && let Some(handle) = datum_as_handle(&value)
     {
         PhysicalPlan::PointGet {
             table: from.name.clone(),
@@ -1357,5 +1357,21 @@ fn access_plan(
         }
     } else {
         PhysicalPlan::table_reader(from.name.clone(), Vec::new())
+    }
+}
+
+/// TiDB constant folding: int handle accepts string/float numeric literals (`a = '1'`).
+fn datum_as_handle(value: &Datum) -> Option<i64> {
+    match value {
+        Datum::I64(v) => Some(*v),
+        Datum::U64(v) => Some(*v as i64),
+        Datum::F64(v) if v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64 => {
+            Some(*v as i64)
+        }
+        Datum::Bytes(b) => {
+            let s = std::str::from_utf8(b).ok()?.trim();
+            s.parse::<i64>().ok()
+        }
+        _ => None,
     }
 }

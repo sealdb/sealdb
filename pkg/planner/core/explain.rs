@@ -1126,7 +1126,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             handle: Some(handle),
             index: None,
         } => (
-            "PointGet".to_string(),
+            // TiDB EXPLAIN id is `Point_Get` (underscore before Get).
+            "Point_Get".to_string(),
             format!("table:{table}"),
             format!("handle:{handle}"),
         ),
@@ -1135,12 +1136,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             index: Some(index),
             ..
         } => (
-            "PointGet".to_string(),
+            "Point_Get".to_string(),
             format!("table:{table}, index:{index}"),
             String::new(),
         ),
         PhysicalPlan::PointGet { table, .. } => (
-            "PointGet".to_string(),
+            "Point_Get".to_string(),
             format!("table:{table}"),
             String::new(),
         ),
