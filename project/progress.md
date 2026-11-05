@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select`/`show` → `green`**；`types/const` 推进中（UNSIGNED/BIGINT 溢出已对齐） |
+| R1 | select, show, types/* | `in_progress` | **`select`/`show` → `green`**；`types/const` Mem 全绿（待 TiKV） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -75,6 +75,7 @@
 | UNSIGNED / BIGINT overflow | 1690；`NO_UNSIGNED_SUBTRACTION`；CAST wrap | i128 有符号差；U64 标签；`qualify_expr_table` | types/const 至 overflow 段已绿 |
 | IGNORE_SPACE CREATE TABLE | `COUNT(a)`/`COUNT (a)` 1064 | session `reject_create_table_func_call` | types/const IGNORE_SPACE 段已绿（HIGH_NOT 前） |
 | HIGH_NOT_PRECEDENCE | `NOT x BETWEEN` → `(NOT x) BETWEEN` | eval rewrite under sql_mode | types/const HIGH_NOT 段已绿 |
+| NO_BACKSLASH_ESCAPES | `\\` 字面反斜杠 | parse 前加倍 `\` 喂 sqlparser | types/const → Mem 全绿 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
