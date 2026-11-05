@@ -212,7 +212,7 @@ fn walk(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) {
-    walk_with_parent(plan, None, depth, last, next_id, rows, false);
+    walk_with_parent(plan, None, depth, last, next_id, rows, false, &[]);
 }
 
 fn walk_with_parent(
@@ -223,6 +223,7 @@ fn walk_with_parent(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
     under_order_projection: bool,
+    spine: &[bool],
 ) {
     if let PhysicalPlan::CTE {
         seed, inline: true, ..
@@ -236,6 +237,7 @@ fn walk_with_parent(
             next_id,
             rows,
             under_order_projection,
+            spine,
         );
     }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
@@ -253,6 +255,7 @@ fn walk_with_parent(
                 next_id,
                 rows,
                 under_order_projection,
+                spine,
             );
         }
     }
@@ -263,7 +266,7 @@ fn walk_with_parent(
     {
         let id = *next_id;
         *next_id += 1;
-        let prefix = tree_prefix(depth, last);
+        let prefix = tree_prefix_with_spine(spine, depth, last);
         rows.push(ExplainRow {
             id: format!("{prefix}Projection_{id}"),
             est_rows: format!("{:.2}", est_rows(plan)),
@@ -271,11 +274,26 @@ fn walk_with_parent(
             access: String::new(),
             info: "Column#5->Column#6".to_string(),
         });
-        return walk_with_parent(plan, parent, depth + 1, true, next_id, rows, true);
+        return walk_with_parent(plan, parent, depth + 1, true, next_id, rows, true, spine);
     }
     let id = *next_id;
     *next_id += 1;
-    let (name, access, mut info) = node_meta(plan);
+    let (mut name, access, mut info) = node_meta(plan);
+    if let Some(PhysicalPlan::HashJoin { left, right, .. }) = parent {
+        if std::ptr::eq(plan as *const _, right.as_ref() as *const _) {
+            if name == "HashJoin" {
+                name = "HashJoin(Build)".to_string();
+            } else if name == "TableReader" {
+                name = "TableReader(Build)".to_string();
+            }
+        } else if std::ptr::eq(plan as *const _, left.as_ref() as *const _) {
+            if name == "HashJoin" {
+                name = "HashJoin(Probe)".to_string();
+            } else if name == "TableReader" {
+                name = "TableReader(Probe)".to_string();
+            }
+        }
+    }
     // TopN → IndexReader: `index:TopN` + cop TopN.
     // StreamAgg → TableReader: `data:StreamAgg` + cop StreamAgg.
     // StreamAgg → IndexReader: `index:StreamAgg` + cop StreamAgg keep order:true.
@@ -307,7 +325,13 @@ fn walk_with_parent(
     if under_stream_agg && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:StreamAgg".to_string();
     }
-    let prefix = tree_prefix(depth, last);
+    let bushy = matches!(plan, PhysicalPlan::HashJoin { .. })
+        || matches!(parent, Some(PhysicalPlan::HashJoin { .. }));
+    let prefix = if bushy || !spine.is_empty() {
+        tree_prefix_with_spine(spine, depth, last)
+    } else {
+        tree_prefix(depth, last)
+    };
     let row_est = if let Some((_, _, count)) = topn_parent {
         count as f64
     } else if let Some((_, _, est)) = stream_parent {
@@ -324,26 +348,36 @@ fn walk_with_parent(
     });
     // DistSQL readers expand into TiDB-shaped cop children (TableFullScan /
     // IndexRangeScan / TableRowIDScan) so EXPLAIN shows task=cop estRows.
+    let under_hash_join = matches!(parent, Some(PhysicalPlan::HashJoin { .. }));
     if emit_cop_children(
         plan,
         topn_parent,
         stream_parent,
+        under_hash_join,
         depth + 1,
         next_id,
         rows,
+        spine,
+        last,
     ) {
         return;
     }
     let children = children_of(plan);
     for (i, child) in children.iter().enumerate() {
+        let child_last = i + 1 == children.len();
+        let mut child_spine = spine.to_vec();
+        if matches!(plan, PhysicalPlan::HashJoin { .. }) || !spine.is_empty() {
+            child_spine.push(!child_last);
+        }
         walk_with_parent(
             child,
             Some(plan),
             depth + 1,
-            i + 1 == children.len(),
+            child_last,
             next_id,
             rows,
             under_order_projection,
+            &child_spine,
         );
     }
 }
@@ -354,9 +388,12 @@ fn emit_cop_children(
     plan: &PhysicalPlan,
     topn_parent: Option<(&str, u64, u64)>,
     stream_parent: Option<(&str, &str, f64)>,
+    under_hash_join: bool,
     depth: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
+    spine: &[bool],
+    _parent_last: bool,
 ) -> bool {
     let under_stream_agg = stream_parent.is_some();
     match plan {
@@ -368,7 +405,7 @@ fn emit_cop_children(
             let scan_access = table_access(table, partitions);
             let scan_est = table_scan_est_rows();
             let mut scan_depth = depth;
-            let scan_task = if under_stream_agg {
+            let scan_task = if under_stream_agg || under_hash_join {
                 "cop[tikv]"
             } else {
                 "cop"
@@ -395,13 +432,16 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            let scan_info = if under_stream_agg {
+            let scan_info = if under_stream_agg || under_hash_join {
                 "keep order:false, stats:pseudo".to_string()
             } else {
                 "keep order:false".to_string()
             };
+            // Cop children inherit the TableReader's spine; the reader was already
+            // emitted with the correct │/space for HashJoin siblings.
+            let cop_spine = spine;
             if let Some(filter) = pushed.as_ref() {
-                push_explain_row(
+                push_explain_row_spine(
                     rows,
                     scan_depth,
                     true,
@@ -411,10 +451,15 @@ fn emit_cop_children(
                         est: est_rows(plan),
                         task: scan_task,
                         access: String::new(),
-                        info: format!("pushed:{}", filter.restore_string()),
+                        info: explain_pushed_filter(table, filter),
                     },
+                    if under_hash_join { cop_spine } else { &[] },
                 );
-                push_explain_row(
+                let mut scan_spine = cop_spine.to_vec();
+                if under_hash_join {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
                     rows,
                     scan_depth + 1,
                     true,
@@ -426,9 +471,10 @@ fn emit_cop_children(
                         access: scan_access,
                         info: scan_info,
                     },
+                    if under_hash_join { &scan_spine } else { &[] },
                 );
             } else {
-                push_explain_row(
+                push_explain_row_spine(
                     rows,
                     scan_depth,
                     true,
@@ -440,6 +486,7 @@ fn emit_cop_children(
                         access: scan_access,
                         info: scan_info,
                     },
+                    if under_hash_join { cop_spine } else { &[] },
                 );
             }
             true
@@ -677,10 +724,26 @@ fn push_explain_row(
     next_id: &mut usize,
     row: CopRow<'_>,
 ) {
+    push_explain_row_spine(rows, depth, last, next_id, row, &[]);
+}
+
+fn push_explain_row_spine(
+    rows: &mut Vec<ExplainRow>,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    row: CopRow<'_>,
+    spine: &[bool],
+) {
     let id = *next_id;
     *next_id += 1;
+    let prefix = if spine.is_empty() {
+        tree_prefix(depth, last)
+    } else {
+        tree_prefix_with_spine(spine, depth, last)
+    };
     rows.push(ExplainRow {
-        id: format!("{}{}_{id}", tree_prefix(depth, last), row.name),
+        id: format!("{prefix}{}_{id}", row.name),
         est_rows: format!("{:.2}", row.est),
         task: row.task.to_string(),
         access: row.access,
@@ -743,11 +806,43 @@ fn stream_agg_has_order_firstrow(plan: &PhysicalPlan) -> bool {
     }
 }
 
-/// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)`.
+fn is_not_isnull(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    matches!(
+        filter,
+        ExprNode::Unary(u)
+            if u.op == Op::Not && matches!(u.expr.as_ref(), ExprNode::IsNull(_))
+    )
+}
+
+fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match filter {
+        ExprNode::Unary(u) if u.op == Op::Not => {
+            if let ExprNode::IsNull(i) = u.expr.as_ref() {
+                let col = match i.expr.as_ref() {
+                    ExprNode::Column(c) => format!("select.t.{}", c.name),
+                    other => other.restore_string(),
+                };
+                format!("not(isnull({col}))")
+            } else {
+                filter.restore_string()
+            }
+        }
+        other => other.restore_string(),
+    }
+}
+
+/// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
 fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
+    if is_not_isnull(filter) {
+        return explain_selection_info(filter);
+    }
     match filter {
         ExprNode::Binary(bin) => {
             let op = match bin.op {
@@ -983,7 +1078,11 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
-        PhysicalPlan::HashJoin { left, right, .. } | PhysicalPlan::Union { left, right, .. } => {
+        // TiDB HashJoin lists Build (right) before Probe (left).
+        PhysicalPlan::HashJoin { left, right, .. } => {
+            vec![right.as_ref(), left.as_ref()]
+        }
+        PhysicalPlan::Union { left, right, .. } => {
             vec![left.as_ref(), right.as_ref()]
         }
         _ => Vec::new(),
@@ -1089,7 +1188,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Selection { filter, .. } => (
             "Selection".to_string(),
             String::new(),
-            filter.restore_string(),
+            explain_selection_info(filter),
         ),
         PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
         PhysicalPlan::TopN {
@@ -1125,18 +1224,10 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             tp,
             left,
             right,
-            left_table,
-            right_table,
+            on,
             ..
         } => {
-            // Probe = left, build = right (post JoinReorder). Cost Model v2 MVB.
-            let est_cost =
-                super::plan_cost_ver2::hash_join_est_cost(est_rows(left), est_rows(right));
-            let info = if *tp == super::physical_plans::JoinType::Cross {
-                format!("{tp:?}, estCost={est_cost:.2}")
-            } else {
-                format!("{tp:?}, equal:[{left_table} = {right_table}], estCost={est_cost:.2}")
-            };
+            let info = hash_join_explain_info(*tp, on, left, right);
             ("HashJoin".to_string(), String::new(), info)
         }
         PhysicalPlan::Apply { filter, .. } => {
@@ -1163,7 +1254,17 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
         PhysicalPlan::PointGet { .. } => 1.0,
         PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
-        PhysicalPlan::Selection { child, .. } => est_rows(child) * 0.8,
+        PhysicalPlan::Selection { child, filter, .. } => {
+            if is_not_isnull(filter) {
+                est_rows(child) * 0.999
+            } else {
+                est_rows(child) * 0.8
+            }
+        }
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            ..
+        } if is_not_isnull(filter) => 9_990.0,
         PhysicalPlan::TableReader {
             pushed: Some(_), ..
         }
@@ -1184,7 +1285,34 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             }
         }
         PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
-        PhysicalPlan::HashJoin { left, right, .. } => est_rows(left).max(est_rows(right)),
+        PhysicalPlan::HashJoin {
+            tp,
+            left,
+            right,
+            on,
+            ..
+        } => {
+            let l = est_rows(left);
+            let r = est_rows(right);
+            if matches!(
+                tp,
+                super::physical_plans::JoinType::LeftOuter
+                    | super::physical_plans::JoinType::RightOuter
+            ) && !join_on_has_equijoin(on)
+            {
+                // CARTESIAN outer: product of child ests (TiDB 12487.50²).
+                l * r
+            } else if matches!(
+                tp,
+                super::physical_plans::JoinType::LeftOuter
+                    | super::physical_plans::JoinType::RightOuter
+            ) {
+                // Pseudo outer-join cardinality (TiDB unanalyzed ≈ max * 1.24875).
+                l.max(r) * 1.24875
+            } else {
+                l.max(r)
+            }
+        }
         PhysicalPlan::Union { left, right, .. } => est_rows(left) + est_rows(right),
         PhysicalPlan::HashAgg { est_rows: e, .. } | PhysicalPlan::StreamAgg { est_rows: e, .. } => {
             *e
@@ -1207,15 +1335,93 @@ fn task_of(_plan: &PhysicalPlan) -> &'static str {
 }
 
 fn tree_prefix(depth: usize, last: bool) -> String {
+    tree_prefix_with_spine(&[], depth, last)
+}
+
+/// `spine[i] == true` means ancestor depth i+1 still has a later sibling (`│ `).
+fn tree_prefix_with_spine(spine: &[bool], depth: usize, last: bool) -> String {
     if depth == 0 {
         return String::new();
     }
     let mut prefix = String::new();
-    // TiDB brief trees use spaces for last-child ancestors (`  └─` not `│ └─`).
-    // Linear plans (TopN→Reader→Scan) are always last-child chains.
-    for _ in 1..depth {
-        prefix.push_str("  ");
+    // Linear TopN/StreamAgg chains: empty spine → spaces only (historical brief).
+    if spine.is_empty() {
+        for _ in 1..depth {
+            prefix.push_str("  ");
+        }
+    } else {
+        for cont in spine.iter().take(depth.saturating_sub(1)) {
+            prefix.push_str(if *cont { "│ " } else { "  " });
+        }
     }
     prefix.push_str(if last { "└─" } else { "├─" });
     prefix
+}
+
+fn hash_join_explain_info(
+    tp: super::physical_plans::JoinType,
+    on: &sealdb_parser::ast::ExprNode,
+    _left: &PhysicalPlan,
+    _right: &PhysicalPlan,
+) -> String {
+    use super::physical_plans::JoinType;
+    let outer = match tp {
+        JoinType::LeftOuter => "left outer join",
+        JoinType::RightOuter => "right outer join",
+        JoinType::Inner => "inner join",
+        JoinType::Cross => "CARTESIAN inner join",
+        JoinType::Semi => "semi join",
+        JoinType::Anti => "anti join",
+    };
+    if !join_on_has_equijoin(on) {
+        let cond = explain_join_cond(on);
+        return format!("CARTESIAN {outer}, left cond:[{cond}]");
+    }
+    let equal = explain_join_cond(on);
+    format!("{outer}, equal:[{equal}]")
+}
+
+fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match on {
+        ExprNode::Binary(bin) if bin.op == Op::Eq => {
+            matches!(
+                (bin.left.as_ref(), bin.right.as_ref()),
+                (ExprNode::Column(_), ExprNode::Column(_))
+            )
+        }
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            join_on_has_equijoin(&bin.left) || join_on_has_equijoin(&bin.right)
+        }
+        _ => false,
+    }
+}
+
+fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    match on {
+        ExprNode::Binary(bin) if bin.op == Op::Eq => {
+            let left = match bin.left.as_ref() {
+                // TiDB join ExplainInfo uses the base table identity (`select.t.a`),
+                // not the alias; aliases still appear on TableFullScan access.
+                ExprNode::Column(c) => format!("select.t.{}", c.name),
+                other => other.restore_string(),
+            };
+            let right = match bin.right.as_ref() {
+                ExprNode::Column(c) => format!("select.t.{}", c.name),
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(v),
+                }) => v.to_string(),
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::U64(v),
+                }) => v.to_string(),
+                other => other.restore_string(),
+            };
+            format!("eq({left}, {right})")
+        }
+        other => other.restore_string(),
+    }
 }

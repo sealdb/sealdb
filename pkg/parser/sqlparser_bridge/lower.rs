@@ -4921,7 +4921,7 @@ fn lower_select(
     for field in &mut fields {
         resolve_named_window(&mut field.expr, &windows)?;
     }
-    let (from, joins, derived) = lower_from(&select.from)?;
+    let (from, joins, from_item, derived) = lower_from(&select.from)?;
     if !joins.is_empty() && !derived.is_empty() {
         return Err(Error::unsupported("subquery JOIN"));
     }
@@ -4934,6 +4934,7 @@ fn lower_select(
         fields,
         from,
         joins,
+        from_item,
         selection,
         group_by,
         having,
@@ -4993,9 +4994,22 @@ fn true_expr() -> ExprNode {
 /// Derived tables (`FROM (SELECT ...) alias`) flatten into CTEs.
 fn lower_from(
     from: &[TableWithJoins],
-) -> Result<(Option<TableName>, Vec<Join>, Vec<CommonTableExpression>)> {
+) -> Result<(
+    Option<TableName>,
+    Vec<Join>,
+    Option<crate::ast::FromItem>,
+    Vec<CommonTableExpression>,
+)> {
     if from.is_empty() {
-        return Ok((None, Vec::new(), Vec::new()));
+        return Ok((None, Vec::new(), None, Vec::new()));
+    }
+    // Prefer bushy FromItem when NestedJoin appears (paren join groups).
+    if from_has_nested_join(from) {
+        let (item, ctes) = lower_from_item_list(from)?;
+        let tables = item.tables();
+        let first = tables.first().map(|t| (*t).clone());
+        let joins = flatten_from_item_joins(&item);
+        return Ok((first, joins, Some(item), ctes));
     }
     let (first, mut joins, ctes) = lower_table_with_joins(&from[0])?;
     if from.len() > 1 && !ctes.is_empty() {
@@ -5020,7 +5034,154 @@ fn lower_from(
         joins.extend(extra_joins);
         prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
     }
-    Ok((Some(first), joins, ctes))
+    Ok((Some(first), joins, None, ctes))
+}
+
+fn from_has_nested_join(from: &[TableWithJoins]) -> bool {
+    from.iter().any(|twj| factor_has_nested(&twj.relation) || twj.joins.iter().any(|j| factor_has_nested(&j.relation)))
+}
+
+fn factor_has_nested(factor: &TableFactor) -> bool {
+    matches!(factor, TableFactor::NestedJoin { .. })
+}
+
+fn lower_from_item_list(
+    from: &[TableWithJoins],
+) -> Result<(crate::ast::FromItem, Vec<CommonTableExpression>)> {
+    let (mut item, mut ctes) = lower_table_with_joins_item(&from[0])?;
+    for extra in &from[1..] {
+        let (right, extra_ctes) = lower_table_with_joins_item(extra)?;
+        if !extra_ctes.is_empty() {
+            return Err(Error::unsupported("subquery JOIN"));
+        }
+        ctes.extend(extra_ctes);
+        item = crate::ast::FromItem::Join {
+            left: Box::new(item),
+            right: Box::new(right),
+            tp: JoinType::Cross,
+            on: true_expr(),
+        };
+    }
+    Ok((item, ctes))
+}
+
+fn lower_table_with_joins_item(
+    table: &TableWithJoins,
+) -> Result<(crate::ast::FromItem, Vec<CommonTableExpression>)> {
+    let (mut left, mut ctes) = table_factor_item(&table.relation)?;
+    for join in &table.joins {
+        let (right, right_ctes) = table_factor_item(&join.relation)?;
+        if !right_ctes.is_empty() {
+            return Err(Error::unsupported("subquery JOIN"));
+        }
+        ctes.extend(right_ctes);
+        let (tp, on) = match &join.join_operator {
+            JoinOperator::Join(JoinConstraint::On(expr))
+            | JoinOperator::Inner(JoinConstraint::On(expr))
+            | JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?)
+            }
+            JoinOperator::Left(JoinConstraint::On(expr))
+            | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+                (JoinType::LeftOuter, lower_expr(expr)?)
+            }
+            JoinOperator::Right(JoinConstraint::On(expr))
+            | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+                (JoinType::RightOuter, lower_expr(expr)?)
+            }
+            JoinOperator::CrossJoin(JoinConstraint::None)
+            | JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::Inner(JoinConstraint::None)
+            | JoinOperator::StraightJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
+            JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?)
+            }
+            other => {
+                return Err(Error::unsupported(format!(
+                    "nested join operator {other:?}"
+                )));
+            }
+        };
+        left = crate::ast::FromItem::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            tp,
+            on,
+        };
+    }
+    Ok((left, ctes))
+}
+
+fn table_factor_item(
+    factor: &TableFactor,
+) -> Result<(crate::ast::FromItem, Vec<CommonTableExpression>)> {
+    match factor {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if alias.is_some() {
+                return Err(Error::unsupported("nested join alias"));
+            }
+            lower_table_with_joins_item(table_with_joins)
+        }
+        TableFactor::Table {
+            name,
+            alias,
+            index_hints,
+            ..
+        } => {
+            let mut physical = object_table_name(name)?;
+            for hint in index_hints {
+                if matches!(
+                    hint.hint_type,
+                    sqlparser::ast::TableIndexHintType::Use
+                        | sqlparser::ast::TableIndexHintType::Force
+                ) {
+                    physical
+                        .use_indexes
+                        .extend(hint.index_names.iter().map(|n| n.value.clone()));
+                }
+            }
+            // TiDB EXPLAIN uses the table alias as the scan name (`table:t1`).
+            if let Some(a) = alias {
+                physical.physical = Some(physical.name.clone());
+                physical.name = a.name.value.clone();
+            }
+            Ok((crate::ast::FromItem::Table(physical), Vec::new()))
+        }
+        other => {
+            let (table, _alias, ctes) = table_factor(other)?;
+            Ok((crate::ast::FromItem::Table(table), ctes))
+        }
+    }
+}
+
+fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
+    match item {
+        crate::ast::FromItem::Table(_) => Vec::new(),
+        crate::ast::FromItem::Join {
+            left,
+            right,
+            tp,
+            on,
+        } => {
+            let mut joins = flatten_from_item_joins(left);
+            joins.extend(flatten_from_item_joins(right));
+            let left_tables = left.tables();
+            let right_tables = right.tables();
+            if let (Some(l), Some(r)) = (left_tables.last(), right_tables.first()) {
+                joins.push(Join {
+                    left: (*l).clone(),
+                    right: (*r).clone(),
+                    tp: *tp,
+                    on: on.clone(),
+                    using_cols: Vec::new(),
+                });
+            }
+            joins
+        }
+    }
 }
 
 /// Lower `t` or `t1 JOIN t2 ON ... JOIN t3 ON ...` into a left-deep `Join` list.

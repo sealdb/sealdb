@@ -96,6 +96,7 @@ pub fn eval_named_cte(
         }],
         from: Some(TableName::new(None, name)),
         joins: Vec::new(),
+        from_item: None,
         selection: None,
         group_by: Vec::new(),
         having: None,
