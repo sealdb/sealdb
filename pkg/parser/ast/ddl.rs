@@ -218,6 +218,25 @@ pub struct PartitionOption {
     pub subpartition_ignored: bool,
 }
 
+/// TiDB table TTL option (`TTL = col + INTERVAL 1 HOUR`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TtlInfo {
+    /// Normalized Explain/SHOW form: `` `created_time` + INTERVAL 1 HOUR ``.
+    pub expr: String,
+    pub enable: bool,
+    pub job_interval: String,
+}
+
+impl TtlInfo {
+    pub fn new(expr: impl Into<String>) -> Self {
+        Self {
+            expr: expr.into(),
+            enable: true,
+            job_interval: "1h".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateTableStmt {
     pub if_not_exists: bool,
@@ -225,6 +244,8 @@ pub struct CreateTableStmt {
     pub cols: Vec<ColumnDef>,
     pub indices: Vec<IndexDef>,
     pub partition: Option<PartitionOption>,
+    /// TiDB `TTL = …` table option.
+    pub ttl: Option<TtlInfo>,
     /// TiDB `ReferTable` (`CREATE TABLE t LIKE src`).
     pub refer_table: Option<TableName>,
     /// TiDB `Select` (`CREATE TABLE t AS SELECT ...`).

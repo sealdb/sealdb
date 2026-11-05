@@ -134,10 +134,21 @@ pub struct TableInfo {
     pub max_idx_id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<PartitionInfo>,
+    /// TiDB TTL table option (SHOW CREATE /*T![ttl] … */).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<TtlInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<SequenceInfo>,
+}
+
+/// Persisted TTL metadata (TiDB `TTLInfo`).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TtlInfo {
+    pub expr: String,
+    pub enable: bool,
+    pub job_interval: String,
 }
 
 impl TableInfo {
@@ -156,6 +167,7 @@ impl TableInfo {
             max_col_id,
             max_idx_id: 0,
             partition: None,
+            ttl: None,
             view: None,
             sequence: None,
         }

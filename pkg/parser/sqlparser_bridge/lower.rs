@@ -4,6 +4,7 @@ use crate::ast::ddl::{
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt, IndexDef,
     PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
+    TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -77,6 +78,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
+    let (rewritten, ttls) = extract_create_table_ttl(&rewritten)?;
     let (rewritten, partitions) = extract_create_table_partitions(&rewritten)?;
     let (rewritten, alter_parts) = extract_alter_partitions(&rewritten)?;
     // sqlparser rejects MySQL `GRANT/REVOKE role TO/FROM user` (no ON).
@@ -102,6 +104,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         )
     })?;
     let mut flags = pessimistic_flags.into_iter();
+    let mut ttls = ttls.into_iter();
     let mut partitions = partitions.into_iter();
     let mut alter_parts = alter_parts.into_iter();
     let mut prepares = prepares.into_iter();
@@ -140,6 +143,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             decode_show_bindings(show);
         }
         if let Statement::CreateTable(create) = &mut lowered {
+            create.ttl = ttls.next().flatten();
             create.partition = partitions.next().flatten();
         }
         if let Statement::AlterTable(alter) = &mut lowered
@@ -4103,6 +4107,111 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.
 /// Strip the clause and re-attach it after lowering, same pattern as
 /// `BEGIN PESSIMISTIC`.
+/// Strip `TTL = expr` table options so sqlparser / PARTITION extract see a
+/// clean CREATE TABLE (...). One Option slot per CREATE TABLE.
+fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)> {
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut ttls = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "CREATE") {
+            let after_create = skip_ws(bytes, i + "CREATE".len());
+            if keyword_at(bytes, after_create, "TABLE") {
+                let after_table = skip_ws(bytes, after_create + "TABLE".len());
+                let after_name = skip_ws(bytes, skip_create_table_name(bytes, after_table));
+                if after_name < bytes.len()
+                    && bytes[after_name] == b'('
+                    && let Some(close) = matching_paren(bytes, after_name)
+                {
+                    let after_cols = skip_ws(bytes, close + 1);
+                    if keyword_at(bytes, after_cols, "TTL") {
+                        let after_ttl = skip_ws(bytes, after_cols + "TTL".len());
+                        if after_ttl < bytes.len() && bytes[after_ttl] == b'=' {
+                            let expr_start = skip_ws(bytes, after_ttl + 1);
+                            let expr_end = scan_ttl_expr_end(bytes, expr_start);
+                            let raw = sql[expr_start..expr_end].trim();
+                            out.push_str(&sql[i..close + 1]);
+                            out.push(' ');
+                            ttls.push(Some(TtlInfo::new(normalize_ttl_expr(raw))));
+                            i = skip_ws(bytes, expr_end);
+                            continue;
+                        }
+                    }
+                    // CREATE TABLE with columns but no TTL — keep text, push None.
+                    out.push_str(&sql[i..close + 1]);
+                    ttls.push(None);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(sql[i..].chars().next().unwrap());
+        i += sql[i..].chars().next().unwrap().len_utf8();
+    }
+    Ok((out, ttls))
+}
+
+/// End of `TTL = <expr>`: stop before PARTITION / ENGINE / CHARSET / `;`.
+fn scan_ttl_expr_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() {
+        let rest = skip_ws(bytes, i);
+        if rest >= bytes.len() || bytes[rest] == b';' {
+            return rest.min(bytes.len());
+        }
+        if keyword_at(bytes, rest, "PARTITION")
+            || keyword_at(bytes, rest, "ENGINE")
+            || keyword_at(bytes, rest, "DEFAULT")
+            || keyword_at(bytes, rest, "CHARSET")
+            || keyword_at(bytes, rest, "COLLATE")
+            || keyword_at(bytes, rest, "COMMENT")
+            || keyword_at(bytes, rest, "TTL_ENABLE")
+            || keyword_at(bytes, rest, "TTL_JOB_INTERVAL")
+        {
+            return rest;
+        }
+        // Advance one token / identifier / number / operator.
+        if bytes[rest] == b'`' {
+            i = rest + 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            i = i.saturating_add(1);
+            continue;
+        }
+        if bytes[rest].is_ascii_alphanumeric() || bytes[rest] == b'_' {
+            i = rest + 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            continue;
+        }
+        i = rest + 1;
+    }
+    bytes.len()
+}
+
+fn normalize_ttl_expr(raw: &str) -> String {
+    // `created_time + interval 1 hour` → `` `created_time` + INTERVAL 1 HOUR ``
+    let mut parts = Vec::new();
+    for tok in raw.split_whitespace() {
+        let upper = tok.to_ascii_uppercase();
+        if upper == "INTERVAL" || upper == "HOUR" || upper == "DAY" || upper == "MINUTE"
+            || upper == "SECOND" || upper == "WEEK" || upper == "MONTH" || upper == "YEAR"
+            || upper == "+"
+        {
+            parts.push(upper);
+        } else if tok.chars().all(|c| c.is_ascii_digit()) {
+            parts.push(tok.to_string());
+        } else {
+            let bare = tok.trim_matches('`');
+            parts.push(format!("`{bare}`"));
+        }
+    }
+    parts.join(" ")
+}
+
 fn extract_create_table_partitions(sql: &str) -> Result<(String, Vec<Option<PartitionOption>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
@@ -6408,6 +6517,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         cols,
         indices,
         partition: None,
+        ttl: None,
         refer_table,
         select,
     }))

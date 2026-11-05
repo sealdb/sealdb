@@ -66,6 +66,7 @@ pub fn create_view(
         cols,
         indices: Vec::new(),
         partition: None,
+        ttl: None,
         refer_table: None,
         select: None,
     };

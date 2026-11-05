@@ -2385,7 +2385,7 @@
     {
       "name": "show",
       "wave": "R1",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/show.test",
       "result": "r/show.result",
       "has_result": true,
