@@ -123,7 +123,12 @@ fn map_insert_row(
                 "Column count doesn't match value count",
             ));
         }
-        return Ok(row.to_vec());
+        // Cast literals to column FieldType (UNSIGNED BIGINT / DECIMAL scale).
+        let mut values = Vec::with_capacity(info.columns.len());
+        for (col, v) in info.columns.iter().zip(row.iter()) {
+            values.push(v.cast(&col.field_type)?);
+        }
+        return Ok(values);
     }
     if row.len() != columns.len() {
         return Err(Error::new(
@@ -137,7 +142,7 @@ fn map_insert_row(
             .iter()
             .position(|c| c.eq_ignore_ascii_case(col.name.o()))
         {
-            values.push(row[idx].clone());
+            values.push(row[idx].cast(&col.field_type)?);
         } else {
             values.push(Datum::Null);
         }

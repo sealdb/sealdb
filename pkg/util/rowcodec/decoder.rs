@@ -51,7 +51,7 @@ fn decode_all(row: &Row<'_>) -> Vec<(i64, Datum)> {
 fn decode_value(data: &[u8], ft: &FieldType) -> Datum {
     match ft.tp {
         TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_INT24 | TYPE_LONG_LONG | TYPE_YEAR => {
-            if ft.unsigned {
+            if ft.is_unsigned() {
                 Datum::U64(decode_uint(data))
             } else {
                 Datum::I64(decode_int(data))

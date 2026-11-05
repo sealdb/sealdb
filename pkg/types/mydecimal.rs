@@ -57,6 +57,29 @@ impl MyDecimal {
         Ok(if self.negative { -v } else { v })
     }
 
+    /// Round/pad fractional digits to `scale` (TiDB `MyDecimal.Round`).
+    pub fn with_frac(&self, scale: i32) -> Self {
+        if scale < 0 {
+            return self.clone();
+        }
+        let scale = scale as usize;
+        let (int_part, frac) = match self.digits.split_once('.') {
+            Some((i, f)) => (i.to_string(), f.to_string()),
+            None => (self.digits.clone(), String::new()),
+        };
+        let digits = if scale == 0 {
+            int_part
+        } else if frac.len() >= scale {
+            format!("{int_part}.{}", &frac[..scale])
+        } else {
+            format!("{int_part}.{frac}{:0>width$}", "", width = scale - frac.len())
+        };
+        Self {
+            negative: self.negative,
+            digits,
+        }
+    }
+
     /// Memcomparable integer encoding of the decimal's integer value.
     /// Full MyDecimal bin format is completed in the completeness wave.
     pub fn encode_int_cmp(&self) -> Result<i64> {

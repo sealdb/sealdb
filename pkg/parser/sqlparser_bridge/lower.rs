@@ -6865,13 +6865,18 @@ fn lower_value(value: &Value) -> Result<Datum> {
         Value::Number(n, _) => {
             // TiDB accepts scientific notation (`1e23`) as float; sqlparser keeps the
             // token text so we must not force i64 when `e`/`E` is present.
+            // Integers wider than i64 become u64 then Decimal (precise_types).
             if n.contains('.') || n.contains('e') || n.contains('E') {
                 n.parse::<f64>()
                     .map(Datum::F64)
                     .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
+            } else if let Ok(v) = n.parse::<i64>() {
+                Ok(Datum::I64(v))
+            } else if let Ok(v) = n.parse::<u64>() {
+                Ok(Datum::U64(v))
             } else {
-                n.parse::<i64>()
-                    .map(Datum::I64)
+                sealdb_types::MyDecimal::parse(n)
+                    .map(Datum::Decimal)
                     .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
             }
         }

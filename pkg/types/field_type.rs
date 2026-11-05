@@ -113,6 +113,12 @@ impl FieldType {
             _ => EvalType::String,
         }
     }
+
+    /// MySQL UNSIGNED (`flag & 32`). `unsigned` is serde-skipped so meta
+    /// round-trips rely on `flag`.
+    pub fn is_unsigned(&self) -> bool {
+        self.unsigned || (self.flag & 32) != 0
+    }
 }
 
 pub const TYPE_DECIMAL: u8 = 0;
