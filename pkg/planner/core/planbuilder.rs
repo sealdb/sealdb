@@ -11,6 +11,7 @@ use super::rule_partition_processor::{
 use super::rule_inject_extra_projection::{
     inject_proj_below_sort, order_by_all_constant, order_by_has_scalar_func,
 };
+use super::rule_having_push_down::apply_having_push_down;
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
@@ -99,9 +100,15 @@ impl PlanBuilder {
                     if needs_window(select) {
                         return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
                     }
-                    let (agg, keep_order) = build_agg_plan(select, plan, current_db);
+                    let (agg, keep_order) =
+                        build_agg_plan(select, plan, current_db);
                     plan = agg;
                     stream_keep_order = keep_order;
+                    if let Some(having) = &select.having {
+                        plan = apply_having_push_down(
+                            plan, having, select, is, current_db,
+                        );
+                    }
                 }
                 if needs_window(select) {
                     // TiDB: Sort → Window → Shuffle, then Projection for
@@ -1785,13 +1792,18 @@ fn order_prefix_of_group_by(select: &SelectStmt) -> bool {
 fn build_agg_plan(
     select: &SelectStmt,
     plan: PhysicalPlan,
-    _current_db: &str,
+    current_db: &str,
 ) -> (PhysicalPlan, bool) {
     let table = select
         .from
         .as_ref()
         .map(|t| t.name.as_str())
         .unwrap_or("dual");
+    let db_qual = if current_db.is_empty() {
+        String::new()
+    } else {
+        format!("{current_db}.")
+    };
     let plan = match plan {
         PhysicalPlan::Projection { child, .. } => *child,
         other => other,
@@ -1867,8 +1879,31 @@ fn build_agg_plan(
         })
         .unwrap_or_else(|| format!("select.{table}.a"));
 
-    let mut root_funcs = vec![format!("funcs:count(Column#{partial_col})->Column#5")];
-    let cop_funcs = vec![format!("count({agg_arg})->Column#{partial_col}")];
+    let agg_fn = select
+        .fields
+        .iter()
+        .find_map(|f| match &f.expr {
+            ExprNode::Func(func) if is_agg_expr(&f.expr) => Some(func.name.to_ascii_lowercase()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "count".into());
+    let mut root_funcs = vec![format!(
+        "funcs:{agg_fn}(Column#{partial_col})->Column#5"
+    )];
+    let cop_funcs = vec![format!("{agg_fn}({agg_arg})->Column#{partial_col}")];
+    // SELECT non-agg columns need firstrow (TiDB HashAgg).
+    for field in &select.fields {
+        if is_agg_expr(&field.expr) {
+            continue;
+        }
+        if let ExprNode::Column(col) = &field.expr {
+            let col_ref = explain_col_ref(table, &field.expr);
+            root_funcs.push(format!(
+                "funcs:firstrow({col_ref})->{db_qual}{table}.{}",
+                col.name
+            ));
+        }
+    }
     // ORDER BY requires firstrow of ordered columns on the root StreamAgg only.
     if !select.order_by.is_empty() {
         for item in &select.order_by {
