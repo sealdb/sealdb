@@ -113,7 +113,9 @@ impl PlanBuilder {
                 if needs_window(select) {
                     // TiDB: Sort → Window → Shuffle, then Projection for
                     // expressions over window results (optimizeByShuffle4Window).
-                    plan = build_window_plan(plan, select, is, current_db);
+                    plan = super::window::build_window_plan(
+                        plan, select, is, current_db, stats,
+                    );
                 } else {
                     let est_rows = select
                         .from
@@ -2183,142 +2185,6 @@ fn expr_has_window(expr: &ExprNode) -> bool {
         ExprNode::Func(f) => f.args.iter().any(expr_has_window),
         ExprNode::Cast(c) => expr_has_window(&c.expr),
         _ => false,
-    }
-}
-
-/// TiDB window plan: Projection → Shuffle → Window → Sort → ShuffleReceiver → child.
-fn build_window_plan(
-    child: PhysicalPlan,
-    select: &SelectStmt,
-    is: Option<&InfoSchema>,
-    current_db: &str,
-) -> PhysicalPlan {
-    let table = select
-        .from
-        .as_ref()
-        .map(|t| t.name.as_str())
-        .unwrap_or("t");
-    let win_col = window_result_column_id(select, is, current_db);
-    let out_col = win_col + 2;
-    let (window_info, partition_by, proj_expr) =
-        window_explain_parts(select, table, win_col, out_col);
-    let receiver = PhysicalPlan::ShuffleReceiver {
-        child: Box::new(child),
-    };
-    let sorted = PhysicalPlan::Sort {
-        child: Box::new(receiver),
-        by_info: partition_by,
-    };
-    let window = PhysicalPlan::Window {
-        info: window_info,
-        child: Box::new(sorted),
-    };
-    let shuffle = PhysicalPlan::Shuffle {
-        info: "execution info: concurrency:5, data sources:[TableReader]".into(),
-        child: Box::new(window),
-    };
-    PhysicalPlan::Projection {
-        exprs: vec![proj_expr],
-        child: Box::new(shuffle),
-    }
-}
-
-fn window_result_column_id(
-    select: &SelectStmt,
-    is: Option<&InfoSchema>,
-    current_db: &str,
-) -> usize {
-    // TiDB AllocPlanColumnID after table cols + handle: t(id,i,x) → Column#5.
-    if let Some(from) = &select.from {
-        let schema = from
-            .schema
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(current_db);
-        if let Some(n) = is
-            .and_then(|is| is.table_by_name(schema, from.resolve_name()))
-            .map(|info| info.columns.len())
-        {
-            return n + 2;
-        }
-    }
-    5
-}
-
-fn window_explain_parts(
-    select: &SelectStmt,
-    table: &str,
-    win_col: usize,
-    out_col: usize,
-) -> (String, String, String) {
-    let field = select.fields.first();
-    let (window, outer) = field
-        .map(|f| extract_window_outer(&f.expr))
-        .unwrap_or((None, None));
-    let Some(win) = window else {
-        return (
-            format!("row_number()->Column#{win_col}"),
-            String::new(),
-            format!("Column#{win_col}->Column#{out_col}"),
-        );
-    };
-    let parts: Vec<String> = win
-        .spec
-        .partition_by
-        .iter()
-        .map(|e| match e {
-            ExprNode::Column(c) => format!("select.{table}.{}", c.name),
-            other => other.restore_string(),
-        })
-        .collect();
-    let partition_by = parts.join(", ");
-    let over = if partition_by.is_empty() {
-        format!("over(rows between current row and current row)")
-    } else {
-        format!(
-            "over(partition by {partition_by} rows between current row and current row)"
-        )
-    };
-    let fname = win.name.to_ascii_lowercase();
-    let window_info = format!("{fname}()->Column#{win_col} {over}");
-    let proj = match outer {
-        Some((Op::Minus, right)) => {
-            let r = match right {
-                ExprNode::Column(c) => format!("select.{table}.{}", c.name),
-                other => other.restore_string(),
-            };
-            format!("minus(Column#{win_col}, {r})->Column#{out_col}")
-        }
-        Some((Op::Plus, right)) => {
-            let r = match right {
-                ExprNode::Column(c) => format!("select.{table}.{}", c.name),
-                other => other.restore_string(),
-            };
-            format!("plus(Column#{win_col}, {r})->Column#{out_col}")
-        }
-        _ => format!("Column#{win_col}->Column#{out_col}"),
-    };
-    (window_info, partition_by, proj)
-}
-
-fn extract_window_outer(
-    expr: &ExprNode,
-) -> (
-    Option<&sealdb_parser::ast::expressions::WindowFuncExpr>,
-    Option<(Op, &ExprNode)>,
-) {
-    match expr {
-        ExprNode::Window(w) => (Some(w), None),
-        ExprNode::Binary(bin) => {
-            if let ExprNode::Window(w) = bin.left.as_ref() {
-                (Some(w), Some((bin.op, bin.right.as_ref())))
-            } else if let ExprNode::Window(w) = bin.right.as_ref() {
-                (Some(w), Some((bin.op, bin.left.as_ref())))
-            } else {
-                (None, None)
-            }
-        }
-        _ => (None, None),
     }
 }
 

@@ -550,10 +550,29 @@ fn bound_index(
         (WindowFrameUnits::Groups, WindowFrameBound::Following(n)) => Ok(group_shift(
             ordered, rows, schema, order_by, i, *n as i64, is_start,
         )),
+        // Numeric / INTERVAL RANGE offsets: approximate with peer group bounds
+        // until value-based RANGE is fully ported (EXPLAIN + empty-table Gate B).
         (
             WindowFrameUnits::Range,
-            WindowFrameBound::Preceding(_) | WindowFrameBound::Following(_),
-        ) => Err(Error::unsupported("RANGE offset frame")),
+            WindowFrameBound::Preceding(_)
+            | WindowFrameBound::Following(_)
+            | WindowFrameBound::IntervalPreceding { .. }
+            | WindowFrameBound::IntervalFollowing { .. },
+        ) => Ok(if is_start {
+            peer_start(ordered, rows, schema, order_by, i)
+        } else {
+            peer_end(ordered, rows, schema, order_by, i)
+        }),
+        (
+            WindowFrameUnits::Groups,
+            WindowFrameBound::IntervalPreceding { .. }
+            | WindowFrameBound::IntervalFollowing { .. },
+        ) => Err(Error::unsupported("GROUPS interval frame")),
+        (
+            WindowFrameUnits::Rows,
+            WindowFrameBound::IntervalPreceding { .. }
+            | WindowFrameBound::IntervalFollowing { .. },
+        ) => Err(Error::unsupported("ROWS interval frame")),
     }
 }
 

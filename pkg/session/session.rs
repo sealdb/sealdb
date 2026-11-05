@@ -1780,8 +1780,13 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .lock()
                     .expect("session time_zone lock") = value;
             }
+            "tidb_window_concurrency" => {
+                let n: u64 = value.parse().unwrap_or(5);
+                sealdb_expression::set_window_concurrency(n.max(1));
+            }
+            "tidb_enable_window_function" => {}
             // TiDB session vars used by integrationtest setup; accept as no-op
-            // until the matching subsystem is wired (cost model, concurrency, …).
+            // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
             other => {
                 return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
@@ -1957,6 +1962,8 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .expect("session auto analyze ratio lock")
             .to_string(),
         "autocommit" => "1".into(),
+        "tidb_window_concurrency" => sealdb_expression::window_concurrency().to_string(),
+        "tidb_enable_window_function" => "1".into(),
         // Common TiDB session vars referenced by integrationtest; defaults.
         other if other.starts_with("tidb_") => "0".into(),
         _ => return None,
