@@ -118,8 +118,12 @@ pub fn with_current_db<T>(db: impl Into<String>, f: impl FnOnce() -> T) -> T {
     })
 }
 
-fn current_db() -> String {
+pub fn current_db_name() -> String {
     CURRENT_DB.with(|cell| cell.borrow().clone())
+}
+
+fn current_db() -> String {
+    current_db_name()
 }
 
 /// Backward-compatible helper: `true` → GeneralCi, `false` → Bin.

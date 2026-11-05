@@ -949,24 +949,80 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
                     };
                     format!("not(isnull({col}))")
                 } else {
-                    item.restore_string()
+                    explain_scalar_expr(&item, "t")
                 }
             }
-            other => other.restore_string(),
+            other => explain_scalar_expr(other, "t"),
         })
         .collect();
     parts.join(", ")
 }
 
-/// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
-fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+/// TiDB-style scalar: `gt(Column#5, 3)` / `or(and(…), …)`.
+fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
+    match expr {
+        ExprNode::Column(c) => {
+            if c.name.starts_with("Column#") {
+                c.name.clone()
+            } else {
+                let tbl = c.table.as_deref().unwrap_or(table);
+                // Prefer session DB schema (suite name) when set — TiDB
+                // `agg_predicate_pushdown.t.a` vs default `select.t.a`.
+                let schema = sealdb_expression::current_db_name();
+                if schema.is_empty() {
+                    format!("select.{tbl}.{}", c.name)
+                } else {
+                    format!("{schema}.{tbl}.{}", c.name)
+                }
+            }
+        }
+        ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+        ExprNode::Binary(bin) => {
+            let op = match bin.op {
+                Op::Gt => "gt",
+                Op::Ge => "ge",
+                Op::Lt => "lt",
+                Op::Le => "le",
+                Op::Eq => "eq",
+                Op::Ne => "ne",
+                Op::LogicAnd => "and",
+                Op::LogicOr => "or",
+                _ => return expr.restore_string(),
+            };
+            format!(
+                "{op}({}, {})",
+                explain_scalar_expr(&bin.left, table),
+                explain_scalar_expr(&bin.right, table)
+            )
+        }
+        other => other.restore_string(),
+    }
+}
+
+/// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
+fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
     if is_not_isnull(filter) {
         return explain_selection_info(filter);
     }
+    // CNF list → comma-joined (TiDB HAVING pushdown under TableReader).
+    let cnf = filter.split_cnf();
+    if cnf.len() > 1 {
+        return cnf
+            .iter()
+            .map(|c| explain_pushed_filter(table, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
     match filter {
+        ExprNode::Binary(bin) if matches!(bin.op, Op::LogicOr | Op::LogicAnd) => {
+            explain_scalar_expr(filter, table)
+        }
         ExprNode::Binary(bin) => {
             let op = match bin.op {
                 Op::Gt => "gt",
@@ -979,35 +1035,11 @@ fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> 
                     return format!("pushed:{}", filter.restore_string());
                 }
             };
-            let left = match bin.left.as_ref() {
-                ExprNode::Column(col) => format!("select.{table}.{}", col.name),
-                other => other.restore_string(),
-            };
-            let right = match bin.right.as_ref() {
-                ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
-                ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
-                ExprNode::Unary(u)
-                    if u.op == Op::UnaryMinus
-                        && matches!(
-                            u.expr.as_ref(),
-                            ExprNode::Value(ValueExpr {
-                                datum: Datum::I64(_) | Datum::U64(_),
-                            })
-                        ) =>
-                {
-                    match u.expr.as_ref() {
-                        ExprNode::Value(ValueExpr {
-                            datum: Datum::I64(v),
-                        }) => format!("-{}", v),
-                        ExprNode::Value(ValueExpr {
-                            datum: Datum::U64(v),
-                        }) => format!("-{}", v),
-                        _ => unreachable!(),
-                    }
-                }
-                other => other.restore_string(),
-            };
-            format!("{op}({left}, {right})")
+            format!(
+                "{op}({}, {})",
+                explain_scalar_expr(&bin.left, table),
+                explain_scalar_expr(&bin.right, table)
+            )
         }
         other => format!("pushed:{}", other.restore_string()),
     }
