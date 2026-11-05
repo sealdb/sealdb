@@ -2,7 +2,8 @@
 
 > **进度尺 = suite `green`**（TiDB v8.5.8 `tests/integrationtest` 金样）。  
 > 包级 `parity_check` / `core-ported` 只是卫生检查，**不能**替代回归绿。  
-> 权威语料：`tests/integrationtest/{t,r}` + `project/regression/manifest.json`。
+> 权威语料：`tests/integrationtest/{t,r}` + `project/regression/manifest.json`。  
+> **对齐纪律（一比一 × TDD × 生产级）**：[parity-discipline.md](./parity-discipline.md)。
 
 ---
 
@@ -56,9 +57,11 @@ MemStorage 与 TiKV（PD 可用）必须对同一金样；`skip_tikv` 仅用于�
 1. `triage_itest.sh` → 首条失败 SQL。  
 2. 分类：parse / 结果 / errno / EXPLAIN / runner。  
 3. 在 TiDB 定位同名包/文件（`Build` / `optRuleList` / `executorBuilder` / builtin）。  
-4. 只改 SealDB **同路径同名** `.rs`；禁止另起捷径。  
-5. 单元测试 + 该套件；升 `in_progress` → `green`；更新 `project/parity/status.json` 时必须有 suite 证据。  
-6. **禁止**改权威 `r/*.result`。
+4. 对照 TiDB 同文件调用链与测试，**一比一**补齐算法与错误分支（见 [parity-discipline.md](./parity-discipline.md)）。  
+5. 只改 SealDB **同路径同名** `.rs`；禁止另起捷径。  
+6. 单元测试 + 该套件 Gate A(+B)；Mem + TiKV 同金样；达生产级清单后升 `green`。  
+7. **实时**更新 [progress.md](./progress.md)；无 suite 证据不得标 `ported`。  
+8. **禁止**改权威 `r/*.result`。
 
 波次依赖序见 [regression/waves/README.md](./regression/waves/README.md)（R1→R7，D 延后）。
 

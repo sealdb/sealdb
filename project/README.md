@@ -55,6 +55,7 @@
 | [features.md](./features.md) | **功能级 backlog**（日常迭代单位） | 所有人 |
 | [progress.md](./progress.md) | **唯一进度看板** | 每次开工/收工 |
 | [testing.md](./testing.md) | Oracle、一致性、差分、集成测试 | 编码 + QA |
+| [parity-discipline.md](./parity-discipline.md) | **一比一 × TDD × 生产级**协作纪律（必读） | 所有编码者 |
 | [debugging.md](./debugging.md) | 分层排障、EXPLAIN、Trace、故障手册 | 编码 + on-call |
 | [parity-matrix.md](./parity-matrix.md) | Go→Rust 包/文件对齐状态 | 所有人 |
 | [risks.md](./risks.md) | 风险登记、开放问题、假设 | 负责人 |

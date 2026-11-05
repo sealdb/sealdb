@@ -2,8 +2,8 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-05（TDD：TiDB integrationtest 全量导入；R1–R3 `in_progress`）  
-> 测试规范：[testing.md](./testing.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
+> 最后更新：2026-11-05（R1 `select` Gate A 推进至 EXPLAIN；纪律文档落地）  
+> 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
 
@@ -24,13 +24,31 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | 同名 expression/executor 修复中；`triage_itest.sh -t select` |
+| R1 | select, show, types/* | `in_progress` | **`select` 推进至 group-by EXPLAIN**：TopN/IndexReader 与空表 StreamAgg brief 已绿；卡在 `distinct b group by a` 的 HashAgg→StreamAgg→IndexReader（keep order）。下一步：`planbuilder` 按 idx(a,b,c) 选 IndexReader + agg explain info |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
-| R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
-实现纪律：失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一复刻；禁止改权威 `r/*.result`。
+实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
+
+### 2.0 今日 R1 `select` 落地（2026-11-05）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| unary `!` → `opcode.Not2` | `parser/opcode` + `UnaryOperationExpr` | `Op::Not2`；`rewrite_mysql_bang` → `__sealdb_bang` | unit `bang_not2_tests`；suite 过 `select !(1+2)` |
+| 投影列名 `field.Text()` | `buildProjectionFieldNameFromExpressions` | `SelectField.orig_text` + `tidb_projection_field_name` | 过 `+ - 1` / `++++++++++++++++++++1` / `+true` 等 header |
+| float `1e23` 展示 | REAL 科学计数 | `types::format_float` 大数用 `e` | 过 `+1e23`/`+1E23` 数据行 |
+| `&&` / `\|\|` | MySQL 逻辑与或 | `PGOverlap`/`StringConcat` → LogicAnd/Or | 过 `1 && 0 \|\| 3 && null` |
+| `JOIN` 无 ON、`FROM (t)` | CrossJoin；paren table | `Join(None)`；`rewrite_mysql_paren_from` | 过 comma/cross/paren FROM |
+| `SELECT *, 1` | ResolveFields 扩 `*` | `expand_projection_fields` + infoschema 列 | 过 `select *, 1 from t` |
+| USE/FORCE INDEX | access path hint | `TableName.use_indexes` + `access_plan` | EXPLAIN 走 IndexReader；`select c,a … use index(idx)` 结果绿 |
+| IndexFullScan 无谓词 | DistSQL full index | `IndexAccess::Range{None,None}` | 上条执行不再 1235 |
+| EXPLAIN `brief` | 去 `_N` 后缀 | `ExplainFormat::Brief` + `brief_operator_id` | id 列已对齐 `TopN`/`IndexReader` |
+| EXPLAIN TopN⊃IndexReader | cop TopN + `index:TopN` | `walk_with_parent` / `emit_cop_children` | 树形骨架已出；info/estRows/前缀仍差 |
+| EXPLAIN TopN⊃IndexReader | 完整 brief 对齐 | TopN by_info/count；`index_columns`；树前缀空格 | `select-triage` TopN 段已绿 |
+| EXPLAIN StreamAgg⊃TableReader | partial agg cop | `data:StreamAgg` + cop StreamAgg | 空表 `count(a)` EXPLAIN 已绿 |
+| **下一缺口** | Gate B：`distinct`/`group by` 的 HashAgg→StreamAgg→IndexReader；agg 列名去反引号 | planner agg+index；`HashAggExec` 用 `orig_text` | `select-triage.txt` ~272 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
