@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` flat outer-join reorder 已推进**；下一缺口 nested FromItem outer simplify（`select-triage` ~555） |
+| R1 | select, show, types/* | `in_progress` | **`select` outer→inner + left/right+inner 已推进**；下一缺口 bushy `(J1)⟕(J2)` reorder（`select-triage` ~611） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -65,7 +65,8 @@
 | `ANALYZE t1,t2,t3` | multi-table AnalyzeTableStmt | extract table list；AnalyzeExec loop | multi ANALYZE 已绿 |
 | join stats / OrigTblName | analyzed TableReader；select.tN | `join_side`→access_plan；FromItem alias rewrite | estRows/table names 已绿 |
 | flat outer-join reorder | card sort + Projection + isnull | `build_left_outer_chain`；`bushy_cop_spine` | `t2⟕t1⟕t3` brief 已绿 |
-| **下一缺口** | nested FromItem outer simplify | ON 引用内侧 → inner；mixed left+inner Projection | `select-triage.txt` ~555 |
+| nested outer→inner / assoc | ON null-reject → Inner；`A⟕B⋈C`→`(A⋈C)⟕B` | `convert_nested_outer_to_inner`；`build_left_then_inner`；right chain | brief 至 right-outer 段已绿 |
+| **下一缺口** | bushy `(J1)⟕(J2)` outer reorder | t4 未分析侧 + star Projection 条件 | `select-triage.txt` ~611 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

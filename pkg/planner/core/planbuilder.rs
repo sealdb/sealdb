@@ -502,6 +502,16 @@ impl PlanBuilder {
         {
             return Ok(plan);
         }
+        if let Some(plan) =
+            self.build_left_then_inner(select, is, current_db, stats, prune_mode)?
+        {
+            return Ok(plan);
+        }
+        if let Some(plan) =
+            self.build_right_outer_chain(select, is, current_db, stats, prune_mode)?
+        {
+            return Ok(plan);
+        }
         let first = &select.joins[0];
         let mut right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
         let first_tp = map_join_type(first.tp);
@@ -597,11 +607,177 @@ impl PlanBuilder {
             left_table = base_name.clone();
         }
         Ok(Some(wrap_star_join_projection(
-            plan,
-            select,
-            is,
-            current_db,
-            false,
+            plan, select, is, current_db,
+        )))
+    }
+
+    /// `A ⋊ B ⋊ C` with ON keys on the preserved spine — mirror of left chain.
+    fn build_right_outer_chain(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        if select.joins.len() < 2
+            || !select
+                .joins
+                .iter()
+                .all(|j| matches!(map_join_type(j.tp), JoinType::RightOuter))
+        {
+            return Ok(None);
+        }
+        // `t2 right join t3 on … right join t1` — preserved side is the last right.
+        let preserved = &select.joins.last().unwrap().right;
+        let preserved_name = preserved.name.clone();
+        // Collect non-preserved sides with ON against preserved / chain.
+        // TiDB: convert to left-outer form with Build=inner joins of smaller sides.
+        // For `t2 ⋊ t3 ⋊ t1` golden: (t3 ⋈ t2) ⋊ t1 as right outer with Probe=t1.
+        let j0 = &select.joins[0];
+        let j1 = &select.joins[1];
+        // Expect left-deep: (t2 ⋊ t3) ⋊ t1 with ON t3.a=t2.a and t2.a=t1.a.
+        if select.joins.len() != 2 {
+            return Ok(None);
+        }
+        if !outer_join_on_base(&j0.on, &j0.left.name, &j0.right.name) {
+            return Ok(None);
+        }
+        if !outer_join_on_base(&j1.on, &j0.left.name, &j1.right.name)
+            && !outer_join_on_base(&j1.on, &j0.right.name, &j1.right.name)
+        {
+            return Ok(None);
+        }
+        // Inner between j0.left (t2) and j0.right (t3), then right-outer with t1.
+        let mut t_left = self.join_side(select, &j0.left, is, current_db, stats, prune_mode)?;
+        let mut t_mid = self.join_side(select, &j0.right, is, current_db, stats, prune_mode)?;
+        if let Some(filter) =
+            null_reject_on_inner(&j0.on, &j0.right.name, j0.right.resolve_name())
+        {
+            t_mid = predicate_push_down(t_mid, &filter, is, current_db);
+        }
+        if let Some(filter) = null_reject_on_inner(&j0.on, &j0.left.name, j0.left.resolve_name()) {
+            t_left = predicate_push_down(t_left, &filter, is, current_db);
+        }
+        let inner = reorder_hash_join(
+            JoinType::Inner,
+            t_left,
+            t_mid,
+            j0.left.name.clone(),
+            j0.right.name.clone(),
+            table_row_count(stats, &j0.left, current_db),
+            table_row_count(stats, &j0.right, current_db),
+            flip_eq_for_build(&j0.on, &j0.right.name),
+        );
+        let outer_right = &j1.right;
+        let outer_side =
+            self.join_side(select, outer_right, is, current_db, stats, prune_mode)?;
+        // Build=inner (nullable for right outer?); Probe=preserved t1.
+        // Right outer: preserved is right → Probe=right=t1, Build=left=inner.
+        // Our labeling: left=Probe, right=Build. For ROJ preserve right: left=inner?
+        // Golden: Build=inner (t3⋈t2), Probe=t1. So right=Build=inner, left=Probe=t1.
+        let plan = PhysicalPlan::HashJoin {
+            tp: JoinType::RightOuter,
+            left: Box::new(outer_side),
+            right: Box::new(inner),
+            left_table: outer_right.name.clone(),
+            right_table: j0.left.name.clone(),
+            on: j1.on.clone(),
+        };
+        let _ = preserved_name;
+        Ok(Some(wrap_star_join_projection(
+            plan, select, is, current_db,
+        )))
+    }
+
+    /// `A LEFT JOIN B ON P(A,B) JOIN C ON Q(A,C)` → `(A ⋈ C) ⟕ B`.
+    fn build_left_then_inner(
+        &self,
+        select: &SelectStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<PhysicalPlan>> {
+        if select.joins.len() != 2 {
+            return Ok(None);
+        }
+        let j0 = &select.joins[0];
+        let j1 = &select.joins[1];
+        let tp0 = map_join_type(j0.tp);
+        let tp1 = map_join_type(j1.tp);
+        let (base, outer_right, outer_on, inner_right, inner_on, outer_tp) =
+            if matches!(tp0, JoinType::LeftOuter) && matches!(tp1, JoinType::Inner) {
+                (
+                    &j0.left,
+                    &j0.right,
+                    &j0.on,
+                    &j1.right,
+                    &j1.on,
+                    JoinType::LeftOuter,
+                )
+            } else if matches!(tp0, JoinType::RightOuter) && matches!(tp1, JoinType::Inner) {
+                (
+                    &j0.right,
+                    &j0.left,
+                    &j0.on,
+                    &j1.right,
+                    &j1.on,
+                    JoinType::RightOuter,
+                )
+            } else {
+                return Ok(None);
+            };
+        if !outer_join_on_base(outer_on, &base.name, &outer_right.name) {
+            return Ok(None);
+        }
+        if !outer_join_on_base(inner_on, &base.name, &inner_right.name) {
+            return Ok(None);
+        }
+        let mut base_for_inner =
+            self.join_side(select, base, is, current_db, stats, prune_mode)?;
+        let mut inner_side =
+            self.join_side(select, inner_right, is, current_db, stats, prune_mode)?;
+        if let Some(filter) =
+            null_reject_on_inner(inner_on, &inner_right.name, inner_right.resolve_name())
+        {
+            inner_side = predicate_push_down(inner_side, &filter, is, current_db);
+        }
+        if let Some(filter) = null_reject_on_inner(inner_on, &base.name, base.resolve_name()) {
+            base_for_inner = predicate_push_down(base_for_inner, &filter, is, current_db);
+        }
+        let inner_join = reorder_hash_join(
+            JoinType::Inner,
+            base_for_inner,
+            inner_side,
+            base.name.clone(),
+            inner_right.name.clone(),
+            table_row_count(stats, base, current_db),
+            table_row_count(stats, inner_right, current_db),
+            flip_eq_for_build(inner_on, &inner_right.name),
+        );
+        let mut outer_side =
+            self.join_side(select, outer_right, is, current_db, stats, prune_mode)?;
+        if let Some(filter) =
+            null_reject_on_inner(outer_on, &outer_right.name, outer_right.resolve_name())
+        {
+            outer_side = predicate_push_down(outer_side, &filter, is, current_db);
+        }
+        let on = if matches!(outer_tp, JoinType::RightOuter) {
+            flip_eq_for_build(outer_on, &outer_right.name)
+        } else {
+            flip_eq_for_build(outer_on, &base.name)
+        };
+        let plan = PhysicalPlan::HashJoin {
+            tp: outer_tp,
+            left: Box::new(outer_side),
+            right: Box::new(inner_join),
+            left_table: outer_right.name.clone(),
+            right_table: base.name.clone(),
+            on,
+        };
+        Ok(Some(wrap_star_join_projection(
+            plan, select, is, current_db,
         )))
     }
 
@@ -646,26 +822,46 @@ impl PlanBuilder {
                     .map(|t| t.resolve_name().to_string())
                     .unwrap_or_else(|| right_table.clone());
                 let join_tp = map_join_type(*tp);
-                // TiDB null-reject: push not(isnull(join_key)) into the inner
-                // (build) side of outer joins.
-                if matches!(
-                    join_tp,
-                    JoinType::LeftOuter | JoinType::RightOuter
-                ) {
+                // Nested outer→inner only when the outer left is a base table
+                // (e.g. `t2 ⟕ (t1 ⟕ t3)`). Bushy `(J1) ⟕ (J2)` needs a fuller
+                // reorder — do not convert/Projection-wrap here.
+                let mut reordered = false;
+                if matches!(left.as_ref(), FromItem::Table(_))
+                    && matches!(join_tp, JoinType::LeftOuter | JoinType::RightOuter)
+                    && let Some(converted) = convert_nested_outer_to_inner(
+                        &mut right_plan,
+                        on,
+                        is,
+                        current_db,
+                    )
+                {
+                    reordered = converted;
+                }
+                if !reordered
+                    && matches!(
+                        join_tp,
+                        JoinType::LeftOuter | JoinType::RightOuter
+                    )
+                {
                     if let Some(filter) =
                         null_reject_on_inner(on, &right_table, &right_physical)
                     {
                         right_plan = predicate_push_down(right_plan, &filter, is, current_db);
                     }
                 }
-                Ok(PhysicalPlan::HashJoin {
+                let plan = PhysicalPlan::HashJoin {
                     tp: join_tp,
                     left: Box::new(left_plan),
                     right: Box::new(right_plan),
                     left_table,
                     right_table,
                     on: on.clone(),
-                })
+                };
+                if reordered {
+                    Ok(wrap_star_join_projection(plan, select, is, current_db))
+                } else {
+                    Ok(plan)
+                }
             }
         }
     }
@@ -1504,24 +1700,11 @@ fn wrap_star_join_projection(
     select: &SelectStmt,
     is: Option<&InfoSchema>,
     current_db: &str,
-    _reordered: bool,
 ) -> PhysicalPlan {
     if !is_star_select(select) {
         return plan;
     }
-    let mut tables = Vec::new();
-    if let Some(from) = &select.from {
-        tables.push(from.clone());
-    }
-    for join in &select.joins {
-        if !tables
-            .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(&join.left.name))
-        {
-            tables.push(join.left.clone());
-        }
-        tables.push(join.right.clone());
-    }
+    let tables: Vec<TableName> = select.join_tables().into_iter().cloned().collect();
     let mut exprs = Vec::new();
     for table in &tables {
         let schema = table
@@ -1542,6 +1725,104 @@ fn wrap_star_join_projection(
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(plan),
+    }
+}
+
+fn convert_nested_outer_to_inner(
+    right_plan: &mut PhysicalPlan,
+    parent_on: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<bool> {
+    let PhysicalPlan::HashJoin {
+        tp,
+        left,
+        right,
+        left_table,
+        right_table,
+        on,
+        ..
+    } = right_plan.clone()
+    else {
+        return None;
+    };
+    if !matches!(tp, JoinType::LeftOuter | JoinType::RightOuter) {
+        return None;
+    }
+    if !expr_mentions_table(parent_on, &right_table) {
+        return None;
+    }
+    let mut left_p = *left;
+    let right_p = *right;
+    if let Some(filter) = null_reject_on_inner(&on, &left_table, &left_table) {
+        left_p = predicate_push_down(left_p, &filter, is, current_db);
+    }
+    let l_rows = raw_scan_rows(&left_p);
+    let r_rows = raw_scan_rows(&right_p);
+    *right_plan = reorder_hash_join(
+        JoinType::Inner,
+        left_p,
+        right_p,
+        left_table,
+        right_table.clone(),
+        l_rows,
+        r_rows,
+        flip_eq_for_build(&on, &right_table),
+    );
+    Some(true)
+}
+
+fn expr_mentions_table(expr: &ExprNode, table: &str) -> bool {
+    match expr {
+        ExprNode::Column(c) => c
+            .table
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(table)),
+        ExprNode::Binary(bin) => {
+            expr_mentions_table(&bin.left, table) || expr_mentions_table(&bin.right, table)
+        }
+        ExprNode::Unary(u) => expr_mentions_table(&u.expr, table),
+        ExprNode::Func(f) => f.args.iter().any(|a| expr_mentions_table(a, table)),
+        ExprNode::IsNull(n) => expr_mentions_table(&n.expr, table),
+        ExprNode::Cast(c) => expr_mentions_table(&c.expr, table),
+        _ => false,
+    }
+}
+
+fn flip_eq_for_build(on: &ExprNode, build_table: &str) -> ExprNode {
+    let ExprNode::Binary(bin) = on else {
+        return on.clone();
+    };
+    if bin.op != Op::Eq {
+        return on.clone();
+    }
+    match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(l), ExprNode::Column(r)) => {
+            let lt = l.table.as_deref().unwrap_or("");
+            let rt = r.table.as_deref().unwrap_or("");
+            if rt.eq_ignore_ascii_case(build_table) && !lt.eq_ignore_ascii_case(build_table) {
+                ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+                    op: Op::Eq,
+                    left: Box::new(ExprNode::Column(r.clone())),
+                    right: Box::new(ExprNode::Column(l.clone())),
+                })
+            } else {
+                on.clone()
+            }
+        }
+        _ => on.clone(),
+    }
+}
+
+fn raw_scan_rows(plan: &PhysicalPlan) -> f64 {
+    match plan {
+        PhysicalPlan::TableReader { row_count, .. } => *row_count,
+        PhysicalPlan::Selection { child, .. } => raw_scan_rows(child),
+        PhysicalPlan::HashJoin { left, right, .. } => {
+            raw_scan_rows(left).max(raw_scan_rows(right))
+        }
+        PhysicalPlan::Projection { child, .. } => raw_scan_rows(child),
+        _ => 10_000.0,
     }
 }
 
