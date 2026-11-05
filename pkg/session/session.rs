@@ -3165,6 +3165,14 @@ mod tests {
             .join("\n");
         assert!(text.contains("MergeJoin"), "{text}");
         assert!(!text.contains("CTE"), "{text}");
+        assert!(
+            text.contains("left key:cte.t1.c1") && text.contains("right key:cte.t1.c1"),
+            "{text}"
+        );
+        assert!(text.contains("Sort(Build)"), "{text}");
+        assert!(text.contains("Sort(Probe)"), "{text}");
+        assert!(text.contains("not(isnull(cte.t1.c1))"), "{text}");
+        assert!(!text.lines().next().unwrap_or("").starts_with("Sort|"), "{text}");
         let rows = session
             .execute_stmt(
                 "WITH cte1 AS (SELECT c1 FROM t1) \
