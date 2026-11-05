@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` 全套 Gate A+B memory 已绿**（MergeJoin+USING）；待 TiKV 复核后升 `green`；下一 R1：`show` / `types/*` |
+| R1 | select, show, types/* | `in_progress` | **`select` → `green`**（Mem+TiKV）；下一：`show` / `types/*` triage |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -68,7 +68,7 @@
 | nested outer→inner / assoc | ON null-reject → Inner；`A⟕B⋈C`→`(A⋈C)⟕B` | `convert_nested_outer_to_inner`；`build_left_then_inner`；right chain | brief 至 right-outer 段已绿 |
 | bushy `(J1)⟕(J2)` | 四表 outer reorder + 2.50/5.00 est | `try_bushy_quad_outer`；analyzed⋈pseudo *1.25 | t1..t4 brief 三段已绿 |
 | derived STRAIGHT_JOIN | 派生表 JOIN/UNION CTE 合并 | lower 放行 subquery JOIN；USING→ON | 派生 STRAIGHT_JOIN 结果已绿 |
-| MergeJoin + USING | STRAIGHT_JOIN EXPLAIN；USING 列合并；DROP 清 stats | `PhysicalPlan::MergeJoin`；`keep order:true`；`TableReader_N(Build)`；Handle::delete | `select` suite memory PASS |
+| MergeJoin + USING | STRAIGHT_JOIN EXPLAIN；USING 列合并；DROP 清 stats | `PhysicalPlan::MergeJoin`；`keep order:true`；`TableReader_N(Build)`；Handle::delete | `select` → `green`（Mem+TiKV） |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

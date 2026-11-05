@@ -2255,7 +2255,7 @@
     {
       "name": "select",
       "wave": "R1",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/select.test",
       "result": "r/select.result",
       "has_result": true,
