@@ -99,19 +99,50 @@ impl Datum {
         }
         match ft.eval_type() {
             EvalType::Int => {
-                if ft.unsigned {
-                    let v = self.as_i64()?;
-                    if v < 0 {
-                        return Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"));
+                if ft.is_unsigned() {
+                    match self {
+                        Datum::U64(v) => Ok(Datum::U64(*v)),
+                        Datum::I64(v) if *v >= 0 => Ok(Datum::U64(*v as u64)),
+                        Datum::I64(_) => {
+                            Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"))
+                        }
+                        Datum::Decimal(d) => {
+                            let s = d.to_string();
+                            if s.starts_with('-') {
+                                return Err(Error::new(
+                                    ERR_DATA_OUT_OF_RANGE,
+                                    "UNSIGNED overflow",
+                                ));
+                            }
+                            let int_part = s.split('.').next().unwrap_or("0");
+                            int_part
+                                .parse::<u64>()
+                                .map(Datum::U64)
+                                .map_err(|_| {
+                                    Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow")
+                                })
+                        }
+                        other => {
+                            let v = other.as_i64()?;
+                            if v < 0 {
+                                return Err(Error::new(
+                                    ERR_DATA_OUT_OF_RANGE,
+                                    "UNSIGNED overflow",
+                                ));
+                            }
+                            Ok(Datum::U64(v as u64))
+                        }
                     }
-                    Ok(Datum::U64(v as u64))
                 } else {
                     Ok(Datum::I64(self.as_i64()?))
                 }
             }
             EvalType::Real => Ok(Datum::F64(self.as_f64()?)),
             EvalType::String => Ok(Datum::Bytes(self.as_bytes())),
-            EvalType::Decimal => Ok(Datum::Decimal(MyDecimal::parse(&self.display())?)),
+            EvalType::Decimal => {
+                let d = MyDecimal::parse(&self.display())?.with_frac(ft.decimal);
+                Ok(Datum::Decimal(d))
+            }
             EvalType::Datetime => Ok(self.clone()),
         }
     }

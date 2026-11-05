@@ -264,24 +264,33 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: 20,
             ..numeric_ft()
         },
-        "FLOAT" => FieldType {
-            tp: TYPE_FLOAT,
-            flen: 12,
-            decimal: -1,
-            ..numeric_ft()
-        },
-        "DOUBLE" | "REAL" => FieldType {
-            tp: TYPE_DOUBLE,
-            flen: 22,
-            decimal: -1,
-            ..numeric_ft()
-        },
-        "DECIMAL" | "NUMERIC" => FieldType {
-            tp: TYPE_NEW_DECIMAL,
-            flen: 10,
-            decimal: 0,
-            ..numeric_ft()
-        },
+        "FLOAT" => {
+            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((12, -1));
+            FieldType {
+                tp: TYPE_FLOAT,
+                flen,
+                decimal,
+                ..numeric_ft()
+            }
+        }
+        "DOUBLE" | "REAL" => {
+            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((22, -1));
+            FieldType {
+                tp: TYPE_DOUBLE,
+                flen,
+                decimal,
+                ..numeric_ft()
+            }
+        }
+        "DECIMAL" | "NUMERIC" => {
+            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((10, 0));
+            FieldType {
+                tp: TYPE_NEW_DECIMAL,
+                flen,
+                decimal,
+                ..numeric_ft()
+            }
+        }
         "CHAR" | "VARCHAR" | "TEXT" | "STRING" => FieldType {
             tp: TYPE_VAR_STRING,
             flen: parse_len(type_name).unwrap_or(-1),
@@ -347,12 +356,35 @@ fn split_type(upper: &str) -> (&str, &str) {
 }
 
 fn parse_len(type_name: &str) -> Option<i32> {
+    parse_flen_decimal(type_name).map(|(flen, _)| flen)
+}
+
+/// Parse `TYPE(flen)` / `TYPE(flen, decimal)` — TiDB FieldType Flen/Decimal.
+fn parse_flen_decimal(type_name: &str) -> Option<(i32, i32)> {
     let start = type_name.find('(')?;
     let end = type_name.find(')')?;
-    type_name[start + 1..end]
-        .split(',')
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    let mut parts = type_name[start + 1..end].split(',');
+    let flen = parts.next()?.trim().parse().ok()?;
+    let decimal = parts
+        .next()
+        .map(|p| p.trim().parse().ok())
+        .unwrap_or(Some(0))?;
+    Some((flen, decimal))
+}
+
+#[cfg(test)]
+mod precise_type_tests {
+    use super::field_type_from_name;
+
+    #[test]
+    fn bigint_unsigned_and_decimal_scale() {
+        let u = field_type_from_name("BIGINT UNSIGNED").unwrap();
+        assert!(u.is_unsigned(), "unsigned flag for BIGINT UNSIGNED");
+        assert_eq!(u.flag & 32, 32);
+        let d = field_type_from_name("DECIMAL(21,1)").unwrap();
+        assert_eq!(d.flen, 21);
+        assert_eq!(d.decimal, 1);
+        let u2 = field_type_from_name("BIGINT").unwrap();
+        assert!(!u2.is_unsigned());
+    }
 }
