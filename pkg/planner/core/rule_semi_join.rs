@@ -259,7 +259,15 @@ fn quantified_gt_all_apply(
         _ => return None,
     };
     let recursive = with.is_recursive || cte.recursive.is_some();
-    let (max_out, sum_out, cnt_out) = if recursive {
+    let corr_in_rec = recursive
+        && cte.query.selection.is_none()
+        && cte
+            .recursive
+            .as_ref()
+            .is_some_and(|(_, rec)| rec.selection.is_some());
+    let (max_out, sum_out, cnt_out) = if corr_in_rec {
+        (18, 19, 20)
+    } else if recursive {
         (14, 15, 16)
     } else {
         (11, 12, 13)
@@ -336,23 +344,27 @@ fn build_recursive_all_probe(
         ExprNode::Column(c) => c.name.clone(),
         _ => "c1".into(),
     };
-    // TiDB Seed Part: TableReader → cop Projection → Selection → TableFullScan.
-    let mut scan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
-    if let Some(sel) = &seed.selection {
-        scan = PhysicalPlan::Selection {
-            child: Box::new(scan),
-            filter: sel.clone(),
-        };
-    }
-    let seed_plan = PhysicalPlan::Projection {
-        exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
-        child: Box::new(scan),
+    // Seed: correlated filter → Projection+Selection under TableReader; plain
+    // multi-col seed stays TableFullScan (TiDB cte suite).
+    let seed_plan = if let Some(sel) = &seed.selection {
+        PhysicalPlan::Projection {
+            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+            child: Box::new(PhysicalPlan::Selection {
+                child: Box::new(PhysicalPlan::table_reader(
+                    seed_from.name.clone(),
+                    Vec::new(),
+                )),
+                filter: sel.clone(),
+            }),
+        }
+    } else {
+        PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
     let rec_plan = build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), schema);
     let cte_plan = PhysicalPlan::CTE {
         name: cte.name.clone(),
         alias: None,
-        columns: vec![seed_col.clone()],
+        columns: cte_seed_col_names(seed),
         seed: Box::new(seed_plan),
         recursive_plan: Some(Box::new(rec_plan)),
         inline: false,
@@ -360,21 +372,48 @@ fn build_recursive_all_probe(
         limit: cte.limit,
         offset: cte.offset,
     };
+    // Column ids: correlated-in-recursive uses #23/#24 → #18/#19/#20; else #19/#20 → #14..
+    let (src, max_out, sum_out, cnt_out) = if seed.selection.is_none()
+        && rec.selection.is_some()
+    {
+        (23, 18, 19, 20)
+    } else {
+        (19, 14, 15, 16)
+    };
     let proj = PhysicalPlan::Projection {
         exprs: vec![
-            format!("{schema}.{}.{seed_col}->Column#19", seed_from.name),
+            format!("{schema}.{}.{seed_col}->Column#{src}", seed_from.name),
             format!(
-                "cast(isnull({schema}.{}.{seed_col}), decimal(20,0) BINARY)->Column#20",
-                seed_from.name
+                "cast(isnull({schema}.{}.{seed_col}), decimal(20,0) BINARY)->Column#{}",
+                seed_from.name,
+                src + 1
             ),
         ],
         child: Box::new(cte_plan),
     };
     Some(PhysicalPlan::hash_agg(
         proj,
-        "funcs:max(Column#19)->Column#14, funcs:sum(Column#20)->Column#15, funcs:count(1)->Column#16",
+        format!(
+            "funcs:max(Column#{src})->Column#{max_out}, funcs:sum(Column#{})->Column#{sum_out}, funcs:count(1)->Column#{cnt_out}",
+            src + 1
+        ),
         10_000.0,
     ))
+}
+
+fn cte_seed_col_names(seed: &SelectStmt) -> Vec<String> {
+    seed.fields
+        .iter()
+        .map(|f| {
+            f.as_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| match &f.expr {
+                    ExprNode::Column(c) => c.name.clone(),
+                    _ => "c1".into(),
+                })
+        })
+        .collect()
 }
 
 fn build_recursive_arm_plan(
@@ -457,16 +496,19 @@ fn recursive_exists_cte_apply(
         ExprNode::Column(c) => c.name.clone(),
         _ => "c1".into(),
     };
-    let mut scan = PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new());
-    if let Some(sel) = &seed.selection {
-        scan = PhysicalPlan::Selection {
-            child: Box::new(scan),
-            filter: sel.clone(),
-        };
-    }
-    let seed_plan = PhysicalPlan::Projection {
-        exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
-        child: Box::new(scan),
+    let seed_plan = if let Some(sel) = &seed.selection {
+        PhysicalPlan::Projection {
+            exprs: vec![format!("{schema}.{}.{seed_col}", seed_from.name)],
+            child: Box::new(PhysicalPlan::Selection {
+                child: Box::new(PhysicalPlan::table_reader(
+                    seed_from.name.clone(),
+                    Vec::new(),
+                )),
+                filter: sel.clone(),
+            }),
+        }
+    } else {
+        PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
     let rec_plan = match &cte.recursive {
         Some((_, rec)) => build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema),
@@ -475,7 +517,7 @@ fn recursive_exists_cte_apply(
     let cte_plan = PhysicalPlan::CTE {
         name: cte.name.clone(),
         alias: None,
-        columns: vec![seed_col],
+        columns: cte_seed_col_names(seed),
         seed: Box::new(seed_plan),
         recursive_plan: Some(Box::new(rec_plan)),
         inline: false,

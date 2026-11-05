@@ -1102,21 +1102,37 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
         _ => None,
     };
     if let Some(exprs) = from_exprs {
-        if let Some(e) = exprs.iter().find(|e| e.contains("plus") || e.contains("->")) {
-            let mut s = e.clone();
-            // plus(cte.t.c1, 1)->Column#6 → cast(plus(cte.t1.c1, 1), int)->cte.t1.c1
-            s = s.replace(".t.", &format!(".{orig_tbl}."));
-            s = s.replace("cte1.", &format!("{orig_tbl}."));
-            if let Some((left, _)) = s.split_once("->") {
-                let core = left.trim();
-                let core = if core.starts_with("cast(") {
-                    core.to_string()
-                } else {
-                    format!("cast({core}, int)")
-                };
-                return format!("{core}->{schema}.{orig_tbl}.c1");
-            }
-            return s;
+        let parts: Vec<String> = exprs
+            .iter()
+            .filter(|e| e.contains("plus") || e.contains("->"))
+            .map(|e| {
+                let mut s = e.clone();
+                s = s.replace(".t.", &format!(".{orig_tbl}."));
+                s = s.replace("cte1.", &format!("{orig_tbl}."));
+                // Already shaped as cast(plus(...), int)->schema.tbl.col
+                if s.contains("->") && s.contains("cast(") {
+                    return s;
+                }
+                if let Some((left, right)) = s.split_once("->") {
+                    let core = left.trim();
+                    let core = if core.starts_with("cast(") {
+                        core.to_string()
+                    } else {
+                        format!("cast({core}, int)")
+                    };
+                    let col = right
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("c1")
+                        .trim()
+                        .to_string();
+                    return format!("{core}->{schema}.{orig_tbl}.{col}");
+                }
+                s
+            })
+            .collect();
+        if !parts.is_empty() {
+            return parts.join(", ");
         }
     }
     format!("cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1")
