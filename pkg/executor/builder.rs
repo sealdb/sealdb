@@ -459,6 +459,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select.from.as_ref().map(|t| t.name.clone()),
+                    select.with.clone(),
                 )))
             }
             PhysicalPlan::IndexJoin { outer, .. } => Self::build(

@@ -2421,7 +2421,10 @@ fn inject_view_cte(
             "VIEW definition must be SELECT",
         ));
     };
-    expand_views_in_select(&mut view_select, is, current_db)?;
+    // Unqualified base tables in the view body resolve in the view's schema
+    // (`USE cte1; SELECT * FROM cte.v1` still reads cte.t2, not cte1.t2).
+    qualify_view_body_tables(&mut view_select, &schema);
+    expand_views_in_select(&mut view_select, is, &schema)?;
     // TiDB MERGE / UNDEFINED: inline simple single-table views.
     if !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
         && try_merge_simple_view(
@@ -2458,6 +2461,56 @@ fn inject_view_cte(
     // CTE names are unqualified; strip schema so planner hits the injected CTE.
     strip_table_schema(select, &name);
     Ok(())
+}
+
+/// Attach `schema` to unqualified table refs that are not CTE names in scope.
+fn qualify_view_body_tables(select: &mut SelectStmt, schema: &str) {
+    if schema.is_empty() {
+        return;
+    }
+    let mut cte_names = Vec::new();
+    if let Some(with) = select.with.as_mut() {
+        for cte in &mut with.ctes {
+            // Nested WITH bodies see only preceding sibling CTE names.
+            qualify_select_tables(cte.query.as_mut(), schema, &cte_names);
+            for (_, arm) in &mut cte.set_rest {
+                qualify_select_tables(arm, schema, &cte_names);
+            }
+            if let Some((_, rec)) = cte.recursive.as_mut() {
+                // Recursive arm may self-ref this CTE.
+                let mut with_self = cte_names.clone();
+                with_self.push(cte.name.clone());
+                qualify_select_tables(rec, schema, &with_self);
+            }
+            cte_names.push(cte.name.clone());
+        }
+    }
+    qualify_select_tables(select, schema, &cte_names);
+}
+
+fn qualify_select_tables(select: &mut SelectStmt, schema: &str, cte_names: &[String]) {
+    let qualify = |table: &mut TableName| {
+        if table.schema.is_some() {
+            return;
+        }
+        if table.name.eq_ignore_ascii_case("dual") {
+            return;
+        }
+        if cte_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(table.resolve_name()))
+        {
+            return;
+        }
+        table.schema = Some(schema.to_string());
+    };
+    if let Some(from) = select.from.as_mut() {
+        qualify(from);
+    }
+    for join in &mut select.joins {
+        qualify(&mut join.left);
+        qualify(&mut join.right);
+    }
 }
 
 /// Merge a simple VIEW into the referencing SELECT (TiDB `algorithm=MERGE`).

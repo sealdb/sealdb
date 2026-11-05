@@ -890,45 +890,132 @@ fn seed_orig_table(plan: &PhysicalPlan) -> Option<String> {
 }
 
 fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<ExplainRow>) {
-    // Unwrap column Projection so Seed Part lands on TableReader.
-    let plan = match plan {
-        PhysicalPlan::Projection { child, exprs, .. }
-            if exprs
-                .iter()
-                .all(|e| !e.contains("->") && !e.contains('(')) =>
-        {
-            child.as_ref()
-        }
-        other => other,
+    // TiDB Seed Part is always a TableReader; column Projection / Selection sit
+    // in the cop subtree (`data:Projection` / `data:Selection` / `data:TableFullScan`).
+    let (proj_exprs, selection, reader) = match plan {
+        PhysicalPlan::Projection { exprs, child, .. } => match child.as_ref() {
+            PhysicalPlan::Selection {
+                filter,
+                child: scan,
+                ..
+            } => (
+                Some(exprs.as_slice()),
+                Some(filter),
+                scan.as_ref(),
+            ),
+            other => (Some(exprs.as_slice()), None, other),
+        },
+        PhysicalPlan::Selection { filter, child, .. } => (None, Some(filter), child.as_ref()),
+        other => (None, None, other),
     };
-    let id = *next_id;
-    *next_id += 1;
-    let (name, access, info) = node_meta(plan);
-    rows.push(ExplainRow {
-        id: format!("├─{name}_{id}(Seed Part)"),
-        est_rows: format!("{:.2}", est_rows(plan)),
-        task: "root".to_string(),
-        access,
-        info,
-    });
-    // Cop children under Seed Part: `│ └─TableFullScan` (│ continues for Recursive Part).
-    if let PhysicalPlan::TableReader {
+    let PhysicalPlan::TableReader {
         table,
         partition_names,
-        row_count,
         stats_pseudo,
         pushed,
         ..
-    } = plan
-    {
+    } = reader
+    else {
+        // Fallback: emit whatever plan we have.
+        let id = *next_id;
+        *next_id += 1;
+        let (name, access, info) = node_meta(plan);
+        rows.push(ExplainRow {
+            id: format!("├─{name}_{id}(Seed Part)"),
+            est_rows: format!("{:.2}", est_rows(plan)),
+            task: "root".to_string(),
+            access,
+            info,
+        });
+        return;
+    };
+    let id = *next_id;
+    *next_id += 1;
+    let data = if proj_exprs.is_some() {
+        "data:Projection"
+    } else if selection.is_some() || pushed.is_some() {
+        "data:Selection"
+    } else {
+        "data:TableFullScan"
+    };
+    rows.push(ExplainRow {
+        id: format!("├─TableReader_{id}(Seed Part)"),
+        est_rows: if proj_exprs.is_some() || selection.is_some() {
+            "10.00".to_string()
+        } else {
+            "10000.00".to_string()
+        },
+        task: "root".to_string(),
+        access: String::new(),
+        info: data.to_string(),
+    });
+    let keep = if *stats_pseudo {
+        "keep order:false, stats:pseudo"
+    } else {
+        "keep order:false"
+    };
+    if let Some(exprs) = proj_exprs {
+        let proj_id = *next_id;
+        *next_id += 1;
+        rows.push(ExplainRow {
+            id: format!("│ └─Projection_{proj_id}"),
+            est_rows: "10.00".to_string(),
+            task: "cop[tikv]".to_string(),
+            access: String::new(),
+            info: exprs.join(", "),
+        });
+        if let Some(filter) = selection {
+            let sel_id = *next_id;
+            *next_id += 1;
+            rows.push(ExplainRow {
+                id: format!("│   └─Selection_{sel_id}"),
+                est_rows: "10.00".to_string(),
+                task: "cop[tikv]".to_string(),
+                access: String::new(),
+                info: explain_selection_info(filter),
+            });
+            let scan_id = *next_id;
+            *next_id += 1;
+            rows.push(ExplainRow {
+                id: format!("│     └─TableFullScan_{scan_id}"),
+                est_rows: "10000.00".to_string(),
+                task: "cop[tikv]".to_string(),
+                access: table_access(table, partition_names),
+                info: keep.to_string(),
+            });
+        } else {
+            let scan_id = *next_id;
+            *next_id += 1;
+            rows.push(ExplainRow {
+                id: format!("│   └─TableFullScan_{scan_id}"),
+                est_rows: "10000.00".to_string(),
+                task: "cop[tikv]".to_string(),
+                access: table_access(table, partition_names),
+                info: keep.to_string(),
+            });
+        }
+    } else if let Some(filter) = selection.or(pushed.as_ref()) {
+        let sel_id = *next_id;
+        *next_id += 1;
+        rows.push(ExplainRow {
+            id: format!("│ └─Selection_{sel_id}"),
+            est_rows: "10.00".to_string(),
+            task: "cop[tikv]".to_string(),
+            access: String::new(),
+            info: explain_selection_info(filter),
+        });
         let scan_id = *next_id;
         *next_id += 1;
-        let keep = if *stats_pseudo {
-            "keep order:false, stats:pseudo"
-        } else {
-            "keep order:false"
-        };
-        let _ = (pushed, row_count);
+        rows.push(ExplainRow {
+            id: format!("│   └─TableFullScan_{scan_id}"),
+            est_rows: "10000.00".to_string(),
+            task: "cop[tikv]".to_string(),
+            access: table_access(table, partition_names),
+            info: keep.to_string(),
+        });
+    } else {
+        let scan_id = *next_id;
+        *next_id += 1;
         rows.push(ExplainRow {
             id: format!("│ └─TableFullScan_{scan_id}"),
             est_rows: "10000.00".to_string(),
