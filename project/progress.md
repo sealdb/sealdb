@@ -90,6 +90,7 @@
 | 部分 OR 下推 | 纯 agg 臂不 extract | `extract_pushable_dnf` | Q4 仅 `a<3`；Q5 `or(a>1,a<3)` |
 | pseudo estRows | `pseudoLessRate` / null=10 | LT→3323.33；covering OR→9990 | Mem+TiKV Gate B |
 | suite green | Gate A+B | manifest `green` | `agg_predicate_pushdown` |
+| UNION ALL derived TopN | `((sel) UNION ALL (sel)) alias` | unwrap arm parens；inline Union；`Column#3:desc` | `topn_pushdown` → `green` |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
