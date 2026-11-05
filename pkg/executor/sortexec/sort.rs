@@ -84,6 +84,23 @@ impl Executor for SortExec {
     }
 }
 
+fn eval_order_key(expr: &sealdb_parser::ast::ExprNode, schema: &[String], row: &[Datum]) -> Datum {
+    // TiDB/MySQL: `ORDER BY n` is 1-based output column ordinal.
+    if let sealdb_parser::ast::ExprNode::Value(v) = expr {
+        let idx = match &v.datum {
+            Datum::I64(n) if *n > 0 => Some((*n as usize).saturating_sub(1)),
+            Datum::U64(n) if *n > 0 => Some((*n as usize).saturating_sub(1)),
+            _ => None,
+        };
+        if let Some(i) = idx
+            && let Some(cell) = row.get(i)
+        {
+            return cell.clone();
+        }
+    }
+    eval_expr_with_row(expr, schema, row).unwrap_or(Datum::Null)
+}
+
 pub(crate) fn compare_rows(
     left: &[Datum],
     right: &[Datum],
@@ -91,8 +108,8 @@ pub(crate) fn compare_rows(
     schema: &[String],
 ) -> std::cmp::Ordering {
     for item in by {
-        let lv = eval_expr_with_row(&item.expr, schema, left).unwrap_or(Datum::Null);
-        let rv = eval_expr_with_row(&item.expr, schema, right).unwrap_or(Datum::Null);
+        let lv = eval_order_key(&item.expr, schema, left);
+        let rv = eval_order_key(&item.expr, schema, right);
         let ord = if matches!((&lv, &rv), (Datum::Bytes(_), Datum::Bytes(_))) {
             sealdb_util::collate::compare_bytes(
                 sealdb_expression::collation_mode(),
