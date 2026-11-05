@@ -73,7 +73,7 @@ impl ExecutorBuilder {
                 }
                 Ok(Box::new(exec))
             }
-            PhysicalPlan::Sort { child } => {
+            PhysicalPlan::Sort { child, .. } => {
                 let by = stmt_order_by(stmt)
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 Ok(Box::new(SortExec::new(

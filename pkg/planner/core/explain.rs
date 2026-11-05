@@ -1153,7 +1153,7 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
     match plan {
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Selection { child, .. }
-        | PhysicalPlan::Sort { child }
+        | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::TopN { child, .. }
         | PhysicalPlan::Limit { child, .. }
         | PhysicalPlan::HashAgg { child, .. }
@@ -1290,7 +1290,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             explain_selection_info(filter),
         ),
-        PhysicalPlan::Sort { .. } => ("Sort".to_string(), String::new(), String::new()),
+        PhysicalPlan::Sort { by_info, .. } => {
+            ("Sort".to_string(), String::new(), by_info.clone())
+        }
         PhysicalPlan::TopN {
             by_info,
             offset,
@@ -1447,7 +1449,7 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
             *e
         }
         PhysicalPlan::Projection { child, .. }
-        | PhysicalPlan::Sort { child }
+        | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Window { child }
         | PhysicalPlan::CTE { seed: child, .. }

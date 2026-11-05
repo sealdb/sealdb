@@ -22,8 +22,9 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             exprs,
             child: Box::new(rewrite_semi_join(*child)),
         },
-        PhysicalPlan::Sort { child } => PhysicalPlan::Sort {
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join(*child)),
+            by_info,
         },
         PhysicalPlan::TopN {
             child,
@@ -403,8 +404,9 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             exprs,
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
-        PhysicalPlan::Sort { child } => PhysicalPlan::Sort {
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join_agg(*child)),
+            by_info,
         },
         PhysicalPlan::TopN {
             child,

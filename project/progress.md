@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` correlated IN semi-join 已绿**；下一缺口 derived `sleep(1)` / `ORDER BY rand()` EXPLAIN（`select-triage` ~453） |
+| R1 | select, show, types/* | `in_progress` | **`select` sleep/ORDER BY rand 已绿**；下一缺口 correlated `IN … ORDER BY` → semi HashJoin（`select-triage` ~482） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -57,7 +57,9 @@
 | PartitionUnion / `partition:pN` | static Union + dynamic access | `PartitionUnion`；uint64 HASH；`PARTITION (…)`；`ALL COLUMNS`；`SET DEFAULT` | 分区 desc 段已绿（static/dynamic） |
 | `!= ANY` / `= ALL` | TiDB agg + CARTESIAN | `quantified_cmp_plan`；alias→scan name；StreamAgg(Build) | any/all brief 段已绿 |
 | correlated `IN` select-list | left outer semi join | `in_subquery_select_plan`；cast Projection；info marker | IN brief 三段已绿 |
-| **下一缺口** | derived `sleep(1)` / `ORDER BY rand()` | dual/projection + sort by_info | `select-triage.txt` ~453 |
+| derived `sleep(1)` dual | inline CTE → Projection⊃Dual | `seed_is_dual_projection`；`text->Column#N` | sleep subquery brief 已绿 |
+| `ORDER BY rand()` / const | InjectProjBelowSort；elide const | `rule_inject_extra_projection`；`Sort.by_info` | rand/abs(2)/abs(rand())+1 brief 已绿 |
+| **下一缺口** | correlated `IN` + other cond / ORDER BY | semi HashJoin equal+other | `select-triage.txt` ~482 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

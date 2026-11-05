@@ -106,6 +106,8 @@ pub enum PhysicalPlan {
     },
     Sort {
         child: Box<PhysicalPlan>,
+        /// TiDB ExplainInfo (`Column#4` or `select.t.a`).
+        by_info: String,
     },
     TopN {
         child: Box<PhysicalPlan>,
@@ -302,7 +304,9 @@ impl PhysicalPlan {
                 name
             }
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
-            PhysicalPlan::Sort { child } => format!("Sort -> {}", child.explain()),
+            PhysicalPlan::Sort { child, by_info } => {
+                format!("Sort({by_info}) -> {}", child.explain())
+            }
             PhysicalPlan::TopN {
                 child,
                 by_info,
