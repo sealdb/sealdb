@@ -1055,14 +1055,16 @@ impl Session {
                 )?;
             }
             Statement::AnalyzeTable(analyze) => {
-                require(
-                    &mgr,
-                    &user,
-                    &roles,
-                    &analyze.table,
-                    &current_db,
-                    PrivilegeType::SELECT,
-                )?;
+                for table in analyze.all_tables() {
+                    require(
+                        &mgr,
+                        &user,
+                        &roles,
+                        table,
+                        &current_db,
+                        PrivilegeType::SELECT,
+                    )?;
+                }
             }
             _ => {}
         }
@@ -1252,6 +1254,7 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
     for (schema, name) in due {
         let analyze = Statement::AnalyzeTable(sealdb_parser::ast::AnalyzeTableStmt {
             table: sealdb_parser::ast::TableName::new(Some(schema), name),
+            tables: Vec::new(),
             indexes: Vec::new(),
         });
         session.execute_one(&analyze)?;

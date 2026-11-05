@@ -406,14 +406,33 @@ fn restore_privs(privs: &[PrivElem], ctx: &mut RestoreCtx) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct AnalyzeTableStmt {
     pub table: TableName,
+    /// Extra tables for `ANALYZE TABLE t1, t2, t3` (TiDB multi-table).
+    pub tables: Vec<TableName>,
     /// Optional index names for `ANALYZE TABLE t INDEX idx1, idx2`.
     pub indexes: Vec<String>,
 }
 
 impl AnalyzeTableStmt {
+    pub fn all_tables(&self) -> Vec<&TableName> {
+        if self.tables.is_empty() {
+            vec![&self.table]
+        } else {
+            self.tables.iter().collect()
+        }
+    }
+
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("ANALYZE TABLE ");
-        self.table.restore(ctx)?;
+        if self.tables.is_empty() {
+            self.table.restore(ctx)?;
+        } else {
+            for (i, t) in self.tables.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                t.restore(ctx)?;
+            }
+        }
         if !self.indexes.is_empty() {
             ctx.write_str(" INDEX ");
             for (i, name) in self.indexes.iter().enumerate() {

@@ -82,8 +82,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, role_ops) = extract_role_grants(&rewritten)?;
     // sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
     let (rewritten, user_ops) = extract_user_ddl(&rewritten)?;
-    // sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx`.
-    let (rewritten, analyze_indexes) = extract_analyze_index(&rewritten)?;
+    // sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx` / multi-table lists.
+    let (rewritten, analyze_extras) = extract_analyze_index(&rewritten)?;
     // sqlparser rejects TiDB `CREATE/DROP BINDING`.
     let (rewritten, binding_ops) = extract_binding_ddl(&rewritten)?;
     // sqlparser rejects MySQL `DO` / `SET PASSWORD` / `SHUTDOWN` / `ALTER DATABASE … CHARSET`.
@@ -106,7 +106,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut prepares = prepares.into_iter();
     let mut role_ops = role_ops.into_iter();
     let mut user_ops = user_ops.into_iter();
-    let mut analyze_indexes = analyze_indexes.into_iter();
+    let mut analyze_extras = analyze_extras.into_iter();
     let mut binding_ops = binding_ops.into_iter();
     let mut misc_ops = misc_ops.into_iter();
     let mut seq_ops = seq_ops.into_iter();
@@ -161,7 +161,18 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             prepare.sql = sql;
         }
         if let Statement::AnalyzeTable(analyze) = &mut lowered {
-            analyze.indexes = analyze_indexes.next().flatten().unwrap_or_default();
+            if let Some((indexes, tables)) = analyze_extras.next().flatten() {
+                analyze.indexes = indexes;
+                if tables.len() > 1 {
+                    analyze.tables = tables
+                        .into_iter()
+                        .map(|n| TableName::new(None, n))
+                        .collect();
+                    if let Some(first) = analyze.tables.first().cloned() {
+                        analyze.table = first;
+                    }
+                }
+            }
         }
         // Placeholders from extract_role_grants / extract_user_ddl become Set NAMES.
         if matches!(&lowered, Statement::Set(s) if is_placeholder(s, "__sealdb_role__"))
@@ -1450,6 +1461,7 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
         .ok_or_else(|| Error::unsupported("ANALYZE without table"))?;
     Ok(Statement::AnalyzeTable(AnalyzeTableStmt {
         table: object_table_name(table)?,
+        tables: Vec::new(),
         indexes: Vec::new(),
     }))
 }
@@ -2091,24 +2103,58 @@ fn push_sql_char(out: &mut String, sql: &str, i: usize) -> usize {
     i + ch.len_utf8()
 }
 
-/// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]`.
-/// Strip the INDEX clause and re-attach index names after lower.
-fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)> {
+/// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]` and
+/// `ANALYZE TABLE t1, t2 ALL COLUMNS`. Strip INDEX / ALL COLUMNS / extra
+/// tables and re-attach after lower. Returns `(indexes, table_names)`.
+fn extract_analyze_index(
+    sql: &str,
+) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>)>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
-    let mut indexes = Vec::new();
+    let mut extras = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if keyword_at(bytes, i, "ANALYZE") {
             let after = skip_ws(bytes, i + "ANALYZE".len());
             if keyword_at(bytes, after, "TABLE") {
-                let mut j = skip_ws(bytes, after + "TABLE".len());
-                j = skip_ident_or_quoted(bytes, j);
-                j = skip_ws(bytes, j);
-                if j < bytes.len() && bytes[j] == b'.' {
-                    j = skip_ident_or_quoted(bytes, skip_ws(bytes, j + 1));
+                let tables_start = skip_ws(bytes, after + "TABLE".len());
+                let mut j = tables_start;
+                let mut table_names = Vec::new();
+                loop {
+                    let name_start = j;
+                    j = skip_ident_or_quoted(bytes, j);
                     j = skip_ws(bytes, j);
+                    if j < bytes.len() && bytes[j] == b'.' {
+                        j = skip_ident_or_quoted(bytes, skip_ws(bytes, j + 1));
+                        j = skip_ws(bytes, j);
+                    }
+                    let raw = sql[name_start..j].trim().trim_matches('`').to_string();
+                    if !raw.is_empty() {
+                        // Keep unqualified name for TableName::new.
+                        let name = raw
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&raw)
+                            .trim_matches('`')
+                            .to_string();
+                        table_names.push(name);
+                    }
+                    if j < bytes.len() && bytes[j] == b',' {
+                        j = skip_ws(bytes, j + 1);
+                        continue;
+                    }
+                    break;
                 }
+                let first_end = {
+                    // End of first table token for sqlparser rewrite.
+                    let mut k = tables_start;
+                    k = skip_ident_or_quoted(bytes, k);
+                    k = skip_ws(bytes, k);
+                    if k < bytes.len() && bytes[k] == b'.' {
+                        k = skip_ident_or_quoted(bytes, skip_ws(bytes, k + 1));
+                    }
+                    k
+                };
                 if keyword_at(bytes, j, "INDEX") {
                     let mut k = skip_ws(bytes, j + "INDEX".len());
                     let mut names = Vec::new();
@@ -2125,8 +2171,8 @@ fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)
                         }
                         break;
                     }
-                    out.push_str(&sql[i..j]);
-                    indexes.push(Some(names));
+                    out.push_str(&sql[i..first_end]);
+                    extras.push(Some((names, table_names)));
                     i = k;
                     continue;
                 }
@@ -2134,14 +2180,14 @@ fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)
                 if keyword_at(bytes, j, "ALL") {
                     let after_all = skip_ws(bytes, j + "ALL".len());
                     if keyword_at(bytes, after_all, "COLUMNS") {
-                        out.push_str(&sql[i..j]);
-                        indexes.push(None);
+                        out.push_str(&sql[i..first_end]);
+                        extras.push(Some((Vec::new(), table_names)));
                         i = skip_ws(bytes, after_all + "COLUMNS".len());
                         continue;
                     }
                 }
-                out.push_str(&sql[i..j]);
-                indexes.push(None);
+                out.push_str(&sql[i..first_end]);
+                extras.push(Some((Vec::new(), table_names)));
                 i = j;
                 continue;
             }
@@ -2150,7 +2196,7 @@ fn extract_analyze_index(sql: &str) -> Result<(String, Vec<Option<Vec<String>>>)
         out.push(ch);
         i += ch.len_utf8();
     }
-    Ok((out, indexes))
+    Ok((out, extras))
 }
 
 /// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.
