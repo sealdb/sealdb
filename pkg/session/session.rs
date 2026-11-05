@@ -2426,13 +2426,9 @@ fn inject_view_cte(
     qualify_view_body_tables(&mut view_select, &schema);
     expand_views_in_select(&mut view_select, is, &schema)?;
     // TiDB MERGE / UNDEFINED: inline simple single-table views.
+    let view_col_names: Vec<String> = view.cols.iter().map(|c| c.o().to_string()).collect();
     if !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
-        && try_merge_simple_view(
-            select,
-            &name,
-            &view_select,
-            &view.cols.iter().map(|c| c.o().to_string()).collect::<Vec<_>>(),
-        )?
+        && try_merge_simple_view(select, &name, &view_select, &view_col_names)?
     {
         return Ok(());
     }
@@ -2443,11 +2439,54 @@ fn inject_view_cte(
     } else {
         CteMaterialize::Default
     };
+    // TiDB names unnamed select-list exprs `name_exp_N` for view/derived output.
+    // Leave empty for `SELECT *` / plain columns so CTE inherits expanded seed names.
+    let is_star_field = |f: &sealdb_parser::ast::SelectField| {
+        matches!(
+            &f.expr,
+            sealdb_parser::ast::expressions::ExprNode::Value(
+                sealdb_parser::ast::expressions::ValueExpr {
+                    datum: sealdb_types::Datum::Bytes(b)
+                }
+            ) if b == b"*"
+        )
+    };
+    let has_star = view_select.fields.iter().any(is_star_field);
+    let needs_name_exp = !has_star
+        && view_select.fields.iter().any(|f| {
+            f.as_name.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+                && !matches!(
+                    &f.expr,
+                    sealdb_parser::ast::expressions::ExprNode::Column(_)
+                )
+        });
+    let col_name_list = if !view_col_names.is_empty() {
+        view_col_names
+    } else if needs_name_exp {
+        view_select
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                if let Some(name) = &f.as_name
+                    && !name.is_empty()
+                {
+                    return name.clone();
+                }
+                match &f.expr {
+                    sealdb_parser::ast::expressions::ExprNode::Column(c) => c.name.clone(),
+                    _ => format!("name_exp_{}", i + 1),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut ctes = select.with.take().map(|w| w.ctes).unwrap_or_default();
     ctes.push(CommonTableExpression {
         name: name.clone(),
         query: Box::new(view_select),
-        col_name_list: view.cols.iter().map(|c| c.o().to_string()).collect(),
+        col_name_list,
         recursive: None,
         set_rest: Vec::new(),
         materialize,
@@ -2511,6 +2550,99 @@ fn qualify_select_tables(select: &mut SelectStmt, schema: &str, cte_names: &[Str
         qualify(&mut join.left);
         qualify(&mut join.right);
     }
+    for field in &mut select.fields {
+        qualify_tables_in_expr(&mut field.expr, schema, cte_names);
+    }
+    if let Some(sel) = select.selection.as_mut() {
+        qualify_tables_in_expr(sel, schema, cte_names);
+    }
+}
+
+fn qualify_tables_in_expr(
+    expr: &mut sealdb_parser::ast::expressions::ExprNode,
+    schema: &str,
+    cte_names: &[String],
+) {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::ScalarSubquery(s) => qualify_tables_in_result_set(&mut s.query, schema, cte_names),
+        ExprNode::Exists(e) => qualify_tables_in_result_set(&mut e.query, schema, cte_names),
+        ExprNode::InSubquery(s) => {
+            qualify_tables_in_expr(&mut s.expr, schema, cte_names);
+            qualify_tables_in_result_set(&mut s.query, schema, cte_names);
+        }
+        ExprNode::QuantifiedCmp(q) => {
+            qualify_tables_in_expr(&mut q.expr, schema, cte_names);
+            qualify_tables_in_result_set(&mut q.query, schema, cte_names);
+        }
+        ExprNode::Binary(b) => {
+            qualify_tables_in_expr(&mut b.left, schema, cte_names);
+            qualify_tables_in_expr(&mut b.right, schema, cte_names);
+        }
+        ExprNode::Unary(u) => qualify_tables_in_expr(&mut u.expr, schema, cte_names),
+        ExprNode::Func(f) => {
+            for arg in &mut f.args {
+                qualify_tables_in_expr(arg, schema, cte_names);
+            }
+        }
+        ExprNode::Cast(c) => qualify_tables_in_expr(&mut c.expr, schema, cte_names),
+        ExprNode::InList(i) => {
+            qualify_tables_in_expr(&mut i.expr, schema, cte_names);
+            for item in &mut i.list {
+                qualify_tables_in_expr(item, schema, cte_names);
+            }
+        }
+        ExprNode::Between(b) => {
+            qualify_tables_in_expr(&mut b.expr, schema, cte_names);
+            qualify_tables_in_expr(&mut b.low, schema, cte_names);
+            qualify_tables_in_expr(&mut b.high, schema, cte_names);
+        }
+        ExprNode::Like(l) => {
+            qualify_tables_in_expr(&mut l.expr, schema, cte_names);
+            qualify_tables_in_expr(&mut l.pattern, schema, cte_names);
+        }
+        ExprNode::IsNull(i) => qualify_tables_in_expr(&mut i.expr, schema, cte_names),
+        ExprNode::Window(w) => {
+            for arg in &mut w.args {
+                qualify_tables_in_expr(arg, schema, cte_names);
+            }
+        }
+        ExprNode::Column(_) | ExprNode::Value(_) => {}
+    }
+}
+
+fn qualify_tables_in_result_set(
+    query: &mut sealdb_parser::ast::ResultSetNode,
+    schema: &str,
+    cte_names: &[String],
+) {
+    match query {
+        sealdb_parser::ast::ResultSetNode::Select(select) => {
+            // Nested WITH on a scalar subquery: qualify bodies, then the select.
+            let mut nested = cte_names.to_vec();
+            if let Some(with) = select.with.as_mut() {
+                for cte in &mut with.ctes {
+                    qualify_select_tables(cte.query.as_mut(), schema, &nested);
+                    for (_, arm) in &mut cte.set_rest {
+                        qualify_select_tables(arm, schema, &nested);
+                    }
+                    if let Some((_, rec)) = cte.recursive.as_mut() {
+                        let mut with_self = nested.clone();
+                        with_self.push(cte.name.clone());
+                        qualify_select_tables(rec, schema, &with_self);
+                    }
+                    nested.push(cte.name.clone());
+                }
+            }
+            qualify_select_tables(select, schema, &nested);
+        }
+        sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
+            qualify_select_tables(&mut set.first, schema, cte_names);
+            for (_, arm) in &mut set.rest {
+                qualify_select_tables(arm, schema, cte_names);
+            }
+        }
+    }
 }
 
 /// Merge a simple VIEW into the referencing SELECT (TiDB `algorithm=MERGE`).
@@ -2532,6 +2664,10 @@ fn try_merge_simple_view(
         || view_select.distinct
         || view_select.limit.is_some()
         || !view_select.order_by.is_empty()
+        // Scalar/WITH subqueries in the select list need CTE materialization so
+        // `SELECT * FROM view` does not collapse to the base table's columns
+        // (cte suite: name_exp_1 / 30 vs bare `a` / 1).
+        || view_select.fields.iter().any(|f| f.expr.has_subquery())
     {
         return Ok(false);
     }
