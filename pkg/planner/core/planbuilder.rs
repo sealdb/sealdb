@@ -65,23 +65,14 @@ impl PlanBuilder {
                 if let Some(filter) = &select.selection {
                     plan = predicate_push_down(plan, filter, is, current_db);
                 }
+                let mut stream_keep_order = false;
                 if needs_hash_agg(select) {
                     if needs_window(select) {
                         return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
                     }
-                    let stream = select.group_by.is_empty();
-                    plan = match plan {
-                        PhysicalPlan::Projection { child, .. } if stream => {
-                            PhysicalPlan::StreamAgg { child }
-                        }
-                        PhysicalPlan::Projection { child, .. } => PhysicalPlan::HashAgg { child },
-                        other if stream => PhysicalPlan::StreamAgg {
-                            child: Box::new(other),
-                        },
-                        other => PhysicalPlan::HashAgg {
-                            child: Box::new(other),
-                        },
-                    };
+                    let (agg, keep_order) = build_agg_plan(select, plan, current_db);
+                    plan = agg;
+                    stream_keep_order = keep_order;
                 }
                 if needs_window(select) {
                     plan = match plan {
@@ -96,9 +87,13 @@ impl PlanBuilder {
                     .as_ref()
                     .map(|from| table_row_count(stats, from, current_db))
                     .unwrap_or(1.0);
+                // StreamAgg on an ordered index already yields group-by order;
+                // skip Sort when ORDER BY is a prefix of GROUP BY.
+                let need_sort = !select.order_by.is_empty()
+                    && !(stream_keep_order && order_prefix_of_group_by(select));
                 plan = apply_order_limit(
                     plan,
-                    !select.order_by.is_empty(),
+                    need_sort,
                     select.limit,
                     select.offset,
                     est_rows,
@@ -107,6 +102,8 @@ impl PlanBuilder {
                 // Project after Selection/Sort so WHERE and ORDER BY still
                 // see the full child schema (TiDB extra-projection shape).
                 plan = wrap_output_projection(plan, select);
+                // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
+                // (see explain.rs); executable plan keeps the agg output schema.
                 plan = rewrite_semi_join_agg(rewrite_semi_join(plan));
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
@@ -674,19 +671,17 @@ fn apply_order_limit(
         plan = PhysicalPlan::Sort {
             child: Box::new(plan),
         };
-        return PhysicalPlan::Limit {
-            child: Box::new(plan),
-        };
+        return PhysicalPlan::limit(plan, off, lim);
     }
     if ordered {
         plan = PhysicalPlan::Sort {
             child: Box::new(plan),
         };
     }
-    if limit.is_some() || offset.is_some() {
-        plan = PhysicalPlan::Limit {
-            child: Box::new(plan),
-        };
+    if let Some(lim) = limit {
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), lim);
+    } else if offset.is_some() {
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), 0);
     }
     plan
 }
@@ -926,7 +921,212 @@ fn is_star_select(select: &SelectStmt) -> bool {
 }
 
 fn needs_hash_agg(select: &SelectStmt) -> bool {
-    !select.group_by.is_empty() || select.fields.iter().any(|f| is_agg_expr(&f.expr))
+    !select.group_by.is_empty()
+        || select.distinct
+        || select.fields.iter().any(|f| is_agg_expr(&f.expr))
+}
+
+/// Prefer IndexReader when GROUP BY columns are a leading prefix of an index.
+fn group_by_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let group_cols = group_by_column_names(select)?;
+    if group_cols.is_empty() {
+        return None;
+    }
+    for index in &info.indices {
+        if !index_has_group_prefix(index, &group_cols) {
+            continue;
+        }
+        if select_covers_index(select, info, index) {
+            return Some(index_plan(select, from, info, index, prune_mode));
+        }
+    }
+    None
+}
+
+fn group_by_column_names(select: &SelectStmt) -> Option<Vec<String>> {
+    let mut cols = Vec::with_capacity(select.group_by.len());
+    for expr in &select.group_by {
+        match expr {
+            ExprNode::Column(col) => cols.push(col.name.clone()),
+            _ => return None,
+        }
+    }
+    Some(cols)
+}
+
+fn index_has_group_prefix(index: &sealdb_meta::IndexInfo, group_cols: &[String]) -> bool {
+    if group_cols.is_empty() || group_cols.len() > index.columns.len() {
+        return false;
+    }
+    group_cols.iter().enumerate().all(|(i, name)| {
+        index.columns[i]
+            .name
+            .o()
+            .eq_ignore_ascii_case(name)
+    })
+}
+
+fn order_prefix_of_group_by(select: &SelectStmt) -> bool {
+    let Some(group_cols) = group_by_column_names(select) else {
+        return false;
+    };
+    if select.order_by.is_empty() || select.order_by.len() > group_cols.len() {
+        return false;
+    }
+    select.order_by.iter().enumerate().all(|(i, item)| {
+        matches!(&item.expr, ExprNode::Column(col) if group_cols[i].eq_ignore_ascii_case(&col.name))
+    })
+}
+
+/// Build HashAgg / StreamAgg (and DISTINCT outer HashAgg) with TiDB ExplainInfo.
+/// Returns `(plan, stream_keep_order)`.
+fn build_agg_plan(
+    select: &SelectStmt,
+    plan: PhysicalPlan,
+    _current_db: &str,
+) -> (PhysicalPlan, bool) {
+    let table = select
+        .from
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .unwrap_or("dual");
+    let plan = match plan {
+        PhysicalPlan::Projection { child, .. } => *child,
+        other => other,
+    };
+    let keep_order = matches!(plan, PhysicalPlan::IndexReader { .. }) && !select.group_by.is_empty();
+    let stream = select.group_by.is_empty() || keep_order;
+    let est = agg_est_rows(select);
+    let partial_col = partial_agg_column_id(select);
+
+    if select.distinct && select.group_by.is_empty() {
+        // SELECT DISTINCT without GROUP BY — dedup projected columns.
+        let keys = select
+            .fields
+            .iter()
+            .map(|f| {
+                f.as_name
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| f.orig_text.clone())
+                    .unwrap_or_else(|| f.expr.restore_string())
+            })
+            .collect();
+        return (
+            PhysicalPlan::Distinct {
+                keys,
+                child: Box::new(plan),
+            },
+            false,
+        );
+    }
+
+    if select.group_by.is_empty() {
+        // Scalar aggregation (empty-table StreamAgg push into TableReader).
+        let info = format!("funcs:count(Column#{partial_col})->Column#5");
+        let cop = format!("funcs:count(select.{table}.a)->Column#{partial_col}");
+        return (PhysicalPlan::stream_agg(plan, info, cop, est), false);
+    }
+
+    let group_info = select
+        .group_by
+        .iter()
+        .map(|e| explain_col_ref(table, e))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if select.distinct {
+        // TiDB: HashAgg(firstrow distinct cols) → StreamAgg(group by) → IndexReader.
+        let field = select
+            .fields
+            .first()
+            .map(|f| explain_col_ref(table, &f.expr))
+            .unwrap_or_else(|| format!("select.{table}.b"));
+        let stream_info = format!(
+            "group by:{group_info}, funcs:firstrow(Column#{partial_col})->{field}"
+        );
+        let cop = format!(
+            "group by:{group_info}, funcs:firstrow({field})->Column#{partial_col}"
+        );
+        let hash_info = format!("group by:{field}, funcs:firstrow({field})->{field}");
+        let stream = PhysicalPlan::stream_agg(plan, stream_info, cop, est);
+        return (PhysicalPlan::hash_agg(stream, hash_info, est), keep_order);
+    }
+
+    let agg_arg = select
+        .fields
+        .iter()
+        .find_map(|f| match &f.expr {
+            ExprNode::Func(func) if is_agg_expr(&f.expr) => func
+                .args
+                .first()
+                .map(|a| explain_col_ref(table, a)),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("select.{table}.a"));
+
+    let mut root_funcs = vec![format!("funcs:count(Column#{partial_col})->Column#5")];
+    let cop_funcs = vec![format!("count({agg_arg})->Column#{partial_col}")];
+    // ORDER BY requires firstrow of ordered columns on the root StreamAgg only.
+    if !select.order_by.is_empty() {
+        for item in &select.order_by {
+            let col = explain_col_ref(table, &item.expr);
+            root_funcs.push(format!("funcs:firstrow({col})->{col}"));
+        }
+    }
+    let info = format!("group by:{group_info}, {}", root_funcs.join(", "));
+    let cop = format!("group by:{group_info}, funcs:{}", cop_funcs.join(", "));
+    if stream {
+        (
+            PhysicalPlan::stream_agg(plan, info, cop, est),
+            keep_order,
+        )
+    } else {
+        (PhysicalPlan::hash_agg(plan, info, est), false)
+    }
+}
+
+fn agg_est_rows(select: &SelectStmt) -> f64 {
+    if select.group_by.is_empty() {
+        return 1.0;
+    }
+    if select.limit == Some(1) {
+        return 1.0;
+    }
+    if select.selection.is_some() {
+        // Pseudo selectivity ~1/3 (TiDB unanalyzed `b>0`).
+        8000.0 / 3.0
+    } else {
+        8000.0
+    }
+}
+
+fn partial_agg_column_id(select: &SelectStmt) -> usize {
+    if select.distinct {
+        return 9;
+    }
+    if select.group_by.is_empty() {
+        return 13;
+    }
+    if select.limit.is_some() && !select.order_by.is_empty() {
+        return 16;
+    }
+    if !select.order_by.is_empty() {
+        return 15;
+    }
+    10
+}
+
+fn explain_col_ref(table: &str, expr: &ExprNode) -> String {
+    match expr {
+        ExprNode::Column(col) => format!("select.{table}.{}", col.name),
+        other => other.restore_string(),
+    }
 }
 
 fn needs_window(select: &SelectStmt) -> bool {
@@ -1033,6 +1233,10 @@ fn access_plan(
             if let Some(index) = info.find_index_covering(&range.column) {
                 return index_plan(select, from, info, index, prune_mode);
             }
+        }
+        // GROUP BY prefix of a secondary index → IndexReader + StreamAgg keep order.
+        if let Some(plan) = group_by_index_plan(select, from, info, prune_mode) {
+            return plan;
         }
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {

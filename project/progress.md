@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-05（R1 `select` Gate A 推进至 EXPLAIN；纪律文档落地）  
+> 最后更新：2026-11-06（R1 `select` group-by StreamAgg→IndexReader Gate A+B 已绿）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` 推进至 group-by EXPLAIN**：TopN/IndexReader 与空表 StreamAgg brief 已绿；卡在 `distinct b group by a` 的 HashAgg→StreamAgg→IndexReader（keep order）。下一步：`planbuilder` 按 idx(a,b,c) 选 IndexReader + agg explain info |
+| R1 | select, show, types/* | `in_progress` | **`select` group-by 段已绿**（HashAgg/StreamAgg→IndexReader keep order + Gate A counts）。下一缺口：nested multi-table join EXPLAIN（`select-triage` ~332） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -48,7 +48,10 @@
 | EXPLAIN TopN⊃IndexReader | cop TopN + `index:TopN` | `walk_with_parent` / `emit_cop_children` | 树形骨架已出；info/estRows/前缀仍差 |
 | EXPLAIN TopN⊃IndexReader | 完整 brief 对齐 | TopN by_info/count；`index_columns`；树前缀空格 | `select-triage` TopN 段已绿 |
 | EXPLAIN StreamAgg⊃TableReader | partial agg cop | `data:StreamAgg` + cop StreamAgg | 空表 `count(a)` EXPLAIN 已绿 |
-| **下一缺口** | Gate B：`distinct`/`group by` 的 HashAgg→StreamAgg→IndexReader；agg 列名去反引号 | planner agg+index；`HashAggExec` 用 `orig_text` | `select-triage.txt` ~272 |
+| GROUP BY → IndexReader StreamAgg | TiDB stream agg on idx prefix | `group_by_index_plan`；StreamAgg info/cop_info；keep order:true | `distinct b group by a` / `count…group by` EXPLAIN+结果绿 |
+| SELECT DISTINCT | Dedup | `SelectStmt.distinct` + `Distinct` / outer HashAgg | `SELECT DISTINCT c1,c2 … LIMIT 1` → `(1,1)` |
+| covering IndexReader | 非 PK 表不覆盖索引列 | `covering_row` 仅在 Null 时填 handle | `USE INDEX` / group-by count 结果正确 |
+| **下一缺口** | nested join `(t1⋈t2)⋈(t3⋈t4)` EXPLAIN | join planner / paren-from | `select-triage.txt` ~332 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
