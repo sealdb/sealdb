@@ -52,6 +52,31 @@ pub struct Join {
     pub using_cols: Vec<String>,
 }
 
+/// Bushy join tree for `(t1 ⋈ t2) ⋈ (t3 ⋈ t4)` NestedJoin (TiDB outer join rewrite).
+#[derive(Clone, Debug)]
+pub enum FromItem {
+    Table(TableName),
+    Join {
+        left: Box<FromItem>,
+        right: Box<FromItem>,
+        tp: JoinType,
+        on: ExprNode,
+    },
+}
+
+impl FromItem {
+    pub fn tables(&self) -> Vec<&TableName> {
+        match self {
+            FromItem::Table(t) => vec![t],
+            FromItem::Join { left, right, .. } => {
+                let mut out = left.tables();
+                out.extend(right.tables());
+                out
+            }
+        }
+    }
+}
+
 impl Join {
     /// Restore `left JOIN right ON expr`, `left CROSS JOIN right`, or
     /// `left LEFT SEMI/ANTI JOIN right ON expr`.
@@ -230,6 +255,8 @@ pub struct SelectStmt {
     /// Left-deep join chain. Empty means a single table (or dual). `joins[i].left`
     /// is the previous right table (or the FROM table for `i == 0`).
     pub joins: Vec<Join>,
+    /// When set, overrides `from`+`joins` for bushy NestedJoin plans.
+    pub from_item: Option<FromItem>,
     pub selection: Option<ExprNode>,
     pub group_by: Vec<ExprNode>,
     pub having: Option<ExprNode>,
@@ -254,6 +281,9 @@ impl SelectStmt {
     /// All tables named in FROM / JOIN, left to right, without duplicates by pointer identity
     /// of the chain (left of the first join plus each join's right).
     pub fn join_tables(&self) -> Vec<&TableName> {
+        if let Some(item) = &self.from_item {
+            return item.tables();
+        }
         if self.joins.is_empty() {
             return self.from.iter().collect();
         }

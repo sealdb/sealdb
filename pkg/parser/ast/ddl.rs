@@ -6,6 +6,8 @@ use sealdb_errno::Result;
 pub struct TableName {
     pub schema: Option<String>,
     pub name: String,
+    /// Physical table name when `name` is an alias (`t t1` → name=t1, physical=t).
+    pub physical: Option<String>,
     /// `USE INDEX` / `FORCE INDEX` names (TiDB index hints on the table factor).
     pub use_indexes: Vec<String>,
 }
@@ -15,8 +17,14 @@ impl TableName {
         Self {
             schema,
             name: name.into(),
+            physical: None,
             use_indexes: Vec::new(),
         }
+    }
+
+    /// Name used for infoschema / storage lookup.
+    pub fn resolve_name(&self) -> &str {
+        self.physical.as_deref().unwrap_or(&self.name)
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
@@ -34,7 +42,7 @@ impl TableName {
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| default_schema.to_string());
-        (schema, self.name.clone())
+        (schema, self.resolve_name().to_string())
     }
 }
 

@@ -15,9 +15,9 @@ pub use ddl::{
     PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
 };
 pub use dml::{
-    Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
-    JoinType, LoadDataStmt, ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt,
-    SetOprStmt, SetOprType, UpdateStmt, WithClause,
+    Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, FromItem, InsertStmt,
+    Join, JoinType, LoadDataStmt, ResultSetNode, SelectField, SelectLock, SelectLockWait,
+    SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 pub use expressions::{
     BetweenExpr, ColumnRange, ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, IsNullExpr,

@@ -10,10 +10,11 @@ use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
 use sealdb_errno::{Error, Result};
 use sealdb_infoschema::InfoSchema;
-use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+use sealdb_parser::ast::expressions::{ExprNode, IsNullExpr, UnaryOpExpr, ValueExpr};
 use sealdb_parser::ast::{
     CteMaterialize, JoinType as AstJoinType, SelectStmt, Statement, StmtNode, TableName, WithClause,
 };
+use sealdb_parser::opcode::Op;
 use sealdb_statistics::{Handle, Table};
 use sealdb_types::Datum;
 
@@ -38,7 +39,7 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
-                let mut plan = if !select.joins.is_empty() {
+                let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
@@ -452,6 +453,9 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
+        if let Some(item) = &select.from_item {
+            return self.build_from_item(select, item, is, current_db, stats, prune_mode);
+        }
         if let Some(plan) = self.build_join_plan_dp(select, is, current_db, stats, prune_mode)? {
             return Ok(plan);
         }
@@ -484,6 +488,63 @@ impl PlanBuilder {
             };
         }
         Ok(plan)
+    }
+
+    fn build_from_item(
+        &self,
+        select: &SelectStmt,
+        item: &sealdb_parser::ast::FromItem,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<PhysicalPlan> {
+        use sealdb_parser::ast::FromItem;
+        match item {
+            FromItem::Table(table) => {
+                self.join_side(select, table, is, current_db, stats, prune_mode)
+            }
+            FromItem::Join {
+                left,
+                right,
+                tp,
+                on,
+            } => {
+                let left_plan =
+                    self.build_from_item(select, left, is, current_db, stats, prune_mode)?;
+                let mut right_plan =
+                    self.build_from_item(select, right, is, current_db, stats, prune_mode)?;
+                let left_table = left
+                    .tables()
+                    .last()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                let right_table = right
+                    .tables()
+                    .first()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                let join_tp = map_join_type(*tp);
+                // TiDB null-reject: push not(isnull(join_key)) into the inner
+                // (build) side of outer joins.
+                if matches!(
+                    join_tp,
+                    JoinType::LeftOuter | JoinType::RightOuter
+                ) {
+                    if let Some(filter) = null_reject_on_inner(on, &right_table) {
+                        right_plan = predicate_push_down(right_plan, &filter, is, current_db);
+                    }
+                }
+                Ok(PhysicalPlan::HashJoin {
+                    tp: join_tp,
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    left_table,
+                    right_table,
+                    on: on.clone(),
+                })
+            }
+        }
     }
 
     /// Costed n-table DP when all joins are Inner equality on a connected graph
@@ -635,6 +696,44 @@ fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectSt
         select.with = with.cloned();
     }
     select
+}
+
+/// `not(isnull(inner.join_key))` for TiDB outer-join null rejection on the build side.
+fn null_reject_on_inner(on: &ExprNode, inner_alias: &str) -> Option<ExprNode> {
+    let ExprNode::Binary(bin) = on else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    let col = match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(c), _)
+            if c.table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(inner_alias)) =>
+        {
+            c.clone()
+        }
+        (_, ExprNode::Column(c))
+            if c.table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(inner_alias)) =>
+        {
+            c.clone()
+        }
+        // Right side of ON may be the first table of a nested join (`t3` when
+        // inner_alias is `t3`); also accept unqualified / any column on the
+        // right expression that matches the join key name.
+        (ExprNode::Column(_), ExprNode::Column(c)) => c.clone(),
+        _ => return None,
+    };
+    Some(ExprNode::Unary(UnaryOpExpr {
+        op: Op::Not,
+        expr: Box::new(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(ExprNode::Column(col)),
+            not: false,
+        })),
+    }))
 }
 
 fn map_join_type(tp: AstJoinType) -> JoinType {
