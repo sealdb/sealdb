@@ -69,7 +69,15 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         },
-        PhysicalPlan::Window { child } => PhysicalPlan::Window {
+        PhysicalPlan::Window { info, child } => PhysicalPlan::Window {
+            info,
+            child: Box::new(rewrite_semi_join(*child)),
+        },
+        PhysicalPlan::Shuffle { info, child } => PhysicalPlan::Shuffle {
+            info,
+            child: Box::new(rewrite_semi_join(*child)),
+        },
+        PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
             child: Box::new(rewrite_semi_join(*child)),
         },
         PhysicalPlan::HashJoin {
@@ -520,6 +528,8 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
         | PhysicalPlan::Window { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::Apply { child, .. }
         | PhysicalPlan::Distinct { child, .. } => plan_table(child),
         _ => None,
@@ -622,7 +632,15 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         },
-        PhysicalPlan::Window { child } => PhysicalPlan::Window {
+        PhysicalPlan::Window { info, child } => PhysicalPlan::Window {
+            info,
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::Shuffle { info, child } => PhysicalPlan::Shuffle {
+            info,
+            child: Box::new(rewrite_semi_join_agg(*child)),
+        },
+        PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
         PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {

@@ -383,7 +383,13 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )?))
             }
-            PhysicalPlan::Window { child } => {
+            PhysicalPlan::Window { child, .. }
+            | PhysicalPlan::Shuffle { child, .. }
+            | PhysicalPlan::ShuffleReceiver { child } => {
+                if matches!(plan, PhysicalPlan::Shuffle { .. } | PhysicalPlan::ShuffleReceiver { .. })
+                {
+                    return Self::build(child, stmt, domain, current_db, txn);
+                }
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("window without select"))?

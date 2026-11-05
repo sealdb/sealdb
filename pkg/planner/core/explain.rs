@@ -1177,7 +1177,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
         | PhysicalPlan::Apply { child, .. }
-        | PhysicalPlan::Window { child }
+        | PhysicalPlan::Window { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
@@ -1356,7 +1358,15 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Union { op, .. } => {
             ("Union".to_string(), String::new(), op.restore().to_string())
         }
-        PhysicalPlan::Window { .. } => ("Window".to_string(), String::new(), String::new()),
+        PhysicalPlan::Window { info, .. } => {
+            ("Window".to_string(), String::new(), info.clone())
+        }
+        PhysicalPlan::Shuffle { info, .. } => {
+            ("Shuffle".to_string(), String::new(), info.clone())
+        }
+        PhysicalPlan::ShuffleReceiver { .. } => {
+            ("ShuffleReceiver".to_string(), String::new(), String::new())
+        }
         PhysicalPlan::CTE { name, .. } => ("CTE".to_string(), format!("cte:{name}"), String::new()),
         PhysicalPlan::Distinct { keys, .. } => (
             "HashAgg".to_string(),
@@ -1478,7 +1488,9 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }
-        | PhysicalPlan::Window { child }
+        | PhysicalPlan::Window { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::CTE { seed: child, .. }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => est_rows(child),

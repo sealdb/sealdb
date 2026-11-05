@@ -163,6 +163,17 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
     },
     Window {
+        /// TiDB Window ExplainInfo (`row_number()->Column#5 over(…)`).
+        info: String,
+        child: Box<PhysicalPlan>,
+    },
+    /// Parallel window/stream-agg shuffle (TiDB `PhysicalShuffle`).
+    Shuffle {
+        info: String,
+        child: Box<PhysicalPlan>,
+    },
+    /// Receiver stub under Shuffle (TiDB `PhysicalShuffleReceiverStub`).
+    ShuffleReceiver {
         child: Box<PhysicalPlan>,
     },
     CTE {
@@ -348,7 +359,15 @@ impl PhysicalPlan {
                     right.explain()
                 )
             }
-            PhysicalPlan::Window { child } => format!("Window -> {}", child.explain()),
+            PhysicalPlan::Window { info, child } => {
+                format!("Window({info}) -> {}", child.explain())
+            }
+            PhysicalPlan::Shuffle { info, child } => {
+                format!("Shuffle({info}) -> {}", child.explain())
+            }
+            PhysicalPlan::ShuffleReceiver { child } => {
+                format!("ShuffleReceiver -> {}", child.explain())
+            }
             PhysicalPlan::CTE {
                 name, seed, inline, ..
             } => {

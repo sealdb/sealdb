@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` correlated IN+other 已绿**；下一缺口 Window/`row_number` EXPLAIN（`select-triage` ~497） |
+| R1 | select, show, types/* | `in_progress` | **`select` Window/Shuffle 已绿**；下一缺口 precise_types 大数 DECIMAL（`select-triage` ~516） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -60,7 +60,8 @@
 | derived `sleep(1)` dual | inline CTE → Projection⊃Dual | `seed_is_dual_projection`；`text->Column#N` | sleep subquery brief 已绿 |
 | `ORDER BY rand()` / const | InjectProjBelowSort；elide const | `rule_inject_extra_projection`；`Sort.by_info` | rand/abs(2)/abs(rand())+1 brief 已绿 |
 | correlated `IN` + other cond | semi equal+other；drop ORDER BY | `from_in` decorrelate；isnull×N；semi est 0.8 | WHERE IN brief 已绿 |
-| **下一缺口** | Window `row_number` EXPLAIN | Shuffle/Window/Sort | `select-triage.txt` ~497 |
+| Window `row_number` | Shuffle⊃Window⊃Sort | `Shuffle`/`ShuffleReceiver`；default rows frame | window brief 已绿 |
+| **下一缺口** | precise_types 大 DECIMAL | MySQL DECIMAL 精度 | `select-triage.txt` ~516 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
