@@ -411,9 +411,16 @@ fn walk_with_parent(
         ) {
             child_spine.push(!child_last);
         } else if !spine.is_empty() {
-            // Under bushy ancestor: whether *this* node continues (e.g. StreamAgg
-            // not-last under HashJoin → `│` for its Projection child).
-            child_spine.push(!last);
+            // StreamAgg under CARTESIAN: push whether *this* node continues.
+            // Projection under HashJoin: push whether the child has siblings
+            // (Projection is usually unary → spaces under `│`).
+            if matches!(plan, PhysicalPlan::Projection { .. })
+                && matches!(parent, Some(PhysicalPlan::HashJoin { .. }))
+            {
+                child_spine.push(!child_last);
+            } else {
+                child_spine.push(!last);
+            }
         }
         walk_with_parent(
             child,
@@ -1487,6 +1494,17 @@ fn hash_join_explain_info(
     _right: &PhysicalPlan,
 ) -> String {
     use super::physical_plans::JoinType;
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+    use sealdb_types::Datum;
+    // Marker: Value(Bytes) holding a full TiDB ExplainInfo override.
+    if let ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(b),
+    }) = on
+        && let Ok(s) = std::str::from_utf8(b)
+        && (s.contains("semi join") || s.contains("anti join"))
+    {
+        return s.to_string();
+    }
     let outer = match tp {
         JoinType::LeftOuter => "left outer join",
         JoinType::RightOuter => "right outer join",
@@ -1497,7 +1515,7 @@ fn hash_join_explain_info(
     };
     // Pure CARTESIAN Cross with stub ON — no left-cond decoration.
     if matches!(tp, JoinType::Cross)
-        && matches!(on, sealdb_parser::ast::expressions::ExprNode::Value(_))
+        && matches!(on, ExprNode::Value(_))
     {
         return "CARTESIAN inner join".to_string();
     }
