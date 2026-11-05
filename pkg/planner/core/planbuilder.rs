@@ -459,6 +459,19 @@ impl PlanBuilder {
             return Err(Error::unsupported("qualified CTE name"));
         }
         let seed_select = with.seed_select(&from.name)?;
+        let cte = with.find(&from.name);
+        // Prefer explicit `WITH cte (a,b) AS`; else seed AS aliases / column names
+        // so `cte2 as c1 … WHERE c2.col_2` resolves (TiDB CTE output names).
+        let columns = {
+            let listed = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
+            if listed.is_empty() && !is_star_select(&seed_select) {
+                // Non-star seeds: AS aliases / column names become CTE output names.
+                // `SELECT *` keeps empty here so CTEExec inherits expanded seed schema.
+                cte_seed_output_names(&seed_select)
+            } else {
+                listed
+            }
+        };
         let mut seed = self.build_with_schema(
             &Statement::Select(seed_select.clone()),
             is,
@@ -471,12 +484,16 @@ impl PlanBuilder {
             && !needs_window(&seed_select)
             && !matches!(seed, PhysicalPlan::Projection { .. })
         {
-            let exprs = seed_select
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("col{i}"))
-                .collect();
+            let exprs = if columns.is_empty() {
+                seed_select
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("col{i}"))
+                    .collect()
+            } else {
+                columns.clone()
+            };
             seed = PhysicalPlan::Projection {
                 exprs,
                 child: Box::new(seed),
@@ -508,8 +525,6 @@ impl PlanBuilder {
                 right: Box::new(right),
             };
         }
-        let cte = with.find(&from.name);
-        let columns = cte.map(|cte| cte.col_name_list.clone()).unwrap_or_default();
         let inline = cte.is_some_and(|cte| {
             cte.materialize == CteMaterialize::NotMaterialized && cte.recursive.is_none()
         }) || seed_is_dual_projection(&seed)
@@ -1645,6 +1660,39 @@ fn push_single_side_on(
     }
 }
 
+/// Output column names for a CTE seed when `col_name_list` is empty.
+fn cte_seed_output_names(seed: &SelectStmt) -> Vec<String> {
+    seed.fields
+        .iter()
+        .map(|f| {
+            if let Some(name) = &f.as_name
+                && !name.is_empty()
+            {
+                return name.clone();
+            }
+            match &f.expr {
+                ExprNode::Column(c) => c.name.clone(),
+                ExprNode::Value(v) => match &v.datum {
+                    Datum::I64(n) => n.to_string(),
+                    Datum::U64(n) => n.to_string(),
+                    Datum::F64(n) => n.to_string(),
+                    Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                    _ => f
+                        .orig_text
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default(),
+                },
+                _ => f
+                    .orig_text
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 fn cte_field_expr(select: &SelectStmt, cte_name: &str, col: &str) -> Option<ExprNode> {
     let with = select.with.as_ref()?;
     let cte = with.find(cte_name)?;
@@ -1679,12 +1727,29 @@ fn push_filter_under_projection(
             columns,
             seed,
             inline,
-        } => PhysicalPlan::CTE {
-            name,
-            columns,
-            seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
-            inline,
-        },
+        } => {
+            if columns.is_empty() {
+                PhysicalPlan::CTE {
+                    name,
+                    columns,
+                    seed: Box::new(push_filter_under_projection(*seed, filter, is, current_db)),
+                    inline,
+                }
+            } else {
+                // Named CTE outputs: keep filter above (seed names may differ).
+                predicate_push_down(
+                    PhysicalPlan::CTE {
+                        name,
+                        columns,
+                        seed,
+                        inline,
+                    },
+                    filter,
+                    is,
+                    current_db,
+                )
+            }
+        }
         other => predicate_push_down(other, filter, is, current_db),
     }
 }

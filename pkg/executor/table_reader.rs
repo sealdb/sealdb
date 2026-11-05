@@ -58,8 +58,10 @@ impl TableReaderExec {
 
 impl Executor for TableReaderExec {
     fn open(&mut self) -> Result<()> {
-        // Recursive CTE working set is published as a table of the same name.
-        if let Some((schema, rows)) = crate::cte::working_cte(&self.table.name) {
+        // Recursive working set, or a sibling CTE already materialized this stmt.
+        // Prefer physical/resolve name so `FROM cte AS m` still hits working `cte`.
+        let cte_key = self.table.resolve_name();
+        if let Some((schema, rows)) = crate::cte::lookup_cte_rows(cte_key) {
             self.schema = schema;
             self.rows = filter_rows(rows, &self.schema, self.pushed.as_ref())?;
             return Ok(());

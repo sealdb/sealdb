@@ -103,9 +103,15 @@ impl HashAggExec {
             .having
             .as_ref()
             .map(|expr| rewrite_having(expr, select));
+        // MySQL/TiDB: `GROUP BY alias` resolves to the select-list expression.
+        let group_by = select
+            .group_by
+            .iter()
+            .map(|g| rewrite_group_by_alias(g, select))
+            .collect();
         Ok(Self {
             child,
-            group_by: select.group_by.clone(),
+            group_by,
             any_exprs,
             agg_specs,
             outputs,
@@ -345,6 +351,22 @@ fn walk_aggs(expr: &ExprNode, out: &mut Vec<FuncCallExpr>) {
         ExprNode::IsNull(is_null) => walk_aggs(&is_null.expr, out),
         ExprNode::QuantifiedCmp(cmp) => walk_aggs(&cmp.expr, out),
         _ => {}
+    }
+}
+
+fn rewrite_group_by_alias(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
+    match expr {
+        ExprNode::Column(col) if col.table.is_none() => {
+            if let Some(field) = select.fields.iter().find(|f| {
+                f.as_name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&col.name))
+            }) {
+                return field.expr.clone();
+            }
+            expr.clone()
+        }
+        other => other.clone(),
     }
 }
 

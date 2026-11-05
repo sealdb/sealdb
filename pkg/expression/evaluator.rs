@@ -790,6 +790,23 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 other => Ok(Datum::I64(other.as_i64()?.saturating_abs())),
             }
         }
+        "CONCAT" => {
+            if func.args.is_empty() {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "CONCAT requires at least 1 argument",
+                ));
+            }
+            let mut out = Vec::new();
+            for arg in &func.args {
+                let v = eval_expr_with_row(arg, schema, row)?;
+                if v.is_null() {
+                    return Ok(Datum::Null);
+                }
+                out.extend_from_slice(v.as_bytes().as_slice());
+            }
+            Ok(Datum::Bytes(out))
+        }
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
