@@ -69,6 +69,16 @@ if [[ ! -f "${BUILD_DIR}/build.ninja" ]]; then
     ${CXX:+-DCMAKE_CXX_COMPILER="$CXX"}
 fi
 
+# Homebrew LLVM 22 + C++23: Poco needs explicit <system_error> includes.
+for f in \
+  contrib/poco/Foundation/src/Event.cpp \
+  contrib/poco/Foundation/src/Thread_STD.cpp; do
+  if [[ -f "$f" ]] && ! grep -q '#include <system_error>' "$f"; then
+    # Insert after the last Poco include block's first include line region.
+    perl -i -0pe 's/(#include "Poco\/[^\"]+"\n)/$1#include <system_error>\n/s' "$f" || true
+  fi
+done
+
 JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}
 if [[ "$JOBS" -gt 8 ]]; then JOBS=8; fi
 cmake --build "$BUILD_DIR" --target tiflash -j"$JOBS"

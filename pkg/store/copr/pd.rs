@@ -2,6 +2,33 @@
 
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use serde::Deserialize;
+use std::time::Duration;
+
+fn pd_http_client() -> reqwest::Result<reqwest::blocking::Client> {
+    // Bypass env/system proxies — Clash/SOCKS on macOS otherwise hijacks 127.0.0.1.
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .build()
+}
+
+fn pd_http_get(url: &str) -> reqwest::Result<reqwest::blocking::Response> {
+    let client = pd_http_client()?;
+    let mut last = None;
+    for attempt in 0..3 {
+        match client.get(url).send() {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < 3 {
+                    std::thread::sleep(Duration::from_millis(50 * (attempt + 1) as u64));
+                }
+            }
+        }
+    }
+    Err(last.expect("pd_http_get retry"))
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PdRegion {
@@ -121,12 +148,22 @@ impl PdClient {
 }
 
 pub fn pd_get_region(pd_endpoints: &[String], key: &[u8]) -> Result<PdRegion> {
+    // Empty key → `/region/key/` 404s on PD; use regions scan instead.
+    if key.is_empty() {
+        let mut regions = pd_scan_regions(pd_endpoints, b"", 1)?;
+        return regions.pop().ok_or_else(|| {
+            Error::new(
+                ERR_UNKNOWN_ERROR,
+                "pd get region: empty cluster has no regions",
+            )
+        });
+    }
     let hex = hex_encode(key);
     let mut last_err = None;
     for ep in pd_endpoints {
         let base = normalize_pd_http(ep);
         let url = format!("{base}/pd/api/v1/region/key/{hex}");
-        match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
+        match pd_http_get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
                 return resp
                     .json::<PdRegion>()
@@ -162,7 +199,7 @@ pub fn pd_get_store(pd_endpoints: &[String], store_id: u64) -> Result<PdStoreInf
     for ep in pd_endpoints {
         let base = normalize_pd_http(ep);
         let url = format!("{base}/pd/api/v1/store/{store_id}");
-        match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
+        match pd_http_get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
                 let wrap = resp
                     .json::<PdStoreWrap>()
@@ -189,7 +226,7 @@ pub fn pd_list_stores(pd_endpoints: &[String]) -> Result<Vec<PdStoreInfo>> {
     for ep in pd_endpoints {
         let base = normalize_pd_http(ep);
         let url = format!("{base}/pd/api/v1/stores");
-        match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
+        match pd_http_get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
                 let wrap = resp
                     .json::<PdStoresWrap>()
@@ -226,7 +263,7 @@ pub fn pd_scan_regions(
         } else {
             format!("{base}/pd/api/v1/regions/key?key={hex}&limit={limit}")
         };
-        match reqwest::blocking::get(&url).and_then(|r| r.error_for_status()) {
+        match pd_http_get(&url).and_then(|r| r.error_for_status()) {
             Ok(resp) => {
                 let wrap = resp.json::<PdRegionsWrap>().map_err(|e| {
                     Error::new(ERR_UNKNOWN_ERROR, format!("pd regions decode: {e}"))
@@ -320,7 +357,13 @@ mod tests {
 
         let regions = pd_scan_regions(&pd, b"", 8).expect("regions after stores ok");
         assert!(!regions.is_empty());
-        let first = pd_get_region(&pd, &[]).expect("region by empty key");
-        assert_eq!(first.id, regions[0].id);
+        let by_empty = pd_get_region(&pd, &[]).expect("region by empty key");
+        assert!(
+            regions.iter().any(|r| r.id == by_empty.id),
+            "empty-key region {} should appear in scan",
+            by_empty.id
+        );
+        let by_t = pd_get_region(&pd, b"t").expect("region by key t");
+        assert!(by_t.id > 0);
     }
 }

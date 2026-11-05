@@ -1,7 +1,7 @@
 # 进度看板（Progress）
 
 > **唯一进度事实来源**。每次工作结束必须更新；没有证据 = 未完成。  
-> 最后更新：2026-11-04（C6 tiflash-cluster-e2e：本地源码编译中；脚本+SEALDB_TIFLASH_E2E gate）
+> 最后更新：2026-11-05（C6 本地 PD+TiKV 联通验证；TiFlash 编译暂缓）
 > 功能级状态：[features/status.json](./features/status.json)
 
 ---
@@ -67,7 +67,7 @@
 | C3 | `core-ported` | `project/reports/features/C3/` |
 | C4 | `core-ported` | `project/reports/features/C4/` |
 | C5 | `core-ported` | `project/reports/features/C5/` |
-| C6 | `in-progress` | C/D：本地 TiFlash 源码编译 + e2e 脚本；gap=`tiflash-cluster-e2e` |
+| C6 | `in-progress` | C：本地 PD+TiKV（tiup v8.5.0）联通；TiFlash 编译暂缓 |
 
 ---
 
@@ -108,17 +108,26 @@
 
 ## 4. 当前工作与证据
 
+### 2026-11-05
+
+- **Phase**: C6 本地 PD + TiKV 联通（TiFlash 暂缓）
+- **完成**:
+  - `run_local_pd_tikv.sh` / `verify_pd_tikv.sh`（tiup `pd/tikv` v8.5.0）
+  - PD HTTP `no_proxy` 客户端；空 key region 走 scan
+  - 实证：TSO + KV roundtrip + list stores/regions
+- **验证**:
+  - `./project/scripts/run_local_pd_tikv.sh start`（另开终端）
+  - `NO_PROXY='*' ./project/scripts/verify_pd_tikv.sh`
+- **下一步**:
+  - 加深 Cop/BatchCop 在活集群上的覆盖；TiFlash 编译延后
+
 ### 2026-11-04
 
-- **Phase**: C6 TiFlash cluster e2e（本地编译）
+- **Phase**: C6 TiFlash cluster e2e（本地编译）— **暂缓**
 - **完成**:
-  - 脚本：`build_tiflash.sh` / `run_local_tiflash.sh` / `tiflash_cluster_e2e.sh`
-  - `SEALDB_TIFLASH_E2E=1` → `test_tiflash_cluster_e2e_plan_dispatch`
-  - 源码：`/Users/wslu/work/github/db/pingcap/tiflash` submodule init 进行中 → `cmake --preset release`
-- **验证**:
-  - 编译完成后：`SEALDB_TIFLASH_E2E=1 cargo test -p sealdb-store --lib test_tiflash_cluster_e2e`
+  - 脚本与源码 submodule 保留；Homebrew LLVM 22 与 Poco/C++23 不兼容，停编
 - **下一步**:
-  - 等 TiFlash 二进制；tiup playground PD/TiKV + 自建 TiFlash；跑 gate
+  - 换兼容工具链或预编译包后再开
 
 ### 2026-11-04
 
