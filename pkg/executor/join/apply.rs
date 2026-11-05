@@ -473,6 +473,7 @@ fn bind_select(select: &SelectStmt, ctx: &ApplyCtx) -> Result<SelectStmt> {
         .map(|field| SelectField {
             expr: bind_expr(&field.expr, ctx, inner_table.as_deref(), &inner_cols),
             as_name: field.as_name.clone(),
+            orig_text: field.orig_text.clone(),
         })
         .collect();
     out.selection = select

@@ -14,6 +14,8 @@ pub enum Op {
     LogicAnd,
     LogicOr,
     Not,
+    /// TiDB `opcode.Not2` — MySQL `!` (same truth table as `NOT`).
+    Not2,
     BitNeg,
     UnaryMinus,
 }
@@ -35,6 +37,7 @@ impl Op {
             Op::LogicAnd => "AND",
             Op::LogicOr => "OR",
             Op::Not => "NOT",
+            Op::Not2 => "!",
             Op::BitNeg => "~",
             Op::UnaryMinus => "-",
         }

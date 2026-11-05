@@ -88,6 +88,7 @@ pub fn eval_named_cte(
 ) -> Result<QueryResult> {
     let select = SelectStmt {
         fields: vec![SelectField {
+            orig_text: None,
             expr: ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(b"*".to_vec()),
             }),

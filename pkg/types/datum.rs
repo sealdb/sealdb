@@ -155,8 +155,19 @@ fn parse_f64(b: &[u8]) -> Result<f64> {
         .map_err(|_| Error::new(ERR_TRUNCATED_WRONG_VALUE, format!("truncated float {s}")))
 }
 
+/// TiDB/MySQL REAL text form: scientific for large/small magnitudes (`1e23`),
+/// otherwise decimal; whole values keep a single fractional digit (`2.0`).
 fn format_float(v: f64) -> String {
-    if v.fract() == 0.0 && v.is_finite() {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    let abs = v.abs();
+    if abs != 0.0 && (abs >= 1e15 || abs < 1e-4) {
+        let s = format!("{v:e}");
+        // Rust may emit `1e+23`; TiDB goldens use `1e23`.
+        return s.replace("e+", "e").replace("E+", "e").replace('E', "e");
+    }
+    if v.fract() == 0.0 {
         format!("{v:.1}")
     } else {
         v.to_string()

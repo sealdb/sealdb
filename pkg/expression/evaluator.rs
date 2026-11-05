@@ -337,7 +337,7 @@ fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Datum::F64(v) => Ok(Datum::F64(-v)),
             other => Ok(Datum::I64(-other.as_i64()?)),
         },
-        Op::Not => Ok(bool_datum(!truthy(&inner).unwrap_or(false))),
+        Op::Not | Op::Not2 => Ok(bool_datum(!truthy(&inner).unwrap_or(false))),
         Op::Plus => Ok(inner),
         _ => Err(Error::unsupported(format!("unary {}", expr.op.restore()))),
     }

@@ -57,14 +57,21 @@ use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
+    // Capture before rewrite so projection names keep TiDB `field.Text()` spelling
+    // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
+    let projection_texts = capture_select_projections(sql);
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    // TiDB `!` SimpleExpr → opcode.Not2; sqlparser rejects bare `!`.
+    let rewritten = rewrite_mysql_bang(&rewritten);
+    // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
+    let rewritten = rewrite_mysql_paren_from(&rewritten);
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_rename_index(&rewritten);
-    let rewritten = rewrite_explain_format(&rewritten);
+    let (rewritten, explain_formats) = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
@@ -104,10 +111,16 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut seq_ops = seq_ops.into_iter();
     let mut load_ops = load_ops.into_iter();
     let mut view_checks = view_checks.into_iter();
+    let mut explain_formats = explain_formats.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
         let mut lowered = lower_statement(stmt)?;
+        if let Statement::Explain(explain) = &mut lowered
+            && let Some(Some(fmt)) = explain_formats.next()
+        {
+            explain.format = fmt;
+        }
         if let Statement::CreateView(create) = &mut lowered
             && let Some(Some(opt)) = view_checks.next()
         {
@@ -181,9 +194,338 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             lowered = op;
         }
         apply_cte_materialize(&mut lowered, &mut materialize_hints);
+        if let Statement::Select(sel) = &mut lowered {
+            attach_projection_texts(sel, projection_texts.as_ref());
+        }
         out.push(lowered);
     }
     Ok(out)
+}
+
+/// Attach TiDB-style original select-list texts for projection naming.
+fn attach_projection_texts(sel: &mut SelectStmt, texts: Option<&Vec<String>>) {
+    let Some(texts) = texts else {
+        return;
+    };
+    for (field, text) in sel.fields.iter_mut().zip(texts.iter()) {
+        if field.orig_text.is_none() {
+            field.orig_text = Some(text.clone());
+        }
+    }
+}
+
+/// Extract top-level SELECT projection snippets from original SQL (TiDB `field.Text()`).
+/// Returns `None` when the statement is not a plain SELECT / EXPLAIN SELECT.
+fn capture_select_projections(sql: &str) -> Option<Vec<String>> {
+    let bytes = sql.as_bytes();
+    let mut i = skip_ws_and_comments(bytes, 0);
+    // EXPLAIN [FORMAT …] SELECT … / DESC[RIBE] …
+    if keyword_at(bytes, i, "EXPLAIN") {
+        i = skip_ws_and_comments(bytes, i + "EXPLAIN".len());
+        if keyword_at(bytes, i, "FORMAT") {
+            i = skip_ws_and_comments(bytes, i + "FORMAT".len());
+            if i < bytes.len() && bytes[i] == b'=' {
+                i = skip_ws_and_comments(bytes, i + 1);
+            }
+            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`') {
+                i = skip_quoted(bytes, i);
+            } else {
+                i = skip_ident_or_quoted(bytes, i);
+            }
+            i = skip_ws_and_comments(bytes, i);
+        }
+    } else if keyword_at(bytes, i, "DESCRIBE") {
+        i = skip_ws_and_comments(bytes, i + "DESCRIBE".len());
+    } else if keyword_at(bytes, i, "DESC") {
+        i = skip_ws_and_comments(bytes, i + "DESC".len());
+    }
+    // WITH … SELECT — skip CTE list until the main SELECT.
+    if keyword_at(bytes, i, "WITH") {
+        i = skip_ws_and_comments(bytes, i + "WITH".len());
+        if keyword_at(bytes, i, "RECURSIVE") {
+            i = skip_ws_and_comments(bytes, i + "RECURSIVE".len());
+        }
+        loop {
+            // cte_name [ (cols) ] AS ( query )
+            i = skip_ident_or_quoted(bytes, i);
+            i = skip_ws_and_comments(bytes, i);
+            if i < bytes.len() && bytes[i] == b'(' {
+                i = skip_balanced(bytes, i);
+                i = skip_ws_and_comments(bytes, i);
+            }
+            if !keyword_at(bytes, i, "AS") {
+                return None;
+            }
+            i = skip_ws_and_comments(bytes, i + "AS".len());
+            if i >= bytes.len() || bytes[i] != b'(' {
+                return None;
+            }
+            i = skip_balanced(bytes, i);
+            i = skip_ws_and_comments(bytes, i);
+            if i < bytes.len() && bytes[i] == b',' {
+                i = skip_ws_and_comments(bytes, i + 1);
+                continue;
+            }
+            break;
+        }
+    }
+    if !keyword_at(bytes, i, "SELECT") {
+        return None;
+    }
+    i = skip_ws_and_comments(bytes, i + "SELECT".len());
+    if keyword_at(bytes, i, "DISTINCT") || keyword_at(bytes, i, "ALL") {
+        let kw = if keyword_at(bytes, i, "DISTINCT") {
+            "DISTINCT"
+        } else {
+            "ALL"
+        };
+        i = skip_ws_and_comments(bytes, i + kw.len());
+    }
+    let start = i;
+    // Projection ends at top-level FROM / WHERE / GROUP / HAVING / ORDER / LIMIT / FOR / ; / EOF.
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    let mut end = bytes.len();
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_bt {
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ if depth == 0
+                && (keyword_at(bytes, i, "FROM")
+                    || keyword_at(bytes, i, "WHERE")
+                    || keyword_at(bytes, i, "GROUP")
+                    || keyword_at(bytes, i, "HAVING")
+                    || keyword_at(bytes, i, "ORDER")
+                    || keyword_at(bytes, i, "LIMIT")
+                    || keyword_at(bytes, i, "FOR")
+                    || keyword_at(bytes, i, "UNION")
+                    || keyword_at(bytes, i, "INTERSECT")
+                    || keyword_at(bytes, i, "EXCEPT")
+                    || keyword_at(bytes, i, "WINDOW")) =>
+            {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let list = sql[start..end].trim();
+    if list.is_empty() {
+        return None;
+    }
+    Some(split_select_list(list))
+}
+
+fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        i = skip_ws(bytes, i);
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        // MySQL `--` comment requires whitespace (or EOL) after `--`.
+        if i + 1 < bytes.len()
+            && bytes[i] == b'-'
+            && bytes[i + 1] == b'-'
+            && (i + 2 >= bytes.len()
+                || bytes[i + 2].is_ascii_whitespace()
+                || bytes[i + 2] == b'\n')
+        {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i < bytes.len() && bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+fn skip_balanced(bytes: &[u8], mut i: usize) -> usize {
+    if i >= bytes.len() || bytes[i] != b'(' {
+        return i;
+    }
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_bt {
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn split_select_list(list: &str) -> Vec<String> {
+    let bytes = list.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_bt {
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                out.push(list[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = list[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
 }
 
 fn is_placeholder(stmt: &SetStmt, marker: &str) -> bool {
@@ -1381,6 +1723,272 @@ fn apply_with_materialize(
             cte.materialize = hints.remove(i).1;
         }
     }
+}
+
+/// Marker fn for TiDB `opcode.Not2` (`!`). Rewritten from `!(...)` before parse.
+const SEALDB_BANG_FN: &str = "__sealdb_bang";
+
+/// Rewrite MySQL/TiDB unary `! (` to `__sealdb_bang(` (sqlparser has no bang).
+/// Skips `!=`, strings, backticks, and MySQL version comments `/*! ... */`.
+fn rewrite_mysql_bang(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\'' {
+                out.push('\'');
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+                i += 1;
+                continue;
+            }
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push('\\');
+                let ch = sql[i + 1..].chars().next().unwrap();
+                out.push(ch);
+                i += 1 + ch.len_utf8();
+                continue;
+            }
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                out.push('"');
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+                i += 1;
+                continue;
+            }
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push('\\');
+                let ch = sql[i + 1..].chars().next().unwrap();
+                out.push(ch);
+                i += 1 + ch.len_utf8();
+                continue;
+            }
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if in_bt {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_sq = true;
+                out.push('\'');
+                i += 1;
+            }
+            b'"' => {
+                in_dq = true;
+                out.push('"');
+                i += 1;
+            }
+            b'`' => {
+                in_bt = true;
+                out.push('`');
+                i += 1;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Keep `/*! ... */` / `/* ... */` verbatim (version comments use `!`).
+                out.push('/');
+                out.push('*');
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                if i + 1 < bytes.len() {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                out.push('-');
+                out.push('-');
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            b'#' => {
+                out.push('#');
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            b'!' => {
+                let next = skip_ws(bytes, i + 1);
+                if next < bytes.len() && bytes[next] == b'(' {
+                    // `!(...)` / `! (...)` → `__sealdb_bang(...)`
+                    out.push_str(SEALDB_BANG_FN);
+                    out.push_str(&sql[i + 1..next]);
+                    out.push('(');
+                    i = next + 1;
+                } else if next < bytes.len() && bytes[next] == b'=' {
+                    // `!=`
+                    out.push('!');
+                    i += 1;
+                } else {
+                    // Bare `! expr` without paren: map to keyword NOT (opcode.Not).
+                    out.push_str(" NOT ");
+                    i += 1;
+                }
+            }
+            _ => {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Strip MySQL parenthesized table refs that are not subqueries.
+/// `FROM (t)`, `FROM (t a, t2 b)`, `FROM (t JOIN t2)` → unwrapped for sqlparser.
+fn rewrite_mysql_paren_from(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                let esc = sql[i + 1..].chars().next().unwrap();
+                out.push(esc);
+                i += 1 + esc.len_utf8();
+                continue;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if in_dq {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            if c == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_dq = false;
+            } else if c == b'\\' && i + 1 < bytes.len() {
+                let esc = sql[i + 1..].chars().next().unwrap();
+                out.push(esc);
+                i += 1 + esc.len_utf8();
+                continue;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if in_bt {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            if c == b'`' {
+                in_bt = false;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if c == b'\'' {
+            in_sq = true;
+            out.push('\'');
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_dq = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if c == b'`' {
+            in_bt = true;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "FROM") {
+            out.push_str(&sql[i..i + 4]);
+            i += 4;
+            // Unwrap one or more `(table-ref)` groups after FROM (not subqueries).
+            loop {
+                let after = skip_ws_and_comments(bytes, i);
+                if after >= bytes.len() || bytes[after] != b'(' {
+                    break;
+                }
+                let close = skip_balanced(bytes, after);
+                if close <= after + 1 {
+                    break;
+                }
+                let inner = sql[after + 1..close - 1].trim();
+                let inner_bytes = inner.as_bytes();
+                let start = skip_ws_and_comments(inner_bytes, 0);
+                // Derived table / subquery — leave parentheses alone.
+                if keyword_at(inner_bytes, start, "SELECT")
+                    || keyword_at(inner_bytes, start, "WITH")
+                    || keyword_at(inner_bytes, start, "VALUES")
+                    || keyword_at(inner_bytes, start, "TABLE")
+                {
+                    break;
+                }
+                // Emit whitespace between FROM and unwrapped body, then body.
+                out.push_str(&sql[i..after]);
+                out.push(' ');
+                out.push_str(inner);
+                i = close;
+                // Continue unwrapping `((t))`.
+            }
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn rewrite_lock_in_share_mode(sql: &str) -> String {
@@ -3150,9 +3758,11 @@ fn txn_chars(modes: &[TransactionMode]) -> Result<TxnChars> {
 }
 
 /// sqlparser-rs accepts `FORMAT JSON`, not TiDB `FORMAT = 'dot'`.
-fn rewrite_explain_format(sql: &str) -> String {
+/// Returns rewritten SQL plus per-EXPLAIN format overrides (`brief` → Brief).
+fn rewrite_explain_format(sql: &str) -> (String, Vec<Option<ExplainFormat>>) {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
+    let mut formats = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if keyword_at(bytes, i, "EXPLAIN") {
@@ -3174,26 +3784,31 @@ fn rewrite_explain_format(sql: &str) -> String {
                 let (value, end) = take_explain_format(bytes, value_at);
                 out.push_str(&sql[i..fmt]);
                 match map_explain_format_kw(&value) {
-                    ExplainFormatRewrite::Strip => {}
+                    ExplainFormatRewrite::Strip(override_fmt) => {
+                        formats.push(override_fmt);
+                    }
                     ExplainFormatRewrite::Keyword(kw) => {
+                        formats.push(None);
                         out.push_str("FORMAT ");
                         out.push_str(kw);
                         out.push(' ');
                     }
                     ExplainFormatRewrite::Keep => {
+                        formats.push(None);
                         out.push_str(&sql[fmt..end]);
                     }
                 }
                 i = end;
                 continue;
             }
+            formats.push(None);
             continue;
         }
         let ch = sql[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
-    out
+    (out, formats)
 }
 
 fn take_explain_format(bytes: &[u8], i: usize) -> (String, usize) {
@@ -3218,15 +3833,17 @@ fn take_explain_format(bytes: &[u8], i: usize) -> (String, usize) {
 }
 
 enum ExplainFormatRewrite {
-    Strip,
+    /// Drop FORMAT clause; optional SealDB format override (e.g. Brief).
+    Strip(Option<ExplainFormat>),
     Keyword(&'static str),
     Keep,
 }
 
 fn map_explain_format_kw(value: &str) -> ExplainFormatRewrite {
     match value.to_ascii_lowercase().as_str() {
-        "row" | "traditional" | "brief" | "text" | "tree" | "verbose" => {
-            ExplainFormatRewrite::Strip
+        "brief" => ExplainFormatRewrite::Strip(Some(ExplainFormat::Brief)),
+        "row" | "traditional" | "text" | "tree" | "verbose" => {
+            ExplainFormatRewrite::Strip(Some(ExplainFormat::Row))
         }
         "json" => ExplainFormatRewrite::Keyword("JSON"),
         "dot" | "graphviz" => ExplainFormatRewrite::Keyword("GRAPHVIZ"),
@@ -4436,7 +5053,10 @@ fn lower_table_with_joins(
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
                 (JoinType::RightOuter, lower_expr(expr)?, Vec::new())
             }
+            // MySQL `JOIN` / `INNER JOIN` without ON/USING ≡ CROSS JOIN.
             JoinOperator::CrossJoin(JoinConstraint::None)
+            | JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::Inner(JoinConstraint::None)
             | JoinOperator::StraightJoin(JoinConstraint::None) => {
                 (JoinType::Cross, true_expr(), Vec::new())
             }
@@ -4618,8 +5238,25 @@ fn table_factor(
     factor: &TableFactor,
 ) -> Result<(TableName, Option<String>, Vec<CommonTableExpression>)> {
     match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let physical = object_table_name(name)?;
+        TableFactor::Table {
+            name,
+            alias,
+            index_hints,
+            ..
+        } => {
+            let mut physical = object_table_name(name)?;
+            // TiDB USE/FORCE INDEX — drive access_path selection in the planner.
+            for hint in index_hints {
+                if matches!(
+                    hint.hint_type,
+                    sqlparser::ast::TableIndexHintType::Use
+                        | sqlparser::ast::TableIndexHintType::Force
+                ) {
+                    physical
+                        .use_indexes
+                        .extend(hint.index_names.iter().map(|n| n.value.clone()));
+                }
+            }
             let alias = alias.as_ref().map(|a| a.name.value.clone());
             Ok((physical, alias, Vec::new()))
         }
@@ -4666,6 +5303,27 @@ fn table_factor(
             });
             // CTE physical name is the alias; ON refs already use that name.
             Ok((TableName::new(None, name), None, ctes))
+        }
+        // `FROM (t1 JOIN t2 …)` after sqlparser NestedJoin (parens not stripped).
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if alias.is_some() {
+                return Err(Error::unsupported("nested join alias"));
+            }
+            let (left, joins, ctes) = lower_table_with_joins(table_with_joins)?;
+            if !joins.is_empty() {
+                // Fold into a derived CTE so callers that only take one TableName
+                // still see a cross/inner product. Prefer rewrite_mysql_paren_from.
+                return Err(Error::unsupported(
+                    "nested join with multiple tables (use paren-from rewrite)",
+                ));
+            }
+            if !ctes.is_empty() {
+                return Err(Error::unsupported("nested derived join"));
+            }
+            Ok((left, None, ctes))
         }
         other => Err(Error::unsupported(format!("FROM {other}"))),
     }
@@ -5560,20 +6218,24 @@ fn lower_select_item(item: &SelectItem) -> Result<SelectField> {
         SelectItem::UnnamedExpr(expr) => Ok(SelectField {
             expr: lower_expr(expr)?,
             as_name: None,
+            orig_text: None,
         }),
         SelectItem::ExprWithAlias { expr, alias } => Ok(SelectField {
             expr: lower_expr(expr)?,
             as_name: Some(alias.value.clone()),
+            orig_text: None,
         }),
         SelectItem::ExprWithAliases { expr, aliases } => Ok(SelectField {
             expr: lower_expr(expr)?,
             as_name: aliases.first().map(|a| a.value.clone()),
+            orig_text: None,
         }),
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => Ok(SelectField {
             expr: ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(b"*".to_vec()),
             }),
             as_name: None,
+            orig_text: None,
         }),
     }
 }
@@ -5771,6 +6433,16 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
             return Err(Error::unsupported("function subquery argument"));
         }
     };
+    // TiDB opcode.Not2 (`!`): rewritten as `__sealdb_bang(expr)`.
+    if name.eq_ignore_ascii_case(SEALDB_BANG_FN) {
+        if args.len() != 1 {
+            return Err(Error::unsupported("bang unary arity"));
+        }
+        return Ok(ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not2,
+            expr: Box::new(args.into_iter().next().unwrap()),
+        }));
+    }
     let args = if name.eq_ignore_ascii_case("COUNT")
         && matches!(
             args.as_slice(),
@@ -6007,7 +6679,9 @@ fn lower_order_by_exprs(items: &[OrderByExpr]) -> Result<Vec<ByItem>> {
 fn lower_value(value: &Value) -> Result<Datum> {
     match value {
         Value::Number(n, _) => {
-            if n.contains('.') {
+            // TiDB accepts scientific notation (`1e23`) as float; sqlparser keeps the
+            // token text so we must not force i64 when `e`/`E` is present.
+            if n.contains('.') || n.contains('e') || n.contains('E') {
                 n.parse::<f64>()
                     .map(Datum::F64)
                     .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
@@ -6117,6 +6791,11 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::GtEq => Op::Ge,
         BinaryOperator::And => Op::LogicAnd,
         BinaryOperator::Or => Op::LogicOr,
+        // MySQL/TiDB default (no PIPES_AS_CONCAT): `||` is logical OR.
+        // sqlparser exposes it as StringConcat; concat mode is a later sql_mode gap.
+        BinaryOperator::StringConcat => Op::LogicOr,
+        // MySQL `&&` → logical AND (sqlparser tokenizes as PGOverlap).
+        BinaryOperator::PGOverlap => Op::LogicAnd,
         _ => return Err(Error::unsupported(format!("operator {op}"))),
     })
 }
@@ -6491,6 +7170,66 @@ mod hex_literal_tests {
         match expr {
             ExprNode::Value(v) => assert_eq!(v.datum, Datum::Bytes(vec![0x80])),
             other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bang_not2_tests {
+    use super::*;
+    use crate::ast::expressions::ExprNode;
+    use crate::opcode::Op;
+
+    #[test]
+    fn rewrite_bang_paren_to_not2() {
+        let stmts = parse_sql("select !(1 + 2)").unwrap();
+        match &stmts[0] {
+            Statement::Select(sel) => match &sel.fields[0].expr {
+                ExprNode::Unary(u) => {
+                    assert_eq!(u.op, Op::Not2);
+                    assert_eq!(sel.fields[0].expr.restore_string(), "!(1 + 2)");
+                }
+                other => panic!("expected Not2 unary, got {other:?}"),
+            },
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaves_not_equal_alone() {
+        let stmts = parse_sql("select 1 != 2").unwrap();
+        match &stmts[0] {
+            Statement::Select(sel) => match &sel.fields[0].expr {
+                ExprNode::Binary(b) => assert_eq!(b.op, Op::Ne),
+                other => panic!("expected !=, got {other:?}"),
+            },
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod paren_from_tests {
+    use super::*;
+
+    #[test]
+    fn unwraps_paren_table_and_comma_list() {
+        parse_sql("select * from (t)").expect("FROM (t)");
+        parse_sql("select * from (t as a, t2 as b)").expect("FROM (t, t2)");
+        parse_sql("select * from (t as a cross join t2 as b)").expect("FROM (t JOIN t2)");
+    }
+
+    #[test]
+    fn keeps_derived_subquery_parens() {
+        let err = parse_sql("select * from (select 1) x");
+        // Must not strip subquery parens into invalid SQL; either OK or a
+        // derived-table error — never a raw sqlparser "joined table" miss.
+        if let Err(e) = err {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("joined table"),
+                "subquery parens were stripped: {msg}"
+            );
         }
     }
 }

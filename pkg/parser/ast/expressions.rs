@@ -366,7 +366,31 @@ impl UnaryOpExpr {
         if matches!(self.op, Op::Not) {
             ctx.write_str(" ");
         }
-        self.expr.restore(ctx)
+        // TiDB keeps ParenthesesExpr under `! (expr)`; sqlparser bang rewrite
+        // drops call/paren nodes, so re-wrap compound children for display.
+        let wrap = matches!(self.op, Op::Not2)
+            && matches!(
+                self.expr.as_ref(),
+                ExprNode::Binary(_)
+                    | ExprNode::Unary(_)
+                    | ExprNode::Func(_)
+                    | ExprNode::Cast(_)
+                    | ExprNode::Between(_)
+                    | ExprNode::InList(_)
+                    | ExprNode::InSubquery(_)
+                    | ExprNode::Like(_)
+                    | ExprNode::IsNull(_)
+                    | ExprNode::QuantifiedCmp(_)
+                    | ExprNode::Window(_)
+            );
+        if wrap {
+            ctx.write_str("(");
+        }
+        self.expr.restore(ctx)?;
+        if wrap {
+            ctx.write_str(")");
+        }
+        Ok(())
     }
 }
 

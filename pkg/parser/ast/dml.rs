@@ -73,6 +73,8 @@ impl Join {
 pub struct SelectField {
     pub expr: ExprNode,
     pub as_name: Option<String>,
+    /// Original select-list text (`field.Text()` in TiDB) for projection naming.
+    pub orig_text: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
