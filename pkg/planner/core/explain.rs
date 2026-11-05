@@ -1104,13 +1104,17 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
     if let Some(exprs) = from_exprs {
         let parts: Vec<String> = exprs
             .iter()
-            .filter(|e| e.contains("plus") || e.contains("->"))
-            .map(|e| {
+            .enumerate()
+            .filter(|(_, e)| e.contains("plus") || e.contains("->"))
+            .map(|(i, e)| {
                 let mut s = e.clone();
                 s = s.replace(".t.", &format!(".{orig_tbl}."));
                 s = s.replace("cte1.", &format!("{orig_tbl}."));
-                // Already shaped as cast(plus(...), int)->schema.tbl.col
-                if s.contains("->") && s.contains("cast(") {
+                // Apply-shaped: cast(plus(...), int)->schema.tbl.col
+                if s.contains("cast(")
+                    && s.contains("->")
+                    && !s.contains("Column#")
+                {
                     return s;
                 }
                 if let Some((left, right)) = s.split_once("->") {
@@ -1123,9 +1127,10 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
                     let col = right
                         .rsplit('.')
                         .next()
-                        .unwrap_or("c1")
-                        .trim()
-                        .to_string();
+                        .map(|c| c.trim())
+                        .filter(|c| !c.is_empty() && !c.starts_with("Column#"))
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| format!("c{}", i + 1));
                     return format!("{core}->{schema}.{orig_tbl}.{col}");
                 }
                 s
