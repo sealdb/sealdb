@@ -170,21 +170,12 @@ impl WithClause {
             .find(name)
             .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
         let mut select = (*cte.query).clone();
-        // View expansion injects WITH into derived CTE bodies; hoist those
-        // CTEs beside preceding siblings (TiDB MERGE flattens the same way).
-        let mut preceding = self.preceding(name);
-        if let Some(inner) = select.with.take() {
-            for nested in inner.ctes {
-                if nested.name.eq_ignore_ascii_case(name)
-                    || preceding
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(&nested.name))
-                {
-                    return Err(Error::unsupported("duplicate CTE name"));
-                }
-                preceding.push(nested);
-            }
+        // Nested WITH on the CTE body stays scoped to the seed (may shadow
+        // `name`). Otherwise attach preceding sibling CTEs.
+        if select.with.is_some() {
+            return Ok(select);
         }
+        let preceding = self.preceding(name);
         if !preceding.is_empty() {
             select.with = Some(WithClause {
                 is_recursive: false,

@@ -5172,7 +5172,6 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     let Some(with) = with else {
         return Ok(None);
     };
-    // CTE FROM clause / nested WITH.
     let mut names = Vec::new();
     let mut ctes = Vec::with_capacity(with.cte_tables.len());
     for cte in &with.cte_tables {
@@ -5193,17 +5192,23 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
 }
 
 /// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`.
+/// Nested WITH on the CTE body is kept on the seed select (scoped; may shadow).
 fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     if cte.from.is_some() {
         return Err(Error::unsupported("CTE FROM clause"));
     }
-    if cte.query.with.is_some() {
-        return Err(Error::unsupported("nested WITH"));
-    }
-    let (query, recursive_arm, set_rest) = match cte.query.body.as_ref() {
-        SetExpr::Select(_) => (lower_query(&cte.query)?, None, Vec::new()),
+    let nested_with = if let Some(inner) = cte.query.with.as_ref() {
+        lower_with(Some(inner))?
+    } else {
+        None
+    };
+    // Strip WITH before lowering the body so lower_query does not re-attach it.
+    let mut query_ast = cte.query.clone();
+    query_ast.with = None;
+    let (mut query, recursive_arm, set_rest) = match query_ast.body.as_ref() {
+        SetExpr::Select(_) => (lower_query(&query_ast)?, None, Vec::new()),
         SetExpr::SetOperation { .. } if recursive => {
-            let set = lower_set_opr(&cte.query)?;
+            let set = lower_set_opr(&query_ast)?;
             if set.rest.len() != 1
                 || !matches!(set.rest[0].0, SetOprType::Union | SetOprType::UnionAll)
             {
@@ -5214,11 +5219,17 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             (set.first, Some(set.rest[0].clone()), Vec::new())
         }
         SetExpr::SetOperation { .. } => {
-            let set = lower_set_opr(&cte.query)?;
+            let set = lower_set_opr(&query_ast)?;
             (set.first, None, set.rest)
         }
         other => return Err(Error::unsupported(format!("CTE body {other}"))),
     };
+    if query.with.is_some() && nested_with.is_some() {
+        return Err(Error::unsupported("nested WITH"));
+    }
+    if query.with.is_none() {
+        query.with = nested_with;
+    }
     Ok(CommonTableExpression {
         name: cte.alias.name.value.clone(),
         query: Box::new(query),

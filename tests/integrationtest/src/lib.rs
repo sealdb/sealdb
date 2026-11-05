@@ -103,6 +103,8 @@ pub struct Step {
     pub sorted: bool,
     /// When true, append session warnings after the result (TiDB `--enable_warnings`).
     pub show_warnings: bool,
+    /// TiDB `--echo …` — emit this line into the result (no SQL execution).
+    pub echo: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +225,16 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 warnings_enabled = false;
                 continue;
             }
+            if let Some(msg) = strip_prefix_ci(rest, "echo") {
+                steps.push(Step {
+                    sql: String::new(),
+                    expected_error: None,
+                    sorted: false,
+                    show_warnings: false,
+                    echo: Some(msg.trim_start().to_string()),
+                });
+                continue;
+            }
             // TiDB directives we do not yet honor: skip with clear error on use.
             if rest.eq_ignore_ascii_case("enable_query_log")
                 || rest.eq_ignore_ascii_case("disable_query_log")
@@ -246,6 +258,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 expected_error,
                 sorted,
                 show_warnings: warnings_enabled,
+                echo: None,
             });
             buf.clear();
             expected_error = None;
@@ -427,6 +440,9 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
 }
 
 fn run_step(session: &Session, step: &Step) -> Result<String> {
+    if let Some(msg) = &step.echo {
+        return Ok(msg.clone());
+    }
     let result = session.execute_stmt(&step.sql);
     match (result, step.expected_error) {
         (Ok(_), Some(code)) => Err(Error::new(
