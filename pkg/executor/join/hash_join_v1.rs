@@ -439,6 +439,15 @@ fn split_join_eq(
     left_table: &str,
     right_table: &str,
 ) -> Result<(ExprNode, ExprNode)> {
+    // Peel LogicAnd wrappers that carry an ExplainInfo Bytes marker alongside Eq.
+    if let ExprNode::Binary(bin) = on
+        && bin.op == Op::LogicAnd
+    {
+        if let Ok(keys) = split_join_eq(&bin.left, left_table, right_table) {
+            return Ok(keys);
+        }
+        return split_join_eq(&bin.right, left_table, right_table);
+    }
     let ExprNode::Binary(bin) = on else {
         return Err(Error::unsupported("JOIN ON must be equality"));
     };

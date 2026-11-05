@@ -457,10 +457,12 @@ fn push_through_agg(
     match plan {
         PhysicalPlan::HashAgg {
             info,
+            cop_info,
             est_rows,
             child,
         } => PhysicalPlan::HashAgg {
             info,
+            cop_info,
             est_rows,
             child: Box::new(predicate_push_down(*child, filter, is, current_db)),
         },
@@ -489,8 +491,14 @@ fn push_through_agg(
 
 fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::HashAgg { info, child, .. } => PhysicalPlan::HashAgg {
+        PhysicalPlan::HashAgg {
             info,
+            cop_info,
+            child,
+            ..
+        } => PhysicalPlan::HashAgg {
+            info,
+            cop_info,
             est_rows: est,
             child,
         },
@@ -523,10 +531,12 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
     match plan {
         PhysicalPlan::HashAgg {
             info,
+            cop_info,
             est_rows,
             child,
         } => PhysicalPlan::HashAgg {
             info,
+            cop_info,
             est_rows,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
         },

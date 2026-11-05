@@ -296,6 +296,7 @@ fn maybe_index_for_window(
         index: index.name.o().to_string(),
         index_columns,
         partitions: partitions.clone(),
+        row_count: 10_000.0,
         pushed: None,
     }
 }

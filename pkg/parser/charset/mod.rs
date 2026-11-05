@@ -13,6 +13,8 @@ pub const SUPPORTED_COLLATIONS: &[&str] = &[
     "utf8mb4_general_ci",
     "utf8mb4_unicode_ci",
     "utf8_bin",
+    "utf8_general_ci",
+    "utf8_unicode_ci",
     "latin1_bin",
     "binary",
     "ascii_bin",
