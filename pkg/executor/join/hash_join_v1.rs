@@ -6,7 +6,7 @@
 // partition spill).
 use crate::internal::exec::Executor;
 use crate::join::hash_join_spill::{partition_count, partition_rows};
-use sealdb_errno::{Error, Result};
+use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_expression::eval_expr_with_row;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{Join, JoinType};
@@ -58,20 +58,28 @@ impl Executor for HashJoinV1Exec {
         self.left.open()?;
         self.right.open()?;
         let left_raw = self.left.schema().to_vec();
+        let right_raw = self.right.schema().to_vec();
+        // Qualified copies are only for join-key / ON expression eval.
         let left_schema = qualify_schema(&left_raw, &self.join.left.name);
-        let right_schema = qualify_schema(self.right.schema(), &self.join.right.name);
+        let right_schema = qualify_schema(&right_raw, &self.join.right.name);
         let left_width = left_schema.len();
         let right_width = right_schema.len();
+        validate_using_cols(&self.join.using_cols, &left_raw, &right_raw)?;
         // Semi/Anti keep the probe (left) schema so SELECT * FROM t1 WHERE EXISTS
         // still returns t1 columns rather than a concatenated join row.
+        // TiDB SELECT * headers use bare column names (duplicates allowed at
+        // top level; derived tables reject them with errno 1060).
+        // USING coalesces shared names: emit left once, drop matching right cols.
         self.schema = if self.join.tp.is_semi_anti() {
+            left_raw.clone()
+        } else if self.join.using_cols.is_empty() {
             left_raw
-        } else {
-            left_schema
                 .iter()
                 .cloned()
-                .chain(right_schema.iter().cloned())
+                .chain(right_raw.iter().cloned())
                 .collect()
+        } else {
+            coalesce_using_schema(&left_raw, &right_raw, &self.join.using_cols)
         };
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
@@ -79,6 +87,14 @@ impl Executor for HashJoinV1Exec {
         // CROSS JOIN has no equality key, so skip hash index and partition spill.
         if self.join.tp == JoinType::Cross {
             self.rows = probe_cross(&left_rows, &right_rows);
+            if !self.join.using_cols.is_empty() {
+                self.rows = project_using_rows(
+                    std::mem::take(&mut self.rows),
+                    left_width,
+                    &right_raw,
+                    &self.join.using_cols,
+                );
+            }
             return Ok(());
         }
         let (left_key, right_key) =
@@ -95,6 +111,14 @@ impl Executor for HashJoinV1Exec {
                 left_width,
                 right_width,
             )?;
+            if !self.join.using_cols.is_empty() {
+                self.rows = project_using_rows(
+                    std::mem::take(&mut self.rows),
+                    left_width,
+                    &right_raw,
+                    &self.join.using_cols,
+                );
+            }
             return Ok(());
         }
         self.spilled = true;
@@ -118,6 +142,14 @@ impl Executor for HashJoinV1Exec {
             )?);
         }
         self.rows = out;
+        if !self.join.using_cols.is_empty() {
+            self.rows = project_using_rows(
+                std::mem::take(&mut self.rows),
+                left_width,
+                &right_raw,
+                &self.join.using_cols,
+            );
+        }
         Ok(())
     }
 
@@ -281,6 +313,68 @@ fn qualify_schema(schema: &[String], table: &str) -> Vec<String> {
                 format!("{table}.{col}")
             }
         })
+        .collect()
+}
+
+fn bare_col(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+fn validate_using_cols(using: &[String], left: &[String], right: &[String]) -> Result<()> {
+    for col in using {
+        let in_left = left
+            .iter()
+            .any(|c| bare_col(c).eq_ignore_ascii_case(col));
+        let in_right = right
+            .iter()
+            .any(|c| bare_col(c).eq_ignore_ascii_case(col));
+        if !in_left || !in_right {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{col}' in 'from clause'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn coalesce_using_schema(left: &[String], right: &[String], using: &[String]) -> Vec<String> {
+    let drop_right: std::collections::HashSet<String> = using
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    left.iter()
+        .cloned()
+        .chain(
+            right
+                .iter()
+                .filter(|c| !drop_right.contains(&bare_col(c).to_ascii_lowercase()))
+                .cloned(),
+        )
+        .collect()
+}
+
+fn project_using_rows(
+    rows: Vec<Vec<Datum>>,
+    left_width: usize,
+    right: &[String],
+    using: &[String],
+) -> Vec<Vec<Datum>> {
+    let drop_right: std::collections::HashSet<String> = using
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let keep: Vec<usize> = (0..left_width)
+        .chain((0..right.len()).filter_map(|i| {
+            if drop_right.contains(&bare_col(&right[i]).to_ascii_lowercase()) {
+                None
+            } else {
+                Some(left_width + i)
+            }
+        }))
+        .collect();
+    rows.into_iter()
+        .map(|row| keep.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)).collect())
         .collect()
 }
 
@@ -579,6 +673,7 @@ mod tests {
                     name: "id".to_string(),
                 })),
             }),
+            using_cols: Vec::new(),
         }
     }
 

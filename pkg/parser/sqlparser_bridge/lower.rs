@@ -33,7 +33,9 @@ use crate::ast::misc::{
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
-use sealdb_errno::{ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result,
+};
 use sealdb_types::Datum;
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
@@ -4393,6 +4395,7 @@ fn lower_from(
             right: right.clone(),
             tp: JoinType::Cross,
             on: true_expr(),
+            using_cols: Vec::new(),
         });
         joins.extend(extra_joins);
         prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
@@ -4404,7 +4407,7 @@ fn lower_from(
 fn lower_table_with_joins(
     table: &TableWithJoins,
 ) -> Result<(TableName, Vec<Join>, Vec<CommonTableExpression>)> {
-    let (left, ctes) = table_factor(&table.relation)?;
+    let (left, left_alias, ctes) = table_factor(&table.relation)?;
     if table.joins.is_empty() {
         return Ok((left, Vec::new(), ctes));
     }
@@ -4413,46 +4416,132 @@ fn lower_table_with_joins(
     }
     let mut out = Vec::new();
     let mut prev = left.clone();
+    let mut prev_alias = left_alias;
     for join in &table.joins {
-        let (right, right_ctes) = table_factor(&join.relation)?;
+        let (right, right_alias, right_ctes) = table_factor(&join.relation)?;
         if !right_ctes.is_empty() {
             return Err(Error::unsupported("subquery JOIN"));
         }
-        let (tp, on) = match &join.join_operator {
+        let (tp, on, using_cols) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
-            | JoinOperator::Inner(JoinConstraint::On(expr)) => (JoinType::Inner, lower_expr(expr)?),
+            | JoinOperator::Inner(JoinConstraint::On(expr))
+            | JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+            }
             JoinOperator::Left(JoinConstraint::On(expr))
             | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?)
+                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::Right(JoinConstraint::On(expr))
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?)
+                (JoinType::RightOuter, lower_expr(expr)?, Vec::new())
             }
-            JoinOperator::CrossJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
+            JoinOperator::CrossJoin(JoinConstraint::None)
+            | JoinOperator::StraightJoin(JoinConstraint::None) => {
+                (JoinType::Cross, true_expr(), Vec::new())
+            }
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::Semi(JoinConstraint::On(expr))
             | JoinOperator::LeftSemi(JoinConstraint::On(expr)) => {
-                (JoinType::Semi, lower_expr(expr)?)
+                (JoinType::Semi, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::Anti(JoinConstraint::On(expr))
             | JoinOperator::LeftAnti(JoinConstraint::On(expr)) => {
-                (JoinType::Anti, lower_expr(expr)?)
+                (JoinType::Anti, lower_expr(expr)?, Vec::new())
             }
-            // Completeness wave: NATURAL / USING / right semi/anti / full outer.
+            JoinOperator::Join(JoinConstraint::Using(names))
+            | JoinOperator::Inner(JoinConstraint::Using(names))
+            | JoinOperator::StraightJoin(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr(&prev, &right, &cols)?;
+                (JoinType::Inner, on, cols)
+            }
+            JoinOperator::Left(JoinConstraint::Using(names))
+            | JoinOperator::LeftOuter(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr(&prev, &right, &cols)?;
+                (JoinType::LeftOuter, on, cols)
+            }
+            JoinOperator::Right(JoinConstraint::Using(names))
+            | JoinOperator::RightOuter(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr(&prev, &right, &cols)?;
+                (JoinType::RightOuter, on, cols)
+            }
+            // Completeness wave: NATURAL / right semi/anti / full outer.
             other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
+        };
+        let mut alias_map = Vec::new();
+        if let Some(alias) = &prev_alias {
+            alias_map.push((alias.clone(), prev.name.clone()));
+        }
+        if let Some(alias) = &right_alias {
+            alias_map.push((alias.clone(), right.name.clone()));
+        }
+        let on = if alias_map.is_empty() {
+            on
+        } else {
+            rewrite_join_on_aliases(on, &alias_map)
         };
         out.push(Join {
             left: prev,
             right: right.clone(),
             tp,
             on,
+            using_cols,
         });
         prev = right;
+        prev_alias = right_alias;
     }
     Ok((left, out, Vec::new()))
+}
+
+fn using_column_names(names: &[ObjectName]) -> Result<Vec<String>> {
+    names
+        .iter()
+        .map(|name| {
+            let parts = object_name_parts(name)?;
+            if parts.len() != 1 {
+                return Err(Error::unsupported(format!("JOIN USING {name}")));
+            }
+            Ok(parts[0].clone())
+        })
+        .collect()
+}
+
+/// `USING (c1, c2)` → `left.c1 = right.c1 AND left.c2 = right.c2`.
+fn using_on_expr(left: &TableName, right: &TableName, cols: &[String]) -> Result<ExprNode> {
+    if cols.is_empty() {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            "Unknown column '' in 'from clause'",
+        ));
+    }
+    let mut eqs = cols.iter().map(|col| {
+        ExprNode::Binary(crate::ast::expressions::BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(crate::ast::expressions::ColumnNameExpr {
+                schema: None,
+                table: Some(left.name.clone()),
+                name: col.clone(),
+            })),
+            right: Box::new(ExprNode::Column(crate::ast::expressions::ColumnNameExpr {
+                schema: None,
+                table: Some(right.name.clone()),
+                name: col.clone(),
+            })),
+        })
+    });
+    let first = eqs.next().expect("non-empty cols");
+    Ok(eqs.fold(first, |acc, next| {
+        ExprNode::Binary(crate::ast::expressions::BinaryOpExpr {
+            op: Op::LogicAnd,
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
+    }))
 }
 
 /// Two-table DML only: reject n-table JOIN chains on UPDATE / DELETE.
@@ -4474,10 +4563,66 @@ fn lower_dml_table(table: &TableWithJoins) -> Result<(TableName, Option<Join>)> 
     }
 }
 
-/// Resolve a FROM item. Derived tables flatten to synthetic CTEs named by alias.
-fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpression>)> {
+fn check_duplicate_field_names(names: &[String]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let key = name.to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if !seen.insert(key) {
+            return Err(Error::new(
+                ERR_DUP_FIELDNAME,
+                format!("Duplicate column name '{name}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn derived_select_names(query: &SelectStmt) -> Result<Vec<String>> {
+    let mut names = Vec::with_capacity(query.fields.len());
+    for field in &query.fields {
+        if let Some(as_name) = &field.as_name
+            && !as_name.is_empty()
+        {
+            names.push(as_name.clone());
+            continue;
+        }
+        // `SELECT *` is lowered as Value(Bytes("*")); uniqueness checked after
+        // schema expansion (second --error 1060 case in select.test).
+        if matches!(&field.expr, ExprNode::Value(v) if matches!(&v.datum, Datum::Bytes(b) if b == b"*"))
+        {
+            names.push(String::new());
+            continue;
+        }
+        names.push(match &field.expr {
+            ExprNode::Column(col) => col.name.clone(),
+            ExprNode::Value(v) => match &v.datum {
+                Datum::I64(n) => n.to_string(),
+                Datum::U64(n) => n.to_string(),
+                Datum::F64(n) => n.to_string(),
+                Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                Datum::Null => "NULL".to_string(),
+                other => format!("{other:?}"),
+            },
+            other => other.restore_string(),
+        });
+    }
+    Ok(names)
+}
+
+/// Resolve a FROM item. Returns `(physical_name, alias_for_on, ctes)`.
+/// Derived tables flatten to synthetic CTEs named by alias.
+fn table_factor(
+    factor: &TableFactor,
+) -> Result<(TableName, Option<String>, Vec<CommonTableExpression>)> {
     match factor {
-        TableFactor::Table { name, .. } => Ok((object_table_name(name)?, Vec::new())),
+        TableFactor::Table { name, alias, .. } => {
+            let physical = object_table_name(name)?;
+            let alias = alias.as_ref().map(|a| a.name.value.clone());
+            Ok((physical, alias, Vec::new()))
+        }
         TableFactor::Derived {
             lateral,
             subquery,
@@ -4499,21 +4644,60 @@ fn table_factor(factor: &TableFactor) -> Result<(TableName, Vec<CommonTableExpre
             if ctes.iter().any(|cte| cte.name.eq_ignore_ascii_case(&name)) {
                 return Err(Error::unsupported("duplicate CTE name"));
             }
+            let col_name_list: Vec<String> = alias
+                .columns
+                .iter()
+                .map(|col| col.name.value.clone())
+                .collect();
+            // TiDB/MySQL: derived table column names must be unique (errno 1060).
+            let names = if col_name_list.is_empty() {
+                derived_select_names(&query)?
+            } else {
+                col_name_list.clone()
+            };
+            check_duplicate_field_names(&names)?;
             ctes.push(CommonTableExpression {
                 name: name.clone(),
                 query: Box::new(query),
-                col_name_list: alias
-                    .columns
-                    .iter()
-                    .map(|col| col.name.value.clone())
-                    .collect(),
+                col_name_list,
                 recursive: None,
                 set_rest: Vec::new(),
                 materialize: CteMaterialize::Default,
             });
-            Ok((TableName::new(None, name), ctes))
+            // CTE physical name is the alias; ON refs already use that name.
+            Ok((TableName::new(None, name), None, ctes))
         }
         other => Err(Error::unsupported(format!("FROM {other}"))),
+    }
+}
+
+/// Rewrite `alias.col` → `physical.col` so HashJoin key split sees real table names.
+fn rewrite_join_on_aliases(
+    expr: ExprNode,
+    aliases: &[(String, String)],
+) -> ExprNode {
+    match expr {
+        ExprNode::Column(mut col) => {
+            if let Some(table) = col.table.as_deref() {
+                for (alias, physical) in aliases {
+                    if table.eq_ignore_ascii_case(alias) {
+                        col.table = Some(physical.clone());
+                        break;
+                    }
+                }
+            }
+            ExprNode::Column(col)
+        }
+        ExprNode::Binary(mut b) => {
+            b.left = Box::new(rewrite_join_on_aliases(*b.left, aliases));
+            b.right = Box::new(rewrite_join_on_aliases(*b.right, aliases));
+            ExprNode::Binary(b)
+        }
+        ExprNode::Unary(mut u) => {
+            u.expr = Box::new(rewrite_join_on_aliases(*u.expr, aliases));
+            ExprNode::Unary(u)
+        }
+        other => other,
     }
 }
 
@@ -4645,7 +4829,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
                     if !twj.joins.is_empty() {
                         return Err(Error::unsupported("JOIN in DELETE FROM list"));
                     }
-                    let (name, ctes) = table_factor(&twj.relation)?;
+                    let (name, _alias, ctes) = table_factor(&twj.relation)?;
                     if !ctes.is_empty() {
                         return Err(Error::unsupported("derived table in UPDATE/DELETE"));
                     }
@@ -5836,10 +6020,38 @@ fn lower_value(value: &Value) -> Result<Datum> {
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
             Ok(Datum::Bytes(s.as_bytes().to_vec()))
         }
+        Value::HexStringLiteral(hex) => Ok(Datum::Bytes(decode_hex_literal(hex)?)),
         Value::Boolean(b) => Ok(Datum::I64(i64::from(*b))),
         Value::Null => Ok(Datum::Null),
         other => Err(Error::unsupported(format!("literal {other}"))),
     }
+}
+
+/// Decode `X'ABCD'` / `0xABCD` hex digits into raw bytes (TiDB binary literal).
+fn decode_hex_literal(hex: &str) -> Result<Vec<u8>> {
+    let h = hex.as_bytes();
+    if h.len() % 2 != 0 {
+        return Err(Error::new(
+            ERR_PARSE_ERROR,
+            format!("Incorrect hex literal: {hex}"),
+        ));
+    }
+    let mut out = Vec::with_capacity(h.len() / 2);
+    let nibble = |c: u8| -> Result<u8> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(Error::new(
+                ERR_PARSE_ERROR,
+                format!("Incorrect hex literal: {hex}"),
+            )),
+        }
+    };
+    for i in (0..h.len()).step_by(2) {
+        out.push((nibble(h[i])? << 4) | nibble(h[i + 1])?);
+    }
+    Ok(out)
 }
 
 /// Lower `left op ANY|ALL (subquery)`.
@@ -6264,6 +6476,21 @@ mod unicode_literal_tests {
                 assert_eq!(d1, &Datum::Bytes("ß".as_bytes().to_vec()));
             }
             other => panic!("expected select, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hex_literal_tests {
+    use super::*;
+    use crate::ast::expressions::ExprNode;
+
+    #[test]
+    fn lower_0x80() {
+        let expr = crate::sqlparser_bridge::parse_expr("0x80").unwrap();
+        match expr {
+            ExprNode::Value(v) => assert_eq!(v.datum, Datum::Bytes(vec![0x80])),
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

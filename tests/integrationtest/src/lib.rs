@@ -1,17 +1,24 @@
 //! TiDB-style SQL integration tester (`tests/integrationtest`).
 //!
-//! Reads `t/*.test`, executes each statement through `Session`, and
-//! compares against `r/*.result` in mysql-tester form:
-//! echoed SQL, tab-separated header/rows, or `Error code (sqlstate): msg`.
+//! Reads `t/**/*.test`, executes each statement through `Session`, and
+//! compares against `r/**/*.result` in mysql-tester form.
 //!
-//! Each suite runs on MemStorage and, when PD is reachable, on TiKV.
-//! Completeness wave: `connect`/`connection` multi-session, stats `s/*.json`,
-//! live MySQL-protocol mysql-tester against `--listen`.
+//! Suite selection is gated by `project/regression/manifest.json`:
+//! - default / CI: `green` + `local`
+//! - `SEALDB_ITEST_RUN_IN_PROGRESS=1`: also `in_progress`
+//! - `SEALDB_ITEST_RUN_PENDING=1`: also `pending` (expect failures; TDD triage)
+//! - `deferred` never runs unless `--status deferred` explicitly
+//!
+//! Authoritative goldens come from TiDB (`project/scripts/record_tidb_itest.sh`).
+//! SealDB `--record` requires `SEALDB_ITEST_ALLOW_SEALDB_RECORD=1` and refuses
+//! non-`local/` suites.
 
 use sealdb_config::Config;
 use sealdb_domain::Domain;
 use sealdb_errno::{Error, Result};
 use sealdb_session::Session;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +59,12 @@ pub struct RunOptions {
     pub stores: Vec<StoreBackend>,
     pub require_tikv: bool,
     pub pd: Option<String>,
+    /// If set, only suites whose manifest status is in this list.
+    pub statuses: Option<Vec<String>>,
+    /// If set, only suites whose manifest wave is in this list (e.g. R1).
+    pub waves: Option<Vec<String>>,
+    /// When true, missing golden is a hard error (default). When false, skip.
+    pub require_golden: bool,
 }
 
 impl Default for RunOptions {
@@ -62,6 +75,9 @@ impl Default for RunOptions {
             stores: vec![StoreBackend::Memory, StoreBackend::Tikv],
             require_tikv: require_tikv_from_env(),
             pd: None,
+            statuses: None,
+            waves: None,
+            require_golden: true,
         }
     }
 }
@@ -71,6 +87,7 @@ pub struct RunReport {
     pub memory: usize,
     pub tikv: usize,
     pub tikv_skipped: bool,
+    pub skipped_suites: usize,
 }
 
 impl RunReport {
@@ -92,10 +109,84 @@ pub struct Suite {
     pub test_path: PathBuf,
     pub result_path: PathBuf,
     pub steps: Vec<Step>,
+    pub status: String,
+    pub wave: String,
+    pub owner_hint: String,
+    pub skip_tikv: bool,
+    /// Set when `t/*.test` uses directives SealDB cannot parse yet.
+    pub load_error: Option<String>,
+}#[derive(Debug, Deserialize)]
+struct ManifestFile {
+    suites: Vec<ManifestSuite>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ManifestSuite {
+    pub name: String,
+    pub wave: String,
+    pub status: String,
+    #[serde(default)]
+    pub owner_hint: String,
+    /// When true, suite is skipped on TiKV (e.g. SAVEPOINT until driver parity).
+    #[serde(default)]
+    pub skip_tikv: bool,
+}
 pub fn testdata_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+pub fn workspace_root() -> PathBuf {
+    testdata_root()
+        .parent()
+        .and_then(|p| p.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn manifest_path() -> PathBuf {
+    workspace_root().join("project/regression/manifest.json")
+}
+
+pub fn load_manifest(path: &Path) -> Result<HashMap<String, ManifestSuite>> {
+    if !path.is_file() {
+        return Ok(HashMap::new());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
+    let doc: ManifestFile = serde_json::from_str(&raw)
+        .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, format!("manifest: {e}")))?;
+    Ok(doc
+        .suites
+        .into_iter()
+        .map(|s| (s.name.clone(), s))
+        .collect())
+}
+
+fn default_status_allowlist() -> HashSet<String> {
+    let mut set = HashSet::from([
+        "green".to_string(),
+        "local".to_string(),
+    ]);
+    if env_flag("SEALDB_ITEST_RUN_IN_PROGRESS") {
+        set.insert("in_progress".to_string());
+    }
+    if env_flag("SEALDB_ITEST_RUN_PENDING") {
+        set.insert("pending".to_string());
+    }
+    if env_flag("SEALDB_ITEST_RUN_DEFERRED") {
+        set.insert("deferred".to_string());
+    }
+    set
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 pub fn parse_test(src: &str) -> Result<Vec<Step>> {
@@ -121,12 +212,23 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 sorted = true;
                 continue;
             }
+            // TiDB directives we do not yet honor: skip with clear error on use.
+            if rest.eq_ignore_ascii_case("enable_query_log")
+                || rest.eq_ignore_ascii_case("disable_query_log")
+                || strip_prefix_ci(rest, "connect").is_some()
+                || strip_prefix_ci(rest, "connection").is_some()
+                || strip_prefix_ci(rest, "sleep").is_some()
+            {
+                return Err(Error::unsupported(format!("test directive -- {rest}")));
+            }
             return Err(Error::unsupported(format!("test directive -- {rest}")));
         }
         if !buf.is_empty() {
             buf.push('\n');
         }
-        buf.push_str(line.trim_end());
+        // TiDB mysql-tester strips leading whitespace on each SQL line in
+        // result files (CREATE TABLE columns appear flush-left).
+        buf.push_str(trimmed);
         if trimmed.ends_with(';') {
             steps.push(Step {
                 sql: buf.trim().to_string(),
@@ -171,13 +273,20 @@ pub fn load_suites(root: &Path) -> Result<Vec<Suite>> {
             format!("missing {}", t_dir.display()),
         ));
     }
+    let manifest = load_manifest(&manifest_path())?;
     let mut suites = Vec::new();
-    collect_tests(&t_dir, &t_dir, root, &mut suites)?;
+    collect_tests(&t_dir, &t_dir, root, &manifest, &mut suites)?;
     suites.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(suites)
 }
 
-fn collect_tests(dir: &Path, t_root: &Path, root: &Path, out: &mut Vec<Suite>) -> Result<()> {
+fn collect_tests(
+    dir: &Path,
+    t_root: &Path,
+    root: &Path,
+    manifest: &HashMap<String, ManifestSuite>,
+    out: &mut Vec<Suite>,
+) -> Result<()> {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?
         .collect::<std::io::Result<Vec<_>>>()
@@ -186,7 +295,7 @@ fn collect_tests(dir: &Path, t_root: &Path, root: &Path, out: &mut Vec<Suite>) -
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            collect_tests(&path, t_root, root, out)?;
+            collect_tests(&path, t_root, root, manifest, out)?;
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("test") {
@@ -194,26 +303,71 @@ fn collect_tests(dir: &Path, t_root: &Path, root: &Path, out: &mut Vec<Suite>) -
         }
         let rel = path.strip_prefix(t_root).unwrap().with_extension("result");
         let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
+        let (status, wave, owner_hint, skip_tikv) = if let Some(m) = manifest.get(&name) {
+            (
+                m.status.clone(),
+                m.wave.clone(),
+                m.owner_hint.clone(),
+                m.skip_tikv,
+            )
+        } else if name.starts_with("local/") {
+            (
+                "local".to_string(),
+                "local".to_string(),
+                "sealdb smoke".to_string(),
+                name == "local/txn",
+            )
+        } else {
+            ("pending".to_string(), "R7".to_string(), String::new(), false)
+        };
         let src = fs::read_to_string(&path)
             .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
+        let (steps, load_error) = match parse_test(&src) {
+            Ok(s) => (s, None),
+            Err(err) => (Vec::new(), Some(format!("suite {name}: {}", err.message))),
+        };
         out.push(Suite {
             name,
             test_path: path,
             result_path: root.join("r").join(rel),
-            steps: parse_test(&src)?,
+            steps,
+            status,
+            wave,
+            owner_hint,
+            skip_tikv,
+            load_error,
         });
     }
     Ok(())
 }
 
+fn suite_allowed(suite: &Suite, opts: &RunOptions) -> bool {
+    if let Some(filter) = opts.filter.as_deref() {
+        // Exact name, path suffix, or basename match — avoid `-t select`
+        // accidentally matching `access_path_selection`.
+        let name = suite.name.as_str();
+        let ok = name == filter
+            || name.ends_with(&format!("/{filter}"))
+            || name.rsplit('/').next() == Some(filter);
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(waves) = opts.waves.as_ref()
+        && !waves.iter().any(|w| w.eq_ignore_ascii_case(&suite.wave))
+    {
+        return false;
+    }
+    let allow = opts
+        .statuses
+        .clone()
+        .map(|v| v.into_iter().collect::<HashSet<_>>())
+        .unwrap_or_else(default_status_allowlist);
+    allow.contains(&suite.status)
+}
+
 fn require_tikv_from_env() -> bool {
-    matches!(
-        std::env::var("SEALDB_ITEST_REQUIRE_TIKV")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes"
-    )
+    env_flag("SEALDB_ITEST_REQUIRE_TIKV")
 }
 
 fn unique_id_base() -> i64 {
@@ -240,7 +394,13 @@ fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
 }
 
 pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<String> {
+    if let Some(err) = suite.load_error.as_ref() {
+        return Err(Error::unsupported(err.clone()));
+    }
     let session = new_session(storage);
+    // TiDB integrationtest defaults to database `test` (mysql-tester convention).
+    let _ = session.execute_stmt("CREATE DATABASE IF NOT EXISTS test");
+    let _ = session.execute_stmt("USE test");
     let mut chunks = Vec::new();
     for step in &suite.steps {
         chunks.push(run_step(&session, step)?);
@@ -287,8 +447,52 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
     }
 }
 
+fn unified_diff(expected: &str, actual: &str, limit: usize) -> String {
+    let exp: Vec<&str> = expected.lines().collect();
+    let act: Vec<&str> = actual.lines().collect();
+    let mut out = String::new();
+    let total = exp.len().max(act.len());
+    // Prefer showing the first differing window even when it starts past `limit`.
+    let first_diff = (0..total).find(|&i| {
+        exp.get(i).copied().unwrap_or("<missing>") != act.get(i).copied().unwrap_or("<missing>")
+    });
+    let start = first_diff.unwrap_or(0);
+    let end = (start + limit).min(total);
+    for i in start..end {
+        let e = exp.get(i).copied().unwrap_or("<missing>");
+        let a = act.get(i).copied().unwrap_or("<missing>");
+        if e != a {
+            out.push_str(&format!("@@ line {} @@\n- {e}\n+ {a}\n", i + 1));
+        }
+    }
+    if total > end {
+        out.push_str(&format!(
+            "... diff truncated (exp={}, act={}, showed {start}..{end})\n",
+            exp.len(),
+            act.len()
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("(no line diff; check trailing newline/whitespace)\n");
+    }
+    out
+}
+
 pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
     let actual = run_suite(suite, storage)?;
+    if let Ok(path) = std::env::var("SEALDB_ITEST_DUMP_ACTUAL") {
+        let _ = fs::write(&path, &actual);
+    }
+    if !suite.result_path.is_file() {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!(
+                "suite {} missing golden {} (record via project/scripts/record_tidb_itest.sh)",
+                suite.name,
+                suite.result_path.display()
+            ),
+        ));
+    }
     let expected = fs::read_to_string(&suite.result_path).map_err(|e| {
         Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
@@ -296,18 +500,55 @@ pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Res
         )
     })?;
     if normalize(&actual) != normalize(&expected) {
+        let hint = if suite.owner_hint.is_empty() {
+            String::new()
+        } else {
+            format!("\nowner_hint: {}\n", suite.owner_hint)
+        };
         return Err(Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
             format!(
-                "suite {} result mismatch\n--- expected ---\n{}--- actual ---\n{}",
-                suite.name, expected, actual
+                "suite {} [{}|{}] result mismatch{hint}\n--- diff ---\n{}--- expected (head) ---\n{}--- actual (head) ---\n{}",
+                suite.name,
+                suite.wave,
+                suite.status,
+                unified_diff(&expected, &actual, 40),
+                head_chars(&expected, 1200),
+                head_chars(&actual, 1200),
             ),
         ));
     }
     Ok(())
 }
 
+fn head_chars(s: &str, n: usize) -> String {
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(n).collect();
+    if it.next().is_some() {
+        format!("{head}\n...\n")
+    } else {
+        head
+    }
+}
+
 pub fn record_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
+    if !env_flag("SEALDB_ITEST_ALLOW_SEALDB_RECORD") {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            "SealDB --record is forbidden for authoritative goldens; \
+             use project/scripts/record_tidb_itest.sh, or set \
+             SEALDB_ITEST_ALLOW_SEALDB_RECORD=1 for local/ experimental only",
+        ));
+    }
+    if !suite.name.starts_with("local/") {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!(
+                "refusing to record non-local suite {} from SealDB; use TiDB recorder",
+                suite.name
+            ),
+        ));
+    }
     let actual = run_suite(suite, storage)?;
     if let Some(parent) = suite.result_path.parent() {
         fs::create_dir_all(parent)
@@ -330,20 +571,24 @@ fn run_backend(
     backend: StoreBackend,
     opts: &RunOptions,
     record: bool,
-) -> Result<(usize, bool)> {
+) -> Result<(usize, usize, bool)> {
     let storage = match open_storage(backend, opts.pd.as_deref()) {
         Ok(storage) => storage,
         Err(err) if backend == StoreBackend::Tikv && !opts.require_tikv => {
             eprintln!("skip tikv integrationtest: {err}");
-            return Ok((0, true));
+            return Ok((0, 0, true));
         }
         Err(err) => return Err(err),
     };
     let mut ran = 0;
+    let mut skipped = 0;
     for suite in suites {
-        if let Some(filter) = opts.filter.as_deref()
-            && !suite.name.contains(filter)
-        {
+        if !suite_allowed(suite, opts) {
+            skipped += 1;
+            continue;
+        }
+        if backend == StoreBackend::Tikv && suite.skip_tikv {
+            skipped += 1;
             continue;
         }
         if record {
@@ -353,13 +598,7 @@ fn run_backend(
         }
         ran += 1;
     }
-    if ran == 0 {
-        return Err(Error::new(
-            sealdb_errno::ERR_UNKNOWN_ERROR,
-            format!("no integrationtest suites matched on {}", backend.as_str()),
-        ));
-    }
-    Ok((ran, false))
+    Ok((ran, skipped, false))
 }
 
 pub fn run_all(root: &Path, opts: &RunOptions) -> Result<RunReport> {
@@ -372,22 +611,28 @@ pub fn run_all(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     let mut report = RunReport::default();
     let mut recorded = false;
     for backend in stores {
-        let (ran, skipped) = run_backend(&suites, backend, opts, opts.record && !recorded)?;
+        let (ran, skipped, tikv_skipped) =
+            run_backend(&suites, backend, opts, opts.record && !recorded)?;
         if opts.record && ran > 0 {
             recorded = true;
         }
+        report.skipped_suites = skipped;
         match backend {
             StoreBackend::Memory => report.memory = ran,
             StoreBackend::Tikv => {
                 report.tikv = ran;
-                report.tikv_skipped = skipped;
+                report.tikv_skipped = tikv_skipped;
             }
         }
     }
     if report.ran() == 0 && !report.tikv_skipped {
         return Err(Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
-            "no integrationtest suites matched",
+            format!(
+                "no integrationtest suites matched (skipped={}); \
+                 check manifest statuses / --status / --wave / -t filter",
+                report.skipped_suites
+            ),
         ));
     }
     Ok(report)
@@ -409,12 +654,26 @@ mod tests {
     }
 
     #[test]
-    fn test_all_suites_memory() {
+    fn test_manifest_loaded() {
+        let m = load_manifest(&manifest_path()).unwrap();
+        assert!(
+            m.len() > 100,
+            "expected imported TiDB suites in manifest, got {}",
+            m.len()
+        );
+        assert!(m.values().any(|s| s.status == "local"));
+        assert!(m.values().any(|s| s.status == "deferred"));
+    }
+
+    #[test]
+    fn test_ci_suites_memory() {
+        // CI gate: only green + local (default allowlist).
         let report = run_all(
             &testdata_root(),
             &RunOptions {
                 stores: vec![StoreBackend::Memory],
                 require_tikv: false,
+                statuses: Some(vec!["green".into(), "local".into()]),
                 ..RunOptions::default()
             },
         )
@@ -424,12 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn test_all_suites_tikv() {
+    fn test_ci_suites_tikv() {
         let report = run_all(
             &testdata_root(),
             &RunOptions {
                 stores: vec![StoreBackend::Tikv],
                 require_tikv: false,
+                statuses: Some(vec!["green".into(), "local".into()]),
                 ..RunOptions::default()
             },
         )

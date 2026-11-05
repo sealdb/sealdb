@@ -2078,6 +2078,8 @@ dependencies = [
  "sealdb-kv",
  "sealdb-session",
  "sealdb-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

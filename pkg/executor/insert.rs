@@ -152,9 +152,16 @@ fn write_row(
     values: &[Datum],
 ) -> Result<()> {
     let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
-    let handle = match values.first() {
-        Some(Datum::I64(v)) => *v,
-        _ => domain.next_handle(info.id)?,
+    // Integer primary-key handle only when `pk_is_handle`; otherwise allocate
+    // a unique _tidb_rowid (TiDB heap table). Using the first INT column as
+    // handle collapses rows that share the same c1 (select.test bool field).
+    let handle = if info.pk_is_handle {
+        match values.first() {
+            Some(Datum::I64(v)) => *v,
+            _ => domain.next_handle(info.id)?,
+        }
+    } else {
+        domain.next_handle(info.id)?
     };
     let physical_id = locate_partition_for_row(info, values)?;
     let key = encode_row_key_with_handle(physical_id, handle);

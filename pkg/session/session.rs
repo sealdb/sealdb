@@ -553,12 +553,18 @@ impl Session {
             mdl_guard.active = false;
             return self.execute_one(&Statement::Insert(insert));
         }
+        if needs_user_var_subst(&expanded) {
+            expanded = subst_user_vars_in_stmt(self, &expanded);
+        }
         let stmt = &expanded;
         if let Some(result) = try_eval_nextval(self, stmt, &current_db)? {
             drop(mdl_guard);
             return Ok(result);
         }
         check_only_full_group_by(self, stmt)?;
+        if let Some(result) = system_var_result(self, stmt) {
+            return Ok(result);
+        }
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         // Prepared EXECUTE may override with the unbound `?` template key.
@@ -604,9 +610,6 @@ impl Session {
                 prune_mode,
             )?
         };
-        if let Some(result) = system_var_result(self, stmt) {
-            return Ok(result);
-        }
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
         let exec = if matches!(&plan, PhysicalPlan::DDL { .. }) {
             Box::new(DDLExec::new(
@@ -1296,6 +1299,179 @@ fn resolve_exec_params(session: &Session, params: &[ExprNode]) -> Result<Vec<Exp
         .collect()
 }
 
+fn needs_user_var_subst(stmt: &Statement) -> bool {
+    let Statement::Select(select) = stmt else {
+        return false;
+    };
+    select.fields.iter().any(|f| expr_has_session_var(&f.expr))
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(|e| expr_has_session_var(e))
+}
+
+fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> bool {
+    col.name.starts_with("@@")
+        || col
+            .table
+            .as_deref()
+            .is_some_and(|t| t.starts_with('@'))
+}
+
+/// TiDB-style select-list name for expressions that mention session vars.
+fn session_var_field_name(expr: &ExprNode) -> String {
+    match expr {
+        ExprNode::Column(col) => col.name.clone(),
+        ExprNode::Binary(b) => {
+            let left = session_var_field_name(&b.left);
+            let right = match b.right.as_ref() {
+                ExprNode::Value(v) => match &v.datum {
+                    sealdb_types::Datum::Bytes(bytes) => {
+                        format!("\"{}\"", String::from_utf8_lossy(bytes))
+                    }
+                    other => literal_field_name(other),
+                },
+                other => session_var_field_name(other),
+            };
+            format!("{left} {} {right}", b.op.restore())
+        }
+        other => other.restore_string(),
+    }
+}
+
+fn expr_has_session_var(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Column(col) => is_user_var_name(&col.name) || is_system_var_column(col),
+        ExprNode::Binary(b) => expr_has_session_var(&b.left) || expr_has_session_var(&b.right),
+        ExprNode::Unary(u) => expr_has_session_var(&u.expr),
+        ExprNode::Func(f) => f.args.iter().any(expr_has_session_var),
+        ExprNode::Cast(c) => expr_has_session_var(&c.expr),
+        ExprNode::InList(i) => {
+            expr_has_session_var(&i.expr) || i.list.iter().any(expr_has_session_var)
+        }
+        ExprNode::Between(b) => {
+            expr_has_session_var(&b.expr)
+                || expr_has_session_var(&b.low)
+                || expr_has_session_var(&b.high)
+        }
+        ExprNode::Like(l) => expr_has_session_var(&l.expr) || expr_has_session_var(&l.pattern),
+        ExprNode::IsNull(i) => expr_has_session_var(&i.expr),
+        _ => false,
+    }
+}
+
+fn subst_user_vars_in_stmt(session: &Session, stmt: &Statement) -> Statement {
+    let Statement::Select(select) = stmt else {
+        return stmt.clone();
+    };
+    let mut select = select.clone();
+    select.fields = select
+        .fields
+        .into_iter()
+        .map(|mut field| {
+            // Preserve TiDB display names (`@@autocommit`, `@b + "123"`) when
+            // substituting vars to Values for evaluation.
+            if field.as_name.as_ref().map_or(true, |s| s.is_empty())
+                && expr_has_session_var(&field.expr)
+            {
+                field.as_name = Some(session_var_field_name(&field.expr));
+            }
+            field.expr = subst_user_vars_in_expr(session, &field.expr);
+            field
+        })
+        .collect();
+    if let Some(sel) = select.selection.take() {
+        select.selection = Some(subst_user_vars_in_expr(session, &sel));
+    }
+    Statement::Select(select)
+}
+
+fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
+    match expr {
+        ExprNode::Column(col) if is_user_var_name(&col.name) => {
+            let key = user_var_key(&col.name);
+            let datum = session
+                .user_vars
+                .lock()
+                .expect("session user vars lock")
+                .get(&key)
+                .cloned()
+                .unwrap_or(sealdb_types::Datum::Null);
+            ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr { datum })
+        }
+        ExprNode::Column(col) if is_system_var_column(col) => {
+            let global = col
+                .table
+                .as_deref()
+                .map(|t| t.trim_start_matches('@').eq_ignore_ascii_case("global"))
+                .unwrap_or(false);
+            let name = col.name.trim_start_matches('@').to_ascii_lowercase();
+            let value = if global {
+                read_global_sysvar(session, &name)
+            } else {
+                read_session_sysvar(session, &name)
+            };
+            let datum = match value {
+                Some(v) => sealdb_types::Datum::Bytes(v.into_bytes()),
+                None => sealdb_types::Datum::Null,
+            };
+            ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr { datum })
+        }
+        ExprNode::Binary(b) => ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: b.op,
+            left: Box::new(subst_user_vars_in_expr(session, &b.left)),
+            right: Box::new(subst_user_vars_in_expr(session, &b.right)),
+        }),
+        ExprNode::Unary(u) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+            op: u.op,
+            expr: Box::new(subst_user_vars_in_expr(session, &u.expr)),
+        }),
+        ExprNode::Func(f) => {
+            let mut f = f.clone();
+            f.args = f
+                .args
+                .iter()
+                .map(|a| subst_user_vars_in_expr(session, a))
+                .collect();
+            ExprNode::Func(f)
+        }
+        ExprNode::Cast(c) => {
+            let mut c = c.clone();
+            c.expr = Box::new(subst_user_vars_in_expr(session, &c.expr));
+            ExprNode::Cast(c)
+        }
+        ExprNode::InList(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(subst_user_vars_in_expr(session, &i.expr));
+            i.list = i
+                .list
+                .iter()
+                .map(|a| subst_user_vars_in_expr(session, a))
+                .collect();
+            ExprNode::InList(i)
+        }
+        ExprNode::Between(b) => {
+            let mut b = b.clone();
+            b.expr = Box::new(subst_user_vars_in_expr(session, &b.expr));
+            b.low = Box::new(subst_user_vars_in_expr(session, &b.low));
+            b.high = Box::new(subst_user_vars_in_expr(session, &b.high));
+            ExprNode::Between(b)
+        }
+        ExprNode::Like(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(subst_user_vars_in_expr(session, &l.expr));
+            l.pattern = Box::new(subst_user_vars_in_expr(session, &l.pattern));
+            ExprNode::Like(l)
+        }
+        ExprNode::IsNull(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(subst_user_vars_in_expr(session, &i.expr));
+            ExprNode::IsNull(i)
+        }
+        other => other.clone(),
+    }
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
     for a in &stmt.assignments {
         if is_user_var_name(&a.name) {
@@ -1384,6 +1560,9 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .expect("session auto analyze ratio lock") = ratio;
             }
             "autocommit" | "unique_checks" | "foreign_key_checks" => {}
+            // TiDB session vars used by integrationtest setup; accept as no-op
+            // until the matching subsystem is wired (cost model, concurrency, …).
+            other if other.starts_with("tidb_") => {}
             other => {
                 return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
             }
@@ -1432,34 +1611,46 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     let mut columns = Vec::new();
     let mut row = Vec::new();
     for field in &select.fields {
-        let ExprNode::Column(col) = &field.expr else {
-            return None;
-        };
-        columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
-        if is_user_var_name(&col.name) {
-            let key = user_var_key(&col.name);
-            let datum = session
-                .user_vars
-                .lock()
-                .expect("session user vars lock")
-                .get(&key)
-                .cloned()
-                .unwrap_or(sealdb_types::Datum::Null);
-            row.push(datum);
-            continue;
+        match &field.expr {
+            ExprNode::Value(v) => {
+                let name = field
+                    .as_name
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| literal_field_name(&v.datum));
+                columns.push(name);
+                row.push(v.datum.clone());
+            }
+            ExprNode::Column(col) => {
+                columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
+                if is_user_var_name(&col.name) {
+                    let key = user_var_key(&col.name);
+                    let datum = session
+                        .user_vars
+                        .lock()
+                        .expect("session user vars lock")
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or(sealdb_types::Datum::Null);
+                    row.push(datum);
+                    continue;
+                }
+                let global = col
+                    .table
+                    .as_deref()
+                    .map(|t| t.trim_start_matches('@').eq_ignore_ascii_case("global"))
+                    .unwrap_or(false);
+                let name = col.name.trim_start_matches('@').to_ascii_lowercase();
+                let value = if global {
+                    read_global_sysvar(session, &name)?
+                } else {
+                    read_session_sysvar(session, &name)?
+                };
+                row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
+            }
+            // Binary / func mixes (e.g. `@b + "123"`) fall through to planner.
+            _ => return None,
         }
-        let global = col
-            .table
-            .as_deref()
-            .map(|t| t.trim_start_matches('@').eq_ignore_ascii_case("global"))
-            .unwrap_or(false);
-        let name = col.name.trim_start_matches('@').to_ascii_lowercase();
-        let value = if global {
-            read_global_sysvar(session, &name)?
-        } else {
-            read_session_sysvar(session, &name)?
-        };
-        row.push(sealdb_types::Datum::Bytes(value.into_bytes()));
     }
     if columns.is_empty() {
         return None;
@@ -1468,6 +1659,17 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
         columns,
         rows: vec![row],
     })
+}
+
+fn literal_field_name(datum: &sealdb_types::Datum) -> String {
+    match datum {
+        sealdb_types::Datum::I64(n) => n.to_string(),
+        sealdb_types::Datum::U64(n) => n.to_string(),
+        sealdb_types::Datum::F64(n) => n.to_string(),
+        sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        sealdb_types::Datum::Null => "NULL".into(),
+        other => format!("{other:?}"),
+    }
 }
 
 fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
@@ -1514,6 +1716,9 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .lock()
             .expect("session auto analyze ratio lock")
             .to_string(),
+        "autocommit" => "1".into(),
+        // Common TiDB session vars referenced by integrationtest; defaults.
+        other if other.starts_with("tidb_") => "0".into(),
         _ => return None,
     })
 }

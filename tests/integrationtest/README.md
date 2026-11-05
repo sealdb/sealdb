@@ -1,67 +1,69 @@
-# SealDB SQL integration tests
+# SealDB SQL integration tests (TDD / TiDB parity)
 
-TiDB-shaped testdata runner: SQL in, real Session execution, expected I/O in `r/*.result`.
+TiDB-shaped testdata runner: SQL in, Session execution, expected I/O in `r/**/*.result`.
 
 ```text
-t/*.test     input scripts (mysql-tester dialect)
-r/*.result   golden output (echoed SQL + TSV / Error line)
+t/**/*.test     input scripts (mysql-tester dialect)
+r/**/*.result   golden output (echoed SQL + TSV / Error line) — TiDB-authoritative
+s/*.json        stats dumps (from TiDB s.zip)
+t/local/        SealDB smoke suites (non-TiDB goldens; status=local)
+project/regression/manifest.json   suite status machine
 ```
 
-Each `.test` file runs twice: a fresh `Session` on **MemStorage**, then the same script on **TiKV** (PD `127.0.0.1:2379` by default). SQL I/O goldens are store-independent. TiKV sessions seed unique table IDs so leftover row keys from a previous process do not leak into `SELECT *`. If PD is down, TiKV is skipped unless `--require-tikv` / `SEALDB_ITEST_REQUIRE_TIKV=1`.
+## Golden policy (hard)
+
+| Action | Allowed? |
+|---|---|
+| Refresh goldens with **TiDB** `project/scripts/record_tidb_itest.sh` | **Yes** (authoritative) |
+| `sealdb-itest --record` / `run-tests.sh -r` on TiDB corpus | **No** |
+| SealDB record for `t/local/*` only | Only with `SEALDB_ITEST_ALLOW_SEALDB_RECORD=1` |
+
+Import / refresh corpus:
+
+```bash
+./project/scripts/import_tidb_itest.sh
+./project/scripts/record_tidb_itest.sh -t select -r   # needs tidb-server
+```
+
+## Manifest statuses
+
+| Status | Default CI | Meaning |
+|---|---|---|
+| `local` | runs | SealDB smoke under `t/local/` |
+| `green` | runs | Matches TiDB golden |
+| `in_progress` | opt-in | Active TDD wave (`SEALDB_ITEST_RUN_IN_PROGRESS=1` or `--status in_progress`) |
+| `pending` | opt-in | Imported, not started (`SEALDB_ITEST_RUN_PENDING=1`) |
+| `deferred` | skip | TiFlash / MPP / TiSpark |
+
+Waves: `R1`…`R7`, `D`, `local` (see manifest `wave` field).
 
 ## Directives
 
 | Line | Meaning |
 |---|---|
-| `# ...` | Comment, dropped |
+| `# ...` | Comment |
 | `-- error N` / `--error N` | Next statement must fail with errno `N` |
-| `-- sorted_result` | Sort result rows before writing/comparing |
-| `SQL;` | Statement, including multi-line |
+| `-- sorted_result` | Sort result rows before compare |
+| `SQL;` | Statement |
 
-Unsupported (deferred): `connect` / `connection` multi-session, mysql-tester over `--listen`, `s/*.json` stats.
-
-Result format:
-
-```text
-SELECT 1 AS n;
-n
-1
-SELECT * FROM missing.t;
-Error 1146 (42S02): table missing.t does not exist
-```
+Unsupported (suite gets `load_error` until ported): `connect` / `connection`, sleep, query-log toggles, etc.
 
 ## Run
 
 ```bash
-# both stores (also `cargo test -p sealdb-integrationtest`)
-./tests/integrationtest/run-tests.sh
-
-# one backend
+# CI gate (green + local)
 ./tests/integrationtest/run-tests.sh -s memory
-./tests/integrationtest/run-tests.sh -s tikv --require-tikv
 
-# one suite on both stores
-./tests/integrationtest/run-tests.sh -t basic
+# one local suite
+./tests/integrationtest/run-tests.sh -t local/basic -s memory
 
-# rewrite goldens from MemStorage, then verify on TiKV
-./tests/integrationtest/run-tests.sh -r
+# TDD: triage a pending wave (expect failures)
+./tests/integrationtest/run-tests.sh --wave R1 --status pending -s memory -t select
 ```
 
-Or:
+## Adding a TiDB-aligned case
 
-```bash
-cargo run -p sealdb-integrationtest -- --store both
-cargo test -p sealdb-integrationtest --lib tests::test_all_suites_memory -- --exact
-cargo test -p sealdb-integrationtest --lib tests::test_all_suites_tikv -- --exact
-```
-
-## Adding a case
-
-1. Add `t/<name>.test` (or `t/<dir>/<name>.test`).
-2. Record: `./tests/integrationtest/run-tests.sh -r -t <name>`.
-3. Review `r/<name>.result` (do not check in unexpected errors).
-4. Re-run without `-r`; `cargo test -p sealdb-integrationtest` must pass.
-
-Do not dump the full TiDB `tests/integrationtest/t` tree: most suites use protocol/stats/features SealDB has not ported.
-
-Goldens must match current I/O, not hoped-for I/O. Table-scan Projection is in: `SELECT id AS i FROM t` emits one column.
+1. Ensure suite exists in TiDB `tests/integrationtest` and re-run `import_tidb_itest.sh`.
+2. Record/verify golden with `record_tidb_itest.sh -t <name> -r`.
+3. Set manifest status `in_progress`, fix SealDB until Gate A/B pass.
+4. Promote to `green`. Never edit TiDB goldens by hand to match SealDB.

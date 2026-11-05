@@ -1,6 +1,6 @@
 use crate::internal::exec::Executor;
 use sealdb_errno::Result;
-use sealdb_expression::eval_filter;
+use sealdb_expression::{eval_filter, validate_string_cmp_literals};
 use sealdb_parser::ast::ExprNode;
 use sealdb_util::chunk::Chunk;
 
@@ -105,6 +105,7 @@ impl SelectionExec {
 
 impl Executor for SelectionExec {
     fn open(&mut self) -> Result<()> {
+        validate_string_cmp_literals(&self.filter)?;
         self.child.open()
     }
 
