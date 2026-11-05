@@ -1989,3 +1989,26 @@ mod tests {
         }
     }
 }
+
+
+#[cfg(test)]
+mod timestamp_lit_parse {
+    use super::*;
+    use crate::ast::ExprNode;
+
+    #[test]
+    fn parse_ts_ok_and_err() {
+        let err = Parser::new()
+            .parse_one_stmt("SELECT TIMESTAMP '2024-01-01 14:00:00+01:00'")
+            .unwrap_err();
+        assert_eq!(err.code, 1292, "{err}");
+        let ok = Parser::new()
+            .parse_one_stmt("SELECT TIMESTAMP '2024-01-01 14:00:00'")
+            .unwrap();
+        let d = match &ok.as_select().unwrap().fields[0].expr {
+            ExprNode::Value(v) => &v.datum,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(d, sealdb_types::Datum::Time(_)), "{d:?}");
+    }
+}

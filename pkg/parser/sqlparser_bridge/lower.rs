@@ -37,7 +37,9 @@ use crate::opcode::Op;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result,
 };
-use sealdb_types::Datum;
+use sealdb_types::{
+    parse_date_literal, parse_time_literal, parse_timestamp_literal, Datum,
+};
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
@@ -52,8 +54,8 @@ use sqlparser::ast::{
     SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
     ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions,
     Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
-    Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, TypedString,
+    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
@@ -6646,6 +6648,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr: Box::new(lower_expr(expr)?),
             target: data_type_name(data_type),
         })),
+        Expr::TypedString(ts) => lower_typed_string(ts),
         Expr::Function(func) => lower_function(func),
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("null") => {
             Ok(ExprNode::Value(ValueExpr { datum: Datum::Null }))
@@ -6781,6 +6784,27 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             format!("expression {other} is not available in this phase"),
         )),
     }
+}
+
+fn lower_typed_string(ts: &TypedString) -> Result<ExprNode> {
+    let raw = ts
+        .value
+        .clone()
+        .into_string()
+        .ok_or_else(|| Error::unsupported(format!("typed string {}", ts)))?;
+    let time = match &ts.data_type {
+        DataType::Timestamp(_, _) | DataType::Datetime(_) => parse_timestamp_literal(&raw)?,
+        DataType::Date => parse_date_literal(&raw)?,
+        DataType::Time(_, _) => parse_time_literal(&raw)?,
+        other => {
+            return Err(Error::unsupported(format!(
+                "typed string type {other}"
+            )));
+        }
+    };
+    Ok(ExprNode::Value(ValueExpr {
+        datum: Datum::Time(time),
+    }))
 }
 
 fn lower_function(func: &Function) -> Result<ExprNode> {
