@@ -49,6 +49,7 @@ use sqlparser::ast::{
     NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
     OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
     SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
+    ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions,
     Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
     TransactionAccessMode, TransactionIsolationLevel, TransactionMode, UnaryOperator, Update, Use,
     Value, Values, WindowFrameBound as SqlWindowFrameBound,
@@ -665,6 +666,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     table: None,
                     user: None,
                     full: false,
+                    pattern: None,
                 }))
             } else {
                 Ok(Statement::Show(ShowStmt {
@@ -673,6 +675,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     table: Some(table),
                     user: None,
                     full: false,
+                    pattern: None,
                 }))
             }
         }
@@ -685,14 +688,17 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             table: Some(object_table_name(obj_name)?),
             user: None,
             full: false,
+            pattern: None,
         })),
-        SqlStatement::ShowDatabases { .. } | SqlStatement::ShowSchemas { .. } => {
+        SqlStatement::ShowDatabases { show_options, .. }
+        | SqlStatement::ShowSchemas { show_options, .. } => {
             Ok(Statement::Show(ShowStmt {
                 kind: ShowStmtKind::Databases,
                 db_name: None,
                 table: None,
                 user: None,
                 full: false,
+                pattern: show_like_pattern(show_options),
             }))
         }
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -706,6 +712,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             table: None,
             user: None,
             full: false,
+            pattern: show_like_pattern(show_options),
         })),
         SqlStatement::ShowCharset(_) => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Charset,
@@ -713,6 +720,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             table: None,
             user: None,
             full: false,
+            pattern: None,
         })),
         SqlStatement::ShowCollation { .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Collation,
@@ -720,6 +728,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             table: None,
             user: None,
             full: false,
+            pattern: None,
         })),
         SqlStatement::ShowColumns {
             full, show_options, ..
@@ -735,6 +744,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 table: Some(object_table_name(table)?),
                 user: None,
                 full: *full,
+                pattern: None,
             }))
         }
         SqlStatement::ExplainTable {
@@ -754,6 +764,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 table: Some(object_table_name(table_name)?),
                 user: None,
                 full: false,
+                pattern: None,
             }))
         }
         SqlStatement::Insert(insert) => {
@@ -5354,6 +5365,18 @@ fn lower_table_with_joins(
         prev_alias = right_alias;
     }
     Ok((left, out, ctes))
+}
+
+fn show_like_pattern(opts: &ShowStatementOptions) -> Option<String> {
+    match &opts.filter_position {
+        Some(
+            ShowStatementFilterPosition::Infix(ShowStatementFilter::Like(p))
+            | ShowStatementFilterPosition::Suffix(ShowStatementFilter::Like(p))
+            | ShowStatementFilterPosition::Infix(ShowStatementFilter::ILike(p))
+            | ShowStatementFilterPosition::Suffix(ShowStatementFilter::ILike(p)),
+        ) => Some(p.clone()),
+        _ => None,
+    }
 }
 
 fn using_column_names(names: &[ObjectName]) -> Result<Vec<String>> {
