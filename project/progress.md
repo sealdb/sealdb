@@ -24,7 +24,7 @@
 | Wave | 代表套件 | 状态 | 证据 / 下一步 |
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
-| R1 | select, show, types/* | `in_progress` | **`select` multi-table ANALYZE 已绿**；下一缺口 analyzed outer-join EXPLAIN（`select-triage` ~533） |
+| R1 | select, show, types/* | `in_progress` | **`select` join stats/OrigTblName 已推进**；下一缺口 outer-join reorder + Projection + isnull（`select-triage` ~533） |
 | R2 | join / subquery / agg / window / cte | `in_progress` | 全波套件已标 `in_progress`；跟 triage 红灯移植 |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
@@ -63,7 +63,8 @@
 | Window `row_number` | Shuffle⊃Window⊃Sort | `Shuffle`/`ShuffleReceiver`；default rows frame | window brief 已绿 |
 | precise_types | UINT64 / DECIMAL(21,1) / REAL | literal u64→Decimal；cast+`is_unsigned`；scale | issue 21692 行已绿 |
 | `ANALYZE t1,t2,t3` | multi-table AnalyzeTableStmt | extract table list；AnalyzeExec loop | multi ANALYZE 已绿 |
-| **下一缺口** | analyzed outer-join EXPLAIN | stats row counts；select.tN；Projection | `select-triage.txt` ~533 |
+| join stats / OrigTblName | analyzed TableReader；select.tN | `join_side`→access_plan；FromItem alias rewrite | estRows/table names 对齐中 |
+| **下一缺口** | outer-join reorder + Projection + isnull | `tidb_enable_outer_join_reorder`；null-reject on flat joins | `select-triage.txt` ~533 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

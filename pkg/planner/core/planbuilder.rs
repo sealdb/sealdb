@@ -711,7 +711,14 @@ impl PlanBuilder {
             self.build_cte_plan(select, table, is, current_db, stats, prune_mode)?
                 .ok_or_else(|| Error::unsupported(format!("unknown CTE {}", table.name)))
         } else {
-            Ok(PhysicalPlan::table_reader(table.name.clone(), Vec::new()))
+            Ok(access_plan(
+                select,
+                table,
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            ))
         }
     }
 }
