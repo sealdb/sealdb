@@ -1867,6 +1867,16 @@ mod tests {
             }
             other => panic!("expected ExplainStmt, got {other:?}"),
         }
+        match parser
+            .parse_one_stmt("desc format='brief' select 1")
+            .unwrap()
+        {
+            crate::ast::Statement::Explain(explain) => {
+                assert_eq!(explain.format, crate::ast::ExplainFormat::Brief);
+                assert!(matches!(*explain.stmt, crate::ast::Statement::Select(_)));
+            }
+            other => panic!("expected ExplainStmt from DESC FORMAT, got {other:?}"),
+        }
     }
 
     #[test]
