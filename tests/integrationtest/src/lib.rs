@@ -101,6 +101,8 @@ pub struct Step {
     pub sql: String,
     pub expected_error: Option<i32>,
     pub sorted: bool,
+    /// When true, append session warnings after the result (TiDB `--enable_warnings`).
+    pub show_warnings: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +196,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
     let mut buf = String::new();
     let mut expected_error = None;
     let mut sorted = false;
+    let mut warnings_enabled = false;
     for line in src.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() && buf.is_empty() {
@@ -210,6 +213,14 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             }
             if rest.eq_ignore_ascii_case("sorted_result") {
                 sorted = true;
+                continue;
+            }
+            if rest.eq_ignore_ascii_case("enable_warnings") {
+                warnings_enabled = true;
+                continue;
+            }
+            if rest.eq_ignore_ascii_case("disable_warnings") {
+                warnings_enabled = false;
                 continue;
             }
             // TiDB directives we do not yet honor: skip with clear error on use.
@@ -234,6 +245,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 sql: buf.trim().to_string(),
                 expected_error,
                 sorted,
+                show_warnings: warnings_enabled,
             });
             buf.clear();
             expected_error = None;
