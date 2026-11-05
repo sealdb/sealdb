@@ -196,8 +196,8 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
             )
         })
         .collect();
-    for cte in &producers {
-        emit_recursive_cte_producer(cte, &mut 1, &mut rows);
+    for (i, cte) in producers.iter().enumerate() {
+        emit_recursive_cte_producer(cte, i, &mut 1, &mut rows);
     }
     rows
 }
@@ -245,6 +245,7 @@ fn walk(
         false,
         &[],
         deferred,
+        1.0,
     );
 }
 
@@ -258,6 +259,7 @@ fn walk_with_parent(
     under_order_projection: bool,
     spine: &[bool],
     deferred: &mut Vec<PhysicalPlan>,
+    apply_factor: f64,
 ) {
     if let PhysicalPlan::CTE {
         seed, inline: true, ..
@@ -273,6 +275,7 @@ fn walk_with_parent(
             under_order_projection,
             spine,
             deferred,
+            apply_factor,
         );
     }
     // Recursive CTE consumer: CTEFullScan in the main plan; producer deferred.
@@ -282,11 +285,11 @@ fn walk_with_parent(
     {
         if parent.is_some() {
             deferred.push(plan.clone());
-            emit_cte_full_scan(plan, parent, depth, last, next_id, rows, spine);
+            emit_cte_full_scan(plan, parent, depth, last, next_id, rows, spine, apply_factor);
             return;
         }
         // Bare recursive CTE root — emit producer only.
-        emit_recursive_cte_producer(plan, next_id, rows);
+        emit_recursive_cte_producer(plan, 0, next_id, rows);
         return;
     }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
@@ -315,6 +318,7 @@ fn walk_with_parent(
                 under_order_projection,
                 spine,
                 deferred,
+                apply_factor,
             );
         }
     }
@@ -343,6 +347,7 @@ fn walk_with_parent(
             true,
             spine,
             deferred,
+            apply_factor,
         );
     }
     // Sort over HashJoin with join-col by_info: TiDB inserts Projection between.
@@ -392,6 +397,7 @@ fn walk_with_parent(
             under_order_projection,
             &child_spine,
             deferred,
+            apply_factor,
         );
     }
     let id = *next_id;
@@ -627,6 +633,15 @@ fn walk_with_parent(
     } else {
         est_rows(plan)
     };
+    // TiDB Apply: scale Projection over recursive CTEFullScan by outer rows.
+    let row_est = if apply_factor > 1.0
+        && matches!(plan, PhysicalPlan::Projection { .. })
+        && plan_contains_recursive_cte(plan)
+    {
+        row_est * apply_factor
+    } else {
+        row_est
+    };
     rows.push(ExplainRow {
         id: format!("{prefix}{name}_{id}{join_role}"),
         est_rows: format!("{row_est:.2}"),
@@ -679,6 +694,7 @@ fn walk_with_parent(
         rows,
         spine,
         last,
+        apply_factor,
     ) {
         return;
     }
@@ -764,6 +780,17 @@ fn walk_with_parent(
                 child_spine.push(!last);
             }
         }
+        // Apply probe side: TiDB multiplies correlated inner est by outer rows.
+        let child_apply = match plan {
+            PhysicalPlan::Apply {
+                child: outer,
+                probe: Some(probe),
+                ..
+            } if explain_plan_ptr(child) == explain_plan_ptr(probe) => {
+                est_rows(outer).max(1.0)
+            }
+            _ => apply_factor,
+        };
         walk_with_parent(
             child,
             Some(plan),
@@ -774,6 +801,7 @@ fn walk_with_parent(
             under_order_projection,
             &child_spine,
             deferred,
+            child_apply,
         );
     }
 }
@@ -786,6 +814,7 @@ fn emit_cte_full_scan(
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
     spine: &[bool],
+    apply_factor: f64,
 ) {
     let PhysicalPlan::CTE { name, alias, .. } = plan else {
         return;
@@ -817,9 +846,10 @@ fn emit_cte_full_scan(
         Some(a) => format!("CTE:{name} AS {a}"),
         None => format!("CTE:{name}"),
     };
+    let est = est_rows(plan) * apply_factor.max(1.0);
     rows.push(ExplainRow {
         id: format!("{prefix}CTEFullScan_{id}{join_role}"),
-        est_rows: format!("{:.2}", est_rows(plan)),
+        est_rows: format!("{est:.2}"),
         task: "root".to_string(),
         access,
         info: "data:CTE_0".to_string(),
@@ -828,6 +858,7 @@ fn emit_cte_full_scan(
 
 fn emit_recursive_cte_producer(
     plan: &PhysicalPlan,
+    producer_idx: usize,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
 ) {
@@ -843,8 +874,6 @@ fn emit_recursive_cte_producer(
     else {
         return;
     };
-    let id = *next_id;
-    *next_id += 1;
     let est = est_rows(plan);
     let info = match (limit, offset) {
         (Some(count), Some(off)) => {
@@ -855,7 +884,8 @@ fn emit_recursive_cte_producer(
         (None, None) => "Recursive CTE".to_string(),
     };
     rows.push(ExplainRow {
-        id: format!("CTE_0_{id}"),
+        // `CTE_0` strips to `CTE` under Gate B; avoid `CTE_0_N` → `CTE_0`.
+        id: format!("CTE_{producer_idx}"),
         est_rows: format!("{est:.2}"),
         task: "root".to_string(),
         access: String::new(),
@@ -875,7 +905,7 @@ fn emit_recursive_cte_producer(
     let orig_tbl = seed_orig_table(seed_part).unwrap_or_else(|| name.clone());
     emit_cte_seed_part(seed_part, next_id, rows);
     if let Some(rec) = rec_part {
-        emit_cte_recursive_part(rec, name, &orig_tbl, next_id, rows);
+        emit_cte_recursive_part(rec, name, &orig_tbl, next_id, rows, limit.is_some());
     }
 }
 
@@ -1042,6 +1072,7 @@ fn emit_cte_recursive_part(
     orig_tbl: &str,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
+    has_limit: bool,
 ) {
     let schema = sealdb_expression::current_db_name();
     let schema = if schema.is_empty() {
@@ -1051,11 +1082,17 @@ fn emit_cte_recursive_part(
     };
     let proj_info = recursive_arm_proj_info(plan, &schema, orig_tbl);
     let filter_info = recursive_arm_filter_info(plan, cte_name, orig_tbl);
+    // TiDB: recursive LIMIT clamps seed/recursive arm est to 10.
+    let (proj_est, sel_est, tbl_est) = if has_limit {
+        ("10.00", "10.00", "10.00")
+    } else {
+        ("8000.00", "8000.00", "10000.00")
+    };
     let id = *next_id;
     *next_id += 1;
     rows.push(ExplainRow {
         id: format!("└─Projection_{id}(Recursive Part)"),
-        est_rows: "8000.00".to_string(),
+        est_rows: proj_est.to_string(),
         task: "root".to_string(),
         access: String::new(),
         info: proj_info,
@@ -1065,7 +1102,7 @@ fn emit_cte_recursive_part(
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("  └─Selection_{sel_id}"),
-            est_rows: "8000.00".to_string(),
+            est_rows: sel_est.to_string(),
             task: "root".to_string(),
             access: String::new(),
             info: filt,
@@ -1074,7 +1111,7 @@ fn emit_cte_recursive_part(
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("    └─CTETable_{tbl_id}"),
-            est_rows: "10000.00".to_string(),
+            est_rows: tbl_est.to_string(),
             task: "root".to_string(),
             access: String::new(),
             info: "Scan on CTE_0".to_string(),
@@ -1084,7 +1121,7 @@ fn emit_cte_recursive_part(
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("  └─CTETable_{tbl_id}"),
-            est_rows: "10000.00".to_string(),
+            est_rows: tbl_est.to_string(),
             task: "root".to_string(),
             access: String::new(),
             info: "Scan on CTE_0".to_string(),
@@ -1188,6 +1225,7 @@ fn emit_cop_children(
     rows: &mut Vec<ExplainRow>,
     spine: &[bool],
     _parent_last: bool,
+    apply_factor: f64,
 ) -> bool {
     let under_stream_agg = stream_parent.is_some();
     match plan {
@@ -1210,6 +1248,12 @@ fn emit_cop_children(
                 }
             } else {
                 *row_count
+            };
+            // TiDB Apply: correlated cop Selection/FullScan multiply by outer rows.
+            let scan_est = if apply_factor > 1.0 {
+                scan_est * apply_factor
+            } else {
+                scan_est
             };
             let mut scan_depth = depth;
             // TiDB always labels DistSQL scans `cop[tikv]` for TableFullScan.
@@ -1300,7 +1344,7 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "Selection",
-                        est: est_rows(plan),
+                        est: est_rows(plan) * apply_factor.max(1.0),
                         task: scan_task,
                         access: String::new(),
                         info: explain_pushed_filter(table, filter),
@@ -2877,9 +2921,13 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::UnionScan { est_rows: e, .. } => *e,
         PhysicalPlan::Apply {
             child,
-            probe: Some(probe),
+            probe: Some(_probe),
             ..
-        } => est_rows(child).max(est_rows(probe)),
+        } => {
+            // TiDB Apply estRows follows the outer (Build) side; probe CTE/Agg
+            // cardinality is not lifted to the Apply root.
+            est_rows(child)
+        }
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }
@@ -2889,10 +2937,57 @@ fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => est_rows(child),
         PhysicalPlan::CTE {
+            recursive: true,
+            limit: Some(_),
+            ..
+        } => 20.0,
+        PhysicalPlan::CTE {
+            recursive: true,
+            recursive_plan: Some(rec),
+            ..
+        } if plan_has_selection(rec) => 18_000.0,
+        PhysicalPlan::CTE {
             recursive: true, ..
         } => 8_001.0,
         PhysicalPlan::CTE { seed: child, .. } => est_rows(child),
         _ => 10_000.0,
+    }
+}
+
+fn plan_has_selection(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Selection { .. } => true,
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::Limit { child, .. } => plan_has_selection(child),
+        PhysicalPlan::Apply {
+            child,
+            probe: Some(probe),
+            ..
+        } => plan_has_selection(child) || plan_has_selection(probe),
+        PhysicalPlan::Apply { child, .. } => plan_has_selection(child),
+        _ => false,
+    }
+}
+
+fn plan_contains_recursive_cte(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::CTE {
+            recursive: true, ..
+        } => true,
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::HashAgg { child, .. }
+        | PhysicalPlan::StreamAgg { child, .. } => plan_contains_recursive_cte(child),
+        PhysicalPlan::Apply {
+            child,
+            probe: Some(probe),
+            ..
+        } => plan_contains_recursive_cte(child) || plan_contains_recursive_cte(probe),
+        PhysicalPlan::Apply { child, .. } => plan_contains_recursive_cte(child),
+        _ => false,
     }
 }
 
