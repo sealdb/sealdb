@@ -1217,8 +1217,10 @@ fn table_status_result(op: &str, tables: &[TableName], current_db: &str) -> Quer
 
 /// MySQL/TiDB ONLY_FULL_GROUP_BY: when the mode is set and the query has
 /// GROUP BY, every SELECT item must be an aggregate, a constant, or appear
-/// in the GROUP BY list (exact restore match). Functional-dependency
-/// exceptions are out of scope for this MVB.
+/// in the GROUP BY list (exact restore match). CTE/derived single-source
+/// columns grouped by another column of that CTE are allowed (TiDB cte suite
+/// `select b from qn group by a`); base-table PK functional dependency is
+/// still out of scope.
 fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
     let select = match stmt {
         Statement::Select(s) => s,
@@ -1240,8 +1242,12 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
     if !sql_mode_has(&mode, "ONLY_FULL_GROUP_BY") || select.group_by.is_empty() {
         return Ok(());
     }
+    let cte_loose = cte_group_by_allows_peer_columns(select);
     for (i, field) in select.fields.iter().enumerate() {
         if select_field_ok_for_group_by(&field.expr, &select.group_by) {
+            continue;
+        }
+        if cte_loose && matches!(&field.expr, ExprNode::Column(_)) {
             continue;
         }
         return Err(sealdb_errno::Error::new(
@@ -1253,6 +1259,29 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// TiDB: `WITH qn AS (SELECT a,b …) SELECT b FROM qn GROUP BY a` is accepted
+/// under ONLY_FULL_GROUP_BY when FROM is that single CTE and GROUP BY is a
+/// bare column from it.
+fn cte_group_by_allows_peer_columns(select: &SelectStmt) -> bool {
+    if !select.joins.is_empty() || select.from_item.is_some() {
+        return false;
+    }
+    let Some(from) = &select.from else {
+        return false;
+    };
+    let Some(with) = &select.with else {
+        return false;
+    };
+    if with.find(from.resolve_name()).is_none() {
+        return false;
+    }
+    !select.group_by.is_empty()
+        && select
+            .group_by
+            .iter()
+            .all(|g| matches!(g, ExprNode::Column(_)))
 }
 
 fn sql_mode_has(mode: &str, flag: &str) -> bool {
@@ -3063,6 +3092,71 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("EXISTS recursive CTE failed: {e}"));
         assert_eq!(rows.display_rows(), vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_scalar_with_chained_cte_and_alias() {
+        let session = Session::new();
+        session
+            .execute_stmt(
+                "DROP DATABASE IF EXISTS cte; CREATE DATABASE cte; USE cte; \
+                 CREATE TABLE t1 (a INT); INSERT INTO t1 VALUES (1);",
+            )
+            .unwrap();
+        // Sibling CTE cols must stay inner under Apply (not outer `a` → 3).
+        let scalar = session
+            .execute_stmt(
+                "SELECT (WITH qn AS (SELECT 10*a AS a FROM t1), \
+                 qn2 AS (SELECT 3*a AS b FROM qn) SELECT * FROM qn2 LIMIT 1) FROM t1",
+            )
+            .unwrap_or_else(|e| panic!("scalar WITH chain: {e}"));
+        assert_eq!(scalar.display_rows(), vec![vec!["30".to_string()]]);
+        assert!(
+            scalar.columns[0].len() <= 256,
+            "TiDB MaxAliasIdentifierLen: {}",
+            scalar.columns[0].len()
+        );
+        // Empty CTE + GROUP BY peer col (TiDB allows under ONLY_FULL_GROUP_BY).
+        session
+            .execute_stmt("DROP TABLE IF EXISTS t1; CREATE TABLE t1 (a INT, b INT)")
+            .unwrap();
+        let grouped = session
+            .execute_stmt("WITH qn AS (SELECT a, b FROM t1) SELECT b FROM qn GROUP BY a")
+            .unwrap_or_else(|e| panic!("CTE GROUP BY: {e}"));
+        assert_eq!(grouped.columns, vec!["b".to_string()]);
+        assert!(grouped.display_rows().is_empty());
+        // Nested same-name recursive + aliased outer ref (was 1146).
+        session
+            .execute_stmt(
+                "DROP TABLE IF EXISTS tbl_1; \
+                 CREATE TABLE tbl_1 (col_2 CHAR(65), col_3 INT NOT NULL)",
+            )
+            .unwrap();
+        let nested = session
+            .execute_stmt(
+                "WITH RECURSIVE cte_8932 (col_34891, col_34892) AS ( \
+                   WITH RECURSIVE cte_8932 (col_34893, col_34894, col_34895) AS ( \
+                     WITH tbl_1 (col_34896, col_34897, col_34898, col_34899) AS ( \
+                       SELECT 1, '2', 3, col_3 FROM tbl_1 \
+                     ) \
+                     SELECT cte_as_8958.col_34896, cte_as_8958.col_34898, cte_as_8958.col_34899 \
+                       FROM tbl_1 AS cte_as_8958 \
+                     UNION DISTINCT \
+                     SELECT col_34893 + 1, CONCAT(col_34894, 1), col_34895 + 1 \
+                       FROM cte_8932 WHERE col_34893 < 5 \
+                   ) \
+                   SELECT cte_as_8959.col_34893, cte_as_8959.col_34895 \
+                     FROM cte_8932 AS cte_as_8959 \
+                 ) \
+                 SELECT * FROM cte_8932 AS cte_as_8960 \
+                 ORDER BY cte_as_8960.col_34891, cte_as_8960.col_34892",
+            )
+            .unwrap_or_else(|e| panic!("nested aliased CTE: {e}"));
+        assert_eq!(
+            nested.columns,
+            vec!["col_34891".to_string(), "col_34892".to_string()]
+        );
+        assert!(nested.display_rows().is_empty());
     }
 
     #[test]

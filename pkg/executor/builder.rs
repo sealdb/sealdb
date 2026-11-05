@@ -930,14 +930,29 @@ fn ast_join_type(tp: JoinType) -> sealdb_parser::ast::JoinType {
     }
 }
 
+/// MySQL/TiDB `MaxAliasIdentifierLen` — truncate projection field names.
+const MAX_ALIAS_IDENTIFIER_LEN: usize = 256;
+
 fn field_output_name(field: &sealdb_parser::ast::SelectField) -> String {
-    if let Some(name) = &field.as_name
+    let raw = if let Some(name) = &field.as_name
         && !name.is_empty()
     {
-        return name.clone();
+        name.clone()
+    } else {
+        // TiDB `buildProjectionFieldNameFromExpressions` (logical_plan_builder.go).
+        tidb_projection_field_name(&field.expr, field.orig_text.as_deref())
+    };
+    truncate_alias_identifier(raw)
+}
+
+fn truncate_alias_identifier(name: String) -> String {
+    if name.len() <= MAX_ALIAS_IDENTIFIER_LEN {
+        return name;
     }
-    // TiDB `buildProjectionFieldNameFromExpressions` (logical_plan_builder.go).
-    tidb_projection_field_name(&field.expr, field.orig_text.as_deref())
+    // Byte truncate like TiDB mysql.MaxAliasIdentifierLen (ASCII SQL text).
+    name.chars()
+        .take(MAX_ALIAS_IDENTIFIER_LEN)
+        .collect::<String>()
 }
 
 fn is_star_expr(expr: &ExprNode) -> bool {
@@ -969,7 +984,8 @@ fn expand_projection_fields(
         } else {
             let expr = match &select.from {
                 Some(from) if select.joins.is_empty() => {
-                    qualify_expr_table(field.expr.clone(), &from.name)
+                    // Physical table name for TiDB overflow labels (`cte.t1.c1`).
+                    qualify_expr_table(field.expr.clone(), from.resolve_name())
                 }
                 _ => field.expr.clone(),
             };

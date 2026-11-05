@@ -84,7 +84,27 @@ impl PlanBuilder {
                 } else if let Some(from) = &select.from
                     && !from.name.eq_ignore_ascii_case("dual")
                 {
-                    if let Some(plan) =
+                    // Aliased `FROM cte AS a`: join_side remaps physical↔alias;
+                    // single-table path must too or build_cte_plan misses the CTE
+                    // (TiDB cte suite: `from cte_8932 as cte_as_8960` → was 1146).
+                    if named_cte(select.with.as_ref(), from.resolve_name()) {
+                        let mut cte_from = from.clone();
+                        if from.physical.is_some() {
+                            cte_from.name = from.resolve_name().to_string();
+                            cte_from.physical = Some(from.name.clone());
+                        }
+                        self.build_cte_plan(
+                            select,
+                            &cte_from,
+                            is,
+                            current_db,
+                            stats,
+                            prune_mode,
+                        )?
+                        .unwrap_or_else(|| {
+                            access_plan(select, from, is, current_db, stats, prune_mode)
+                        })
+                    } else if let Some(plan) =
                         self.build_cte_plan(select, from, is, current_db, stats, prune_mode)?
                     {
                         plan
