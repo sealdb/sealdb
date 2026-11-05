@@ -146,6 +146,20 @@ pub enum PhysicalPlan {
         #[serde(skip)]
         on: ExprNode,
     },
+    /// `STRAIGHT_JOIN` on ordered keys (TiDB PhysicalMergeJoin). Executed as
+    /// HashJoin; EXPLAIN shows MergeJoin + keep order:true scans.
+    MergeJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_table: String,
+        right_table: String,
+        /// EXPLAIN `left key:select.t1.id`.
+        left_key: String,
+        /// EXPLAIN `right key:select.t2.id`.
+        right_key: String,
+        #[serde(skip)]
+        on: ExprNode,
+    },
     Explain {
         format: ExplainFormat,
         #[serde(default)]
@@ -341,6 +355,9 @@ impl PhysicalPlan {
                 tp, left, right, ..
             } => {
                 format!("HashJoin_{tp:?}({}, {})", left.explain(), right.explain())
+            }
+            PhysicalPlan::MergeJoin { left, right, .. } => {
+                format!("MergeJoin({}, {})", left.explain(), right.explain())
             }
             PhysicalPlan::Explain {
                 format,

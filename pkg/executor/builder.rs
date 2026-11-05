@@ -491,40 +491,40 @@ impl ExecutorBuilder {
                 left_table,
                 right_table,
                 on,
-            } => {
-                let using_cols = stmt
-                    .as_select()
-                    .map(|select| {
-                        select
-                            .joins
-                            .iter()
-                            .find(|j| {
-                                j.left.name.eq_ignore_ascii_case(left_table)
-                                    && j.right.name.eq_ignore_ascii_case(right_table)
-                            })
-                            .map(|j| j.using_cols.clone())
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                let join = sealdb_parser::ast::Join {
-                    left: sealdb_parser::ast::TableName::new(None, left_table.clone()),
-                    right: sealdb_parser::ast::TableName::new(None, right_table.clone()),
-                    tp: ast_join_type(*tp),
-                    on: on.clone(),
-                    using_cols,
-                };
-                Ok(Box::new(HashJoinV1Exec::new(
-                    join,
-                    Self::build(
-                        left,
-                        stmt,
-                        Arc::clone(&domain),
-                        current_db,
-                        Arc::clone(&txn),
-                    )?,
-                    Self::build(right, stmt, domain, current_db, txn)?,
-                )))
-            }
+            } => Self::build_hash_join(
+                *tp,
+                left,
+                right,
+                left_table,
+                right_table,
+                on,
+                false,
+                stmt,
+                domain,
+                current_db,
+                txn,
+            ),
+            // MergeJoin executes as HashJoin; EXPLAIN already labeled MergeJoin.
+            PhysicalPlan::MergeJoin {
+                left,
+                right,
+                left_table,
+                right_table,
+                on,
+                ..
+            } => Self::build_hash_join(
+                JoinType::Inner,
+                left,
+                right,
+                left_table,
+                right_table,
+                on,
+                true,
+                stmt,
+                domain,
+                current_db,
+                txn,
+            ),
             PhysicalPlan::Explain {
                 format,
                 analyze,
@@ -552,6 +552,60 @@ impl ExecutorBuilder {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_hash_join(
+        tp: JoinType,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        left_table: &str,
+        right_table: &str,
+        on: &ExprNode,
+        straight: bool,
+        stmt: &Statement,
+        domain: Arc<Domain>,
+        current_db: &str,
+        txn: Arc<TxnHandle>,
+    ) -> Result<Box<dyn Executor>> {
+        let using_cols = stmt
+            .as_select()
+            .map(|select| {
+                select
+                    .joins
+                    .iter()
+                    .find(|j| {
+                        (j.left.name.eq_ignore_ascii_case(left_table)
+                            && j.right.name.eq_ignore_ascii_case(right_table))
+                            || (j.left.name.eq_ignore_ascii_case(right_table)
+                                && j.right.name.eq_ignore_ascii_case(left_table))
+                            // Chained join: plan left_table is prior right name.
+                            || (j.right.name.eq_ignore_ascii_case(right_table)
+                                && !j.using_cols.is_empty())
+                    })
+                    .map(|j| j.using_cols.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let join = sealdb_parser::ast::Join {
+            left: sealdb_parser::ast::TableName::new(None, left_table.to_string()),
+            right: sealdb_parser::ast::TableName::new(None, right_table.to_string()),
+            tp: ast_join_type(tp),
+            on: on.clone(),
+            using_cols,
+            straight,
+        };
+        Ok(Box::new(HashJoinV1Exec::new(
+            join,
+            Self::build(
+                left,
+                stmt,
+                Arc::clone(&domain),
+                current_db,
+                Arc::clone(&txn),
+            )?,
+            Self::build(right, stmt, domain, current_db, txn)?,
+        )))
     }
 
     fn build_select_arm(
@@ -844,26 +898,44 @@ fn expand_projection_fields(
 }
 
 /// Column names visible to `SELECT *` from the FROM/JOIN clause.
+/// `USING (c)` coalesces `c` (emit once from the left spine).
 fn select_from_column_names(
     select: &sealdb_parser::ast::SelectStmt,
     domain: &Domain,
     current_db: &str,
 ) -> Vec<String> {
     let is = domain.infoschema();
-    let mut cols = Vec::new();
-    let mut push_table = |table: &TableName| {
+    let table_cols = |table: &TableName| -> Vec<String> {
         let (schema, name) = table.qualified(current_db);
-        if let Some(info) = is.table_by_name(&schema, &name) {
-            for c in &info.columns {
-                cols.push(c.name.o().to_string());
-            }
-        }
+        is.table_by_name(&schema, &name)
+            .map(|info| {
+                info.columns
+                    .iter()
+                    .map(|c| c.name.o().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
     };
+    let mut cols = Vec::new();
     if let Some(from) = &select.from {
-        push_table(from);
+        cols = table_cols(from);
     }
     for join in &select.joins {
-        push_table(&join.right);
+        let right_cols = table_cols(&join.right);
+        if join.using_cols.is_empty() {
+            cols.extend(right_cols);
+        } else {
+            let drop: std::collections::HashSet<String> = join
+                .using_cols
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            cols.extend(
+                right_cols
+                    .into_iter()
+                    .filter(|c| !drop.contains(&c.to_ascii_lowercase())),
+            );
+        }
     }
     cols
 }

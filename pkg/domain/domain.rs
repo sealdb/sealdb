@@ -490,6 +490,16 @@ impl Domain {
             };
         }
         result?;
+        // TiDB drops stats_meta with the table; stale ANALYZE must not linger
+        // across DROP + CREATE of the same name (pseudo card until ANALYZE).
+        if let Statement::DropTable(drop) = stmt {
+            for name in &drop.tables {
+                let (schema, table) = name.qualified(current_db);
+                if !schema.is_empty() {
+                    self.stats.delete(&schema, &table);
+                }
+            }
+        }
         inner.infoschema = InfoSchema::from_meta(&inner.meta)?;
         if persist {
             persist_meta(self.storage.as_ref(), &mut inner.meta)?;

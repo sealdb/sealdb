@@ -50,6 +50,8 @@ pub struct Join {
     /// Columns from `USING (...)`; empty when the join used `ON` / CROSS.
     /// SELECT * coalesces these names (emit left only).
     pub using_cols: Vec<String>,
+    /// `STRAIGHT_JOIN` — TiDB prefers MergeJoin on ordered PK keys.
+    pub straight: bool,
 }
 
 /// Bushy join tree for `(t1 ⋈ t2) ⋈ (t3 ⋈ t4)` NestedJoin (TiDB outer join rewrite).

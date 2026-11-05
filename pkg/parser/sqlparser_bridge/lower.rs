@@ -5079,6 +5079,7 @@ fn lower_from(
             tp: JoinType::Cross,
             on: true_expr(),
             using_cols: Vec::new(),
+        straight: false,
         });
         joins.extend(extra_joins);
         prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
@@ -5245,6 +5246,7 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
                     tp: *tp,
                     on: on.clone(),
                     using_cols: Vec::new(),
+                straight: false,
                 });
             }
             joins
@@ -5266,56 +5268,64 @@ fn lower_table_with_joins(
     for join in &table.joins {
         let (right, right_alias, right_ctes) = table_factor(&join.relation)?;
         ctes.extend(right_ctes);
-        let (tp, on, using_cols) = match &join.join_operator {
+        let (tp, on, using_cols, straight) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
-            | JoinOperator::Inner(JoinConstraint::On(expr))
-            | JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+            | JoinOperator::Inner(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
+            }
+            JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), true)
             }
             JoinOperator::Left(JoinConstraint::On(expr))
             | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new())
+                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Right(JoinConstraint::On(expr))
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?, Vec::new())
+                (JoinType::RightOuter, lower_expr(expr)?, Vec::new(), false)
             }
             // MySQL `JOIN` / `INNER JOIN` without ON/USING ≡ CROSS JOIN.
             JoinOperator::CrossJoin(JoinConstraint::None)
             | JoinOperator::Join(JoinConstraint::None)
-            | JoinOperator::Inner(JoinConstraint::None)
-            | JoinOperator::StraightJoin(JoinConstraint::None) => {
-                (JoinType::Cross, true_expr(), Vec::new())
+            | JoinOperator::Inner(JoinConstraint::None) => {
+                (JoinType::Cross, true_expr(), Vec::new(), false)
+            }
+            JoinOperator::StraightJoin(JoinConstraint::None) => {
+                (JoinType::Cross, true_expr(), Vec::new(), true)
             }
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Semi(JoinConstraint::On(expr))
             | JoinOperator::LeftSemi(JoinConstraint::On(expr)) => {
-                (JoinType::Semi, lower_expr(expr)?, Vec::new())
+                (JoinType::Semi, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Anti(JoinConstraint::On(expr))
             | JoinOperator::LeftAnti(JoinConstraint::On(expr)) => {
-                (JoinType::Anti, lower_expr(expr)?, Vec::new())
+                (JoinType::Anti, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Join(JoinConstraint::Using(names))
-            | JoinOperator::Inner(JoinConstraint::Using(names))
-            | JoinOperator::StraightJoin(JoinConstraint::Using(names)) => {
+            | JoinOperator::Inner(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::Inner, on, cols)
+                (JoinType::Inner, on, cols, false)
+            }
+            JoinOperator::StraightJoin(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr(&prev, &right, &cols)?;
+                (JoinType::Inner, on, cols, true)
             }
             JoinOperator::Left(JoinConstraint::Using(names))
             | JoinOperator::LeftOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::LeftOuter, on, cols)
+                (JoinType::LeftOuter, on, cols, false)
             }
             JoinOperator::Right(JoinConstraint::Using(names))
             | JoinOperator::RightOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::RightOuter, on, cols)
+                (JoinType::RightOuter, on, cols, false)
             }
             // Completeness wave: NATURAL / right semi/anti / full outer.
             other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
@@ -5338,6 +5348,7 @@ fn lower_table_with_joins(
             tp,
             on,
             using_cols,
+            straight,
         });
         prev = right;
         prev_alias = right_alias;

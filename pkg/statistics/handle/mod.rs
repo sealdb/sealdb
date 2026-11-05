@@ -51,6 +51,12 @@ impl Handle {
         entry.modify_count = entry.modify_count.saturating_add(delta);
     }
 
+    /// Drop stats for a table (TiDB clears stats_meta on DROP TABLE).
+    pub fn delete(&self, db: &str, table: &str) {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        self.inner.lock().expect("stats lock").remove(&key);
+    }
+
     pub fn needs_auto_analyze(&self, db: &str, table: &str, ratio: f64) -> bool {
         self.table(db, table)
             .map(|t| t.needs_auto_analyze(ratio))
