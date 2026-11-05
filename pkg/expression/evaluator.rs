@@ -40,12 +40,30 @@ pub fn with_sql_mode<T>(mode: impl Into<String>, f: impl FnOnce() -> T) -> T {
     })
 }
 
-fn sql_mode_flag(flag: &str) -> bool {
+pub fn sql_mode_flag(flag: &str) -> bool {
     SQL_MODE.with(|cell| {
         cell.borrow()
             .split(',')
             .any(|m| m.trim().eq_ignore_ascii_case(flag))
     })
+}
+
+thread_local! {
+    static CURRENT_DB: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub fn with_current_db<T>(db: impl Into<String>, f: impl FnOnce() -> T) -> T {
+    CURRENT_DB.with(|cell| {
+        let prev = cell.borrow().clone();
+        *cell.borrow_mut() = db.into();
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
+    })
+}
+
+fn current_db() -> String {
+    CURRENT_DB.with(|cell| cell.borrow().clone())
 }
 
 /// Backward-compatible helper: `true` → GeneralCi, `false` → Bin.
@@ -273,6 +291,11 @@ fn split_qualified(name: &str) -> (Option<&str>, &str) {
 fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let left = eval_expr_with_row(&expr.left, schema, row)?;
     let right = eval_expr_with_row(&expr.right, schema, row)?;
+    if matches!(expr.op, Op::LogicOr) && sql_mode_flag("PIPES_AS_CONCAT") {
+        return Ok(Datum::Bytes(
+            [left.as_bytes().as_slice(), right.as_bytes().as_slice()].concat(),
+        ));
+    }
     if matches!(expr.op, Op::LogicAnd | Op::LogicOr) {
         return eval_logic(expr.op, &left, &right);
     }
@@ -289,19 +312,29 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             {
                 unsigned_minus(&left, &right)
             } else {
-                num_bin(
-                    &left,
-                    &right,
-                    |a, b| {
-                        a.checked_sub(b).ok_or_else(|| {
-                            Error::new(
-                                ERR_DATA_OUT_OF_RANGE,
-                                format!("BIGINT value is out of range in '({a} - {b})'"),
-                            )
-                        })
-                    },
-                    |a, b| Ok(a - b),
-                )
+                // Signed BIGINT result (also under NO_UNSIGNED_SUBTRACTION).
+                // Use i128 so U64 magnitudes stay positive — wrapping U64→i64
+                // wrongly makes CAST(-1 UNSIGNED)-MAX == i64::MIN (in range).
+                if matches!(left, Datum::F64(_)) || matches!(right, Datum::F64(_)) {
+                    num_bin(&left, &right, |a, b| Ok(a - b), |a, b| Ok(a - b))
+                } else {
+                    let li = datum_as_i128(&left)?;
+                    let ri = datum_as_i128(&right)?;
+                    let diff = li - ri;
+                    if diff < i64::MIN as i128 || diff > i64::MAX as i128 {
+                        let label = format!(
+                            "({} - {})",
+                            minus_operand_label(&expr.left, &left),
+                            minus_operand_label(&expr.right, &right)
+                        );
+                        Err(Error::new(
+                            ERR_DATA_OUT_OF_RANGE,
+                            format!("BIGINT value is out of range in '{label}'"),
+                        ))
+                    } else {
+                        Ok(Datum::I64(diff as i64))
+                    }
+                }
             }
         }
         Op::Mul => num_bin(&left, &right, |a, b| Ok(a * b), |a, b| Ok(a * b)),
@@ -622,6 +655,32 @@ fn num_bin(
     }
 }
 
+fn datum_as_i128(d: &Datum) -> Result<i128> {
+    match d {
+        Datum::I64(v) => Ok(*v as i128),
+        Datum::U64(v) => Ok(*v as i128),
+        other => Ok(other.as_i64()? as i128),
+    }
+}
+
+fn datum_decimal_label(d: &Datum) -> String {
+    match d {
+        Datum::I64(v) => v.to_string(),
+        Datum::U64(v) => v.to_string(),
+        other => other
+            .as_i64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| format!("{other:?}")),
+    }
+}
+
+fn minus_operand_label(expr: &ExprNode, value: &Datum) -> String {
+    match expr {
+        ExprNode::Column(_) => expr_overflow_label(expr),
+        _ => datum_decimal_label(value),
+    }
+}
+
 fn datum_as_u64(d: &Datum) -> Result<u64> {
     match d {
         Datum::U64(v) => Ok(*v),
@@ -653,6 +712,24 @@ fn unsigned_minus(left: &Datum, right: &Datum) -> Result<Datum> {
         ));
     }
     Ok(Datum::U64(l - r))
+}
+
+fn expr_overflow_label(expr: &ExprNode) -> String {
+    match expr {
+        ExprNode::Column(c) => match (&c.schema, &c.table) {
+            (Some(schema), Some(table)) => format!("{schema}.{table}.{}", c.name),
+            (None, Some(table)) => {
+                let db = current_db();
+                if db.is_empty() {
+                    format!("{table}.{}", c.name)
+                } else {
+                    format!("{db}.{table}.{}", c.name)
+                }
+            }
+            _ => c.name.clone(),
+        },
+        other => other.restore_string(),
+    }
 }
 
 fn truthy(d: &Datum) -> Option<bool> {
@@ -744,30 +821,68 @@ mod hex_cmp_tests {
 #[cfg(test)]
 mod unsigned_sub_tests {
     use super::*;
-    use sealdb_parser::ast::expressions::{BinaryOpExpr, FuncCastExpr, ValueExpr};
-    use sealdb_types::Datum;
+    use sealdb_parser::ast::*;
+    use sealdb_parser::Parser;
+
+    fn select_expr(sql: &str) -> ExprNode {
+        let stmt = Parser::new().parse_one_stmt(sql).unwrap();
+        match stmt {
+            Statement::Select(s) => s.fields[0].expr.clone(),
+            _ => panic!("expected select"),
+        }
+    }
 
     #[test]
-    fn minus_unsigned_overflow() {
-        let expr = ExprNode::Binary(BinaryOpExpr {
-            op: Op::Minus,
-            left: Box::new(ExprNode::Value(ValueExpr {
-                datum: Datum::I64(12),
-            })),
-            right: Box::new(ExprNode::Cast(FuncCastExpr {
-                expr: Box::new(ExprNode::Value(ValueExpr {
-                    datum: Datum::I64(15),
-                })),
-                target: "UNSIGNED".to_string(),
-            })),
-        });
+    fn minus_unsigned_default_underflow() {
+        let expr = select_expr("SELECT 12 - cast(15 as unsigned)");
         with_sql_mode("", || {
             let err = eval_expr_with_row(&expr, &[], &[]).unwrap_err();
             assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
+            assert!(
+                err.message.contains("BIGINT UNSIGNED"),
+                "{}",
+                err.message
+            );
         });
         with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
-            let v = eval_expr_with_row(&expr, &[], &[]).unwrap();
-            assert_eq!(v, Datum::I64(-3));
+            assert_eq!(
+                eval_expr_with_row(&expr, &[], &[]).unwrap(),
+                Datum::I64(-3)
+            );
+        });
+    }
+
+    #[test]
+    fn minus_no_unsigned_subtraction_overflow() {
+        let expr = select_expr(
+            "SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)",
+        );
+        with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
+            let err = eval_expr_with_row(&expr, &[], &[]).unwrap_err();
+            assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
+            assert!(
+                err.message.contains("18446744073709551615"),
+                "{}",
+                err.message
+            );
+            assert!(
+                err.message.contains("9223372036854775807"),
+                "{}",
+                err.message
+            );
+        });
+    }
+
+    #[test]
+    fn minus_no_unsigned_subtraction_ok() {
+        let expr = select_expr(
+            "SELECT CAST(-1 as UNSIGNED) - cast(-9223372036854775808 as unsigned)",
+        );
+        with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
+            assert_eq!(
+                eval_expr_with_row(&expr, &[], &[]).unwrap(),
+                Datum::I64(i64::MAX)
+            );
         });
     }
 }

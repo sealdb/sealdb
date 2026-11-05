@@ -71,7 +71,9 @@
 | MergeJoin + USING | STRAIGHT_JOIN EXPLAIN；USING 列合并；DROP 清 stats | `PhysicalPlan::MergeJoin`；`keep order:true`；`TableReader_N(Build)`；Handle::delete | `select` → `green`（Mem+TiKV） |
 | SHOW LIKE + suite DB | `Tables_in_show (%xx)`；suite 名作库名 | ShowStmt.pattern；itest `path/→__` | show LIKE 段已绿 |
 | CREATE TTL + SHOW CREATE | TTL 表选项；RANGE COLUMNS 渲染 | extract TTL；TableInfo.ttl；ENGINE/CHARSET/PARTITION | `show` → `green`（Mem+TiKV） |
-| UNSIGNED / BIGINT overflow | 1690；`NO_UNSIGNED_SUBTRACTION`；`-i64::MIN` | sql_mode TLS；unsigned_minus；UnaryMinus(U64(2^63)) | types/const 至 overflow 段已绿 |
+| REAL_AS_FLOAT / PIPES_AS_CONCAT | REAL→FLOAT；`||` 拼接 | ddl `sql_mode_flag`；LogicOr concat | types/const 段已绿 |
+| UNSIGNED / BIGINT overflow | 1690；`NO_UNSIGNED_SUBTRACTION`；CAST wrap | i128 有符号差；U64 标签；`qualify_expr_table` | types/const 至 overflow 段已绿 |
+| IGNORE_SPACE CREATE TABLE | `COUNT(a)`/`COUNT (a)` 1064 | session `reject_create_table_func_call` | types/const IGNORE_SPACE 段已绿（HIGH_NOT 前） |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
