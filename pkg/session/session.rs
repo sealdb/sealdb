@@ -604,41 +604,40 @@ impl Session {
             .clone()
             .unwrap_or_else(|| restore_sql(stmt));
         let use_cache = *self.cache_plans.lock().expect("session cache flag lock");
-        let plan = if use_cache {
-            let cache = self.domain.plan_cache();
-            if let Some(plan) = cache.get(&cache_key, schema_ver) {
-                plan
+        let prune_mode = *self
+            .partition_prune_mode
+            .lock()
+            .expect("session partition prune mode lock");
+        // EXPLAIN / semi-join strings use `current_db_name()` (suite schema).
+        let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
+            if use_cache {
+                let cache = self.domain.plan_cache();
+                if let Some(plan) = cache.get(&cache_key, schema_ver) {
+                    Ok(plan)
+                } else {
+                    // Shortcut: plan is built from the first bound SQL, then reused
+                    // under the template key. PointGet/index lookup re-read literals
+                    // from the current bound stmt in ExecutorBuilder.
+                    let plan = self.planner.build_with_schema(
+                        stmt,
+                        Some(&is),
+                        &current_db,
+                        Some(stats.as_ref()),
+                        prune_mode,
+                    )?;
+                    cache.put(cache_key, schema_ver, plan.clone());
+                    Ok(plan)
+                }
             } else {
-                let prune_mode = *self
-                    .partition_prune_mode
-                    .lock()
-                    .expect("session partition prune mode lock");
-                // Shortcut: plan is built from the first bound SQL, then reused
-                // under the template key. PointGet/index lookup re-read literals
-                // from the current bound stmt in ExecutorBuilder.
-                let plan = self.planner.build_with_schema(
+                self.planner.build_with_schema(
                     stmt,
                     Some(&is),
                     &current_db,
                     Some(stats.as_ref()),
                     prune_mode,
-                )?;
-                cache.put(cache_key, schema_ver, plan.clone());
-                plan
+                )
             }
-        } else {
-            let prune_mode = *self
-                .partition_prune_mode
-                .lock()
-                .expect("session partition prune mode lock");
-            self.planner.build_with_schema(
-                stmt,
-                Some(&is),
-                &current_db,
-                Some(stats.as_ref()),
-                prune_mode,
-            )?
-        };
+        })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
         let exec = if matches!(&plan, PhysicalPlan::DDL { .. }) {
             Box::new(DDLExec::new(
@@ -6374,10 +6373,13 @@ mod tests {
             with_outer.display_rows(),
             vec![vec!["1".to_string(), "a".to_string()]]
         );
-        let err = session
+        let joined = session
             .execute_stmt("SELECT * FROM db1.t JOIN (SELECT 1 AS id) d ON t.id = d.id")
-            .unwrap_err();
-        assert!(err.message.contains("subquery JOIN"));
+            .unwrap();
+        assert_eq!(
+            joined.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string(), "1".to_string()]]
+        );
     }
 
     #[test]
