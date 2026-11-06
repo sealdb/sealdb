@@ -450,6 +450,11 @@ fn filter_rows_by_on(
     Ok(out)
 }
 
+/// `JOIN ... ON TRUE` is a comma/cross join (string-rewritten UPDATE joins).
+fn join_on_is_true(on: &ExprNode) -> bool {
+    matches!(on, ExprNode::Value(v) if matches!(v.datum, Datum::I64(n) if n != 0))
+}
+
 fn split_join_eq(
     on: &ExprNode,
     left_table: &str,
@@ -594,7 +599,7 @@ pub(crate) fn hash_join_pairs(
     left_rows: &[Vec<Datum>],
     right_rows: &[Vec<Datum>],
 ) -> Result<Vec<(Option<usize>, Option<usize>)>> {
-    if join.tp == JoinType::Cross {
+    if join.tp == JoinType::Cross || join_on_is_true(&join.on) {
         let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
         for i in 0..left_rows.len() {
             for j in 0..right_rows.len() {

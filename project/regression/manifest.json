@@ -1045,7 +1045,7 @@
     {
       "name": "executor/union_scan",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/union_scan.test",
       "result": "r/executor/union_scan.result",
       "has_result": true,

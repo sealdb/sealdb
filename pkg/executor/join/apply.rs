@@ -533,10 +533,26 @@ fn bind_select_with_cte_schemas(
     ctx: &ApplyCtx,
     prior_ctes: &HashMap<String, Vec<String>>,
 ) -> Result<SelectStmt> {
-    let inner_table = select.from.as_ref().map(|t| {
-        // Prefer physical name so `FROM qn AS a` still matches CTE `qn`.
-        t.resolve_name().to_string()
-    });
+    // A query's own columns are qualified by the alias (`FROM t t1` → t1.x).
+    // Once aliased, the physical name is only a valid qualifier for CTEs, whose
+    // corpus queries sometimes reference the CTE name instead of the alias.
+    let inner_tables: Vec<String> = select
+        .from
+        .as_ref()
+        .map(|t| {
+            let mut names = vec![t.name.clone()];
+            let cte_name = t.resolve_name();
+            let is_cte = prior_ctes.contains_key(&cte_name.to_ascii_lowercase())
+                || select
+                    .with
+                    .as_ref()
+                    .is_some_and(|with| with.find(cte_name).is_some());
+            if is_cte && !names.iter().any(|n| n.eq_ignore_ascii_case(cte_name)) {
+                names.push(cte_name.to_string());
+            }
+            names
+        })
+        .unwrap_or_default();
     let mut inner_cols = inner_columns(select, ctx, prior_ctes);
     // CTE output names count as inner so `WHERE b=a` keeps `b` on the CTE.
     if let Some(with) = &select.with {
@@ -565,7 +581,7 @@ fn bind_select_with_cte_schemas(
         .fields
         .iter()
         .map(|field| SelectField {
-            expr: bind_expr(&field.expr, ctx, inner_table.as_deref(), &inner_cols),
+            expr: bind_expr(&field.expr, ctx, inner_tables.as_slice(), &inner_cols),
             as_name: field.as_name.clone(),
             orig_text: field.orig_text.clone(),
         })
@@ -573,18 +589,18 @@ fn bind_select_with_cte_schemas(
     out.selection = select
         .selection
         .as_ref()
-        .map(|expr| bind_expr(expr, ctx, inner_table.as_deref(), &inner_cols));
+        .map(|expr| bind_expr(expr, ctx, inner_tables.as_slice(), &inner_cols));
     out.having = select
         .having
         .as_ref()
-        .map(|expr| bind_expr(expr, ctx, inner_table.as_deref(), &inner_cols));
+        .map(|expr| bind_expr(expr, ctx, inner_tables.as_slice(), &inner_cols));
     out.group_by = select
         .group_by
         .iter()
-        .map(|expr| bind_expr(expr, ctx, inner_table.as_deref(), &inner_cols))
+        .map(|expr| bind_expr(expr, ctx, inner_tables.as_slice(), &inner_cols))
         .collect();
     for item in &mut out.order_by {
-        item.expr = bind_expr(&item.expr, ctx, inner_table.as_deref(), &inner_cols);
+        item.expr = bind_expr(&item.expr, ctx, inner_tables.as_slice(), &inner_cols);
     }
     Ok(out)
 }
@@ -694,77 +710,77 @@ fn inner_columns(
 fn bind_expr(
     expr: &ExprNode,
     ctx: &ApplyCtx,
-    inner_table: Option<&str>,
+    inner_tables: &[String],
     inner_cols: &[String],
 ) -> ExprNode {
     match expr {
-        ExprNode::Column(col) => bind_column(col, ctx, inner_table, inner_cols),
+        ExprNode::Column(col) => bind_column(col, ctx, inner_tables, inner_cols),
         ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
             op: bin.op,
-            left: Box::new(bind_expr(&bin.left, ctx, inner_table, inner_cols)),
-            right: Box::new(bind_expr(&bin.right, ctx, inner_table, inner_cols)),
+            left: Box::new(bind_expr(&bin.left, ctx, inner_tables, inner_cols)),
+            right: Box::new(bind_expr(&bin.right, ctx, inner_tables, inner_cols)),
         }),
         ExprNode::Unary(unary) => ExprNode::Unary(UnaryOpExpr {
             op: unary.op,
-            expr: Box::new(bind_expr(&unary.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&unary.expr, ctx, inner_tables, inner_cols)),
         }),
         ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
             name: func.name.clone(),
             args: func
                 .args
                 .iter()
-                .map(|arg| bind_expr(arg, ctx, inner_table, inner_cols))
+                .map(|arg| bind_expr(arg, ctx, inner_tables, inner_cols))
                 .collect(),
             distinct: func.distinct,
         }),
         ExprNode::Cast(cast) => ExprNode::Cast(FuncCastExpr {
-            expr: Box::new(bind_expr(&cast.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&cast.expr, ctx, inner_tables, inner_cols)),
             target: cast.target.clone(),
         }),
         ExprNode::InList(list) => ExprNode::InList(InListExpr {
-            expr: Box::new(bind_expr(&list.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&list.expr, ctx, inner_tables, inner_cols)),
             not: list.not,
             list: list
                 .list
                 .iter()
-                .map(|item| bind_expr(item, ctx, inner_table, inner_cols))
+                .map(|item| bind_expr(item, ctx, inner_tables, inner_cols))
                 .collect(),
         }),
         ExprNode::Between(between) => ExprNode::Between(BetweenExpr {
-            expr: Box::new(bind_expr(&between.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&between.expr, ctx, inner_tables, inner_cols)),
             not: between.not,
-            low: Box::new(bind_expr(&between.low, ctx, inner_table, inner_cols)),
-            high: Box::new(bind_expr(&between.high, ctx, inner_table, inner_cols)),
+            low: Box::new(bind_expr(&between.low, ctx, inner_tables, inner_cols)),
+            high: Box::new(bind_expr(&between.high, ctx, inner_tables, inner_cols)),
         }),
         ExprNode::Like(like) => ExprNode::Like(PatternLikeExpr {
-            expr: Box::new(bind_expr(&like.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&like.expr, ctx, inner_tables, inner_cols)),
             not: like.not,
-            pattern: Box::new(bind_expr(&like.pattern, ctx, inner_table, inner_cols)),
+            pattern: Box::new(bind_expr(&like.pattern, ctx, inner_tables, inner_cols)),
             ci: like.ci,
         }),
         ExprNode::IsNull(is_null) => ExprNode::IsNull(IsNullExpr {
-            expr: Box::new(bind_expr(&is_null.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&is_null.expr, ctx, inner_tables, inner_cols)),
             not: is_null.not,
         }),
         ExprNode::Case(case) => ExprNode::Case(CaseExpr {
             operand: case
                 .operand
                 .as_ref()
-                .map(|operand| Box::new(bind_expr(operand, ctx, inner_table, inner_cols))),
+                .map(|operand| Box::new(bind_expr(operand, ctx, inner_tables, inner_cols))),
             when_then: case
                 .when_then
                 .iter()
                 .map(|(when, then)| {
                     (
-                        bind_expr(when, ctx, inner_table, inner_cols),
-                        bind_expr(then, ctx, inner_table, inner_cols),
+                        bind_expr(when, ctx, inner_tables, inner_cols),
+                        bind_expr(then, ctx, inner_tables, inner_cols),
                     )
                 })
                 .collect(),
             else_expr: case
                 .else_expr
                 .as_ref()
-                .map(|branch| Box::new(bind_expr(branch, ctx, inner_table, inner_cols))),
+                .map(|branch| Box::new(bind_expr(branch, ctx, inner_tables, inner_cols))),
         }),
         // Nested subqueries are bound too: an inner subquery may correlate with
         // this query's row (`… WHERE b > (SELECT … WHERE c > (SELECT ref.a …))`),
@@ -774,12 +790,12 @@ fn bind_expr(
             query: Box::new(bind_nested_query(&exists.query, ctx)),
         }),
         ExprNode::InSubquery(sub) => ExprNode::InSubquery(InSubqueryExpr {
-            expr: Box::new(bind_expr(&sub.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&sub.expr, ctx, inner_tables, inner_cols)),
             not: sub.not,
             query: Box::new(bind_nested_query(&sub.query, ctx)),
         }),
         ExprNode::QuantifiedCmp(cmp) => ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
-            expr: Box::new(bind_expr(&cmp.expr, ctx, inner_table, inner_cols)),
+            expr: Box::new(bind_expr(&cmp.expr, ctx, inner_tables, inner_cols)),
             op: cmp.op,
             all: cmp.all,
             query: Box::new(bind_nested_query(&cmp.query, ctx)),
@@ -800,10 +816,10 @@ fn bind_nested_query(query: &ResultSetNode, ctx: &ApplyCtx) -> ResultSetNode {
 fn bind_column(
     col: &ColumnNameExpr,
     ctx: &ApplyCtx,
-    inner_table: Option<&str>,
+    inner_tables: &[String],
     inner_cols: &[String],
 ) -> ExprNode {
-    if column_is_inner(col, inner_table, inner_cols) {
+    if column_is_inner(col, inner_tables, inner_cols) {
         return ExprNode::Column(col.clone());
     }
     if let Some(value) = lookup_outer(col, ctx) {
@@ -812,9 +828,12 @@ fn bind_column(
     ExprNode::Column(col.clone())
 }
 
-fn column_is_inner(col: &ColumnNameExpr, inner_table: Option<&str>, inner_cols: &[String]) -> bool {
+fn column_is_inner(col: &ColumnNameExpr, inner_tables: &[String], inner_cols: &[String]) -> bool {
     if let Some(table) = &col.table {
-        if inner_table.is_some_and(|inner| inner.eq_ignore_ascii_case(table)) {
+        if inner_tables
+            .iter()
+            .any(|inner| inner.eq_ignore_ascii_case(table))
+        {
             return true;
         }
         return false;
