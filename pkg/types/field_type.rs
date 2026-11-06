@@ -93,6 +93,7 @@ impl FieldType {
             TYPE_DATE => "date",
             TYPE_DATETIME => "datetime",
             TYPE_TIMESTAMP => "timestamp",
+            TYPE_JSON => "json",
             _ => "varchar",
         };
         if self.unsigned {

@@ -2073,6 +2073,7 @@ name = "sealdb-integrationtest"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "regex",
  "sealdb-config",
  "sealdb-domain",
  "sealdb-errno",

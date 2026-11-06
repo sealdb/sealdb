@@ -106,6 +106,16 @@
 | Apply 外行放大 | 只在 probe 相关子树生效 | 穿过 Hash/Merge/IndexJoin 时重置为 1.0 | subquery TableRangeScan est 5.00 |
 | Gate B 复验 | green 11 套件 | manifest 不变 | `--status green` Mem=11 / TiKV=11 全 PASS |
 
+### 2.0d mysql-tester 指令 + TRUNCATE 隐式提交 + JSON 列类型（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| `--replace_regex` | `/pat/repl/` 可多组，作用于单条语句结果 | `parse_replace_regex` + `Step.replace_regex`（`regex` crate） | join/globalindex/join_reorder_through_projection 不再因指令跳过 |
+| `--disable_result_log` | 只回显 SQL，不输出结果 | `Step.log_result` | executor/union_scan 越过 117 行 |
+| `TRUNCATE` 隐式提交 | DDL 前提交当前显式事务，不可回滚 | `session` 在 TruncateTable 前 commit + 释放 MDL | union_scan 事务内 truncate 后重复键消失 |
+| `JSON` 列类型 | `json` 类型名 + 文本存储 | `TYPE_JSON` + `create_table` 映射 | union_scan `create table t(a json, b bigint)` |
+| Gate B 复验 | green 11 套件 | manifest 不变 | `--status green` Mem=11 全 PASS |
+
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
