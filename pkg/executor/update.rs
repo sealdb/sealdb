@@ -94,6 +94,7 @@ impl Executor for UpdateExec {
                     Some(&mut new_values),
                     None,
                 )?;
+                crate::insert::fill_generated_columns(&info, &mut new_values)?;
                 if let Some(check) = &self.stmt.check_option_where
                     && !eval_filter(check, &col_names, &new_values)?
                 {
@@ -176,6 +177,12 @@ impl UpdateExec {
                 left_new.as_deref_mut(),
                 right_new.as_deref_mut(),
             )?;
+            if let (Some(left), Some(values)) = (&left_info, left_new.as_mut()) {
+                crate::insert::fill_generated_columns(left, values)?;
+            }
+            if let (Some(right), Some(values)) = (&right_info, right_new.as_mut()) {
+                crate::insert::fill_generated_columns(right, values)?;
+            }
             if left_info.is_some()
                 && let (Some(scanned), Some(values)) = (left_row, left_new)
             {
@@ -394,13 +401,23 @@ pub(crate) fn apply_row_update(
     new_values: Vec<Datum>,
 ) -> Result<()> {
     let col_ids: Vec<i64> = info.columns.iter().map(|c| c.id).collect();
-    let new_handle = new_values
-        .first()
-        .and_then(|d| match d {
-            Datum::I64(v) => Some(*v),
-            _ => None,
-        })
-        .unwrap_or(scanned.handle);
+    // Only an integer clustered PRIMARY KEY changes the row handle; heap tables
+    // keep their allocated `_tidb_rowid` across updates.
+    let new_handle = if info.pk_is_handle {
+        info.indices
+            .iter()
+            .find(|idx| idx.primary)
+            .and_then(|idx| idx.columns.first())
+            .and_then(|c| new_values.get(c.offset as usize))
+            .and_then(|d| match d {
+                Datum::I64(v) => Some(*v),
+                Datum::U64(v) => Some(*v as i64),
+                _ => None,
+            })
+            .unwrap_or(scanned.handle)
+    } else {
+        scanned.handle
+    };
     let new_physical = locate_partition_for_row(info, &new_values)?;
     delete_index_keys(
         txn,

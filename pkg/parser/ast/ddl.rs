@@ -79,6 +79,15 @@ impl ColumnPosition {
 pub struct ColumnDef {
     pub name: String,
     pub type_name: String,
+    /// `GENERATED ALWAYS AS (expr) [VIRTUAL|STORED]`; the expression is kept
+    /// as restored SQL text so ColumnDef stays Eq/PartialEq.
+    pub generated: Option<GeneratedColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedColumn {
+    pub expr: String,
+    pub stored: bool,
 }
 
 impl ColumnDef {
@@ -86,6 +95,11 @@ impl ColumnDef {
         ctx.write_name(&self.name);
         ctx.write_str(" ");
         ctx.write_str(&self.type_name);
+        if let Some(g) = &self.generated {
+            ctx.write_str(" GENERATED ALWAYS AS (");
+            ctx.write_str(&g.expr);
+            ctx.write_str(if g.stored { ") STORED" } else { ") VIRTUAL" });
+        }
         Ok(())
     }
 }

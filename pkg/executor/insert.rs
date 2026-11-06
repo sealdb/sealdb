@@ -4,7 +4,7 @@ use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
 };
-use sealdb_expression::{eval_expr, locate_partition_for_row};
+use sealdb_expression::{eval_expr, eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
@@ -106,9 +106,23 @@ fn eval_insert_row(
 ) -> Result<Vec<Datum>> {
     let mut values = Vec::with_capacity(row.len());
     for expr in row {
+        // `DEFAULT` in VALUES: a generated column recomputes it below; other
+        // columns fall back to NULL until column defaults land.
+        if is_default_keyword(expr) {
+            values.push(Datum::Null);
+            continue;
+        }
         values.push(eval_expr(expr)?);
     }
     map_insert_row(info, columns, &values)
+}
+
+fn is_default_keyword(expr: &sealdb_parser::ast::ExprNode) -> bool {
+    matches!(
+        expr,
+        sealdb_parser::ast::ExprNode::Column(c)
+            if c.table.is_none() && c.schema.is_none() && c.name.eq_ignore_ascii_case("default")
+    )
 }
 
 fn map_insert_row(
@@ -128,6 +142,7 @@ fn map_insert_row(
         for (col, v) in info.columns.iter().zip(row.iter()) {
             values.push(cast_for_column(v, col)?);
         }
+        fill_generated_columns(info, &mut values)?;
         return Ok(values);
     }
     if row.len() != columns.len() {
@@ -147,7 +162,34 @@ fn map_insert_row(
             values.push(Datum::Null);
         }
     }
+    fill_generated_columns(info, &mut values)?;
     Ok(values)
+}
+
+/// Evaluate `GENERATED ALWAYS AS (expr)` columns in ascending offset order so a
+/// generated column may reference earlier generated ones. Values are stored
+/// physically (VIRTUAL columns included) until a lazy-read path lands.
+pub(crate) fn fill_generated_columns(info: &sealdb_meta::TableInfo, values: &mut [Datum]) -> Result<()> {
+    if info.columns.iter().all(|c| c.generated_expr.is_none()) {
+        return Ok(());
+    }
+    let schema: Vec<String> = info.columns.iter().map(|c| c.name.o().to_string()).collect();
+    let mut exprs = Vec::new();
+    for col in &info.columns {
+        let Some(text) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        exprs.push((col.offset as usize, expr, col));
+    }
+    for (offset, expr, col) in exprs {
+        if offset >= values.len() {
+            continue;
+        }
+        let value = eval_expr_with_row(&expr, &schema, values)?;
+        values[offset] = cast_for_column(&value, col)?;
+    }
+    Ok(())
 }
 
 fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
