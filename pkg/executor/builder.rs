@@ -447,6 +447,11 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
+            // TiDB `buildDistinct` HashAgg: EXPLAIN shape for a distinct UNION
+            // group. Duplicates are eliminated by the per-arm UNION fold below.
+            PhysicalPlan::DistinctUnion { child, .. } => {
+                Self::build(child, stmt, domain, current_db, txn)
+            }
             PhysicalPlan::Union { .. } => {
                 let set = match stmt {
                     Statement::SetOpr(s) => s,

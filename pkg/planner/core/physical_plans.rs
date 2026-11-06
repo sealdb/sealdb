@@ -201,10 +201,20 @@ pub enum PhysicalPlan {
         est_rows: f64,
         child: Box<PhysicalPlan>,
     },
+    /// TiDB `PhysicalUnionAll`: n-ary children. `op` keeps the set-operator
+    /// semantics for the executor; EXPLAIN always prints empty info.
     Union {
         op: SetOprType,
-        left: Box<PhysicalPlan>,
-        right: Box<PhysicalPlan>,
+        children: Vec<Box<PhysicalPlan>>,
+    },
+    /// TiDB `HashAgg` that eliminates duplicates for a distinct UNION group
+    /// (`buildDistinct` over `LogicalUnionAll`). EXPLAIN prints `HashAgg` →
+    /// child `Union`.
+    DistinctUnion {
+        /// `group by:…, funcs:firstrow(…)`.
+        info: String,
+        est_rows: f64,
+        child: Box<PhysicalPlan>,
     },
     Window {
         /// TiDB Window ExplainInfo (`row_number()->Column#5 over(…)`).
@@ -422,13 +432,12 @@ impl PhysicalPlan {
             PhysicalPlan::UnionScan { child, info, .. } => {
                 format!("UnionScan({info}) -> {}", child.explain())
             }
-            PhysicalPlan::Union { op, left, right } => {
-                format!(
-                    "Union_{}({}, {})",
-                    op.restore(),
-                    left.explain(),
-                    right.explain()
-                )
+            PhysicalPlan::Union { op, children } => {
+                let parts: Vec<String> = children.iter().map(|c| c.explain()).collect();
+                format!("Union_{}({})", op.restore(), parts.join(", "))
+            }
+            PhysicalPlan::DistinctUnion { child, .. } => {
+                format!("DistinctUnion -> {}", child.explain())
             }
             PhysicalPlan::Window { info, child } => {
                 format!("Window({info}) -> {}", child.explain())

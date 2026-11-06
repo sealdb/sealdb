@@ -5639,11 +5639,11 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
                     offset: set.offset,
                 });
             };
-            if split == 0 {
-                return Err(Error::unsupported(
-                    "recursive CTE requires a non-recursive seed arm",
-                ));
-            }
+            // TiDB: when the very first arm already names the CTE (e.g. a
+            // same-name nested WITH shadows it), the first arm still acts as
+            // the seed and every later arm is recursive; binding then reports
+            // the shadowing mismatch (errno 1054).
+            let split = split.max(1);
             let mut arms = arms.into_iter();
             let (_, seed) = arms.next().expect("seed arm");
             let set_rest: Vec<(SetOprType, SelectStmt)> = arms

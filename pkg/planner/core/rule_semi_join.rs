@@ -128,10 +128,18 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             outer: Box::new(rewrite_semi_join(*outer)),
             inner: Box::new(rewrite_semi_join(*inner)),
         },
-        PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {
+        PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
-            left: Box::new(rewrite_semi_join(*left)),
-            right: Box::new(rewrite_semi_join(*right)),
+            children: children.into_iter().map(|c| Box::new(rewrite_semi_join(*c))).collect(),
+        },
+        PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child: Box::new(rewrite_semi_join(*child)),
         },
         PhysicalPlan::CTE {
             name,
@@ -467,6 +475,14 @@ fn build_recursive_arm_plan(
         pushed: None,
     };
     // Marker table name "CTE_0" — explain recursive part maps CTETable.
+    // `… where exists (select /*+ no_decorrelate() */ … from t …)` keeps a
+    // correlated Apply (TiDB skips decorrelation on the hint) instead of a
+    // Selection over the CTE scan.
+    if let Some(sel) = &rec.selection
+        && let Some(apply) = no_decorrelate_exists_apply(scan.clone(), sel.clone(), &rec.fields)
+    {
+        return apply;
+    }
     let child = if let Some(sel) = &rec.selection {
         PhysicalPlan::Selection {
             child: Box::new(scan),
@@ -479,6 +495,57 @@ fn build_recursive_arm_plan(
         exprs,
         child: Box::new(child),
     }
+}
+
+/// `SELECT <plain cols> FROM cte WHERE EXISTS (SELECT … FROM t WHERE corr)` with
+/// a `no_decorrelate()` hint: TiDB keeps `Apply CARTESIAN semi join` with a
+/// `Limit(1)` probe over the correlated inner scan.
+fn no_decorrelate_exists_apply(
+    outer: PhysicalPlan,
+    filter: ExprNode,
+    fields: &[sealdb_parser::ast::SelectField],
+) -> Option<PhysicalPlan> {
+    if fields
+        .iter()
+        .any(|f| !matches!(f.expr, ExprNode::Column(_)))
+    {
+        return None;
+    }
+    let ExprNode::Exists(exists) = &filter else {
+        return None;
+    };
+    if exists.not {
+        return None;
+    }
+    let query = exists.query.as_select()?;
+    if !query.text.contains("no_decorrelate") || !query.joins.is_empty() {
+        return None;
+    }
+    let from = query.from.as_ref()?;
+    if query
+        .with
+        .as_ref()
+        .is_some_and(|w| w.find(&from.name).is_some())
+    {
+        return None;
+    }
+    let probe = match &query.selection {
+        Some(sel) => PhysicalPlan::Selection {
+            child: Box::new(PhysicalPlan::table_reader(from.name.clone(), Vec::new())),
+            filter: sel.clone(),
+        },
+        None => PhysicalPlan::table_reader(from.name.clone(), Vec::new()),
+    };
+    Some(PhysicalPlan::Apply {
+        child: Box::new(outer),
+        filter,
+        probe: Some(Box::new(PhysicalPlan::Limit {
+            child: Box::new(probe),
+            offset: 0,
+            count: 1,
+        })),
+        info: Some("CARTESIAN semi join".into()),
+    })
 }
 
 fn recursive_exists_cte_apply(
@@ -532,10 +599,23 @@ fn recursive_exists_cte_apply(
         limit: cte.limit,
         offset: cte.offset,
     };
+    // Correlated predicate on the CTE scan (`… from cte1 where cte1.c1 = outer.c1`)
+    // stays a `Limit(1)` + Selection probe instead of being folded into Apply.
+    let probe = match &query.selection {
+        Some(sel) => PhysicalPlan::Limit {
+            child: Box::new(PhysicalPlan::Selection {
+                child: Box::new(cte_plan),
+                filter: sel.clone(),
+            }),
+            offset: 0,
+            count: 1,
+        },
+        None => cte_plan,
+    };
     Some(PhysicalPlan::Apply {
         child: Box::new(outer),
         filter,
-        probe: Some(Box::new(cte_plan)),
+        probe: Some(Box::new(probe)),
         info: Some("CARTESIAN semi join".into()),
     })
 }
@@ -1246,10 +1326,21 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
-        PhysicalPlan::Union { op, left, right } => PhysicalPlan::Union {
+        PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
-            left: Box::new(rewrite_semi_join_agg(*left)),
-            right: Box::new(rewrite_semi_join_agg(*right)),
+            children: children
+                .into_iter()
+                .map(|c| Box::new(rewrite_semi_join_agg(*c)))
+                .collect(),
+        },
+        PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child: Box::new(rewrite_semi_join_agg(*child)),
         },
         PhysicalPlan::CTE {
             name,
