@@ -528,6 +528,11 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
     if let Some(msg) = &step.echo {
         return Ok(msg.clone());
     }
+    // `SEALDB_ITEST_TRACE=1` prints each statement before it runs, so a panic
+    // or abort still names the failing SQL.
+    if std::env::var_os("SEALDB_ITEST_TRACE").is_some() {
+        eprintln!("[trace] {}", step.sql);
+    }
     let result = session.execute_stmt(&step.sql);
     match (result, step.expected_error) {
         (Ok(_), Some(code)) => Err(Error::new(
