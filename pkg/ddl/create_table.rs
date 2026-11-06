@@ -6,8 +6,9 @@ use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt, TableName};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
 use sealdb_types::field_type::{
-    FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_FLOAT, TYPE_JSON, TYPE_LONG,
-    TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY, TYPE_VAR_STRING,
+    FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION, TYPE_FLOAT,
+    TYPE_JSON, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY,
+    TYPE_VAR_STRING, TYPE_YEAR,
 };
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
@@ -343,6 +344,16 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             tp: TYPE_TIMESTAMP,
             flen: 19,
             ..string_ft()
+        },
+        "TIME" => FieldType {
+            tp: TYPE_DURATION,
+            flen: parse_len(type_name).unwrap_or(10),
+            ..string_ft()
+        },
+        "YEAR" => FieldType {
+            tp: TYPE_YEAR,
+            flen: 4,
+            ..numeric_ft()
         },
         _ => {
             return Err(Error::unsupported(format!("column type {type_name}")));

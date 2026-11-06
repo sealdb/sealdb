@@ -327,7 +327,7 @@ fn concat_optional(
 }
 
 /// Evaluate SET exprs against the original joined row, then write into left/right copies.
-fn apply_assignments(
+pub(crate) fn apply_assignments(
     list: &[Assignment],
     schema: &[String],
     original: &[Datum],

@@ -430,6 +430,8 @@ pub struct InsertStmt {
     pub rows: Vec<Vec<ExprNode>>,
     pub select: Option<Box<SelectStmt>>,
     pub with: Option<WithClause>,
+    /// `ON DUPLICATE KEY UPDATE col = expr, ...`
+    pub on_duplicate: Vec<Assignment>,
 }
 
 impl InsertStmt {

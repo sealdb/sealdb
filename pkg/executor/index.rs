@@ -33,9 +33,22 @@ pub(crate) fn write_index_keys(
             index.unique,
         );
         if index.unique && txn.get(key.as_bytes())?.is_some() {
+            let value = index_values(index, values)
+                .iter()
+                .map(|v| v.display())
+                .collect::<Vec<_>>()
+                .join("-");
+            let name = if index.primary {
+                "PRIMARY".to_string()
+            } else {
+                index.name.o().to_string()
+            };
             return Err(Error::new(
                 ERR_DUP_ENTRY,
-                format!("Duplicate entry for key '{}'", index.name.o()),
+                format!(
+                    "Duplicate entry '{value}' for key '{}.{name}'",
+                    info.name.o()
+                ),
             ));
         }
         txn.set(
