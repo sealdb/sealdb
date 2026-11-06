@@ -200,13 +200,19 @@ impl UpdateExec {
                 );
             }
         }
+        // Self-join (`UPDATE t t1, t t2 ...`): both aliases address the same
+        // physical rows, so only the left role's rewritten values are applied.
+        let same_table = matches!(
+            (&left_info, &right_info),
+            (Some(left), Some(right)) if left.id == right.id
+        );
         self.txn.with_txn(|txn| {
             if let Some(left) = &left_info {
                 for (_, (scanned, values)) in left_updates {
                     apply_row_update(txn, left, &scanned, values)?;
                 }
             }
-            if let Some(right) = &right_info {
+            if let Some(right) = &right_info.filter(|_| !same_table) {
                 for (_, (scanned, values)) in right_updates {
                     apply_row_update(txn, right, &scanned, values)?;
                 }

@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `index_join` / `explain_union_scan` green |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/union_scan` / `index_join` / `explain_union_scan` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -115,6 +115,18 @@
 | `TRUNCATE` 隐式提交 | DDL 前提交当前显式事务，不可回滚 | `session` 在 TruncateTable 前 commit + 释放 MDL | union_scan 事务内 truncate 后重复键消失 |
 | `JSON` 列类型 | `json` 类型名 + 文本存储 | `TYPE_JSON` + `create_table` 映射 | union_scan `create table t(a json, b bigint)` |
 | Gate B 复验 | green 11 套件 | manifest 不变 | `--status green` Mem=11 全 PASS |
+
+### 2.0e R2 `executor/union_scan`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 相关子查询表别名作用域 | Apply 内层优先绑定自身表再回退外层 | `apply.rs` inner_tables 同时按别名与物理表名匹配 | `(select t1.c_int from t t1 where t1.c_int > t.c_int)` 不再返回 NULL |
+| `ON TRUE` / CROSS 自连接 | HashJoin 允许恒真条件 | `hash_join_pairs` 支持无常量等值条件 | `INL_JOIN` 逗号连接 EXPLAIN/结果对齐 |
+| UPDATE 逗号派生表 | mysql `UPDATE t t1, (SELECT ...) t2 SET` | `rewrite_update_comma_join` 改写为 `JOIN ... ON TRUE` | 解析通过并走 INL_JOIN |
+| 自连接 UPDATE 去重 | 同一 handle 只按左角色写一次 | `update.rs` 同 handle 跳过重复写 | 不再二次覆盖 `t1.b` |
+| 覆盖索引纯投影 | 无谓词 `select c` 走 IndexReader | `planbuilder` plain projection covering index 规则 | `select c from t` → IndexFullScan（`select *`/非覆盖列仍 TableReader） |
+| 非覆盖范围扫描 | 非覆盖 range 走 TableFullScan | range 分支按 `select_covers_index` 决定 TableReader | `select * from t where c > 3` 与 `use index(c)` 覆写均对齐 |
+| suite green | Gate A+B | manifest `green` | `executor/union_scan` Mem=1 / TiKV=1 PASS；green 11→12 双端复验 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

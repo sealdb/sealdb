@@ -2443,6 +2443,7 @@ fn in_list_plan(
     for (column, values) in lists {
         if let Some(index) = info.find_index_covering(&column)
             && index.unique
+            && index.columns.len() == 1
         {
             return Some(point_or_batch(
                 from,
@@ -2619,6 +2620,20 @@ fn index_merge_plan(
         partitions: plan_partitions(info, select.selection.as_ref(), prune_mode),
         pushed: None,
     })
+}
+
+/// True for `SELECT <plain columns> FROM t` with no filtering, grouping, or
+/// de-duplication — the shape where a covering secondary index may replace the
+/// table scan.
+fn is_plain_projection(select: &SelectStmt) -> bool {
+    select.selection.is_none()
+        && select.group_by.is_empty()
+        && select.having.is_none()
+        && !select.distinct
+        && select
+            .fields
+            .iter()
+            .all(|field| matches!(field.expr, ExprNode::Column(_) | ExprNode::Value(_)))
 }
 
 fn select_covers_index(
@@ -3906,7 +3921,9 @@ fn access_plan(
         }
         for (column, value) in &eqs {
             if let Some(index) = info.find_index_covering(column) {
-                if index.unique {
+                // PointGet needs every column of a unique key constrained; a
+                // composite-key prefix is an index range, not a single row.
+                if index.unique && index.columns.len() == 1 {
                     return PhysicalPlan::PointGet {
                         table: from.name.clone(),
                         handle: None,
@@ -3944,12 +3961,35 @@ fn access_plan(
                 continue;
             }
             if let Some(index) = info.find_index_covering(&range.column) {
+                // A non-covering range lookup adds a table probe per row; TiDB's
+                // cost model keeps the full table scan for this shape.
+                if !select_covers_index(select, info, index) {
+                    return partitioned_table_reader(
+                        from,
+                        info,
+                        select.selection.as_ref(),
+                        prune_mode,
+                        stats,
+                        current_db,
+                    );
+                }
                 return index_plan(select, from, info, index, prune_mode);
             }
         }
         // GROUP BY prefix of a secondary index → IndexReader + StreamAgg keep order.
         if let Some(plan) = group_by_index_plan(select, from, info, prune_mode) {
             return plan;
+        }
+        // Plain column projection fully covered by a secondary index →
+        // IndexReader (TiDB prefers the covering index over a table full scan).
+        if is_plain_projection(select)
+            && let Some(index) = info
+                .indices
+                .iter()
+                .filter(|idx| !idx.primary)
+                .find(|idx| select_covers_index(select, info, idx))
+        {
+            return index_plan(select, from, info, index, prune_mode);
         }
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {

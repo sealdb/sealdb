@@ -79,6 +79,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_mysql_interval_minute_second(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
+    let rewritten = rewrite_update_comma_join(&rewritten)?;
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
@@ -2486,6 +2487,130 @@ fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {
         i += sql[i..].chars().next().unwrap().len_utf8();
     }
     (out, flags)
+}
+
+/// MySQL `UPDATE t1, (SELECT ...) t2 SET ...` — sqlparser only accepts a single
+/// table-with-joins before SET. Rewrite the simple derived-table arm into a
+/// JOIN against its base table when the subquery is a plain projection.
+fn rewrite_update_comma_join(sql: &str) -> Result<String> {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "UPDATE")
+            && let Some((fragment, end)) = rewrite_one_update_comma_join(sql, i)?
+        {
+            out.push_str(&fragment);
+            i = end;
+            continue;
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    Ok(out)
+}
+
+fn rewrite_one_update_comma_join(
+    sql: &str,
+    start: usize,
+) -> Result<Option<(String, usize)>> {
+    let bytes = sql.as_bytes();
+    let mut j = start + "UPDATE".len();
+    let mut depth = 0i32;
+    let mut set_pos = None;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b';' => break,
+            _ if depth == 0 && keyword_at(bytes, j, "SET") => {
+                set_pos = Some(j);
+                break;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    let Some(set_pos) = set_pos else {
+        return Ok(None);
+    };
+    let mut commas = Vec::new();
+    let mut d = 0i32;
+    let mut k = start + "UPDATE".len();
+    while k < set_pos {
+        match bytes[k] {
+            b'(' => d += 1,
+            b')' => d -= 1,
+            b',' if d == 0 => commas.push(k),
+            _ => {}
+        }
+        k += 1;
+    }
+    let [comma] = commas[..] else {
+        return Ok(None);
+    };
+    let Some(right) = rewrite_simple_derived_update_side(&sql[comma + 1..set_pos]) else {
+        return Ok(None);
+    };
+    let mut fragment = String::with_capacity(set_pos - start + right.len() + 16);
+    fragment.push_str(&sql[start..comma]);
+    fragment.push_str(" JOIN ");
+    fragment.push_str(&right);
+    fragment.push_str(" ON TRUE ");
+    Ok(Some((fragment, set_pos)))
+}
+
+/// `(SELECT a, b FROM t) t2` → `t t2` when the subquery only projects base
+/// columns with no filtering, grouping, ordering, or limit.
+fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
+    let text = item.trim();
+    let open = text.find('(')?;
+    let close = text.rfind(')')?;
+    if !text[..open].trim().is_empty() {
+        return None;
+    }
+    let alias = text[close + 1..].trim();
+    if alias.is_empty() || alias.split_whitespace().count() != 1 {
+        return None;
+    }
+    let inner = &text[open + 1..close];
+    let stmts = Parser::parse_sql(&dialect(), inner).ok()?;
+    let [SqlStatement::Query(query)] = stmts.as_slice() else {
+        return None;
+    };
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.selection.is_some()
+        || select.having.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || !matches!(select.distinct, None)
+        || !matches!(select.group_by, GroupByExpr::Expressions(ref e, ref m) if e.is_empty() && m.is_empty())
+    {
+        return None;
+    }
+    if !select.projection.iter().all(|field| {
+        matches!(
+            field,
+            SelectItem::UnnamedExpr(Expr::Identifier(_))
+                | SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_))
+                | SelectItem::Wildcard(_)
+        )
+    }) {
+        return None;
+    }
+    let TableFactor::Table {
+        name, alias: None, ..
+    } = &select.from[0].relation
+    else {
+        return None;
+    };
+    Some(format!("{name} {alias}"))
 }
 
 fn keyword_at(bytes: &[u8], i: usize, keyword: &str) -> bool {
