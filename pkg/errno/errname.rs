@@ -31,6 +31,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_LOCK_DEADLOCK => "ErrLockDeadlock",
         errcode::ERR_SUBQUERY_NO_1_ROW => "ErrSubqueryNo1Row",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "ErrWrongNumberOfColumnsInSelect",
+        errcode::ERR_INCORRECT_USAGE => "ErrWrongUsage",
         errcode::ERR_VIEW_WRONG_LIST => "ErrViewWrongList",
         errcode::ERR_DUP_FIELDNAME => "ErrDupFieldName",
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
@@ -48,6 +49,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_VIEW_CHECK_FAILED => "ErrViewCheckFailed",
         errcode::ERR_VIEW_INVALID => "ErrViewInvalid",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
+        errcode::ERR_CTE_MAX_RECURSION_DEPTH => "ErrCTEMaxRecursionDepth",
         _ => "ErrUnknown",
     }
 }

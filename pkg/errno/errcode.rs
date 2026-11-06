@@ -29,6 +29,8 @@ pub const ERR_LOCK_NOWAIT: i32 = 3572;
 pub const ERR_LOCK_DEADLOCK: i32 = 1213;
 pub const ERR_SUBQUERY_NO_1_ROW: i32 = 1242;
 pub const ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT: i32 = 1222;
+/// MySQL `ER_WRONG_USAGE`: e.g. per-arm LIMIT without parentheses in UNION.
+pub const ERR_INCORRECT_USAGE: i32 = 1221;
 /// CTE / derived / VIEW: SELECT list vs column names list (MySQL ER_VIEW_WRONG_LIST).
 pub const ERR_VIEW_WRONG_LIST: i32 = 1353;
 pub const ERR_DUP_FIELDNAME: i32 = 1060;
@@ -48,3 +50,5 @@ pub const ERR_VIEW_CHECK_FAILED: i32 = 1369;
 /// VIEW WITH CHECK OPTION is invalid for ALGORITHM=TEMPTABLE (MySQL 1471).
 pub const ERR_VIEW_INVALID: i32 = 1471;
 pub const ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION: i32 = 1792;
+/// TiDB `ErrCTEMaxRecursionDepth`: recursive CTE exceeded @@cte_max_recursion_depth.
+pub const ERR_CTE_MAX_RECURSION_DEPTH: i32 = 3636;

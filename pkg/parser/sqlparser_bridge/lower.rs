@@ -35,7 +35,8 @@ use crate::ast::misc::{
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error, Result,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error,
+    Result,
 };
 use sealdb_types::{
     parse_date_literal, parse_time_literal, parse_timestamp_literal, Datum,
@@ -110,6 +111,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, load_ops) = extract_load_data(&rewritten)?;
     // sqlparser comments on but does not capture MySQL `WITH [CASCADED|LOCAL] CHECK OPTION`.
     let (rewritten, view_checks) = extract_view_check_option(&rewritten);
+    // TiDB parses a per-arm `LIMIT` before `UNION` and rejects it with 1221.
+    reject_union_arm_limit(&rewritten)?;
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -1302,6 +1305,56 @@ fn take_sql_until_semicolon(bytes: &[u8], start: usize) -> (String, usize) {
         String::from_utf8_lossy(&bytes[start..]).into_owned(),
         bytes.len(),
     )
+}
+
+/// TiDB accepts `SELECT … LIMIT … UNION SELECT …` syntactically but rejects a
+/// per-arm LIMIT without parentheses with errno 1221 (MySQL ER_WRONG_USAGE).
+fn reject_union_arm_limit(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    // Per paren depth: has an unterminated per-arm LIMIT been seen at this level?
+    let mut limit_at_depth: Vec<bool> = vec![false];
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
+                i = skip_quoted(bytes, i);
+                continue;
+            }
+            b'(' => {
+                depth += 1;
+                if limit_at_depth.len() <= depth {
+                    limit_at_depth.push(false);
+                }
+            }
+            b')' => {
+                limit_at_depth[depth] = false;
+                depth = depth.saturating_sub(1);
+            }
+            b';' => {
+                limit_at_depth.iter_mut().for_each(|f| *f = false);
+            }
+            _ if keyword_at(bytes, i, "LIMIT") => {
+                limit_at_depth[depth] = true;
+                i += "LIMIT".len();
+                continue;
+            }
+            _ if keyword_at(bytes, i, "UNION") => {
+                if limit_at_depth[depth] {
+                    return Err(Error::new(
+                        ERR_INCORRECT_USAGE,
+                        "Incorrect usage of UNION and LIMIT",
+                    ));
+                }
+                i += "UNION".len();
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn skip_quoted(bytes: &[u8], i: usize) -> usize {
@@ -5512,6 +5565,14 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
     }))
 }
 
+/// Does `select` read table `name` anywhere in its FROM / JOIN tree?
+fn select_references_table(select: &SelectStmt, name: &str) -> bool {
+    select
+        .join_tables()
+        .into_iter()
+        .any(|table| table.resolve_name().eq_ignore_ascii_case(name))
+}
+
 /// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`.
 /// Nested WITH on the CTE body is kept on the seed select (scoped; may shadow).
 fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
@@ -5526,33 +5587,96 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     // Strip WITH before lowering the body so lower_query does not re-attach it.
     let mut query_ast = cte.query.clone();
     query_ast.with = None;
-    let (mut query, recursive_arm, set_rest, limit, offset) = match query_ast.body.as_ref() {
+    let (mut query, recursive_arm, recursive_rest, set_rest, limit, offset) =
+        match query_ast.body.as_ref() {
         SetExpr::Select(_) => {
-            let q = lower_query(&query_ast)?;
-            let limit = q.limit;
-            let offset = q.offset;
-            (q, None, Vec::new(), limit, offset)
+            let mut q = lower_query(&query_ast)?;
+            // The body LIMIT/OFFSET belongs to the CTE (applied once by
+            // CTEExec), not to the seed SELECT as well.
+            let limit = q.limit.take();
+            let offset = q.offset.take();
+            (q, None, Vec::new(), Vec::new(), limit, offset)
         }
         SetExpr::SetOperation { .. } if recursive => {
             let set = lower_set_opr(&query_ast)?;
-            if set.rest.len() != 1
-                || !matches!(set.rest[0].0, SetOprType::Union | SetOprType::UnionAll)
+            let name = cte.alias.name.value.clone();
+            // TiDB `buildRecursiveCTE`: the body is split at the first arm that
+            // references the CTE itself — earlier arms form the seed, the rest
+            // (all UNION / UNION ALL) form the recursive part.
+            let mut arms: Vec<(Option<SetOprType>, SelectStmt)> =
+                Vec::with_capacity(set.rest.len() + 1);
+            arms.push((None, set.first));
+            arms.extend(set.rest.into_iter().map(|(op, select)| (Some(op), select)));
+            let split = arms
+                .iter()
+                .position(|(_, select)| select_references_table(select, &name));
+            let Some(split) = split else {
+                // No arm references the CTE: a `WITH RECURSIVE` body that is a
+                // plain set operation (TiDB treats it as non-recursive).
+                let mut iter = arms.into_iter();
+                let (_, seed) = iter.next().expect("seed arm");
+                let rest = iter.map(|(op, select)| (op.expect("non-first arm"), select));
+                return Ok(CommonTableExpression {
+                    name,
+                    query: Box::new(seed),
+                    col_name_list: cte
+                        .alias
+                        .columns
+                        .iter()
+                        .map(|col| col.name.value.clone())
+                        .collect(),
+                    recursive: None,
+                    recursive_rest: Vec::new(),
+                    set_rest: rest.collect(),
+                    materialize: match cte.materialized {
+                        Some(CteAsMaterialized::Materialized) => CteMaterialize::Materialized,
+                        Some(CteAsMaterialized::NotMaterialized) => {
+                            CteMaterialize::NotMaterialized
+                        }
+                        None => CteMaterialize::Default,
+                    },
+                    limit: set.limit,
+                    offset: set.offset,
+                });
+            };
+            if split == 0 {
+                return Err(Error::unsupported(
+                    "recursive CTE requires a non-recursive seed arm",
+                ));
+            }
+            let mut arms = arms.into_iter();
+            let (_, seed) = arms.next().expect("seed arm");
+            let set_rest: Vec<(SetOprType, SelectStmt)> = arms
+                .by_ref()
+                .take(split - 1)
+                .map(|(op, select)| (op.expect("non-first arm"), select))
+                .collect();
+            let (op, rec) = arms.next().expect("recursive arm");
+            let first_rec = (op.expect("recursive arm op"), rec);
+            let recursive_rest: Vec<(SetOprType, SelectStmt)> = arms
+                .map(|(op, select)| (op.expect("non-first arm"), select))
+                .collect();
+            if !matches!(first_rec.0, SetOprType::Union | SetOprType::UnionAll)
+                || recursive_rest
+                    .iter()
+                    .any(|(op, _)| !matches!(op, SetOprType::Union | SetOprType::UnionAll))
             {
                 return Err(Error::unsupported(
-                    "recursive CTE requires a single UNION / UNION ALL",
+                    "recursive CTE requires UNION / UNION ALL arms",
                 ));
             }
             (
-                set.first,
-                Some(set.rest[0].clone()),
-                Vec::new(),
+                seed,
+                Some(first_rec),
+                recursive_rest,
+                set_rest,
                 set.limit,
                 set.offset,
             )
         }
         SetExpr::SetOperation { .. } => {
             let set = lower_set_opr(&query_ast)?;
-            (set.first, None, set.rest, set.limit, set.offset)
+            (set.first, None, Vec::new(), set.rest, set.limit, set.offset)
         }
         other => return Err(Error::unsupported(format!("CTE body {other}"))),
     };
@@ -5572,6 +5696,7 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             .map(|col| col.name.value.clone())
             .collect(),
         recursive: recursive_arm,
+        recursive_rest,
         set_rest,
         materialize: match cte.materialized {
             Some(CteAsMaterialized::Materialized) => CteMaterialize::Materialized,
@@ -5676,6 +5801,7 @@ fn isolate_setopr_group(query: &Query) -> Result<SelectStmt> {
         query: Box::new(seed),
         col_name_list: Vec::new(),
         recursive: None,
+        recursive_rest: Vec::new(),
         set_rest: rest,
         // TiDB merges parenthesized set operations into the enclosing plan.
         materialize: CteMaterialize::NotMaterialized,
@@ -6422,6 +6548,7 @@ fn table_factor(
                 query: Box::new(query),
                 col_name_list,
                 recursive: None,
+                recursive_rest: Vec::new(),
                 set_rest,
                 // Derived tables merge into the parent plan (TiDB default).
                 materialize: CteMaterialize::NotMaterialized,

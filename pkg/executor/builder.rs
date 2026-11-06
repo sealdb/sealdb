@@ -547,7 +547,7 @@ impl ExecutorBuilder {
                     })
                 };
                 let cte = with.find(name);
-                let recursive = with.recursive_arm(name)?;
+                let recursive = with.recursive_arms(name)?;
                 let limit = cte.and_then(|c| c.limit);
                 let offset = cte.and_then(|c| c.offset);
                 let share = !inline;

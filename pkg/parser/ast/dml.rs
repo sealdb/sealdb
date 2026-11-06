@@ -138,6 +138,9 @@ pub struct CommonTableExpression {
     pub col_name_list: Vec<String>,
     /// Recursive `UNION` / `UNION ALL` arm for `WITH RECURSIVE`.
     pub recursive: Option<(SetOprType, SelectStmt)>,
+    /// Additional recursive arms after the first one
+    /// (`seed UNION ALL rec1 UNION ALL rec2 …`).
+    pub recursive_rest: Vec<(SetOprType, SelectStmt)>,
     /// Non-recursive set-op rest (`UNION` / `EXCEPT` / `INTERSECT`) of the CTE body.
     pub set_rest: Vec<(SetOprType, SelectStmt)>,
     /// `AS MATERIALIZED` / `AS NOT MATERIALIZED`; default leaves planner choice.
@@ -244,6 +247,29 @@ impl WithClause {
         }
         crate::ast::cte_scope::inherit_cte_scope_in_select(&mut rec);
         Ok(Some((op, rec)))
+    }
+
+    /// All recursive arms of `name` (first arm first), with the body scope
+    /// attached. Empty for a non-recursive CTE.
+    pub fn recursive_arms(&self, name: &str) -> Result<Vec<(SetOprType, SelectStmt)>> {
+        let cte = self
+            .find(name)
+            .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
+        let mut arms = Vec::new();
+        if let Some((op, rec)) = cte.recursive.clone() {
+            arms.push((op, rec));
+            arms.extend(cte.recursive_rest.iter().cloned());
+        }
+        let scope = self.body_scope(name);
+        for (_, rec) in arms.iter_mut() {
+            if rec.with.is_none()
+                && let Some(scope) = &scope
+            {
+                rec.with = Some(scope.clone());
+            }
+            crate::ast::cte_scope::inherit_cte_scope_in_select(rec);
+        }
+        Ok(arms)
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {

@@ -1,10 +1,13 @@
-use sealdb_errno::{ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_NO_SUCH_TABLE, Error, Result};
+use sealdb_errno::{
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_NO_SUCH_TABLE, ERR_VIEW_WRONG_LIST, Error, Result,
+};
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
-use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt, TableName};
+use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
+use std::collections::HashMap;
 use sealdb_types::field_type::{
     FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION, TYPE_FLOAT,
     TYPE_JSON, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY,
@@ -92,16 +95,57 @@ pub(crate) fn columns_from_select(
     select: &SelectStmt,
     current_db: &str,
 ) -> Result<Vec<ColumnDef>> {
-    let sources = select_source_tables(is, select, current_db)?;
+    columns_from_select_scoped(is, select, current_db, &HashMap::new())
+}
+
+/// One `FROM` / `JOIN` source: a physical table or a CTE in scope.
+struct SelectSource {
+    table: String,
+    columns: Vec<(String, String)>,
+}
+
+fn columns_from_select_scoped(
+    is: &InfoSchema,
+    select: &SelectStmt,
+    current_db: &str,
+    outer_scope: &HashMap<String, Vec<(String, String)>>,
+) -> Result<Vec<ColumnDef>> {
+    let mut scope = outer_scope.clone();
+    // CTE bodies see only preceding sibling CTEs; their output names/types are
+    // what a later `FROM cte` expands / resolves columns against.
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            let cols = columns_from_select_scoped(is, &cte.query, current_db, &scope)?;
+            let mut cols = cols;
+            if !cte.col_name_list.is_empty() {
+                if cte.col_name_list.len() != cols.len() {
+                    return Err(Error::new(
+                        ERR_VIEW_WRONG_LIST,
+                        "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts",
+                    ));
+                }
+                for (col, name) in cols.iter_mut().zip(&cte.col_name_list) {
+                    col.name = name.clone();
+                }
+            }
+            scope.insert(
+                cte.name.to_ascii_lowercase(),
+                cols.into_iter()
+                    .map(|col| (col.name, col.type_name))
+                    .collect(),
+            );
+        }
+    }
+    let sources = select_sources(is, select, current_db, &scope)?;
     let mut cols = Vec::new();
     for (i, field) in select.fields.iter().enumerate() {
         if is_star_expr(&field.expr) {
             if sources.is_empty() {
                 return Err(Error::unsupported("CREATE TABLE AS SELECT * without FROM"));
             }
-            for table in &sources {
-                for col in &table.columns {
-                    push_select_column(&mut cols, col.name.o(), col.field_type.type_name())?;
+            for source in &sources {
+                for (name, type_name) in &source.columns {
+                    push_select_column(&mut cols, name, type_name.clone())?;
                 }
             }
             continue;
@@ -131,34 +175,38 @@ fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) 
     Ok(())
 }
 
-fn select_source_tables<'a>(
-    is: &'a InfoSchema,
+fn select_sources(
+    is: &InfoSchema,
     select: &SelectStmt,
     current_db: &str,
-) -> Result<Vec<&'a TableInfo>> {
-    let mut tables = Vec::new();
-    if !select.joins.is_empty() {
-        for table in select.join_tables() {
-            tables.push(lookup_table(is, table, current_db)?);
+    scope: &HashMap<String, Vec<(String, String)>>,
+) -> Result<Vec<SelectSource>> {
+    let mut sources = Vec::new();
+    for table in select.join_tables() {
+        if let Some(columns) = scope.get(&table.resolve_name().to_ascii_lowercase()) {
+            sources.push(SelectSource {
+                table: table.name.clone(),
+                columns: columns.clone(),
+            });
+            continue;
         }
-    } else if let Some(from) = &select.from {
-        tables.push(lookup_table(is, from, current_db)?);
+        let (schema, name) = table.qualified(current_db);
+        let info = is.table_by_name(&schema, &name).ok_or_else(|| {
+            Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{schema}.{name}' doesn't exist"),
+            )
+        })?;
+        sources.push(SelectSource {
+            table: table.name.clone(),
+            columns: info
+                .columns
+                .iter()
+                .map(|col| (col.name.o().to_string(), col.field_type.type_name()))
+                .collect(),
+        });
     }
-    Ok(tables)
-}
-
-fn lookup_table<'a>(
-    is: &'a InfoSchema,
-    name: &TableName,
-    current_db: &str,
-) -> Result<&'a TableInfo> {
-    let (schema, table) = name.qualified(current_db);
-    is.table_by_name(&schema, &table).ok_or_else(|| {
-        Error::new(
-            ERR_NO_SUCH_TABLE,
-            format!("Table '{schema}.{table}' doesn't exist"),
-        )
-    })
+    Ok(sources)
 }
 
 fn field_column_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> String {
@@ -180,9 +228,9 @@ fn field_column_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> 
     }
 }
 
-fn type_name_from_expr(expr: &ExprNode, sources: &[&TableInfo]) -> Result<String> {
+fn type_name_from_expr(expr: &ExprNode, sources: &[SelectSource]) -> Result<String> {
     match expr {
-        ExprNode::Column(col) => Ok(lookup_select_column(col, sources)?.field_type.type_name()),
+        ExprNode::Column(col) => Ok(lookup_select_column(col, sources)?),
         ExprNode::Cast(cast) => Ok(cast.target.clone()),
         ExprNode::Value(ValueExpr { datum }) => Ok(type_name_from_datum(datum).to_string()),
         ExprNode::Func(func) if func.name.eq_ignore_ascii_case("COUNT") => Ok("bigint".to_string()),
@@ -193,22 +241,19 @@ fn type_name_from_expr(expr: &ExprNode, sources: &[&TableInfo]) -> Result<String
     }
 }
 
-fn lookup_select_column<'a>(
-    col: &ColumnNameExpr,
-    sources: &[&'a TableInfo],
-) -> Result<&'a ColumnInfo> {
+fn lookup_select_column(col: &ColumnNameExpr, sources: &[SelectSource]) -> Result<String> {
     let hinted = col.table.as_deref();
     let mut found = None;
-    for table in sources {
+    for source in sources {
         if let Some(hint) = hinted
-            && !table.name.o().eq_ignore_ascii_case(hint)
+            && !source.table.eq_ignore_ascii_case(hint)
         {
             continue;
         }
-        if let Some(column) = table
+        if let Some((_, type_name)) = source
             .columns
             .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+            .find(|(name, _)| name.eq_ignore_ascii_case(&col.name))
         {
             if found.is_some() && hinted.is_none() {
                 return Err(Error::new(
@@ -216,7 +261,7 @@ fn lookup_select_column<'a>(
                     format!("Column '{0}' in field list is ambiguous", col.name),
                 ));
             }
-            found = Some(column);
+            found = Some(type_name.clone());
         }
     }
     found.ok_or_else(|| {
