@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（executor/cte green；green 13 套件 Mem+TiKV 复验通过）  
+> 最后更新：2026-11-06（executor/window green；green 16 套件 Mem+TiKV 复验通过）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -151,6 +151,32 @@
 | RightOuter 空补宽 | 保留侧在右，输出仍 `[left, right]` | `probe_outer` 右侧保留时按 build 宽度补 NULL | `t1 join t2 using(a) right join t3 …` 返回 4 列 |
 | 括号 JOIN + USING | `(t2 JOIN t3 USING (b))` 作为单侧时列名可重复 | `FromItem::Join.using_cols` + 可见列模型；1052 `Column … in from clause is ambiguous` | `t1 JOIN (t2 JOIN t3 USING (b)) USING (a)` → 1052 |
 | suite green | Gate A+B | manifest `green` | `executor/jointest/join` Mem=1 / TiKV=1 PASS；green 13→14 双端复验 |
+
+### 2.0h R2 `naaj`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| Row 构造器 AST | `ast.RowExpr` 承载 `(a, b)` | `ExprNode::Row(RowExpr)`；lower `Expr::Tuple`；标量上下文报 1241 | `select (a,b)` → Error 1241；`(a,b) not in (…)` 可解析 |
+| `!= ALL` 语义标记 | `ast.CompareSubqueryExpr.All` 与 `NOT IN` 分流 | `InSubqueryExpr.all_ne`；`lower_quantified_cmp` 置位 | `(a,b) != all (…)` 与 `not in` 分别走不同计划形状 |
+| Null-Aware Anti Join 计划 | `PhysicalHashJoin` + `NullAwareAntiJoin`（`convertToNullAwareAntiJoin`） | `PhysicalPlan::NullAwareAntiJoin`；`naaj_plan` 生成 `HashJoin` 信息/keys/other cond | PART1/2 brief 全对齐（`Null-aware anti semi` / `anti left outer semi`） |
+| 相关等式让位 | 内层相关 EQ 存在时不建 NAEQ | `corr_eq` 提升为 hash key，行比较降级为 `other cond` | `where naaj_A.c = naaj_B.c` → `anti (left outer) semi join, equal:[eq(c,c)]` |
+| 注入投影 | `injectExtraProjection` 仅在纯 NAEQ 路径 | `RowProjection` 计划节点（执行透明）；corr-EQ 路径不注入 | `(a+1,b*2) not in (…)` 的 `plus(...)->Column#14` Projection |
+| 三值 NOT IN 执行 | NAAJ 探针/构建侧 NULL 语义 | `NullAwareAntiJoinExec`：行比较 TRUE/FALSE/NULL + `left_outer` 布尔列 `1/0/NULL` | PART2/4 左表 NULL、右表 NULL 桶全部结果对齐 |
+| WHERE `!= ALL` 形状 | `Selection(Column#9)` + 回投 Projection | `naaj_plan` 包装 Selection/Projection；est 0.8 折叠 | PART3/4 brief `Projection▷Selection▷HashJoin` 对齐 |
+| suite green | Gate A+B | manifest `green` | `naaj` Mem=1 / TiKV=1 PASS；green 14→15 双端复验 |
+
+### 2.0i R2 `executor/window`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 命名窗口 `WINDOW w AS (...)` | `ast.WindowSpec` 引用解析 | `resolve_named_window` 合并 named spec 后再建 Window | `lead(col_13,1,NULL) over w` 结果对齐 |
+| 窗口计划下的恒等投影 | `PhysicalProjection` 只改名 | `ProjectionExec::passthrough`；`is_window_plan` + `is_identity_projection` | `Projection(Column#5->Column#6)▷Window` 不再二次求值窗口函数 |
+| `SUBSTRING/SUBSTR/MID` | `builtinStringSubstring` | `eval_substring`（1-based、负 pos、负 len 空串、按字符切） | `substring(cast(...), n, abs(n))` |
+| `XOR` 三值逻辑 | `opcode.LogicXor` | `Op::LogicXor` + `eval_logic` 分支 | `c_k4duc4l XOR c_tutmh1` |
+| `PRIMARY KEY ... CLUSTERED` / `pre_split_regions=N` | TiDB DDL 扩展子句 | `strip_tidb_create_table_options` 解析前剥离 | `create table t (...) CLUSTERED) pre_split_regions=2` |
+| `INSERT ... VALUES` 内子查询 | `InsertExec` 用 session 求值 | `SubqueryEvalCtx` 传入 `eval_insert_row` | `values (..., (select ... limit 1 offset 2))` |
+| DML 谓词内嵌子查询 | `preEvaluateDMLPredicate` 递归 | `pre_evaluate_dml_predicate` 进 Func/Cast/InList/Between/Like/IsNull/Case | `delete ... where substring(..., (select ...))` |
+| suite green | Gate A+B | manifest `green` | `executor/window` Mem=1 / TiKV=1 PASS；green 15→16 双端复验 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

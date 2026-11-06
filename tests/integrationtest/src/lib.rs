@@ -511,6 +511,10 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     // TiDB mysql-tester: database name = suite path with `/` → `__`
     // (`show` → `show`, `types/const` → `types__const`).
     let db = suite.name.replace('/', "__");
+    // TiDB runs each test file against a fresh instance, so suites assume an
+    // empty database and skip `DROP TABLE`. TiKV storage is persistent, so
+    // recreate the suite database rather than inheriting an aborted run's tables.
+    let _ = session.execute_stmt(&format!("DROP DATABASE IF EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("CREATE DATABASE IF NOT EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("USE `{db}`"));
     let mut chunks = Vec::new();
