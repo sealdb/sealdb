@@ -89,13 +89,26 @@ impl Executor for HashJoinV1Exec {
         // CROSS JOIN / non-equality ON (e.g. `ON (sub.col)` truthiness) →
         // cartesian product then filter; no hash keys.
         if self.join.tp == JoinType::Cross || !join_on_is_equijoin(&self.join.on) {
+            let full_schema: Vec<String> = left_schema
+                .iter()
+                .cloned()
+                .chain(right_schema.iter().cloned())
+                .collect();
+            // Semi/Anti keep only the probe columns: fold the cartesian product
+            // back to the left row instead of emitting joined rows.
+            if self.join.tp.is_semi_anti() {
+                self.rows = probe_semi_anti_non_equi(
+                    self.join.tp,
+                    &left_rows,
+                    &right_rows,
+                    &full_schema,
+                    &self.join.on,
+                    left_width,
+                )?;
+                return Ok(());
+            }
             self.rows = probe_cross(&left_rows, &right_rows);
             if !is_trivial_on_true(&self.join.on) {
-                let full_schema: Vec<String> = left_schema
-                    .iter()
-                    .cloned()
-                    .chain(right_schema.iter().cloned())
-                    .collect();
                 self.rows = filter_rows_by_on(
                     std::mem::take(&mut self.rows),
                     &full_schema,
@@ -222,6 +235,8 @@ fn probe_join(
             right_width,
             true,
         ),
+        // Probe is the preserved right side; output rows stay `[left, right]`,
+        // so an unmatched row null-pads the *build* (original left) width.
         JoinType::RightOuter => probe_outer(
             right_rows,
             left_rows,
@@ -229,8 +244,8 @@ fn probe_join(
             left_schema,
             right_key,
             left_key,
-            right_width,
             left_width,
+            right_width,
             false,
         ),
         JoinType::Cross => Ok(probe_cross(left_rows, right_rows)),
@@ -429,6 +444,43 @@ fn is_trivial_on_true(on: &ExprNode) -> bool {
     )
 }
 
+/// Semi/Anti over a non-equality `ON`: cartesian product, then keep the left
+/// row itself (Semi: any right row matches; Anti: none does). TiDB evaluates
+/// these as an Apply; the emitted schema is still the probe side only.
+fn probe_semi_anti_non_equi(
+    tp: JoinType,
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    full_schema: &[String],
+    on: &ExprNode,
+    left_width: usize,
+) -> Result<Vec<Vec<Datum>>> {
+    let trivial = is_trivial_on_true(on);
+    let mut out = Vec::new();
+    for left in left_rows {
+        let mut matched = trivial && !right_rows.is_empty();
+        if !trivial {
+            for right in right_rows {
+                let mut row = left.clone();
+                row.extend(right.iter().cloned());
+                if row_passes_on(&row, full_schema, on)? {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        let keep = match tp {
+            JoinType::Semi => matched,
+            JoinType::Anti => !matched,
+            _ => false,
+        };
+        if keep {
+            out.push(left[..left_width.min(left.len())].to_vec());
+        }
+    }
+    Ok(out)
+}
+
 fn filter_rows_by_on(
     rows: Vec<Vec<Datum>>,
     schema: &[String],
@@ -436,18 +488,25 @@ fn filter_rows_by_on(
 ) -> Result<Vec<Vec<Datum>>> {
     let mut out = Vec::new();
     for row in rows {
-        let v = eval_expr_with_row(on, schema, &row)?;
-        if v.is_null() {
-            continue;
-        }
-        match v {
-            Datum::I64(n) if n != 0 => out.push(row),
-            Datum::U64(n) if n != 0 => out.push(row),
-            Datum::Bytes(b) if !b.is_empty() => out.push(row),
-            _ => {}
+        if row_passes_on(&row, schema, on)? {
+            out.push(row);
         }
     }
     Ok(out)
+}
+
+/// Evaluate a (non-equality) join `ON` predicate against one joined row.
+fn row_passes_on(row: &[Datum], schema: &[String], on: &ExprNode) -> Result<bool> {
+    let v = eval_expr_with_row(on, schema, row)?;
+    if v.is_null() {
+        return Ok(false);
+    }
+    Ok(match v {
+        Datum::I64(n) => n != 0,
+        Datum::U64(n) => n != 0,
+        Datum::Bytes(b) => !b.is_empty(),
+        _ => false,
+    })
 }
 
 /// `JOIN ... ON TRUE` is a comma/cross join (string-rewritten UPDATE joins).
