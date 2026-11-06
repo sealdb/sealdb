@@ -1,11 +1,12 @@
 use crate::index::write_index_keys;
 use crate::internal::exec::Executor;
+use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
 };
 use sealdb_expression::{eval_expr, eval_expr_with_row, locate_partition_for_row};
-use sealdb_kv::TxnHandle;
+use sealdb_kv::{LockWait, TxnHandle};
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
@@ -66,16 +67,70 @@ impl Executor for InsertExec {
         } else {
             Vec::new()
         };
-        self.txn.with_txn(|txn| {
-            if self.select.is_some() {
-                for row in &source_rows {
-                    let values = map_insert_row(info, &self.stmt.columns, row)?;
-                    write_row(txn, &self.domain, info, &values)?;
+        let mut pending = Vec::with_capacity(if self.select.is_some() {
+            source_rows.len()
+        } else {
+            self.stmt.rows.len()
+        });
+        if self.select.is_some() {
+            for row in &source_rows {
+                pending.push(map_insert_row(info, &self.stmt.columns, row)?);
+            }
+        } else {
+            for row in &self.stmt.rows {
+                pending.push(eval_insert_row(info, &self.stmt.columns, row)?);
+            }
+        }
+        if self.stmt.on_duplicate.is_empty() {
+            return self.txn.with_txn(|txn| {
+                for values in &pending {
+                    write_row(txn, &self.domain, info, values)?;
                 }
-            } else {
-                for row in &self.stmt.rows {
-                    let values = eval_insert_row(info, &self.stmt.columns, row)?;
-                    write_row(txn, &self.domain, info, &values)?;
+                Ok(())
+            });
+        }
+        // `ON DUPLICATE KEY UPDATE`: locate conflicts against a snapshot of the
+        // table, then update the conflicting row instead of inserting.
+        let lock = crate::update::dml_row_lock(&self.txn)?;
+        let physical = info.prune_partitions(None);
+        let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
+        let names = crate::update::col_names(info);
+        self.txn.with_txn(|txn| {
+            for values in pending {
+                match find_conflict(info, &existing, None, &values) {
+                    Some((idx, _)) => {
+                        let mut merged = existing[idx].values.clone();
+                        crate::update::apply_assignments(
+                            &self.stmt.on_duplicate,
+                            &names,
+                            &existing[idx].values,
+                            names.len(),
+                            Some(&mut merged),
+                            None,
+                        )?;
+                        fill_generated_columns(info, &mut merged)?;
+                        if let Some((_, dup_idx)) =
+                            find_conflict(info, &existing, Some(idx), &merged)
+                        {
+                            return Err(duplicate_error(info, dup_idx, &merged));
+                        }
+                        crate::update::apply_row_update(
+                            txn,
+                            info,
+                            &existing[idx],
+                            merged.clone(),
+                        )?;
+                        existing[idx].values = merged;
+                    }
+                    None => {
+                        let (handle, physical_id) =
+                            write_row(txn, &self.domain, info, &values)?;
+                        existing.push(crate::table_reader::ScannedRow {
+                            handle,
+                            physical_id,
+                            values,
+                        });
+                    }
                 }
             }
             Ok(())
@@ -212,18 +267,18 @@ fn write_row(
     domain: &Domain,
     info: &sealdb_meta::TableInfo,
     values: &[Datum],
-) -> Result<()> {
+) -> Result<(i64, i64)> {
     let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
     // Integer primary-key handle only when `pk_is_handle`; otherwise allocate
     // a unique _tidb_rowid (TiDB heap table). The handle is the PRIMARY KEY
     // column value (not always column 0 — e.g. `wkey, pkey PRIMARY KEY(pkey)`).
+    let pk_offset = info
+        .indices
+        .iter()
+        .find(|idx| idx.primary)
+        .and_then(|idx| idx.columns.first())
+        .map(|c| c.offset as usize);
     let handle = if info.pk_is_handle {
-        let pk_offset = info
-            .indices
-            .iter()
-            .find(|idx| idx.primary)
-            .and_then(|idx| idx.columns.first())
-            .map(|c| c.offset as usize);
         match pk_offset.and_then(|off| values.get(off)) {
             Some(Datum::I64(v)) => *v,
             Some(Datum::U64(v)) => *v as i64,
@@ -235,11 +290,87 @@ fn write_row(
     let physical_id = locate_partition_for_row(info, values)?;
     let key = encode_row_key_with_handle(physical_id, handle);
     if info.indices.iter().any(|idx| idx.primary) && txn.get(key.as_bytes())?.is_some() {
+        let value = pk_offset
+            .and_then(|off| values.get(off))
+            .map(|v| v.display())
+            .unwrap_or_default();
         return Err(Error::new(
             ERR_DUP_ENTRY,
-            "Duplicate entry for key 'PRIMARY'",
+            format!("Duplicate entry '{value}' for key '{}.PRIMARY'", info.name.o()),
         ));
     }
     txn.set(key.as_bytes(), &encode_row(&col_ids, values))?;
-    write_index_keys(txn, info, handle, values, physical_id)
+    write_index_keys(txn, info, handle, values, physical_id)?;
+    Ok((handle, physical_id))
+}
+
+/// Index columns equal on every column (NULL never conflicts). Returns the
+/// first conflicting unique index, if any.
+fn index_conflict(
+    info: &sealdb_meta::TableInfo,
+    a: &[Datum],
+    b: &[Datum],
+) -> Option<usize> {
+    for (i, index) in info.indices.iter().enumerate() {
+        if !index.unique {
+            continue;
+        }
+        let mut all_eq = true;
+        for col in &index.columns {
+            let av = a.get(col.offset as usize);
+            let bv = b.get(col.offset as usize);
+            match (av, bv) {
+                (Some(av), Some(bv)) if !av.is_null() && !bv.is_null() && av == bv => {}
+                _ => {
+                    all_eq = false;
+                    break;
+                }
+            }
+        }
+        if all_eq {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_conflict(
+    info: &sealdb_meta::TableInfo,
+    rows: &[crate::table_reader::ScannedRow],
+    skip: Option<usize>,
+    values: &[Datum],
+) -> Option<(usize, usize)> {
+    rows.iter().enumerate().find_map(|(i, row)| {
+        if Some(i) == skip {
+            return None;
+        }
+        index_conflict(info, &row.values, values).map(|idx| (i, idx))
+    })
+}
+
+fn duplicate_error(info: &sealdb_meta::TableInfo, index_idx: usize, values: &[Datum]) -> Error {
+    let index = &info.indices[index_idx];
+    let value = index
+        .columns
+        .iter()
+        .map(|c| {
+            values
+                .get(c.offset as usize)
+                .map(|v| v.display())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    let name = if index.primary {
+        "PRIMARY".to_string()
+    } else {
+        index.name.o().to_string()
+    };
+    Error::new(
+        ERR_DUP_ENTRY,
+        format!(
+            "Duplicate entry '{value}' for key '{}.{name}'",
+            info.name.o()
+        ),
+    )
 }

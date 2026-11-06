@@ -572,6 +572,7 @@ impl Session {
                     rows: Vec::new(),
                     select: Some(select.clone()),
                     with: None,
+                    on_duplicate: Vec::new(),
                 })
             }),
             _ => None,
@@ -3104,6 +3105,7 @@ fn load_data_to_insert(
         rows,
         select: None,
         with: None,
+        on_duplicate: Vec::new(),
     })
 }
 

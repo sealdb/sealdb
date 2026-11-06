@@ -49,7 +49,8 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
     LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
-    NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OrderByExpr, OrderByKind,
+    NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OnInsert, OrderByExpr,
+    OrderByKind,
     OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
     SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
     ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions,
@@ -809,12 +810,36 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .iter()
                 .map(object_name_last)
                 .collect::<Result<Vec<_>>>()?;
-            let (rows, select) = match insert.source.as_deref() {
-                Some(query) => match query.body.as_ref() {
-                    SetExpr::Values(values) => (lower_values(values)?, None),
-                    _ => (Vec::new(), Some(Box::new(lower_query(query)?))),
-                },
-                None => return Err(Error::unsupported("INSERT without VALUES")),
+            let (columns, rows, select) = if !insert.assignments.is_empty() {
+                let mut columns = Vec::with_capacity(insert.assignments.len());
+                let mut row = Vec::with_capacity(insert.assignments.len());
+                for item in &insert.assignments {
+                    match &item.target {
+                        AssignmentTarget::ColumnName(name) => {
+                            columns.push(object_name_last(name)?);
+                        }
+                        AssignmentTarget::Tuple(_) => {
+                            return Err(Error::unsupported("tuple INSERT SET assignment"));
+                        }
+                    }
+                    row.push(lower_expr(&item.value)?);
+                }
+                (columns, vec![row], None)
+            } else {
+                match insert.source.as_deref() {
+                    Some(query) => match query.body.as_ref() {
+                        SetExpr::Values(values) => (columns, lower_values(values)?, None),
+                        _ => (columns, Vec::new(), Some(Box::new(lower_query(query)?))),
+                    },
+                    None => return Err(Error::unsupported("INSERT without VALUES")),
+                }
+            };
+            let on_duplicate = match &insert.on {
+                Some(OnInsert::DuplicateKeyUpdate(list)) => lower_assignments(list)?,
+                Some(other) => {
+                    return Err(Error::unsupported(format!("INSERT {other}")));
+                }
+                None => Vec::new(),
             };
             Ok(Statement::Insert(InsertStmt {
                 table,
@@ -822,6 +847,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 rows,
                 select,
                 with: None,
+                on_duplicate,
             }))
         }
         SqlStatement::Update(update) => lower_update(update),
@@ -1037,6 +1063,19 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
     while i < bytes.len() {
         if keyword_at(bytes, i, "ADMIN") {
             let after_admin = skip_ws(bytes, i + "ADMIN".len());
+            if keyword_at(bytes, after_admin, "CHECK") {
+                let after_check = skip_ws(bytes, after_admin + "CHECK".len());
+                if keyword_at(bytes, after_check, "TABLE") {
+                    // `ADMIN CHECK TABLE t` — verification no-op for now.
+                    out.push_str("DO 0");
+                    let mut j = after_check + "TABLE".len();
+                    while j < bytes.len() && bytes[j] != b';' {
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
             if keyword_at(bytes, after_admin, "SHOW") {
                 let after_show = skip_ws(bytes, after_admin + "SHOW".len());
                 if keyword_at(bytes, after_show, "DDL") {
@@ -2415,10 +2454,13 @@ fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {
             if keyword_at(bytes, after_start, "TRANSACTION") {
                 let after_txn = skip_ws(bytes, after_start + "TRANSACTION".len());
                 let pessimistic = keyword_at(bytes, after_txn, "PESSIMISTIC");
+                let optimistic = !pessimistic && keyword_at(bytes, after_txn, "OPTIMISTIC");
                 flags.push(pessimistic);
                 out.push_str(&sql[i..after_start + "TRANSACTION".len()]);
                 i = if pessimistic {
                     after_txn + "PESSIMISTIC".len()
+                } else if optimistic {
+                    after_txn + "OPTIMISTIC".len()
                 } else {
                     after_start + "TRANSACTION".len()
                 };
@@ -2428,10 +2470,13 @@ fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {
         if keyword_at(bytes, i, "BEGIN") {
             let after = skip_ws(bytes, i + 5);
             let pessimistic = keyword_at(bytes, after, "PESSIMISTIC");
+            let optimistic = !pessimistic && keyword_at(bytes, after, "OPTIMISTIC");
             flags.push(pessimistic);
             out.push_str("BEGIN");
             i = if pessimistic {
                 after + "PESSIMISTIC".len()
+            } else if optimistic {
+                after + "OPTIMISTIC".len()
             } else {
                 i + 5
             };
@@ -6373,21 +6418,9 @@ fn expr_as_u64(expr: &Expr) -> Result<u64> {
     }
 }
 
-/// Lower UPDATE, including two-table JOIN. FROM / RETURNING are not in TiDB v8.5.8.
-fn lower_update(update: &Update) -> Result<Statement> {
-    // two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
-    if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
-        return Err(Error::unsupported("UPDATE FROM / RETURNING"));
-    }
-    let (table, join) = lower_dml_table(&update.table)?;
-    let order_by = lower_order_by_exprs(&update.order_by)?;
-    let limit = update.limit.as_ref().map(expr_as_u64).transpose()?;
-    if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
-        return Err(Error::unsupported("ORDER BY / LIMIT on multi-table UPDATE"));
-    }
-    let list = update
-        .assignments
-        .iter()
+/// Lower `SET col = expr` lists shared by UPDATE and INSERT ... ON DUPLICATE KEY.
+fn lower_assignments(list: &[sqlparser::ast::Assignment]) -> Result<Vec<Assignment>> {
+    list.iter()
         .map(|item| {
             let (table, column) = match &item.target {
                 AssignmentTarget::ColumnName(name) => assignment_column(name)?,
@@ -6401,7 +6434,22 @@ fn lower_update(update: &Update) -> Result<Statement> {
                 expr: lower_expr(&item.value)?,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+/// Lower UPDATE, including two-table JOIN. FROM / RETURNING are not in TiDB v8.5.8.
+fn lower_update(update: &Update) -> Result<Statement> {
+    // two-table UPDATE JOIN. TiDB v8.5.8 has no UPDATE FROM / RETURNING.
+    if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
+        return Err(Error::unsupported("UPDATE FROM / RETURNING"));
+    }
+    let (table, join) = lower_dml_table(&update.table)?;
+    let order_by = lower_order_by_exprs(&update.order_by)?;
+    let limit = update.limit.as_ref().map(expr_as_u64).transpose()?;
+    if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
+        return Err(Error::unsupported("ORDER BY / LIMIT on multi-table UPDATE"));
+    }
+    let list = lower_assignments(&update.assignments)?;
     if list.is_empty() {
         return Err(Error::unsupported("UPDATE without SET"));
     }
