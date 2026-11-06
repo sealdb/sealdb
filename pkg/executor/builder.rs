@@ -47,7 +47,7 @@ impl ExecutorBuilder {
                 current_db.to_string(),
                 true,
             ))),
-            PhysicalPlan::Projection { child, .. } => {
+            PhysicalPlan::Projection { exprs, child } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
@@ -61,6 +61,14 @@ impl ExecutorBuilder {
                     current_db,
                     Arc::clone(&txn),
                 )?;
+                // Window plans synthesize an identity projection above `Window`
+                // (`Column#8->Column#9`); `WindowExec` already emits the
+                // SELECT-list columns, so re-evaluating the fields would call
+                // window functions outside `WindowExec`.
+                if is_window_plan(&child) && is_identity_projection(exprs) {
+                    let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
+                    return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
+                }
                 let (exprs, names) = expand_projection_fields(select, &from_cols);
                 let mut exec = ProjectionExec::new(exprs, names, child_exec);
                 if select.fields.iter().any(|field| field.expr.has_subquery()) {
@@ -1131,6 +1139,32 @@ fn is_star_expr(expr: &ExprNode) -> bool {
         expr,
         ExprNode::Value(v) if matches!(&v.datum, sealdb_types::Datum::Bytes(b) if b == b"*")
     )
+}
+
+/// True when the plan's top executor is a `Window` (optionally under shuffle).
+fn is_window_plan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::Window { .. } => true,
+        PhysicalPlan::Shuffle { child, .. } | PhysicalPlan::ShuffleReceiver { child } => {
+            is_window_plan(child)
+        }
+        _ => false,
+    }
+}
+
+/// `Column#8->Column#9` style projection emitted by the window plan builder.
+fn is_identity_projection(exprs: &[String]) -> bool {
+    !exprs.is_empty()
+        && exprs.iter().all(|expr| {
+            let mut parts = expr.split("->");
+            let lhs = parts.next().unwrap_or("").trim();
+            let rhs = parts.next().unwrap_or("").trim();
+            parts.next().is_none()
+                && lhs.starts_with("Column#")
+                && rhs.starts_with("Column#")
+                && lhs["Column#".len()..].chars().all(|c| c.is_ascii_digit())
+                && rhs["Column#".len()..].chars().all(|c| c.is_ascii_digit())
+        })
 }
 
 /// Expand select-list stars against the FROM schema (TiDB ResolveFields).

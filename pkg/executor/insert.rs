@@ -1,11 +1,12 @@
 use crate::index::write_index_keys;
+use crate::join::apply::SubqueryEvalCtx;
 use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
 };
-use sealdb_expression::{eval_expr, eval_expr_with_row, locate_partition_for_row};
+use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
@@ -77,8 +78,21 @@ impl Executor for InsertExec {
                 pending.push(map_insert_row(info, &self.stmt.columns, row)?);
             }
         } else {
+            // VALUES may hold scalar/IN/EXISTS subqueries (`INSERT ... VALUES
+            // ((SELECT ...))`); evaluate them against the session txn.
+            let mut subquery = SubqueryEvalCtx::new(
+                Arc::clone(&self.domain),
+                self.current_db.clone(),
+                Arc::clone(&self.txn),
+                Some(table.clone()),
+            );
             for row in &self.stmt.rows {
-                pending.push(eval_insert_row(info, &self.stmt.columns, row)?);
+                pending.push(eval_insert_row(
+                    info,
+                    &self.stmt.columns,
+                    row,
+                    &mut subquery,
+                )?);
             }
         }
         if self.stmt.on_duplicate.is_empty() {
@@ -158,6 +172,7 @@ fn eval_insert_row(
     info: &sealdb_meta::TableInfo,
     columns: &[String],
     row: &[sealdb_parser::ast::ExprNode],
+    subquery: &mut SubqueryEvalCtx,
 ) -> Result<Vec<Datum>> {
     let mut values = Vec::with_capacity(row.len());
     for expr in row {
@@ -167,7 +182,7 @@ fn eval_insert_row(
             values.push(Datum::Null);
             continue;
         }
-        values.push(eval_expr(expr)?);
+        values.push(subquery.eval(expr, &[], &[])?);
     }
     map_insert_row(info, columns, &values)
 }

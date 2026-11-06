@@ -70,6 +70,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
     let rewritten = rewrite_mysql_version_comments(&rewritten);
+    // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
+    // drop index-option/table-option clauses sqlparser rejects.
+    let rewritten = strip_tidb_create_table_options(&rewritten);
     // TiDB `!` SimpleExpr → opcode.Not2; sqlparser rejects bare `!`.
     let rewritten = rewrite_mysql_bang(&rewritten);
     // sqlparser rejects `((SELECT…) UNION ALL (SELECT…)) alias`; unwrap arm parens
@@ -2021,9 +2024,138 @@ fn rewrite_mysql_version_comments(sql: &str) -> String {
     out
 }
 
+/// Drops TiDB `CREATE TABLE` extension clauses sqlparser rejects:
+/// `PRIMARY KEY (c) CLUSTERED|NONCLUSTERED` index options and
+/// `pre_split_regions=N` / `shard_row_id_bits=N` table options.
+fn strip_tidb_create_table_options(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let start = match lower.find("create table") {
+        Some(pos) => pos,
+        None => return sql.to_string(),
+    };
+    const GLOBAL: [&str; 2] = ["nonclustered", "clustered"];
+    const OPTIONS: [&str; 2] = ["pre_split_regions", "shard_row_id_bits"];
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    // Copy everything before the first CREATE TABLE verbatim.
+    while i < bytes.len() && i < start {
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq || in_dq || in_bt {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            match (in_sq, in_dq, in_bt, c) {
+                (true, _, _, b'\'') => in_sq = false,
+                (_, true, _, b'"') => in_dq = false,
+                (_, _, true, b'`') => in_bt = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_sq = true;
+                out.push('\'');
+                i += 1;
+            }
+            b'"' => {
+                in_dq = true;
+                out.push('"');
+                i += 1;
+            }
+            b'`' => {
+                in_bt = true;
+                out.push('`');
+                i += 1;
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Keep block comments (`/*T![...] ...*/`) verbatim.
+                out.push('/');
+                out.push('*');
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+                if i + 1 < bytes.len() {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    let ch = sql[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            _ if c.is_ascii_alphanumeric() || c == b'_' => {
+                let word_start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                let word = lower[word_start..i].to_string();
+                if GLOBAL.contains(&word.as_str()) {
+                    out.push(' ');
+                    continue;
+                }
+                if OPTIONS.contains(&word.as_str()) {
+                    // `name = digits` table option.
+                    let mut j = i;
+                    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'=' {
+                        j += 1;
+                        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                            j += 1;
+                        }
+                        let num_start = j;
+                        while j < bytes.len() && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if j > num_start {
+                            out.push(' ');
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+                out.push_str(&sql[word_start..i]);
+            }
+            _ => {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 /// Skips `!=`, strings, backticks, and MySQL version comments `/*! ... */`.
-fn rewrite_mysql_bang(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len() + 16);
+fn rewrite_mysql_bang(sql: &str) -> String {    let mut out = String::with_capacity(sql.len() + 16);
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut in_sq = false;
@@ -7757,6 +7889,28 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 query: Box::new(query),
             }))
         }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![lower_expr(expr)?];
+            args.push(match substring_from {
+                Some(from) => lower_expr(from)?,
+                None => ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(1),
+                }),
+            });
+            if let Some(len) = substring_for {
+                args.push(lower_expr(len)?);
+            }
+            Ok(ExprNode::Func(FuncCallExpr {
+                name: "substring".to_string(),
+                args,
+                distinct: false,
+            }))
+        }
         Expr::AnyOp {
             left,
             compare_op,
@@ -8268,6 +8422,7 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::GtEq => Op::Ge,
         BinaryOperator::And => Op::LogicAnd,
         BinaryOperator::Or => Op::LogicOr,
+        BinaryOperator::Xor => Op::LogicXor,
         // MySQL/TiDB default (no PIPES_AS_CONCAT): `||` is logical OR.
         // sqlparser exposes it as StringConcat; concat mode is a later sql_mode gap.
         BinaryOperator::StringConcat => Op::LogicOr,

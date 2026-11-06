@@ -519,7 +519,7 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             [left.as_bytes().as_slice(), right.as_bytes().as_slice()].concat(),
         ));
     }
-    if matches!(expr.op, Op::LogicAnd | Op::LogicOr) {
+    if matches!(expr.op, Op::LogicAnd | Op::LogicOr | Op::LogicXor) {
         return eval_logic(expr.op, &left, &right);
     }
     // Null-safe equal: NULL <=> NULL is true; NULL <=> x is false.
@@ -629,6 +629,10 @@ fn eval_logic(op: Op, left: &Datum, right: &Datum) -> Result<Datum> {
         Op::LogicOr => match (l, r) {
             (Some(true), _) | (_, Some(true)) => Ok(bool_datum(true)),
             (Some(false), Some(false)) => Ok(bool_datum(false)),
+            _ => Ok(Datum::Null),
+        },
+        Op::LogicXor => match (l, r) {
+            (Some(a), Some(b)) => Ok(bool_datum(a != b)),
             _ => Ok(Datum::Null),
         },
         _ => unreachable!(),
@@ -853,6 +857,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out))
         }
+        "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
@@ -872,8 +877,55 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
     }
 }
 
-fn datum_as_time(d: &Datum) -> Result<Time> {
-    match d {
+/// MySQL `SUBSTRING(str, pos[, len])`: 1-based; negative `pos` counts from the
+/// end; `pos = 0`, negative `len` yield `''`. Character-based (utf8mb4).
+fn eval_substring(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if !(2..=3).contains(&func.args.len()) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 2 or 3 arguments", func.name),
+        ));
+    }
+    let src = eval_expr_with_row(&func.args[0], schema, row)?;
+    if src.is_null() {
+        return Ok(Datum::Null);
+    }
+    let pos = eval_expr_with_row(&func.args[1], schema, row)?;
+    if pos.is_null() {
+        return Ok(Datum::Null);
+    }
+    let len = match func.args.get(2) {
+        Some(expr) => {
+            let value = eval_expr_with_row(expr, schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            Some(value.as_i64()?)
+        }
+        None => None,
+    };
+    let text = String::from_utf8_lossy(&src.as_bytes()).into_owned();
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len() as i64;
+    let pos = pos.as_i64()?;
+    if pos == 0 {
+        return Ok(Datum::Bytes(Vec::new()));
+    }
+    let start = if pos > 0 { pos - 1 } else { total + pos };
+    let start = start.max(0);
+    let end = match len {
+        Some(n) if n <= 0 => start,
+        Some(n) => (start + n).min(total),
+        None => total,
+    };
+    if start >= total || end <= start {
+        return Ok(Datum::Bytes(Vec::new()));
+    }
+    let out: String = chars[start as usize..end as usize].iter().collect();
+    Ok(Datum::Bytes(out.into_bytes()))
+}
+
+fn datum_as_time(d: &Datum) -> Result<Time> {    match d {
         Datum::Time(t) => Ok(*t),
         Datum::Bytes(b) => {
             let s = String::from_utf8_lossy(b);
