@@ -14,6 +14,11 @@ pub struct ColumnInfo {
     pub field_type: FieldType,
     pub state: SchemaState,
     pub version: u64,
+    /// `GENERATED ALWAYS AS (expr)` body, restored as SQL text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_expr: Option<String>,
+    #[serde(default)]
+    pub generated_stored: bool,
 }
 
 impl ColumnInfo {
@@ -25,6 +30,8 @@ impl ColumnInfo {
             field_type,
             state: STATE_PUBLIC,
             version: CURR_LATEST_COLUMN_INFO_VERSION,
+            generated_expr: None,
+            generated_stored: false,
         }
     }
 }

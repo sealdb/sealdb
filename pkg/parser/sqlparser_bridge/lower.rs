@@ -2,9 +2,9 @@ use super::dialect::dialect;
 use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
-    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt, IndexDef,
-    PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName, TruncateTableStmt,
-    TtlInfo,
+    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
+    GeneratedColumn, IndexDef, PartitionDef, PartitionOption, PartitionType, SequenceOptionSet,
+    TableName, TruncateTableStmt, TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -7044,6 +7044,29 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
     }))
 }
 
+fn lower_generated_column(
+    options: &[sqlparser::ast::ColumnOptionDef],
+) -> Result<Option<GeneratedColumn>> {
+    for opt in options {
+        if let sqlparser::ast::ColumnOption::Generated {
+            generation_expr: Some(expr),
+            generation_expr_mode,
+            ..
+        } = &opt.option
+        {
+            let stored = matches!(
+                generation_expr_mode,
+                Some(sqlparser::ast::GeneratedExpressionMode::Stored)
+            );
+            return Ok(Some(GeneratedColumn {
+                expr: lower_expr(expr)?.restore_string(),
+                stored,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     // LIKE / AS SELECT. TEMPORARY stays deferred ( gaps).
     if create.temporary {
@@ -7076,6 +7099,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         cols.push(ColumnDef {
             name: col.name.value.clone(),
             type_name: col.data_type.to_string(),
+            generated: lower_generated_column(&col.options)?,
         });
         for opt in &col.options {
             if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)) {
@@ -8004,6 +8028,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             column: ColumnDef {
                 name: column_def.name.value.clone(),
                 type_name: column_def.data_type.to_string(),
+                generated: lower_generated_column(&column_def.options)?,
             },
             position: lower_column_position(column_position),
         }),

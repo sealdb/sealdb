@@ -16,12 +16,17 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     }
     let mut columns = Vec::with_capacity(stmt.cols.len());
     for (offset, col) in stmt.cols.iter().enumerate() {
-        columns.push(ColumnInfo::new(
+        let mut info = ColumnInfo::new(
             (offset as i64) + 1,
             offset as i32,
             col.name.clone(),
             field_type_from_name(&col.type_name)?,
-        ));
+        );
+        if let Some(generated) = &col.generated {
+            info.generated_expr = Some(generated.expr.clone());
+            info.generated_stored = generated.stored;
+        }
+        columns.push(info);
     }
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
     for (offset, index) in stmt.indices.iter().enumerate() {
@@ -120,6 +125,7 @@ fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) 
     cols.push(ColumnDef {
         name: name.to_string(),
         type_name,
+        generated: None,
     });
     Ok(())
 }
