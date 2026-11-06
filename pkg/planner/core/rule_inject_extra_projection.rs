@@ -166,22 +166,28 @@ fn is_order_by_ordinal(expr: &ExprNode) -> bool {
 }
 
 fn is_const_order_expr(expr: &ExprNode) -> bool {
+    // Ordinals sort by output position; do not elide Sort (`ORDER BY 1, 2`).
+    if is_order_by_ordinal(expr) {
+        return false;
+    }
+    is_const_expr(expr)
+}
+
+/// A foldable constant expression. Inside a function/composite ORDER BY item a
+/// numeric literal is a value (`abs(2)`), not a select-list ordinal.
+fn is_const_expr(expr: &ExprNode) -> bool {
     match expr {
-        // Ordinals sort by output position; do not elide Sort (`ORDER BY 1, 2`).
-        ExprNode::Value(_) if is_order_by_ordinal(expr) => false,
         ExprNode::Value(_) => true,
         ExprNode::Column(_) => false,
         ExprNode::Func(f) => {
             if is_non_deterministic_func(&f.name) {
                 return false;
             }
-            f.args.iter().all(is_const_order_expr)
+            f.args.iter().all(is_const_expr)
         }
-        ExprNode::Binary(bin) => {
-            is_const_order_expr(&bin.left) && is_const_order_expr(&bin.right)
-        }
-        ExprNode::Unary(u) => is_const_order_expr(&u.expr),
-        ExprNode::Cast(c) => is_const_order_expr(&c.expr),
+        ExprNode::Binary(bin) => is_const_expr(&bin.left) && is_const_expr(&bin.right),
+        ExprNode::Unary(u) => is_const_expr(&u.expr),
+        ExprNode::Cast(c) => is_const_expr(&c.expr),
         _ => false,
     }
 }

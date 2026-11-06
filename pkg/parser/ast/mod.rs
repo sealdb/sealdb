@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod base;
+pub mod cte_scope;
 pub mod ddl;
 pub mod dml;
 pub mod expressions;

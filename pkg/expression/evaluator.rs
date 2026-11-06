@@ -446,6 +446,9 @@ fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Res
         }
     }
     let idx = found.ok_or_else(|| {
+        if std::env::var("SEALDB_DEBUG_COL").is_ok() {
+            eprintln!("DEBUG unbound column {:?} schema={schema:?}", col);
+        }
         Error::new(
             ERR_BAD_FIELD,
             format!("Unknown column '{}' in 'where clause'", col.name),
@@ -688,8 +691,31 @@ fn rewrite_high_not_precedence(op: Op, inner: &ExprNode) -> Option<ExprNode> {
     }
 }
 
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" => {
+            let now = Time::from_unix_secs(unix_now_secs(), TimeType::Timestamp);
+            Ok(Datum::Time(utc_to_session_local(now)?))
+        }
+        "UTC_TIMESTAMP" => Ok(Datum::Time(Time::from_unix_secs(
+            unix_now_secs(),
+            TimeType::Timestamp,
+        ))),
+        "CURDATE" | "CURRENT_DATE" | "UTC_DATE" => Ok(Datum::Time(Time::from_unix_secs(
+            unix_now_secs(),
+            TimeType::Date,
+        ))),
+        "CURTIME" | "CURRENT_TIME" | "UTC_TIME" => Ok(Datum::Time(Time::from_unix_secs(
+            unix_now_secs(),
+            TimeType::Time,
+        ))),
         "IF" => {
             if func.args.len() != 3 {
                 return Err(Error::new(
@@ -814,6 +840,12 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
         "UNIX_TIMESTAMP" => eval_unix_timestamp(func, schema, row),
         "FROM_UNIXTIME" => eval_from_unixtime(func, schema, row),
+        "YEAR" => eval_date_part(func, schema, row, |t| i64::from(t.year)),
+        "MONTH" => eval_date_part(func, schema, row, |t| i64::from(t.month)),
+        "DAY" | "DAYOFMONTH" => eval_date_part(func, schema, row, |t| i64::from(t.day)),
+        "HOUR" => eval_date_part(func, schema, row, |t| i64::from(t.hour)),
+        "MINUTE" => eval_date_part(func, schema, row, |t| i64::from(t.minute)),
+        "SECOND" => eval_date_part(func, schema, row, |t| i64::from(t.second)),
         other => Err(Error::new(
             ERR_UNKNOWN_FUNCTION,
             format!("FUNCTION {other} does not exist"),
@@ -837,11 +869,110 @@ fn datum_as_time(d: &Datum) -> Result<Time> {
             t.tp = TimeType::Datetime;
             Ok(t)
         }
-        other => Err(Error::new(
-            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
-            format!("Incorrect datetime value: '{other:?}'"),
-        )),
+        // TiDB numeric→datetime: 20240628 → 2024-06-28 00:00:00.
+        other => {
+            let n = other.as_i64()?;
+            time_from_yyyymmdd(n).ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Incorrect datetime value: '{other:?}'"),
+                )
+            })
+        }
     }
+}
+
+/// Parse TiDB's numeric date/datetime formats (`20240628`, `20240628153000`, …).
+fn time_from_yyyymmdd(n: i64) -> Option<Time> {
+    if n < 0 {
+        return None;
+    }
+    let digits = n.to_string();
+    let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
+        match digits.len() {
+        14 => (
+            digits[0..4].parse().ok()?,
+            digits[4..6].parse().ok()?,
+            digits[6..8].parse().ok()?,
+            digits[8..10].parse().ok()?,
+            digits[10..12].parse().ok()?,
+            digits[12..14].parse().ok()?,
+        ),
+        12 => (
+            digits[0..4].parse().ok()?,
+            digits[4..6].parse().ok()?,
+            digits[6..8].parse().ok()?,
+            digits[8..10].parse().ok()?,
+            digits[10..12].parse().ok()?,
+            0,
+        ),
+        8 => (
+            digits[0..4].parse().ok()?,
+            digits[4..6].parse().ok()?,
+            digits[6..8].parse().ok()?,
+            0,
+            0,
+            0,
+        ),
+        6 => {
+            let yy: i64 = digits[0..2].parse().ok()?;
+            (
+                if yy < 70 { 2000 + yy } else { 1900 + yy },
+                digits[2..4].parse().ok()?,
+                digits[4..6].parse().ok()?,
+                0,
+                0,
+                0,
+            )
+        }
+        l if l > 14 => (
+            digits[0..4].parse().ok()?,
+            digits[4..6].parse().ok()?,
+            digits[6..8].parse().ok()?,
+            digits[8..10].parse().ok()?,
+            digits[10..12].parse().ok()?,
+            digits[12..14].parse().ok()?,
+        ),
+        _ => return None,
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(Time {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        micro: 0,
+        fsp: 0,
+        tp: TimeType::Datetime,
+    })
+}
+
+fn eval_date_part(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    part: impl Fn(&Time) -> i64,
+) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 1 argument", func.name),
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mut t = datum_as_time(&value)?;
+    // TIMESTAMP storage is UTC; extract from the session-local wall clock.
+    if matches!(t.tp, TimeType::Timestamp) {
+        t = utc_to_session_local(t)?;
+    }
+    Ok(Datum::I64(part(&t)))
 }
 
 fn unit_name(d: &Datum) -> Result<String> {
@@ -879,6 +1010,23 @@ fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<
             return add_interval(t, "MINUTE", mins, false);
         }
         "DAY" | "DAYS" => add_days(&mut t, amount)?,
+        "YEAR" | "YEARS" => {
+            let total = i64::from(t.year) + amount;
+            if !(1..=9999).contains(&total) {
+                return Ok(zero_datetime());
+            }
+            t.year = total as u16;
+            clamp_day(&mut t);
+        }
+        "MONTH" | "MONTHS" => {
+            let total = (i64::from(t.year) * 12 + i64::from(t.month) - 1) + amount;
+            if total < 0 {
+                return Ok(zero_datetime());
+            }
+            t.year = (total / 12) as u16;
+            t.month = (total % 12 + 1) as u8;
+            clamp_day(&mut t);
+        }
         other => {
             return Err(Error::unsupported(format!("interval unit {other}")));
         }
@@ -916,6 +1064,27 @@ fn add_days(t: &mut Time, days: i64) -> Result<()> {
     t.month = m as u8;
     t.day = d as u8;
     Ok(())
+}
+
+fn zero_datetime() -> Time {
+    Time {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        micro: 0,
+        fsp: 0,
+        tp: TimeType::Datetime,
+    }
+}
+
+fn clamp_day(t: &mut Time) {
+    let dim = days_in_month_i(i32::from(t.year), i32::from(t.month)) as u8;
+    if t.day > dim {
+        t.day = dim;
+    }
 }
 
 fn days_in_month_i(year: i32, month: i32) -> i32 {

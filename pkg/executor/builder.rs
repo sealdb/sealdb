@@ -73,8 +73,9 @@ impl ExecutorBuilder {
                 }
                 Ok(Box::new(exec))
             }
-            PhysicalPlan::Sort { child, .. } => {
+            PhysicalPlan::Sort { child, by_info } => {
                 let by = stmt_order_by(stmt)
+                    .or_else(|| order_by_from_plan_info(by_info))
                     .ok_or_else(|| Error::unsupported("sort without ORDER BY"))?;
                 Ok(Box::new(SortExec::new(
                     by,
@@ -115,8 +116,15 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 ).with_index_dst_double(under_index)))
             }
-            PhysicalPlan::Distinct { keys, child } => Ok(Box::new(DistinctExec::new(
+            PhysicalPlan::Distinct {
+                keys,
+                fields,
+                names,
+                child,
+            } => Ok(Box::new(DistinctExec::new(
                 keys.clone(),
+                fields.clone(),
+                names.clone(),
                 Self::build(child, stmt, domain, current_db, txn)?,
             ))),
             PhysicalPlan::Simple { kind } if kind == "Analyze" => Ok(Box::new(AnalyzeExec::new(
@@ -378,7 +386,39 @@ impl ExecutorBuilder {
                                 .unwrap_or_else(|| f.expr.restore_string())
                         })
                         .collect();
-                    return Ok(Box::new(DistinctExec::new(keys, built)));
+                    // `SELECT DISTINCT *` keeps the full child row.
+                    let star = select.fields.iter().all(|f| {
+                        matches!(
+                            &f.expr,
+                            sealdb_parser::ast::expressions::ExprNode::Value(
+                                sealdb_parser::ast::expressions::ValueExpr {
+                                    datum: sealdb_types::Datum::Bytes(b),
+                                }
+                            ) if b == b"*"
+                        )
+                    });
+                    let fields = if star {
+                        Vec::new()
+                    } else {
+                        select.fields.iter().map(|f| f.expr.clone()).collect()
+                    };
+                    let names = if star {
+                        Vec::new()
+                    } else {
+                        select
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| {
+                                f.as_name
+                                    .clone()
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| f.orig_text.clone())
+                                    .unwrap_or_else(|| format!("col{i}"))
+                            })
+                            .collect()
+                    };
+                    return Ok(Box::new(DistinctExec::new(keys, fields, names, built)));
                 }
                 Ok(Box::new(HashAggExec::new(select, built)?))
             }
@@ -507,7 +547,7 @@ impl ExecutorBuilder {
                     })
                 };
                 let cte = with.find(name);
-                let recursive = cte.and_then(|c| c.recursive.clone());
+                let recursive = with.recursive_arm(name)?;
                 let limit = cte.and_then(|c| c.limit);
                 let offset = cte.and_then(|c| c.offset);
                 let share = !inline;
@@ -680,14 +720,30 @@ impl ExecutorBuilder {
         with_shared_ctes(|| {
             exec.open()?;
             // Join schemas may keep `alias.col` for ORDER BY/WHERE; TiDB SELECT *
-            // result headers are bare (duplicates allowed).
+            // result headers are bare (duplicates allowed). Only strip a real
+            // `alias.col` suffix — expressions like `t.c1 + t.c2` or `1.23`
+            // must keep their original text.
             let columns = exec
                 .schema()
                 .iter()
                 .map(|c| {
-                    c.rsplit_once('.')
-                        .map(|(_, name)| name.to_string())
-                        .unwrap_or_else(|| c.clone())
+                    let Some((prefix, name)) = c.rsplit_once('.') else {
+                        return c.clone();
+                    };
+                    let simple = |s: &str| {
+                        !s.is_empty()
+                            && s.chars()
+                                .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
+                    };
+                    let ident_start = prefix
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$');
+                    if ident_start && simple(prefix) && simple(name) {
+                        name.to_string()
+                    } else {
+                        c.clone()
+                    }
                 })
                 .collect();
             let mut rows = Vec::new();
@@ -732,6 +788,30 @@ fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {
         Statement::SetOpr(set) if !set.order_by.is_empty() => Some(set.order_by.clone()),
         _ => None,
     }
+}
+
+/// Synthetic Sort keys for MergeJoin sides: `by_info` holds TiDB join-key
+/// labels (`select.a.x`). Resolve the bare column so SortExec can evaluate it.
+fn order_by_from_plan_info(by_info: &str) -> Option<Vec<ByItem>> {
+    let mut out = Vec::new();
+    for part in by_info.split(',').map(str::trim) {
+        if part.is_empty() {
+            return None;
+        }
+        let name = part.rsplit('.').next().unwrap_or(part).trim();
+        if name.is_empty() || name.contains('#') || name.contains('(') {
+            return None;
+        }
+        out.push(ByItem {
+            expr: ExprNode::Column(sealdb_parser::ast::expressions::ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: name.to_string(),
+            }),
+            desc: false,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn stmt_limit(stmt: &Statement) -> Option<(Option<u64>, u64)> {

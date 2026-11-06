@@ -238,8 +238,14 @@ pub enum PhysicalPlan {
         offset: Option<u64>,
     },
     /// Dedup child rows by `keys` (TiDB SemiJoinRewriter inner aggregation).
+    /// `fields`/`names` are the `SELECT DISTINCT` output projection; empty for
+    /// the semi-join rewriter, which emits full child rows.
     Distinct {
         keys: Vec<String>,
+        #[serde(skip)]
+        fields: Vec<ExprNode>,
+        #[serde(skip)]
+        names: Vec<String>,
         child: Box<PhysicalPlan>,
     },
 }
@@ -448,7 +454,12 @@ impl PhysicalPlan {
                     format!("CTE_{name} -> {}", seed.explain())
                 }
             }
-            PhysicalPlan::Distinct { keys, child } => {
+            PhysicalPlan::Distinct {
+                keys,
+                fields: _,
+                names: _,
+                child,
+            } => {
                 format!("Distinct({}) -> {}", keys.join(","), child.explain())
             }
         }

@@ -14,7 +14,7 @@ use super::rule_inject_extra_projection::{
 use super::rule_having_push_down::apply_having_push_down;
 use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join, rewrite_semi_join_agg};
-use sealdb_errno::{Error, Result};
+use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::expressions::{
     BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, IsNullExpr, UnaryOpExpr, ValueExpr,
@@ -580,7 +580,7 @@ impl PlanBuilder {
             .count()
             > 1;
         let recursive = cte.is_some_and(|cte| cte.recursive.is_some());
-        let recursive_plan = if let Some((_, rec)) = cte.and_then(|c| c.recursive.clone()) {
+        let recursive_plan = if let Some((_, rec)) = with.recursive_arm(&from.name)? {
             Some(Box::new(self.build_with_schema(
                 &Statement::Select(rec),
                 is,
@@ -632,6 +632,7 @@ impl PlanBuilder {
         if let Some(item) = &select.from_item {
             return self.build_from_item(select, item, is, current_db, stats, prune_mode);
         }
+        validate_join_using(select, is, current_db)?;
         // STRAIGHT_JOIN / /*+ MERGE_JOIN(...) */ freeze join order and prefer
         // MergeJoin on equality keys (TiDB PhysicalMergeJoin).
         if select.joins.iter().any(|j| j.straight) || select_has_merge_join_hint(select) {
@@ -1446,6 +1447,65 @@ fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
 }
 
+/// MySQL resolves `USING (col)` against both join inputs before planning, so an
+/// unknown name is Error 1054 rather than a keyless join. CTE / derived sides
+/// have no infoschema entry here; skip validation for those.
+fn validate_join_using(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Result<()> {
+    let Some(is) = is else {
+        return Ok(());
+    };
+    if select.joins.is_empty() {
+        return Ok(());
+    }
+    let columns_of = |table: &TableName| -> Option<Vec<String>> {
+        let schema = table
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        is.table_by_name(schema, table.resolve_name()).map(|info| {
+            info.columns
+                .iter()
+                .map(|col| col.name.o().to_string())
+                .collect()
+        })
+    };
+    let tables = select.join_tables();
+    for (i, join) in select.joins.iter().enumerate() {
+        if join.using_cols.is_empty() || tables.len() <= i + 1 {
+            continue;
+        }
+        let Some(left) = tables[..=i]
+            .iter()
+            .map(|table| columns_of(table))
+            .collect::<Option<Vec<Vec<String>>>>()
+        else {
+            continue;
+        };
+        let Some(right) = columns_of(&join.right) else {
+            continue;
+        };
+        for col in &join.using_cols {
+            let has = |side: &[Vec<String>]| {
+                side.iter()
+                    .flatten()
+                    .any(|name| name.eq_ignore_ascii_case(col))
+            };
+            if !has(&left) || !has(std::slice::from_ref(&right)) {
+                return Err(Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Unknown column '{col}' in 'from clause'"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `/*+ MERGE_JOIN(t1, t2) */` in restored select text (TiDB hint parser MVB).
 fn select_has_merge_join_hint(select: &SelectStmt) -> bool {
     select.text.to_ascii_lowercase().contains("merge_join")
@@ -1618,8 +1678,17 @@ fn prepare_merge_join_side(
         other => other,
     };
     if !pk_ordered {
-        let filter = null_reject_on_inner(on, &table.name, &phys)
-            .or_else(|| null_reject_on_inner(on, table.resolve_name(), &phys));
+        // `not(isnull(key))` only applies to sides backed by a base-table scan
+        // whose schema keeps `table.col`. Derived sides (`Projection` over dual /
+        // aggregate) expose the projected alias, so the filter would not resolve;
+        // TiDB omits it there too.
+        let scan_shaped = side_has_base_scan(&plan);
+        let filter = scan_shaped
+            .then(|| {
+                null_reject_on_inner(on, &table.name, &phys)
+                    .or_else(|| null_reject_on_inner(on, table.resolve_name(), &phys))
+            })
+            .flatten();
         if let Some(filter) = filter {
             // Push through inline CTE seed so EXPLAIN shows cop Selection under
             // TableReader (`data:Selection`), not a root Selection above CTE.
@@ -1656,8 +1725,29 @@ fn prepare_merge_join_side(
     plan
 }
 
-fn strip_cte_order_sort(plan: PhysicalPlan) -> PhysicalPlan {
+/// True when the plan reads a base table somewhere, so `table.col` names are
+/// still meaningful for a null-reject filter.
+fn side_has_base_scan(plan: &PhysicalPlan) -> bool {
     match plan {
+        PhysicalPlan::TableReader { .. }
+        | PhysicalPlan::IndexReader { .. }
+        | PhysicalPlan::IndexLookUpReader { .. }
+        | PhysicalPlan::PointGet { .. }
+        | PhysicalPlan::BatchPointGet { .. } => true,
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::UnionScan { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::HashAgg { child, .. }
+        | PhysicalPlan::StreamAgg { child, .. } => side_has_base_scan(child),
+        PhysicalPlan::CTE { seed, .. } => side_has_base_scan(seed),
+        _ => false,
+    }
+}
+
+fn strip_cte_order_sort(plan: PhysicalPlan) -> PhysicalPlan {    match plan {
         PhysicalPlan::Sort { child, .. } => strip_cte_order_sort(*child),
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -2694,6 +2784,28 @@ fn build_agg_plan(
         return (
             PhysicalPlan::Distinct {
                 keys,
+                // `SELECT DISTINCT *` keeps the full child row.
+                fields: if is_star_select(select) {
+                    Vec::new()
+                } else {
+                    select.fields.iter().map(|f| f.expr.clone()).collect()
+                },
+                names: if is_star_select(select) {
+                    Vec::new()
+                } else {
+                    select
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            f.as_name
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| f.orig_text.clone())
+                                .unwrap_or_else(|| format!("col{i}"))
+                        })
+                        .collect()
+                },
                 child: Box::new(plan),
             },
             false,
@@ -3769,10 +3881,17 @@ fn access_plan(
             }
         }
         let eqs = eq_column_consts(select.selection.as_ref());
-        if let Some(first) = info.columns.first()
+        // Only an integer clustered PRIMARY KEY is the row handle; a plain
+        // first column (`= const`) is a filter, not a point get.
+        let handle_col = if info.pk_is_handle {
+            info.handle_column().map(|c| c.name.o().to_string())
+        } else {
+            None
+        };
+        if let Some(handle_col) = handle_col
             && let Some((_, value)) = eqs
                 .iter()
-                .find(|(column, _)| first.name.o().eq_ignore_ascii_case(column))
+                .find(|(column, _)| handle_col.eq_ignore_ascii_case(column))
             && let Some(handle) = datum_as_handle(value)
         {
             let _ = point_get_cost();

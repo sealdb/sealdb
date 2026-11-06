@@ -201,7 +201,9 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
     let mut warnings_enabled = false;
     for line in src.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() && buf.is_empty() {
+        // TiDB mysql-tester drops blank lines inside multi-line statements, so
+        // the echoed statement (and golden) has no interior empty lines.
+        if trimmed.is_empty() {
             continue;
         }
         if trimmed.starts_with('#') {
