@@ -95,6 +95,12 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // Row constructor `(a, b) NOT IN (subq)` / `!= ALL` → null-aware
+                // anti join (TiDB `convertToNullAwareAntiJoin`).
+                if let Some(plan) = naaj_plan(select, is, current_db) {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
@@ -2528,6 +2534,11 @@ impl<'a> PlanColumnIds<'a> {
                     self.consume_expr(arg, self_cte);
                 }
             }
+            ExprNode::Row(r) => {
+                for expr in &r.exprs {
+                    self.consume_expr(expr, self_cte);
+                }
+            }
             ExprNode::Value(_) | ExprNode::Column(_) => {}
         }
     }
@@ -2724,6 +2735,11 @@ fn count_expr_table_refs(expr: &ExprNode, counts: &mut std::collections::HashMap
         ExprNode::Window(w) => {
             for arg in &w.args {
                 count_expr_table_refs(arg, counts);
+            }
+        }
+        ExprNode::Row(r) => {
+            for expr in &r.exprs {
+                count_expr_table_refs(expr, counts);
             }
         }
         ExprNode::Value(_) | ExprNode::Column(_) => {}
@@ -4022,6 +4038,417 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
                 "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
             )
     )
+}
+
+/// Row-constructor `(a, b) NOT IN (SELECT a, b …)` / `(a, b) != ALL (…)`
+/// rewrite (TiDB `convertToNullAwareAntiJoin`).
+///
+/// TiDB builds a `PhysicalHashJoin` with the null-aware anti join type:
+/// the row operands become equality keys (`NAEQ`) and any correlated filter
+/// becomes `other cond`. A correlated equality inside the subquery cannot
+/// coexist with `NAEQ`, so it is hoisted to the hash key and the row operands
+/// fall back to plain `other cond` equalities.
+fn naaj_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    if !select.joins.is_empty()
+        || select.from_item.is_some()
+        || select.with.is_some()
+        || select.distinct
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return None;
+    }
+    let outer_tbl = select.from.as_ref()?;
+    // Select list: `select (a, b) not in (…) from t` → AntiLeftOuterSemiJoin.
+    // WHERE: `select * from t where (a, b) not in (…)` → AntiSemiJoin.
+    let select_list = select.fields.len() == 1
+        && select.selection.is_none()
+        && !naaj_is_star(&select.fields[0].expr);
+    let predicate = if select_list {
+        &select.fields[0].expr
+    } else {
+        if select.selection.is_none()
+            || !select.fields.iter().all(|f| naaj_is_star(&f.expr))
+        {
+            return None;
+        }
+        select.selection.as_ref()?
+    };
+    let (row_exprs, query, all_ne) = naaj_predicate(predicate)?;
+    let ResultSetNode::Select(inner) = query else {
+        return None;
+    };
+    if inner.distinct
+        || !inner.joins.is_empty()
+        || inner.from_item.is_some()
+        || inner.with.is_some()
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+        || inner.fields.len() != row_exprs.len()
+        || inner.fields.iter().any(|f| naaj_is_star(&f.expr))
+    {
+        return None;
+    }
+    let inner_tbl = inner.from.as_ref()?;
+    let outer_name = outer_tbl.resolve_name().to_string();
+    let inner_name = inner_tbl.resolve_name().to_string();
+    // Correlated conjuncts reference the outer query; the rest are pushed onto
+    // the inner TableReader.
+    let mut correlated = Vec::new();
+    let mut inner_only = Vec::new();
+    if let Some(selection) = &inner.selection {
+        for conjunct in selection.split_cnf() {
+            if naaj_refs_table(&conjunct, &outer_name) {
+                correlated.push(conjunct);
+            } else {
+                inner_only.push(conjunct);
+            }
+        }
+    }
+    let inner_keys: Vec<ExprNode> = inner.fields.iter().map(|f| f.expr.clone()).collect();
+    // A lone correlated equality becomes the hash key (`equal:[eq(outer, inner)]`).
+    let corr_eq = match correlated.as_slice() {
+        [ExprNode::Binary(bin)] if bin.op == Op::Eq => {
+            if naaj_refs_table(&bin.left, &outer_name) && !naaj_refs_table(&bin.right, &outer_name)
+            {
+                Some(((*bin.left).clone(), (*bin.right).clone()))
+            } else if naaj_refs_table(&bin.right, &outer_name)
+                && !naaj_refs_table(&bin.left, &outer_name)
+            {
+                Some(((*bin.right).clone(), (*bin.left).clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let null_aware = corr_eq.is_none();
+    let (keys, other_cond) = match &corr_eq {
+        Some((outer_side, inner_side)) => {
+            // Row operands are compared via `other cond` equalities.
+            let conds: Vec<ExprNode> = row_exprs
+                .iter()
+                .cloned()
+                .zip(inner_keys.iter().cloned())
+                .map(|(outer, inner)| {
+                    naaj_eq(
+                        naaj_qualify(&outer, &outer_name),
+                        naaj_qualify(&inner, &inner_name),
+                    )
+                })
+                .collect();
+            (
+                vec![(outer_side.clone(), inner_side.clone())],
+                ExprNode::compose_cnf(conds),
+            )
+        }
+        None => (
+            row_exprs.iter().cloned().zip(inner_keys).collect(),
+            ExprNode::compose_cnf(correlated.clone()),
+        ),
+    };
+    let schema = schema_prefix(current_db);
+    let outer_q = format!("{schema}.{}", outer_name.to_ascii_lowercase());
+    let inner_q = format!("{schema}.{}", inner_name.to_ascii_lowercase());
+    let mut probe = PhysicalPlan::table_reader(outer_tbl.name.clone(), Vec::new());
+    let mut build = PhysicalPlan::table_reader(inner_tbl.name.clone(), Vec::new());
+    if let Some(filter) = ExprNode::compose_cnf(inner_only) {
+        if let PhysicalPlan::TableReader { pushed, .. } = &mut build {
+            *pushed = Some(filter);
+        }
+    }
+    // Row operands that are not plain columns need TiDB's injected Projection
+    // (`injectExtraProjection`); the join still evaluates the expressions.
+    // A correlated equality already hoists the key (`NAEQ` cannot coexist with
+    // `EQ`), so TiDB injects no operand projection in that case.
+    let probe_projected = null_aware
+        && row_exprs.iter().any(|e| !matches!(e, ExprNode::Column(_)));
+    let build_projected = null_aware
+        && inner.fields.iter().any(|f| !matches!(f.expr, ExprNode::Column(_)));
+    let (mut probe_cols, mut build_cols) = (Vec::new(), Vec::new());
+    if probe_projected || build_projected {
+        // TiDB result column ids for the injected projections. The operands of
+        // the row constructors are allocated before them, so the probe/build
+        // projections start at #14/#9 for `(a, b)` over two 3-column tables.
+        let (probe_base, build_base) = if select_list { (14, 0) } else { (13, 9) };
+        probe_cols = (0..row_exprs.len()).map(|i| probe_base + i).collect();
+        build_cols = (0..row_exprs.len()).map(|i| build_base + i).collect();
+    }
+    if probe_projected {
+        let mut exprs: Vec<String> = Vec::new();
+        if !select_list {
+            // `SELECT *` keeps every probe column ahead of the operands.
+            if let Some(info) = is.and_then(|is| {
+                let (db, table) = outer_tbl.qualified(current_db);
+                is.table_by_name(&db, &table)
+            }) {
+                exprs.extend(
+                    info.columns
+                        .iter()
+                        .map(|c| format!("{outer_q}.{}", c.name.o())),
+                );
+            }
+        }
+        exprs.extend(row_exprs.iter().zip(probe_cols.iter()).map(|(e, id)| {
+            format!(
+                "{}->Column#{id}",
+                naaj_operand_info(&naaj_qualify(e, &outer_name), &schema)
+            )
+        }));
+        probe = PhysicalPlan::RowProjection {
+            info: exprs.join(", "),
+            child: Box::new(probe),
+        };
+    }
+    if build_projected {
+        let exprs: Vec<String> = inner
+            .fields
+            .iter()
+            .zip(build_cols.iter())
+            .map(|(f, id)| {
+                format!(
+                    "{}->Column#{id}",
+                    naaj_operand_info(&naaj_qualify(&f.expr, &inner_name), &schema)
+                )
+            })
+            .collect();
+        build = PhysicalPlan::RowProjection {
+            info: exprs.join(", "),
+            child: Box::new(build),
+        };
+    }
+    let eq_list: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, (outer, inner))| {
+            let left = if probe_projected {
+                format!("Column#{}", probe_cols[i])
+            } else {
+                naaj_operand_info(&naaj_qualify(outer, &outer_name), &schema)
+            };
+            let right = if build_projected {
+                format!("Column#{}", build_cols[i])
+            } else {
+                naaj_operand_info(&naaj_qualify(inner, &inner_name), &schema)
+            };
+            format!("eq({left}, {right})")
+        })
+        .collect();
+    let left_outer = select_list || all_ne;
+    let header = if null_aware {
+        if left_outer {
+            "Null-aware anti left outer semi join"
+        } else {
+            "Null-aware anti semi join"
+        }
+    } else if left_outer {
+        "anti left outer semi join"
+    } else {
+        "anti semi join"
+    };
+    let mut info = format!("{header}, equal:[{}]", eq_list.join(" "));
+    if let Some(cond) = &other_cond {
+        info.push_str(", other cond:");
+        info.push_str(&naaj_other_conds(cond, &schema));
+    }
+    let _ = (&outer_q, &inner_q);
+    let probe_est = est_rows_of(&probe);
+    let build_est = est_rows_of(&build);
+    // TiDB NAAJ cardinality: anti keeps 0.8 of the probe; the anti-left-outer
+    // semi join emits every probe row.
+    let est_rows = if left_outer {
+        probe_est.max(build_est)
+    } else {
+        probe_est * 0.8
+    };
+    let bool_column = if select_list {
+        select.fields[0]
+            .orig_text
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| predicate.restore_string())
+    } else {
+        "Column#9".to_string()
+    };
+    let join = PhysicalPlan::NullAwareAntiJoin {
+        info,
+        est_rows,
+        left_outer,
+        bool_only: select_list,
+        null_aware,
+        bool_column,
+        keys,
+        other_cond,
+        probe_table: outer_name.clone(),
+        build_table: inner_name.clone(),
+        probe: Box::new(probe),
+        build: Box::new(build),
+    };
+    if select_list {
+        return Some(join);
+    }
+    if !all_ne {
+        return Some(join);
+    }
+    // `WHERE (a, b) != ALL (…)`: Selection over the boolean column, then a
+    // Projection back to the probe schema.
+    let probe_cols: Vec<String> = is
+        .and_then(|is| {
+            let (db, table) = outer_tbl.qualified(current_db);
+            is.table_by_name(&db, &table)
+        })
+        .map(|info| {
+            info.columns
+                .iter()
+                .map(|c| format!("{outer_q}.{}", c.name.o()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PhysicalPlan::Projection {
+        exprs: probe_cols,
+        child: Box::new(PhysicalPlan::Selection {
+            filter: ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: "Column#9".to_string(),
+            }),
+            child: Box::new(join),
+        }),
+    })
+}
+
+/// Attach a table qualifier onto bare column refs so EXPLAIN keys print as
+/// `eq(naaj.naaj_a.a, naaj.naaj_b.a)` like TiDB.
+fn naaj_qualify(expr: &ExprNode, table: &str) -> ExprNode {
+    match expr.clone() {
+        ExprNode::Column(mut col) => {
+            if col.table.is_none() {
+                col.table = Some(table.to_string());
+            }
+            ExprNode::Column(col)
+        }
+        ExprNode::Binary(mut bin) => {
+            bin.left = Box::new(naaj_qualify(&bin.left, table));
+            bin.right = Box::new(naaj_qualify(&bin.right, table));
+            ExprNode::Binary(bin)
+        }
+        ExprNode::Unary(mut un) => {
+            un.expr = Box::new(naaj_qualify(&un.expr, table));
+            ExprNode::Unary(un)
+        }
+        ExprNode::Func(mut func) => {
+            func.args = func.args.iter().map(|a| naaj_qualify(a, table)).collect();
+            ExprNode::Func(func)
+        }
+        ExprNode::Cast(mut cast) => {
+            cast.expr = Box::new(naaj_qualify(&cast.expr, table));
+            ExprNode::Cast(cast)
+        }
+        other => other,
+    }
+}
+
+fn naaj_is_star(expr: &ExprNode) -> bool {    matches!(expr, ExprNode::Value(ValueExpr { datum: Datum::Bytes(b) }) if b == b"*")
+}
+
+/// `(row) NOT IN (subq)` / `(row) != ALL (subq)` → row operands, subquery, form.
+fn naaj_predicate(expr: &ExprNode) -> Option<(Vec<ExprNode>, &ResultSetNode, bool)> {
+    let ExprNode::InSubquery(sub) = expr else {
+        return None;
+    };
+    if !sub.not {
+        return None;
+    }
+    let ExprNode::Row(row) = sub.expr.as_ref() else {
+        return None;
+    };
+    if row.exprs.is_empty() {
+        return None;
+    }
+    Some((row.exprs.clone(), sub.query.as_ref(), sub.all_ne))
+}
+
+fn naaj_eq(left: ExprNode, right: ExprNode) -> ExprNode {
+    ExprNode::Binary(BinaryOpExpr {
+        op: Op::Eq,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
+/// True when the expression references `table` (case-insensitive, alias-aware).
+fn naaj_refs_table(expr: &ExprNode, table: &str) -> bool {
+    expr.referenced_columns().iter().any(|(qualifier, _)| {
+        qualifier
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case(table))
+    })
+}
+
+fn naaj_operand_info(expr: &ExprNode, schema: &str) -> String {
+    match expr {
+        ExprNode::Column(col) => match col.table.as_deref() {
+            Some(table) => format!("{schema}.{}.{}", table.to_ascii_lowercase(), col.name),
+            None => col.name.clone(),
+        },
+        ExprNode::Binary(bin) => {
+            let op = match bin.op {
+                Op::Eq => "eq",
+                Op::Ne => "ne",
+                Op::Gt => "gt",
+                Op::Ge => "ge",
+                Op::Lt => "lt",
+                Op::Le => "le",
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
+                Op::LogicAnd => "and",
+                Op::LogicOr => "or",
+                _ => return expr.restore_string(),
+            };
+            format!(
+                "{op}({}, {})",
+                naaj_operand_info(&bin.left, schema),
+                naaj_operand_info(&bin.right, schema)
+            )
+        }
+        ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".to_string(),
+        other => other.restore_string(),
+    }
+}
+
+/// `other cond:` payload — comma-separated TiDB condition texts. TiDB gathers
+/// the row-operand equalities through a schema-keyed map, so the printed order
+/// is the condition text order rather than the row-constructor order.
+fn naaj_other_conds(cond: &ExprNode, schema: &str) -> String {
+    let mut parts: Vec<String> = cond
+        .split_cnf()
+        .iter()
+        .map(|c| naaj_operand_info(c, schema))
+        .collect();
+    parts.sort();
+    parts.join(", ")
+}
+
+fn est_rows_of(plan: &PhysicalPlan) -> f64 {
+    match plan {
+        PhysicalPlan::TableReader { row_count, .. } => row_count.abs(),
+        PhysicalPlan::RowProjection { child, .. } => est_rows_of(child),
+        _ => 10_000.0,
+    }
 }
 
 /// TiDB rewrite of uncorrelated `!= ANY` / `= ALL` into StreamAgg + CARTESIAN.

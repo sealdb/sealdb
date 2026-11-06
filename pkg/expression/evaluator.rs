@@ -370,7 +370,16 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
             Err(Error::unsupported("subquery evaluation outside Apply"))
         }
         ExprNode::Window(_) => Err(Error::unsupported("window evaluation outside WindowExec")),
+        ExprNode::Row(_) => Err(Error::new(
+            sealdb_errno::ERR_OPERAND_COLUMNS,
+            "Operand should contain 1 column(s)",
+        )),
     }
+}
+
+/// SQL `=` on two already-evaluated datums (caller handles NULL operands).
+pub fn datum_sql_eq(left: &Datum, right: &Datum) -> Result<bool> {
+    Ok(compare_datums_for_op(left, right, Op::Eq)?.is_eq())
 }
 
 pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
@@ -691,6 +700,7 @@ fn rewrite_high_not_precedence(op: Op, inner: &ExprNode) -> Option<ExprNode> {
             expr: Box::new(not_inner((*i.expr).clone())),
             not: false,
             query: i.query.clone(),
+            all_ne: false,
         })),
         ExprNode::IsNull(i) if !i.not => Some(ExprNode::IsNull(IsNullExpr {
             expr: Box::new(not_inner((*i.expr).clone())),

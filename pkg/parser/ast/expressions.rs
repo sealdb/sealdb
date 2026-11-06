@@ -25,6 +25,10 @@ pub enum ExprNode {
     /// `= ANY` / `= SOME` lower to `InSubquery`; `<> ALL` lowers to `NOT IN`.
     QuantifiedCmp(QuantifiedCmpExpr),
     Window(WindowFuncExpr),
+    /// Row constructor `(a, b)` (TiDB `*ast.RowExpr`). Only meaningful as the
+    /// left operand of `IN` / quantified comparison subqueries, which lower to
+    /// a null-aware anti join (`rule_semi_join` / `planbuilder::naaj_plan`).
+    Row(RowExpr),
 }
 
 impl ExprNode {
@@ -46,6 +50,7 @@ impl ExprNode {
             ExprNode::ScalarSubquery(v) => v.restore(ctx),
             ExprNode::QuantifiedCmp(v) => v.restore(ctx),
             ExprNode::Window(v) => v.restore(ctx),
+            ExprNode::Row(v) => v.restore(ctx),
         }
     }
 
@@ -77,6 +82,7 @@ impl ExprNode {
                     || w.spec.partition_by.iter().any(Self::has_subquery)
                     || w.spec.order_by.iter().any(|item| item.expr.has_subquery())
             }
+            ExprNode::Row(r) => r.exprs.iter().any(Self::has_subquery),
             ExprNode::Value(_) | ExprNode::Column(_) => false,
         }
     }
@@ -295,6 +301,11 @@ impl ExprNode {
                 q.expr.collect_columns(out);
                 collect_result_set_columns(&q.query, out);
             }
+            ExprNode::Row(r) => {
+                for expr in &r.exprs {
+                    expr.collect_columns(out);
+                }
+            }
             ExprNode::Value(_) => {}
         }
     }
@@ -487,17 +498,43 @@ pub struct InSubqueryExpr {
     pub expr: Box<ExprNode>,
     pub not: bool,
     pub query: Box<ResultSetNode>,
+    /// `expr != ALL (subquery)`: TiDB keeps the quantified form
+    /// (`*ast.CompareSubqueryExpr`) instead of folding to `NOT IN`, so the
+    /// planner can pick the left-outer-semi shape.
+    pub all_ne: bool,
 }
 
 impl InSubqueryExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.expr.restore(ctx)?;
-        if self.not {
+        if self.all_ne {
+            ctx.write_str(" != ALL (");
+        } else if self.not {
             ctx.write_str(" NOT IN (");
         } else {
             ctx.write_str(" IN (");
         }
         self.query.restore(ctx)?;
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+/// Row constructor `(a, b)` — TiDB `*ast.RowExpr`.
+#[derive(Clone, Debug)]
+pub struct RowExpr {
+    pub exprs: Vec<ExprNode>,
+}
+
+impl RowExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("(");
+        for (i, expr) in self.exprs.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            expr.restore(ctx)?;
+        }
         ctx.write_str(")");
         Ok(())
     }

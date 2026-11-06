@@ -2453,6 +2453,11 @@ fn inherit_cte_in_expr(expr: &mut ExprNode, scope: Option<&WithClause>) {
                 inherit_cte_in_expr(arg, Some(scope));
             }
         }
+        ExprNode::Row(r) => {
+            for expr in &mut r.exprs {
+                inherit_cte_in_expr(expr, Some(scope));
+            }
+        }
         ExprNode::Column(_) | ExprNode::Value(_) => {}
     }
 }
@@ -2854,6 +2859,11 @@ fn qualify_tables_in_expr(
                 qualify_tables_in_expr(arg, schema, cte_names);
             }
         }
+        ExprNode::Row(r) => {
+            for expr in &mut r.exprs {
+                qualify_tables_in_expr(expr, schema, cte_names);
+            }
+        }
         ExprNode::Column(_) | ExprNode::Value(_) => {}
     }
 }
@@ -3057,6 +3067,11 @@ fn rewrite_merged_view_cols(
             }
             for o in &mut w.spec.order_by {
                 rewrite_merged_view_cols(&mut o.expr, view_name, mapping);
+            }
+        }
+        ExprNode::Row(r) => {
+            for expr in &mut r.exprs {
+                rewrite_merged_view_cols(expr, view_name, mapping);
             }
         }
         ExprNode::Value(_)
