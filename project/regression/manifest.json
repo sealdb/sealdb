@@ -836,7 +836,7 @@
     {
       "name": "executor/jointest/join",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/jointest/join.test",
       "result": "r/executor/jointest/join.result",
       "has_result": true,

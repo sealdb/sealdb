@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` green |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -140,6 +140,17 @@
 | 相关标量子查询 + 同名 CTE | `cte1.c1` 在 `FROM cte1 dt1` 内指外层 | `apply.rs` 自引用 CTE 输出列先入 inner scope；别名隐藏 CTE 名 | `where cte1.c1 = (select dt1.c1 … where dt1.c1 = cte1.c1)` 返回 2,3 |
 | CREATE VIEW 体含 CTE | 视图列由 CTE 输出推导 | `columns_from_select` 识别 CTE scope 后取列名/类型 | `create view v as with tt as (…) select * from tt` 通过 |
 | suite green | Gate A+B | manifest `green` | `executor/cte` Mem=1 / TiKV=1 PASS；green 12→13 双端复验 |
+
+### 2.0g R2 `executor/jointest/join`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 派生表内 `ONLY_FULL_GROUP_BY` | 派生表 `(SELECT clock … GROUP BY source)` 同样校验 1055 | `check_only_full_group_by` 递归 `with.ctes`（派生表被降级为合成 CTE） | `events e JOIN (…) e3` → Error 1055 |
+| JOIN ON 子查询 | HashJoin 不支持 ON 内子查询，报 1105 | `planbuilder` 在 `build_join_plan` 前置 `has_subquery` 检查（含 bushy `FromItem`） | `on (t2.id < all (select 1))` → 1105 |
+| 非等值 Semi/Anti | Apply 语义只输出探针列 | `probe_semi_anti_non_equi` 直接回投左行 | `m1.a in (select m2.b+1 …)` 不再触发 chunk 宽度断言 |
+| RightOuter 空补宽 | 保留侧在右，输出仍 `[left, right]` | `probe_outer` 右侧保留时按 build 宽度补 NULL | `t1 join t2 using(a) right join t3 …` 返回 4 列 |
+| 括号 JOIN + USING | `(t2 JOIN t3 USING (b))` 作为单侧时列名可重复 | `FromItem::Join.using_cols` + 可见列模型；1052 `Column … in from clause is ambiguous` | `t1 JOIN (t2 JOIN t3 USING (b)) USING (a)` → 1052 |
+| suite green | Gate A+B | manifest `green` | `executor/jointest/join` Mem=1 / TiKV=1 PASS；green 13→14 双端复验 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
