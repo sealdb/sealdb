@@ -1253,24 +1253,49 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
         .lock()
         .expect("session sql_mode lock")
         .clone();
-    if !sql_mode_has(&mode, "ONLY_FULL_GROUP_BY") || select.group_by.is_empty() {
+    if !sql_mode_has(&mode, "ONLY_FULL_GROUP_BY") {
         return Ok(());
     }
-    let cte_loose = cte_group_by_allows_peer_columns(select);
-    for (i, field) in select.fields.iter().enumerate() {
-        if select_field_ok_for_group_by(&field.expr, &select.group_by) {
-            continue;
+    check_select_only_full_group_by(select)
+}
+
+/// One SELECT block plus every nested block reachable from it.
+///
+/// Derived `FROM (SELECT …)` tables are lowered into synthetic CTEs on the
+/// same `SelectStmt`, so recursing through `with.ctes` also validates the
+/// bodies of derived tables (TiDB reports 1055 for those too).
+fn check_select_only_full_group_by(select: &SelectStmt) -> Result<()> {
+    if !select.group_by.is_empty() {
+        let cte_loose = cte_group_by_allows_peer_columns(select);
+        for (i, field) in select.fields.iter().enumerate() {
+            if select_field_ok_for_group_by(&field.expr, &select.group_by) {
+                continue;
+            }
+            if cte_loose && matches!(&field.expr, ExprNode::Column(_)) {
+                continue;
+            }
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP,
+                format!(
+                    "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+                    i + 1
+                ),
+            ));
         }
-        if cte_loose && matches!(&field.expr, ExprNode::Column(_)) {
-            continue;
+    }
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            check_select_only_full_group_by(&cte.query)?;
+            if let Some((_, arm)) = &cte.recursive {
+                check_select_only_full_group_by(arm)?;
+            }
+            for (_, arm) in &cte.recursive_rest {
+                check_select_only_full_group_by(arm)?;
+            }
+            for (_, arm) in &cte.set_rest {
+                check_select_only_full_group_by(arm)?;
+            }
         }
-        return Err(sealdb_errno::Error::new(
-            sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP,
-            format!(
-                "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
-                i + 1
-            ),
-        ));
     }
     Ok(())
 }
