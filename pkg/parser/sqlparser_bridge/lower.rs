@@ -6093,6 +6093,7 @@ fn lower_from_item_list(
             right: Box::new(right),
             tp: JoinType::Cross,
             on: true_expr(),
+            using_cols: Vec::new(),
         };
     }
     Ok((item, ctes))
@@ -6105,26 +6106,48 @@ fn lower_table_with_joins_item(
     for join in &table.joins {
         let (right, right_ctes) = table_factor_item(&join.relation)?;
         ctes.extend(right_ctes);
-        let (tp, on) = match &join.join_operator {
+        let left_name = left.tables().last().map(|t| (*t).clone());
+        let right_name = right.tables().first().map(|t| (*t).clone());
+        let (tp, on, using_cols) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
             | JoinOperator::Inner(JoinConstraint::On(expr))
             | JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::Left(JoinConstraint::On(expr))
             | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?)
+                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::Right(JoinConstraint::On(expr))
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?)
+                (JoinType::RightOuter, lower_expr(expr)?, Vec::new())
             }
             JoinOperator::CrossJoin(JoinConstraint::None)
             | JoinOperator::Join(JoinConstraint::None)
             | JoinOperator::Inner(JoinConstraint::None)
-            | JoinOperator::StraightJoin(JoinConstraint::None) => (JoinType::Cross, true_expr()),
+            | JoinOperator::StraightJoin(JoinConstraint::None) => {
+                (JoinType::Cross, true_expr(), Vec::new())
+            }
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+            }
+            JoinOperator::Join(JoinConstraint::Using(names))
+            | JoinOperator::Inner(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
+                (JoinType::Inner, on, cols)
+            }
+            JoinOperator::Left(JoinConstraint::Using(names))
+            | JoinOperator::LeftOuter(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
+                (JoinType::LeftOuter, on, cols)
+            }
+            JoinOperator::Right(JoinConstraint::Using(names))
+            | JoinOperator::RightOuter(JoinConstraint::Using(names)) => {
+                let cols = using_column_names(names)?;
+                let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
+                (JoinType::RightOuter, on, cols)
             }
             other => {
                 return Err(Error::unsupported(format!(
@@ -6146,6 +6169,7 @@ fn lower_table_with_joins_item(
             right: Box::new(right),
             tp,
             on,
+            using_cols,
         };
     }
     Ok((left, ctes))
@@ -6220,6 +6244,7 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
             right,
             tp,
             on,
+            using_cols,
         } => {
             let mut joins = flatten_from_item_joins(left);
             joins.extend(flatten_from_item_joins(right));
@@ -6231,8 +6256,8 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
                     right: (*r).clone(),
                     tp: *tp,
                     on: on.clone(),
-                    using_cols: Vec::new(),
-                straight: false,
+                    using_cols: using_cols.clone(),
+                    straight: false,
                 });
             }
             joins
@@ -6398,6 +6423,19 @@ fn using_on_expr(left: &TableName, right: &TableName, cols: &[String]) -> Result
             right: Box::new(next),
         })
     }))
+}
+
+/// `USING (…)` for a nested join item: falls back to `TRUE` when a side has no
+/// single representative table (name resolution reports ambiguity later).
+fn using_on_expr_opt(
+    left: &Option<TableName>,
+    right: &Option<TableName>,
+    cols: &[String],
+) -> Result<ExprNode> {
+    match (left, right) {
+        (Some(left), Some(right)) => using_on_expr(left, right, cols),
+        _ => Ok(true_expr()),
+    }
 }
 
 /// Two-table DML only: reject n-table JOIN chains on UPDATE / DELETE.
