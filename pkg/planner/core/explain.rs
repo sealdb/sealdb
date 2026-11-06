@@ -337,6 +337,10 @@ fn walk_with_parent(
             access: String::new(),
             info: "Column#5->Column#6".to_string(),
         });
+        // The synthetic node occupies one more level, so its continuation
+        // column must be carried into the real plan below it.
+        let mut child_spine = spine.to_vec();
+        child_spine.push(!last);
         return walk_with_parent(
             plan,
             parent,
@@ -345,7 +349,7 @@ fn walk_with_parent(
             next_id,
             rows,
             true,
-            spine,
+            &child_spine,
             deferred,
             apply_factor,
         );
@@ -699,86 +703,14 @@ fn walk_with_parent(
         return;
     }
     let children = children_of(plan);
-    // Under `└─` (Projection→HashJoin, or Probe whose spine ends in space):
-    // children get spaces at this column. Nested HashJoin builds keep a leftover
-    // `true` for Probe `│`; TableReader Selection uses `bushy_cop_spine`.
-    // Under `└─` (TopN→Union, Projection→HashJoin, …): children get spaces at
-    // this column so we render `  ├─` not `│ ├─`.
-    let under_last_join = matches!(
-        plan,
-        PhysicalPlan::HashJoin { .. }
-            | PhysicalPlan::MergeJoin { .. }
-            | PhysicalPlan::IndexJoin { .. }
-            | PhysicalPlan::Apply { probe: Some(_), .. }
-            | PhysicalPlan::PartitionUnion { .. }
-            | PhysicalPlan::Union { .. }
-    ) && last
-        && (matches!(
-            parent,
-            Some(
-                PhysicalPlan::Projection { .. }
-                    | PhysicalPlan::TopN { .. }
-                    | PhysicalPlan::StreamAgg { .. }
-                    | PhysicalPlan::Apply { .. }
-                    | PhysicalPlan::Limit { .. }
-            )
-        ) || spine.last() == Some(&false));
     for (i, child) in children.iter().enumerate() {
         let child_last = i + 1 == children.len();
         let mut child_spine = spine.to_vec();
-        if under_last_join {
-            child_spine.push(false);
-            if !child_last
-                && matches!(
-                    child,
-                    PhysicalPlan::HashJoin { .. }
-                        | PhysicalPlan::MergeJoin { .. }
-                        | PhysicalPlan::IndexJoin { .. }
-                        | PhysicalPlan::Apply { probe: Some(_), .. }
-                        | PhysicalPlan::PartitionUnion { .. }
-                        | PhysicalPlan::Union { .. }
-                )
-            {
-                child_spine.push(true);
-            }
-        } else if matches!(
-            plan,
-            PhysicalPlan::HashJoin { .. }
-                | PhysicalPlan::MergeJoin { .. }
-                | PhysicalPlan::IndexJoin { .. }
-                | PhysicalPlan::Apply { probe: Some(_), .. }
-                | PhysicalPlan::PartitionUnion { .. }
-                | PhysicalPlan::Union { .. }
-        ) {
-            child_spine.push(!child_last);
-        } else if !spine.is_empty() {
-            // StreamAgg under CARTESIAN: push whether *this* node continues.
-            // Unary ops under HashJoin Build (Selection/HashAgg/Projection):
-            // push whether *their* child has siblings → spaces under `│`.
-            // Projection under Union: push `!last` so Dual keeps `│` when the
-            // Projection is a non-last Union arm (`  ├─` / `  │ └─`).
-            if matches!(
-                plan,
-                PhysicalPlan::Projection { .. }
-                    | PhysicalPlan::Selection { .. }
-                    | PhysicalPlan::Sort { .. }
-                    | PhysicalPlan::HashAgg { .. }
-                    | PhysicalPlan::StreamAgg { .. }
-            ) && matches!(
-                parent,
-                Some(
-                    PhysicalPlan::HashJoin { .. }
-                        | PhysicalPlan::MergeJoin { .. }
-                        | PhysicalPlan::IndexJoin { .. }
-                        | PhysicalPlan::Apply { probe: Some(_), .. }
-                )
-            ) {
-                // Unary under Build: spaces under the │ (no further siblings).
-                child_spine.push(!child_last);
-            } else {
-                // Limit/UnionScan Build under HashJoin: keep │ for Probe sibling.
-                child_spine.push(!last);
-            }
+        // `spine[d-1]` is the continuation column of the ancestor at depth `d`:
+        // `│ ` while that ancestor still has a later sibling. Descending appends
+        // this node's own continuation, which grandchildren then render.
+        if parent.is_some() {
+            child_spine.push(!last);
         }
         // Apply probe side: TiDB multiplies correlated inner est by outer rows.
         let child_apply = match plan {
@@ -788,6 +720,17 @@ fn walk_with_parent(
                 ..
             } if explain_plan_ptr(child) == explain_plan_ptr(probe) => {
                 est_rows(outer).max(1.0)
+            }
+            // Inner sides of a join are re-estimated by the join itself, so the
+            // Apply outer-row factor must not leak through them.
+            _ if matches!(
+                plan,
+                PhysicalPlan::HashJoin { .. }
+                    | PhysicalPlan::MergeJoin { .. }
+                    | PhysicalPlan::IndexJoin { .. }
+            ) =>
+            {
+                1.0
             }
             _ => apply_factor,
         };
