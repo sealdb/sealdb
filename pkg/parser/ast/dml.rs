@@ -63,6 +63,8 @@ pub enum FromItem {
         right: Box<FromItem>,
         tp: JoinType,
         on: ExprNode,
+        /// Columns from `USING (...)`; empty when the join used `ON` / CROSS.
+        using_cols: Vec<String>,
     },
 }
 

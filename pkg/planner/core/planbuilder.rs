@@ -652,7 +652,20 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
+        // TiDB hash join: subqueries inside a JOIN ON clause are rejected.
+        if select.joins.iter().any(|j| j.on.has_subquery())
+            || select
+                .from_item
+                .as_ref()
+                .is_some_and(from_item_on_has_subquery)
+        {
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                "ON condition doesn't support subqueries yet",
+            ));
+        }
         if let Some(item) = &select.from_item {
+            validate_from_item_using(item, is, current_db)?;
             return self.build_from_item(select, item, is, current_db, stats, prune_mode);
         }
         validate_join_using(select, is, current_db)?;
@@ -1066,6 +1079,7 @@ impl PlanBuilder {
                 right,
                 tp,
                 on,
+                using_cols: _,
             } => {
                 if let Some(plan) = self.try_bushy_quad_outer(
                     select, left, right, *tp, on, is, current_db, stats, prune_mode,
@@ -1160,12 +1174,14 @@ impl PlanBuilder {
                 right: l2,
                 tp: lt,
                 on: lon,
+                ..
             },
             FromItem::Join {
                 left: r1,
                 right: r2,
                 tp: rt,
                 on: ron,
+                ..
             },
         ) = (left, right)
         else {
@@ -1468,6 +1484,112 @@ fn is_information_schema(from: &TableName, current_db: &str) -> bool {
 
 fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
+}
+
+/// MySQL `USING` resolution on a bushy `FromItem` tree: each side of a join
+/// must expose exactly one column with the bare name (1052 when a side has
+/// several, 1054 when it has none). A nested `(a JOIN b USING …)` group
+/// collapses its USING columns, so `t1 JOIN (t2 JOIN t3 USING (b)) USING (a)`
+/// leaves both `t2.a` and `t3.a` visible → ambiguous.
+fn validate_from_item_using(
+    item: &sealdb_parser::ast::FromItem,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Result<()> {
+    fn columns_of(
+        is: &InfoSchema,
+        current_db: &str,
+        table: &TableName,
+    ) -> Option<Vec<String>> {
+        let schema = table
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        is.table_by_name(schema, table.resolve_name()).map(|info| {
+            info.columns
+                .iter()
+                .map(|col| col.name.o().to_string())
+                .collect()
+        })
+    }
+
+    fn visible(item: &sealdb_parser::ast::FromItem, is: &InfoSchema, db: &str) -> Option<Vec<String>> {
+        match item {
+            sealdb_parser::ast::FromItem::Table(t) => columns_of(is, db, t),
+            sealdb_parser::ast::FromItem::Join {
+                left,
+                right,
+                using_cols,
+                ..
+            } => {
+                let mut cols = visible(left, is, db)?;
+                let right_cols = visible(right, is, db)?;
+                let drop: std::collections::HashSet<String> =
+                    using_cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+                cols.extend(
+                    right_cols
+                        .into_iter()
+                        .filter(|c| !drop.contains(&c.to_ascii_lowercase())),
+                );
+                Some(cols)
+            }
+        }
+    }
+
+    fn check(item: &sealdb_parser::ast::FromItem, is: &InfoSchema, db: &str) -> Result<()> {
+        let sealdb_parser::ast::FromItem::Join {
+            left,
+            right,
+            using_cols,
+            ..
+        } = item
+        else {
+            return Ok(());
+        };
+        check(left, is, db)?;
+        check(right, is, db)?;
+        if using_cols.is_empty() {
+            return Ok(());
+        }
+        let (Some(left_cols), Some(right_cols)) = (visible(left, is, db), visible(right, is, db))
+        else {
+            return Ok(());
+        };
+        for col in using_cols {
+            let count =
+                |cols: &[String]| cols.iter().filter(|c| c.eq_ignore_ascii_case(col)).count();
+            let (l, r) = (count(&left_cols), count(&right_cols));
+            if l > 1 || r > 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_AMBIGUOUS_COLUMN,
+                    format!("Column '{col}' in from clause is ambiguous"),
+                ));
+            }
+            if l == 0 || r == 0 {
+                return Err(Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Unknown column '{col}' in 'from clause'"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let Some(is) = is else {
+        return Ok(());
+    };
+    check(item, is, current_db)
+}
+
+/// `FROM ((a JOIN b ON <subquery>) …)` — ON conditions nested in paren groups.
+fn from_item_on_has_subquery(item: &sealdb_parser::ast::FromItem) -> bool {
+    match item {
+        sealdb_parser::ast::FromItem::Table(_) => false,
+        sealdb_parser::ast::FromItem::Join {
+            left, right, on, ..
+        } => on.has_subquery() || from_item_on_has_subquery(left) || from_item_on_has_subquery(right),
+    }
 }
 
 /// MySQL resolves `USING (col)` against both join inputs before planning, so an
