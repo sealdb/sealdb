@@ -20,8 +20,8 @@ use sealdb_parser::ast::expressions::{
     BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, IsNullExpr, UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{
-    CteMaterialize, JoinType as AstJoinType, ResultSetNode, SelectStmt, Statement, StmtNode,
-    TableName, WithClause,
+    ByItem, CommonTableExpression, CteMaterialize, JoinType as AstJoinType, ResultSetNode,
+    SelectStmt, SetOprStmt, SetOprType, Statement, StmtNode, TableName, WithClause,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_statistics::{Handle, Table};
@@ -39,6 +39,22 @@ impl PlanBuilder {
     }
 
     pub fn build_with_schema(
+        &self,
+        stmt: &Statement,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<PhysicalPlan> {
+        // Statement-wide CTE reference counts (TiDB `computeCTEInlineFlag`).
+        // Computed once for the outermost statement and reused by nested
+        // subquery builds.
+        with_statement_cte_refs(stmt, || {
+            self.build_with_schema_inner(stmt, is, current_db, stats, prune_mode)
+        })
+    }
+
+    fn build_with_schema_inner(
         &self,
         stmt: &Statement,
         is: Option<&InfoSchema>,
@@ -450,33 +466,46 @@ impl PlanBuilder {
                 )?),
             }),
             Statement::SetOpr(set) => {
-                let mut plan = self.build_with_schema(
-                    &Statement::Select(with_inherited(set.first.clone(), set.with.as_ref())),
-                    is,
-                    current_db,
-                    stats,
-                    prune_mode,
-                )?;
+                let mut arms: Vec<(SetOprType, PhysicalPlan)> =
+                    Vec::with_capacity(set.rest.len() + 1);
+                arms.push((
+                    SetOprType::UnionAll,
+                    self.build_with_schema(
+                        &Statement::Select(with_inherited(set.first.clone(), set.with.as_ref())),
+                        is,
+                        current_db,
+                        stats,
+                        prune_mode,
+                    )?,
+                ));
                 for (op, select) in &set.rest {
-                    plan = PhysicalPlan::Union {
-                        op: *op,
-                        left: Box::new(plan),
-                        right: Box::new(self.build_with_schema(
+                    arms.push((
+                        *op,
+                        self.build_with_schema(
                             &Statement::Select(with_inherited(select.clone(), set.with.as_ref())),
                             is,
                             current_db,
                             stats,
                             prune_mode,
-                        )?),
-                    };
+                        )?,
+                    ));
                 }
-                plan = apply_order_limit(
+                // EXPLAIN Sort/TopN over a set op renders TiDB's plan column
+                // ids (`ORDER BY 1` → `Column#N`).
+                let ids = PlanColumnIds::new(is, current_db).statement(set);
+                let plan = build_set_op_plan(arms, &ids);
+                let by_info = if set.order_by.is_empty() {
+                    String::new()
+                } else {
+                    set_op_order_by_info(&set.order_by, &set.first, ids.outer_ids())
+                };
+                let plan = apply_order_limit(
                     plan,
                     !set.order_by.is_empty(),
                     set.limit,
                     set.offset,
                     Table::PSEUDO_ROW_COUNT as f64,
-                    String::new(),
+                    by_info,
                 );
                 Ok(plan)
             }
@@ -544,41 +573,38 @@ impl PlanBuilder {
                 child: Box::new(seed),
             };
         }
-        let union_col = if !with.set_rest(&from.name)?.is_empty() {
+        let set_rest = with.set_rest(&from.name)?;
+        let mut set_op_ids = SetOpColumnIds::default();
+        if !set_rest.is_empty() {
             // TiDB set-op output column ids for dual constants start at #3.
-            Some(3usize)
-        } else {
-            None
-        };
-        if let Some(col) = union_col {
-            seed = remap_dual_projection_column(seed, col);
-        }
-        for (op, select) in with.set_rest(&from.name)? {
-            let mut right = self.build_with_schema(
-                &Statement::Select(select),
-                is,
-                current_db,
-                stats,
-                prune_mode,
-            )?;
-            if let Some(col) = union_col {
-                right = remap_dual_projection_column(right, col);
+            const DUAL_UNION_COLUMN: usize = 3;
+            seed = remap_dual_projection_column(seed, DUAL_UNION_COLUMN);
+            let mut arms = vec![(SetOprType::UnionAll, seed)];
+            for (op, select) in set_rest {
+                let right = self.build_with_schema(
+                    &Statement::Select(select),
+                    is,
+                    current_db,
+                    stats,
+                    prune_mode,
+                )?;
+                arms.push((op, remap_dual_projection_column(right, DUAL_UNION_COLUMN)));
             }
-            seed = PhysicalPlan::Union {
-                op,
-                left: Box::new(seed),
-                right: Box::new(right),
-            };
+            // TiDB plan column ids of this CTE body's set op (dedup HashAgg info).
+            if let Some(with) = select.with.as_ref() {
+                set_op_ids = PlanColumnIds::new(is, current_db).cte(with, &from.name);
+            }
+            seed = build_set_op_plan(arms, &set_op_ids);
         }
         // TiDB: non-recursive CTEs inline by default unless AS MATERIALIZED or
         // referenced more than once (shared CTETableReader).
-        let cte_name = from.name.as_str();
-        let multi_ref = select
-            .join_tables()
-            .into_iter()
-            .filter(|t| t.resolve_name().eq_ignore_ascii_case(cte_name))
-            .count()
-            > 1;
+        let refs = cte_ref_count(&from.name).unwrap_or_else(|| {
+            select
+                .join_tables()
+                .into_iter()
+                .filter(|t| t.resolve_name().eq_ignore_ascii_case(&from.name))
+                .count()
+        });
         let recursive = cte.is_some_and(|cte| cte.recursive.is_some());
         let recursive_plan = if let Some((_, rec)) = with.recursive_arm(&from.name)? {
             Some(Box::new(self.build_with_schema(
@@ -591,11 +617,8 @@ impl PlanBuilder {
         } else {
             None
         };
-        let inline = cte.is_some_and(|cte| {
-            cte.materialize != CteMaterialize::Materialized
-                && cte.recursive.is_none()
-                && !multi_ref
-        }) || seed_is_dual_projection(&seed)
+        let inline = cte.is_some_and(|cte| !cte_materialized(cte, refs))
+            || seed_is_dual_projection(&seed)
             // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
             || seed_is_union_of_dual(&seed);
         // `cte1 AS dt2` → name=cte1, physical=dt2 after join_side remap.
@@ -1872,6 +1895,740 @@ fn apply_order_limit(
     plan
 }
 
+/// TiDB distinct-UNION dedup selectivity (`buildDistinct` → `HashAgg`):
+/// pseudo stats give the dedup agg `0.8 * Union.estRows`.
+const DISTINCT_UNION_EST_FACTOR: f64 = 0.8;
+
+/// TiDB set-op plan (`planner/core/logical_plan_builder.go` `buildUnion` /
+/// `buildUnionAll` / `buildDistinct`): `PhysicalUnionAll` is n-ary over all
+/// arms, and a distinct `UNION` group is deduped by a `HashAgg(firstrow)` above
+/// it. Trailing `UNION ALL` arms stack on top of that agg
+/// (`divideUnionSelectPlans`).
+///
+/// `ids` are TiDB's plan column ids for the set-op output (see
+/// [`PlanColumnIds`]).
+fn build_set_op_plan(arms: Vec<(SetOprType, PhysicalPlan)>, ids: &SetOpColumnIds) -> PhysicalPlan {
+    let ops: Vec<SetOprType> = arms.iter().map(|(op, _)| *op).collect();
+    let Some((distinct_len, _)) = set_op_groups(&ops) else {
+        // EXCEPT / INTERSECT keep per-arm semantics (binary fold).
+        let mut iter = arms.into_iter();
+        let (_, mut plan) = iter.next().expect("set op arm");
+        for (op, right) in iter {
+            plan = PhysicalPlan::Union {
+                op,
+                children: vec![Box::new(plan), Box::new(right)],
+            };
+        }
+        return plan;
+    };
+    let mut arms = arms;
+    let all_arms = arms.split_off(distinct_len);
+    let deduped = match arms.len() {
+        0 => None,
+        1 => Some(arms.pop().expect("set op arm").1),
+        _ => {
+            let children: Vec<Box<PhysicalPlan>> =
+                arms.into_iter().map(|(_, plan)| Box::new(plan)).collect();
+            let union = PhysicalPlan::Union {
+                op: SetOprType::UnionAll,
+                children,
+            };
+            let est_rows = super::explain::est_rows(&union) * DISTINCT_UNION_EST_FACTOR;
+            Some(PhysicalPlan::DistinctUnion {
+                info: distinct_union_info(&ids.distinct),
+                est_rows,
+                child: Box::new(union),
+            })
+        }
+    };
+    // All arms distinct → the dedup HashAgg is the set op root (TiDB keeps a
+    // single UnionAll below it; no extra one-child Union wrapper).
+    if all_arms.is_empty() {
+        if let Some(deduped) = deduped {
+            return deduped;
+        }
+    }
+    let mut children: Vec<Box<PhysicalPlan>> = Vec::with_capacity(all_arms.len() + 1);
+    children.extend(deduped.map(Box::new));
+    children.extend(all_arms.into_iter().map(|(_, plan)| Box::new(plan)));
+    PhysicalPlan::Union {
+        op: SetOprType::UnionAll,
+        children,
+    }
+}
+
+/// `(distinct_len, union_all_len)` for a flattened set op; `None` when the op
+/// list has `EXCEPT` / `INTERSECT` arms. TiDB `divideUnionSelectPlans` keeps
+/// every arm up to the last non-`UNION ALL` operator in the distinct group.
+fn set_op_groups(ops: &[SetOprType]) -> Option<(usize, usize)> {
+    if ops
+        .iter()
+        .any(|op| !matches!(op, SetOprType::Union | SetOprType::UnionAll))
+    {
+        return None;
+    }
+    let distinct = ops
+        .iter()
+        .rposition(|op| *op != SetOprType::UnionAll)
+        .map_or(0, |i| i + 1);
+    Some((distinct, ops.len() - distinct))
+}
+
+/// TiDB `buildDistinct` HashAgg over a distinct UNION:
+/// `group by:Column#7, Column#8, funcs:firstrow(Column#7)->Column#7, …`.
+fn distinct_union_info(cols: &[usize]) -> String {
+    if cols.is_empty() {
+        return "group by:Column#1, funcs:firstrow(Column#1)->Column#1".to_string();
+    }
+    let group_by: Vec<String> = cols.iter().map(|c| format!("Column#{c}")).collect();
+    let funcs: Vec<String> = cols
+        .iter()
+        .map(|c| format!("funcs:firstrow(Column#{c})->Column#{c}"))
+        .collect();
+    format!("group by:{}, {}", group_by.join(", "), funcs.join(", "))
+}
+
+/// `ORDER BY` over a set op sorts by TiDB's output plan column ids
+/// (`ORDER BY 1` → `Column#7`).
+fn set_op_order_by_info(order_by: &[ByItem], first: &SelectStmt, ids: &[usize]) -> String {
+    let position = |expr: &ExprNode| -> Option<usize> {
+        match expr {
+            ExprNode::Value(ValueExpr {
+                datum: Datum::I64(n),
+            }) if *n > 0 => Some(*n as usize - 1),
+            ExprNode::Value(ValueExpr {
+                datum: Datum::U64(n),
+            }) if *n > 0 => Some(*n as usize - 1),
+            ExprNode::Column(col) => first.fields.iter().position(|f| {
+                f.as_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&col.name))
+                    || matches!(&f.expr, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&col.name))
+            }),
+            _ => None,
+        }
+    };
+    order_by
+        .iter()
+        .map(|item| {
+            let base = position(&item.expr)
+                .and_then(|i| ids.get(i))
+                .map(|c| format!("Column#{c}"))
+                .unwrap_or_else(|| item.expr.restore_string());
+            if item.desc {
+                format!("{base}:desc")
+            } else {
+                base
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// TiDB plan column ids of a set operation's output columns.
+#[derive(Clone, Default)]
+struct SetOpColumnIds {
+    /// Dedup `HashAgg` output of the distinct `UNION` group.
+    distinct: Vec<usize>,
+    /// Output columns of the outermost `UNION ALL`.
+    outer: Vec<usize>,
+}
+
+impl SetOpColumnIds {
+    /// Final output column ids of the set op (outermost group).
+    fn outer_ids(&self) -> &[usize] {
+        if self.outer.is_empty() {
+            &self.distinct
+        } else {
+            &self.outer
+        }
+    }
+}
+
+/// A visible `WITH` CTE definition in [`PlanColumnIds`].
+#[derive(Clone)]
+struct CteColumnId {
+    name: String,
+    /// Output column count (`cte (a, b)` list or the seed select width).
+    width: usize,
+    /// Plan ids consumed building the CTE body (inline references rebuild it).
+    body_cost: usize,
+    /// TiDB `computeCTEInlineFlag`: recursive / `AS MATERIALIZED` /
+    /// referenced more than once → shared `CTETableReader`.
+    materialized: bool,
+}
+
+/// Replays TiDB's plan column id allocation for set operations.
+///
+/// `buildUnionAll` hands out one id per output column (`buildProjection4Union`)
+/// *after* every arm is built, and `WITH` CTE definitions are built before the
+/// query body. EXPLAIN renders those ids in the `Sort`/`TopN` by-items above a
+/// set op and in the distinct-UNION dedup HashAgg. This mirrors TiDB's build
+/// order, not our physical plan.
+struct PlanColumnIds<'a> {
+    is: Option<&'a InfoSchema>,
+    current_db: &'a str,
+    /// Next id handed out (TiDB starts at 1).
+    next: usize,
+    /// CTE definitions in scope, innermost last.
+    ctes: Vec<CteColumnId>,
+    /// Set-op output ids recorded per CTE name.
+    recorded: Vec<(String, SetOpColumnIds)>,
+}
+
+impl<'a> PlanColumnIds<'a> {
+    fn new(is: Option<&'a InfoSchema>, current_db: &'a str) -> Self {
+        Self {
+            is,
+            current_db,
+            next: 1,
+            ctes: Vec::new(),
+            recorded: Vec::new(),
+        }
+    }
+
+    /// Top-level `Statement::SetOpr`.
+    fn statement(mut self, set: &SetOprStmt) -> SetOpColumnIds {
+        if let Some(with) = &set.with {
+            self.consume_with(with);
+        }
+        self.consume_set_op(&set.first, &set.rest, None).0
+    }
+
+    /// Statement-wide reference count for `name` (TiDB `computeCTEInlineFlag`).
+    fn ref_count(&self, name: &str) -> usize {
+        cte_ref_count(name).unwrap_or(1)
+    }
+
+    /// Set-op ids of `name`'s body (`WITH` definitions are built first).
+    fn cte(mut self, with: &WithClause, name: &str) -> SetOpColumnIds {
+        self.consume_with(with);
+        self.recorded
+            .iter()
+            .rev()
+            .find(|(cte, _)| cte.eq_ignore_ascii_case(name))
+            .map(|(_, ids)| ids.clone())
+            .unwrap_or_default()
+    }
+
+    fn alloc(&mut self) -> usize {
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+
+    fn alloc_width(&mut self, width: usize) -> Vec<usize> {
+        (0..width.max(1)).map(|_| self.alloc()).collect()
+    }
+
+    fn lookup_cte(&self, name: &str) -> Option<CteColumnId> {
+        self.ctes
+            .iter()
+            .rev()
+            .find(|cte| cte.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    /// Build `WITH` definitions in declaration order (`buildWith`). Scopes are
+    /// inherited into every subquery by the parser (`inherit_cte_scope_in_select`),
+    /// so an already built name is skipped.
+    fn consume_with(&mut self, with: &WithClause) {
+        for cte in &with.ctes {
+            self.consume_cte_def(with, cte);
+        }
+    }
+
+    fn consume_cte_def(&mut self, with: &WithClause, cte: &CommonTableExpression) {
+        if self.lookup_cte(&cte.name).is_some() {
+            return;
+        }
+        let width = self.cte_width(cte);
+        let start = self.next;
+        if cte.recursive.is_some() {
+            // TiDB `buildRecursiveCTE`: arms are built left to right until the
+            // first self reference fails (the CTE has no seed plan yet, so no
+            // column ids are consumed), then the seed group is rebuilt as a set
+            // op, then the recursive arms are built (`CTETable` re-allocates the
+            // CTE schema via `getResultCTESchema`) and the CTE union projection
+            // (`buildProjection4CTEUnion`) allocates the result schema.
+            self.ctes.push(CteColumnId {
+                name: cte.name.clone(),
+                width,
+                body_cost: 0,
+                materialized: true,
+            });
+            let mut seed_group: Vec<SelectStmt> = Vec::new();
+            if let Ok(seed) = with.seed_select(&cte.name) {
+                seed_group.push(seed);
+                // `set_rest` arms that do not touch the CTE are seed arms.
+                for (_, arm) in with.set_rest(&cte.name).unwrap_or_default() {
+                    if select_refs_cte(&arm, &cte.name) {
+                        break;
+                    }
+                    seed_group.push(arm);
+                }
+            }
+            // Probe build: the seed arms are built (and thrown away) first.
+            for arm in &seed_group {
+                self.consume_select(arm, Some(&cte.name));
+            }
+            // Seed rebuild, then the seed set-op output columns.
+            for arm in &seed_group {
+                self.consume_select(arm, None);
+            }
+            if seed_group.len() > 1 {
+                let w = self.select_width(&seed_group[0]);
+                self.alloc_width(w);
+            }
+            let rec_arms = with.recursive_arms(&cte.name).unwrap_or_default();
+            for (_, arm) in &rec_arms {
+                self.consume_select(arm, Some(&cte.name));
+            }
+            if rec_arms.len() > 1 {
+                let w = self.select_width(&rec_arms[0].1);
+                self.alloc_width(w);
+            }
+            self.alloc_width(width);
+            let cost = self.next - start;
+            if let Some(entry) = self
+                .ctes
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&cte.name))
+            {
+                entry.body_cost = cost;
+            }
+            return;
+        }
+        let mut recorded = None;
+        if let Ok(seed) = with.seed_select(&cte.name) {
+            let rest = with.set_rest(&cte.name).unwrap_or_default();
+            if rest.is_empty() {
+                self.consume_select(&seed, None);
+            } else {
+                let (ids, _) = self.consume_set_op(&seed, &rest, None);
+                recorded = Some(ids);
+            }
+        }
+        let body_cost = self.next - start;
+        // TiDB inlines a CTE unless it is recursive, `AS MATERIALIZED`, or
+        // referenced more than once (shared CTETableReader).
+        let materialized = cte_materialized(cte, self.ref_count(&cte.name));
+        self.ctes.push(CteColumnId {
+            name: cte.name.clone(),
+            width,
+            body_cost,
+            materialized,
+        });
+        if let Some(ids) = recorded {
+            self.recorded.push((cte.name.clone(), ids));
+        }
+    }
+
+    fn cte_width(&self, cte: &CommonTableExpression) -> usize {
+        if !cte.col_name_list.is_empty() {
+            return cte.col_name_list.len();
+        }
+        self.select_width(&cte.query)
+    }
+
+    fn select_width(&self, select: &SelectStmt) -> usize {
+        if is_star_select(select) {
+            let width: usize = select
+                .join_tables()
+                .into_iter()
+                .map(|table| self.table_width(table))
+                .sum();
+            return width.max(1);
+        }
+        select.fields.len().max(1)
+    }
+
+    fn table_width(&self, table: &TableName) -> usize {
+        if let Some(cte) = self
+            .lookup_cte(table.resolve_name())
+            .or_else(|| self.lookup_cte(&table.name))
+        {
+            return cte.width;
+        }
+        self.is
+            .and_then(|is| is.table_by_name(self.schema_of(table), table.resolve_name()))
+            .map_or(1, |info| info.columns.len())
+    }
+
+    fn schema_of<'b>(&'b self, table: &'b TableName) -> &'b str {
+        table
+            .schema
+            .as_deref()
+            .filter(|schema| !schema.is_empty())
+            .unwrap_or(self.current_db)
+    }
+
+    fn consume_result_set(&mut self, node: &ResultSetNode, self_cte: Option<&str>) -> usize {
+        match node {
+            ResultSetNode::Select(select) => self.consume_select(select, self_cte),
+            ResultSetNode::SetOpr(set) => {
+                if let Some(with) = &set.with {
+                    self.consume_with(with);
+                }
+                self.consume_set_op(&set.first, &set.rest, self_cte).1
+            }
+        }
+    }
+
+    /// One `SELECT` block: `WITH`, FROM, WHERE, GROUP BY / HAVING, select list.
+    fn consume_select(&mut self, select: &SelectStmt, self_cte: Option<&str>) -> usize {
+        if let Some(with) = &select.with {
+            self.consume_with(with);
+        }
+        for table in select.join_tables() {
+            self.consume_table(table, self_cte);
+        }
+        if let Some(selection) = &select.selection {
+            self.consume_expr(selection, self_cte);
+        }
+        for group in &select.group_by {
+            self.consume_expr(group, self_cte);
+        }
+        if let Some(having) = &select.having {
+            self.consume_expr(having, self_cte);
+        }
+        if !is_star_select(select) {
+            for field in &select.fields {
+                self.consume_expr(&field.expr, self_cte);
+            }
+            // Computed select-list expressions get a fresh output column
+            // (`buildProjectionField`); bare columns reuse the table's id.
+            for field in &select.fields {
+                if !matches!(field.expr, ExprNode::Column(_)) {
+                    self.alloc();
+                }
+            }
+        } else {
+            for field in &select.fields {
+                self.consume_expr(&field.expr, self_cte);
+            }
+        }
+        self.select_width(select)
+    }
+
+    fn consume_table(&mut self, table: &TableName, self_cte: Option<&str>) {
+        let name = table.resolve_name();
+        if let Some(cte) = self
+            .lookup_cte(name)
+            .or_else(|| self.lookup_cte(&table.name))
+        {
+            // Recursive self-scan is a `CTETable` (no fresh column ids).
+            let self_scan = self_cte.is_some_and(|cte_name| {
+                cte_name.eq_ignore_ascii_case(name) || cte_name.eq_ignore_ascii_case(&table.name)
+            });
+            if !self_scan {
+                self.next += if cte.materialized {
+                    cte.width
+                } else {
+                    // Inline reference: rebuild the body (+ output column).
+                    cte.body_cost + cte.width
+                };
+            } else {
+                // Recursive `CTETable`: `getResultCTESchema` re-allocates the
+                // CTE result schema for the self scan.
+                self.next += cte.width;
+            }
+            return;
+        }
+        if let Some(info) = self
+            .is
+            .and_then(|is| is.table_by_name(self.schema_of(table), name))
+        {
+            // TableFullScan schema = columns + `_tidb_rowid` unless the table
+            // has an integer clustered primary key.
+            self.next += info.columns.len() + usize::from(!info.pk_is_handle);
+        }
+    }
+
+    fn consume_expr(&mut self, expr: &ExprNode, self_cte: Option<&str>) {
+        match expr {
+            ExprNode::Exists(e) => {
+                self.consume_result_set(&e.query, self_cte);
+            }
+            ExprNode::InSubquery(e) => {
+                self.consume_expr(&e.expr, self_cte);
+                self.consume_result_set(&e.query, self_cte);
+            }
+            ExprNode::ScalarSubquery(e) => {
+                self.consume_result_set(&e.query, self_cte);
+            }
+            ExprNode::QuantifiedCmp(e) => {
+                self.consume_expr(&e.expr, self_cte);
+                self.consume_result_set(&e.query, self_cte);
+            }
+            ExprNode::Binary(b) => {
+                self.consume_expr(&b.left, self_cte);
+                self.consume_expr(&b.right, self_cte);
+            }
+            ExprNode::Unary(u) => self.consume_expr(&u.expr, self_cte),
+            ExprNode::Func(f) => {
+                for arg in &f.args {
+                    self.consume_expr(arg, self_cte);
+                }
+            }
+            ExprNode::Cast(c) => self.consume_expr(&c.expr, self_cte),
+            ExprNode::InList(i) => {
+                self.consume_expr(&i.expr, self_cte);
+                for item in &i.list {
+                    self.consume_expr(item, self_cte);
+                }
+            }
+            ExprNode::Between(b) => {
+                self.consume_expr(&b.expr, self_cte);
+                self.consume_expr(&b.low, self_cte);
+                self.consume_expr(&b.high, self_cte);
+            }
+            ExprNode::Like(l) => {
+                self.consume_expr(&l.expr, self_cte);
+                self.consume_expr(&l.pattern, self_cte);
+            }
+            ExprNode::IsNull(i) => self.consume_expr(&i.expr, self_cte),
+            ExprNode::Case(c) => {
+                if let Some(operand) = &c.operand {
+                    self.consume_expr(operand, self_cte);
+                }
+                for (when, then) in &c.when_then {
+                    self.consume_expr(when, self_cte);
+                    self.consume_expr(then, self_cte);
+                }
+                if let Some(else_expr) = &c.else_expr {
+                    self.consume_expr(else_expr, self_cte);
+                }
+            }
+            ExprNode::Window(w) => {
+                for arg in &w.args {
+                    self.consume_expr(arg, self_cte);
+                }
+            }
+            ExprNode::Value(_) | ExprNode::Column(_) => {}
+        }
+    }
+
+    /// Every arm left to right, then the distinct-group output columns, then the
+    /// outer `UNION ALL` output columns.
+    fn consume_set_op(
+        &mut self,
+        first: &SelectStmt,
+        rest: &[(SetOprType, SelectStmt)],
+        self_cte: Option<&str>,
+    ) -> (SetOpColumnIds, usize) {
+        let arms: Vec<(&SelectStmt, SetOprType)> = std::iter::once((first, SetOprType::UnionAll))
+            .chain(rest.iter().map(|(op, select)| (select, *op)))
+            .collect();
+        for (select, _) in &arms {
+            self.consume_select(select, self_cte);
+        }
+        let width = self.select_width(first);
+        let ops: Vec<SetOprType> = arms.iter().map(|(_, op)| *op).collect();
+        let mut ids = SetOpColumnIds::default();
+        match set_op_groups(&ops) {
+            Some((distinct_len, all_len)) => {
+                if distinct_len >= 2 {
+                    ids.distinct = self.alloc_width(width);
+                    if all_len > 0 {
+                        ids.outer = self.alloc_width(width);
+                    }
+                } else {
+                    ids.outer = self.alloc_width(width);
+                }
+            }
+            // EXCEPT / INTERSECT: the binary fold allocates once per operator.
+            None => {
+                ids.outer = self.alloc_width(width);
+            }
+        }
+        (ids, width)
+    }
+}
+
+thread_local! {
+    /// Statement-wide table reference counts for the plan build in progress
+    /// (TiDB `computeCTEInlineFlag`, see [`with_statement_cte_refs`]).
+    static CTE_REF_COUNTS: std::cell::RefCell<Option<std::collections::HashMap<String, usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TiDB decides CTE inlining per statement (`computeCTEInlineFlag`): a
+/// non-recursive CTE referenced more than once is materialized as a shared
+/// `CTETableReader`. Count table references over the whole statement for the
+/// outermost `build_with_schema` call; nested subquery builds reuse them.
+fn with_statement_cte_refs<T>(stmt: &Statement, f: impl FnOnce() -> T) -> T {
+    let outermost = CTE_REF_COUNTS.with(|cell| cell.borrow().is_none());
+    if outermost {
+        let mut counts = std::collections::HashMap::new();
+        count_statement_table_refs(stmt, &mut counts);
+        CTE_REF_COUNTS.with(|cell| *cell.borrow_mut() = Some(counts));
+    }
+    let out = f();
+    if outermost {
+        CTE_REF_COUNTS.with(|cell| *cell.borrow_mut() = None);
+    }
+    out
+}
+
+/// Whether `select` references the CTE `name` in its FROM (recursive arm
+/// detection for `buildRecursiveCTE` seeding).
+fn select_refs_cte(select: &SelectStmt, name: &str) -> bool {
+    select.join_tables().into_iter().any(|table| {
+        table.name.eq_ignore_ascii_case(name)
+            || table.resolve_name().eq_ignore_ascii_case(name)
+    })
+}
+
+fn cte_ref_count(name: &str) -> Option<usize> {    CTE_REF_COUNTS.with(|cell| {
+        let counts = cell.borrow();
+        counts
+            .as_ref()
+            .and_then(|counts| counts.get(&name.to_ascii_lowercase()).copied())
+    })
+}
+
+fn count_statement_table_refs(stmt: &Statement, counts: &mut std::collections::HashMap<String, usize>) {
+    match stmt {
+        Statement::Select(select) => count_select_table_refs(select, counts),
+        Statement::SetOpr(set) => {
+            if let Some(with) = &set.with {
+                for cte in &with.ctes {
+                    count_select_table_refs(&cte.query, counts);
+                }
+            }
+            count_select_table_refs(&set.first, counts);
+            for (_, select) in &set.rest {
+                count_select_table_refs(select, counts);
+            }
+        }
+        Statement::Explain(explain) => count_statement_table_refs(&explain.stmt, counts),
+        _ => {}
+    }
+}
+
+fn count_select_table_refs(select: &SelectStmt, counts: &mut std::collections::HashMap<String, usize>) {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            count_select_table_refs(&cte.query, counts);
+            for (_, arm) in &cte.set_rest {
+                count_select_table_refs(arm, counts);
+            }
+            if let Some((_, rec)) = &cte.recursive {
+                count_select_table_refs(rec, counts);
+            }
+            for (_, rec) in &cte.recursive_rest {
+                count_select_table_refs(rec, counts);
+            }
+        }
+    }
+    for table in select.join_tables() {
+        // One reference, but count both the written name and the CTE it
+        // resolves to (aliases `FROM cte AS a`); avoid double counting when
+        // the two are identical, else single-reference CTEs look shared.
+        let written = table.name.to_ascii_lowercase();
+        *counts.entry(written.clone()).or_insert(0) += 1;
+        let resolved = table.resolve_name().to_ascii_lowercase();
+        if resolved != written {
+            *counts.entry(resolved).or_insert(0) += 1;
+        }
+    }
+    for field in &select.fields {
+        count_expr_table_refs(&field.expr, counts);
+    }
+    if let Some(selection) = &select.selection {
+        count_expr_table_refs(selection, counts);
+    }
+    for group in &select.group_by {
+        count_expr_table_refs(group, counts);
+    }
+    if let Some(having) = &select.having {
+        count_expr_table_refs(having, counts);
+    }
+}
+
+fn count_expr_table_refs(expr: &ExprNode, counts: &mut std::collections::HashMap<String, usize>) {
+    match expr {
+        ExprNode::Exists(e) => count_result_set_table_refs(&e.query, counts),
+        ExprNode::InSubquery(e) => {
+            count_expr_table_refs(&e.expr, counts);
+            count_result_set_table_refs(&e.query, counts);
+        }
+        ExprNode::ScalarSubquery(e) => count_result_set_table_refs(&e.query, counts),
+        ExprNode::QuantifiedCmp(e) => {
+            count_expr_table_refs(&e.expr, counts);
+            count_result_set_table_refs(&e.query, counts);
+        }
+        ExprNode::Binary(b) => {
+            count_expr_table_refs(&b.left, counts);
+            count_expr_table_refs(&b.right, counts);
+        }
+        ExprNode::Unary(u) => count_expr_table_refs(&u.expr, counts),
+        ExprNode::Func(f) => {
+            for arg in &f.args {
+                count_expr_table_refs(arg, counts);
+            }
+        }
+        ExprNode::Cast(c) => count_expr_table_refs(&c.expr, counts),
+        ExprNode::InList(i) => {
+            count_expr_table_refs(&i.expr, counts);
+            for item in &i.list {
+                count_expr_table_refs(item, counts);
+            }
+        }
+        ExprNode::Between(b) => {
+            count_expr_table_refs(&b.expr, counts);
+            count_expr_table_refs(&b.low, counts);
+            count_expr_table_refs(&b.high, counts);
+        }
+        ExprNode::Like(l) => {
+            count_expr_table_refs(&l.expr, counts);
+            count_expr_table_refs(&l.pattern, counts);
+        }
+        ExprNode::IsNull(i) => count_expr_table_refs(&i.expr, counts),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &c.operand {
+                count_expr_table_refs(operand, counts);
+            }
+            for (when, then) in &c.when_then {
+                count_expr_table_refs(when, counts);
+                count_expr_table_refs(then, counts);
+            }
+            if let Some(else_expr) = &c.else_expr {
+                count_expr_table_refs(else_expr, counts);
+            }
+        }
+        ExprNode::Window(w) => {
+            for arg in &w.args {
+                count_expr_table_refs(arg, counts);
+            }
+        }
+        ExprNode::Value(_) | ExprNode::Column(_) => {}
+    }
+}
+
+fn count_result_set_table_refs(node: &ResultSetNode, counts: &mut std::collections::HashMap<String, usize>) {
+    match node {
+        ResultSetNode::Select(select) => count_select_table_refs(select, counts),
+        ResultSetNode::SetOpr(set) => {
+            count_select_table_refs(&set.first, counts);
+            for (_, select) in &set.rest {
+                count_select_table_refs(select, counts);
+            }
+        }
+    }
+}
+
+/// TiDB CTE materialization: recursive or `AS MATERIALIZED`, or a
+/// non-`NOT MATERIALIZED` CTE referenced more than once.
+fn cte_materialized(cte: &CommonTableExpression, refs: usize) -> bool {
+    if cte.recursive.is_some() || cte.materialize == CteMaterialize::Materialized {
+        return true;
+    }
+    cte.materialize != CteMaterialize::NotMaterialized && refs > 1
+}
+
 /// TiDB TopN ExplainInfo by-items: `select.<table>.<col>` (query-block prefix).
 /// Derived UNION duals use `Column#3:desc` (TiDB plan column id for set-op output).
 /// Join + ORDER BY ordinals use `{db}.{origTbl}.{col}` per output position.
@@ -1891,19 +2648,36 @@ fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
             let base = match (&table, &item.expr) {
                 (_, ExprNode::Column(_)) if from_derived_union => "Column#3".to_string(),
                 (Some(t), ExprNode::Column(col)) => format!("select.{t}.{}", col.name),
-                (_, ExprNode::Value(v))
-                    if matches!(v.datum, Datum::I64(_) | Datum::U64(_))
-                        && !join_labels.is_empty() =>
-                {
+                (_, ExprNode::Value(v)) if matches!(v.datum, Datum::I64(_) | Datum::U64(_)) => {
                     let ord = match v.datum {
                         Datum::I64(n) => n as usize,
                         Datum::U64(n) => n as usize,
                         _ => 0,
                     };
-                    join_labels
-                        .get(ord.saturating_sub(1))
-                        .cloned()
-                        .unwrap_or_else(|| item.expr.restore_string())
+                    if !join_labels.is_empty() {
+                        join_labels
+                            .get(ord.saturating_sub(1))
+                            .cloned()
+                            .unwrap_or_else(|| item.expr.restore_string())
+                    } else {
+                        // `ORDER BY 1` over a base table resolves to the field's
+                        // column label (`cte1.tt2.c1`), not the ordinal.
+                        let from_cte = table.is_some_and(|t| {
+                            select.with.as_ref().is_some_and(|w| w.find(t).is_some())
+                        });
+                        let label = select
+                            .fields
+                            .get(ord.saturating_sub(1))
+                            .and_then(|f| match (&f.expr, table) {
+                                (ExprNode::Column(c), Some(t)) if !from_cte => Some(format!(
+                                    "{}.{t}.{}",
+                                    schema_prefix(current_db),
+                                    c.name
+                                )),
+                                _ => None,
+                            });
+                        label.unwrap_or_else(|| item.expr.restore_string())
+                    }
                 }
                 _ => item.expr.restore_string(),
             };
@@ -2374,12 +3148,10 @@ fn remap_dual_projection_column(plan: PhysicalPlan, col: usize) -> PhysicalPlan 
 
 fn seed_is_union_of_dual(plan: &PhysicalPlan) -> bool {
     match plan {
-        PhysicalPlan::Union { left, right, .. } => {
-            seed_is_dual_projection(left) && seed_is_dual_projection(right)
-                || seed_is_union_of_dual(left) && seed_is_dual_projection(right)
-                || seed_is_dual_projection(left) && seed_is_union_of_dual(right)
-                || seed_is_union_of_dual(left) && seed_is_union_of_dual(right)
+        PhysicalPlan::Union { children, .. } => {
+            children.iter().all(|c| seed_is_dual_projection(c) || seed_is_union_of_dual(c))
         }
+        PhysicalPlan::DistinctUnion { child, .. } => seed_is_union_of_dual(child),
         _ => false,
     }
 }
