@@ -10,9 +10,12 @@ use sealdb_errno::{
 };
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
+use sealdb_parser::ast::expressions::{
+    ColumnNameExpr, ExprNode, InListExpr, ValueExpr,
+};
 use sealdb_parser::ast::{
-    SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprType, Statement, WithClause,
+    ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprType, Statement,
+    WithClause,
 };
 use sealdb_planner::PlanBuilder;
 use sealdb_types::Datum;
@@ -451,9 +454,32 @@ fn run_select(
     txn: &Arc<TxnHandle>,
 ) -> Result<QueryResult> {
     let stmt = Statement::Select(select.clone());
+    run_statement(&stmt, domain, current_db, txn)
+}
+
+/// Run a subquery `ResultSetNode` (SELECT or set operation) to completion.
+pub fn run_result_set(
+    query: &ResultSetNode,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<QueryResult> {
+    let stmt = match query {
+        ResultSetNode::Select(select) => Statement::Select(select.clone()),
+        ResultSetNode::SetOpr(set) => Statement::SetOpr(set.clone()),
+    };
+    run_statement(&stmt, domain, current_db, txn)
+}
+
+fn run_statement(
+    stmt: &Statement,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<QueryResult> {
     let stats = domain.stats();
     let plan = PlanBuilder::new().build_with_schema(
-        &stmt,
+        stmt,
         Some(&domain.infoschema()),
         current_db,
         Some(stats.as_ref()),
@@ -461,12 +487,102 @@ fn run_select(
     )?;
     let exec = ExecutorBuilder::build(
         &plan,
-        &stmt,
+        stmt,
         Arc::clone(domain),
         current_db,
         Arc::clone(txn),
     )?;
     ExecutorBuilder::run(exec)
+}
+
+/// Materialize uncorrelated subqueries in a DML predicate.
+///
+/// `UPDATE`/`DELETE` filters are evaluated row-by-row, which cannot execute a
+/// subquery (TiDB builds an Apply). Before filtering we run each uncorrelated
+/// `IN`/`EXISTS`/scalar subquery once and rewrite it into a row-local form.
+/// Correlated subqueries (unknown outer column) are left untouched.
+pub fn pre_evaluate_dml_predicate(
+    expr: &ExprNode,
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<ExprNode> {
+    match expr {
+        ExprNode::Binary(b) => {
+            let mut b = b.clone();
+            b.left = Box::new(pre_evaluate_dml_predicate(
+                &b.left, domain, current_db, txn,
+            )?);
+            b.right = Box::new(pre_evaluate_dml_predicate(
+                &b.right, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::Binary(b))
+        }
+        ExprNode::Unary(u) => {
+            let mut u = u.clone();
+            u.expr = Box::new(pre_evaluate_dml_predicate(
+                &u.expr, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::Unary(u))
+        }
+        ExprNode::InSubquery(i) => {
+            let result = match run_result_set(&i.query, domain, current_db, txn) {
+                Ok(result) => result,
+                // Unknown outer column: correlated, leave for the Apply path.
+                Err(e) if e.code == ERR_BAD_FIELD => return Ok(expr.clone()),
+                Err(e) => return Err(e),
+            };
+            let list = result
+                .rows
+                .into_iter()
+                .map(|mut row| {
+                    ExprNode::Value(ValueExpr {
+                        datum: if row.is_empty() {
+                            Datum::Null
+                        } else {
+                            row.swap_remove(0)
+                        },
+                    })
+                })
+                .collect();
+            Ok(ExprNode::InList(InListExpr {
+                expr: i.expr.clone(),
+                not: i.not,
+                list,
+            }))
+        }
+        ExprNode::Exists(e) => {
+            let result = match run_result_set(&e.query, domain, current_db, txn) {
+                Ok(result) => result,
+                Err(e) if e.code == ERR_BAD_FIELD => return Ok(expr.clone()),
+                Err(e) => return Err(e),
+            };
+            let found = !result.rows.is_empty();
+            let datum = Datum::I64(i64::from(found != e.not));
+            Ok(ExprNode::Value(ValueExpr { datum }))
+        }
+        ExprNode::ScalarSubquery(s) => {
+            let result = match run_result_set(&s.query, domain, current_db, txn) {
+                Ok(result) => result,
+                Err(e) if e.code == ERR_BAD_FIELD => return Ok(expr.clone()),
+                Err(e) => return Err(e),
+            };
+            let datum = result
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|mut row| {
+                    if row.is_empty() {
+                        None
+                    } else {
+                        Some(row.swap_remove(0))
+                    }
+                })
+                .unwrap_or(Datum::Null);
+            Ok(ExprNode::Value(ValueExpr { datum }))
+        }
+        _ => Ok(expr.clone()),
+    }
 }
 
 fn collect_rows(exec: &mut Box<dyn Executor>) -> Result<Vec<Vec<Datum>>> {

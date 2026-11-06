@@ -2,6 +2,7 @@
 // pessimistic DELETE reads latest and takes exclusive locks.
 // Completeness wave / not this feature: n-table DELETE, comma FROM without USING,
 // RETURNING (not in TiDB v8.5.8 / MySQL 8.0), MySQL-protocol affected-row counts.
+use crate::cte::pre_evaluate_dml_predicate;
 use crate::index::delete_index_keys;
 use crate::internal::exec::Executor;
 use crate::join::hash_join_v1::hash_join_pairs;
@@ -71,9 +72,18 @@ impl Executor for DeleteExec {
         let lock = dml_row_lock(&self.txn)?;
         let physical = info.prune_partitions(self.stmt.selection.as_ref());
         let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
+        let filter = match &self.stmt.selection {
+            Some(expr) => Some(pre_evaluate_dml_predicate(
+                expr,
+                &self.domain,
+                &self.current_db,
+                &self.txn,
+            )?),
+            None => None,
+        };
         let mut matched = Vec::new();
         for scanned in rows {
-            if let Some(filter) = &self.stmt.selection
+            if let Some(filter) = &filter
                 && !eval_filter(filter, &names, &scanned.values)?
             {
                 continue;

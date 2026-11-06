@@ -168,46 +168,82 @@ impl WithClause {
             .collect()
     }
 
+    /// CTE scope visible inside `name`'s body: the body's own nested `WITH`
+    /// first (shadows siblings), then preceding sibling CTEs.
+    pub fn body_scope(&self, name: &str) -> Option<WithClause> {
+        let cte = self.find(name)?;
+        let mut scope = cte.query.with.clone().unwrap_or(WithClause {
+            is_recursive: self.is_recursive,
+            ctes: Vec::new(),
+        });
+        scope.is_recursive |= self.is_recursive;
+        for sibling in self.preceding(name) {
+            if scope.find(&sibling.name).is_none() {
+                scope.ctes.push(sibling);
+            }
+        }
+        if scope.ctes.is_empty() {
+            None
+        } else {
+            Some(scope)
+        }
+    }
+
     pub fn seed_select(&self, name: &str) -> Result<SelectStmt> {
         let cte = self
             .find(name)
             .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
         let mut select = (*cte.query).clone();
         // Nested WITH on the CTE body stays scoped to the seed (may shadow
-        // `name`). Otherwise attach preceding sibling CTEs.
-        if select.with.is_some() {
-            return Ok(select);
+        // `name`); preceding sibling CTEs are appended unless shadowed.
+        if let Some(scope) = self.body_scope(name) {
+            select.with = Some(scope);
         }
-        let preceding = self.preceding(name);
-        if !preceding.is_empty() {
-            select.with = Some(WithClause {
-                is_recursive: false,
-                ctes: preceding,
-            });
-        }
+        // Nested subqueries see the same CTE scope (`EXISTS (… FROM cte1 …)`).
+        crate::ast::cte_scope::inherit_cte_scope_in_select(&mut select);
         Ok(select)
     }
 
-    /// Set-operator arms of a non-recursive CTE body, with preceding CTEs attached.
+    /// Set-operator arms of a CTE body, with the body's nested WITH and
+    /// preceding sibling CTEs attached (TiDB scoping: `WITH RECURSIVE cte2 …)
+    /// SELECT … UNION SELECT … FROM cte2`).
     pub fn set_rest(&self, name: &str) -> Result<Vec<(SetOprType, SelectStmt)>> {
         let cte = self
             .find(name)
             .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
-        let preceding = self.preceding(name);
+        let scope = self.body_scope(name);
         Ok(cte
             .set_rest
             .iter()
             .map(|(op, select)| {
                 let mut select = select.clone();
-                if select.with.is_none() && !preceding.is_empty() {
-                    select.with = Some(WithClause {
-                        is_recursive: false,
-                        ctes: preceding.clone(),
-                    });
+                if select.with.is_none()
+                    && let Some(scope) = &scope
+                {
+                    select.with = Some(scope.clone());
                 }
+                crate::ast::cte_scope::inherit_cte_scope_in_select(&mut select);
                 (*op, select)
             })
             .collect())
+    }
+
+    /// Recursive `UNION` arm of `name` with the body scope attached.
+    pub fn recursive_arm(&self, name: &str) -> Result<Option<(SetOprType, SelectStmt)>> {
+        let cte = self
+            .find(name)
+            .ok_or_else(|| Error::unsupported(format!("unknown CTE {name}")))?;
+        let Some((op, rec)) = cte.recursive.clone() else {
+            return Ok(None);
+        };
+        let mut rec = rec;
+        if rec.with.is_none()
+            && let Some(scope) = self.body_scope(name)
+        {
+            rec.with = Some(scope);
+        }
+        crate::ast::cte_scope::inherit_cte_scope_in_select(&mut rec);
+        Ok(Some((op, rec)))
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {

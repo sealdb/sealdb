@@ -226,6 +226,8 @@ impl Executor for LimitExec {
 /// Dedup child rows by named columns (SemiJoinRewriter inner aggregation).
 pub struct DistinctExec {
     keys: Vec<String>,
+    fields: Vec<ExprNode>,
+    names: Vec<String>,
     child: Box<dyn Executor>,
     schema: Vec<String>,
     rows: Vec<Vec<sealdb_types::Datum>>,
@@ -233,9 +235,16 @@ pub struct DistinctExec {
 }
 
 impl DistinctExec {
-    pub fn new(keys: Vec<String>, child: Box<dyn Executor>) -> Self {
+    pub fn new(
+        keys: Vec<String>,
+        fields: Vec<ExprNode>,
+        names: Vec<String>,
+        child: Box<dyn Executor>,
+    ) -> Self {
         Self {
             keys,
+            fields,
+            names,
             child,
             schema: Vec::new(),
             rows: Vec::new(),
@@ -260,17 +269,34 @@ impl Executor for DistinctExec {
                 })
             })
             .collect();
+        // `SELECT DISTINCT a, b` outputs only the select list (TiDB HashAgg
+        // group keys), not the whole child row.
+        let project = !self.fields.is_empty() && !self.names.is_empty();
+        if project {
+            self.schema = self.names.clone();
+        }
         let mut seen = std::collections::HashSet::new();
         while let Some(chunk) = self.child.next()? {
+            let child_schema = self.child.schema().to_vec();
             for i in 0..chunk.num_rows() {
                 let row = chunk.get_row(i);
-                if idxs.is_empty() {
-                    self.rows.push(row);
-                    continue;
-                }
-                let key = row_key(&row, &idxs);
+                let out = if project {
+                    self.fields
+                        .iter()
+                        .map(|expr| sealdb_expression::eval_expr_with_row(expr, &child_schema, &row))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    row.clone()
+                };
+                let key = if project {
+                    row_key(&out, &(0..out.len()).collect::<Vec<_>>())
+                } else if idxs.is_empty() {
+                    row_key(&out, &(0..out.len()).collect::<Vec<_>>())
+                } else {
+                    row_key(&out, &idxs)
+                };
                 if seen.insert(key) {
-                    self.rows.push(row);
+                    self.rows.push(out);
                 }
             }
         }

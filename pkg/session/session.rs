@@ -9,7 +9,7 @@ use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_parser::ast::{
     CommonTableExpression, CteMaterialize, InsertStmt, IsolationLevel as AstIsolation,
-    PrivilegeType, SelectStmt, SetVarScope, Statement, UserIdentity,
+    PrivilegeType, SelectStmt, SetVarScope, Statement, UserIdentity, WithClause,
 };
 use sealdb_parser::charset::Collation;
 use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
@@ -570,6 +570,7 @@ impl Session {
         // Apply CREATE BINDING rewrite before plan build (MVB: substitute bind SQL).
         let rebound = self.apply_sql_binding(stmt)?;
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
+        inherit_cte_scope(&mut expanded);
         expand_views(&mut expanded, &is, &current_db)?;
         if let Statement::LoadData(load) = &expanded {
             let insert = load_data_to_insert(load, &is, &current_db)?;
@@ -2249,6 +2250,150 @@ fn is_write_stmt(stmt: &Statement) -> bool {
             | Statement::LockTables(_)
             | Statement::CleanupTableLock(_)
     )
+}
+
+/// TiDB resolves a statement-level `WITH` inside every subquery of that
+/// statement (`… WHERE EXISTS (SELECT * FROM cte1 …)` where `cte1` is the
+/// outer CTE). Planning reads only `select.with`, so push the visible scope
+/// into nested SELECTs. Inner CTEs keep precedence for shadowed names.
+fn inherit_cte_scope(stmt: &mut Statement) {
+    match stmt {
+        Statement::Select(select) => {
+            sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(select);
+        }
+        Statement::SetOpr(set) => {
+            let scope = set.with.clone();
+            if let Some(outer) = scope.as_ref() {
+                sealdb_parser::ast::cte_scope::merge_cte_scope(&mut set.first, outer);
+            }
+            sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(&mut set.first);
+            for (_, select) in &mut set.rest {
+                if let Some(outer) = scope.as_ref() {
+                    sealdb_parser::ast::cte_scope::merge_cte_scope(select, outer);
+                }
+                sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(select);
+            }
+        }
+        Statement::Explain(explain) => inherit_cte_scope(&mut explain.stmt),
+        Statement::Insert(insert) => {
+            if let Some(select) = insert.select.as_mut() {
+                if let Some(outer) = insert.with.as_ref() {
+                    sealdb_parser::ast::cte_scope::merge_cte_scope(select, outer);
+                }
+                sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(select);
+            }
+        }
+        Statement::Update(update) => {
+            let scope = update.with.clone();
+            if let Some(sel) = update.selection.as_mut() {
+                inherit_cte_in_expr(sel, scope.as_ref());
+            }
+            if let Some(join) = update.join.as_mut() {
+                inherit_cte_in_expr(&mut join.on, scope.as_ref());
+            }
+        }
+        Statement::Delete(delete) => {
+            let scope = delete.with.clone();
+            if let Some(sel) = delete.selection.as_mut() {
+                inherit_cte_in_expr(sel, scope.as_ref());
+            }
+            if let Some(join) = delete.join.as_mut() {
+                inherit_cte_in_expr(&mut join.on, scope.as_ref());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inherit_cte_in_expr(expr: &mut ExprNode, scope: Option<&WithClause>) {
+    let Some(scope) = scope else {
+        return;
+    };
+    match expr {
+        ExprNode::InSubquery(s) => {
+            inherit_cte_in_expr(&mut s.expr, Some(scope));
+            inherit_cte_in_result_set(&mut s.query, scope);
+        }
+        ExprNode::ScalarSubquery(s) => inherit_cte_in_result_set(&mut s.query, scope),
+        ExprNode::Exists(e) => inherit_cte_in_result_set(&mut e.query, scope),
+        ExprNode::QuantifiedCmp(q) => {
+            inherit_cte_in_expr(&mut q.expr, Some(scope));
+            inherit_cte_in_result_set(&mut q.query, scope);
+        }
+        ExprNode::Binary(b) => {
+            inherit_cte_in_expr(&mut b.left, Some(scope));
+            inherit_cte_in_expr(&mut b.right, Some(scope));
+        }
+        ExprNode::Unary(u) => inherit_cte_in_expr(&mut u.expr, Some(scope)),
+        ExprNode::Func(f) => {
+            for arg in &mut f.args {
+                inherit_cte_in_expr(arg, Some(scope));
+            }
+        }
+        ExprNode::Cast(c) => inherit_cte_in_expr(&mut c.expr, Some(scope)),
+        ExprNode::InList(i) => {
+            inherit_cte_in_expr(&mut i.expr, Some(scope));
+            for item in &mut i.list {
+                inherit_cte_in_expr(item, Some(scope));
+            }
+        }
+        ExprNode::Between(b) => {
+            inherit_cte_in_expr(&mut b.expr, Some(scope));
+            inherit_cte_in_expr(&mut b.low, Some(scope));
+            inherit_cte_in_expr(&mut b.high, Some(scope));
+        }
+        ExprNode::Like(l) => {
+            inherit_cte_in_expr(&mut l.expr, Some(scope));
+            inherit_cte_in_expr(&mut l.pattern, Some(scope));
+        }
+        ExprNode::IsNull(i) => inherit_cte_in_expr(&mut i.expr, Some(scope)),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &mut c.operand {
+                inherit_cte_in_expr(operand, Some(scope));
+            }
+            for (when, then) in &mut c.when_then {
+                inherit_cte_in_expr(when, Some(scope));
+                inherit_cte_in_expr(then, Some(scope));
+            }
+            if let Some(branch) = &mut c.else_expr {
+                inherit_cte_in_expr(branch, Some(scope));
+            }
+        }
+        ExprNode::Window(w) => {
+            for arg in &mut w.args {
+                inherit_cte_in_expr(arg, Some(scope));
+            }
+        }
+        ExprNode::Column(_) | ExprNode::Value(_) => {}
+    }
+}
+
+fn inherit_cte_in_result_set(query: &mut sealdb_parser::ast::ResultSetNode, scope: &WithClause) {
+    match query {
+        sealdb_parser::ast::ResultSetNode::Select(select) => {
+            sealdb_parser::ast::cte_scope::merge_cte_scope(select, scope);
+            sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(select);
+        }
+        sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
+            let merged = match set.with.take() {
+                Some(mut inner) => {
+                    let mut outer = scope.clone();
+                    outer.ctes.extend(inner.ctes.drain(..));
+                    outer.is_recursive |= inner.is_recursive;
+                    outer
+                }
+                None => scope.clone(),
+            };
+            set.with = Some(merged);
+            let merged = set.with.clone().unwrap_or_else(|| scope.clone());
+            sealdb_parser::ast::cte_scope::merge_cte_scope(&mut set.first, &merged);
+            sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(&mut set.first);
+            for (_, select) in &mut set.rest {
+                sealdb_parser::ast::cte_scope::merge_cte_scope(select, &merged);
+                sealdb_parser::ast::cte_scope::inherit_cte_scope_in_select(select);
+            }
+        }
+    }
 }
 
 /// Expand VIEW references into CTEs so planner/executor reuse derived-table paths.

@@ -154,8 +154,15 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             limit,
             offset,
         },
-        PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
+        PhysicalPlan::Distinct {
             keys,
+            fields,
+            names,
+            child,
+        } => PhysicalPlan::Distinct {
+            keys,
+            fields,
+            names,
             child: Box::new(rewrite_semi_join(*child)),
         },
         PhysicalPlan::Explain {
@@ -1133,6 +1140,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
                     left: Box::new(left),
                     right: Box::new(PhysicalPlan::Distinct {
                         keys: vec![key],
+                        fields: Vec::new(),
+                        names: Vec::new(),
                         child: Box::new(right),
                     }),
                     left_table,
@@ -1263,8 +1272,15 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             limit,
             offset,
         },
-        PhysicalPlan::Distinct { keys, child } => PhysicalPlan::Distinct {
+        PhysicalPlan::Distinct {
             keys,
+            fields,
+            names,
+            child,
+        } => PhysicalPlan::Distinct {
+            keys,
+            fields,
+            names,
             child: Box::new(rewrite_semi_join_agg(*child)),
         },
         PhysicalPlan::Explain {
