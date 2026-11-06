@@ -1066,7 +1066,7 @@
     {
       "name": "executor/window",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/window.test",
       "result": "r/executor/window.result",
       "has_result": true,
@@ -1696,7 +1696,7 @@
     {
       "name": "naaj",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/naaj.test",
       "result": "r/naaj.result",
       "has_result": true,
