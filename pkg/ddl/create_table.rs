@@ -6,7 +6,7 @@ use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt, TableName};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
 use sealdb_types::field_type::{
-    FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_FLOAT, TYPE_LONG,
+    FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_FLOAT, TYPE_JSON, TYPE_LONG,
     TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY, TYPE_VAR_STRING,
 };
 
@@ -313,6 +313,13 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
         },
         "BLOB" => FieldType {
             tp: TYPE_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        // JSON is stored as its serialized text for now; comparisons still use
+        // the string path until the binary JSON codec lands.
+        "JSON" => FieldType {
+            tp: TYPE_JSON,
             flen: -1,
             ..string_ft()
         },

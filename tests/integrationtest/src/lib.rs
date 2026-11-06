@@ -105,6 +105,10 @@ pub struct Step {
     pub show_warnings: bool,
     /// TiDB `--echo …` — emit this line into the result (no SQL execution).
     pub echo: Option<String>,
+    /// TiDB `--disable_result_log`: echo the statement but suppress its rows.
+    pub log_result: bool,
+    /// TiDB `--replace_regex /pat/repl/` applied to this statement's result.
+    pub replace_regex: Vec<(regex::Regex, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,7 +123,8 @@ pub struct Suite {
     pub skip_tikv: bool,
     /// Set when `t/*.test` uses directives SealDB cannot parse yet.
     pub load_error: Option<String>,
-}#[derive(Debug, Deserialize)]
+}
+#[derive(Debug, Deserialize)]
 struct ManifestFile {
     suites: Vec<ManifestSuite>,
 }
@@ -199,6 +204,8 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
     let mut expected_error = None;
     let mut sorted = false;
     let mut warnings_enabled = false;
+    let mut result_log = true;
+    let mut replace_regex: Vec<(regex::Regex, String)> = Vec::new();
     for line in src.lines() {
         let trimmed = line.trim();
         // TiDB mysql-tester drops blank lines inside multi-line statements, so
@@ -219,6 +226,18 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 sorted = true;
                 continue;
             }
+            if rest.eq_ignore_ascii_case("disable_result_log") {
+                result_log = false;
+                continue;
+            }
+            if rest.eq_ignore_ascii_case("enable_result_log") {
+                result_log = true;
+                continue;
+            }
+            if let Some(spec) = strip_prefix_ci(rest, "replace_regex") {
+                replace_regex = parse_replace_regex(spec.trim())?;
+                continue;
+            }
             if rest.eq_ignore_ascii_case("enable_warnings") {
                 warnings_enabled = true;
                 continue;
@@ -234,6 +253,8 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     sorted: false,
                     show_warnings: false,
                     echo: Some(msg.trim_start().to_string()),
+                    log_result: true,
+                    replace_regex: Vec::new(),
                 });
                 continue;
             }
@@ -261,6 +282,8 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 sorted,
                 show_warnings: warnings_enabled,
                 echo: None,
+                log_result: result_log,
+                replace_regex: std::mem::take(&mut replace_regex),
             });
             buf.clear();
             expected_error = None;
@@ -274,6 +297,64 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
         ));
     }
     Ok(steps)
+}
+
+/// Parse `--replace_regex /pat/repl/ [/pat/repl/ …]` into (regex, replacement) pairs.
+fn parse_replace_regex(spec: &str) -> Result<Vec<(regex::Regex, String)>> {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] != '/' {
+            return Err(Error::unsupported(format!(
+                "test directive -- replace_regex {spec}"
+            )));
+        }
+        i += 1;
+        let mut pattern = String::new();
+        while i < chars.len() && chars[i] != '/' {
+            if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                pattern.push('/');
+                i += 2;
+                continue;
+            }
+            pattern.push(chars[i]);
+            i += 1;
+        }
+        if i >= chars.len() {
+            return Err(Error::unsupported(format!(
+                "test directive -- replace_regex {spec}"
+            )));
+        }
+        i += 1;
+        let mut replacement = String::new();
+        while i < chars.len() && chars[i] != '/' {
+            if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                replacement.push('/');
+                i += 2;
+                continue;
+            }
+            replacement.push(chars[i]);
+            i += 1;
+        }
+        if i < chars.len() {
+            i += 1;
+        }
+        let re = regex::Regex::new(&pattern).map_err(|e| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("replace_regex pattern {pattern:?}: {e}"),
+            )
+        })?;
+        out.push((re, replacement));
+    }
+    Ok(out)
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -461,6 +542,9 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
             ),
         )),
         (Ok(qr), None) => {
+            if !step.log_result {
+                return Ok(step.sql.clone());
+            }
             let mut lines = vec![step.sql.clone()];
             if !qr.columns.is_empty() {
                 lines.push(qr.columns.join("\t"));
@@ -478,7 +562,11 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                     lines.push(format!("Warning\t{code}\t{msg}"));
                 }
             }
-            Ok(lines.join("\n"))
+            let mut out = lines.join("\n");
+            for (re, replacement) in &step.replace_regex {
+                out = re.replace_all(&out, replacement.as_str()).into_owned();
+            }
+            Ok(out)
         }
         (Err(err), _) => Ok(format!(
             "{}\nError {} ({}): {}",

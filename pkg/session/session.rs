@@ -537,6 +537,15 @@ impl Session {
                 }
             }
         }
+        // TiDB: TRUNCATE TABLE is DDL and implicitly commits the open
+        // transaction before clearing rows (it cannot be rolled back).
+        if matches!(stmt, Statement::TruncateTable(_))
+            && self.txn.lock().expect("session txn lock").is_explicit()
+        {
+            self.apply_pending_schema(true)?;
+            self.txn.lock().expect("session txn lock").commit()?;
+            self.domain.mdl_unlock_session(self.session_id);
+        }
         let current_db = self
             .current_db
             .lock()
