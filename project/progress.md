@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（EXPLAIN 树形续列统一；green 11 套件 Mem+TiKV 复验通过）  
+> 最后更新：2026-11-06（executor/cte green；green 13 套件 Mem+TiKV 复验通过）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
-| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/union_scan` / `index_join` / `explain_union_scan` green |
+| R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
@@ -127,6 +127,19 @@
 | 覆盖索引纯投影 | 无谓词 `select c` 走 IndexReader | `planbuilder` plain projection covering index 规则 | `select c from t` → IndexFullScan（`select *`/非覆盖列仍 TableReader） |
 | 非覆盖范围扫描 | 非覆盖 range 走 TableFullScan | range 分支按 `select_covers_index` 决定 TableReader | `select * from t where c > 3` 与 `use index(c)` 覆写均对齐 |
 | suite green | Gate A+B | manifest `green` | `executor/union_scan` Mem=1 / TiKV=1 PASS；green 11→12 双端复验 |
+
+### 2.0f R2 `executor/cte`（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 多递归臂 CTE | `buildRecursiveCTE` 按首个自引用臂切分 seed / recursive | `CommonTableExpression.recursive_rest`；`recursive_arms()`；`iterate_recursive` 逐臂求并 | `select 1 union all select 2 union all select c1+1 …` 结果对齐 |
+| `cte_max_recursion_depth` | 种子算第 1 次迭代；超限报 3636 | session 变量 + `iterate_recursive` 深度检查 | `set @@cte_max_recursion_depth=-1/0/1` 边界一致 |
+| UNION 臂 LIMIT | 未加括号的分支 LIMIT 非法 | `reject_union_arm_limit` 返回 1221 | `… limit 1 offset 1 union …` → Error 1221 |
+| SELECT 除零 | SELECT 警告 + NULL；严格 DML/DDL 报 1365 | `DivByZeroMode`（Warn/Error） | `select 1/0` / `insert … 1/0` 分流 |
+| CTE 体 LIMIT 只应用一次 | `computeSeedPart` 先按 limit+offset 截断种子 | `lower_cte` 剥离 seed LIMIT；`iterate_recursive` 截断 seed | `cte1 AS (… limit 2 offset 1)` 不再丢行；`limit 0` 不触发递归深度错误 |
+| 相关标量子查询 + 同名 CTE | `cte1.c1` 在 `FROM cte1 dt1` 内指外层 | `apply.rs` 自引用 CTE 输出列先入 inner scope；别名隐藏 CTE 名 | `where cte1.c1 = (select dt1.c1 … where dt1.c1 = cte1.c1)` 返回 2,3 |
+| CREATE VIEW 体含 CTE | 视图列由 CTE 输出推导 | `columns_from_select` 识别 CTE scope 后取列名/类型 | `create view v as with tt as (…) select * from tt` 通过 |
+| suite green | Gate A+B | manifest `green` | `executor/cte` Mem=1 / TiKV=1 PASS；green 12→13 双端复验 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

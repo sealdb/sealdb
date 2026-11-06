@@ -14,8 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "in_progress": 55,
-      "pending": 189,
+      "in_progress": 41,
+      "green": 13,
+      "pending": 190,
       "deferred": 2,
       "local": 8
     },
@@ -605,7 +606,7 @@
     {
       "name": "executor/cte",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/cte.test",
       "result": "r/executor/cte.result",
       "has_result": true,

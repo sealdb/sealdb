@@ -5,9 +5,10 @@ use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_UNSUPPORTED, ERR_VIEW_WRONG_LIST,
-    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
+    ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_DUP_FIELDNAME, ERR_UNSUPPORTED,
+    ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
+use std::sync::atomic::{AtomicI64, Ordering};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::{
@@ -23,6 +24,19 @@ use sealdb_util::chunk::Chunk;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// TiDB session var `cte_max_recursion_depth` (default 1000). Stored process-wide
+/// like `tidb_window_concurrency`; the itest runner executes suites serially.
+static CTE_MAX_RECURSION_DEPTH: AtomicI64 = AtomicI64::new(1000);
+
+pub fn set_cte_max_recursion_depth(depth: i64) {
+    CTE_MAX_RECURSION_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+pub fn cte_max_recursion_depth() -> i64 {
+    CTE_MAX_RECURSION_DEPTH.load(Ordering::Relaxed)
+}
+
 
 type CteWorking = (Vec<String>, Vec<Vec<Datum>>);
 
@@ -171,15 +185,13 @@ fn with_working_cte<T>(
     out
 }
 
-const MAX_RECURSION: usize = 1000;
-
 /// Materializes a `WITH` query; recursive CTEs iterate `recursive` against
 /// a TableReader working set published under `name`. Shared storage reuses
 /// one materialization per statement (TiDB `CTETableReader`).
 pub struct CTEExec {
     columns: Vec<String>,
     name: String,
-    recursive: Option<(SetOprType, SelectStmt)>,
+    recursive: Vec<(SetOprType, SelectStmt)>,
     seed: Box<dyn Executor>,
     domain: Arc<Domain>,
     current_db: String,
@@ -201,7 +213,7 @@ impl CTEExec {
     pub fn new(
         columns: Vec<String>,
         name: String,
-        recursive: Option<(SetOprType, SelectStmt)>,
+        recursive: Vec<(SetOprType, SelectStmt)>,
         seed: Box<dyn Executor>,
         domain: Arc<Domain>,
         current_db: impl Into<String>,
@@ -266,26 +278,27 @@ impl Executor for CTEExec {
         // TiDB/MySQL: derived-table / CTE output names must be unique (errno 1060),
         // including after `SELECT *` expands join schemas with overlapping names.
         check_duplicate_field_names(&self.schema)?;
-        if let Some((op, rec)) = self.recursive.clone() {
+        if !self.recursive.is_empty() {
             // TiDB: same-name nested WITH keeps recursive names as seed output;
             // outer col_name_list refs in the recursive arm → errno 1054.
             if self.shadow_same_name {
-                if let Some(bad) =
-                    unknown_outer_col_in_recursive(&rec, &self.schema, &self.columns)
-                {
-                    let _ = self.seed.close();
-                    return Err(Error::new(
-                        ERR_BAD_FIELD,
-                        format!("Unknown column '{bad}' in 'where clause'"),
-                    ));
+                for (_, rec) in &self.recursive {
+                    if let Some(bad) =
+                        unknown_outer_col_in_recursive(rec, &self.schema, &self.columns)
+                    {
+                        let _ = self.seed.close();
+                        return Err(Error::new(
+                            ERR_BAD_FIELD,
+                            format!("Unknown column '{bad}' in 'where clause'"),
+                        ));
+                    }
                 }
             }
             self.rows = iterate_recursive(
                 &self.name,
                 self.schema.clone(),
                 std::mem::take(&mut self.rows),
-                op,
-                rec,
+                &self.recursive,
                 &self.domain,
                 &self.current_db,
                 &self.txn,
@@ -330,14 +343,13 @@ impl Executor for CTEExec {
 }
 
 /// Expand the recursive UNION / UNION ALL arm against the working set until
-/// a step produces no new rows or `MAX_RECURSION` is hit.
+/// a step produces no new rows or the recursion depth limit is hit.
 #[allow(clippy::too_many_arguments)]
 fn iterate_recursive(
     name: &str,
     schema: Vec<String>,
     seed: Vec<Vec<Datum>>,
-    op: SetOprType,
-    rec: SelectStmt,
+    arms: &[(SetOprType, SelectStmt)],
     domain: &Arc<Domain>,
     current_db: &str,
     txn: &Arc<TxnHandle>,
@@ -345,15 +357,17 @@ fn iterate_recursive(
     offset: Option<u64>,
 ) -> Result<Vec<Vec<Datum>>> {
     // TiDB rejects ORDER BY / LIMIT / DISTINCT in the recursive arm.
-    if rec.limit.is_some() || !rec.order_by.is_empty() || rec.distinct {
-        return Err(Error::new(
-            ERR_UNSUPPORTED,
-            "This version of TiDB doesn't yet support 'ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression'",
-        ));
+    for (_, rec) in arms {
+        if rec.limit.is_some() || !rec.order_by.is_empty() || rec.distinct {
+            return Err(Error::new(
+                ERR_UNSUPPORTED,
+                "This version of TiDB doesn't yet support 'ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression'",
+            ));
+        }
     }
-    let distinct = op.is_distinct();
+    let distinct = arms[0].0.is_distinct();
     // UNION (distinct) also collapses duplicate seed rows (TiDB / MySQL).
-    let (mut all, mut seen) = if distinct {
+    let (mut all, _seen) = if distinct {
         let mut uniq = Vec::new();
         let mut seen = HashSet::new();
         for row in seed {
@@ -366,57 +380,90 @@ fn iterate_recursive(
         let seen: HashSet<Vec<String>> = seed.iter().map(|row| row_key(row)).collect();
         (seed, seen)
     };
-    // Outer CTE LIMIT applies to the whole result (seed + recursive).
-    if let Some(lim) = limit {
-        let need = lim.saturating_add(offset.unwrap_or(0)) as usize;
-        if all.len() >= need {
-            return Ok(apply_cte_limit(all, limit, offset));
-        }
+    // Outer CTE LIMIT applies to the whole result (seed + recursive). TiDB
+    // `computeSeedPart` stops reading the seed once it reaches limit + offset
+    // rows, so a `limit 0` body never runs the recursive part at all.
+    let limit_end = limit.map(|lim| lim.saturating_add(offset.unwrap_or(0)) as usize);
+    if let Some(end) = limit_end {
+        all.truncate(end);
     }
+    let mut seen: HashSet<Vec<String>> = all.iter().map(|row| row_key(row)).collect();
+    let limit_done = |rows: &Vec<Vec<Datum>>| limit_end.is_some_and(|end| rows.len() >= end);
     let mut working = all.clone();
-    // TiDB/MySQL: recursive arm that never reads this CTE runs once (not forever).
-    let self_ref = select_refs_table(&rec, name);
-    for iter in 0..=MAX_RECURSION {
-        if working.is_empty() {
-            break;
-        }
-        if iter == MAX_RECURSION {
-            return Err(Error::unsupported("recursive CTE exceeded max recursion"));
-        }
-        let next = with_working_cte(name, schema.clone(), working.clone(), || {
-            run_select(&rec, domain, current_db, txn)
-        })?;
-        if let Some(row) = next.rows.first() {
-            if row.len() != schema.len() {
-                return Err(Error::new(
-                    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-                    "The used SELECT statements have a different number of columns",
-                ));
-            }
-        }
+    if working.is_empty() {
+        return Ok(apply_cte_limit(all, limit, offset));
+    }
+    // TiDB/MySQL: a recursive arm that never reads this CTE runs once (the
+    // planner turns it into a regular child and no depth limit applies).
+    let self_ref = arms
+        .iter()
+        .any(|(_, rec)| select_refs_table(rec, name));
+    // TiDB counts the seed as iteration 1 (`computeSeedPart` sets curIter=1) and
+    // rejects starting an iteration whose number exceeds @@cte_max_recursion_depth.
+    // The depth check runs before `limitDone` (`computeRecursivePart`).
+    let max_depth = if self_ref {
+        cte_max_recursion_depth()
+    } else {
+        i64::MAX
+    };
+    let mut cur_iter: i64 = 1;
+    if cur_iter > max_depth {
+        return Err(cte_max_depth_error(cur_iter));
+    }
+    if limit_done(&all) {
+        return Ok(apply_cte_limit(all, limit, offset));
+    }
+    loop {
         let mut step = Vec::new();
-        for row in next.rows {
-            if distinct && !seen.insert(row_key(&row)) {
-                continue;
+        for (arm_op, rec) in arms {
+            let next = with_working_cte(name, schema.clone(), working.clone(), || {
+                run_select(rec, domain, current_db, txn)
+            })?;
+            if let Some(row) = next.rows.first() {
+                if row.len() != schema.len() {
+                    return Err(Error::new(
+                        ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                        "The used SELECT statements have a different number of columns",
+                    ));
+                }
             }
-            step.push(row);
+            // `UNION` between recursive arms dedupes those arms' rows.
+            let dedupe = distinct || arm_op.is_distinct();
+            for row in next.rows {
+                if dedupe && !seen.insert(row_key(&row)) {
+                    continue;
+                }
+                step.push(row);
+            }
         }
         if step.is_empty() {
+            // No rows this round: stop once the outer LIMIT is satisfied, or when
+            // the working set is exhausted (TiDB `setupTblsForNewIteration`).
             break;
         }
         all.extend(step.clone());
-        if let Some(lim) = limit {
-            let need = lim.saturating_add(offset.unwrap_or(0)) as usize;
-            if all.len() >= need {
-                return Ok(apply_cte_limit(all, limit, offset));
-            }
+        if limit_done(&all) {
+            return Ok(apply_cte_limit(all, limit, offset));
         }
         if !self_ref {
             break;
         }
         working = step;
+        cur_iter += 1;
+        if cur_iter > max_depth {
+            return Err(cte_max_depth_error(cur_iter));
+        }
     }
     Ok(apply_cte_limit(all, limit, offset))
+}
+
+fn cte_max_depth_error(iter: i64) -> Error {
+    Error::new(
+        ERR_CTE_MAX_RECURSION_DEPTH,
+        format!(
+            "Recursive query aborted after {iter} iterations. Try increasing @@cte_max_recursion_depth to a larger value"
+        ),
+    )
 }
 
 fn apply_cte_limit(

@@ -542,11 +542,14 @@ fn bind_select_with_cte_schemas(
         .map(|t| {
             let mut names = vec![t.name.clone()];
             let cte_name = t.resolve_name();
-            let is_cte = prior_ctes.contains_key(&cte_name.to_ascii_lowercase())
-                || select
-                    .with
-                    .as_ref()
-                    .is_some_and(|with| with.find(cte_name).is_some());
+            // An alias hides the table / CTE name (`FROM cte1 dt1` → only
+            // `dt1.x` qualifies; `cte1.x` is an outer reference).
+            let is_cte = t.physical.is_none()
+                && (prior_ctes.contains_key(&cte_name.to_ascii_lowercase())
+                    || select
+                        .with
+                        .as_ref()
+                        .is_some_and(|with| with.find(cte_name).is_some()));
             if is_cte && !names.iter().any(|n| n.eq_ignore_ascii_case(cte_name)) {
                 names.push(cte_name.to_string());
             }
@@ -641,6 +644,9 @@ fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
     // `qn2 AS (SELECT 3*a FROM qn)` keeps `a` on qn (not outer correlation).
     let mut prior: HashMap<String, Vec<String>> = HashMap::new();
     for cte in &with.ctes {
+        // The CTE's own output names are inner while binding its body, so a
+        // recursive arm keeps `c1` on the CTE instead of the outer row.
+        prior.insert(cte.name.to_ascii_lowercase(), cte_output_names(cte));
         let mut bound = cte.clone();
         bound.query = Box::new(bind_select_with_cte_schemas(&cte.query, ctx, &prior)?);
         if let Some((op, rec)) = &cte.recursive {

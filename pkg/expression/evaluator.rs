@@ -82,6 +82,29 @@ pub fn sql_mode_flag(flag: &str) -> bool {
     })
 }
 
+/// How `ERROR_FOR_DIVISION_BY_ZERO` resolves for the current statement
+/// (`errctx` level: SELECT warns; strict DML/DDL errors).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DivByZeroMode {
+    Ignore,
+    Warn,
+    Error,
+}
+
+thread_local! {
+    static DIV_BY_ZERO_MODE: Cell<DivByZeroMode> = const { Cell::new(DivByZeroMode::Warn) };
+}
+
+pub fn with_div_by_zero_mode<T>(mode: DivByZeroMode, f: impl FnOnce() -> T) -> T {
+    DIV_BY_ZERO_MODE.with(|cell| {
+        let prev = cell.get();
+        cell.set(mode);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
 /// Run `f` under the session `time_zone` (TiDB TIMESTAMP/DST).
 pub fn with_time_zone<T>(tz: impl Into<String>, f: impl FnOnce() -> T) -> T {
     TIME_ZONE.with(|cell| {
@@ -541,42 +564,28 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             }
         }
         Op::Mul => num_bin(&left, &right, |a, b| Ok(a * b), |a, b| Ok(a * b)),
-        Op::Div => num_bin(
-            &left,
-            &right,
-            |a, b| {
-                if b == 0 {
-                    Err(Error::new(ERR_DIVISION_BY_ZERO, "Division by 0"))
-                } else {
-                    Ok(a / b)
-                }
-            },
-            |a, b| {
-                if b == 0.0 {
-                    Err(Error::new(ERR_DIVISION_BY_ZERO, "Division by 0"))
-                } else {
-                    Ok(a / b)
-                }
-            },
-        ),
-        Op::Mod => num_bin(
-            &left,
-            &right,
-            |a, b| {
-                if b == 0 {
-                    Err(Error::new(ERR_DIVISION_BY_ZERO, "Division by 0"))
-                } else {
-                    Ok(a % b)
-                }
-            },
-            |a, b| {
-                if b == 0.0 {
-                    Err(Error::new(ERR_DIVISION_BY_ZERO, "Division by 0"))
-                } else {
-                    Ok(a % b)
-                }
-            },
-        ),
+        Op::Div => {
+            if is_zero_divisor(&right)? {
+                return div_by_zero();
+            }
+            num_bin(
+                &left,
+                &right,
+                |a, b| Ok(a / b),
+                |a, b| Ok(a / b),
+            )
+        }
+        Op::Mod => {
+            if is_zero_divisor(&right)? {
+                return div_by_zero();
+            }
+            num_bin(
+                &left,
+                &right,
+                |a, b| Ok(a % b),
+                |a, b| Ok(a % b),
+            )
+        }
         Op::Eq => Ok(bool_datum(
             compare_datums_for_op(&left, &right, Op::Eq)?.is_eq(),
         )),
@@ -1518,6 +1527,23 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         _ => FieldType::new_string(),
     };
     value.cast(&ft)
+}
+
+fn is_zero_divisor(right: &Datum) -> Result<bool> {
+    Ok(right.as_f64()? == 0.0)
+}
+
+/// `ERR_DIVISION_BY_ZERO` as error or warning + NULL, per statement errctx
+/// (TiDB `handleDivisionByZeroError`).
+fn div_by_zero() -> Result<Datum> {
+    match DIV_BY_ZERO_MODE.with(|cell| cell.get()) {
+        DivByZeroMode::Error => Err(Error::new(ERR_DIVISION_BY_ZERO, "Division by 0")),
+        DivByZeroMode::Warn => {
+            push_warning(ERR_DIVISION_BY_ZERO, "Division by 0");
+            Ok(Datum::Null)
+        }
+        DivByZeroMode::Ignore => Ok(Datum::Null),
+    }
 }
 
 fn num_bin(

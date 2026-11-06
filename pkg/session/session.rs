@@ -681,12 +681,15 @@ impl Session {
             .expect("session time_zone lock")
             .clone();
         let mode = sealdb_expression::CollateMode::from_name(&coll.name);
-        let result = sealdb_expression::with_sql_mode(sql_mode, || {
-            sealdb_expression::with_time_zone(time_zone, || {
-                sealdb_expression::with_current_db(current_db.as_str(), || {
-                    sealdb_expression::with_collation(mode, || {
-                        sealdb_expression::clear_warnings();
-                        ExecutorBuilder::run(exec)
+        let div_mode = div_by_zero_mode(&sql_mode, stmt);
+        let result = sealdb_expression::with_div_by_zero_mode(div_mode, || {
+            sealdb_expression::with_sql_mode(sql_mode, || {
+                sealdb_expression::with_time_zone(time_zone, || {
+                    sealdb_expression::with_current_db(current_db.as_str(), || {
+                        sealdb_expression::with_collation(mode, || {
+                            sealdb_expression::clear_warnings();
+                            ExecutorBuilder::run(exec)
+                        })
                     })
                 })
             })
@@ -1758,6 +1761,40 @@ fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
     }
 }
 
+/// TiDB `errctx` level for `ERROR_FOR_DIVISION_BY_ZERO` per statement kind:
+/// SELECT always warns; DML/DDL error only under strict mode with the flag set
+/// (`ResetUpdateStmtCtx` / insert path).
+fn div_by_zero_mode(
+    sql_mode: &str,
+    stmt: &sealdb_parser::ast::Statement,
+) -> sealdb_expression::DivByZeroMode {
+    let flag = |name: &str| {
+        sql_mode
+            .split(',')
+            .any(|m| m.trim().eq_ignore_ascii_case(name))
+    };
+    let strict = flag("STRICT_TRANS_TABLES") || flag("STRICT_ALL_TABLES");
+    let dml_or_ddl = matches!(
+        stmt,
+        sealdb_parser::ast::Statement::Insert(_)
+            | sealdb_parser::ast::Statement::Update(_)
+            | sealdb_parser::ast::Statement::Delete(_)
+            | sealdb_parser::ast::Statement::CreateTable(_)
+            | sealdb_parser::ast::Statement::AlterTable(_)
+            | sealdb_parser::ast::Statement::CreateIndex(_)
+    );
+    if !dml_or_ddl {
+        return sealdb_expression::DivByZeroMode::Warn;
+    }
+    if !flag("ERROR_FOR_DIVISION_BY_ZERO") {
+        sealdb_expression::DivByZeroMode::Ignore
+    } else if strict {
+        sealdb_expression::DivByZeroMode::Error
+    } else {
+        sealdb_expression::DivByZeroMode::Warn
+    }
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
     for a in &stmt.assignments {
         if is_user_var_name(&a.name) {
@@ -1852,6 +1889,22 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .expect("session auto analyze ratio lock") = ratio;
             }
             "autocommit" | "unique_checks" | "foreign_key_checks" => {}
+            "cte_max_recursion_depth" => {
+                // `SET … = DEFAULT` resets to TiDB's default (1000).
+                let depth = if value.eq_ignore_ascii_case("DEFAULT") {
+                    1000
+                } else {
+                    value.parse::<i64>().map_err(|_| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!(
+                                "Variable 'cte_max_recursion_depth' can't be set to the value of '{value}'"
+                            ),
+                        )
+                    })?
+                };
+                sealdb_executor::cte::set_cte_max_recursion_depth(depth);
+            }
             // Session time zone (DST / TIMESTAMP display). Value stored for later
             // conversion; offset literals like '+00:00' / named zones accepted.
             "time_zone" => {
@@ -2042,6 +2095,7 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .expect("session auto analyze ratio lock")
             .to_string(),
         "autocommit" => "1".into(),
+        "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "tidb_window_concurrency" => sealdb_expression::window_concurrency().to_string(),
         "tidb_enable_window_function" => "1".into(),
         // Common TiDB session vars referenced by integrationtest; defaults.
@@ -2643,6 +2697,7 @@ fn inject_view_cte(
         query: Box::new(view_select),
         col_name_list,
         recursive: None,
+        recursive_rest: Vec::new(),
         set_rest: Vec::new(),
         materialize,
         limit: None,
