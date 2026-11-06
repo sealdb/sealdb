@@ -11,6 +11,9 @@ pub struct ProjectionExec {
     child: Box<dyn Executor>,
     subquery: Option<SubqueryEvalCtx>,
     opened: bool,
+    /// Window plans emit the SELECT-list columns already; re-emit them as-is
+    /// instead of re-evaluating window expressions outside `WindowExec`.
+    passthrough: bool,
 }
 
 impl ProjectionExec {
@@ -21,6 +24,20 @@ impl ProjectionExec {
             child,
             subquery: None,
             opened: false,
+            passthrough: false,
+        }
+    }
+
+    /// Projection over a `Window` plan: `WindowExec` already produced exactly the
+    /// SELECT-list columns, so only the output names are replaced.
+    pub fn passthrough(names: Vec<String>, child: Box<dyn Executor>) -> Self {
+        Self {
+            exprs: Vec::new(),
+            names,
+            child,
+            subquery: None,
+            opened: false,
+            passthrough: true,
         }
     }
 
@@ -38,6 +55,9 @@ impl Executor for ProjectionExec {
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.passthrough {
+            return self.child.next();
+        }
         let Some(input) = self.child.next()? else {
             return Ok(None);
         };

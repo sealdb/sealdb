@@ -608,6 +608,90 @@ pub fn pre_evaluate_dml_predicate(
             let datum = Datum::I64(i64::from(found != e.not));
             Ok(ExprNode::Value(ValueExpr { datum }))
         }
+        // Nested subqueries (`DELETE ... WHERE f(col, (SELECT ...))`): recurse
+        // into compound expressions so inner scalar/IN/EXISTS are pre-evaluated.
+        ExprNode::Func(f) => {
+            let mut f = f.clone();
+            f.args = f
+                .args
+                .iter()
+                .map(|arg| pre_evaluate_dml_predicate(arg, domain, current_db, txn))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ExprNode::Func(f))
+        }
+        ExprNode::Cast(c) => {
+            let mut c = c.clone();
+            c.expr = Box::new(pre_evaluate_dml_predicate(
+                &c.expr, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::Cast(c))
+        }
+        ExprNode::InList(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(pre_evaluate_dml_predicate(
+                &l.expr, domain, current_db, txn,
+            )?);
+            l.list = l
+                .list
+                .iter()
+                .map(|item| pre_evaluate_dml_predicate(item, domain, current_db, txn))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ExprNode::InList(l))
+        }
+        ExprNode::Between(b) => {
+            let mut b = b.clone();
+            b.expr = Box::new(pre_evaluate_dml_predicate(
+                &b.expr, domain, current_db, txn,
+            )?);
+            b.low = Box::new(pre_evaluate_dml_predicate(
+                &b.low, domain, current_db, txn,
+            )?);
+            b.high = Box::new(pre_evaluate_dml_predicate(
+                &b.high, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::Between(b))
+        }
+        ExprNode::Like(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(pre_evaluate_dml_predicate(
+                &l.expr, domain, current_db, txn,
+            )?);
+            l.pattern = Box::new(pre_evaluate_dml_predicate(
+                &l.pattern, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::Like(l))
+        }
+        ExprNode::IsNull(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(pre_evaluate_dml_predicate(
+                &i.expr, domain, current_db, txn,
+            )?);
+            Ok(ExprNode::IsNull(i))
+        }
+        ExprNode::Case(c) => {
+            let mut c = c.clone();
+            if let Some(operand) = &c.operand {
+                c.operand = Some(Box::new(pre_evaluate_dml_predicate(
+                    operand, domain, current_db, txn,
+                )?));
+            }
+            c.when_then = c
+                .when_then
+                .iter()
+                .map(|(when, then)| {
+                    Ok((
+                        pre_evaluate_dml_predicate(when, domain, current_db, txn)?,
+                        pre_evaluate_dml_predicate(then, domain, current_db, txn)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(else_expr) = &c.else_expr {
+                c.else_expr = Some(Box::new(pre_evaluate_dml_predicate(
+                    else_expr, domain, current_db, txn,
+                )?));
+            }
+            Ok(ExprNode::Case(c))
+        }
         ExprNode::ScalarSubquery(s) => {
             let result = match run_result_set(&s.query, domain, current_db, txn) {
                 Ok(result) => result,
@@ -724,6 +808,11 @@ fn walk_expr_columns(expr: &ExprNode, visit: &mut impl FnMut(&ColumnNameExpr)) {
             }
             if let Some(branch) = &c.else_expr {
                 walk_expr_columns(branch, visit);
+            }
+        }
+        ExprNode::Row(r) => {
+            for expr in &r.exprs {
+                walk_expr_columns(expr, visit);
             }
         }
         ExprNode::Value(_)

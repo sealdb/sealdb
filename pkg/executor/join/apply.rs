@@ -799,6 +799,7 @@ fn bind_expr(
             expr: Box::new(bind_expr(&sub.expr, ctx, inner_tables, inner_cols)),
             not: sub.not,
             query: Box::new(bind_nested_query(&sub.query, ctx)),
+            all_ne: sub.all_ne,
         }),
         ExprNode::QuantifiedCmp(cmp) => ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
             expr: Box::new(bind_expr(&cmp.expr, ctx, inner_tables, inner_cols)),

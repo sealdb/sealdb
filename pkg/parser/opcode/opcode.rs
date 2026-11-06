@@ -15,6 +15,8 @@ pub enum Op {
     Ge,
     LogicAnd,
     LogicOr,
+    /// MySQL `XOR` — logical exclusive or (three-valued).
+    LogicXor,
     Not,
     /// TiDB `opcode.Not2` — MySQL `!` (same truth table as `NOT`).
     Not2,
@@ -39,6 +41,7 @@ impl Op {
             Op::Ge => ">=",
             Op::LogicAnd => "AND",
             Op::LogicOr => "OR",
+            Op::LogicXor => "XOR",
             Op::Not => "NOT",
             Op::Not2 => "!",
             Op::BitNeg => "~",
