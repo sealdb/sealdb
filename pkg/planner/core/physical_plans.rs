@@ -258,6 +258,43 @@ pub enum PhysicalPlan {
         names: Vec<String>,
         child: Box<PhysicalPlan>,
     },
+    /// Null-aware anti join (TiDB `PhysicalHashJoin` with `NullAwareAntiJoin`):
+    /// the row-constructor rewrite of `(a, b) NOT IN (SELECT a, b …)` /
+    /// `(a, b) != ALL (…)`. `left_outer` emits `probe row + bool` (anti left
+    /// outer semi), otherwise only the matching probe rows (anti semi).
+    NullAwareAntiJoin {
+        /// TiDB ExplainInfo (`Null-aware anti semi join, equal:[…]`).
+        info: String,
+        est_rows: f64,
+        /// Emit `probe row + bool` instead of probe rows only.
+        left_outer: bool,
+        /// Emit only the boolean column (`SELECT (a,b) IN (…)` form).
+        bool_only: bool,
+        /// Null-aware row-constructor semantics; `false` for the correlated
+        /// equality rewrite, which behaves like a plain anti join.
+        null_aware: bool,
+        /// Name of the appended boolean column (`Column#N`).
+        bool_column: String,
+        /// (probe expr, build expr) equality key pairs.
+        #[serde(skip)]
+        keys: Vec<(ExprNode, ExprNode)>,
+        /// ON condition over `[probe cols…, build cols…]`.
+        #[serde(skip)]
+        other_cond: Option<ExprNode>,
+        /// Outer / inner table names, for qualified column resolution.
+        probe_table: String,
+        build_table: String,
+        probe: Box<PhysicalPlan>,
+        build: Box<PhysicalPlan>,
+    },
+    /// Plan-level Projection that computes row-constructor operands under a
+    /// join (TiDB `injectExtraProjection`). Execution is transparent — the
+    /// join evaluates the operand expressions on the child row itself — but
+    /// EXPLAIN prints the injected Projection.
+    RowProjection {
+        info: String,
+        child: Box<PhysicalPlan>,
+    },
 }
 
 /// Physical join kind. `Cross` is a cartesian product with no equality keys.
@@ -470,6 +507,12 @@ impl PhysicalPlan {
                 child,
             } => {
                 format!("Distinct({}) -> {}", keys.join(","), child.explain())
+            }
+            PhysicalPlan::NullAwareAntiJoin { info, probe, build, .. } => {
+                format!("NullAwareAntiJoin({info}, {}, {})", probe.explain(), build.explain())
+            }
+            PhysicalPlan::RowProjection { info, child } => {
+                format!("RowProjection({info}) -> {}", child.explain())
             }
         }
     }

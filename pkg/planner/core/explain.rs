@@ -438,7 +438,12 @@ fn walk_with_parent(
     let join_role = match parent {
         // HashJoin / MergeJoin: children_of lists right(Build) then left(Probe).
         Some(PhysicalPlan::HashJoin { left, right, .. })
-        | Some(PhysicalPlan::MergeJoin { left, right, .. }) => {
+        | Some(PhysicalPlan::MergeJoin { left, right, .. })
+        | Some(PhysicalPlan::NullAwareAntiJoin {
+            probe: left,
+            build: right,
+            ..
+        }) => {
             let left_p = explain_plan_ptr(left);
             let right_p = explain_plan_ptr(right);
             let self_p = explain_plan_ptr(plan);
@@ -605,6 +610,8 @@ fn walk_with_parent(
         plan,
         PhysicalPlan::HashJoin { .. }
             | PhysicalPlan::MergeJoin { .. }
+            | PhysicalPlan::NullAwareAntiJoin { .. }
+            | PhysicalPlan::RowProjection { .. }
             | PhysicalPlan::IndexJoin { .. }
             | PhysicalPlan::Apply { probe: Some(_), .. }
             | PhysicalPlan::PartitionUnion { .. }
@@ -615,6 +622,8 @@ fn walk_with_parent(
         Some(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::NullAwareAntiJoin { .. }
+                | PhysicalPlan::RowProjection { .. }
                 | PhysicalPlan::IndexJoin { .. }
                 | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
@@ -694,6 +703,7 @@ fn walk_with_parent(
         Some(
             PhysicalPlan::HashJoin { .. }
                 | PhysicalPlan::MergeJoin { .. }
+                | PhysicalPlan::NullAwareAntiJoin { .. }
                 | PhysicalPlan::IndexJoin { .. }
                 | PhysicalPlan::Apply { probe: Some(_), .. }
                 | PhysicalPlan::PartitionUnion { .. }
@@ -709,6 +719,7 @@ fn walk_with_parent(
                 parent,
                 Some(
                     PhysicalPlan::Projection { .. }
+                        | PhysicalPlan::RowProjection { .. }
                         | PhysicalPlan::Selection { .. }
                         | PhysicalPlan::Sort { .. }
                         | PhysicalPlan::HashAgg { .. }
@@ -2519,6 +2530,10 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::IndexJoin { outer, inner, .. } => {
             vec![outer.as_ref(), inner.as_ref()]
         }
+        // Null-aware anti join: Build (right) then Probe (left), like HashJoin.
+        PhysicalPlan::NullAwareAntiJoin { probe, build, .. } => {
+            vec![build.as_ref(), probe.as_ref()]
+        }        PhysicalPlan::RowProjection { child, .. } => vec![child.as_ref()],
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::DistinctUnion { child, .. } => vec![child.as_ref()],
         PhysicalPlan::PartitionUnion { children } => children.iter().collect(),
@@ -2687,6 +2702,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         } => {
             let info = hash_join_explain_info(*tp, on, left, right);
             ("HashJoin".to_string(), String::new(), info)
+        }
+        PhysicalPlan::NullAwareAntiJoin { info, .. } => {
+            ("HashJoin".to_string(), String::new(), info.clone())
+        }
+        PhysicalPlan::RowProjection { info, .. } => {
+            ("Projection".to_string(), String::new(), info.clone())
         }
         PhysicalPlan::MergeJoin {
             left_key,
@@ -2995,6 +3016,8 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             }
         }
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| est_rows(c)).sum(),
+        PhysicalPlan::NullAwareAntiJoin { est_rows: e, .. } => *e,
+        PhysicalPlan::RowProjection { child, .. } => est_rows(child),
         PhysicalPlan::DistinctUnion { est_rows: e, .. } => *e,
         PhysicalPlan::HashAgg { est_rows: e, .. } | PhysicalPlan::StreamAgg { est_rows: e, .. } => {
             *e

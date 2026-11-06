@@ -121,6 +121,11 @@ fn inherit_cte_in_expr(expr: &mut ExprNode, scope: Option<&WithClause>) {
                 inherit_cte_in_expr(arg, scope);
             }
         }
+        ExprNode::Row(r) => {
+            for expr in &mut r.exprs {
+                inherit_cte_in_expr(expr, scope);
+            }
+        }
         ExprNode::Column(_) | ExprNode::Value(_) => {}
     }
 }

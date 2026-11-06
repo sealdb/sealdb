@@ -7662,6 +7662,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 expr: Box::new(lower_expr(expr)?),
                 not: *negated,
                 query: Box::new(query),
+                all_ne: false,
             }))
         }
         Expr::InList {
@@ -7767,6 +7768,11 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             compare_op,
             right,
         } => lower_quantified_cmp(left, compare_op, right, true),
+        // Row constructor `(a, b)`: only legal as an `IN` / quantified
+        // subquery operand; validation happens in the planner.
+        Expr::Tuple(exprs) => Ok(ExprNode::Row(crate::ast::expressions::RowExpr {
+            exprs: exprs.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
+        })),
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("expression {other} is not available in this phase"),
@@ -8221,11 +8227,15 @@ fn lower_quantified_cmp(
             expr: Box::new(expr),
             not: false,
             query: Box::new(query),
+            all_ne: false,
         })),
+        // Keep TiDB's quantified form: `x != ALL (subq)` is planned as a
+        // left-outer-semi join, unlike `x NOT IN (subq)` (anti semi join).
         (true, Op::Ne) => Ok(ExprNode::InSubquery(InSubqueryExpr {
             expr: Box::new(expr),
             not: true,
             query: Box::new(query),
+            all_ne: true,
         })),
         (_, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
             Ok(ExprNode::QuantifiedCmp(QuantifiedCmpExpr {

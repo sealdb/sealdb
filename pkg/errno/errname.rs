@@ -74,6 +74,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_TRUNCATED_WRONG_VALUE => "22007",
         errcode::ERR_DIVISION_BY_ZERO => "22012",
         errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
+        errcode::ERR_OPERAND_COLUMNS => "21000",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "21000",
         errcode::ERR_UNSUPPORTED => "42000",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "25006",

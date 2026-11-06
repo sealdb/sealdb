@@ -30,6 +30,8 @@ pub const ERR_LOCK_WAIT_TIMEOUT: i32 = 1205;
 pub const ERR_LOCK_NOWAIT: i32 = 3572;
 pub const ERR_LOCK_DEADLOCK: i32 = 1213;
 pub const ERR_SUBQUERY_NO_1_ROW: i32 = 1242;
+/// Row constructor used where a single column is required (MySQL 1241).
+pub const ERR_OPERAND_COLUMNS: i32 = 1241;
 pub const ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT: i32 = 1222;
 /// MySQL `ER_WRONG_USAGE`: e.g. per-arm LIMIT without parentheses in UNION.
 pub const ERR_INCORRECT_USAGE: i32 = 1221;

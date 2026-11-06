@@ -10,7 +10,7 @@ use crate::grant::GrantExec;
 use crate::insert::InsertExec;
 use crate::internal::exec::{Executor, QueryResult};
 use crate::join::apply::SubqueryEvalCtx;
-use crate::join::{HashJoinV1Exec, NestedLoopApplyExec};
+use crate::join::{HashJoinV1Exec, NestedLoopApplyExec, NullAwareAntiJoinExec};
 use crate::point_get::PointGetExec;
 use crate::projection::ProjectionExec;
 use crate::select::{DistinctExec, LimitExec, MemTableExec, SelectionExec, TableDualExec};
@@ -611,6 +611,35 @@ impl ExecutorBuilder {
                 current_db,
                 txn,
             ),
+            // Row-constructor projection: EXPLAIN-only, execution passes rows
+            // through (the join evaluates the operands itself).
+            PhysicalPlan::RowProjection { child, .. } => {
+                Self::build(child, stmt, domain, current_db, txn)
+            }
+            PhysicalPlan::NullAwareAntiJoin {
+                left_outer,
+                bool_only,
+                null_aware,
+                bool_column,
+                keys,
+                other_cond,
+                probe_table,
+                build_table,
+                probe,
+                build,
+                ..
+            } => Ok(Box::new(NullAwareAntiJoinExec::new(
+                *left_outer,
+                *bool_only,
+                *null_aware,
+                bool_column.clone(),
+                keys.clone(),
+                other_cond.clone(),
+                probe_table.clone(),
+                build_table.clone(),
+                Self::build(probe, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?,
+                Self::build(build, stmt, domain, current_db, txn)?,
+            ))),
             PhysicalPlan::Explain {
                 format,
                 analyze,
@@ -947,6 +976,7 @@ fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
                     .and_then(|branch| find_table_in_expr(branch, table))
             }),
         ExprNode::Window(w) => w.args.iter().find_map(|arg| find_table_in_expr(arg, table)),
+        ExprNode::Row(r) => r.exprs.iter().find_map(|expr| find_table_in_expr(expr, table)),
         ExprNode::Column(_) | ExprNode::Value(_) => None,
     }
 }
