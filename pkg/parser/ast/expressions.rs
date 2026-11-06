@@ -18,6 +18,8 @@ pub enum ExprNode {
     Between(BetweenExpr),
     Like(PatternLikeExpr),
     IsNull(IsNullExpr),
+    /// `CASE [operand] WHEN … THEN … [ELSE …] END`.
+    Case(CaseExpr),
     ScalarSubquery(ScalarSubqueryExpr),
     /// Quantified comparison: `expr op ANY|ALL (subquery)`.
     /// `= ANY` / `= SOME` lower to `InSubquery`; `<> ALL` lowers to `NOT IN`.
@@ -40,6 +42,7 @@ impl ExprNode {
             ExprNode::Between(v) => v.restore(ctx),
             ExprNode::Like(v) => v.restore(ctx),
             ExprNode::IsNull(v) => v.restore(ctx),
+            ExprNode::Case(v) => v.restore(ctx),
             ExprNode::ScalarSubquery(v) => v.restore(ctx),
             ExprNode::QuantifiedCmp(v) => v.restore(ctx),
             ExprNode::Window(v) => v.restore(ctx),
@@ -62,6 +65,13 @@ impl ExprNode {
             }
             ExprNode::Like(l) => l.expr.has_subquery() || l.pattern.has_subquery(),
             ExprNode::IsNull(i) => i.expr.has_subquery(),
+            ExprNode::Case(c) => {
+                c.operand.as_ref().is_some_and(|o| o.has_subquery())
+                    || c.when_then
+                        .iter()
+                        .any(|(w, t)| w.has_subquery() || t.has_subquery())
+                    || c.else_expr.as_ref().is_some_and(|e| e.has_subquery())
+            }
             ExprNode::Window(w) => {
                 w.args.iter().any(Self::has_subquery)
                     || w.spec.partition_by.iter().any(Self::has_subquery)
@@ -252,6 +262,18 @@ impl ExprNode {
                 l.pattern.collect_columns(out);
             }
             ExprNode::IsNull(i) => i.expr.collect_columns(out),
+            ExprNode::Case(c) => {
+                if let Some(operand) = &c.operand {
+                    operand.collect_columns(out);
+                }
+                for (when, then) in &c.when_then {
+                    when.collect_columns(out);
+                    then.collect_columns(out);
+                }
+                if let Some(else_expr) = &c.else_expr {
+                    else_expr.collect_columns(out);
+                }
+            }
             ExprNode::Window(w) => {
                 for arg in &w.args {
                     arg.collect_columns(out);
@@ -381,6 +403,7 @@ impl UnaryOpExpr {
                     | ExprNode::InSubquery(_)
                     | ExprNode::Like(_)
                     | ExprNode::IsNull(_)
+                    | ExprNode::Case(_)
                     | ExprNode::QuantifiedCmp(_)
                     | ExprNode::Window(_)
             );
@@ -588,6 +611,37 @@ impl BetweenExpr {
         self.low.restore(ctx)?;
         ctx.write_str(" AND ");
         self.high.restore(ctx)
+    }
+}
+
+/// `CASE [operand] WHEN cond THEN result … [ELSE result] END`.
+#[derive(Clone, Debug)]
+pub struct CaseExpr {
+    /// Simple-CASE operand (`CASE x WHEN 1 THEN …`); None for searched CASE.
+    pub operand: Option<Box<ExprNode>>,
+    pub when_then: Vec<(ExprNode, ExprNode)>,
+    pub else_expr: Option<Box<ExprNode>>,
+}
+
+impl CaseExpr {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("CASE");
+        if let Some(operand) = &self.operand {
+            ctx.write_str(" ");
+            operand.restore(ctx)?;
+        }
+        for (when, then) in &self.when_then {
+            ctx.write_str(" WHEN ");
+            when.restore(ctx)?;
+            ctx.write_str(" THEN ");
+            then.restore(ctx)?;
+        }
+        if let Some(else_expr) = &self.else_expr {
+            ctx.write_str(" ELSE ");
+            else_expr.restore(ctx)?;
+        }
+        ctx.write_str(" END");
+        Ok(())
     }
 }
 

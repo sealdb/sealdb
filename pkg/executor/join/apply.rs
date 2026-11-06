@@ -8,12 +8,12 @@ use crate::cte::with_isolated_shared_ctes;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{ERR_SUBQUERY_NO_1_ROW, ERR_UNKNOWN_ERROR, Error, Result};
-use sealdb_expression::{collation_mode, eval_expr_with_row, eval_filter, with_collation};
+use sealdb_expression::{collation_mode, eval_expr_with_row, eval_filter, truthy, with_collation};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::expressions::{
-    BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
-    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
-    UnaryOpExpr, ValueExpr,
+    BetweenExpr, BinaryOpExpr, CaseExpr, ColumnNameExpr, ExistsExpr, ExprNode, FuncCallExpr,
+    FuncCastExpr, InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr,
+    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr,
 };
 use sealdb_parser::ast::{
     CommonTableExpression, ResultSetNode, SelectField, SelectStmt, SetOprStmt, Statement,
@@ -340,6 +340,50 @@ fn materialize(
             expr: Box::new(materialize(&is_null.expr, ctx, cache)?),
             not: is_null.not,
         })),
+        // CASE is lazy in TiDB: only the branch that is taken runs, so an
+        // untaken branch's subquery must not be materialized (it may even be
+        // an erroring multi-row scalar). The caller evaluates the result against
+        // exactly `ctx.outer_schema`/`ctx.outer_row`, so conditions can be
+        // decided here.
+        ExprNode::Case(case) => {
+            let taken = match &case.operand {
+                Some(operand) => {
+                    let operand = materialize(operand, ctx, cache)?;
+                    let operand = eval_expr_with_row(&operand, &ctx.outer_schema, &ctx.outer_row)?;
+                    let mut taken = None;
+                    for (when, then) in &case.when_then {
+                        let when = materialize(when, ctx, cache)?;
+                        let when = eval_expr_with_row(&when, &ctx.outer_schema, &ctx.outer_row)?;
+                        let matched = !operand.is_null()
+                            && !when.is_null()
+                            && operand.compare(&when).is_eq();
+                        if matched {
+                            taken = Some(then);
+                            break;
+                        }
+                    }
+                    taken
+                }
+                None => {
+                    let mut taken = None;
+                    for (when, then) in &case.when_then {
+                        let when = materialize(when, ctx, cache)?;
+                        let cond = eval_expr_with_row(&when, &ctx.outer_schema, &ctx.outer_row)?;
+                        if truthy(&cond).unwrap_or(false) {
+                            taken = Some(then);
+                            break;
+                        }
+                    }
+                    taken
+                }
+            };
+            match taken.or(case.else_expr.as_deref()) {
+                Some(branch) => materialize(branch, ctx, cache),
+                None => Ok(ExprNode::Value(ValueExpr {
+                    datum: Datum::Null,
+                })),
+            }
+        }
         other => Ok(other.clone()),
     }
 }
@@ -563,6 +607,20 @@ fn merge_with_clauses(outer: &WithClause, inner: &WithClause) -> WithClause {
 
 fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
     let mut ctes = Vec::with_capacity(with.ctes.len());
+    // CTE bodies must not re-attach the very WITH being bound: a body without
+    // its own WITH would otherwise pull `ctx.outer_with` in again and recurse
+    // forever (`WITH cte AS (SELECT …) SELECT … WHERE CASE … (SELECT … FROM cte)`).
+    // Outer projection values are already substituted into the caller's plan.
+    let body_ctx = ApplyCtx {
+        domain: Arc::clone(&ctx.domain),
+        current_db: ctx.current_db.clone(),
+        txn: Arc::clone(&ctx.txn),
+        outer_table: ctx.outer_table.clone(),
+        outer_with: None,
+        outer_schema: ctx.outer_schema.clone(),
+        outer_row: ctx.outer_row.clone(),
+    };
+    let ctx = &body_ctx;
     // Sibling CTEs: later bodies see earlier output cols as inner so
     // `qn2 AS (SELECT 3*a FROM qn)` keeps `a` on qn (not outer correlation).
     let mut prior: HashMap<String, Vec<String>> = HashMap::new();
@@ -688,24 +746,55 @@ fn bind_expr(
             expr: Box::new(bind_expr(&is_null.expr, ctx, inner_table, inner_cols)),
             not: is_null.not,
         }),
+        ExprNode::Case(case) => ExprNode::Case(CaseExpr {
+            operand: case
+                .operand
+                .as_ref()
+                .map(|operand| Box::new(bind_expr(operand, ctx, inner_table, inner_cols))),
+            when_then: case
+                .when_then
+                .iter()
+                .map(|(when, then)| {
+                    (
+                        bind_expr(when, ctx, inner_table, inner_cols),
+                        bind_expr(then, ctx, inner_table, inner_cols),
+                    )
+                })
+                .collect(),
+            else_expr: case
+                .else_expr
+                .as_ref()
+                .map(|branch| Box::new(bind_expr(branch, ctx, inner_table, inner_cols))),
+        }),
+        // Nested subqueries are bound too: an inner subquery may correlate with
+        // this query's row (`… WHERE b > (SELECT … WHERE c > (SELECT ref.a …))`),
+        // and that reference must be substituted while this scope is available.
         ExprNode::Exists(exists) => ExprNode::Exists(ExistsExpr {
             not: exists.not,
-            query: exists.query.clone(),
+            query: Box::new(bind_nested_query(&exists.query, ctx)),
         }),
         ExprNode::InSubquery(sub) => ExprNode::InSubquery(InSubqueryExpr {
             expr: Box::new(bind_expr(&sub.expr, ctx, inner_table, inner_cols)),
             not: sub.not,
-            query: sub.query.clone(),
+            query: Box::new(bind_nested_query(&sub.query, ctx)),
         }),
         ExprNode::QuantifiedCmp(cmp) => ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
             expr: Box::new(bind_expr(&cmp.expr, ctx, inner_table, inner_cols)),
             op: cmp.op,
             all: cmp.all,
-            query: cmp.query.clone(),
+            query: Box::new(bind_nested_query(&cmp.query, ctx)),
         }),
-        ExprNode::ScalarSubquery(sub) => ExprNode::ScalarSubquery(sub.clone()),
+        ExprNode::ScalarSubquery(sub) => ExprNode::ScalarSubquery(ScalarSubqueryExpr {
+            query: Box::new(bind_nested_query(&sub.query, ctx)),
+        }),
         other => other.clone(),
     }
+}
+
+/// Bind a subquery body in the enclosing scope; on failure keep it unchanged so
+/// planning still reports the original error rather than a nested one.
+fn bind_nested_query(query: &ResultSetNode, ctx: &ApplyCtx) -> ResultSetNode {
+    bind_result_set(query, ctx).unwrap_or_else(|_| query.clone())
 }
 
 fn bind_column(
