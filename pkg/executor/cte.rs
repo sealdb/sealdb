@@ -551,6 +551,18 @@ fn walk_expr_columns(expr: &ExprNode, visit: &mut impl FnMut(&ColumnNameExpr)) {
             walk_expr_columns(&l.pattern, visit);
         }
         ExprNode::IsNull(i) => walk_expr_columns(&i.expr, visit),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &c.operand {
+                walk_expr_columns(operand, visit);
+            }
+            for (when, then) in &c.when_then {
+                walk_expr_columns(when, visit);
+                walk_expr_columns(then, visit);
+            }
+            if let Some(branch) = &c.else_expr {
+                walk_expr_columns(branch, visit);
+            }
+        }
         ExprNode::Value(_)
         | ExprNode::Exists(_)
         | ExprNode::InSubquery(_)

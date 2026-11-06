@@ -4,8 +4,8 @@ use sealdb_errno::{
 };
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
-    BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
-    InSubqueryExpr, IsNullExpr, PatternLikeExpr, UnaryOpExpr,
+    BetweenExpr, BinaryOpExpr, CaseExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr,
+    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, UnaryOpExpr,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
@@ -339,6 +339,7 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
         ExprNode::Between(b) => eval_between(b, schema, row),
         ExprNode::Like(l) => eval_like(l, schema, row),
         ExprNode::IsNull(i) => eval_is_null(i, schema, row),
+        ExprNode::Case(c) => eval_case(c, schema, row),
         ExprNode::Exists(_)
         | ExprNode::InSubquery(_)
         | ExprNode::ScalarSubquery(_)
@@ -1238,6 +1239,39 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
     }
 }
 
+/// TiDB/MySQL CASE: the first WHEN whose condition is true wins. A NULL
+/// condition is not true. Simple CASE compares the operand with `=` (NULL
+/// never matches). With no matching branch, ELSE applies; otherwise NULL.
+fn eval_case(expr: &CaseExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let operand = match &expr.operand {
+        Some(operand) => Some(eval_expr_with_row(operand, schema, row)?),
+        None => None,
+    };
+    for (when, then) in &expr.when_then {
+        let matched = match &operand {
+            Some(operand) => {
+                let value = eval_expr_with_row(when, schema, row)?;
+                if operand.is_null() || value.is_null() {
+                    false
+                } else {
+                    compare_datums(operand, &value)?.is_eq()
+                }
+            }
+            None => {
+                let cond = eval_expr_with_row(when, schema, row)?;
+                truthy(&cond).unwrap_or(false)
+            }
+        };
+        if matched {
+            return eval_expr_with_row(then, schema, row);
+        }
+    }
+    match &expr.else_expr {
+        Some(else_expr) => eval_expr_with_row(else_expr, schema, row),
+        None => Ok(Datum::Null),
+    }
+}
+
 fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let value = eval_expr_with_row(&expr.expr, schema, row)?;
     let low = eval_expr_with_row(&expr.low, schema, row)?;
@@ -1418,7 +1452,7 @@ fn expr_overflow_label(expr: &ExprNode) -> String {
     }
 }
 
-fn truthy(d: &Datum) -> Option<bool> {
+pub fn truthy(d: &Datum) -> Option<bool> {
     if d.is_null() {
         return None;
     }

@@ -12,10 +12,10 @@ use crate::ast::dml::{
     SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
-    BetweenExpr, BinaryOpExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
-    InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
-    UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFuncExpr,
-    WindowSpec,
+    BetweenExpr, BinaryOpExpr, CaseExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
+    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr,
+    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec,
+    WindowFrameUnits, WindowFuncExpr, WindowSpec,
 };
 use crate::ast::misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
@@ -5431,6 +5431,16 @@ fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, Sele
         } => {
             let tp = map_set_opr(*op, *set_quantifier)?;
             let (first, mut rest) = flatten_set_expr(left)?;
+            // `a UNION (b UNION ALL c)` is not the same left-deep chain as
+            // `a UNION b UNION ALL c`. Keep a parenthesized set-op group as an
+            // isolated operand whenever its grouping changes the set algebra.
+            if let SetExpr::Query(group) = right.as_ref()
+                && matches!(group.body.as_ref(), SetExpr::SetOperation { .. })
+                && set_group_needs_isolation(tp, group.body.as_ref())
+            {
+                rest.push((tp, isolate_setopr_group(group)?));
+                return Ok((first, rest));
+            }
             let (right_first, right_rest) = flatten_set_expr(right)?;
             rest.push((tp, right_first));
             rest.extend(right_rest);
@@ -5438,6 +5448,102 @@ fn flatten_set_expr(expr: &SetExpr) -> Result<(SelectStmt, Vec<(SetOprType, Sele
         }
         _ => Ok((lower_set_operand(expr)?, Vec::new())),
     }
+}
+
+/// Whether a parenthesized set-op operand must keep its own grouping scope.
+///
+/// Union-all is associative, so `a UNION ALL (b UNION ALL c)` may flatten.
+/// Any distinct operator (UNION / EXCEPT / INTERSECT) breaks associativity and
+/// the parenthesized group is lowered to a synthetic derived CTE instead.
+fn set_group_needs_isolation(outer: SetOprType, body: &SetExpr) -> bool {
+    !matches!(outer, SetOprType::UnionAll) || set_body_has_distinct(body)
+}
+
+fn set_body_has_distinct(expr: &SetExpr) -> bool {
+    match expr {
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => {
+            !matches!(map_set_opr(*op, *set_quantifier), Ok(SetOprType::UnionAll))
+                || set_body_has_distinct(left)
+                || set_body_has_distinct(right)
+        }
+        SetExpr::Query(query) => set_body_has_distinct(query.body.as_ref()),
+        _ => false,
+    }
+}
+
+/// Lower a parenthesized set operation as a standalone arm by folding it into a
+/// derived CTE (`SELECT * FROM __sealdb_setopr_N`), so the executor evaluates
+/// the group before the enclosing operator sees its rows. The group's own WITH
+/// stays scoped to its arms (e.g. `UNION (WITH cte2 AS … SELECT …)`).
+fn isolate_setopr_group(query: &Query) -> Result<SelectStmt> {
+    if query.order_by.is_some() {
+        return Err(Error::unsupported(
+            "ORDER BY on a parenthesized set operation",
+        ));
+    }
+    let set = lower_set_opr(query)?;
+    let group_with = lower_with(query.with.as_ref())?;
+    let name = next_setopr_group_name();
+    let mut seed = set.first;
+    let mut rest = set.rest;
+    if let Some(with) = group_with {
+        if seed.with.is_none() {
+            seed.with = Some(with.clone());
+        }
+        for (_, arm) in rest.iter_mut() {
+            if arm.with.is_none() {
+                arm.with = Some(with.clone());
+            }
+        }
+    }
+    let cte = CommonTableExpression {
+        name: name.clone(),
+        query: Box::new(seed),
+        col_name_list: Vec::new(),
+        recursive: None,
+        set_rest: rest,
+        // TiDB merges parenthesized set operations into the enclosing plan.
+        materialize: CteMaterialize::NotMaterialized,
+        limit: set.limit,
+        offset: set.offset,
+    };
+    Ok(SelectStmt {
+        fields: vec![SelectField {
+            expr: ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(b"*".to_vec()),
+            }),
+            as_name: None,
+            orig_text: None,
+        }],
+        from: Some(TableName::new(None, name)),
+        joins: Vec::new(),
+        from_item: None,
+        selection: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        lock: SelectLock::None,
+        lock_wait: SelectLockWait::Block,
+        with: Some(WithClause {
+            is_recursive: false,
+            ctes: vec![cte],
+        }),
+        text: String::new(),
+    })
+}
+
+fn next_setopr_group_name() -> String {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("__sealdb_setopr_{n}")
 }
 
 /// Peel parenthesized `Query` wrappers so `(SELECT …)` and
@@ -7179,9 +7285,6 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         }
         Expr::Exists { subquery, negated } => {
             let query = lower_result_set(subquery)?;
-            if query.has_join() {
-                return Err(Error::unsupported("subquery JOIN"));
-            }
             Ok(ExprNode::Exists(ExistsExpr {
                 not: *negated,
                 query: Box::new(query),
@@ -7253,6 +7356,30 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 ci: true,
             }))
         }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => Ok(ExprNode::Case(CaseExpr {
+            operand: operand
+                .as_ref()
+                .map(|operand| lower_expr(operand).map(Box::new))
+                .transpose()?,
+            when_then: conditions
+                .iter()
+                .map(|when| {
+                    Ok((
+                        lower_expr(&when.condition)?,
+                        lower_expr(&when.result)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_expr: else_result
+                .as_ref()
+                .map(|branch| lower_expr(branch).map(Box::new))
+                .transpose()?,
+        })),
         Expr::IsNull(expr) => Ok(ExprNode::IsNull(IsNullExpr {
             expr: Box::new(lower_expr(expr)?),
             not: false,
@@ -7263,9 +7390,6 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         })),
         Expr::Subquery(subquery) => {
             let query = lower_result_set(subquery)?;
-            if query.has_join() {
-                return Err(Error::unsupported("subquery JOIN"));
-            }
             Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {
                 query: Box::new(query),
             }))
@@ -7728,9 +7852,6 @@ fn lower_quantified_cmp(
             )));
         }
     };
-    if query.has_join() {
-        return Err(Error::unsupported("subquery JOIN"));
-    }
     let expr = lower_expr(left)?;
     let op = lower_binary_op(compare_op)?;
     match (all, op) {

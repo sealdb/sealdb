@@ -298,11 +298,25 @@ fn probe_anti(
 }
 
 /// Concatenate every left row with every right row (CROSS JOIN / comma join).
+///
+/// TiDB scans the smaller join side into the hash table (build) and lets the
+/// other side (probe) drive the output loop; bucket chains are prepended, so
+/// matched build rows come back in reverse insertion order. With equal sizes
+/// the inner/right side is the build side.
 fn probe_cross(left_rows: &[Vec<Datum>], right_rows: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
     let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
-    for left in left_rows {
+    let build_is_left = left_rows.len() < right_rows.len();
+    if build_is_left {
         for right in right_rows {
-            out.push(concat_row(left, right));
+            for left in left_rows.iter().rev() {
+                out.push(concat_row(left, right));
+            }
+        }
+    } else {
+        for left in left_rows {
+            for right in right_rows.iter().rev() {
+                out.push(concat_row(left, right));
+            }
         }
     }
     out

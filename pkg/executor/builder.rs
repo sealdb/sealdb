@@ -847,6 +847,20 @@ fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
             find_table_in_expr(&l.expr, table).or_else(|| find_table_in_expr(&l.pattern, table))
         }
         ExprNode::IsNull(i) => find_table_in_expr(&i.expr, table),
+        ExprNode::Case(c) => c
+            .operand
+            .as_ref()
+            .and_then(|operand| find_table_in_expr(operand, table))
+            .or_else(|| {
+                c.when_then.iter().find_map(|(when, then)| {
+                    find_table_in_expr(when, table).or_else(|| find_table_in_expr(then, table))
+                })
+            })
+            .or_else(|| {
+                c.else_expr
+                    .as_ref()
+                    .and_then(|branch| find_table_in_expr(branch, table))
+            }),
         ExprNode::Window(w) => w.args.iter().find_map(|arg| find_table_in_expr(arg, table)),
         ExprNode::Column(_) | ExprNode::Value(_) => None,
     }

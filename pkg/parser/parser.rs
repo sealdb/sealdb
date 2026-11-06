@@ -1383,14 +1383,21 @@ mod tests {
             }
             other => panic!("expected SetOprStmt, got {other:?}"),
         }
+        // A parenthesized set-op group keeps its own scope: the group lowers to
+        // a derived CTE so the enclosing UNION reads its deduplicated rows
+        // instead of flattening into `a UNION b UNION c`.
         match parser
             .parse_one_stmt("SELECT 1 UNION (SELECT 2 UNION SELECT 3)")
             .unwrap()
         {
             crate::ast::Statement::SetOpr(set) => {
-                assert_eq!(set.rest.len(), 2);
+                assert_eq!(set.rest.len(), 1);
                 assert_eq!(set.rest[0].0, crate::ast::SetOprType::Union);
-                assert_eq!(set.rest[1].0, crate::ast::SetOprType::Union);
+                let arm = &set.rest[0].1;
+                let with = arm.with.as_ref().expect("grouped set op arm WITH");
+                assert_eq!(with.ctes.len(), 1);
+                assert!(with.ctes[0].name.starts_with("__sealdb_setopr_"));
+                assert_eq!(with.ctes[0].set_rest.len(), 1);
             }
             other => panic!("expected SetOprStmt, got {other:?}"),
         }

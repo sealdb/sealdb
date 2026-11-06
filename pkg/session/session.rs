@@ -2602,6 +2602,18 @@ fn qualify_tables_in_expr(
             qualify_tables_in_expr(&mut l.pattern, schema, cte_names);
         }
         ExprNode::IsNull(i) => qualify_tables_in_expr(&mut i.expr, schema, cte_names),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &mut c.operand {
+                qualify_tables_in_expr(operand, schema, cte_names);
+            }
+            for (when, then) in &mut c.when_then {
+                qualify_tables_in_expr(when, schema, cte_names);
+                qualify_tables_in_expr(then, schema, cte_names);
+            }
+            if let Some(branch) = &mut c.else_expr {
+                qualify_tables_in_expr(branch, schema, cte_names);
+            }
+        }
         ExprNode::Window(w) => {
             for arg in &mut w.args {
                 qualify_tables_in_expr(arg, schema, cte_names);
@@ -2789,6 +2801,18 @@ fn rewrite_merged_view_cols(
             rewrite_merged_view_cols(&mut l.pattern, view_name, mapping);
         }
         ExprNode::IsNull(i) => rewrite_merged_view_cols(&mut i.expr, view_name, mapping),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &mut c.operand {
+                rewrite_merged_view_cols(operand, view_name, mapping);
+            }
+            for (when, then) in &mut c.when_then {
+                rewrite_merged_view_cols(when, view_name, mapping);
+                rewrite_merged_view_cols(then, view_name, mapping);
+            }
+            if let Some(branch) = &mut c.else_expr {
+                rewrite_merged_view_cols(branch, view_name, mapping);
+            }
+        }
         ExprNode::Window(w) => {
             for arg in &mut w.args {
                 rewrite_merged_view_cols(arg, view_name, mapping);
