@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（R2 `explain_union_scan` Mem+TiKV 已绿）  
+> 最后更新：2026-11-06（EXPLAIN 树形续列统一；green 11 套件 Mem+TiKV 复验通过）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -96,6 +96,15 @@
 | Shuffle by partition NDV | concurrency=min(var,NDV) | skip Shuffle when NDV≤1 | `window_function` → `green` |
 | VIEW MERGE + single-side ON | null-reject CARTESIAN | merge view；ON push；SHOW WARNINGS | `null_rejected` → `green` |
 | row_number − col Projection | minus(Column#N, t.x) | window outer Binary + default rows frame | select window EXPLAIN 回归修复 |
+
+### 2.0c EXPLAIN 树形续列统一（2026-11-06）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 续列推导 | `│` 只随祖先「仍有后续兄弟」延伸 | `walk_with_parent` 统一按 `!last` 追加，删除分支特判 | select / subquery / explain_union_scan brief 树形全对齐 |
+| 合成 Projection | StreamAgg+ORDER BY 上方补 `Projection` 层 | 递归时携带该层续列 | `count(a) … order by a limit 1` 缩进对齐 |
+| Apply 外行放大 | 只在 probe 相关子树生效 | 穿过 Hash/Merge/IndexJoin 时重置为 1.0 | subquery TableRangeScan est 5.00 |
+| Gate B 复验 | green 11 套件 | manifest 不变 | `--status green` Mem=11 / TiKV=11 全 PASS |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
