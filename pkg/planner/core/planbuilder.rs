@@ -4948,7 +4948,7 @@ fn partitioned_table_reader(
     let (db, table) = from.qualified(current_db);
     let table_stats = stats
         .and_then(|h| h.table(&db, &table))
-        .filter(|t| t.version > 0);
+        .filter(|t| super::plan_cost::has_real_stats(t));
     let stats_pseudo = table_stats.is_none();
     // TiDB derives the filtered cardinality from the prune ranges; exact
     // value counts give the same estimate for range-partitioned scans.
