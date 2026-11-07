@@ -782,6 +782,21 @@ impl Session {
 
     fn acquire_mdl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
         let (keys, exclusive) = mdl_targets(stmt, current_db);
+        // MySQL: a session holding `LOCK TABLES … READ` cannot write the table.
+        if is_write_stmt(stmt) {
+            for key in &keys {
+                if self
+                    .domain
+                    .session_read_locks_table(self.session_id, key)
+                {
+                    let table = key.rsplit('.').next().unwrap_or(key);
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_TABLE_NOT_LOCKED_FOR_WRITE,
+                        format!("Table '{table}' was locked with a READ lock and can't be updated"),
+                    ));
+                }
+            }
+        }
         for key in keys {
             if key.ends_with('.') || key.starts_with('.') {
                 continue;

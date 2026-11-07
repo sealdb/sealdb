@@ -269,6 +269,16 @@ impl Domain {
         }
     }
 
+    /// True when `session_id` holds a `LOCK TABLES … READ` entry for the table.
+    pub fn session_read_locks_table(&self, session_id: u64, table_key: &str) -> bool {
+        self.table_locks
+            .lock()
+            .expect("domain table locks")
+            .held
+            .get(table_key)
+            .is_some_and(|(holder, write)| *holder == session_id && !*write)
+    }
+
     /// True when `session_id` currently holds a LOCK TABLES entry.
     pub fn session_holds_table_lock(&self, session_id: u64, table_key: &str) -> bool {
         self.table_locks
