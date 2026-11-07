@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-07 18:50 (+08:00)
+> 生成时间：2026-11-07 19:10 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **24 个** 做到 1:1 金样对齐并在**内存引擎**上全绿（今日复验 `PASS: memory=24`）；R1 已收口，R2 完成 15/22，R3 完成 5/48 并正在主攻分区与 EXPLAIN 形状；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **25 个** 做到 1:1 金样对齐并在**内存引擎**上全绿（今日复验 `PASS: memory=25`）；R1 已收口，R2 完成 15/22，R3 完成 6/48 并正在主攻分区与 EXPLAIN 形状；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
 
 ---
 
@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **24 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 24 | 9.4% |
-| `in_progress` | 30 | 11.8% |
+| `green` | 25 | 9.8% |
+| `in_progress` | 29 | 11.4% |
 | `pending` | 190 | 74.8% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -34,7 +34,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **24 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 15 | 6 | 1 | 主波完成 ~68% |
-| R3（point_get / index / partition / explain*） | 5 | 24 | 19 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 6 | 23 | 19 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 0 | 0 | 12 | 未开工 |
 | R6 | 0 | 0 | 35 | 未开工 |
@@ -44,22 +44,22 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **24 个** �
 
 ---
 
-## 3. 已绿 suite 清单（24）
+## 3. 已绿 suite 清单（25）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_pushdown`, `window_function` |
-| R3 | `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `explain-non-select-stmt`, `globalindex/point_get` |
+| R3 | `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `explain-non-select-stmt`, `globalindex/point_get` |
 
 **复验证据**
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory --status green
-→ PASS: memory=24 tikv=0 skipped=230
+→ PASS: memory=25 tikv=0 skipped=229
 ```
 
-TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），24 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=24 skipped=230`）。
+TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），25 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=25 skipped=229`）。
 
 ---
 
@@ -82,9 +82,8 @@ TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not 
 | `e712298` | 查询引用 `_tidb_rowid` 时的隐藏列投影（TableReader / IndexLookUp） |
 | `d95740a` | 唯一键 LEFT JOIN 上的 `count(*)` 走覆盖索引单表计数 |
 | `92e64dd` | 分区表跳过同步 auto-analyze（对齐 TiDB 异步分区统计） |
-| `executor/partition/table` | 由上述能力合并转绿（Mem + TiKV 双过） |
 
-非提交的在研改动（17 文件，+473/−33）与 `executor/partition/issues` 相关：
+`executor/partition/issues` 相关的分区能力（已随本轮提交落地）：
 
 - `INSERT ... PARTITION (p0,p1)` 目标分区过滤 + `INSERT IGNORE` 下 warning `1748` / 去重 `1062`（`pkg/executor/insert.rs`、`errcode/errname`）。
 - 无符号 BIGINT 分区键：`Datum::U64` 按有符号位模式哈希；`hash_conjunction_range` 用 `i128` 承接 `i64::MAX+1` 边界值（`pkg/meta/model/partition.rs`）。
@@ -94,26 +93,23 @@ TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not 
 
 ---
 
-## 5. 当前主攻：`executor/partition/issues`（R3）
+## 5. 刚收口的 R3 套件
 
-`executor/partition/table` 已收口转绿；下方为 `issues` 剩余差异。
+| Suite | 收口要点 |
+|---|---|
+| `executor/partition/issues` | 自连接派生谓词、空表 ANALYZE 仍为 pseudo、整域 `BETWEEN` 折叠为裸 `TableFullScan`、`inl_join(c)` 的 IndexJoin 形状、`desc` 的 `_N` 编号、`partition:p2` 裁剪 |
+| `executor/partition/table` | `EXCHANGE PARTITION ... WITH TABLE` 语法与元数据换 ID、`_tidb_rowid` 隐藏列投影、唯一键 LEFT JOIN 的 `count(*)` 覆盖索引简化、分区表异步 auto-analyze、`SET GLOBAL tidb_partition_prune_mode` |
+| `executor/partition/partition_boundaries` | `BETWEEN`/`IN` 下沉与折叠、`NOT` 绑定、`partition:dual`、value-counts 选择性 |
+| `executor/partition/partition_with_expression` | 表达式分区键、字符串/数值强转、HASH 分区范围裁剪 |
 
-该 suite 已从早期大面积错误推进到只剩 3 类差异：
-
-| # | 差异 | 目标形状 |
-|---|---|---|
-| 1 | 自连接 + `GROUP BY t1.col1, t2.col1` | 期望 `HashAgg(group by:uk_hp16726.col1 ×2, funcs:firstrow(...) ×2)` 直接套在 `HashJoin` 上；当前多出外层 `Projection` 与 `funcs:count(Column#10)->Column#5`、`group by:select.t1.col1` |
-| 2 | `/*+ inl_join(c) */` 连接分区表 `c` | 期望 `IndexJoin_2x`，outer key 来自 `t`，inner 为 `TableReader(partition:all) ⊃ Selection ⊃ TableRangeScan(range: decided by [...])`；当前回落为 `HashJoin` |
-| 3 | `EXPLAIN` 节点编号与前缀 | 期望 `TableReader_6 ⊃ TableRangeScan_5`、`TableReader_7 ⊃ Selection_6 ⊃ TableFullScan_5`；当前统一 `_1/_2/_3`。同时 `BETWEEN i64::MIN AND i64::MAX` 应退化为 `TableFullScan`（无 Selection），`KEY` 分区无符号边界期望 `partition:p2` |
-
-其余 `executor/partition/table`、`executor/partition/write` 同为 R3 在研，紧随其后。
+下一个分区目标是 `executor/partition/write`（INSERT/UPDATE/DELETE 的分区写入路径与 EXPLAIN 子计划）。
 
 ---
 
 ## 6. R2 剩余与 R3 队列
 
 - **R2 在研（6）**：`cte`, `explain_cte`, `topn_push_down`, `planner/core/join_reorder2`, `planner/core/join_reorder_through_projection`, `planner/core/casetest/rule/rule_derive_topn_from_window`
-- **R3 在研（24）**：`access_path_selection`, `clustered_index`, `executor/batch_point_get`, `executor/explain`, `executor/index_merge_reader`, `executor/partition/{issues,write}`, `executor/point_get`, `explain`, `explain_complex`, `explain_complex_stats`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `index_merge`, `planner/core/point_get_plan`, `planner/core/casetest/point_get_plan`
+- **R3 在研（23）**：`access_path_selection`, `clustered_index`, `executor/batch_point_get`, `executor/explain`, `executor/index_merge_reader`, `executor/partition/write`, `executor/point_get`, `explain`, `explain_complex`, `explain_complex_stats`, `explain_easy`, `explain_easy_stats`, `explain_foreign_key`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `index_merge`, `planner/core/point_get_plan`, `planner/core/casetest/point_get_plan`
 
 策略：优先吃「同一根因能一次带绿多套」的项——EXPLAIN 节点编号/树形、IndexJoin hint、Point_Get/IndexMerge 统计形状。
 
@@ -143,8 +139,8 @@ TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not 
 
 ## 9. 下一步（有序队列）
 
-1. `executor/partition/issues`：修 HashAgg 形状（第 5 节 #1）→ IndexJoin hint（#2）→ EXPLAIN 编号/退化扫描（#3），Mem + TiKV 双过后升 `green`。
-2. `executor/partition/write`。
+1. `executor/partition/write`：EXCHANGE PARTITION / 分区写入路径对齐后升 `green`。
+2. `executor/partition/{batch_point_get,point_get,index_merge_reader}`。
 3. `explain_*` 家族与 `point_get` 家族（EXPLAIN 编号与统计形状一次带绿多套）。
 4. 回到 R2 剩余 `cte` / `explain_cte` / `topn_push_down` / `join_reorder*`。
 5. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
