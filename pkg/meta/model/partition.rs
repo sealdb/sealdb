@@ -127,7 +127,8 @@ impl PartitionInfo {
     pub fn locate(&self, value: &Datum) -> Result<i64> {
         match self.tp {
             PartitionType::Range => self.locate_range(value),
-            PartitionType::Hash | PartitionType::Key => self.locate_hash(value),
+            PartitionType::Hash => self.locate_hash(value),
+            PartitionType::Key => self.locate_key(value),
             PartitionType::List => self.locate_list(value),
         }
     }
@@ -173,6 +174,22 @@ impl PartitionInfo {
         let n = self.definitions.len() as i64;
         let idx = (v % n).unsigned_abs();
         Ok(self.definitions[idx as usize].id)    }
+
+    /// TiDB `KEY` partitioning: MD5 of the key value, first 8 digest bytes as
+    /// a big-endian `u64`, then `% partitions`. Distinct from HASH (modulo of
+    /// the raw value), so `9223372036854775807` and `9223372036854775808`
+    /// both land in `p2` of five.
+    fn locate_key(&self, value: &Datum) -> Result<i64> {
+        if self.definitions.is_empty() {
+            return Err(no_partition());
+        }
+        if matches!(value, Datum::Null) {
+            return Ok(self.definitions[0].id);
+        }
+        let idx = super::key_hash::key_partition_index(value, self.definitions.len())
+            .ok_or_else(no_partition)?;
+        Ok(self.definitions[idx].id)
+    }
 
     /// Lexicographic RANGE COLUMNS compare: the first bound the row is strictly
     /// less than (MAXVALUE is +inf) is the partition.
@@ -283,7 +300,7 @@ impl PartitionInfo {
     /// fewer values than there are partitions, enumerate every value in the
     /// range and collect the hash targets (`a >= 4 and a <= 5` → p0,p1).
     fn hash_conjunction_range(&self, expr: &ExprNode) -> Option<Vec<i64>> {
-        if !matches!(self.tp, PartitionType::Hash) {
+        if !matches!(self.tp, PartitionType::Hash | PartitionType::Key) {
             return None;
         }
         let mut low: Option<(i128, bool)> = None;
