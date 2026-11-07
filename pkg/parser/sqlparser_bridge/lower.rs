@@ -181,6 +181,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                         .specs
                         .push(AlterTableSpec::DropPartition { if_exists, names });
                 }
+                AlterPartOp::Exchange { partition, table } => {
+                    alter
+                        .specs
+                        .push(AlterTableSpec::ExchangePartition { partition, table });
+                }
             }
         }
         if let Statement::Prepare(prepare) = &mut lowered
@@ -4837,6 +4842,7 @@ fn lower_explain_format(
 enum AlterPartOp {
     Add(Vec<PartitionDef>),
     Drop { if_exists: bool, names: Vec<String> },
+    Exchange { partition: String, table: TableName },
 }
 
 /// sqlparser MySQL dialect rejects `ADD/DROP PARTITION`; strip and re-attach.
@@ -4912,6 +4918,41 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                         out.push_str("ALGORITHM=INPLACE");
                         ops.push(Some(AlterPartOp::Drop { if_exists, names }));
                         i = j;
+                        continue;
+                    }
+                }
+                if keyword_at(bytes, after_name, "EXCHANGE") {
+                    let after_exchange = skip_ws(bytes, after_name + "EXCHANGE".len());
+                    if keyword_at(bytes, after_exchange, "PARTITION") {
+                        let mut j = skip_ws(bytes, after_exchange + "PARTITION".len());
+                        let (partition, next) = read_ident(bytes, j);
+                        if partition.is_empty() {
+                            return Err(Error::unsupported("EXCHANGE PARTITION without name"));
+                        }
+                        j = skip_ws(bytes, next);
+                        if !keyword_at(bytes, j, "WITH") {
+                            return Err(Error::unsupported("EXCHANGE PARTITION WITHOUT WITH"));
+                        }
+                        j = skip_ws(bytes, j + "WITH".len());
+                        if !keyword_at(bytes, j, "TABLE") {
+                            return Err(Error::unsupported("EXCHANGE PARTITION without TABLE"));
+                        }
+                        j = skip_ws(bytes, j + "TABLE".len());
+                        let (first, next) = read_ident(bytes, j);
+                        if first.is_empty() {
+                            return Err(Error::unsupported("EXCHANGE PARTITION without table"));
+                        }
+                        let mut table = TableName::new(None, first);
+                        j = skip_ws(bytes, next);
+                        if j < bytes.len() && bytes[j] == b'.' {
+                            let (second, next) = read_ident(bytes, skip_ws(bytes, j + 1));
+                            table = TableName::new(Some(table.name), second);
+                            j = next;
+                        }
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Exchange { partition, table }));
+                        i = skip_ws(bytes, j);
                         continue;
                     }
                 }

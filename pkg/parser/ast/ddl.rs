@@ -687,6 +687,11 @@ pub enum AlterTableSpec {
         if_exists: bool,
         names: Vec<String>,
     },
+    /// `EXCHANGE PARTITION p WITH TABLE t`.
+    ExchangePartition {
+        partition: String,
+        table: TableName,
+    },
 }
 
 impl AlterTableSpec {
@@ -825,6 +830,12 @@ impl AlterTableSpec {
                     ctx.write_name(name);
                 }
                 Ok(())
+            }
+            AlterTableSpec::ExchangePartition { partition, table } => {
+                ctx.write_str("EXCHANGE PARTITION ");
+                ctx.write_name(partition);
+                ctx.write_str(" WITH TABLE ");
+                table.restore(ctx)
             }
         }
     }
