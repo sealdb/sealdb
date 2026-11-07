@@ -86,6 +86,18 @@ impl ExecutorBuilder {
                     let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
                     return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
                 }
+                // GLOBAL index aggregation puts a placeholder cast/rename
+                // Projection between the HashAgg and the index reader. Only the
+                // aggregate executor evaluates the aggregate arguments against
+                // the reader's rows, so drop the projection entirely.
+                if is_explain_only_projection(exprs)
+                    && select
+                        .fields
+                        .iter()
+                        .any(|field| matches!(&field.expr, ExprNode::Func(func) if crate::aggfuncs::is_agg_name(&func.name)))
+                {
+                    return Ok(child_exec);
+                }
                 let (exprs, names) = expand_projection_fields(select, &from_cols);
                 let mut exec = ProjectionExec::new(exprs, names, child_exec);
                 if select.fields.iter().any(|field| field.expr.has_subquery()) {

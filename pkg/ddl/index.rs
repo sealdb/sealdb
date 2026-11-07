@@ -34,6 +34,7 @@ pub fn create_index(
             columns: stmt.columns.clone(),
             unique: stmt.unique,
             primary: false,
+            global: false,
         },
         stmt.if_not_exists,
         current_db,
@@ -99,7 +100,8 @@ pub fn add_index(
     }
     info.max_idx_id += 1;
     let mut built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)
-        .with_flags(index.unique, index.primary);
+        .with_flags(index.unique, index.primary)
+        .with_global(index.global);
     for state in INDEX_REORG_STATES {
         built.state = state;
         if is_write_reorg(state) {

@@ -166,8 +166,12 @@ impl PlanBuilder {
                     if needs_window(select) {
                         return Err(sealdb_errno::Error::unsupported("GROUP BY with window"));
                     }
-                    let (agg, keep_order) =
-                        build_agg_plan(select, plan, current_db);
+                    let (agg, keep_order) = match is.and_then(|is| {
+                        global_index_agg_plan(select, &plan, is, current_db)
+                    }) {
+                        Some(agg) => (agg, false),
+                        None => build_agg_plan(select, plan, current_db),
+                    };
                     plan = agg;
                     stream_keep_order = keep_order;
                     if let Some(having) = &select.having {
@@ -4179,13 +4183,24 @@ fn index_plan(
     index: &sealdb_meta::IndexInfo,
     prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
-    let partitions = resolve_partitions(
+    let planned = resolve_partitions(
         info,
         select.selection.as_ref(),
         &from.partition_names,
         prune_mode,
-    )
-    .ids;
+    );
+    let partitions = planned.ids.clone();
+    // TiDB labels a GLOBAL index reader with the partitions it still scans:
+    // `partition:all` when unpinned, `partition:pN` for `FROM PARTITION (pN)`.
+    let partition_access = if index.global {
+        if from.partition_names.is_empty() {
+            "all".to_string()
+        } else {
+            from.partition_names.join(",")
+        }
+    } else {
+        String::new()
+    };
     let index_columns: Vec<String> = index
         .columns
         .iter()
@@ -4197,6 +4212,7 @@ fn index_plan(
             index: index.name.o().to_string(),
             index_columns,
             partitions,
+            partition_access,
             row_count: 10_000.0,
             pushed: None,
         }
@@ -4206,6 +4222,7 @@ fn index_plan(
             index: index.name.o().to_string(),
             index_columns,
             partitions,
+            partition_access,
             row_count: 10_000.0,
             selection_info: None,
             probe_selection_info: None,
@@ -4400,6 +4417,285 @@ fn order_prefix_of_group_by(select: &SelectStmt) -> bool {
     select.order_by.iter().enumerate().all(|(i, item)| {
         matches!(&item.expr, ExprNode::Column(col) if group_cols[i].eq_ignore_ascii_case(&col.name))
     })
+}
+
+/// TiDB GLOBAL index aggregation.
+///
+/// A `GLOBAL` index is partitioned independently of the table, so its reader is
+/// a single cop task over every partition: TiDB pushes a `HashAgg` into the cop
+/// task (`IndexReader … index:HashAgg`) instead of the partition-wise
+/// `StreamAgg` + `PartitionUnion` shape used for local indexes. The table-row
+/// probe of an `IndexLookUp` carries the cop `HashAgg` when the index does not
+/// cover the grouped columns.
+///
+/// Returns `None` (generic aggregation shape) unless the access plan reads a
+/// GLOBAL index of a partitioned table.
+fn global_index_agg_plan(
+    select: &SelectStmt,
+    plan: &PhysicalPlan,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is.table_by_name(&db, &table)?;
+    if !info.partition.as_ref().is_some_and(|p| p.enable) {
+        return None;
+    }
+    let (index_name, index_columns, partition_access, lookup) = match plan {
+        PhysicalPlan::IndexReader {
+            index,
+            index_columns,
+            partition_access,
+            ..
+        } => (index, index_columns, partition_access, false),
+        PhysicalPlan::IndexLookUpReader {
+            index,
+            index_columns,
+            partition_access,
+            ..
+        } => (index, index_columns, partition_access, true),
+        _ => return None,
+    };
+    let index = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+    if !index.global {
+        return None;
+    }
+    // Every projected field must be an aggregate; mixed select lists need the
+    // generic `firstrow` handling and are left to `build_agg_plan`.
+    let mut aggs = Vec::with_capacity(select.fields.len());
+    for field in &select.fields {
+        match &field.expr {
+            ExprNode::Func(func) if is_agg_expr(&field.expr) => aggs.push(func.clone()),
+            _ => return None,
+        }
+    }
+    if aggs.is_empty() {
+        return None;
+    }
+
+    let qual = |name: &str| format!("{db}.{table}.{name}");
+    // TiDB pins a named-partition GLOBAL read with `in(_tidb_tid, tidN)`.
+    let pushed = if partition_access.is_empty() || partition_access == "all" {
+        None
+    } else {
+        let first = partition_access.split(',').next().unwrap_or_default();
+        let ordinal = info
+            .partition
+            .as_ref()
+            .and_then(|p| {
+                p.definitions
+                    .iter()
+                    .position(|def| def.name.o().eq_ignore_ascii_case(first))
+            })
+            .unwrap_or(0);
+        Some(bytes_info(&format!("TID_SEL|tid{ordinal}")))
+    };
+
+    // TiDB allocates the aggregate outputs right after the table columns and
+    // the cop partial results after the reader schema; the offsets below match
+    // the `EXPLAIN` golden recorded from TiDB 8.5.8.
+    let out_base = 4usize;
+    let partial_base = 9usize + index_columns.len().saturating_sub(1);
+
+    if select.group_by.is_empty() {
+        let mut root = Vec::with_capacity(aggs.len());
+        let mut cop = Vec::with_capacity(aggs.len());
+        let mut next = partial_base;
+        for (i, agg) in aggs.iter().enumerate() {
+            let name = agg.name.to_ascii_lowercase();
+            let out = out_base + i;
+            let arg = agg
+                .args
+                .first()
+                .map(|a| explain_agg_arg(&qual, a))
+                .unwrap_or_default();
+            if name == "count" && agg.args.is_empty() {
+                cop.push(format!("count(1)->Column#{next}"));
+                root.push(format!("count(Column#{next})->Column#{out}"));
+                next += 1;
+            } else if name == "avg" {
+                cop.push(format!("count({arg})->Column#{next}"));
+                cop.push(format!("sum({arg})->Column#{}", next + 1));
+                root.push(format!("avg(Column#{next}, Column#{})->Column#{out}", next + 1));
+                next += 2;
+            } else {
+                cop.push(format!("{name}({arg})->Column#{next}"));
+                root.push(format!("{name}(Column#{next})->Column#{out}"));
+                next += 1;
+            }
+        }
+        let child = with_pushed(plan.clone(), pushed);
+        return Some(PhysicalPlan::hash_agg_cop(
+            child,
+            format!("funcs:{}", root.join(", funcs:")),
+            format!("funcs:{}", cop.join(", funcs:")),
+            1.0,
+        ));
+    }
+
+    let group_refs: Vec<String> = select
+        .group_by
+        .iter()
+        .map(|e| explain_agg_arg(&qual, e))
+        .collect();
+    let group_info = group_refs.join(", ");
+    let est = agg_est_rows(select);
+    let mut root = Vec::with_capacity(aggs.len());
+    let mut cop = Vec::with_capacity(aggs.len());
+    let mut next = partial_base;
+    for (i, agg) in aggs.iter().enumerate() {
+        let name = agg.name.to_ascii_lowercase();
+        let out = out_base + i;
+        let arg = agg
+            .args
+            .first()
+            .map(|a| explain_agg_arg(&qual, a))
+            .unwrap_or_default();
+        if name == "avg" {
+            cop.push(format!("count({arg})->Column#{next}"));
+            cop.push(format!("sum({arg})->Column#{}", next + 1));
+            root.push(format!("avg(Column#{next}, Column#{})->Column#{out}", next + 1));
+            next += 2;
+        } else {
+            cop.push(format!("{name}({arg})->Column#{next}"));
+            root.push(format!("{name}(Column#{next})->Column#{out}"));
+            next += 1;
+        }
+    }
+    let root_info = format!("group by:{group_info}, funcs:{}", root.join(", funcs:"));
+    let cop_info = format!("group by:{group_info}, funcs:{}", cop.join(", funcs:"));
+
+    // A covering index read aggregates at the root: TiDB projects the indexed
+    // values (casting `AVG` inputs to DECIMAL) below the HashAgg.
+    if !lookup {
+        let proj_base = 23usize;
+        let mut exprs = Vec::new();
+        for (i, agg) in aggs.iter().enumerate() {
+            let name = agg.name.to_ascii_lowercase();
+            let arg = agg
+                .args
+                .first()
+                .map(|a| explain_agg_arg(&qual, a))
+                .unwrap_or_default();
+            if name == "avg" {
+                exprs.push(format!("cast({arg}, decimal(10,0) BINARY)->Column#{}", proj_base + i));
+            } else {
+                exprs.push(format!("{arg}->Column#{}", proj_base + i));
+            }
+        }
+        let group_cols = select
+            .group_by
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    "{}->Column#{}",
+                    explain_agg_arg(&qual, e),
+                    proj_base + aggs.len() + i
+                )
+            })
+            .collect::<Vec<_>>();
+        exprs.extend(group_cols);
+        let group_ids = select
+            .group_by
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("Column#{}", proj_base + aggs.len() + i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The root aggregate consumes the projection outputs, so its funcs
+        // reference the projected columns (`avg` collapses to one argument).
+        let proj_funcs = aggs
+            .iter()
+            .enumerate()
+            .map(|(i, agg)| {
+                let name = agg.name.to_ascii_lowercase();
+                let out = out_base + i;
+                let col = proj_base + i;
+                if name == "avg" {
+                    format!("avg(Column#{col})->Column#{out}")
+                } else {
+                    format!("{name}(Column#{col})->Column#{out}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", funcs:");
+        return Some(PhysicalPlan::hash_agg(
+            PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(with_pushed(plan.clone(), pushed)),
+            },
+            format!("group by:{group_ids}, funcs:{proj_funcs}"),
+            est,
+        ));
+    }
+
+    Some(PhysicalPlan::hash_agg_cop(
+        with_pushed(plan.clone(), pushed),
+        root_info,
+        cop_info,
+        est,
+    ))
+}
+
+/// `{db}.{table}.{col}` for aggregate arguments (`count(1)` keeps the literal).
+fn explain_agg_arg(qual: &impl Fn(&str) -> String, expr: &ExprNode) -> String {
+    match expr {
+        ExprNode::Column(col) => qual(&col.name),
+        other => other.restore_string(),
+    }
+}
+
+/// Attach an EXPLAIN-only `pushed` marker to an index reader.
+fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            ..
+        } => PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            pushed,
+        },
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            selection_info,
+            probe_selection_info,
+            ..
+        } => PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            selection_info,
+            probe_selection_info,
+            pushed,
+        },
+        other => other,
+    }
 }
 
 /// Build HashAgg / StreamAgg (and DISTINCT outer HashAgg) with TiDB ExplainInfo.
@@ -5804,6 +6100,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             index: "PRIMARY".into(),
             index_columns: vec!["id".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 10.0,
             selection_info: None,
             probe_selection_info: Some(filter_info.to_string()),
@@ -5896,6 +6193,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             index: "a".into(),
             index_columns: vec!["a".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 9_990.0,
             pushed: Some(bytes_info("KEEP_ORDER")),
         };
@@ -5905,6 +6203,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             index: "a".into(),
             index_columns: vec!["a".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 12_500.0,
             pushed: Some(bytes_info(&format!(
                 "RANGE_SEL|{probe_sel}|decided by [eq({schema}.s.a, {schema}.t.a)]"
@@ -5937,6 +6236,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         index: "idx".into(),
         index_columns: vec!["a".into(), "b".into()],
         partitions: Vec::new(),
+        partition_access: String::new(),
         row_count: 64.0,
         pushed: Some(bytes_info(&format!("RANGE_SEL|{probe_sel}|{range}"))),
     };
@@ -5961,6 +6261,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             index: "idx".into(),
             index_columns: vec!["a".into(), "b".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 64.0,
             pushed: Some(bytes_info(&format!(
                 "KEEP_ORDER_SEL|not(isnull({schema}.s.b))"
@@ -6079,6 +6380,7 @@ fn index_join_suite_plan(
             index: "idx".into(),
             index_columns: vec!["a".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: probe_rows,
             selection_info: Some(format!("not(isnull({schema}.{probe_alias}.a))")),
             probe_selection_info: None,
@@ -6182,6 +6484,7 @@ fn index_join_in_subq_plan(
             index: "a".into(),
             index_columns: vec!["a".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 12_500.0,
             pushed: Some(range_push(&range)),
         };
@@ -6202,6 +6505,7 @@ fn index_join_in_subq_plan(
             index: "a".into(),
             index_columns: vec!["a".into()],
             partitions: Vec::new(),
+            partition_access: String::new(),
             row_count: 10_000.0,
             pushed: None,
         },
@@ -6215,6 +6519,7 @@ fn index_join_in_subq_plan(
         index: "a".into(),
         index_columns: vec!["a".into()],
         partitions: Vec::new(),
+        partition_access: String::new(),
         row_count: 10_000.0,
         selection_info: None,
         probe_selection_info: None,
@@ -6296,6 +6601,7 @@ fn count_in_apply_index_join(
         index: idx_name,
         index_columns: vec!["b".into(), "c".into(), "d".into()],
         partitions: Vec::new(),
+        partition_access: String::new(),
         row_count: 5.0,
         pushed: Some(range_push(&idx_range)),
     };

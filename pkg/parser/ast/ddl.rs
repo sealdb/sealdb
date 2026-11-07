@@ -184,6 +184,9 @@ pub struct IndexDef {
     pub columns: Vec<String>,
     pub unique: bool,
     pub primary: bool,
+    /// TiDB `GLOBAL` index option on a partitioned table: the index spans every
+    /// partition instead of being partitioned alongside the table.
+    pub global: bool,
 }
 
 impl IndexDef {
@@ -206,6 +209,11 @@ impl IndexDef {
             ctx.write_name(col);
         }
         ctx.write_str(")");
+        // TiDB `SHOW CREATE TABLE` keeps the GLOBAL option behind a version
+        // comment so MySQL clients ignore it.
+        if self.global {
+            ctx.write_str(" /*T![global_index] GLOBAL */");
+        }
         Ok(())
     }
 }

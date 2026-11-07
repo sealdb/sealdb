@@ -347,6 +347,7 @@ fn index_reader(
         index: index.name.o().to_string(),
         index_columns,
         partitions: partitions.clone(),
+        partition_access: String::new(),
         row_count: 10_000.0,
         pushed: None,
     }

@@ -2024,6 +2024,20 @@ fn rewrite_mysql_version_comments(sql: &str) -> String {
     out
 }
 
+/// Marker smuggled through sqlparser's index `COMMENT` option to record a TiDB
+/// `GLOBAL` index (sqlparser has no GLOBAL index option).
+const GLOBAL_INDEX_MARKER: &str = "sealdb_global_index";
+
+/// True when the index options carry [`GLOBAL_INDEX_MARKER`].
+fn index_def_global(options: &[sqlparser::ast::IndexOption]) -> bool {
+    options.iter().any(|option| {
+        matches!(
+            option,
+            sqlparser::ast::IndexOption::Comment(comment) if comment == GLOBAL_INDEX_MARKER
+        )
+    })
+}
+
 /// Drops TiDB `CREATE TABLE` extension clauses sqlparser rejects:
 /// `PRIMARY KEY (c) CLUSTERED|NONCLUSTERED`, `INDEX (c) GLOBAL` index
 /// options, and `pre_split_regions=N` / `shard_row_id_bits=N` table options.
@@ -2125,8 +2139,12 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                     continue;
                 }
                 // `UNIQUE INDEX idx(id) GLOBAL` — partition-independent index.
+                // sqlparser has no GLOBAL index option, so pass it through as an
+                // index COMMENT marker recovered in `index_def_global`.
                 if word == "global" && out.trim_end().ends_with(')') {
-                    out.push(' ');
+                    out.push_str(" COMMENT '");
+                    out.push_str(GLOBAL_INDEX_MARKER);
+                    out.push('\'');
                     continue;
                 }
                 if OPTIONS.contains(&word.as_str()) {
@@ -7777,6 +7795,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     columns: vec![name],
                     unique: true,
                     primary: true,
+                    global: false,
                 },
             );
         }
@@ -8859,6 +8878,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     columns,
                     unique: false,
                     primary: false,
+                    global: index_def_global(&idx.index_options),
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -8899,6 +8919,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     columns,
                     unique: false,
                     primary: false,
+                    global: index_def_global(&idx.index_options),
                 });
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
@@ -8942,6 +8963,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         columns,
         unique: true,
         primary: false,
+        global: index_def_global(&idx.index_options),
     })
 }
 
@@ -8962,6 +8984,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         columns,
         unique: true,
         primary: true,
+        global: index_def_global(&idx.index_options),
     })
 }
 
