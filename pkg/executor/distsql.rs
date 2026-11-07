@@ -42,6 +42,8 @@ pub struct IndexLookUpExecutor {
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     covering: bool,
+    /// Project TiDB's `_tidb_rowid` (the heap table handle) as an extra column.
+    with_rowid: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -61,6 +63,7 @@ impl IndexLookUpExecutor {
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
         covering: bool,
+        with_rowid: bool,
     ) -> Self {
         Self {
             domain,
@@ -74,6 +77,7 @@ impl IndexLookUpExecutor {
             partitions,
             pushed,
             covering,
+            with_rowid,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -112,6 +116,7 @@ impl Executor for IndexLookUpExecutor {
         } else {
             info.physical_ids()
         };
+        let expose_rowid = self.with_rowid && !info.pk_is_handle;
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
             for physical_id in physical {
@@ -124,25 +129,32 @@ impl Executor for IndexLookUpExecutor {
                     for (key, value) in pairs {
                         let handle = index_handle(&index, &key, &value)?;
                         if self.covering {
-                            rows.push(covering_row(&info, &index, &key, handle)?);
+                            let mut row = covering_row(&info, &index, &key, handle)?;
+                            if expose_rowid {
+                                row.push(Datum::I64(handle));
+                            }
+                            rows.push(row);
                             continue;
                         }
                         let row_key = encode_row_key_with_handle(physical_id, handle);
                         let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
                         if let Some(raw) = raw {
                             let decoded = decode_row(&raw, &info.col_field_types());
-                            rows.push(
-                                info.columns
-                                    .iter()
-                                    .map(|col| {
-                                        decoded
-                                            .iter()
-                                            .find(|(id, _)| *id == col.id)
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or(Datum::Null)
-                                    })
-                                    .collect(),
-                            );
+                            let mut row: Vec<Datum> = info
+                                .columns
+                                .iter()
+                                .map(|col| {
+                                    decoded
+                                        .iter()
+                                        .find(|(id, _)| *id == col.id)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or(Datum::Null)
+                                })
+                                .collect();
+                            if expose_rowid {
+                                row.push(Datum::I64(handle));
+                            }
+                            rows.push(row);
                         }
                     }
                 }
@@ -156,6 +168,9 @@ impl Executor for IndexLookUpExecutor {
                 self.pushed.as_ref(),
             )
         })?;
+        if expose_rowid {
+            self.schema.push("\u{1}_tidb_rowid".to_string());
+        }
         Ok(())
     }
 

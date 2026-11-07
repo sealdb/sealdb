@@ -23,6 +23,8 @@ pub struct TableReaderExec {
     wait: LockWait,
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
+    /// Project TiDB's `_tidb_rowid` (the heap table handle) as an extra column.
+    with_rowid: bool,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
@@ -39,6 +41,7 @@ impl TableReaderExec {
         wait: LockWait,
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
+        with_rowid: bool,
     ) -> Self {
         Self {
             domain,
@@ -49,6 +52,7 @@ impl TableReaderExec {
             wait,
             partitions,
             pushed,
+            with_rowid,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
@@ -90,14 +94,28 @@ impl Executor for TableReaderExec {
         } else {
             info.physical_ids()
         };
+        let scanned = scan_table(&self.txn, &info, self.lock, self.wait, &physical)?;
+        // Heap tables expose the row handle as `_tidb_rowid` when referenced.
+        let expose_rowid = self.with_rowid && !info.pk_is_handle;
         self.rows = filter_rows(
-            scan_table(&self.txn, &info, self.lock, self.wait, &physical)?
+            scanned
                 .into_iter()
-                .map(|row| row.values)
+                .map(|row| {
+                    if expose_rowid {
+                        let mut values = row.values;
+                        values.push(Datum::I64(row.handle));
+                        values
+                    } else {
+                        row.values
+                    }
+                })
                 .collect(),
             &self.schema,
             self.pushed.as_ref(),
         )?;
+        if expose_rowid {
+            self.schema.push("\u{1}_tidb_rowid".to_string());
+        }
         Ok(())
     }
 

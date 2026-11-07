@@ -548,6 +548,10 @@ fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Res
 fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
     // Hidden USING column (`\u{1}t2.a`): only qualified references may bind.
     if let Some(name) = schema_name.strip_prefix('\u{1}') {
+        // Hidden handle column: an unqualified `_tidb_rowid` binds to it.
+        if name.eq_ignore_ascii_case("_tidb_rowid") && col.name.eq_ignore_ascii_case(name) {
+            return true;
+        }
         let col_table = match col.table.as_deref() {
             Some(t) => t,
             None => return false,

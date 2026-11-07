@@ -285,6 +285,7 @@ impl ExecutorBuilder {
                     partitions.clone(),
                     pushed.clone(),
                     covering,
+                    Self::select_references_tidb_rowid(select),
                 )))
             }
             PhysicalPlan::IndexMerge {
@@ -390,6 +391,9 @@ impl ExecutorBuilder {
                 ..
             } => {
                 let from = resolve_reader_table(stmt, table)?;
+                let with_rowid = stmt
+                    .as_select()
+                    .is_some_and(Self::select_references_tidb_rowid);
                 Ok(Box::new(TableReaderExec::new(
                     domain,
                     from,
@@ -399,6 +403,7 @@ impl ExecutorBuilder {
                     stmt_lock_wait(stmt),
                     partitions.clone(),
                     pushed.clone(),
+                    with_rowid,
                 )))
             }
             PhysicalPlan::PartitionUnion { children } => {
@@ -783,6 +788,27 @@ fn select_on_text(select: &sealdb_parser::ast::SelectStmt) -> String {
         from_item_ons(item, &mut out);
     }
     out
+}
+
+/// True when the SELECT list / ORDER BY / WHERE mentions `_tidb_rowid`.
+fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool {
+    fn mentions(expr: &ExprNode) -> bool {
+        match expr {
+            ExprNode::Column(col) => col.name.eq_ignore_ascii_case("_tidb_rowid"),
+            ExprNode::Binary(b) => mentions(&b.left) || mentions(&b.right),
+            ExprNode::Unary(u) => mentions(&u.expr),
+            ExprNode::Func(f) => f.args.iter().any(mentions),
+            ExprNode::Cast(c) => mentions(&c.expr),
+            ExprNode::InList(i) => mentions(&i.expr) || i.list.iter().any(mentions),
+            ExprNode::Between(b) => mentions(&b.expr),
+            _ => false,
+        }
+    }
+    // The handle column is appended as a hidden (`\u{1}`) schema entry, so a
+    // `SELECT *` result never exposes it while ORDER BY can still bind to it.
+    select.fields.iter().any(|f| mentions(&f.expr))
+        || select.order_by.iter().any(|o| mentions(&o.expr))
+        || select.selection.as_ref().is_some_and(mentions)
 }
 
     fn build_hash_join(
