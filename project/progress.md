@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-06（executor/window green；green 16 套件 Mem+TiKV 复验通过）  
+> 最后更新：2026-11-07（green 23 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -1553,6 +1553,7 @@
 ### 2026-11-07
 
 - **Phase**: R3 分区/谓词波
+- **整体快照**: [status-report.md](./status-report.md)（manifest 254 套：green 23 / in_progress 31 / pending 190 / local 8 / deferred 2）
 - **完成**:
   - `executor/partition/partition_boundaries` 1:1 对齐 TiDB 金样（Gate A+B）
   - 统计：窄列（<=10k distinct）保留精确 value counts，分区扫描 selectivity 与 TiDB 一致
@@ -1566,6 +1567,19 @@
   - `local/agg` 在 HEAD 上已红：投影列名头不再带反引号（`name` vs `` `name` ``），属前序 “projection column ids” 改动的本地冒烟金样漂移，未改金样
 - **下一步**:
   - 继续 R2/R3 分区与 planner 套件
+
+### 2026-11-07（`executor/partition/issues` 波）
+
+- **完成**:
+  - 自连接相等键谓词派生：`t1.col1 = t2.col1` + `t1.col1 > k` ⇒ 在 `t2` 上派生镜像谓词（TiDB `pushDownPredicatesForJoin`）；所有权表在 infoschema 里按**物理表**解析，别名侧按“单表子树即拥有全部 ON 列”处理，避免别名误配到其他库同名表
+  - 统计：ANALYZE 后的**空表**仍为 pseudo（`has_real_stats` 需 `version > 0 && count > 0`），EXPLAIN 保留 `10000.00 … stats:pseudo`（`UK_HP16726` 动态裁剪段已对齐）
+  - 谓词折叠：`c BETWEEN T::MIN AND T::MAX` 等整域边界在 NOT NULL 主键列上折叠为裸 `TableFullScan`；支持一元负号字面量与持久的 UNSIGNED flag
+  - `executor/partition/issues` 差分行数 94 → 约 60（8 个 hunk），剩余：`inl_join(c)` IndexJoin（Build/Probe、dynamic prune、decided-by range、`stats:partial`）、`desc` 算子 `_N` 编号、`partition:p2` vs `partition:all`
+- **验证**:
+  - `run-tests.sh -s memory --status green` → PASS: memory=23
+  - `run-tests.sh -s tikv --status green` → PASS: tikv=23
+- **下一步**:
+  - `executor/partition/issues` 的 `inl_join(c)` IndexJoin 形状；再依次 `executor/partition/table`、`executor/partition/write`
 
 ### 2026-11-01
 - **Phase**: 功能波 Unlock + F01
