@@ -4692,6 +4692,14 @@ fn rewrite_explain_format(sql: &str) -> (String, Vec<Option<ExplainFormat>>) {
     let mut formats = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        // Never rewrite inside quoted identifiers or string literals
+        // (`` `a-explain-b` `` must keep its lowercase `explain`).
+        if matches!(bytes[i], b'`' | b'\'' | b'"') {
+            let end = skip_quoted(bytes, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
         let explain_kw = if keyword_at(bytes, i, "EXPLAIN") {
             Some("EXPLAIN")
         } else if keyword_at(bytes, i, "DESCRIBE") {
