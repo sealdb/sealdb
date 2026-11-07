@@ -595,6 +595,8 @@ impl Session {
                 }
                 Some(InsertStmt {
                     table: create.table.clone(),
+                    ignore: false,
+                    partitions: Vec::new(),
                     columns: Vec::new(),
                     rows: Vec::new(),
                     select: Some(select.clone()),
@@ -3454,6 +3456,8 @@ fn load_data_to_insert(
     }
     Ok(InsertStmt {
         table: load.table.clone(),
+        ignore: false,
+        partitions: Vec::new(),
         columns,
         rows,
         select: None,

@@ -4,8 +4,8 @@ use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT,
-    Error, Result,
+    ERR_DUP_ENTRY, ERR_NO_DB, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_NO_SUCH_TABLE,
+    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -101,10 +101,25 @@ impl Executor for InsertExec {
         for values in &mut pending {
             fill_auto_increment(&self.domain, info, values)?;
         }
+        if !self.stmt.partitions.is_empty() {
+            pending = filter_target_partitions(
+                info,
+                &self.stmt.partitions,
+                pending,
+                self.stmt.ignore,
+            )?;
+        }
         if self.stmt.on_duplicate.is_empty() {
+            let ignore = self.stmt.ignore;
             return self.txn.with_txn(|txn| {
                 for values in &pending {
-                    write_row(txn, &self.domain, info, values)?;
+                    match write_row(txn, &self.domain, info, values) {
+                        Ok(_) => {}
+                        Err(e) if ignore && e.code == ERR_DUP_ENTRY => {
+                            sealdb_expression::note_warning(e.code, e.message.clone());
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(())
             });
@@ -269,6 +284,56 @@ fn map_insert_row(
     }
     fill_generated_columns(info, &mut values)?;
     Ok(values)
+}
+
+/// Restrict `INSERT ... PARTITION (p...)` to the named partitions.
+///
+/// TiDB walks each row through the table's partitioning rule; rows whose
+/// physical partition is not in the target list are dropped. `INSERT IGNORE`
+/// turns the skip into `Warning 1748`, plain inserts fail.
+fn filter_target_partitions(
+    info: &sealdb_meta::TableInfo,
+    names: &[String],
+    pending: Vec<Vec<Datum>>,
+    ignore: bool,
+) -> Result<Vec<Vec<Datum>>> {
+    let Some(part) = info.partition.as_ref() else {
+        return Ok(pending);
+    };
+    let mut targets = Vec::with_capacity(names.len());
+    for name in names {
+        let matches: Vec<i64> = part
+            .definitions
+            .iter()
+            .filter(|def| def.name.o().eq_ignore_ascii_case(name))
+            .map(|def| def.id)
+            .collect();
+        if matches.is_empty() {
+            return Err(Error::new(
+                ERR_UNKNOWN_PARTITION,
+                format!("Unknown partition '{name}' in table '{}'", info.name.o()),
+            ));
+        }
+        targets.extend(matches);
+    }
+    let mut kept = Vec::with_capacity(pending.len());
+    for values in pending {
+        let target = locate_partition_for_row(info, &values)?;
+        if targets.contains(&target) {
+            kept.push(values);
+        } else if ignore {
+            sealdb_expression::note_warning(
+                ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+                "Found a row not matching the given partition set".to_string(),
+            );
+        } else {
+            return Err(Error::new(
+                ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+                "Found a row not matching the given partition set",
+            ));
+        }
+    }
+    Ok(kept)
 }
 
 /// Assign `AUTO_INCREMENT` values (TiDB `allocAutoRandomID` / auto-id

@@ -183,9 +183,11 @@ impl TableInfo {
 
     pub fn find_index_covering(&self, column: &str) -> Option<&IndexInfo> {
         let name = column.to_ascii_lowercase();
-        self.indices
-            .iter()
-            .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
+        self.indices.iter().find(|idx| {
+            // Clustered integer PRIMARY KEY is the row handle, not an index path.
+            !(idx.primary && self.pk_is_handle)
+                && idx.columns.first().is_some_and(|col| col.name.l() == name)
+        })
     }
 
     /// Unique index whose only column is `column` — the point-get access path
@@ -193,7 +195,10 @@ impl TableInfo {
     pub fn find_unique_index_on(&self, column: &str) -> Option<&IndexInfo> {
         let name = column.to_ascii_lowercase();
         self.indices.iter().find(|idx| {
-            idx.unique && idx.columns.len() == 1 && idx.columns[0].name.l() == name
+            !(idx.primary && self.pk_is_handle)
+                && idx.unique
+                && idx.columns.len() == 1
+                && idx.columns[0].name.l() == name
         })
     }
 

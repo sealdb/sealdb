@@ -45,6 +45,10 @@ pub const ERR_DUP_FIELDNAME: i32 = 1060;
 pub const ERR_DUP_KEYNAME: i32 = 1061;
 pub const ERR_CANT_DROP_FIELD_OR_KEY: i32 = 1091;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;
+/// MySQL `ER_UNKNOWN_PARTITION`: named partition does not exist (1735).
+pub const ERR_UNKNOWN_PARTITION: i32 = 1735;
+/// TiDB `ErrRowDoesNotMatchGivenPartitionSet` (`INSERT ... PARTITION` skip).
+pub const ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET: i32 = 1748;
 pub const ERR_ACCESS_DENIED_ERROR: i32 = 1045;
 pub const ERR_DBACCESS_DENIED_ERROR: i32 = 1044;
 pub const ERR_TABLEACCESS_DENIED_ERROR: i32 = 1142;

@@ -462,6 +462,10 @@ impl SelectStmt {
 #[derive(Clone, Debug)]
 pub struct InsertStmt {
     pub table: TableName,
+    /// `INSERT IGNORE`: duplicate-key / partition-mismatch errors become warnings.
+    pub ignore: bool,
+    /// `INSERT INTO t PARTITION (p0, p1) ...` — target partition names.
+    pub partitions: Vec<String>,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ExprNode>>,
     pub select: Option<Box<SelectStmt>>,
@@ -475,8 +479,22 @@ impl InsertStmt {
         if let Some(with) = &self.with {
             with.restore(ctx)?;
         }
-        ctx.write_str("INSERT INTO ");
+        ctx.write_str(if self.ignore {
+            "INSERT IGNORE INTO "
+        } else {
+            "INSERT INTO "
+        });
         self.table.restore(ctx)?;
+        if !self.partitions.is_empty() {
+            ctx.write_str(" PARTITION (");
+            for (i, name) in self.partitions.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                ctx.write_name(name);
+            }
+            ctx.write_str(")");
+        }
         if !self.columns.is_empty() {
             ctx.write_str(" (");
             for (i, col) in self.columns.iter().enumerate() {
