@@ -172,6 +172,13 @@ impl ExprNode {
     }
 
     pub fn column_in_consts(&self) -> Option<(String, Vec<Datum>)> {
+        self.column_in_consts_with_len()
+            .map(|(name, values, _)| (name, values))
+    }
+
+    /// Like `column_in_consts`, but also reports the source list length so
+    /// BatchPointGet estRows keeps duplicates (`IN (1,2,3,1,2)` → 5).
+    pub fn column_in_consts_with_len(&self) -> Option<(String, Vec<Datum>, usize)> {
         let ExprNode::InList(list) = self else {
             return None;
         };
@@ -196,7 +203,7 @@ impl ExprNode {
                 values.push(value.datum.clone());
             }
         }
-        Some((col.name.clone(), values))
+        Some((col.name.clone(), values, list.list.len()))
     }
 
     pub fn in_const_on(&self, column: &str) -> Option<Vec<Datum>> {
@@ -204,6 +211,56 @@ impl ExprNode {
             expr.column_in_consts()
                 .and_then(|(name, values)| name.eq_ignore_ascii_case(column).then_some(values))
         })
+    }
+
+    /// `(a, b) IN ((1, 2), (3, 4))`: row column names plus deduped constant
+    /// tuples, and the source list length for BatchPointGet estRows.
+    pub fn row_in_consts_with_len(&self) -> Option<(Vec<String>, Vec<Vec<Datum>>, usize)> {
+        let ExprNode::InList(list) = self else {
+            return None;
+        };
+        if list.not {
+            return None;
+        }
+        let ExprNode::Row(row) = list.expr.as_ref() else {
+            return None;
+        };
+        let mut names = Vec::with_capacity(row.exprs.len());
+        for expr in &row.exprs {
+            let ExprNode::Column(col) = expr else {
+                return None;
+            };
+            names.push(col.name.clone());
+        }
+        if names.is_empty() {
+            return None;
+        }
+        let mut tuples: Vec<Vec<Datum>> = Vec::new();
+        for item in &list.list {
+            let ExprNode::Row(tuple) = item else {
+                return None;
+            };
+            if tuple.exprs.len() != names.len() {
+                return None;
+            }
+            let mut values = Vec::with_capacity(tuple.exprs.len());
+            for expr in &tuple.exprs {
+                let ExprNode::Value(value) = expr else {
+                    return None;
+                };
+                values.push(value.datum.clone());
+            }
+            if !tuples.iter().any(|have| {
+                have.len() == values.len()
+                    && have
+                        .iter()
+                        .zip(values.iter())
+                        .all(|(a, b)| a.compare(b).is_eq())
+            }) {
+                tuples.push(values);
+            }
+        }
+        Some((names, tuples, list.list.len()))
     }
 
     pub fn column_cmp_const(&self) -> Option<(String, Op, Datum)> {

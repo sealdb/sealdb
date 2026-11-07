@@ -346,7 +346,7 @@ impl ExecutorBuilder {
                     })
                 });
                 let lookup = index.as_ref().and_then(|index_name| {
-                    index_lookup_value(
+                    index_lookup_values(
                         &domain,
                         current_db,
                         &from,
@@ -371,22 +371,54 @@ impl ExecutorBuilder {
                 table,
                 column,
                 index,
+                tuple_columns,
+                index_columns,
+                partition_names,
                 ..
             } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
                 let from = resolve_reader_table(stmt, table)?;
-                let lookups = select
-                    .selection
-                    .as_ref()
-                    .and_then(|expr| expr.in_const_on(column))
-                    .ok_or_else(|| Error::unsupported("batch point get without IN list"))?;
+                let selection = select.selection.as_ref();
+                let lookups: Vec<Vec<sealdb_types::Datum>> = if tuple_columns.is_empty() {
+                    selection
+                        .and_then(|expr| expr.in_const_on(column))
+                        .ok_or_else(|| Error::unsupported("batch point get without IN list"))?
+                        .into_iter()
+                        .map(|value| vec![value])
+                        .collect()
+                } else {
+                    let (_, tuples, _) = selection
+                        .and_then(|expr| {
+                            expr.split_cnf()
+                                .into_iter()
+                                .find_map(|item| item.row_in_consts_with_len())
+                        })
+                        .ok_or_else(|| Error::unsupported("batch point get without row IN list"))?;
+                    // Reorder row values into the unique index column order.
+                    tuples
+                        .into_iter()
+                        .map(|tuple| {
+                            index_columns
+                                .iter()
+                                .map(|index_col| {
+                                    tuple_columns
+                                        .iter()
+                                        .position(|col| col.eq_ignore_ascii_case(index_col))
+                                        .and_then(|pos| tuple.get(pos).cloned())
+                                        .unwrap_or(sealdb_types::Datum::Null)
+                                })
+                                .collect()
+                        })
+                        .collect()
+                };
                 Ok(Box::new(BatchPointGetExec::new(
                     domain,
                     from,
                     index.clone(),
                     lookups,
+                    partition_names.clone(),
                     current_db.to_string(),
                     txn,
                     select_row_lock(select),
@@ -1238,13 +1270,13 @@ fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
     }
 }
 
-fn index_lookup_value(
+fn index_lookup_values(
     domain: &Domain,
     current_db: &str,
     table: &sealdb_parser::ast::TableName,
     index_name: &str,
     selection: Option<&ExprNode>,
-) -> Option<sealdb_types::Datum> {
+) -> Option<Vec<sealdb_types::Datum>> {
     let (schema, name) = table.qualified(current_db);
     let is = domain.infoschema();
     let info = is.table_by_name(&schema, &name)?;
@@ -1252,13 +1284,19 @@ fn index_lookup_value(
         .indices
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
-    let column = index.columns.first()?.name.o().to_string();
-    if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
-        return Some(value);
+    let mut values = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        let column = column.name.o();
+        let value = selection
+            .and_then(|expr| expr.eq_const_on(column))
+            .or_else(|| {
+                selection
+                    .and_then(|expr| expr.in_const_on(column))
+                    .and_then(|values| values.into_iter().next())
+            })?;
+        values.push(value);
     }
-    selection
-        .and_then(|expr| expr.in_const_on(&column))
-        .and_then(|values| values.into_iter().next())
+    Some(values)
 }
 
 /// Table factor that owns an index-scan plan node: match the plan's `table`

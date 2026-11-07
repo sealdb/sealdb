@@ -75,6 +75,7 @@ fn push_into(
                     index: None,
                     index_columns: Vec::new(),
                     partition_names,
+                    global_index: false,
                     lock: false,
                 };
             }
@@ -243,9 +244,19 @@ fn push_into(
             index,
             index_columns,
             partition_names,
+            global_index,
             lock,
         } => {
-            let residual = conjuncts
+            // Only the equality on the handle column itself is consumed by a
+            // handle point get (`a = 1 AND b = 1` keeps `b = 1` as a filter).
+            let handle_column = (handle.is_some() && index.is_none())
+                .then(|| {
+                    is.and_then(|is| is.table_by_name(current_db, &table))
+                        .and_then(|info| info.handle_column())
+                        .map(|c| c.name.o().to_string())
+                })
+                .flatten();
+            let mut residual: Vec<ExprNode> = conjuncts
                 .into_iter()
                 .filter(|expr| {
                     // The unique-index equality is already the point get lookup.
@@ -257,9 +268,14 @@ fn push_into(
                     {
                         return false;
                     }
-                    handle.is_none_or(|value| !is_handle_eq(expr, value))
+                    match (&handle_column, handle) {
+                        (Some(col), Some(value)) => !is_handle_eq_on(expr, value, col),
+                        _ => handle.is_none_or(|value| !is_handle_eq(expr, value)),
+                    }
                 })
                 .collect();
+            // TiDB renders point-get table filters in sorted expression order.
+            residual.sort_by_key(|expr| expr.restore_string());
             wrap_residual(
                 PhysicalPlan::PointGet {
                     table,
@@ -267,6 +283,7 @@ fn push_into(
                     index,
                     index_columns,
                     partition_names,
+                    global_index,
                     lock,
                 },
                 residual,
@@ -277,20 +294,36 @@ fn push_into(
             column,
             index,
             n_keys,
+            handles,
             index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
             lock,
         } => {
-            let residual = conjuncts
+            let mut residual: Vec<ExprNode> = conjuncts
                 .into_iter()
-                .filter(|expr| !is_in_list_on(expr, &column))
+                .filter(|expr| {
+                    if tuple_columns.is_empty() {
+                        !is_in_list_on(expr, &column)
+                    } else {
+                        !is_row_in_list_on(expr, &tuple_columns)
+                    }
+                })
                 .collect();
+            // TiDB renders point-get table filters in sorted expression order.
+            residual.sort_by_key(|expr| expr.restore_string());
             wrap_residual(
                 PhysicalPlan::BatchPointGet {
                     table,
                     column,
                     index,
                     n_keys,
+                    handles,
                     index_columns,
+                    tuple_columns,
+                    partition_names,
+                    global_index,
                     lock,
                 },
                 residual,
@@ -614,6 +647,12 @@ fn const_i128(expr: &ExprNode) -> Option<i128> {
     }
 }
 
+fn is_handle_eq_on(expr: &ExprNode, handle: i64, column: &str) -> bool {
+    expr.eq_column_const().is_some_and(|(col, value)| {
+        col.eq_ignore_ascii_case(column) && datum_as_i64(&value) == Some(handle)
+    })
+}
+
 fn is_handle_eq(expr: &ExprNode, handle: i64) -> bool {
     expr.eq_column_const()
         .and_then(|(_, value)| datum_as_i64(&value))
@@ -635,6 +674,18 @@ fn datum_as_i64(value: &Datum) -> Option<i64> {
 fn is_in_list_on(expr: &ExprNode, column: &str) -> bool {
     expr.column_in_consts()
         .is_some_and(|(name, _)| name.eq_ignore_ascii_case(column))
+}
+
+/// Row-IN list whose columns are exactly the batch point get key columns.
+fn is_row_in_list_on(expr: &ExprNode, tuple_columns: &[String]) -> bool {
+    expr.row_in_consts_with_len().is_some_and(|(names, _, _)| {
+        names.len() == tuple_columns.len()
+            && names.iter().all(|name| {
+                tuple_columns
+                    .iter()
+                    .any(|col| col.eq_ignore_ascii_case(name))
+            })
+    })
 }
 
 enum Side {

@@ -18,7 +18,8 @@ pub struct PointGetExec {
     table: TableName,
     handle: Option<i64>,
     index: Option<String>,
-    lookup: Option<Datum>,
+    /// Key tuple: one value per index column.
+    lookup: Option<Vec<Datum>>,
     /// `FROM t PARTITION (pN)` restricts the lookup to those partitions.
     partition_names: Vec<String>,
     current_db: String,
@@ -37,7 +38,7 @@ impl PointGetExec {
         table: TableName,
         handle: Option<i64>,
         index: Option<String>,
-        lookup: Option<Datum>,
+        lookup: Option<Vec<Datum>>,
         partition_names: Vec<String>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
@@ -118,7 +119,7 @@ impl Executor for PointGetExec {
                     let key = encode_index_key(
                         physical_id,
                         index.id,
-                        std::slice::from_ref(&lookup),
+                        &lookup,
                         0,
                         true,
                     );

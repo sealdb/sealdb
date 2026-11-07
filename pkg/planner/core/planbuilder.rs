@@ -4628,10 +4628,71 @@ fn projection_column_base(plan: &PhysicalPlan) -> usize {
     }
 }
 
+fn index_allowed(from: &TableName, name: &str, only_index: Option<&str>) -> bool {
+    if from
+        .ignore_indexes
+        .iter()
+        .any(|ignored| ignored.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+    only_index.is_none_or(|only| only.eq_ignore_ascii_case(name))
+}
+
+/// `a = 1 AND b = 2 …` fully constrains a multi-column unique key → PointGet.
+fn unique_index_eq_point(
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    eqs: &[(String, Datum)],
+    only_index: Option<&str>,
+) -> Option<PhysicalPlan> {
+    let index = info.indices.iter().find(|idx| {
+        idx.unique
+            && !(idx.primary && info.pk_is_handle)
+            && idx.columns.len() > 1
+            && index_allowed(from, idx.name.o(), only_index)
+            && idx.columns.iter().all(|c| {
+                eqs.iter()
+                    .any(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
+            })
+    })?;
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let values: Vec<Datum> = index_columns
+        .iter()
+        .map(|column| {
+            eqs.iter()
+                .find(|(col, _)| col.eq_ignore_ascii_case(column))
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Datum::Null)
+        })
+        .collect();
+    let partition_names = tuple_partition_names(
+        info,
+        &index_columns,
+        std::slice::from_ref(&values),
+        &from.partition_names,
+        index.global,
+    );
+    Some(PhysicalPlan::PointGet {
+        table: from.name.clone(),
+        handle: None,
+        index: Some(index.name.o().to_string()),
+        index_columns,
+        partition_names,
+        global_index: index.global,
+        lock: false,
+    })
+}
+
 fn in_list_plan(
     select: &SelectStmt,
     from: &TableName,
     info: &sealdb_meta::TableInfo,
+    only_index: Option<&str>,
 ) -> Option<PhysicalPlan> {
     let lists = select
         .selection
@@ -4639,12 +4700,15 @@ fn in_list_plan(
         .map(|expr| {
             expr.split_cnf()
                 .into_iter()
-                .filter_map(|item| item.column_in_consts())
+                .filter_map(|item| item.column_in_consts_with_len())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if info.pk_is_handle && let Some(first) = info.columns.first() {
-        for (column, values) in &lists {
+    if info.pk_is_handle
+        && only_index.is_none()
+        && let Some(first) = info.columns.first()
+    {
+        for (column, values, total) in &lists {
             if !first.name.o().eq_ignore_ascii_case(column) {
                 continue;
             }
@@ -4661,15 +4725,19 @@ fn in_list_plan(
             }
             return Some(point_or_batch(
                 from,
+                info,
                 column.clone(),
                 None,
                 Vec::new(),
                 handles.into_iter().map(Datum::I64).collect(),
+                *total,
             ));
         }
     }
-    for (column, values) in lists {
-        if let Some(index) = info.find_unique_index_on(&column) {
+    for (column, values, total) in lists {
+        if let Some(index) = info.find_unique_index_on(&column).filter(|idx| {
+            index_allowed(from, idx.name.o(), only_index)
+        }) {
             let index_columns = index
                 .columns
                 .iter()
@@ -4677,24 +4745,178 @@ fn in_list_plan(
                 .collect();
             return Some(point_or_batch(
                 from,
+                info,
                 column,
                 Some(index.name.o().to_string()),
                 index_columns,
                 values,
+                total,
             ));
         }
     }
-    None
+    // `(a, b) IN ((1, 2), (3, 4))` on a unique key covering exactly those
+    // columns is a batch point get as well.
+    let row_list = select
+        .selection
+        .as_ref()
+        .and_then(|expr| {
+            expr.split_cnf()
+                .into_iter()
+                .find_map(|item| item.row_in_consts_with_len())
+        })?;
+    let (names, tuples, total) = row_list;
+    let index = info.indices.iter().find(|idx| {
+        idx.unique
+            && idx.columns.len() == names.len()
+            && index_allowed(from, idx.name.o(), only_index)
+            && idx.columns.iter().all(|c| {
+                names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(c.name.o()))
+            })
+    })?;
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    Some(PhysicalPlan::BatchPointGet {
+        table: from.name.clone(),
+        column: names.first().cloned().unwrap_or_default(),
+        index: Some(index.name.o().to_string()),
+        n_keys: total,
+        handles: Vec::new(),
+        index_columns,
+        partition_names: tuple_partition_names(
+            info,
+            &names,
+            &tuples,
+            &from.partition_names,
+            index.global,
+        ),
+        tuple_columns: names,
+        global_index: index.global,
+        lock: false,
+    })
+}
+
+/// Static partition names a row-IN batch point get touches; the tuples are
+/// placed into a sparse table row so HASH/KEY/RANGE/LIST locate each one.
+fn tuple_partition_names(
+    info: &sealdb_meta::TableInfo,
+    names: &[String],
+    tuples: &[Vec<Datum>],
+    explicit: &[String],
+    index_global: bool,
+) -> Vec<String> {
+    if index_global {
+        return explicit.to_vec();
+    }
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+    let Some(part) = info.partition.as_ref().filter(|p| p.enable) else {
+        return Vec::new();
+    };
+    if part.is_expr_key()
+        || part.columns.len() != 1
+        || !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(part.column()))
+    {
+        return Vec::new();
+    }
+    let positions: Vec<Option<usize>> = names
+        .iter()
+        .map(|name| {
+            info.columns
+                .iter()
+                .position(|c| c.name.o().eq_ignore_ascii_case(name))
+        })
+        .collect();
+    let mut ids: Vec<i64> = Vec::new();
+    for tuple in tuples {
+        let mut row = vec![Datum::Null; info.columns.len()];
+        for (pos, value) in positions.iter().zip(tuple.iter()) {
+            if let Some(pos) = pos {
+                row[*pos] = value.clone();
+            }
+        }
+        if let Ok(id) = info.locate_partition_row(&row)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    part.definitions
+        .iter()
+        .filter(|def| ids.contains(&def.id))
+        .map(|def| def.name.o().to_string())
+        .collect()
+}
+
+/// Static partition names a single/batch point get touches. `FROM t PARTITION
+/// (pN)` wins; otherwise a hash/range/list partition on the very column being
+/// looked up locates each value. Expression keys and multi-column keys stay
+/// unpinned (the executor scans every physical partition).
+fn point_partition_names(
+    info: &sealdb_meta::TableInfo,
+    column: &str,
+    values: &[Datum],
+    explicit: &[String],
+    index_global: bool,
+) -> Vec<String> {
+    // A GLOBAL index spans every partition; TiDB never labels its point get,
+    // but an explicit `PARTITION (pN)` must still constrain the row fetch.
+    if index_global {
+        return explicit.to_vec();
+    }
+    if !explicit.is_empty() {
+        return explicit.to_vec();
+    }
+    let Some(part) = info.partition.as_ref().filter(|p| p.enable) else {
+        return Vec::new();
+    };
+    if part.is_expr_key()
+        || part.columns.len() != 1
+        || !part.column().eq_ignore_ascii_case(column)
+    {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    for value in values {
+        if let Ok(id) = info.locate_partition(value)
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    part.definitions
+        .iter()
+        .filter(|def| ids.contains(&def.id))
+        .map(|def| def.name.o().to_string())
+        .collect()
 }
 
 fn point_or_batch(
     from: &TableName,
+    info: &sealdb_meta::TableInfo,
     column: String,
     index: Option<String>,
     index_columns: Vec<String>,
     values: Vec<Datum>,
+    n_keys: usize,
 ) -> PhysicalPlan {
-    let partition_names = from.partition_names.clone();
+    let index_global = index
+        .as_deref()
+        .and_then(|name| {
+            info.indices
+                .iter()
+                .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+        })
+        .is_some_and(|idx| idx.global);
+    let partition_names =
+        point_partition_names(info, &column, &values, &from.partition_names, index_global);
     if let [value] = values.as_slice() {
         let handle = match (&index, value) {
             (None, Datum::I64(handle)) => Some(*handle),
@@ -4706,15 +4928,30 @@ fn point_or_batch(
             index,
             index_columns,
             partition_names,
+            global_index: index_global,
             lock: false,
         };
     }
+    let mut handles: Vec<i64> = values
+        .iter()
+        .filter_map(|value| match value {
+            Datum::I64(handle) => Some(*handle),
+            Datum::U64(handle) => Some(*handle as i64),
+            _ => None,
+        })
+        .collect();
+    handles.sort_unstable();
+    handles.dedup();
     PhysicalPlan::BatchPointGet {
         table: from.name.clone(),
         column,
         index,
-        n_keys: values.len(),
+        n_keys,
+        handles,
         index_columns,
+        tuple_columns: Vec::new(),
+        partition_names,
+        global_index: index_global,
         lock: false,
     }
 }
@@ -6490,6 +6727,7 @@ fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
             index: None,
             index_columns,
             partition_names,
+            global_index: false,
             lock: true,
         },
         PhysicalPlan::BatchPointGet {
@@ -6497,14 +6735,22 @@ fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
             column,
             index,
             n_keys,
+            handles,
             index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
             ..
         } => PhysicalPlan::BatchPointGet {
             table,
             column,
             index,
             n_keys,
+            handles,
             index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
             lock: true,
         },
         other => PhysicalPlan::SelectLock {
@@ -9186,6 +9432,7 @@ fn access_plan(
         schema.table_by_name(&db, &table)
     }) {
         // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
+        let eqs = eq_column_consts(select.selection.as_ref());
         if !from.use_indexes.is_empty() {
             for hint in &from.use_indexes {
                 if let Some(index) = info
@@ -9193,11 +9440,18 @@ fn access_plan(
                     .iter()
                     .find(|idx| idx.name.o().eq_ignore_ascii_case(hint))
                 {
+                    if let Some(plan) =
+                        unique_index_eq_point(from, info, &eqs, Some(hint.as_str()))
+                    {
+                        return plan;
+                    }
+                    if let Some(plan) = in_list_plan(select, from, info, Some(hint.as_str())) {
+                        return plan;
+                    }
                     return index_plan(select, from, info, index, prune_mode);
                 }
             }
         }
-        let eqs = eq_column_consts(select.selection.as_ref());
         // Only an integer clustered PRIMARY KEY is the row handle; a plain
         // first column (`= const`) is a filter, not a point get.
         let handle_col = if info.pk_is_handle {
@@ -9206,7 +9460,7 @@ fn access_plan(
             None
         };
         if let Some(handle_col) = handle_col
-            && let Some((_, value)) = eqs
+            && let Some((column, value)) = eqs
                 .iter()
                 .find(|(column, _)| handle_col.eq_ignore_ascii_case(column))
             && let Some(handle) = datum_as_handle(value)
@@ -9217,11 +9471,21 @@ fn access_plan(
                 handle: Some(handle),
                 index: None,
                 index_columns: Vec::new(),
-                partition_names: from.partition_names.clone(),
+                partition_names: point_partition_names(
+                    info,
+                    column,
+                    std::slice::from_ref(value),
+                    &from.partition_names,
+                    false,
+                ),
+                global_index: false,
                 lock: false,
             };
         }
-        if let Some(plan) = in_list_plan(select, from, info) {
+        if let Some(plan) = unique_index_eq_point(from, info, &eqs, None) {
+            return plan;
+        }
+        if let Some(plan) = in_list_plan(select, from, info, None) {
             return plan;
         }
         // Clustered integer PK range → TiDB scans the table as a handle range
@@ -9262,7 +9526,14 @@ fn access_plan(
                             .iter()
                             .map(|c| c.name.o().to_string())
                             .collect(),
-                        partition_names: from.partition_names.clone(),
+                        partition_names: point_partition_names(
+                            info,
+                            column,
+                            std::slice::from_ref(value),
+                            &from.partition_names,
+                            index.global,
+                        ),
+                        global_index: index.global,
                         lock: false,
                     };
                 }

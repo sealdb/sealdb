@@ -104,6 +104,9 @@ pub enum PhysicalPlan {
         /// `FROM t PARTITION (pN)` pins the lookup to those physical partitions.
         #[serde(default)]
         partition_names: Vec<String>,
+        /// GLOBAL index: partitions constrain execution but stay out of EXPLAIN.
+        #[serde(default)]
+        global_index: bool,
         /// `FOR UPDATE` handled by the point get itself (`handle:1, lock`).
         #[serde(default)]
         lock: bool,
@@ -113,9 +116,23 @@ pub enum PhysicalPlan {
         column: String,
         index: Option<String>,
         n_keys: usize,
+        /// Deduped, ascending row handles for a handle batch point get
+        /// (`handle:[1 2 3]`).
+        #[serde(default)]
+        handles: Vec<i64>,
         /// Columns of the unique index serving the batch point get.
         #[serde(default)]
         index_columns: Vec<String>,
+        /// Row-IN column order (`(a, b) IN ((1, 2), …)`); empty for a plain
+        /// single-column IN list.
+        #[serde(default)]
+        tuple_columns: Vec<String>,
+        /// Pruned partitions (`table:t, partition:p0,p1`).
+        #[serde(default)]
+        partition_names: Vec<String>,
+        /// GLOBAL index: partitions constrain execution but stay out of EXPLAIN.
+        #[serde(default)]
+        global_index: bool,
         /// `FOR UPDATE` handled by the batch point get (`desc:false, lock`).
         #[serde(default)]
         lock: bool,

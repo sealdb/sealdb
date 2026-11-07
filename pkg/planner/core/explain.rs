@@ -2553,12 +2553,26 @@ fn lock_suffix(lock: bool) -> &'static str {
     }
 }
 
-fn point_get_index_access(table: &str, index: &str, columns: &[String]) -> String {
-    if columns.is_empty() {
-        format!("table:{table}, index:{index}")
+fn point_get_index_access(
+    table: &str,
+    index: &str,
+    columns: &[String],
+    partitions: &[String],
+) -> String {
+    let (kind, index) = if columns.is_empty() {
+        ("index", index.to_string())
     } else {
-        format!("table:{table}, index:{index}({})", columns.join(", "))
-    }
+        // A composite PRIMARY KEY is the clustered common handle in TiDB.
+        let kind = if index.eq_ignore_ascii_case("PRIMARY") && columns.len() > 1 {
+            "clustered index"
+        } else {
+            "index"
+        };
+        (kind, format!("{index}({})", columns.join(", ")))
+    };
+    let mut access = table_access(table, partitions);
+    access.push_str(&format!(", {kind}:{index}"));
+    access
 }
 
 fn table_access(table: &str, partition_names: &[String]) -> String {
@@ -3324,22 +3338,30 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             table,
             handle: Some(handle),
             index: None,
+            partition_names,
             lock,
             ..
         } => (
             // TiDB EXPLAIN id is `Point_Get` (underscore before Get).
             "Point_Get".to_string(),
-            format!("table:{table}"),
+            table_access(table, partition_names),
             format!("handle:{handle}{}", lock_suffix(*lock)),
         ),
         PhysicalPlan::PointGet {
             table,
             index: Some(index),
             index_columns,
+            partition_names,
+            global_index,
             ..
         } => (
             "Point_Get".to_string(),
-            point_get_index_access(table, index, index_columns),
+            point_get_index_access(
+                table,
+                index,
+                index_columns,
+                if *global_index { &[] } else { partition_names },
+            ),
             String::new(),
         ),
         PhysicalPlan::PointGet { table, .. } => (
@@ -3351,17 +3373,38 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             table,
             index: Some(index),
             index_columns,
+            partition_names,
+            global_index,
             lock,
             ..
         } => (
             "Batch_Point_Get".to_string(),
-            point_get_index_access(table, index, index_columns),
+            point_get_index_access(
+                table,
+                index,
+                index_columns,
+                if *global_index { &[] } else { partition_names },
+            ),
             format!("keep order:false, desc:false{}", lock_suffix(*lock)),
         ),
-        PhysicalPlan::BatchPointGet { table, lock, .. } => (
+        PhysicalPlan::BatchPointGet {
+            table,
+            handles,
+            partition_names,
+            lock,
+            ..
+        } => (
             "Batch_Point_Get".to_string(),
-            format!("table:{table}"),
-            format!("keep order:false, desc:false{}", lock_suffix(*lock)),
+            table_access(table, partition_names),
+            format!(
+                "handle:[{}], keep order:false, desc:false{}",
+                handles
+                    .iter()
+                    .map(|handle| handle.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                lock_suffix(*lock)
+            ),
         ),
         PhysicalPlan::IndexLookUpReader {
             partition_access, ..
@@ -3794,6 +3837,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
         PhysicalPlan::SelectLock { child, .. } => est_rows(child),
         PhysicalPlan::Selection { child, filter, .. } => {
+            // A residual filter over an integer-handle point get keeps one row.
+            if matches!(child.as_ref(), PhysicalPlan::PointGet { index: None, .. }) {
+                return 1.0;
+            }
             let n = not_isnull_count(filter);
             // TiDB: not(isnull) over CTEFullScan uses 0.8 (6400.80 from 8001).
             if n > 0

@@ -10,6 +10,8 @@ pub struct TableName {
     pub physical: Option<String>,
     /// `USE INDEX` / `FORCE INDEX` names (TiDB index hints on the table factor).
     pub use_indexes: Vec<String>,
+    /// `IGNORE INDEX` names.
+    pub ignore_indexes: Vec<String>,
     /// `FROM t PARTITION (p2, p1)` name filter (definition order after resolve).
     pub partition_names: Vec<String>,
 }
@@ -21,6 +23,7 @@ impl TableName {
             name: name.into(),
             physical: None,
             use_indexes: Vec::new(),
+            ignore_indexes: Vec::new(),
             partition_names: Vec::new(),
         }
     }

@@ -7155,6 +7155,10 @@ fn table_factor(
                     physical
                         .use_indexes
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
+                } else if hint.hint_type == sqlparser::ast::TableIndexHintType::Ignore {
+                    physical
+                        .ignore_indexes
+                        .extend(hint.index_names.iter().map(|n| n.value.clone()));
                 }
             }
             // TiDB EXPLAIN uses the table alias as the scan name (`table:t1`).

@@ -17,7 +17,10 @@ pub struct BatchPointGetExec {
     domain: Arc<Domain>,
     table: TableName,
     index: Option<String>,
-    lookups: Vec<Datum>,
+    /// Key tuples: one value per index column (row handle for a handle get).
+    lookups: Vec<Vec<Datum>>,
+    /// `FROM t PARTITION (pN)` restricts the lookup to those partitions.
+    partition_names: Vec<String>,
     current_db: String,
     txn: Arc<TxnHandle>,
     lock: RowLock,
@@ -33,7 +36,8 @@ impl BatchPointGetExec {
         domain: Arc<Domain>,
         table: TableName,
         index: Option<String>,
-        lookups: Vec<Datum>,
+        lookups: Vec<Vec<Datum>>,
+        partition_names: Vec<String>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         lock: RowLock,
@@ -44,6 +48,7 @@ impl BatchPointGetExec {
             table,
             index,
             lookups,
+            partition_names,
             current_db: current_db.into(),
             txn,
             lock,
@@ -73,6 +78,27 @@ impl Executor for BatchPointGetExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
+        let pinned: Vec<i64> = info
+            .partition
+            .as_ref()
+            .filter(|_| !self.partition_names.is_empty())
+            .map(|part| {
+                part.definitions
+                    .iter()
+                    .filter(|def| {
+                        self.partition_names
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(def.name.o()))
+                    })
+                    .map(|def| def.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scan_ids: Vec<i64> = if pinned.is_empty() {
+            info.physical_ids()
+        } else {
+            pinned.clone()
+        };
         let handles = if let Some(index_name) = &self.index {
             let index = info
                 .indices
@@ -83,11 +109,11 @@ impl Executor for BatchPointGetExec {
             self.txn.with_txn(|txn| {
                 let mut handles = Vec::new();
                 for lookup in &self.lookups {
-                    for physical_id in info.physical_ids() {
+                    for physical_id in scan_ids.iter().copied() {
                         let key = encode_index_key(
                             physical_id,
                             index.id,
-                            std::slice::from_ref(lookup),
+                            lookup,
                             0,
                             true,
                         );
@@ -103,6 +129,7 @@ impl Executor for BatchPointGetExec {
         } else {
             self.lookups
                 .iter()
+                .filter_map(|lookup| lookup.first())
                 .filter_map(|value| match value {
                     Datum::I64(handle) => Some(*handle),
                     Datum::U64(handle) => Some(*handle as i64),
@@ -112,11 +139,13 @@ impl Executor for BatchPointGetExec {
         };
         self.rows = self.txn.with_txn(|txn| {
             if self.lock == RowLock::None {
-                get_rows_batch(txn, &info, &handles)
+                get_rows_batch(txn, &info, &handles, &pinned)
             } else {
                 let mut rows = Vec::new();
                 for handle in handles {
-                    if let Some(row) = get_row(txn, &info, handle, self.lock, self.wait)? {
+                    if let Some(row) =
+                        get_row(txn, &info, handle, &pinned, self.lock, self.wait)?
+                    {
                         rows.push(row);
                     }
                 }
@@ -147,8 +176,10 @@ impl Executor for BatchPointGetExec {
     }
 }
 
-fn physical_ids_for_handle(info: &TableInfo, handle: i64) -> Vec<i64> {
-    if info.partition.as_ref().is_some_and(|p| {
+fn physical_ids_for_handle(info: &TableInfo, handle: i64, pinned: &[i64]) -> Vec<i64> {
+    let ids = if !pinned.is_empty() {
+        pinned.to_vec()
+    } else if info.partition.as_ref().is_some_and(|p| {
         p.column()
             .eq_ignore_ascii_case(info.columns.first().map(|c| c.name.o()).unwrap_or(""))
     }) {
@@ -158,7 +189,8 @@ fn physical_ids_for_handle(info: &TableInfo, handle: i64) -> Vec<i64> {
         }
     } else {
         info.physical_ids()
-    }
+    };
+    ids
 }
 
 fn decode_table_row(info: &TableInfo, raw: &[u8]) -> Vec<Datum> {
@@ -179,10 +211,11 @@ fn get_row(
     txn: &mut dyn sealdb_kv::Transaction,
     info: &TableInfo,
     handle: i64,
+    pinned: &[i64],
     lock: RowLock,
     wait: LockWait,
 ) -> Result<Option<Vec<Datum>>> {
-    for physical_id in physical_ids_for_handle(info, handle) {
+    for physical_id in physical_ids_for_handle(info, handle, pinned) {
         let key = encode_row_key_with_handle(physical_id, handle);
         let raw = txn.get_locked(key.as_bytes(), lock, wait)?;
         if let Some(raw) = raw {
@@ -197,11 +230,12 @@ fn get_rows_batch(
     txn: &mut dyn sealdb_kv::Transaction,
     info: &TableInfo,
     handles: &[i64],
+    pinned: &[i64],
 ) -> Result<Vec<Vec<Datum>>> {
     let mut handle_keys: Vec<(i64, Vec<Vec<u8>>)> = Vec::with_capacity(handles.len());
     let mut all_keys = Vec::new();
     for &handle in handles {
-        let keys: Vec<Vec<u8>> = physical_ids_for_handle(info, handle)
+        let keys: Vec<Vec<u8>> = physical_ids_for_handle(info, handle, pinned)
             .into_iter()
             .map(|physical_id| {
                 encode_row_key_with_handle(physical_id, handle)
