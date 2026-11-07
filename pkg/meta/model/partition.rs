@@ -161,16 +161,18 @@ impl PartitionInfo {
         if matches!(value, Datum::Null) {
             return Ok(self.definitions[0].id);
         }
-        let Some(v) = datum_i64(value) else {
-            return Err(no_partition());
-        };
         // TiDB / MySQL HASH: `value % partitions`, then `abs` the signed
         // remainder, so negatives mirror on the first partitions
-        // (`a = -1` with 4 partitions lands in p1).
+        // (`a = -1` with 4 partitions lands in p1). UNSIGNED values hash
+        // through their signed bit pattern, matching TiDB.
+        let v = match value {
+            Datum::I64(v) => *v,
+            Datum::U64(v) => *v as i64,
+            _ => return Err(no_partition()),
+        };
         let n = self.definitions.len() as i64;
         let idx = (v % n).unsigned_abs();
-        Ok(self.definitions[idx as usize].id)
-    }
+        Ok(self.definitions[idx as usize].id)    }
 
     /// Lexicographic RANGE COLUMNS compare: the first bound the row is strictly
     /// less than (MAXVALUE is +inf) is the partition.
@@ -284,25 +286,36 @@ impl PartitionInfo {
         if !matches!(self.tp, PartitionType::Hash) {
             return None;
         }
-        let mut low: Option<(i64, bool)> = None;
-        let mut high: Option<(i64, bool)> = None;
+        let mut low: Option<(i128, bool)> = None;
+        let mut high: Option<(i128, bool)> = None;
         collect_cmp_bounds(expr, self.column(), &mut low, &mut high)?;
         let (lo, lo_inc) = low?;
         let (hi, hi_inc) = high?;
-        let n = self.definitions.len() as i64;
+        let n = self.definitions.len() as i128;
         let pos_low = if lo_inc { lo } else { lo.saturating_add(1) };
         let pos_high = if hi_inc { hi } else { hi.saturating_sub(1) };
         if pos_high < pos_low {
             return Some(Vec::new());
         }
-        let range_scalar = (pos_high as i128 - pos_low as i128) as u128;
-        if range_scalar >= n as u128 {
+        let range_scalar = pos_high - pos_low;
+        if range_scalar >= n {
             return None;
         }
         let mut out = Vec::new();
-        for offset in 0..=range_scalar as i64 {
-            let idx = ((pos_low + offset) % n).unsigned_abs() as usize;
-            out.push(self.definitions[idx].id);
+        for offset in 0..=range_scalar {
+            let raw = pos_low + offset;
+            let datum = if raw > i64::MAX as i128 {
+                // UNSIGNED range above `i64::MAX` (`bigint unsigned` BETWEEN).
+                Datum::U64(u64::try_from(raw).ok()?)
+            } else {
+                Datum::I64(raw as i64)
+            };
+            let Ok(id) = self.locate(&datum) else {
+                return None;
+            };
+            if !out.contains(&id) {
+                out.push(id);
+            }
         }
         Some(out)
     }
@@ -518,8 +531,8 @@ fn flip_cmp(op: Op) -> Option<Op> {
 fn collect_cmp_bounds(
     expr: &ExprNode,
     column: &str,
-    low: &mut Option<(i64, bool)>,
-    high: &mut Option<(i64, bool)>,
+    low: &mut Option<(i128, bool)>,
+    high: &mut Option<(i128, bool)>,
 ) -> Option<()> {
     match expr {
         ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
@@ -537,7 +550,7 @@ fn collect_cmp_bounds(
             if !col.eq_ignore_ascii_case(column) {
                 return None;
             }
-            let value = datum_i64(&value)?;
+            let value = datum_i128(&value)?;
             match op {
                 Op::Ge => {
                     if low.is_none_or(|(v, _)| value > v) {
@@ -582,6 +595,15 @@ fn union(left: &[i64], right: &[i64]) -> Vec<i64> {
         }
     }
     out
+}
+
+fn datum_i128(value: &Datum) -> Option<i128> {
+    match value {
+        Datum::I64(v) => Some(*v as i128),
+        Datum::U64(v) => Some(*v as i128),
+        Datum::F64(v) if v.fract() == 0.0 => Some(*v as i128),
+        _ => None,
+    }
 }
 
 fn datum_i64(value: &Datum) -> Option<i64> {

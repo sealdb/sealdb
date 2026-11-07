@@ -25,6 +25,11 @@ pub(crate) fn write_index_keys(
     physical_id: i64,
 ) -> Result<()> {
     for index in &info.indices {
+        // A clustered integer PRIMARY KEY is the row handle: TiDB stores no
+        // separate index entry for it (`pk_is_handle`).
+        if index.primary && info.pk_is_handle {
+            continue;
+        }
         let key = encode_index_key(
             physical_id,
             index.id,
@@ -67,6 +72,10 @@ pub(crate) fn delete_index_keys(
     physical_id: i64,
 ) -> Result<()> {
     for index in &info.indices {
+        // Clustered handle PRIMARY KEY rows are removed by the row key.
+        if index.primary && info.pk_is_handle {
+            continue;
+        }
         let key = encode_index_key(
             physical_id,
             index.id,

@@ -10,9 +10,9 @@ use sealdb_types::Datum;
 use std::collections::HashMap;
 use sealdb_types::field_type::{
     FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
-    TYPE_ENUM, TYPE_FLOAT, TYPE_JSON, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT,
-    TYPE_STRING,
-    TYPE_TIMESTAMP, TYPE_TINY, TYPE_VAR_STRING, TYPE_YEAR,
+    TYPE_ENUM, TYPE_FLOAT, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG, TYPE_MEDIUM_BLOB,
+    TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
+    TYPE_VAR_STRING, TYPE_YEAR,
 };
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
@@ -402,6 +402,21 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
         },
         "BLOB" => FieldType {
             tp: TYPE_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        "TINYBLOB" => FieldType {
+            tp: TYPE_TINY_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        "MEDIUMBLOB" => FieldType {
+            tp: TYPE_MEDIUM_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        "LONGBLOB" => FieldType {
+            tp: TYPE_LONG_BLOB,
             flen: -1,
             ..string_ft()
         },

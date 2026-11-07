@@ -73,6 +73,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
     // drop index-option/table-option clauses sqlparser rejects.
     let rewritten = strip_tidb_create_table_options(&rewritten);
+    // MySQL `INSERT … PARTITION (p0, p1) (cols) VALUES` — sqlparser wants the
+    // column list first.
+    let rewritten = rewrite_insert_partition_columns(&rewritten);
     // TiDB `!` SimpleExpr → opcode.Not2; sqlparser rejects bare `!`.
     let rewritten = rewrite_mysql_bang(&rewritten);
     // sqlparser rejects `((SELECT…) UNION ALL (SELECT…)) alias`; unwrap arm parens
@@ -850,6 +853,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             };
             Ok(Statement::Insert(InsertStmt {
                 table,
+                ignore: insert.ignore,
+                partitions: insert_partition_names(insert.partitioned.as_ref())?,
                 columns,
                 rows,
                 select,
@@ -5251,8 +5256,114 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
-    // SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
+/// MySQL `INSERT INTO t PARTITION (p0, p1) (a, b) VALUES …` — sqlparser only
+/// accepts the column list *before* `PARTITION`, so swap them before parsing.
+fn rewrite_insert_partition_columns(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let Some(ins) = find_word(&lower, "insert", 0) else {
+        return sql.to_string();
+    };
+    let Some(into) = find_word(&lower, "into", ins + "insert".len()) else {
+        return sql.to_string();
+    };
+    // Table name: `t`, `db.t`, `` `db`.`t` ``.
+    let mut i = skip_ws(bytes, into + "into".len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'`' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'`' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'.' => i += 1,
+            b if is_ident_byte(b) => i += 1,
+            _ => break,
+        }
+    }
+    i = skip_ws(bytes, i);
+    if !keyword_at(bytes, i, "PARTITION") {
+        return sql.to_string();
+    }
+    let part_open = skip_ws(bytes, i + "PARTITION".len());
+    if part_open >= bytes.len() || bytes[part_open] != b'(' {
+        return sql.to_string();
+    }
+    let Some(part_close) = matching_paren(bytes, part_open) else {
+        return sql.to_string();
+    };
+    let col_open = skip_ws(bytes, part_close + 1);
+    if col_open >= bytes.len() || bytes[col_open] != b'(' {
+        return sql.to_string();
+    }
+    let Some(col_close) = matching_paren(bytes, col_open) else {
+        return sql.to_string();
+    };
+    let table_end = skip_ws(bytes, into + "into".len());
+    // `table_end` is where the table name starts; find where it ends again.
+    let mut table_stop = table_end;
+    while table_stop < bytes.len() {
+        match bytes[table_stop] {
+            b'`' => {
+                table_stop += 1;
+                while table_stop < bytes.len() && bytes[table_stop] != b'`' {
+                    table_stop += 1;
+                }
+                if table_stop < bytes.len() {
+                    table_stop += 1;
+                }
+            }
+            b'.' => table_stop += 1,
+            b if is_ident_byte(b) => table_stop += 1,
+            _ => break,
+        }
+    }
+    format!(
+        "{} {} PARTITION ({}){}",
+        &sql[..table_stop],
+        &sql[col_open..=col_close],
+        &sql[part_open + 1..part_close],
+        &sql[col_close + 1..]
+    )
+}
+
+/// First `word` occurrence at a word boundary at or after `from`.
+fn find_word(haystack: &str, word: &str, from: usize) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut i = from;
+    while let Some(pos) = haystack[i..].find(word) {
+        let start = i + pos;
+        let end = start + word.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        i = end;
+    }
+    None
+}
+
+/// `p0`, `P1`, … partition names in `INSERT … PARTITION (...)`.
+fn insert_partition_names(exprs: Option<&Vec<Expr>>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in exprs.map(Vec::as_slice).unwrap_or(&[]) {
+        match e {
+            Expr::Identifier(id) => out.push(id.value.clone()),
+            Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
+                out.push(parts[0].value.clone());
+            }
+            other => return Err(Error::unsupported(format!("INSERT PARTITION {other}"))),
+        }
+    }
+    Ok(out)
+}
+
+fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {    // SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
     // rejected under HASH/KEY with ErrSubpartition.
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
@@ -5269,7 +5380,8 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     } else {
         return Err(Error::unsupported("partition type"));
     };
-    let range_columns = tp == PartitionType::Range && keyword_at(bytes, i, "COLUMNS");
+    let range_columns = matches!(tp, PartitionType::Range | PartitionType::List)
+        && keyword_at(bytes, i, "COLUMNS");
     if range_columns {
         i = skip_ws(bytes, i + "COLUMNS".len());
     }

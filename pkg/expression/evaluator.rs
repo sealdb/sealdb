@@ -1046,6 +1046,21 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Ok(Datum::Bytes(out))
         }
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        // MySQL `SPACE(n)`: `n` spaces; negative length yields ''.
+        "SPACE" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "SPACE requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let n = v.as_i64()?.max(0) as usize;
+            Ok(Datum::Bytes(vec![b' '; n]))
+        }
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
@@ -1059,6 +1074,10 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "MINUTE" => eval_date_part(func, schema, row, |t| i64::from(t.minute)),
         "SECOND" => eval_date_part(func, schema, row, |t| i64::from(t.second)),
         "WEEKDAY" => eval_date_part(func, schema, row, |t| weekday_of(t)),
+        // MySQL `TO_DAYS`: days since year 0 (1970-01-01 == 719528).
+        "TO_DAYS" => eval_date_part(func, schema, row, |t| {
+            days_from_civil(t.year, t.month, t.day) + 719528
+        }),
         "FLOOR" => {
             if func.args.len() != 1 {
                 return Err(Error::new(

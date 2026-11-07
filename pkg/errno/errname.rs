@@ -38,6 +38,10 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
         errcode::ERR_NO_PARTITION_FOR_GIVEN_VALUE => "ErrNoPartitionForGivenValue",
+        errcode::ERR_UNKNOWN_PARTITION => "ErrUnknownPartition",
+        errcode::ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET => {
+            "ErrRowDoesNotMatchGivenPartitionSet"
+        }
         errcode::ERR_ACCESS_DENIED_ERROR => "ErrAccessDenied",
         errcode::ERR_DBACCESS_DENIED_ERROR => "ErrDBaccessDenied",
         errcode::ERR_TABLEACCESS_DENIED_ERROR => "ErrTableaccessDenied",
