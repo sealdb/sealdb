@@ -366,6 +366,10 @@ impl ValueExpr {
             Datum::Bytes(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
             Datum::Decimal(d) => d.to_string(),
             Datum::Time(t) => format!("'{t}'"),
+            Datum::Enum(e) => format!(
+                "'{}'",
+                String::from_utf8_lossy(&e.label).replace('\'', "''")
+            ),
         });
         Ok(())
     }
@@ -438,6 +442,14 @@ pub struct FuncCallExpr {
 
 impl FuncCallExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        // `IS [NOT] TRUE|FALSE|UNKNOWN` round-trips as a predicate.
+        if let Some(suffix) = is_truth_suffix(&self.name)
+            && let Some(arg) = self.args.first()
+        {
+            arg.restore(ctx)?;
+            ctx.write_str(suffix);
+            return Ok(());
+        }
         ctx.write_str(&self.name);
         ctx.write_str("(");
         if self.distinct {
@@ -455,6 +467,26 @@ impl FuncCallExpr {
         }
         ctx.write_str(")");
         Ok(())
+    }
+}
+
+/// SQL text for the `IS [NOT] …` scalar functions lowered from
+/// `Expr::IsTrue` / `IsFalse` / `IsUnknown` (and negations).
+pub fn is_truth_suffix(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("istrue") {
+        Some(" is true")
+    } else if name.eq_ignore_ascii_case("isnottrue") {
+        Some(" is not true")
+    } else if name.eq_ignore_ascii_case("isfalse") {
+        Some(" is false")
+    } else if name.eq_ignore_ascii_case("isnotfalse") {
+        Some(" is not false")
+    } else if name.eq_ignore_ascii_case("isunknown") {
+        Some(" is unknown")
+    } else if name.eq_ignore_ascii_case("isnotunknown") {
+        Some(" is not unknown")
+    } else {
+        None
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod cte;
 pub mod explain;
+pub mod natural_join;
 pub mod physical_plans;
 pub mod plan_cache;
 pub mod plan_cache_instance;
@@ -24,5 +25,6 @@ pub use plan_cache::PlanCacheValue;
 pub use plan_cache_instance::InstancePlanCache;
 pub use plan_cache_lru::LRUPlanCache;
 pub use plan_cache_param::normalize_prep_cache_key;
-pub use planbuilder::PlanBuilder;
+pub use natural_join::{expand_natural_joins, stmt_has_natural_join};
+pub use planbuilder::{merged_star_columns, using_dropped_columns, PlanBuilder};
 pub use rule_partition_processor::PartitionPruneMode;

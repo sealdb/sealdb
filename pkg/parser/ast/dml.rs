@@ -50,6 +50,9 @@ pub struct Join {
     /// Columns from `USING (...)`; empty when the join used `ON` / CROSS.
     /// SELECT * coalesces these names (emit left only).
     pub using_cols: Vec<String>,
+    /// `NATURAL` join: common columns are resolved against the catalog at plan
+    /// time and expanded into `using_cols` + `on` before execution.
+    pub natural: bool,
     /// `STRAIGHT_JOIN` — TiDB prefers MergeJoin on ordered PK keys.
     pub straight: bool,
 }
@@ -65,6 +68,8 @@ pub enum FromItem {
         on: ExprNode,
         /// Columns from `USING (...)`; empty when the join used `ON` / CROSS.
         using_cols: Vec<String>,
+        /// `NATURAL` join; expanded into `using_cols` + `on` at plan time.
+        natural: bool,
     },
 }
 
@@ -87,6 +92,9 @@ impl Join {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.left.restore(ctx)?;
         ctx.write_str(" ");
+        if self.natural {
+            ctx.write_str("NATURAL ");
+        }
         ctx.write_str(self.tp.restore());
         ctx.write_str(" ");
         self.right.restore(ctx)?;
