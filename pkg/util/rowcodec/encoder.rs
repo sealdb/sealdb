@@ -36,6 +36,7 @@ fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
         Datum::U64(v) => encode_uint(buf, *v),
         Datum::F64(v) => encode_float(buf, *v),
         Datum::Bytes(b) => buf.extend_from_slice(b),
+        Datum::Bit(b) => buf.extend_from_slice(b),
         Datum::Decimal(d) => buf.extend_from_slice(d.to_string().as_bytes()),
         Datum::Time(t) => encode_uint(buf, t.to_packed_u64()),
         // ENUM/SET persist the member label text (see `cast_enum_set`).

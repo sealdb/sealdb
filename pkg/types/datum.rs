@@ -10,6 +10,10 @@ pub enum Datum {
     U64(u64),
     F64(f64),
     Bytes(Vec<u8>),
+    /// `BIT(n)` value: fixed-width big-endian bytes. Distinct from `Bytes` so
+    /// numeric comparisons/functions treat it as an unsigned integer while
+    /// `SELECT` prints the raw padded bytes (TiDB binary representation).
+    Bit(Vec<u8>),
     Decimal(MyDecimal),
     Time(Time),
     /// `ENUM`/`SET` value: `(label, number)`. TiDB stores the member index
@@ -99,6 +103,14 @@ impl Datum {
             )),
             Datum::F64(v) => Ok(*v as i64),
             Datum::Bytes(b) => parse_i64(b),
+            Datum::Bit(b) => {
+                let v = bit_as_u64(b);
+                if v <= i64::MAX as u64 {
+                    Ok(v as i64)
+                } else {
+                    Err(Error::new(ERR_DATA_OUT_OF_RANGE, "BIGINT overflow"))
+                }
+            }
             Datum::Decimal(d) => d.to_i64(),
             // MySQL numeric value: `HHMMSS` for TIME, `YYYYMMDDHHMMSS` for
             // DATE/DATETIME (`types.Datum.GetInt64` on KindMysqlTime).
@@ -114,6 +126,7 @@ impl Datum {
             Datum::U64(v) => Ok(*v as f64),
             Datum::F64(v) => Ok(*v),
             Datum::Bytes(b) => parse_f64(b),
+            Datum::Bit(b) => Ok(bit_as_u64(b) as f64),
             Datum::Decimal(d) => d.to_f64(),
             Datum::Time(t) => Ok(t.to_number() as f64),
             Datum::Enum(e) => Ok(e.number as f64),
@@ -127,6 +140,7 @@ impl Datum {
             Datum::U64(v) => v.to_string().into_bytes(),
             Datum::F64(v) => format_float(*v).into_bytes(),
             Datum::Bytes(b) => b.clone(),
+            Datum::Bit(b) => b.clone(),
             Datum::Decimal(d) => d.to_string().into_bytes(),
             Datum::Time(t) => t.to_string().into_bytes(),
             Datum::Enum(e) => e.label.clone(),
@@ -148,6 +162,12 @@ impl Datum {
             (Datum::I64(a), Datum::I64(b)) => a.cmp(b),
             (Datum::U64(a), Datum::U64(b)) => a.cmp(b),
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
+            (Datum::Bit(a), Datum::Bit(b)) => a.cmp(b),
+            (Datum::Bit(a), other) | (other, Datum::Bit(a))
+                if is_numeric_datum(other) || matches!(other, Datum::Bit(_)) =>
+            {
+                bit_as_u128(a).cmp(&numeric_as_u128(other))
+            }
             (Datum::Decimal(a), Datum::Decimal(b)) => a.cmp(b),
             (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
             // TiDB compares temporal values with numbers via their MySQL
@@ -213,6 +233,7 @@ impl Datum {
             Datum::Null | Datum::I64(_) | Datum::U64(_) => EvalType::Int,
             Datum::F64(_) => EvalType::Real,
             Datum::Bytes(_) => EvalType::String,
+            Datum::Bit(_) => EvalType::Int,
             Datum::Decimal(_) => EvalType::Decimal,
             Datum::Time(_) => EvalType::Datetime,
             Datum::Enum(_) => EvalType::String,
@@ -222,6 +243,9 @@ impl Datum {
     pub fn cast(&self, ft: &FieldType) -> Result<Datum> {
         if self.is_null() {
             return Ok(Datum::Null);
+        }
+        if ft.tp == crate::field_type::TYPE_BIT {
+            return Ok(Datum::Bit(bit_bytes_for(self, ft.flen)));
         }
         match ft.eval_type() {
             EvalType::Int => {
@@ -261,7 +285,15 @@ impl Datum {
                     Ok(Datum::I64(self.as_i64()?))
                 }
             }
-            EvalType::Real => Ok(Datum::F64(self.as_f64()?)),
+            EvalType::Real => {
+                let v = self.as_f64()?;
+                // FLOAT is float32; DOUBLE stays float64.
+                if ft.tp == crate::field_type::TYPE_FLOAT {
+                    Ok(Datum::F64((v as f32) as f64))
+                } else {
+                    Ok(Datum::F64(v))
+                }
+            }
             EvalType::String => Ok(Datum::Bytes(self.as_bytes())),
             EvalType::Decimal => {
                 let d = MyDecimal::parse(&self.display())?.with_frac(ft.decimal);
@@ -329,6 +361,7 @@ impl Datum {
             Datum::U64(v) => v.to_string(),
             Datum::F64(v) => format_float(*v),
             Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            Datum::Bit(b) => String::from_utf8_lossy(b).into_owned(),
             Datum::Decimal(d) => d.to_string(),
             Datum::Time(t) => t.to_string(),
             Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
@@ -343,6 +376,9 @@ impl Datum {
             Datum::F64(v) => serde_json::json!({"type": "float", "value": v}),
             Datum::Bytes(b) => {
                 serde_json::json!({"type": "string", "value": String::from_utf8_lossy(b)})
+            }
+            Datum::Bit(b) => {
+                serde_json::json!({"type": "bit", "value": bit_as_u64(b)})
             }
             Datum::Decimal(d) => serde_json::json!({"type": "decimal", "value": d.to_string()}),
             Datum::Time(t) => serde_json::json!({"type": "time", "value": t.to_string()}),
@@ -368,11 +404,61 @@ fn parse_f64(b: &[u8]) -> Result<f64> {
 
 /// TiDB/MySQL REAL text form: scientific for large/small magnitudes (`1e23`),
 /// otherwise decimal; whole values keep a single fractional digit (`2.0`).
+fn bit_as_u64(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+}
+
+fn bit_as_u128(bytes: &[u8]) -> u128 {
+    bytes
+        .iter()
+        .fold(0u128, |acc, b| (acc << 8) | u128::from(*b))
+}
+
+fn numeric_as_u128(datum: &Datum) -> u128 {
+    match datum {
+        Datum::U64(v) => u128::from(*v),
+        Datum::I64(v) => *v as i128 as u128,
+        Datum::F64(v) => *v as u128,
+        Datum::Decimal(d) => d.to_f64().unwrap_or(0.0) as u128,
+        Datum::Bit(b) => bit_as_u128(b),
+        _ => 0,
+    }
+}
+
+/// Big-endian bytes of `flen` bits, masked to the declared width.
+fn bit_bytes_for(value: &Datum, flen: i32) -> Vec<u8> {
+    let n = flen.max(1) as u32;
+    let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let bits = match value {
+        Datum::U64(v) => *v,
+        Datum::I64(v) => *v as u64,
+        Datum::F64(v) => *v as u64,
+        Datum::Decimal(d) => d.to_f64().unwrap_or(0.0) as u64,
+        // Binary literals (`0x39`, `X'39'`) carry raw big-endian bytes.
+        Datum::Bytes(b) => bit_as_u64(b),
+        Datum::Bit(b) => bit_as_u64(b),
+        Datum::Time(t) => t.to_packed_u64(),
+        Datum::Enum(e) => e.number,
+        Datum::Null => 0,
+    };
+    let width = ((n as usize).div_ceil(8)).clamp(1, 8);
+    let be = (bits & mask).to_be_bytes();
+    be[8 - width..].to_vec()
+}
+
 fn format_float(v: f64) -> String {
     if !v.is_finite() {
         return v.to_string();
     }
+    // A FLOAT column stores float32: print its shortest float32 form
+    // (`281.3699951171875` → `281.37`). Large values keep float64 digits so
+    // genuine DOUBLE columns (e.g. `2^64`) are not truncated.
     let abs = v.abs();
+    if abs != 0.0 && abs < 1e15 && (v as f32) as f64 == v {
+        return (v as f32).to_string();
+    }
     if abs != 0.0 && (abs >= 1e15 || abs < 1e-4) {
         let s = format!("{v:e}");
         // Rust may emit `1e+23`; TiDB goldens use `1e23`.

@@ -41,8 +41,16 @@ impl MyDecimal {
         })
     }
 
-    pub fn to_i64(&self) -> Result<i64> {
-        let int_part = self.digits.split('.').next().unwrap_or("0");
+    /// Unary minus on the decimal value (zero stays unsigned zero).
+    pub fn negated(&self) -> Self {
+        let mut out = self.clone();
+        if out.digits != "0" && out.digits != "0.0" {
+            out.negative = !out.negative;
+        }
+        out
+    }
+
+    pub fn to_i64(&self) -> Result<i64> {        let int_part = self.digits.split('.').next().unwrap_or("0");
         let v: i64 = int_part
             .parse()
             .map_err(|_| Error::new(ERR_TRUNCATED_WRONG_VALUE, "decimal overflow"))?;

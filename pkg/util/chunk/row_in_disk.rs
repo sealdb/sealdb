@@ -18,6 +18,7 @@ const TAG_BYTES: u8 = 4;
 const TAG_DECIMAL: u8 = 5;
 const TAG_TIME: u8 = 6;
 const TAG_ENUM: u8 = 7;
+const TAG_BIT: u8 = 8;
 
 pub fn mem_row_limit() -> usize {
     std::env::var("SEALDB_SPILL_MEM_ROWS")
@@ -143,6 +144,12 @@ fn encode_datum(w: &mut impl Write, value: &Datum) -> Result<()> {
                 .map_err(io_err)?;
             w.write_all(b).map_err(io_err)
         }
+        Datum::Bit(b) => {
+            w.write_all(&[TAG_BIT]).map_err(io_err)?;
+            w.write_all(&(b.len() as u32).to_le_bytes())
+                .map_err(io_err)?;
+            w.write_all(b).map_err(io_err)
+        }
         Datum::Decimal(d) => {
             let bytes = d.to_string().into_bytes();
             w.write_all(&[TAG_DECIMAL]).map_err(io_err)?;
@@ -185,6 +192,7 @@ fn decode_datum(r: &mut impl Read) -> Result<Datum> {
         TAG_U64 => Ok(Datum::U64(read_fixed::<8>(r).map(u64::from_le_bytes)?)),
         TAG_F64 => Ok(Datum::F64(read_fixed::<8>(r).map(f64::from_le_bytes)?)),
         TAG_BYTES => Ok(Datum::Bytes(read_len_bytes(r)?)),
+        TAG_BIT => Ok(Datum::Bit(read_len_bytes(r)?)),
         TAG_DECIMAL => {
             let bytes = read_len_bytes(r)?;
             let text = String::from_utf8_lossy(&bytes);

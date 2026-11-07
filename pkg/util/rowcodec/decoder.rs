@@ -83,7 +83,8 @@ fn decode_value(data: &[u8], ft: &FieldType) -> Datum {
         }
         TYPE_VAR_STRING | TYPE_VARCHAR | TYPE_STRING | TYPE_BLOB | TYPE_TINY_BLOB
         | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => Datum::Bytes(data.to_vec()),
-        TYPE_BIT => Datum::U64(decode_uint(data)),
+        // BIT(n) rows store the raw big-endian bytes (see insert `cast_for_column`).
+        TYPE_BIT => Datum::Bit(data.to_vec()),
         _ => Datum::Bytes(data.to_vec()),
     }
 }

@@ -38,6 +38,10 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
             buf.push(BYTES_FLAG);
             encode_bytes(buf, b);
         }
+        Datum::Bit(b) => {
+            buf.push(UINT_FLAG);
+            encode_uint(buf, b.iter().fold(0u64, |acc, x| (acc << 8) | u64::from(*x)));
+        }
         Datum::Decimal(d) => {
             // MVB: UTF-8 decimal string after a compact-bytes length (TiDB uses
             // MyDecimal bin; string form is enough for round-trip in tests).

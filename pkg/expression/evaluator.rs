@@ -772,6 +772,7 @@ fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 format!("BIGINT UNSIGNED value is out of range in '(-{v})'"),
             )),
             Datum::F64(v) => Ok(Datum::F64(-v)),
+            Datum::Decimal(d) => Ok(Datum::Decimal(d.negated())),
             other => Ok(Datum::I64(-other.as_i64()?)),
         },
         Op::Not | Op::Not2 => Ok(bool_datum(!truthy(&inner).unwrap_or(false))),
@@ -1021,6 +1022,11 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             let out = match &v {
                 // String/binary: two uppercase hex digits per byte.
                 Datum::Bytes(b) => b.iter().map(|x| format!("{x:02X}")).collect::<String>(),
+                // BIT is numeric: leading zero bytes never appear in HEX.
+                Datum::Bit(b) => format!(
+                    "{:X}",
+                    b.iter().fold(0u64, |acc, x| (acc << 8) | u64::from(*x))
+                ),
                 // Integers: uppercase hex, negatives as two's complement u64.
                 Datum::I64(i) => format!("{:X}", *i as u64),
                 Datum::U64(u) => format!("{u:X}"),
@@ -1096,6 +1102,22 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
         "UNIX_TIMESTAMP" => eval_unix_timestamp(func, schema, row),
+        // MySQL `SLEEP(n)`: block `n` seconds and return 0.
+        "SLEEP" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "SLEEP requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let secs = v.as_f64()?.max(0.0);
+            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            Ok(Datum::I64(0))
+        }
         "FROM_UNIXTIME" => eval_from_unixtime(func, schema, row),
         "YEAR" => eval_date_part(func, schema, row, |t| i64::from(t.year)),
         "MONTH" => eval_date_part(func, schema, row, |t| i64::from(t.month)),
