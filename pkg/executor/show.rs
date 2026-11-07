@@ -187,9 +187,12 @@ impl Executor for ShowExec {
                         "Extra".to_string(),
                     ]
                 };
+                let column = self.stmt.column.as_deref();
+                let pattern = self.stmt.pattern.as_deref();
                 self.rows = info
                     .columns
                     .iter()
+                    .filter(|col| show_column_visible(col.name.o(), column, pattern))
                     .map(|col| column_row(col, full))
                     .collect();
             }
@@ -548,6 +551,15 @@ fn show_column_header(base: &str, pattern: Option<&str>) -> String {
     match pattern {
         Some(pat) => format!("{base} ({pat})"),
         None => base.to_string(),
+    }
+}
+
+/// TiDB `DESC tbl col` filters on the column name exactly (case-insensitive);
+/// `SHOW COLUMNS … LIKE` matches the LIKE pattern instead.
+fn show_column_visible(name: &str, column: Option<&str>, pattern: Option<&str>) -> bool {
+    match column {
+        Some(column) => name.eq_ignore_ascii_case(column),
+        None => show_like_ok(name, pattern),
     }
 }
 

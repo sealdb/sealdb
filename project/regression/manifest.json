@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "in_progress": 41,
-      "green": 13,
+      "in_progress": 27,
+      "green": 27,
       "pending": 190,
       "deferred": 2,
       "local": 8
@@ -1206,7 +1206,7 @@
     {
       "name": "explain_stats",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_stats.test",
       "result": "r/explain_stats.result",
       "has_result": true,

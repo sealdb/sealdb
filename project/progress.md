@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-07（green 26 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-07（green 27 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | `executor/partition/issues` / `executor/partition/write` green；其余 27 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` green；21 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -205,6 +205,15 @@
 | 嵌套执行器 DML 摘要 | 子查询执行不能清空外层影响行数 | `DmlSummary` 改栈式（push/pop） | `delete ignore … where id=(select '2a')` → `affected rows: 1` |
 | `NOT NULL` 1048 / SQLSTATE | `23000` | `sqlstate_of` 映射 `ERR_BAD_NULL` | `Error 1048 (23000): Column 'id' cannot be null` |
 | suite green | Gate A+B | manifest `green` | `executor/partition/write` Mem=1 / TiKV=1 PASS；green 25→26 |
+
+### 2.0l R3 `explain_stats`（2026-11-07）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| `explain t` 裸表 | `ExplainStmt{ShowStmt{ShowColumns}}`，`EXPLAIN/DESC/DESCRIBE` 三者等价 | `lower.rs` `ExplainTable` 不再拒绝 `DescribeAlias::Explain` | `explain t` 输出列清单，不再 `1235 EXPLAIN EXPLAIN` |
+| `desc t col` | 语法 `ExplainSym TableName ColumnName`；`ShowStmt.Column` 与 `Pattern` 是两个字段 | `ShowStmt.column`；`rewrite_describe_column` 把列编码进 schema 标记，`decode_describe_column` 还原 | `desc t c1` / `desc t id` 只回该列 |
+| `SHOW COLUMNS … LIKE` | `fieldFilter` 精确匹配、`fieldPatternsLike` 模糊匹配，表头仍是 `Field` | `show_column_visible`：先精确（忽略大小写）再 LIKE | `show columns from t like 'abc%'` 只回匹配列 |
+| suite green | Gate A+B | manifest `green` | `explain_stats` Mem=1 / TiKV=1 PASS；green 26→27 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

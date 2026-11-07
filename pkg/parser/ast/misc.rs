@@ -485,6 +485,9 @@ pub struct ShowStmt {
     pub full: bool,
     /// `SHOW … LIKE 'pat'` pattern (TiDB appends ` (pat)` to the column header).
     pub pattern: Option<String>,
+    /// `DESC tbl col`: TiDB keeps the column apart from the LIKE pattern and
+    /// matches it case-insensitively against `Field`.
+    pub column: Option<String>,
 }
 
 impl ShowStmt {
@@ -506,6 +509,10 @@ impl ShowStmt {
                 }
                 if let Some(table) = &self.table {
                     table.restore(ctx)?;
+                }
+                if let Some(column) = &self.column {
+                    ctx.write_str(" ");
+                    ctx.write_name(column);
                 }
             }
             ShowStmtKind::Grants => {

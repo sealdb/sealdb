@@ -45,7 +45,7 @@ use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
     CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
-    DescribeAlias, Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable,
+    Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable,
     Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
@@ -91,6 +91,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
+    // TiDB `DESC|DESCRIBE|EXPLAIN tbl col` → `SHOW COLUMNS` with a column filter.
+    let rewritten = rewrite_describe_column(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_show_warnings(&rewritten);
@@ -162,6 +164,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         if let Statement::Show(show) = &mut lowered {
             decode_show_grants(show);
             decode_show_index(show);
+            decode_describe_column(show);
             decode_show_ddl_jobs(show);
             decode_show_bindings(show);
             decode_show_warnings(show);
@@ -716,6 +719,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     user: None,
                     full: false,
                     pattern: None,
+                    column: None,
                 }))
             } else {
                 Ok(Statement::Show(ShowStmt {
@@ -725,6 +729,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     user: None,
                     full: false,
                     pattern: None,
+                    column: None,
                 }))
             }
         }
@@ -738,6 +743,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             user: None,
             full: false,
             pattern: None,
+            column: None,
         })),
         SqlStatement::ShowDatabases { show_options, .. }
         | SqlStatement::ShowSchemas { show_options, .. } => {
@@ -748,6 +754,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 user: None,
                 full: false,
                 pattern: show_like_pattern(show_options),
+                column: None,
             }))
         }
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -762,6 +769,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             user: None,
             full: false,
             pattern: show_like_pattern(show_options),
+            column: None,
         })),
         SqlStatement::ShowCharset(_) => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Charset,
@@ -770,6 +778,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             user: None,
             full: false,
             pattern: None,
+            column: None,
         })),
         SqlStatement::ShowCollation { .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Collation,
@@ -778,6 +787,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             user: None,
             full: false,
             pattern: None,
+            column: None,
         })),
         SqlStatement::ShowColumns {
             full, show_options, ..
@@ -793,20 +803,13 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 table: Some(object_table_name(table)?),
                 user: None,
                 full: *full,
-                pattern: None,
+                pattern: show_like_pattern(show_options),
+                column: None,
             }))
         }
-        SqlStatement::ExplainTable {
-            describe_alias,
-            table_name,
-            ..
-        } => {
-            if !matches!(
-                describe_alias,
-                DescribeAlias::Desc | DescribeAlias::Describe
-            ) {
-                return Err(Error::unsupported(format!("EXPLAIN {describe_alias}")));
-            }
+        SqlStatement::ExplainTable { table_name, .. } => {
+            // `EXPLAIN|DESC|DESCRIBE tbl` is plain `SHOW COLUMNS FROM tbl` in
+            // TiDB (`ExplainStmt` over a `ShowStmt`); the alias is irrelevant.
             Ok(Statement::Show(ShowStmt {
                 kind: ShowStmtKind::Columns,
                 db_name: None,
@@ -814,6 +817,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 user: None,
                 full: false,
                 pattern: None,
+                column: None,
             }))
         }
         SqlStatement::Insert(insert) => {
@@ -1455,6 +1459,111 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
         i += 1;
     }
     (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
+}
+
+const DESC_COL_MARKER: &str = "__sealdb_desc_col__";
+
+/// Keywords that begin a statement, so `EXPLAIN <kw>` is never a table name.
+fn starts_statement(word: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "SELECT", "INSERT", "REPLACE", "UPDATE", "DELETE", "WITH", "ANALYZE", "TABLE", "VALUES",
+        "SET", "CREATE", "DROP", "ALTER", "TRUNCATE", "SHOW", "EXPLAIN", "DESC", "DESCRIBE",
+        "USE", "BEGIN", "COMMIT", "ROLLBACK", "LOAD", "DO", "EXECUTE", "PREPARE", "GRANT",
+        "REVOKE", "FLUSH", "SHUTDOWN", "KILL", "CALL", "CHECK", "RENAME", "ADMIN", "SPLIT",
+        "TRACE", "BACKUP", "RESTORE", "LOCK", "UNLOCK", "START", "SAVEPOINT", "RELEASE",
+        "PURGE", "CHANGE", "IMPORT",
+    ];
+    KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word))
+}
+
+/// TiDB parses `EXPLAIN|DESC|DESCRIBE tbl col` as `ShowStmt{ShowColumns, Table,
+/// Column}`; sqlparser stops after the table name. Move the column into the
+/// schema slot and re-attach it in [`decode_describe_column`].
+fn rewrite_describe_column(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_start = {
+            let trimmed = out.trim_end();
+            trimmed.is_empty() || trimmed.ends_with(';')
+        };
+        if at_start {
+            let kw_len = if keyword_at(bytes, i, "DESCRIBE") {
+                Some("DESCRIBE".len())
+            } else if keyword_at(bytes, i, "DESC") {
+                Some("DESC".len())
+            } else if keyword_at(bytes, i, "EXPLAIN") {
+                Some("EXPLAIN".len())
+            } else {
+                None
+            };
+            if let Some(kw_len) = kw_len
+                && let Some((table, column, end)) =
+                    describe_column_tokens(bytes, i + kw_len)
+            {
+                out.push_str("SHOW COLUMNS FROM `");
+                out.push_str(DESC_COL_MARKER);
+                out.push_str(&escape_backticks(&column));
+                out.push_str("`.`");
+                out.push_str(&escape_backticks(&table));
+                out.push('`');
+                i = end;
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+/// Match `<table>[.<db>] <column>` up to end of statement.
+fn describe_column_tokens(bytes: &[u8], mut i: usize) -> Option<(String, String, usize)> {
+    i = skip_ws(bytes, i);
+    let (first, end) = read_ident(bytes, i);
+    if first.is_empty() || first.as_bytes()[0].is_ascii_digit() || starts_statement(&first) {
+        return None;
+    }
+    let mut table = first;
+    let mut end = end;
+    let after_first = skip_ws(bytes, end);
+    if after_first < bytes.len() && bytes[after_first] == b'.' {
+        let (second, second_end) = read_ident(bytes, skip_ws(bytes, after_first + 1));
+        if second.is_empty() {
+            return None;
+        }
+        table = format!("{table}.{second}");
+        end = second_end;
+    }
+    let (column, end) = read_ident(bytes, skip_ws(bytes, end));
+    if column.is_empty() || column.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let after = skip_ws(bytes, end);
+    if after < bytes.len() && bytes[after] != b';' {
+        return None;
+    }
+    Some((table, column, end))
+}
+
+fn decode_describe_column(show: &mut ShowStmt) {
+    let Some(table) = show.table.as_mut() else {
+        return;
+    };
+    let Some(encoded) = table
+        .schema
+        .as_deref()
+        .and_then(|schema| schema.strip_prefix(DESC_COL_MARKER))
+    else {
+        return;
+    };
+    show.column = Some(encoded.replace("``", "`"));
+    if let Some((db, name)) = table.name.split_once('.') {
+        table.schema = Some(db.to_string());
+        table.name = name.to_string();
+    } else {
+        table.schema = None;
+    }
 }
 
 fn rewrite_show_index(sql: &str) -> String {

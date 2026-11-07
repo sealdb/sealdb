@@ -731,6 +731,29 @@ mod tests {
             }
             other => panic!("expected SHOW FULL COLUMNS, got {other:?}"),
         }
+        match parser.parse_one_stmt("desc db1.t c1").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::Columns);
+                let table = show.table.unwrap();
+                assert_eq!(table.schema.as_deref(), Some("db1"));
+                assert_eq!(table.name, "t");
+                assert_eq!(show.column.as_deref(), Some("c1"));
+            }
+            other => panic!("expected DESC tbl col, got {other:?}"),
+        }
+        match parser.parse_one_stmt("explain t c1").unwrap() {
+            crate::ast::Statement::Show(show) => {
+                assert_eq!(show.kind, crate::ast::ShowStmtKind::Columns);
+                assert_eq!(show.table.unwrap().name, "t");
+                assert_eq!(show.column.as_deref(), Some("c1"));
+            }
+            other => panic!("expected EXPLAIN tbl col, got {other:?}"),
+        }
+        // `EXPLAIN <statement>` must stay an EXPLAIN, not `DESC tbl col`.
+        assert_eq!(
+            parser.parse_one_stmt("explain select 1").unwrap().stmt_type(),
+            "ExplainStmt"
+        );
         match parser.parse_one_stmt("SHOW CREATE TABLE db1.t").unwrap() {
             crate::ast::Statement::Show(show) => {
                 assert_eq!(show.kind, crate::ast::ShowStmtKind::CreateTable);
