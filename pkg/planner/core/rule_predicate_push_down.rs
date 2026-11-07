@@ -46,7 +46,9 @@ fn push_into(
             row_count,
             stats_pseudo,
             filter_est,
+            range_scan,
             pushed,
+            ..
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
@@ -73,6 +75,7 @@ fn push_into(
                     stats_pseudo,
                     filter_est,
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
+                    range_scan,
                     pushed: and_opt(ExprNode::compose_cnf(pushable), pushed),
                 },
                 residual,
@@ -293,6 +296,20 @@ fn push_into(
                             }
                         }
                     }
+                }
+                // TiDB `pushDownPredicatesForJoin`: an inner-join equality key
+                // makes single-side predicates derivable on the other side
+                // (`t1.c1 > k` ⇒ `t2.c1 > k` when `t1.c1 = t2.c1`).
+                if matches!(tp, JoinType::Inner) && !is_true_expr(&on) {
+                    let (dl, dr) = derive_equal_cond_preds(
+                        &on,
+                        &left_map,
+                        &right_map,
+                        &left_preds,
+                        &right_preds,
+                    );
+                    left_preds.extend(dl);
+                    right_preds.extend(dr);
                 }
                 residual = keep;
             }
@@ -719,3 +736,141 @@ fn qualify_cross_equality(
     Some(ExprNode::Binary(new))
 }
 
+
+/// TiDB derived predicates across an inner-join equality key.
+///
+/// For each `a = b` in `ON` every single-side conjunct on `a` is mirrored onto
+/// `b` (and vice versa), which is why unanalyzed TiDB plans show the same
+/// filter on both sides of a join. The mirrored column is bound to the alias
+/// that owns it inside the target subtree.
+fn derive_equal_cond_preds(
+    on: &ExprNode,
+    left_map: &std::collections::HashMap<String, Vec<String>>,
+    right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_preds: &[ExprNode],
+    right_preds: &[ExprNode],
+) -> (Vec<ExprNode>, Vec<ExprNode>) {
+    use sealdb_parser::ast::expressions::{
+        BinaryOpExpr, ColumnNameExpr, ExprNode, UnaryOpExpr,
+    };
+
+    fn single_col(e: &ExprNode) -> Option<ColumnNameExpr> {
+        match e {
+            ExprNode::Column(c) => Some(c.clone()),
+            ExprNode::Binary(b) => match (b.left.as_ref(), b.right.as_ref()) {
+                (ExprNode::Column(c), other) | (other, ExprNode::Column(c))
+                    if other.referenced_columns().is_empty() =>
+                {
+                    Some(c.clone())
+                }
+                _ => None,
+            },
+            ExprNode::Unary(u) => single_col(&u.expr),
+            _ => None,
+        }
+    }
+    fn owns(
+        map: &std::collections::HashMap<String, Vec<String>>,
+        name: &str,
+    ) -> bool {
+        map.contains_key(&name.to_ascii_lowercase())
+    }
+    /// Alias that owns `name` in the given subtree (`None` → cannot derive).
+    fn alias_for(
+        map: &std::collections::HashMap<String, Vec<String>>,
+        name: &str,
+    ) -> Option<String> {
+        let owners = map.get(&name.to_ascii_lowercase())?;
+        (owners.len() == 1).then(|| owners[0].clone())
+    }
+    fn replace(e: &ExprNode, from: &str, to: &str, alias: &str) -> Option<ExprNode> {
+        if e.referenced_columns().is_empty() {
+            return Some(e.clone());
+        }
+        match e {
+            ExprNode::Column(c) if c.name.eq_ignore_ascii_case(from) => {
+                Some(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(alias.to_string()),
+                    name: to.to_string(),
+                }))
+            }
+            ExprNode::Binary(b) => Some(ExprNode::Binary(BinaryOpExpr {
+                op: b.op,
+                left: Box::new(replace(&b.left, from, to, alias)?),
+                right: Box::new(replace(&b.right, from, to, alias)?),
+                single_cnf_item: b.single_cnf_item,
+            })),
+            ExprNode::Unary(u) => Some(ExprNode::Unary(UnaryOpExpr {
+                op: u.op,
+                expr: Box::new(replace(&u.expr, from, to, alias)?),
+            })),
+            ExprNode::IsNull(n) => Some(ExprNode::IsNull(
+                sealdb_parser::ast::expressions::IsNullExpr {
+                    expr: Box::new(replace(&n.expr, from, to, alias)?),
+                    not: n.not,
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    let mut dl = Vec::new();
+    let mut dr = Vec::new();
+    for item in on.split_cnf() {
+        let ExprNode::Binary(bin) = &item else {
+            continue;
+        };
+        if bin.op != sealdb_parser::opcode::Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(a), ExprNode::Column(b)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        for p in left_preds {
+            let Some(c) = single_col(p) else { continue };
+            if !owns(left_map, &c.name) {
+                continue;
+            }
+            let (from, to) = if c.name.eq_ignore_ascii_case(&a.name)
+                && !c.name.eq_ignore_ascii_case(&b.name)
+            {
+                (a.name.clone(), b.name.clone())
+            } else if c.name.eq_ignore_ascii_case(&b.name) {
+                (b.name.clone(), a.name.clone())
+            } else {
+                continue;
+            };
+            let Some(alias) = alias_for(right_map, &to) else {
+                continue;
+            };
+            if let Some(d) = replace(p, &from, &to, &alias) {
+                dr.push(d);
+            }
+        }
+        for p in right_preds {
+            let Some(c) = single_col(p) else { continue };
+            if !owns(right_map, &c.name) {
+                continue;
+            }
+            let (from, to) = if c.name.eq_ignore_ascii_case(&b.name)
+                && !c.name.eq_ignore_ascii_case(&a.name)
+            {
+                (b.name.clone(), a.name.clone())
+            } else if c.name.eq_ignore_ascii_case(&a.name) {
+                (a.name.clone(), b.name.clone())
+            } else {
+                continue;
+            };
+            let Some(alias) = alias_for(left_map, &to) else {
+                continue;
+            };
+            if let Some(d) = replace(p, &from, &to, &alias) {
+                dl.push(d);
+            }
+        }
+    }
+    (dl, dr)
+}

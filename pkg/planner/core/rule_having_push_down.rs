@@ -34,7 +34,16 @@ pub fn apply_having_push_down(
     let below_est = pushable_est_raw(&pushable);
     let agg_est = below_est * 0.8;
 
-    let mut plan = inject_avg_group_projection(plan, select, current_db, agg_est);
+    // The injected cast/Projection below the aggregate only exists when an
+    // aggregate function is actually computed above it. A plain
+    // `GROUP BY … HAVING <group col> …` shape keeps the group-by/firstrow plan.
+    let has_agg = expr_has_agg(having)
+        || select.fields.iter().any(|f| expr_has_agg(&f.expr));
+    let mut plan = if has_agg {
+        inject_avg_group_projection(plan, select, current_db, agg_est)
+    } else {
+        plan
+    };
     if let Some(filter) = ExprNode::compose_cnf(pushable) {
         let filter = normalize_or_right(filter);
         plan = push_through_agg(plan, &filter, is, current_db);
@@ -49,6 +58,7 @@ pub fn apply_having_push_down(
     // aggregate in HAVING is projected, otherwise the aggregate executor filters
     // HAVING itself and no such output column exists.
     let residual_supported = residual_aggs_projected(&residual, select);
+    let has_residual = !residual.is_empty();
     if residual_supported
         && let Some(filter) = compose_cnf_right(residual)
     {
@@ -57,7 +67,7 @@ pub fn apply_having_push_down(
             child: Box::new(plan),
         };
     }
-    if residual_supported {
+    if residual_supported && has_residual {
         wrap_having_output_projection(plan, select, current_db)
     } else {
         plan
@@ -528,12 +538,37 @@ fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
             cop_info,
             child,
             ..
-        } => PhysicalPlan::HashAgg {
-            info,
-            cop_info,
-            est_rows: est,
-            child,
-        },
+        } => {
+            // `GROUP BY <join cols> HAVING …` (no aggregate function): TiDB
+            // estimates the aggregate after HAVING has been pushed below it,
+            // at one 0.8 NDV step per group-by operand.
+            let est = if matches!(
+                *child,
+                PhysicalPlan::HashJoin { .. }
+                    | PhysicalPlan::IndexJoin { .. }
+                    | PhysicalPlan::MergeJoin { .. }
+            ) {
+                let groups = info
+                    .split("group by:")
+                    .nth(1)
+                    .and_then(|rest| rest.split(", funcs:").next())
+                    .map(|g| g.split(", ").count())
+                    .unwrap_or(1) as i32;
+                let mut e = super::explain::est_rows(&child);
+                for _ in 0..groups {
+                    e *= 0.8;
+                }
+                e
+            } else {
+                est
+            };
+            PhysicalPlan::HashAgg {
+                info,
+                cop_info,
+                est_rows: est,
+                child,
+            }
+        }
         PhysicalPlan::StreamAgg {
             info,
             cop_info,
@@ -598,6 +633,7 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             row_count: -below_est,
             stats_pseudo,
             filter_est: None,
+            range_scan: None,
             pushed,
         },
         other => other,

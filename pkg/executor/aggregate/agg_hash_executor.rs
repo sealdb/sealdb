@@ -49,15 +49,21 @@ impl HashAggExec {
         let mut outputs = Vec::new();
         let mut schema = Vec::new();
         for field in &select.fields {
-            // TiDB uses field.Text() / AsName; prefer orig_text over restore (no backticks).
-            schema.push(
-                field
-                    .as_name
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| field.orig_text.clone())
-                    .unwrap_or_else(|| restore_expr(&field.expr)),
-            );
+            // TiDB `buildProjectionFieldNameFromExpressions`: an explicit alias
+            // wins, a bare column keeps its column name (`t1. col1` → `col1`),
+            // otherwise field.Text() (orig_text) without backticks.
+            let name = field
+                .as_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| match &field.expr {
+                    ExprNode::Column(col) => col.name.clone(),
+                    _ => field
+                        .orig_text
+                        .clone()
+                        .unwrap_or_else(|| restore_expr(&field.expr)),
+                });
+            schema.push(name);
             if let ExprNode::Func(func) = &field.expr
                 && is_agg_name(&func.name)
             {

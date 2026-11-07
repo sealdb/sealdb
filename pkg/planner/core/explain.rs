@@ -1398,6 +1398,7 @@ fn emit_cop_children(
             partition_names,
             row_count,
             stats_pseudo,
+            range_scan,
             pushed,
             ..
         } => {
@@ -1448,6 +1449,51 @@ fn emit_cop_children(
                     );
                     scan_depth = depth + 1;
                 }
+            }
+            // Clustered handle range: TiDB scans the PK as a table range
+            // (`TableRangeScan`), eliding the pushed Selection row.
+            if let Some(range_info) = range_scan {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                let keep = if *stats_pseudo {
+                    format!(
+                        "range:{range_info}, keep order:{}, stats:pseudo",
+                        if under_merge_join { "true" } else { "false" }
+                    )
+                } else {
+                    format!(
+                        "range:{range_info}, keep order:{}",
+                        if under_merge_join { "true" } else { "false" }
+                    )
+                };
+                let range_est = est_rows(plan) * apply_factor.max(1.0);
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRangeScan",
+                        est: range_est,
+                        task: scan_task,
+                        access: scan_access,
+                        info: keep,
+                    },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
+                );
+                return true;
             }
             // RANGE: marker → TableRangeScan (no Selection row).
             if let Some(range_info) = range_pushed(pushed.as_ref()) {
@@ -3088,6 +3134,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::TableReader {
             pushed,
             partition_access,
+            range_scan,
             ..
         } => (
             "TableReader".to_string(),
@@ -3096,7 +3143,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if range_pushed(pushed.as_ref()).is_some() {
+            if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
             } else if cop_proj_sel_pushed(pushed.as_ref()).is_some() {
                 "data:Projection".to_string()
@@ -3341,6 +3388,234 @@ fn filter_has_like(filter: &sealdb_parser::ast::ExprNode) -> bool {
     })
 }
 
+/// Range lower/upper bounds as TiDB `ranger` builds them for pseudo stats
+/// (`pkg/planner/cardinality/pseudo.go`, `getPseudoRowCountByColumnRanges`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PRangeLow {
+    Null,
+    MinNotNull,
+    Val(i128),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PRangeHigh {
+    Null,
+    Val(i128),
+    MaxValue,
+}
+
+type PRange = (PRangeLow, PRangeHigh);
+
+fn prange_low_key(lo: PRangeLow) -> (u8, i128) {
+    match lo {
+        PRangeLow::Null => (0, 0),
+        PRangeLow::MinNotNull => (1, 0),
+        PRangeLow::Val(v) => (2, v),
+    }
+}
+
+fn prange_high_key(hi: PRangeHigh) -> (u8, i128) {
+    match hi {
+        PRangeHigh::Null => (0, 0),
+        PRangeHigh::Val(v) => (1, v),
+        PRangeHigh::MaxValue => (2, 0),
+    }
+}
+
+fn prange_max_low(a: PRangeLow, b: PRangeLow) -> PRangeLow {
+    if prange_low_key(a) >= prange_low_key(b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn prange_min_high(a: PRangeHigh, b: PRangeHigh) -> PRangeHigh {
+    if prange_high_key(a) <= prange_high_key(b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn prange_empty(r: &PRange) -> bool {
+    match (r.0, r.1) {
+        (PRangeLow::Val(a), PRangeHigh::Val(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// Integer literal value of a datum (partition/`int` columns only).
+fn datum_to_i128(datum: &sealdb_types::Datum) -> Option<i128> {
+    use sealdb_types::Datum;
+    match datum {
+        Datum::I64(v) => Some(*v as i128),
+        Datum::U64(v) => Some(*v as i128),
+        _ => None,
+    }
+}
+
+/// `col <op> literal` (either operand order) → ranges over one column.
+fn pseudo_ranges_of_predicate(
+    expr: &sealdb_parser::ast::ExprNode,
+) -> Option<(String, Vec<PRange>)> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    // Only real table columns carry pseudo statistics; derived outputs
+    // (`Column#5` from an aggregate) fall back to the generic 0.8 factor.
+    let col_key = |e: &ExprNode| match e {
+        ExprNode::Column(c) if !c.name.starts_with("Column#") => Some(format!(
+            "{}.{}",
+            c.table.as_deref().unwrap_or("").to_ascii_lowercase(),
+            c.name.to_ascii_lowercase()
+        )),
+        _ => None,
+    };
+    match expr {
+        ExprNode::IsNull(i) => {
+            let key = col_key(&i.expr)?;
+            Some((key, vec![(PRangeLow::Null, PRangeHigh::Null)]))
+        }
+        ExprNode::Unary(u) if u.op == Op::Not && matches!(u.expr.as_ref(), ExprNode::IsNull(_)) => {
+            let ExprNode::IsNull(i) = u.expr.as_ref() else {
+                return None;
+            };
+            let key = col_key(&i.expr)?;
+            Some((key, vec![(PRangeLow::MinNotNull, PRangeHigh::MaxValue)]))
+        }
+        ExprNode::Between(b) => {
+            let key = col_key(&b.expr)?;
+            let low = expr_to_i128_const(&b.low)?;
+            let high = expr_to_i128_const(&b.high)?;
+            Some((
+                key,
+                vec![(PRangeLow::Val(low), PRangeHigh::Val(high))],
+            ))
+        }
+        ExprNode::Binary(bin) => {
+            let (col, val, op, flipped) = match (bin.left.as_ref(), bin.right.as_ref()) {
+                (ExprNode::Column(_), right) => (&bin.left, expr_to_i128_const(right)?, bin.op, false),
+                (left, ExprNode::Column(_)) => (&bin.right, expr_to_i128_const(left)?, bin.op, true),
+                _ => return None,
+            };
+            let key = col_key(col)?;
+            // Flipped operands swap the comparison direction.
+            let op = if flipped { reverse_cmp_op(op)? } else { op };
+            let ranges = match op {
+                Op::Gt => vec![(PRangeLow::Val(val), PRangeHigh::MaxValue)],
+                Op::Ge => {
+                    if val <= i64::MIN as i128 {
+                        vec![(PRangeLow::MinNotNull, PRangeHigh::MaxValue)]
+                    } else {
+                        vec![(PRangeLow::Val(val - 1), PRangeHigh::MaxValue)]
+                    }
+                }
+                Op::Lt => vec![(PRangeLow::MinNotNull, PRangeHigh::Val(val))],
+                Op::Le => vec![(PRangeLow::MinNotNull, PRangeHigh::Val(val + 1))],
+                Op::Eq => vec![(PRangeLow::Val(val), PRangeHigh::Val(val))],
+                Op::Ne => vec![
+                    (PRangeLow::MinNotNull, PRangeHigh::Val(val)),
+                    (PRangeLow::Val(val), PRangeHigh::MaxValue),
+                ],
+                _ => return None,
+            };
+            Some((key, ranges))
+        }
+        _ => None,
+    }
+}
+
+/// Integer constant of an expression, folding a leading unary minus
+/// (`-9223372036854775808` parses as `-(9223372036854775808)`).
+fn expr_to_i128_const(expr: &sealdb_parser::ast::ExprNode) -> Option<i128> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Value(v) => datum_to_i128(&v.datum),
+        ExprNode::Unary(u) if u.op == Op::UnaryMinus => expr_to_i128_const(&u.expr).map(|v| -v),
+        _ => None,
+    }
+}
+
+fn reverse_cmp_op(op: sealdb_parser::opcode::Op) -> Option<sealdb_parser::opcode::Op> {
+    use sealdb_parser::opcode::Op;
+    match op {
+        Op::Gt => Some(Op::Lt),
+        Op::Ge => Some(Op::Le),
+        Op::Lt => Some(Op::Gt),
+        Op::Le => Some(Op::Ge),
+        Op::Eq => Some(Op::Eq),
+        Op::Ne => Some(Op::Ne),
+        _ => None,
+    }
+}
+
+/// TiDB pseudo per-range row count.
+fn prange_count(row_count: f64, r: &PRange) -> f64 {
+    let null_count = row_count / 1000.0;
+    match (r.0, r.1) {
+        (PRangeLow::Null, PRangeHigh::MaxValue) => row_count,
+        (PRangeLow::MinNotNull, PRangeHigh::MaxValue) => row_count - null_count,
+        (PRangeLow::MinNotNull, PRangeHigh::Val(_)) => {
+            (row_count / 3.0 - null_count).max(0.0)
+        }
+        (_, PRangeHigh::MaxValue) => row_count / 3.0,
+        (PRangeLow::Val(a), PRangeHigh::Val(b)) if a == b => row_count / 1000.0,
+        _ => row_count / 40.0,
+    }
+}
+
+/// Sum per-column range counts, then combine columns independently (TiDB
+/// multiplies the per-column selectivities).
+fn pseudo_range_est(
+    conjuncts: &[sealdb_parser::ast::ExprNode],
+    row_count: f64,
+) -> Option<f64> {
+    let mut per_col: Vec<(String, Vec<PRange>)> = Vec::new();
+    for c in conjuncts {
+        let Some((key, ranges)) = pseudo_ranges_of_predicate(c) else {
+            return None;
+        };
+        match per_col.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, cur)) => {
+                let mut merged = Vec::new();
+                for a in cur.iter() {
+                    for b in ranges.iter() {
+                        let r = (
+                            prange_max_low(a.0, b.0),
+                            prange_min_high(a.1, b.1),
+                        );
+                        if !prange_empty(&r) {
+                            merged.push(r);
+                        }
+                    }
+                }
+                *cur = merged;
+            }
+            None => per_col.push((key, ranges)),
+        }
+    }
+    if per_col.is_empty() {
+        return None;
+    }
+    if per_col.iter().all(|(_, r)| r.is_empty()) {
+        return Some(0.0);
+    }
+    let mut est = row_count;
+    for (_, ranges) in &per_col {
+        let col_est: f64 = ranges
+            .iter()
+            .map(|r| prange_count(row_count, r))
+            .sum::<f64>()
+            .min(row_count);
+        est *= col_est / row_count;
+    }
+    Some(est.clamp(0.0, row_count))
+}
+
+/// Extra rows TiDB adds for `not(isnull(..))` saturation on analyzed stats.
+
+
 pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
@@ -3378,6 +3653,8 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 } else {
                     base * 0.532_533_333_333
                 }
+            } else if let Some(est) = pseudo_range_est(&filter.split_cnf(), est_rows(child)) {
+                est
             } else {
                 est_rows(child) * 0.8
             }
@@ -3434,6 +3711,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         {
             *row_count
         }
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if let Some(est) = pseudo_range_est(&filter.split_cnf(), *row_count) => est,
         PhysicalPlan::TableReader {
             pushed: Some(_),
             row_count,
@@ -3567,8 +3849,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 // Pure CARTESIAN (Cross or Inner with non-equality ON pushed away).
                 l * r
             } else if matches!(tp, super::physical_plans::JoinType::Inner) {
-                let lp = is_pseudo_card(l);
-                let rp = is_pseudo_card(r);
+                // Pseudo-ness is a property of the source statistics, not of the
+                // filtered row count: a pseudo scan under `col > k` is 3583.33
+                // and still counts as unanalyzed (`min * 1.25`).
+                let lp = is_pseudo_card(l) || is_pseudo_plan(left);
+                let rp = is_pseudo_card(r) || is_pseudo_plan(right);
                 if !lp && !rp {
                     // Analyzed: ≥2× skew → max (t1⋈t3→4); else min (t2⋈t3→2).
                     let lo = l.min(r);
@@ -3756,6 +4041,21 @@ fn bushy_cop_spine(
         cop[need - 1] = true;
     }
     cop
+}
+
+/// True when the subtree's base scan is an unanalyzed pseudo scan.
+fn is_pseudo_plan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableReader { stats_pseudo, .. } => *stats_pseudo,
+        PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::UnionScan { child, .. } => is_pseudo_plan(child),
+        PhysicalPlan::PartitionUnion { children } => children.iter().all(is_pseudo_plan),
+        _ => false,
+    }
 }
 
 fn is_pseudo_card(rows: f64) -> bool {
