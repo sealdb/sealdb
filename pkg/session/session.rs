@@ -49,6 +49,8 @@ pub struct Session {
     enable_auto_analyze: Mutex<bool>,
     /// TiDB `tidb_auto_analyze_ratio` (default 0.5).
     auto_analyze_ratio: Mutex<f64>,
+    /// TiDB `tidb_window_concurrency` (default 5).
+    window_concurrency: Mutex<u64>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
 }
@@ -90,6 +92,7 @@ impl Session {
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
+            window_concurrency: Mutex::new(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY),
             last_warnings: Mutex::new(Vec::new()),
         }
     }
@@ -184,6 +187,15 @@ impl Session {
     }
 
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
+        // Publish this session's `tidb_window_concurrency` for the planner and
+        // executor (thread-local), so a suite that changes it cannot leak its
+        // value into a later session on the same thread.
+        sealdb_expression::set_window_concurrency(
+            *self
+                .window_concurrency
+                .lock()
+                .expect("session window_concurrency lock"),
+        );
         let mut owned = None;
         let stmt = if let Statement::Show(show) = stmt
             && show.kind == sealdb_parser::ast::ShowStmtKind::Grants
@@ -2130,8 +2142,11 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                     .expect("session time_zone lock") = value;
             }
             "tidb_window_concurrency" => {
-                let n: u64 = value.parse().unwrap_or(5);
-                sealdb_expression::set_window_concurrency(n.max(1));
+                let n: u64 = value.parse().unwrap_or(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY);
+                *session
+                    .window_concurrency
+                    .lock()
+                    .expect("session window_concurrency lock") = n.max(1);
             }
             "tidb_enable_window_function" => {}
             // Per-query memory quota (TiDB `tidb_mem_quota_query`): `0` = no
@@ -2349,7 +2364,11 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .to_string(),
         "autocommit" => "1".into(),
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
-        "tidb_window_concurrency" => sealdb_expression::window_concurrency().to_string(),
+        "tidb_window_concurrency" => session
+            .window_concurrency
+            .lock()
+            .expect("session window_concurrency lock")
+            .to_string(),
         "tidb_enable_window_function" => "1".into(),
         // Common TiDB session vars referenced by integrationtest; defaults.
         other if other.starts_with("tidb_") => "0".into(),
