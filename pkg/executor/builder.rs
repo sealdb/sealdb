@@ -1487,17 +1487,42 @@ fn select_from_column_names(
     current_db: &str,
 ) -> Vec<String> {
     let is = domain.infoschema();
+    // `WITH` CTEs are not in the infoschema; derive their output column names
+    // from the CTE body so `SELECT *` over a CTE join expands them.
+    let cte_cols = |name: &str| -> Vec<String> {
+        let Some(with) = select.with.as_ref() else {
+            return Vec::new();
+        };
+        let Some(cte) = with.find(name) else {
+            return Vec::new();
+        };
+        if !cte.col_name_list.is_empty() {
+            return cte.col_name_list.clone();
+        }
+        let mut out = Vec::new();
+        for field in &cte.query.fields {
+            if is_star_expr(&field.expr) {
+                out.extend(
+                    select_from_column_names(&cte.query, domain, current_db)
+                        .into_iter()
+                        .map(|c| c.rsplit_once('.').map(|(_, n)| n.to_string()).unwrap_or(c)),
+                );
+            } else {
+                out.push(field_output_name(field));
+            }
+        }
+        out
+    };
     let table_cols = |table: &TableName| -> Vec<String> {
         let (schema, name) = table.qualified(current_db);
-        let alias = table.resolve_name();
-        is.table_by_name(&schema, &name)
-            .map(|info| {
-                info.columns
-                    .iter()
-                    .map(|c| format!("{alias}.{}", c.name.o()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        // Visible qualifier: the FROM alias when present (`t dt1` → `dt1.c1`),
+        // matching the child plan's schema names.
+        let alias = table.name.as_str();
+        let raw: Vec<String> = match is.table_by_name(&schema, &name) {
+            Some(info) => info.columns.iter().map(|c| c.name.o().to_string()).collect(),
+            None => cte_cols(&name),
+        };
+        raw.into_iter().map(|c| format!("{alias}.{c}")).collect()
     };
     let mut cols = Vec::new();
     // `t1.*, t2.*` keeps every table's raw columns (no USING coalescing).
@@ -1511,15 +1536,25 @@ fn select_from_column_names(
         return cols;
     }
     // Nested join trees follow TiDB's `mergeSchema`: USING columns first, then
-    // the leading side's remaining columns, then the other side's.
+    // the leading side's remaining columns, then the other side's. Aliases are
+    // the visible FROM names so the expressions bind to the child schema.
     if let Some(item @ sealdb_parser::ast::FromItem::Join { .. }) = &select.from_item
-        && select.joins.iter().any(|j| !j.using_cols.is_empty())
-        && let Some(merged) = sealdb_planner::merged_star_columns(item, Some(&is), current_db)
+        && let Some(merged) =
+            sealdb_planner::merged_star_visible_columns(item, Some(&is), current_db)
+        && !merged.is_empty()
     {
         return merged
             .into_iter()
             .map(|(alias, col)| format!("{alias}.{col}"))
             .collect();
+    }
+    // Join trees whose sides are not all in the infoschema (CTE arms, derived
+    // tables): fall back to FROM-order concatenation.
+    if select.from_item.is_some() {
+        for table in select.join_tables() {
+            cols.extend(table_cols(table));
+        }
+        return cols;
     }
     if let Some(from) = &select.from {
         cols = table_cols(from);
