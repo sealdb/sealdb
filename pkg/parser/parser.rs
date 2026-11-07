@@ -116,6 +116,29 @@ mod tests {
     }
 
     #[test]
+    fn test_quoted_ident_keeps_keyword_case() {
+        // The EXPLAIN-FORMAT rewrite scans raw text; it must never rewrite
+        // inside backtick identifiers (e.g. suite db `explain-non-select-stmt`).
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("CREATE DATABASE `a-explain-b`")
+            .unwrap()
+        {
+            crate::ast::Statement::CreateDatabase(stmt) => {
+                assert_eq!(stmt.name, "a-explain-b");
+            }
+            other => panic!("expected CreateDatabaseStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("EXPLAIN SELECT 1 FROM `explain-non-select-stmt`.`a-desc-b`")
+            .unwrap()
+        {
+            crate::ast::Statement::Explain(_) => {}
+            other => panic!("expected ExplainStmt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_truncate_table() {
         let parser = Parser::new();
         match parser.parse_one_stmt("TRUNCATE TABLE db1.t").unwrap() {
