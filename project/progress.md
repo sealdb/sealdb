@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-07（green 23 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-07（green 24 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | 首批 29 套件 `in_progress`；与 R1 EXPLAIN 形状对齐联动 |
+| R3 | point_get / index / partition / explain* | `in_progress` | `executor/partition/issues` green；其余 28 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -177,6 +177,18 @@
 | `INSERT ... VALUES` 内子查询 | `InsertExec` 用 session 求值 | `SubqueryEvalCtx` 传入 `eval_insert_row` | `values (..., (select ... limit 1 offset 2))` |
 | DML 谓词内嵌子查询 | `preEvaluateDMLPredicate` 递归 | `pre_evaluate_dml_predicate` 进 Func/Cast/InList/Between/Like/IsNull/Case | `delete ... where substring(..., (select ...))` |
 | suite green | Gate A+B | manifest `green` | `executor/window` Mem=1 / TiKV=1 PASS；green 15→16 双端复验 |
+
+### 2.0j R3 `executor/partition/issues`（2026-11-07）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| `/*+ INL_JOIN(t) */` 计划 | `PhysicalIndexJoin`：hint 表作 inner（probe），按 outer 键决定范围 | `inl_join_hint_plan`（EXPLAIN-only；执行仍走 hash join，行一致） | `IndexJoin▷TableReader(Build)` + `TableReader(Probe) partition:all` |
+| 决定范围扫描 | `TableRangeScan` + `range: decided by [eq(inner, outer) …]` | `explain.rs` TableReader 支持 `RANGE_SEL`；`explain::range_prefix` | `range: decided by [...]` 与 TiDB 逐字符一致 |
+| 常量类型收敛 | `col = '2022-11-17'` → `DatumTime`（date 列打印全 datetime） | `coerce_eq_const`（DATE/DATETIME/TIMESTAMP） | `eq(…occur_trade_date, 2022-11-17 00:00:00.000000)` |
+| 新增列的部分统计 | `stats:partial[serial_id:missing]` + 0.8 伪选择率 | `PARTIAL_SEL` 标记 + `filter_est`；`TableFullScan` 保持基数 | `TableFullScan 1.00 / Selection 0.80 / IndexJoin 0.80` |
+| PK 隐式 NOT NULL | ON 侧键列不再补 `not(isnull(...))` | `nullable_column`（PK 列视作非空） | `Selection` 仅剩 `eq(broker, "0009")` |
+| KEY 分区静态剪枝 | `KEY` 用 MD5 前 8 字节大端取 `% n`（区别于 HASH 取模） | `model/key_hash.rs`（MD5 + `key_partition_index`）；KEY 复用 `getUsedHashPartitions` 区间枚举 | `partition:p2`（5807/5808 同分区） |
+| suite green | Gate A+B | manifest `green` | `executor/partition/issues` Mem=1 / TiKV=1 PASS；green 23→24 双端复验 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
