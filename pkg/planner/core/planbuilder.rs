@@ -87,6 +87,12 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // GLOBAL index equi-join: index nested-loop with the global
+                // index reader on the probe side (globalindex/index_join).
+                if let Some(plan) = global_index_join_plan(select, is, current_db, stats) {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Dirty-read UnionScan EXPLAIN (explain_union_scan suite).
                 if let Some(plan) = explain_union_scan_plan(select, current_db) {
                     let _ = crate::cascades::maybe_optimize("select")?;
@@ -6466,6 +6472,228 @@ fn index_join_suite_plan(
             right_table: build_alias.into(),
             on,
         }),
+    })
+}
+
+/// GLOBAL index equi-join EXPLAIN shape (TiDB 8.5.8).
+///
+/// A partitioned table's local index cannot be probed from the other join
+/// side, so TiDB plans an index nested-loop join whose probe side is the
+/// `GLOBAL` index reader (`IndexLookUp` / covering `IndexReader`). The build
+/// side is the other table, tiny after `not(isnull(key))` pushdown.
+///
+/// The plan is EXPLAIN-only: execution keeps the generic hash join, which
+/// produces the same rows.
+fn global_index_join_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build() {
+        return None;
+    }
+    let is = is?;
+    if select.from_item.is_some() || select.from.is_none() || select.joins.len() != 1 {
+        return None;
+    }
+    let join = &select.joins[0];
+    if !matches!(map_join_type(join.tp), JoinType::Inner) {
+        return None;
+    }
+    let ExprNode::Binary(bin) = &join.on else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    let (ExprNode::Column(left_col), ExprNode::Column(right_col)) =
+        (bin.left.as_ref(), bin.right.as_ref())
+    else {
+        return None;
+    };
+    let from = select.from.as_ref()?;
+    let (from_db, from_tbl) = from.qualified(current_db);
+    let from_info = is.table_by_name(&from_db, &from_tbl)?;
+    let (right_db, right_tbl) = join.right.qualified(current_db);
+    let right_info = is.table_by_name(&right_db, &right_tbl)?;
+    let global_partitioned = |info: &sealdb_meta::TableInfo| {
+        info.partition.as_ref().is_some_and(|p| p.enable)
+            && info.indices.iter().any(|idx| idx.global)
+    };
+    // (partitioned table, its info, other table, other info)
+    let (p_tbl, p_info, o_tbl, o_info) = if global_partitioned(&from_info) {
+        (from, &from_info, &join.right, &right_info)
+    } else if global_partitioned(&right_info) {
+        (&join.right, &right_info, from, &from_info)
+    } else {
+        return None;
+    };
+    // Attribute the equality columns to each side.
+    let belongs = |col: &ColumnNameExpr, tbl: &TableName, info: &sealdb_meta::TableInfo| {
+        if let Some(name) = col.table.as_deref() {
+            return name.eq_ignore_ascii_case(&tbl.name)
+                || tbl
+                    .physical
+                    .as_deref()
+                    .is_some_and(|p| name.eq_ignore_ascii_case(p));
+        }
+        info.columns
+            .iter()
+            .any(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+    };
+    let (p_col, o_col) = match (
+        belongs(left_col, p_tbl, p_info),
+        belongs(right_col, p_tbl, p_info),
+    ) {
+        (true, false) => (left_col, right_col),
+        (false, true) => (right_col, left_col),
+        _ => return None,
+    };
+    let index = p_info.indices.iter().find(|idx| {
+        idx.global
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&p_col.name))
+    })?;
+    let schema = schema_prefix(current_db);
+    let p_name = schema_table(&schema, &p_tbl.name);
+    let o_name = schema_table(&schema, &o_tbl.name);
+    let pinned = !p_tbl.partition_names.is_empty();
+    let partition_access = if pinned {
+        p_tbl.partition_names.join(",")
+    } else {
+        "all".to_string()
+    };
+    let tid = pinned
+        .then(|| tid_ordinal(p_info, &p_tbl.partition_names[0]))
+        .flatten()
+        .map(|n| format!("tid{n}"));
+    let build_rows = table_row_count(stats, o_tbl, current_db);
+    let est = if build_rows > 0.0 { build_rows } else { 1.0 };
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let build = PhysicalPlan::TableReader {
+        table: o_tbl.name.clone(),
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: est,
+        stats_pseudo: false,
+        pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
+    };
+    let range_info = format!("decided by [eq({p_name}.{}, {o_name}.{})]", p_col.name, o_col.name);
+    let mut sel = format!("not(isnull({p_name}.{}))", p_col.name);
+    if let Some(tid) = tid.as_deref() {
+        sel = format!("in(_tidb_tid, {tid}), {sel}");
+    }
+    // `SELECT *` needs every column, so the reader stays non-covering; a
+    // select list covered by the GLOBAL index reads it directly.
+    let covering = select_covers_index(select, p_info, index);
+    let probe = if covering {
+        PhysicalPlan::IndexReader {
+            table: p_tbl.name.clone(),
+            index: index.name.o().to_string(),
+            index_columns,
+            partitions: Vec::new(),
+            partition_access,
+            row_count: est,
+            pushed: Some(range_sel_push(&sel, &range_info)),
+        }
+    } else {
+        PhysicalPlan::IndexLookUpReader {
+            table: p_tbl.name.clone(),
+            index: index.name.o().to_string(),
+            index_columns,
+            partitions: Vec::new(),
+            partition_access,
+            row_count: est,
+            selection_info: Some(sel),
+            probe_selection_info: None,
+            pushed: Some(range_push(&range_info)),
+        }
+    };
+    let inner_reader = if covering { "IndexReader" } else { "IndexLookUp" };
+    let info = format!(
+        "inner join, inner:{inner_reader}, outer key:{o_name}.{}, inner key:{p_name}.{}, equal cond:eq({o_name}.{}, {p_name}.{})",
+        o_col.name, p_col.name, o_col.name, p_col.name
+    );
+    // A multi-column clustered PRIMARY KEY makes the inner lookup a common
+    // handle: TiDB switches to `IndexHashJoin` (covering reads stay IndexJoin).
+    let clustered = !covering
+        && p_info
+            .indices
+            .iter()
+            .any(|idx| idx.primary && idx.columns.len() > 1);
+    let info = if clustered {
+        format!("IndexHashJoin|{info}")
+    } else {
+        info
+    };
+    let join = PhysicalPlan::IndexJoin {
+        info,
+        est_rows: est,
+        outer: Box::new(build),
+        inner: Box::new(probe),
+    };
+    if !is_star_select(select) {
+        return Some(join);
+    }
+    // TiDB orders the join output as the partitioned table's columns then the
+    // other table's (the `SELECT *` expansion).
+    let mut exprs = Vec::with_capacity(p_info.columns.len() + o_info.columns.len());
+    for col in &p_info.columns {
+        exprs.push(format!("{p_name}.{}", col.name.o()));
+    }
+    for col in &o_info.columns {
+        exprs.push(format!("{o_name}.{}", col.name.o()));
+    }
+    Some(PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(join),
+    })
+}
+
+/// `{schema}.{table}` qualifier used by TiDB `ExplainInfo`.
+fn schema_table(schema: &str, table: &str) -> String {
+    format!("{schema}.{table}")
+}
+
+/// `PARTITION (pN)` → `tidN` (position in the definition list).
+fn tid_ordinal(
+    info: &sealdb_meta::TableInfo,
+    name: &str,
+) -> Option<usize> {
+    info.partition.as_ref().and_then(|p| {
+        p.definitions
+            .iter()
+            .position(|def| def.name.o().eq_ignore_ascii_case(name))
+    })
+}
+
+/// Real `not(isnull(col))` predicate for the build side.
+fn not_null_expr(table: &Option<String>, name: &str) -> ExprNode {
+    ExprNode::Unary(UnaryOpExpr {
+        op: Op::Not,
+        expr: Box::new(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: table.clone(),
+                name: name.to_string(),
+            })),
+            not: false,
+        })),
+    })
+}
+
+/// `RANGE_SEL|<sel info>|<range>` marker (real range decided at execution).
+fn range_sel_push(sel: &str, range: &str) -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(format!("RANGE_SEL|{sel}|{range}").into_bytes()),
     })
 }
 
