@@ -1,6 +1,7 @@
 // StreamAgg for scalar aggregations (no GROUP BY).
 // Completeness wave: sorted GROUP BY StreamAgg, pipelined partial aggs.
 use super::HashAggExec;
+use crate::join::apply::SubqueryEvalCtx;
 use crate::internal::exec::Executor;
 use sealdb_errno::Result;
 use sealdb_parser::ast::SelectStmt;
@@ -15,6 +16,11 @@ impl StreamAggExec {
         Ok(Self {
             inner: HashAggExec::new(select, child)?,
         })
+    }
+
+    pub(crate) fn with_subquery(mut self, subquery: SubqueryEvalCtx) -> Self {
+        self.inner = self.inner.with_subquery(subquery);
+        self
     }
 }
 

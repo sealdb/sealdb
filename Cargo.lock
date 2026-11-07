@@ -2156,6 +2156,7 @@ dependencies = [
  "sealdb-domain",
  "sealdb-errno",
  "sealdb-executor",
+ "sealdb-expression",
  "sealdb-parser",
  "sealdb-session",
  "sealdb-types",

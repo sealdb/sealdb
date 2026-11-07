@@ -49,6 +49,11 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
             buf.push(UINT_FLAG);
             encode_uint(buf, t.to_packed_u64());
         }
+        // Coprocessor rows carry the enum/set label text.
+        Datum::Enum(e) => {
+            buf.push(BYTES_FLAG);
+            encode_bytes(buf, &e.label);
+        }
     }
 }
 

@@ -211,12 +211,14 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::IndexLookUpReader {
+                table,
                 index,
                 partitions,
                 pushed,
                 ..
             }
             | PhysicalPlan::IndexReader {
+                table,
                 index,
                 partitions,
                 pushed,
@@ -226,10 +228,11 @@ impl ExecutorBuilder {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
-                let from = select
-                    .from
-                    .clone()
-                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
+                // The reader may belong to any table of a joined SELECT (index
+                // join / applied subquery), not only the leading FROM factor.
+                let from = index_reader_table(select, table).ok_or_else(|| {
+                    Error::unsupported("index lookup without FROM")
+                })?;
                 let access =
                     index_access(&domain, current_db, &from, index, select.selection.as_ref())
                         .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
@@ -269,20 +272,22 @@ impl ExecutorBuilder {
                     select.selection.clone(),
                 )))
             }
-            PhysicalPlan::PointGet { handle, index, .. } => {
+            PhysicalPlan::PointGet {
+                table,
+                handle,
+                index,
+            } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("point get without FROM"))?;
-                let from = select
-                    .from
-                    .clone()
-                    .ok_or_else(|| Error::unsupported("point get without FROM"))?;
-                // Prefer literals from the current bound stmt so a plan cached
-                // under a prepared `?` template still PointGets the right row.
-                let handle = select
-                    .selection
-                    .as_ref()
-                    .and_then(|expr| {
+                // Multi-table joins push `pk = const` into one side, so the plan
+                // names the table to fetch; single-table plans can fall back to
+                // FROM (prepare templates keep the bound literal in WHERE).
+                let from = resolve_reader_table(stmt, table)?;
+                // Prefer plan literals; a plan cached under a prepared `?`
+                // template keeps the bound value in the current stmt's WHERE.
+                let handle = (*handle).or_else(|| {
+                    select.selection.as_ref().and_then(|expr| {
                         expr.split_cnf().into_iter().find_map(|item| {
                             item.eq_column_const().and_then(|(_, value)| match value {
                                 sealdb_types::Datum::I64(h) => Some(h),
@@ -290,7 +295,7 @@ impl ExecutorBuilder {
                             })
                         })
                     })
-                    .or(*handle);
+                });
                 let lookup = index.as_ref().and_then(|index_name| {
                     index_lookup_value(
                         &domain,
@@ -312,14 +317,16 @@ impl ExecutorBuilder {
                     select_lock_wait(select),
                 )))
             }
-            PhysicalPlan::BatchPointGet { column, index, .. } => {
+            PhysicalPlan::BatchPointGet {
+                table,
+                column,
+                index,
+                ..
+            } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
-                let from = select
-                    .from
-                    .clone()
-                    .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
+                let from = resolve_reader_table(stmt, table)?;
                 let lookups = select
                     .selection
                     .as_ref()
@@ -377,7 +384,13 @@ impl ExecutorBuilder {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("hash agg without select"))?;
-                let built = Self::build(child, stmt, domain, current_db, txn)?;
+                let built = Self::build(
+                    child,
+                    stmt,
+                    Arc::clone(&domain),
+                    current_db,
+                    Arc::clone(&txn),
+                )?;
                 // Outer DISTINCT HashAgg over StreamAgg: dedup projected columns.
                 if matches!(
                     child.as_ref(),
@@ -428,16 +441,26 @@ impl ExecutorBuilder {
                     };
                     return Ok(Box::new(DistinctExec::new(keys, fields, names, built)));
                 }
-                Ok(Box::new(HashAggExec::new(select, built)?))
+                let mut exec = HashAggExec::new(select, built)?;
+                if let Some(ctx) = agg_subquery_ctx(select, domain, current_db, txn) {
+                    exec = exec.with_subquery(ctx);
+                }
+                Ok(Box::new(exec))
             }
             PhysicalPlan::StreamAgg { child, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("stream agg without select"))?;
-                Ok(Box::new(StreamAggExec::new(
+                let ctx =
+                    agg_subquery_ctx(select, Arc::clone(&domain), current_db, Arc::clone(&txn));
+                let mut exec = StreamAggExec::new(
                     select,
                     Self::build(child, stmt, domain, current_db, txn)?,
-                )?))
+                )?;
+                if let Some(ctx) = ctx {
+                    exec = exec.with_subquery(ctx);
+                }
+                Ok(Box::new(exec))
             }
             PhysicalPlan::Window { child, .. }
             | PhysicalPlan::Shuffle { child, .. }
@@ -604,10 +627,11 @@ impl ExecutorBuilder {
                 right,
                 left_table,
                 right_table,
+                tp,
                 on,
                 ..
             } => Self::build_hash_join(
-                JoinType::Inner,
+                *tp,
                 left,
                 right,
                 left_table,
@@ -621,9 +645,16 @@ impl ExecutorBuilder {
             ),
             // Row-constructor projection: EXPLAIN-only, execution passes rows
             // through (the join evaluates the operands itself).
-            PhysicalPlan::RowProjection { child, .. } => {
-                Self::build(child, stmt, domain, current_db, txn)
-            }
+            PhysicalPlan::RowProjection {
+                exprs,
+                names,
+                child,
+                ..
+            } => Ok(Box::new(ProjectionExec::new(
+                exprs.clone(),
+                names.clone(),
+                Self::build(child, stmt, domain, current_db, txn)?,
+            ))),
             PhysicalPlan::NullAwareAntiJoin {
                 left_outer,
                 bool_only,
@@ -678,6 +709,31 @@ impl ExecutorBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
+/// Text of every `ON` condition in the statement (flat join chain and nested
+/// `FROM` items), used to decide which coalesced USING columns stay reachable.
+fn select_on_text(select: &sealdb_parser::ast::SelectStmt) -> String {
+    fn from_item_ons(item: &sealdb_parser::ast::FromItem, out: &mut String) {
+        if let sealdb_parser::ast::FromItem::Join {
+            left, right, on, ..
+        } = item
+        {
+            from_item_ons(left, out);
+            from_item_ons(right, out);
+            out.push_str(&on.restore_string());
+            out.push(' ');
+        }
+    }
+    let mut out = String::new();
+    for join in &select.joins {
+        out.push_str(&join.on.restore_string());
+        out.push(' ');
+    }
+    if let Some(item) = &select.from_item {
+        from_item_ons(item, &mut out);
+    }
+    out
+}
+
     fn build_hash_join(
         tp: JoinType,
         left: &PhysicalPlan,
@@ -715,20 +771,70 @@ impl ExecutorBuilder {
             right: sealdb_parser::ast::TableName::new(None, right_table.to_string()),
             tp: ast_join_type(tp),
             on: on.clone(),
-            using_cols,
+            using_cols: using_cols.clone(),
+            natural: false,
             straight,
         };
-        Ok(Box::new(HashJoinV1Exec::new(
-            join,
-            Self::build(
-                left,
-                stmt,
-                Arc::clone(&domain),
-                current_db,
-                Arc::clone(&txn),
-            )?,
-            Self::build(right, stmt, domain, current_db, txn)?,
-        )))
+        let left_exec = Self::build(
+            left,
+            stmt,
+            Arc::clone(&domain),
+            current_db,
+            Arc::clone(&txn),
+        )?;
+        let right_exec = Self::build(right, stmt, domain, current_db, txn)?;
+        // The SELECT may still reference the dropped side's USING column
+        // (`SELECT t1.a, t2.a … USING(a)` / `WHERE NOT (t1.a <=> t2.a)`); keep
+        // the raw values as hidden columns for filter/order evaluation.
+        let mut hidden_using: Vec<String> = Vec::new();
+        let has_qualified_star = stmt.as_select().is_some_and(|select| {
+            select.fields.iter().any(|f| {
+                matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some())
+            })
+        });
+        if !using_cols.is_empty() {
+            if let Some(select) = stmt.as_select() {
+                // Restored AST text backticks identifiers (`t2`.`a`), while
+                // schema labels are plain `t2.a`; compare without quoting.
+                let text = select.text.to_ascii_lowercase().replace('`', "");
+                let all_ons = Self::select_on_text(select)
+                    .to_ascii_lowercase()
+                    .replace('`', "");
+                // Columns coalesced away are those of the dropped side: the
+                // left subtree for RIGHT JOIN (the preserved right side owns
+                // the USING column), the right table otherwise.
+                let dropped_tables: Vec<String> = if matches!(tp, JoinType::RightOuter) {
+                    select
+                        .join_tables()
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .filter(|t| !t.eq_ignore_ascii_case(right_table))
+                        .collect()
+                } else {
+                    vec![right_table.to_string()]
+                };
+                for col in &using_cols {
+                    for table in &dropped_tables {
+                        let qual = format!("{table}.{col}").to_ascii_lowercase();
+                        // The parent SELECT or any ON in the statement may need
+                        // the raw value (chained `t1 JOIN t2 USING(a) RIGHT JOIN
+                        // t3 USING(a)` evaluates `t2.a = t3.a` above this join).
+                        if (text.contains(&qual) || all_ons.contains(&qual))
+                            && !hidden_using
+                                .iter()
+                                .any(|h| h.eq_ignore_ascii_case(&qual))
+                        {
+                            hidden_using.push(format!("{table}.{col}"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Box::new(
+            HashJoinV1Exec::new(join, left_exec, right_exec)
+                .with_hidden_using(hidden_using)
+                .with_coalesce_using(!has_qualified_star),
+        ))
     }
 
     fn build_select_arm(
@@ -765,10 +871,20 @@ impl ExecutorBuilder {
             // result headers are bare (duplicates allowed). Only strip a real
             // `alias.col` suffix — expressions like `t.c1 + t.c2` or `1.23`
             // must keep their original text.
-            let columns = exec
+            // `\u{1}`-prefixed entries are hidden USING columns used only to
+            // evaluate parent filters; they never reach the result.
+            let keep: Vec<usize> = exec
                 .schema()
                 .iter()
-                .map(|c| {
+                .enumerate()
+                .filter(|(_, c)| !c.starts_with('\u{1}'))
+                .map(|(i, _)| i)
+                .collect();
+            let hidden = keep.len() != exec.schema().len();
+            let columns = keep
+                .iter()
+                .map(|&i| {
+                    let c = &exec.schema()[i];
                     let Some((prefix, name)) = c.rsplit_once('.') else {
                         return c.clone();
                     };
@@ -791,7 +907,19 @@ impl ExecutorBuilder {
             let mut rows = Vec::new();
             while let Some(chunk) = exec.next()? {
                 for i in 0..chunk.num_rows() {
-                    rows.push(localize_timestamp_row(chunk.get_row(i)));
+                    let row = localize_timestamp_row(chunk.get_row(i));
+                    if hidden {
+                        let mut it = row.into_iter();
+                        let mut kept = Vec::with_capacity(keep.len());
+                        for (idx, cell) in it.by_ref().enumerate() {
+                            if keep.contains(&idx) {
+                                kept.push(cell);
+                            }
+                        }
+                        rows.push(kept);
+                    } else {
+                        rows.push(row);
+                    }
                 }
             }
             exec.close()?;
@@ -1012,6 +1140,29 @@ fn index_lookup_value(
         .and_then(|values| values.into_iter().next())
 }
 
+/// Table factor that owns an index-scan plan node: match the plan's `table`
+/// (physical name or alias) against the SELECT's FROM / JOIN operands.
+fn index_reader_table(
+    select: &sealdb_parser::ast::SelectStmt,
+    table: &str,
+) -> Option<sealdb_parser::ast::TableName> {
+    let matches = |t: &sealdb_parser::ast::TableName| {
+        t.name.eq_ignore_ascii_case(table) || t.physical.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(table))
+    };
+    if let Some(from) = select.from.as_ref().filter(|t| matches(t)) {
+        return Some(from.clone());
+    }
+    for join in &select.joins {
+        if matches(&join.right) {
+            return Some(join.right.clone());
+        }
+    }
+    select
+        .from
+        .clone()
+        .or_else(|| select.joins.first().map(|j| j.right.clone()))
+}
+
 fn index_access(
     domain: &Domain,
     current_db: &str,
@@ -1175,16 +1326,39 @@ fn expand_projection_fields(
     let mut exprs = Vec::new();
     let mut names = Vec::new();
     for field in &select.fields {
-        if is_star_expr(&field.expr) {
+        // `t1.*` — expand only that table's columns.
+        let qualified_star = match &field.expr {
+            ExprNode::Column(c) if c.name == "*" => c.table.clone(),
+            _ => None,
+        };
+        if is_star_expr(&field.expr) || qualified_star.is_some() {
+            let wanted = qualified_star.map(|t| t.to_ascii_lowercase());
             for col in from_cols {
+                if let Some(wanted) = &wanted {
+                    let owner = col
+                        .rsplit_once('.')
+                        .map(|(t, _)| t.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if &owner != wanted {
+                        continue;
+                    }
+                }
+                // `from_cols` entries are `alias.column`: keep the qualifier on
+                // the expression so `t left join tt on ... left join t ttt`
+                // resolves each repeated `a` to its own input, while the output
+                // label stays bare (`a	b	a	b	a	b`).
+                let (table, name) = match col.rsplit_once('.') {
+                    Some((table, name)) => (Some(table.to_string()), name.to_string()),
+                    None => (None, col.clone()),
+                };
                 exprs.push(ExprNode::Column(
                     sealdb_parser::ast::expressions::ColumnNameExpr {
                         schema: None,
-                        table: None,
-                        name: col.clone(),
+                        table,
+                        name: name.clone(),
                     },
                 ));
-                names.push(col.clone());
+                names.push(name);
             }
         } else {
             let expr = match &select.from {
@@ -1244,16 +1418,38 @@ fn select_from_column_names(
     let is = domain.infoschema();
     let table_cols = |table: &TableName| -> Vec<String> {
         let (schema, name) = table.qualified(current_db);
+        let alias = table.resolve_name();
         is.table_by_name(&schema, &name)
             .map(|info| {
                 info.columns
                     .iter()
-                    .map(|c| c.name.o().to_string())
+                    .map(|c| format!("{alias}.{}", c.name.o()))
                     .collect()
             })
             .unwrap_or_default()
     };
     let mut cols = Vec::new();
+    // `t1.*, t2.*` keeps every table's raw columns (no USING coalescing).
+    let qualified_star = select.fields.iter().any(|f| {
+        matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some())
+    });
+    if qualified_star {
+        for table in select.join_tables() {
+            cols.extend(table_cols(table));
+        }
+        return cols;
+    }
+    // Nested join trees follow TiDB's `mergeSchema`: USING columns first, then
+    // the leading side's remaining columns, then the other side's.
+    if let Some(item @ sealdb_parser::ast::FromItem::Join { .. }) = &select.from_item
+        && select.joins.iter().any(|j| !j.using_cols.is_empty())
+        && let Some(merged) = sealdb_planner::merged_star_columns(item, Some(&is), current_db)
+    {
+        return merged
+            .into_iter()
+            .map(|(alias, col)| format!("{alias}.{col}"))
+            .collect();
+    }
     if let Some(from) = &select.from {
         cols = table_cols(from);
     }
@@ -1267,11 +1463,36 @@ fn select_from_column_names(
                 .iter()
                 .map(|c| c.to_ascii_lowercase())
                 .collect();
-            cols.extend(
-                right_cols
-                    .into_iter()
-                    .filter(|c| !drop.contains(&c.to_ascii_lowercase())),
-            );
+            cols.extend(right_cols.into_iter().filter(|c| {
+                let bare = c.rsplit_once('.').map(|(_, n)| n).unwrap_or(c);
+                !drop.contains(&bare.to_ascii_lowercase())
+            }));
+        }
+    }
+    // RIGHT JOIN preserves its right side, so TiDB's `SELECT *` starts with
+    // that table's columns (`t1(a,c) RIGHT JOIN t2(a,d) USING(a)` → a, d, c).
+    if let Some(last) = select.joins.last()
+        && matches!(last.tp, sealdb_parser::ast::JoinType::RightOuter)
+        && !last.using_cols.is_empty()
+    {
+        // Only the non-preserved side of each USING join loses the column; a
+        // third table that shares the name keeps its own (`t1, t2 NATURAL
+        // RIGHT JOIN t3` → `t1.i, t3.i`).
+        let drop =
+            sealdb_planner::using_dropped_columns(select, Some(&is), current_db);
+        let mut reordered = table_cols(&last.right);
+        for table in select.join_tables() {
+            if table.name == last.right.name {
+                continue;
+            }
+            let table_name = table.name.to_ascii_lowercase();
+            reordered.extend(table_cols(table).into_iter().filter(|c| {
+                let bare = c.rsplit_once('.').map(|(_, n)| n).unwrap_or(c);
+                !drop.contains(&(table_name.clone(), bare.to_ascii_lowercase()))
+            }));
+        }
+        if !reordered.is_empty() {
+            cols = reordered;
         }
     }
     cols
@@ -1282,6 +1503,15 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
     let inner = unwrap_paren_and_unary_plus(expr);
     match inner {
         ExprNode::Value(v) => match &v.datum {
+            sealdb_types::Datum::Enum(e) => {
+                // ENUM/SET literal: TiDB uses field.Text() (the label).
+                let s = String::from_utf8_lossy(&e.label);
+                s.trim_start_matches(|c: char| {
+                    !(c.is_ascii_alphanumeric()
+                        || (c as u32 > 0x20 && c as u32 <= 0x7e && !c.is_ascii_whitespace()))
+                })
+                .to_string()
+            }
             sealdb_types::Datum::Bytes(b) => {
                 // String literal: content with leading non-graph trimmed (TiDB #3686/#3994).
                 let s = String::from_utf8_lossy(b);
@@ -1325,14 +1555,36 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
         },
         ExprNode::Column(_) => tidb_expr_display_name(inner),
         _ => {
-            // Non-literal: TiDB uses field.Text() (comments stripped).
+            // Non-literal: TiDB uses field.Text().
             if let Some(text) = orig_text {
-                text.trim().to_string()
+                strip_inner_comment_terminators(text.trim())
             } else {
                 tidb_expr_display_name(expr)
             }
         }
     }
+}
+
+/// TiDB `SelectField.Text()` keeps a comment that ends the text (`1 /* c */`)
+/// but drops the `*/` terminator of a comment followed by more tokens:
+/// `(1 /* c */ + 2)` renders as `(1 /* c  + 2)`.
+fn strip_inner_comment_terminators(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("*/") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 2..];
+        let has_open = rest[..idx].rfind("/*").is_some();
+        let more_after = !after
+            .trim_end_matches(|c: char| c.is_whitespace() || c == ')')
+            .is_empty();
+        if !(has_open && more_after) {
+            out.push_str("*/");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn unwrap_paren_and_unary_plus(expr: &ExprNode) -> &ExprNode {
@@ -1371,6 +1623,7 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
             sealdb_types::Datum::Null => "NULL".into(),
             sealdb_types::Datum::Time(t) => t.to_string(),
             sealdb_types::Datum::Decimal(d) => d.to_string(),
+            sealdb_types::Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
         },
         ExprNode::Binary(b) => {
             let op = match b.op {
@@ -1396,4 +1649,26 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
         other if other.has_subquery() => other.restore_string(),
         other => other.restore_string(),
     }
+}
+
+/// `Apply`-style context for scalar subqueries in SELECT list / GROUP BY /
+/// HAVING, where the aggregate executor evaluates expressions per input row.
+fn agg_subquery_ctx(
+    select: &sealdb_parser::ast::SelectStmt,
+    domain: Arc<Domain>,
+    current_db: &str,
+    txn: Arc<TxnHandle>,
+) -> Option<SubqueryEvalCtx> {
+    let needs = select.fields.iter().any(|f| f.expr.has_subquery())
+        || select.group_by.iter().any(|g| g.has_subquery())
+        || select.having.as_ref().is_some_and(|h| h.has_subquery());
+    if !needs {
+        return None;
+    }
+    Some(SubqueryEvalCtx::new(
+        domain,
+        current_db.to_string(),
+        txn,
+        select.from.as_ref().map(|table| table.name.clone()),
+    ))
 }

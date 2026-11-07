@@ -16,8 +16,12 @@ pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
+/// MySQL `ER_WARN_DATA_TRUNCATED`: invalid ENUM/SET member coerced to `''`.
+pub const ERR_WARN_DATA_TRUNCATED: i32 = 1265;
 /// TiDB: timestamp falls in a DST transition gap.
 pub const ERR_TIMESTAMP_IN_DST_TRANSITION: i32 = 8179;
+/// TiDB `ErrMemoryExceedForQuery`: statement exceeded `tidb_mem_quota_query`.
+pub const ERR_MEMORY_EXCEEDED: i32 = 8175;
 pub const ERR_UNKNOWN_FUNCTION: i32 = 1305;
 pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
 pub const ERR_UNSUPPORTED: i32 = 1235;

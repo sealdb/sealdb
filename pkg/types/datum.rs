@@ -12,6 +12,22 @@ pub enum Datum {
     Bytes(Vec<u8>),
     Decimal(MyDecimal),
     Time(Time),
+    /// `ENUM`/`SET` value: `(label, number)`. TiDB stores the member index
+    /// (enum) / bitmask (set) and keeps the label for display: numeric
+    /// comparisons use `number`, string comparisons use `label`.
+    Enum(EnumValue),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnumValue {
+    pub label: Vec<u8>,
+    pub number: u64,
+}
+
+impl EnumValue {
+    pub fn new(label: Vec<u8>, number: u64) -> Self {
+        Self { label, number }
+    }
 }
 
 impl Datum {
@@ -31,7 +47,10 @@ impl Datum {
             Datum::F64(v) => Ok(*v as i64),
             Datum::Bytes(b) => parse_i64(b),
             Datum::Decimal(d) => d.to_i64(),
-            Datum::Time(t) => Ok(t.to_packed_u64() as i64),
+            // MySQL numeric value: `HHMMSS` for TIME, `YYYYMMDDHHMMSS` for
+            // DATE/DATETIME (`types.Datum.GetInt64` on KindMysqlTime).
+            Datum::Time(t) => Ok(t.to_number()),
+            Datum::Enum(e) => Ok(e.number as i64),
         }
     }
 
@@ -43,7 +62,8 @@ impl Datum {
             Datum::F64(v) => Ok(*v),
             Datum::Bytes(b) => parse_f64(b),
             Datum::Decimal(d) => d.to_f64(),
-            Datum::Time(t) => Ok(t.to_packed_u64() as f64),
+            Datum::Time(t) => Ok(t.to_number() as f64),
+            Datum::Enum(e) => Ok(e.number as f64),
         }
     }
 
@@ -56,6 +76,7 @@ impl Datum {
             Datum::Bytes(b) => b.clone(),
             Datum::Decimal(d) => d.to_string().into_bytes(),
             Datum::Time(t) => t.to_string().into_bytes(),
+            Datum::Enum(e) => e.label.clone(),
         }
     }
 
@@ -76,6 +97,45 @@ impl Datum {
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
             (Datum::Decimal(a), Datum::Decimal(b)) => a.cmp(b),
             (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
+            // TiDB compares temporal values with numbers via their MySQL
+            // numeric form (`20191111 = DATE '2019-11-11'`).
+            (Datum::Time(a), Datum::I64(b)) => a.to_number().cmp(b),
+            (Datum::I64(a), Datum::Time(b)) => a.cmp(&b.to_number()),
+            (Datum::Time(a), Datum::U64(b)) => (a.to_number() as i128).cmp(&i128::from(*b)),
+            (Datum::U64(a), Datum::Time(b)) => i128::from(*a).cmp(&(b.to_number() as i128)),
+            (Datum::Time(a), Datum::F64(b)) => (a.to_number() as f64)
+                .partial_cmp(b)
+                .unwrap_or(Ordering::Equal),
+            (Datum::F64(a), Datum::Time(b)) => a
+                .partial_cmp(&(b.to_number() as f64))
+                .unwrap_or(Ordering::Equal),
+            // ENUM/SET: numbers compare by member index / bitmask, strings
+            // (and other enum/set labels) compare by label.
+            (Datum::Enum(a), Datum::Enum(b)) => a.label.cmp(&b.label),
+            (Datum::Enum(a), Datum::Bytes(b)) => a.label.cmp(b),
+            (Datum::Bytes(a), Datum::Enum(b)) => a.cmp(&b.label),
+            (Datum::Enum(a), Datum::I64(b)) => {
+                i128::from(a.number).cmp(&i128::from(*b))
+            }
+            (Datum::I64(a), Datum::Enum(b)) => {
+                i128::from(*a).cmp(&i128::from(b.number))
+            }
+            (Datum::Enum(a), Datum::U64(b)) => u128::from(a.number).cmp(&u128::from(*b)),
+            (Datum::U64(a), Datum::Enum(b)) => u128::from(*a).cmp(&u128::from(b.number)),
+            (Datum::Enum(a), Datum::F64(b)) => (a.number as f64)
+                .partial_cmp(b)
+                .unwrap_or(Ordering::Equal),
+            (Datum::F64(a), Datum::Enum(b)) => a
+                .partial_cmp(&(b.number as f64))
+                .unwrap_or(Ordering::Equal),
+            (Datum::Enum(a), Datum::Decimal(b)) => (a.number as f64)
+                .partial_cmp(&b.to_f64().unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            (Datum::Decimal(a), Datum::Enum(b)) => a
+                .to_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&(b.number as f64))
+                .unwrap_or(Ordering::Equal),
             _ => match (self.as_f64(), other.as_f64()) {
                 (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
                 _ => self.as_bytes().cmp(&other.as_bytes()),
@@ -90,6 +150,7 @@ impl Datum {
             Datum::Bytes(_) => EvalType::String,
             Datum::Decimal(_) => EvalType::Decimal,
             Datum::Time(_) => EvalType::Datetime,
+            Datum::Enum(_) => EvalType::String,
         }
     }
 
@@ -145,26 +206,53 @@ impl Datum {
                 Datum::Time(t) => Ok(Datum::Time(*t)),
                 Datum::Bytes(b) => {
                     let s = String::from_utf8_lossy(b);
-                    let mut t = crate::time::parse_timestamp_literal(&s).or_else(|_| {
-                        if s.contains(' ') {
-                            crate::time::parse_timestamp_literal(&s)
-                        } else {
-                            crate::time::parse_timestamp_literal(&format!("{s} 00:00:00"))
-                        }
-                    })?;
+                    let mut t = if ft.tp == crate::field_type::TYPE_DURATION {
+                        crate::time::parse_duration_string(&s).ok_or_else(|| {
+                            Error::new(
+                                ERR_TRUNCATED_WRONG_VALUE,
+                                format!("Incorrect time value: '{s}'"),
+                            )
+                        })?
+                    } else {
+                        crate::time::parse_timestamp_literal(&s).or_else(|_| {
+                            if s.contains(' ') {
+                                crate::time::parse_timestamp_literal(&s)
+                            } else {
+                                crate::time::parse_timestamp_literal(&format!("{s} 00:00:00"))
+                            }
+                        })?
+                    };
                     if ft.tp == crate::field_type::TYPE_TIMESTAMP {
                         t.tp = crate::time::TimeType::Timestamp;
                     } else if ft.tp == crate::field_type::TYPE_DATE {
                         t.tp = crate::time::TimeType::Date;
+                    } else if ft.tp == crate::field_type::TYPE_DURATION {
+                        t.tp = crate::time::TimeType::Time;
                     } else {
                         t.tp = crate::time::TimeType::Datetime;
                     }
                     Ok(Datum::Time(t))
                 }
-                other => Err(Error::new(
-                    ERR_TRUNCATED_WRONG_VALUE,
-                    format!("Incorrect datetime value: '{}'", other.display()),
-                )),
+                // TiDB `ParseTimeFromNum`: numeric DATE/DATETIME/TIME literals.
+                other => {
+                    let n = other.as_i64()?;
+                    let tp = if ft.tp == crate::field_type::TYPE_DATE {
+                        crate::time::TimeType::Date
+                    } else if ft.tp == crate::field_type::TYPE_DURATION {
+                        crate::time::TimeType::Time
+                    } else if ft.tp == crate::field_type::TYPE_TIMESTAMP {
+                        crate::time::TimeType::Timestamp
+                    } else {
+                        crate::time::TimeType::Datetime
+                    };
+                    let t = crate::time::time_from_number(n, tp).ok_or_else(|| {
+                        Error::new(
+                            ERR_TRUNCATED_WRONG_VALUE,
+                            format!("Incorrect datetime value: '{}'", other.display()),
+                        )
+                    })?;
+                    Ok(Datum::Time(t))
+                }
             },
         }
     }
@@ -178,6 +266,7 @@ impl Datum {
             Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
             Datum::Decimal(d) => d.to_string(),
             Datum::Time(t) => t.to_string(),
+            Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
         }
     }
 
@@ -192,6 +281,10 @@ impl Datum {
             }
             Datum::Decimal(d) => serde_json::json!({"type": "decimal", "value": d.to_string()}),
             Datum::Time(t) => serde_json::json!({"type": "time", "value": t.to_string()}),
+            Datum::Enum(e) => serde_json::json!({
+                "type": "string",
+                "value": String::from_utf8_lossy(&e.label)
+            }),
         }
     }
 }
@@ -220,9 +313,7 @@ fn format_float(v: f64) -> String {
         // Rust may emit `1e+23`; TiDB goldens use `1e23`.
         return s.replace("e+", "e").replace("E+", "e").replace('E', "e");
     }
-    if v.fract() == 0.0 {
-        format!("{v:.1}")
-    } else {
-        v.to_string()
-    }
+    // TiDB prints FLOAT/DOUBLE like Go `%v` (`1.0` → `1`); DECIMAL keeps its
+    // scale through `Datum::Decimal` instead.
+    v.to_string()
 }

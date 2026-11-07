@@ -381,10 +381,14 @@ fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
         };
         row.push(collation);
     }
+    let default = match col.default_expr.as_deref() {
+        Some(text) => Datum::Bytes(default_display(text).into_bytes()),
+        None => Datum::Null,
+    };
     row.extend([
         Datum::Bytes(b"YES".to_vec()),
         Datum::Bytes(Vec::new()),
-        Datum::Null,
+        default,
         Datum::Bytes(Vec::new()),
     ]);
     if full {
@@ -392,6 +396,15 @@ fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
         row.push(Datum::Bytes(Vec::new()));
     }
     row
+}
+
+/// DESCRIBE `Default` cell: string literals lose their quotes.
+fn default_display(text: &str) -> String {
+    let t = text.trim();
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return t[1..t.len() - 1].replace("''", "'");
+    }
+    t.to_string()
 }
 
 fn render_create_table(info: &TableInfo) -> String {
@@ -402,7 +415,9 @@ fn render_create_table(info: &TableInfo) -> String {
         .iter()
         .map(|col| {
             let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
-            if col.field_type.flag & NOT_NULL_FLAG == 0 {
+            if let Some(default) = &col.default_expr {
+                line.push_str(&format!(" DEFAULT {default}"));
+            } else if col.field_type.flag & NOT_NULL_FLAG == 0 {
                 line.push_str(" DEFAULT NULL");
             }
             line

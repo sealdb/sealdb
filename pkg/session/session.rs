@@ -416,7 +416,14 @@ impl Session {
                 let inner = self.parser.parse_one_stmt(&bound)?;
                 // MVB: still plan/execute the bound SQL, but cache under the
                 // unbound `?` template so different USING literals share one entry.
-                *self.cache_plans.lock().expect("session cache flag lock") = true;
+                //
+                // Subqueries are excluded: decorrelation rewrites (semi/anti
+                // join, apply) bake the bound constants into the join keys, and
+                // unlike PointGet/index lookups those literals are not re-read
+                // from the current statement, so a cached plan would answer a
+                // later EXECUTE with the first USING values.
+                let cacheable = !sql.to_ascii_lowercase().contains("(select");
+                *self.cache_plans.lock().expect("session cache flag lock") = cacheable;
                 *self
                     .plan_cache_key
                     .lock()
@@ -582,6 +589,11 @@ impl Session {
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         inherit_cte_scope(&mut expanded);
         expand_views(&mut expanded, &is, &current_db)?;
+        // `NATURAL JOIN` has no schema at parse time: resolve common columns
+        // against the catalog before planning (TiDB buildNaturalJoin).
+        if sealdb_planner::stmt_has_natural_join(&expanded) {
+            expanded = sealdb_planner::expand_natural_joins(&expanded, Some(&is), &current_db)?;
+        }
         if let Statement::LoadData(load) = &expanded {
             let insert = load_data_to_insert(load, &is, &current_db)?;
             mdl_guard.active = false;
@@ -688,6 +700,8 @@ impl Session {
                     sealdb_expression::with_current_db(current_db.as_str(), || {
                         sealdb_expression::with_collation(mode, || {
                             sealdb_expression::clear_warnings();
+                            // TiDB allocates a fresh memory tracker per query.
+                            sealdb_expression::reset_query_mem_usage();
                             ExecutorBuilder::run(exec)
                         })
                     })
@@ -1256,7 +1270,12 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
     if !sql_mode_has(&mode, "ONLY_FULL_GROUP_BY") {
         return Ok(());
     }
-    check_select_only_full_group_by(select)
+    let current_db = session
+        .current_db
+        .lock()
+        .expect("session current_db lock")
+        .clone();
+    check_select_only_full_group_by(select, &current_db)
 }
 
 /// One SELECT block plus every nested block reachable from it.
@@ -1264,7 +1283,7 @@ fn check_only_full_group_by(session: &Session, stmt: &Statement) -> Result<()> {
 /// Derived `FROM (SELECT …)` tables are lowered into synthetic CTEs on the
 /// same `SelectStmt`, so recursing through `with.ctes` also validates the
 /// bodies of derived tables (TiDB reports 1055 for those too).
-fn check_select_only_full_group_by(select: &SelectStmt) -> Result<()> {
+fn check_select_only_full_group_by(select: &SelectStmt, current_db: &str) -> Result<()> {
     if !select.group_by.is_empty() {
         let cte_loose = cte_group_by_allows_peer_columns(select);
         for (i, field) in select.fields.iter().enumerate() {
@@ -1276,28 +1295,57 @@ fn check_select_only_full_group_by(select: &SelectStmt) -> Result<()> {
             }
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_WRONG_FIELD_WITH_GROUP,
-                format!(
-                    "Expression #{} of SELECT list is not in GROUP BY clause and contains nonaggregated column which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
-                    i + 1
-                ),
+                nonaggregated_column_message(i + 1, &field.expr, select, current_db),
             ));
         }
     }
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            check_select_only_full_group_by(&cte.query)?;
+            check_select_only_full_group_by(&cte.query, current_db)?;
             if let Some((_, arm)) = &cte.recursive {
-                check_select_only_full_group_by(arm)?;
+                check_select_only_full_group_by(arm, current_db)?;
             }
             for (_, arm) in &cte.recursive_rest {
-                check_select_only_full_group_by(arm)?;
+                check_select_only_full_group_by(arm, current_db)?;
             }
             for (_, arm) in &cte.set_rest {
-                check_select_only_full_group_by(arm)?;
+                check_select_only_full_group_by(arm, current_db)?;
             }
         }
     }
     Ok(())
+}
+
+/// TiDB names the offending column as `{db}.{table}.{col}` when it can
+/// resolve the owner (`e2.clock` for `SELECT clock FROM events e2 GROUP BY
+/// e2.source`), and omits the name for expressions without a single column.
+fn nonaggregated_column_message(
+    position: usize,
+    expr: &ExprNode,
+    select: &SelectStmt,
+    current_db: &str,
+) -> String {
+    let column = match expr {
+        ExprNode::Column(col) => {
+            let owner = col
+                .table
+                .clone()
+                .or_else(|| select.from.as_ref().map(|t| t.name.clone()));
+            owner.map(|owner| {
+                let db = if current_db.is_empty() {
+                    "select"
+                } else {
+                    current_db
+                };
+                format!("column '{db}.{owner}.{}'", col.name)
+            })
+        }
+        _ => None,
+    }
+    .unwrap_or_else(|| "column".to_string());
+    format!(
+        "Expression #{position} of SELECT list is not in GROUP BY clause and contains nonaggregated {column} which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by"
+    )
 }
 
 /// TiDB: `WITH qn AS (SELECT a,b …) SELECT b FROM qn GROUP BY a` is accepted
@@ -1581,8 +1629,151 @@ fn user_var_key(name: &str) -> String {
     name.trim_start_matches('@').to_ascii_lowercase()
 }
 
-fn parse_set_literal(value: &str) -> sealdb_types::Datum {
-    let v = value.trim();
+/// Evaluate an integer expression accepted as a `SET` numeric value, e.g.
+/// `1 << 18` for `tidb_mem_quota_query`. Supports unary `-`, `+ - * / %`,
+/// `<<`/`>>`, `|`, `&` and parentheses over decimal/hex literals.
+fn parse_set_int_expr(value: &str) -> Option<i64> {
+    let trimmed = value.trim().trim_matches(|c| c == '\'' || c == '"');
+    let mut parser = SetIntParser {
+        bytes: trimmed.as_bytes(),
+        pos: 0,
+    };
+    let result = parser.parse_add()?;
+    parser.skip_spaces();
+    if parser.pos == parser.bytes.len() {
+        Some(result)
+    } else {
+        // Plain quoted non-numeric values ("CANCEL") reach here.
+        trimmed.parse::<i64>().ok()
+    }
+}
+
+struct SetIntParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl SetIntParser<'_> {
+    fn skip_spaces(&mut self) {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        self.skip_spaces();
+        let end = self.pos + token.len();
+        if end <= self.bytes.len() && &self.bytes[self.pos..end] == token.as_bytes() {
+            self.pos = end;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_add(&mut self) -> Option<i64> {
+        let mut left = self.parse_mul()?;
+        loop {
+            if self.eat("+") {
+                left = left.checked_add(self.parse_mul()?)?;
+            } else if self.eat("-") {
+                left = left.checked_sub(self.parse_mul()?)?;
+            } else if self.eat("|") {
+                left |= self.parse_mul()?;
+            } else {
+                return Some(left);
+            }
+        }
+    }
+
+    fn parse_mul(&mut self) -> Option<i64> {
+        let mut left = self.parse_shift()?;
+        loop {
+            if self.eat("*") {
+                left = left.checked_mul(self.parse_shift()?)?;
+            } else if self.eat("/") {
+                let rhs = self.parse_shift()?;
+                if rhs == 0 {
+                    return None;
+                }
+                left /= rhs;
+            } else if self.eat("%") {
+                let rhs = self.parse_shift()?;
+                if rhs == 0 {
+                    return None;
+                }
+                left %= rhs;
+            } else if self.eat("&") {
+                left &= self.parse_shift()?;
+            } else {
+                return Some(left);
+            }
+        }
+    }
+
+    fn parse_shift(&mut self) -> Option<i64> {
+        let mut left = self.parse_unary()?;
+        loop {
+            if self.eat("<<") {
+                let rhs = self.parse_unary()?;
+                left = left.checked_shl(u32::try_from(rhs).ok()?)?;
+            } else if self.eat(">>") {
+                let rhs = self.parse_unary()?;
+                left = left.checked_shr(u32::try_from(rhs).ok()?)?;
+            } else {
+                return Some(left);
+            }
+        }
+    }
+
+    fn parse_unary(&mut self) -> Option<i64> {
+        self.skip_spaces();
+        if self.eat("-") {
+            return self.parse_unary()?.checked_neg();
+        }
+        if self.eat("+") {
+            return self.parse_unary();
+        }
+        if self.eat("(") {
+            let value = self.parse_add()?;
+            if !self.eat(")") {
+                return None;
+            }
+            return Some(value);
+        }
+        self.parse_number()
+    }
+
+    fn parse_number(&mut self) -> Option<i64> {
+        self.skip_spaces();
+        let start = self.pos;
+        if self.bytes[self.pos..].starts_with(b"0x") || self.bytes[self.pos..].starts_with(b"0X") {
+            self.pos += 2;
+            let digits = self.pos;
+            while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_hexdigit() {
+                self.pos += 1;
+            }
+            let text = std::str::from_utf8(&self.bytes[digits..self.pos]).ok()?;
+            return i64::from_str_radix(text, 16).ok();
+        }
+        while self.pos < self.bytes.len()
+            && (self.bytes[self.pos].is_ascii_digit() || self.bytes[self.pos] == b'_')
+        {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        let text: String = std::str::from_utf8(&self.bytes[start..self.pos])
+            .ok()?
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
+        text.parse().ok()
+    }
+}
+
+fn parse_set_literal(value: &str) -> sealdb_types::Datum {    let v = value.trim();
     if v.eq_ignore_ascii_case("null") {
         return sealdb_types::Datum::Null;
     }
@@ -1943,6 +2134,38 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                 sealdb_expression::set_window_concurrency(n.max(1));
             }
             "tidb_enable_window_function" => {}
+            // Per-query memory quota (TiDB `tidb_mem_quota_query`): `0` = no
+            // limit, `DEFAULT` = 1 GiB. Values are byte counts, possibly written
+            // as an integer expression (`1 << 18`).
+            "tidb_mem_quota_query" => {
+                let quota = if value.eq_ignore_ascii_case("DEFAULT") {
+                    sealdb_expression::memquota::DEFAULT_QUERY_MEM_QUOTA
+                } else {
+                    parse_set_int_expr(&value).ok_or_else(|| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!(
+                                "Variable 'tidb_mem_quota_query' can't be set to the value of '{value}'"
+                            ),
+                        )
+                    })?
+                };
+                sealdb_expression::set_query_mem_quota(quota);
+            }
+            "tidb_mem_oom_action" => {
+                let action = sealdb_expression::OomAction::parse(&value).ok_or_else(|| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_mem_oom_action' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                sealdb_expression::set_query_mem_oom_action(action);
+            }
+            // Accepted for compatibility; SealDB always keeps intermediate data
+            // in memory rather than spilling to local temporary storage.
+            "tidb_enable_tmp_storage_on_oom" => {}
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
@@ -1975,6 +2198,10 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
                 .domain
                 .set_global_character_set_connection(value.to_string());
         }
+        // System-wide memory OOM policy; SealDB tracks per session, so accept
+        // the assignment without persisting a domain-wide default.
+        "tidb_mem_oom_action" | "tidb_enable_tmp_storage_on_oom" => {}
+        "tidb_mem_quota_query" => {}
         other => {
             return Err(sealdb_errno::Error::unsupported(format!(
                 "SET GLOBAL {other}"
@@ -2067,6 +2294,7 @@ fn literal_field_name(datum: &sealdb_types::Datum) -> String {
         sealdb_types::Datum::Null => "NULL".into(),
         sealdb_types::Datum::Time(t) => t.to_string(),
         sealdb_types::Datum::Decimal(d) => d.to_string(),
+        sealdb_types::Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
     }
 }
 

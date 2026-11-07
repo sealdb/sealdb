@@ -53,6 +53,12 @@ fn push_warning(code: i32, message: impl Into<String>) {
     WARNINGS.with(|w| w.borrow_mut().push((code, message.into())));
 }
 
+/// Record a statement warning from outside the expression evaluator
+/// (e.g. INSERT ENUM/SET truncation).
+pub fn note_warning(code: i32, message: impl Into<String>) {
+    push_warning(code, message);
+}
+
 pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {
     COLLATION_MODE.with(|cell| {
         let prev = *cell.borrow();
@@ -377,6 +383,53 @@ pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> 
     }
 }
 
+/// Operands of a row comparison: a `Row` expands to its items, anything else
+/// is a one-column row.
+fn row_operands(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<Vec<Datum>> {
+    match expr {
+        ExprNode::Row(inner) => inner
+            .exprs
+            .iter()
+            .map(|item| eval_expr_with_row(item, schema, row))
+            .collect(),
+        other => Ok(vec![eval_expr_with_row(other, schema, row)?]),
+    }
+}
+
+/// MySQL row comparison: compare column by column, the first pair that differs
+/// decides; a NULL pair yields NULL before any decision.
+fn eval_row_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let left = row_operands(&expr.left, schema, row)?;
+    let right = row_operands(&expr.right, schema, row)?;
+    if left.len() != right.len() {
+        return Err(Error::new(
+            sealdb_errno::ERR_OPERAND_COLUMNS,
+            format!(
+                "Operand should contain {} column(s)",
+                left.len().max(right.len())
+            ),
+        ));
+    }
+    for (l, r) in left.iter().zip(right.iter()) {
+        if l.is_null() || r.is_null() {
+            return Ok(Datum::Null);
+        }
+        let ord = compare_datums_for_op(l, r, expr.op)?;
+        if ord == std::cmp::Ordering::Equal {
+            continue;
+        }
+        let result = match expr.op {
+            Op::Eq => false,
+            Op::Ne => true,
+            Op::Lt | Op::Le => ord == std::cmp::Ordering::Less,
+            Op::Gt | Op::Ge => ord == std::cmp::Ordering::Greater,
+            _ => return Err(Error::unsupported("row comparison operator")),
+        };
+        return Ok(bool_datum(result));
+    }
+    Ok(bool_datum(matches!(expr.op, Op::Eq | Op::Le | Op::Ge)))
+}
+
 /// SQL `=` on two already-evaluated datums (caller handles NULL operands).
 pub fn datum_sql_eq(left: &Datum, right: &Datum) -> Result<bool> {
     Ok(compare_datums_for_op(left, right, Op::Eq)?.is_eq())
@@ -490,6 +543,14 @@ fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Res
 }
 
 fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
+    // Hidden USING column (`\u{1}t2.a`): only qualified references may bind.
+    if let Some(name) = schema_name.strip_prefix('\u{1}') {
+        let col_table = match col.table.as_deref() {
+            Some(t) => t,
+            None => return false,
+        };
+        return name.eq_ignore_ascii_case(&format!("{col_table}.{}", col.name));
+    }
     let (table, name) = split_qualified(schema_name);
     let name_ok =
         name.eq_ignore_ascii_case(&col.name) || schema_name.eq_ignore_ascii_case(&col.name);
@@ -512,6 +573,12 @@ fn split_qualified(name: &str) -> (Option<&str>, &str) {
 }
 
 fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    // Row constructors compare lexicographically: `(a, b) = (c, d)`.
+    if matches!(expr.left.as_ref(), ExprNode::Row(_))
+        || matches!(expr.right.as_ref(), ExprNode::Row(_))
+    {
+        return eval_row_binary(expr, schema, row);
+    }
     let left = eval_expr_with_row(&expr.left, schema, row)?;
     let right = eval_expr_with_row(&expr.right, schema, row)?;
     if matches!(expr.op, Op::LogicOr) && sql_mode_flag("PIPES_AS_CONCAT") {
@@ -782,6 +849,27 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Null)
         }
+        "ISTRUE" | "ISNOTTRUE" | "ISFALSE" | "ISNOTFALSE" | "ISUNKNOWN" | "ISNOTUNKNOWN" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 1 argument", func.name),
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            let name = func.name.to_ascii_uppercase();
+            let is_null = v.is_null();
+            let truth = truthy(&v);
+            let out = match name.as_str() {
+                "ISTRUE" => truth == Some(true),
+                "ISNOTTRUE" => truth != Some(true),
+                "ISFALSE" => truth == Some(false),
+                "ISNOTFALSE" => truth != Some(false),
+                "ISUNKNOWN" => is_null,
+                _ => !is_null,
+            };
+            Ok(bool_datum(out))
+        }
         "ISNULL" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -839,6 +927,36 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::F64(v) => Ok(Datum::F64(v.abs())),
                 other => Ok(Datum::I64(other.as_i64()?.saturating_abs())),
             }
+        }
+        "HEX" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "HEX requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let out = match &v {
+                // String/binary: two uppercase hex digits per byte.
+                Datum::Bytes(b) => b.iter().map(|x| format!("{x:02X}")).collect::<String>(),
+                // Integers: uppercase hex, negatives as two's complement u64.
+                Datum::I64(i) => format!("{:X}", *i as u64),
+                Datum::U64(u) => format!("{u:X}"),
+                Datum::F64(f) => format!("{:X}", (*f as i64) as u64),
+                Datum::Decimal(d) => format!("{:X}", d.to_i64()? as u64),
+                Datum::Time(t) => format!("{:X}", t.to_packed_u64()),
+                // ENUM/SET hex is taken over the label text (MySQL string path).
+                Datum::Enum(e) => e
+                    .label
+                    .iter()
+                    .map(|x| format!("{x:02X}"))
+                    .collect::<String>(),
+                Datum::Null => return Ok(Datum::Null),
+            };
+            Ok(Datum::Bytes(out.into_bytes()))
         }
         "CONCAT" => {
             if func.args.is_empty() {
@@ -1254,6 +1372,10 @@ pub fn utc_to_session_local(mut t: Time) -> Result<Time> {
     if tz.eq_ignore_ascii_case("UTC") || tz == "+00:00" || tz.eq_ignore_ascii_case("SYSTEM") {
         return Ok(t);
     }
+    if let Some(minutes) = parse_tz_offset(&tz) {
+        shift_minutes(&mut t, minutes)?;
+        return Ok(t);
+    }
     if tz.eq_ignore_ascii_case("Europe/Paris") {
         // 2025-03-30 spring forward at 01:00 UTC (02:00 CET → 03:00 CEST).
         let offset = if t.year == 2025 && t.month == 3 && t.day == 30 && t.hour >= 1 {
@@ -1277,6 +1399,10 @@ pub fn utc_to_session_local(mut t: Time) -> Result<Time> {
 pub fn session_local_to_utc(mut t: Time) -> Result<Time> {
     let tz = current_time_zone();
     if tz.eq_ignore_ascii_case("UTC") || tz == "+00:00" || tz.eq_ignore_ascii_case("SYSTEM") {
+        return Ok(t);
+    }
+    if let Some(minutes) = parse_tz_offset(&tz) {
+        shift_minutes(&mut t, -minutes)?;
         return Ok(t);
     }
     if tz.eq_ignore_ascii_case("Europe/Paris") {
@@ -1309,6 +1435,42 @@ pub fn format_timestamp_display(t: Time) -> String {
         Ok(local) => local.to_string(),
         Err(_) => t.to_string(),
     }
+}
+
+/// Parse a numeric session time zone offset (`+10:00`, `-05:30`, `+08`) into
+/// minutes east of UTC. Named zones are handled separately.
+fn parse_tz_offset(tz: &str) -> Option<i64> {
+    let tz = tz.trim();
+    let sign = match tz.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &tz[1..];
+    let (hours, minutes) = match rest.split_once(':') {
+        Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+        None => (rest.parse::<i64>().ok()?, 0),
+    };
+    if !(0..=14).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+/// Shift a wall clock by whole minutes, rolling the date over as needed.
+fn shift_minutes(t: &mut Time, minutes: i64) -> Result<()> {
+    if minutes == 0 {
+        return Ok(());
+    }
+    let total = i64::from(t.hour) * 60 + i64::from(t.minute) + minutes;
+    let days = total.div_euclid(1440);
+    let rem = total.rem_euclid(1440);
+    t.hour = (rem / 60) as u8;
+    t.minute = (rem % 60) as u8;
+    if days != 0 {
+        add_days(t, days)?;
+    }
+    Ok(())
 }
 
 fn eval_timestamp_diff(
@@ -1586,6 +1748,18 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "DOUBLE" | "REAL" | "FLOAT" => FieldType::new_double(),
         "CHAR" | "BINARY" | "CHARSET" => FieldType::new_string(),
         "DECIMAL" | "NUMERIC" => FieldType::new_newdecimal(),
+        "DATE" => FieldType {
+            tp: sealdb_types::field_type::TYPE_DATE,
+            flen: 10,
+            decimal: 0,
+            ..FieldType::default()
+        },
+        "DATETIME" => FieldType {
+            tp: sealdb_types::field_type::TYPE_DATETIME,
+            flen: 19,
+            decimal: 0,
+            ..FieldType::default()
+        },
         _ => FieldType::new_string(),
     };
     value.cast(&ft)

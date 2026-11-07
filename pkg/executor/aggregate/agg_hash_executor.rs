@@ -5,7 +5,8 @@ use crate::aggfuncs::{build_agg_func, is_agg_name};
 use crate::aggregate::agg_spill::{add_to_partition, new_partitions};
 use crate::internal::exec::Executor;
 use sealdb_errno::Result;
-use sealdb_expression::{eval_expr_with_row, eval_filter};
+use crate::join::apply::SubqueryEvalCtx;
+use sealdb_expression::{eval_expr_with_row, eval_filter, truthy};
 use sealdb_parser::ast::SelectStmt;
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, FuncCallExpr};
 use sealdb_parser::format::RestoreCtx;
@@ -31,6 +32,8 @@ pub struct HashAggExec {
     outputs: Vec<OutputItem>,
     extra_aggs: usize,
     having: Option<ExprNode>,
+    /// Correlated SELECT-list / HAVING subqueries (`Apply` is flattened here).
+    subquery: Option<SubqueryEvalCtx>,
     filter_schema: Vec<String>,
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
@@ -117,6 +120,7 @@ impl HashAggExec {
             outputs,
             extra_aggs,
             having,
+            subquery: None,
             filter_schema,
             schema,
             rows: Vec::new(),
@@ -124,6 +128,27 @@ impl HashAggExec {
             spilled: false,
             emitted: false,
         })
+    }
+
+    pub(crate) fn with_subquery(mut self, subquery: SubqueryEvalCtx) -> Self {
+        self.subquery = Some(subquery);
+        self
+    }
+
+    /// Evaluate `expr` against one input row, materializing any subquery first.
+    fn eval(&mut self, expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<Datum> {
+        match self.subquery.as_mut() {
+            Some(ctx) => ctx.eval(expr, schema, row),
+            None => eval_expr_with_row(expr, schema, row),
+        }
+    }
+
+    fn eval_bool(&mut self, expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
+        if self.subquery.is_none() {
+            return eval_filter(expr, schema, row);
+        }
+        let value = self.eval(expr, schema, row)?;
+        Ok(truthy(&value).unwrap_or(false))
     }
 
     pub fn with_mem_limit(mut self, mem_limit: usize) -> Self {
@@ -204,15 +229,15 @@ struct GroupState {
 
 impl HashAggExec {
     fn write_partition(
-        &self,
+        &mut self,
         files: &mut [DataInDiskByRows],
         input_schema: &[String],
         row: &[Datum],
     ) -> Result<()> {
-        let keys = self
-            .group_by
+        let group_by = self.group_by.clone();
+        let keys = group_by
             .iter()
-            .map(|expr| eval_expr_with_row(expr, input_schema, row))
+            .map(|expr| self.eval(expr, input_schema, row))
             .collect::<Result<Vec<_>>>()?;
         add_to_partition(files, &keys, row)
     }
@@ -224,18 +249,18 @@ impl HashAggExec {
         emit_empty_scalar: bool,
     ) -> Result<()> {
         let mut groups: BTreeMap<String, GroupState> = BTreeMap::new();
+        let group_by = self.group_by.clone();
+        let any_exprs = self.any_exprs.clone();
         for row in rows {
-            let keys = self
-                .group_by
+            let keys = group_by
                 .iter()
-                .map(|expr| eval_expr_with_row(expr, input_schema, &row))
+                .map(|expr| self.eval(expr, input_schema, &row))
                 .collect::<Result<Vec<_>>>()?;
             let map_key = encode_group_key(&keys);
             if !groups.contains_key(&map_key) {
-                let any_vals = self
-                    .any_exprs
+                let any_vals = any_exprs
                     .iter()
-                    .map(|expr| eval_expr_with_row(expr, input_schema, &row))
+                    .map(|expr| self.eval(expr, input_schema, &row))
                     .collect::<Result<Vec<_>>>()?;
                 groups.insert(
                     map_key.clone(),
@@ -253,12 +278,18 @@ impl HashAggExec {
             let group = groups
                 .get_mut(&map_key)
                 .expect("group just inserted or already present");
-            for (spec, agg) in self.agg_specs.iter().zip(group.aggs.iter_mut()) {
-                if spec.args.is_empty() {
-                    agg.update(None)?;
-                } else {
-                    let value = eval_expr_with_row(&spec.args[0], input_schema, &row)?;
-                    agg.update(Some(&value))?;
+            let args: Vec<Option<ExprNode>> = self
+                .agg_specs
+                .iter()
+                .map(|spec| spec.args.first().cloned())
+                .collect();
+            for (arg, agg) in args.into_iter().zip(group.aggs.iter_mut()) {
+                match arg {
+                    None => agg.update(None)?,
+                    Some(expr) => {
+                        let value = self.eval(&expr, input_schema, &row)?;
+                        agg.update(Some(&value))?;
+                    }
                 }
             }
         }
@@ -291,10 +322,11 @@ impl HashAggExec {
         aggs: &mut [Box<dyn crate::aggfuncs::AggFunc>],
     ) -> Result<()> {
         let full = self.finish_row(keys, any_vals, aggs)?;
-        if let Some(having) = &self.having
-            && !eval_filter(having, &self.filter_schema, &full)?
-        {
-            return Ok(());
+        if let Some(having) = self.having.clone() {
+            let schema = self.filter_schema.clone();
+            if !self.eval_bool(&having, &schema, &full)? {
+                return Ok(());
+            }
         }
         let visible = full.len().saturating_sub(self.extra_aggs);
         self.rows.push(full[..visible].to_vec());

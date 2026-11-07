@@ -826,7 +826,7 @@
     {
       "name": "executor/jointest/hash_join",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/jointest/hash_join.test",
       "result": "r/executor/jointest/hash_join.result",
       "has_result": true,

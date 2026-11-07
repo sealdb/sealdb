@@ -21,6 +21,13 @@ pub struct FieldType {
     pub charset: String,
     #[serde(rename = "Collate")]
     pub collate: String,
+    /// `ENUM`/`SET` members in declaration order (TiDB `FieldType.Elems`).
+    #[serde(
+        rename = "Elems",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub elems: Option<Vec<String>>,
     #[serde(skip)]
     pub unsigned: bool,
 }
@@ -34,6 +41,7 @@ impl Default for FieldType {
             decimal: -1,
             charset: "utf8mb4".to_string(),
             collate: "utf8mb4_bin".to_string(),
+            elems: None,
             unsigned: false,
         }
     }
@@ -84,6 +92,18 @@ impl FieldType {
             TYPE_DOUBLE => "double",
             TYPE_NEW_DECIMAL | TYPE_DECIMAL => "decimal",
             TYPE_VAR_STRING | TYPE_VARCHAR | TYPE_STRING => {
+                if self.charset == "binary" {
+                    let name = if self.tp == TYPE_STRING {
+                        "binary"
+                    } else {
+                        "varbinary"
+                    };
+                    return if self.flen > 0 {
+                        format!("{name}({})", self.flen)
+                    } else {
+                        name.to_string()
+                    };
+                }
                 if self.flen > 0 {
                     return format!("varchar({})", self.flen);
                 }
@@ -94,6 +114,9 @@ impl FieldType {
             TYPE_DATETIME => "datetime",
             TYPE_TIMESTAMP => "timestamp",
             TYPE_JSON => "json",
+            TYPE_BIT => return format!("bit({})", self.flen.max(1)),
+            TYPE_ENUM => return self.elems_type_name("enum"),
+            TYPE_SET => return self.elems_type_name("set"),
             _ => "varchar",
         };
         if self.unsigned {
@@ -103,14 +126,51 @@ impl FieldType {
         }
     }
 
+    /// TiDB `FieldType.HandleWrongValue` numbering for an ENUM/SET label:
+    /// 1-based member index for ENUM, member bitmask for SET (0 when empty).
+    pub fn enum_set_number(&self, label: &[u8]) -> u64 {
+        let Some(elems) = self.elems.as_deref() else {
+            return 0;
+        };
+        if label.is_empty() {
+            return 0;
+        }
+        let s = String::from_utf8_lossy(label);
+        if self.tp == TYPE_ENUM {
+            return elems
+                .iter()
+                .position(|e| e.eq_ignore_ascii_case(&s))
+                .map(|i| i as u64 + 1)
+                .unwrap_or(0);
+        }
+        let mut bits = 0u64;
+        for part in s.split(',') {
+            if let Some(i) = elems.iter().position(|e| e.eq_ignore_ascii_case(part)) {
+                bits |= 1u64 << i;
+            }
+        }
+        bits
+    }
+
+    /// TiDB renders `enum('a','b')` / `set('a','b')` in SHOW/DESCRIBE output.
+    fn elems_type_name(&self, kind: &str) -> String {
+        let Some(elems) = &self.elems else {
+            return kind.to_string();
+        };
+        let quoted: Vec<String> = elems
+            .iter()
+            .map(|e| format!("'{}'", e.replace('\\', "\\\\").replace('\'', "''")))
+            .collect();
+        format!("{kind}({})", quoted.join(","))
+    }
+
     pub fn eval_type(&self) -> EvalType {
         match self.tp {
-            TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_LONG_LONG | TYPE_INT24 | TYPE_YEAR => {
-                EvalType::Int
-            }
+            TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_LONG_LONG | TYPE_INT24 | TYPE_YEAR
+            | TYPE_BIT => EvalType::Int,
             TYPE_FLOAT | TYPE_DOUBLE => EvalType::Real,
             TYPE_NEW_DECIMAL | TYPE_DECIMAL => EvalType::Decimal,
-            TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DATE => EvalType::Datetime,
+            TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DATE | TYPE_DURATION => EvalType::Datetime,
             _ => EvalType::String,
         }
     }

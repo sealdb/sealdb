@@ -354,6 +354,12 @@ fn row_key(row: &[sealdb_types::Datum], idxs: &[usize]) -> Vec<u8> {
                 out.push(6);
                 out.extend(t.to_string().into_bytes());
             }
+            // ENUM/SET key by label text, like a string column.
+            sealdb_types::Datum::Enum(e) => {
+                out.push(4);
+                out.extend((e.label.len() as u32).to_le_bytes());
+                out.extend(&e.label);
+            }
         }
         out.push(0xff);
     }

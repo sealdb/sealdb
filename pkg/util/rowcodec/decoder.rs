@@ -7,7 +7,7 @@ use sealdb_types::field_type::{
     TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
     TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
 };
-use sealdb_types::{Datum, MyDecimal, Time, TimeType};
+use sealdb_types::{Datum, EnumValue, MyDecimal, Time, TimeType};
 
 /// Decode a v128 row. The new format has no type tags, so each requested column
 /// needs a `FieldType`. An empty `columns` list returns every stored value as
@@ -74,9 +74,16 @@ fn decode_value(data: &[u8], ft: &FieldType) -> Datum {
             };
             Datum::Time(t)
         }
-        TYPE_BIT | TYPE_ENUM | TYPE_SET => Datum::U64(decode_uint(data)),
+        // ENUM/SET store member labels as text; rebuild the numeric form
+        // (enum index, set bitmask) from `FieldType.elems` for comparisons.
+        TYPE_ENUM | TYPE_SET => {
+            let label = data.to_vec();
+            let number = ft.enum_set_number(&label);
+            Datum::Enum(EnumValue { label, number })
+        }
         TYPE_VAR_STRING | TYPE_VARCHAR | TYPE_STRING | TYPE_BLOB | TYPE_TINY_BLOB
         | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => Datum::Bytes(data.to_vec()),
+        TYPE_BIT => Datum::U64(decode_uint(data)),
         _ => Datum::Bytes(data.to_vec()),
     }
 }
