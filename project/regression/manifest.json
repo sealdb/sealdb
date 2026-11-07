@@ -1426,7 +1426,7 @@
     {
       "name": "globalindex/index_join",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/globalindex/index_join.test",
       "result": "r/globalindex/index_join.result",
       "has_result": true,
