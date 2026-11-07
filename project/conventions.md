@@ -60,6 +60,29 @@
 - [ ] 记录已知差异（PARITY_NOTES / progress）
 - [ ] 如引入新依赖，说明 License 与替代方案
 - [ ] Commit 禁止 `Co-authored-by` trailer
+- [ ] Commit 标题符合下节格式，单行长度受约束
+
+### 2.5 Commit message
+
+标题固定为 `<type>(<scope>): <subject>`：
+
+```text
+fix(session): ONLY_FULL_GROUP_BY validates CTE and derived-table bodies
+```
+
+- `type`：`feat` / `fix` / `docs` / `test` / `refactor` / `perf` / `style` /
+  `chore` / `build` / `ci` / `revert`
+- `scope`：受影响的目录或 crate，多域用逗号分隔（`fix(meta,types,errno): …`）
+- `subject`：祈使句、小写开头、句尾不加句号
+- **行长**：标题 ≤ 80 字符；正文每行 ≤ 100 字符（URL 除外），需要连贯时先断句再换行
+- 标题与正文之间空一行；正文说明「改了什么 + 为什么」，不复述 diff
+- 禁止 `Co-authored-by` trailer
+
+校验脚本：`project/scripts/check_commit_msg.sh`。安装为本地 hook：
+
+```bash
+ln -sf ../../project/scripts/check_commit_msg.sh .git/hooks/commit-msg
+```
 
 ---
 
