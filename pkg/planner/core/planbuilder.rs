@@ -849,8 +849,9 @@ impl PlanBuilder {
             is,
             current_db,
             // The preserved side of an outer join keeps NULL keys (they never
-            // match); only the null-supplying side gets `not(isnull(key))`.
-            matches!(first_tp, JoinType::RightOuter),
+            // match); on an inner join both sides supply NULLs, so both get
+            // `not(isnull(key))`.
+            matches!(first_tp, JoinType::RightOuter | JoinType::Inner | JoinType::Cross),
         );
         let mut right = prepare_merge_join_side(
             right,
@@ -4813,11 +4814,34 @@ pub fn merged_star_columns(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> Option<Vec<(String, String)>> {
+    merged_star_columns_impl(item, is, current_db, false)
+}
+
+/// Same as [`merged_star_columns`], but the alias is the visible FROM alias
+/// (`t dt1` → `dt1`), matching plan schemas built from the alias.
+pub fn merged_star_visible_columns(
+    item: &FromItem,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<Vec<(String, String)>> {
+    merged_star_columns_impl(item, is, current_db, true)
+}
+
+fn merged_star_columns_impl(
+    item: &FromItem,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    visible_alias: bool,
+) -> Option<Vec<(String, String)>> {
     match item {
         FromItem::Table(table) => {
             let (schema, name) = table.qualified(current_db);
             let info = is?.table_by_name(&schema, &name)?;
-            let alias = table.resolve_name().to_string();
+            let alias = if visible_alias {
+                table.name.clone()
+            } else {
+                table.resolve_name().to_string()
+            };
             Some(
                 info.columns
                     .iter()
@@ -4832,8 +4856,8 @@ pub fn merged_star_columns(
             using_cols,
             ..
         } => {
-            let left_cols = merged_star_columns(left, is, current_db)?;
-            let right_cols = merged_star_columns(right, is, current_db)?;
+            let left_cols = merged_star_columns_impl(left, is, current_db, visible_alias)?;
+            let right_cols = merged_star_columns_impl(right, is, current_db, visible_alias)?;
             let right_outer = matches!(map_join_type(*tp), JoinType::RightOuter);
             let (leading, trailing) = if right_outer {
                 (&right_cols, &left_cols)
