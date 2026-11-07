@@ -633,6 +633,9 @@ impl Session {
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         inherit_cte_scope(&mut expanded);
         expand_views(&mut expanded, &is, &current_db)?;
+        // `ENUM`/`SET` numeric constants become member labels before planning so
+        // index point gets encode the stored label (`a = 1` → `a = 'a'`).
+        sealdb_planner::normalize_enum_constants(&mut expanded, Some(&is), &current_db);
         // `NATURAL JOIN` has no schema at parse time: resolve common columns
         // against the catalog before planning (TiDB buildNaturalJoin).
         if sealdb_planner::stmt_has_natural_join(&expanded) {

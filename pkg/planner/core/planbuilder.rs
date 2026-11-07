@@ -85,6 +85,16 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // `ENUM`/`SET` columns compare with numbers by member index, so
+                // `a = 1` must look up the label `'a'`.
+                let enum_select;
+                let select = match coerce_enum_selection(select, is, current_db) {
+                    Some(coerced) => {
+                        enum_select = coerced;
+                        &enum_select
+                    }
+                    None => select,
+                };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` and plans a zero-row TableDual.
                 if let Some(ExprNode::Value(ValueExpr {
@@ -4718,6 +4728,17 @@ pub fn normalize_bit_constants(stmt: &mut Statement, is: Option<&InfoSchema>, cu
     }
 }
 
+/// Rewrite `ENUM`/`SET` numeric constants in a SELECT's WHERE to the member
+/// label. Runs before planning so executors that re-read the statement
+/// (e.g. batch point gets) see the same representation as the plan.
+pub fn normalize_enum_constants(stmt: &mut Statement, is: Option<&InfoSchema>, current_db: &str) {
+    if let Statement::Select(select) = stmt
+        && let Some(coerced) = coerce_enum_selection(select, is, current_db)
+    {
+        *select = coerced;
+    }
+}
+
 fn bit_column_width(expr: &ExprNode, widths: &std::collections::HashMap<String, usize>) -> Option<usize> {
     let ExprNode::Column(col) = expr else {
         return None;
@@ -5371,6 +5392,147 @@ fn coerce_temporal_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> E
         }
         other => other.clone(),
     }
+}
+
+/// Rewrite numeric constants compared with an `ENUM`/`SET` column into the
+/// member they select (TiDB folds `a = 1` to `a = 'a'` while building the
+/// datasource, so a point get looks up the stored label, not the number).
+fn coerce_enum_selection(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let selection = select.selection.as_ref()?;
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    let enum_cols: std::collections::HashMap<String, sealdb_types::FieldType> = info
+        .columns
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.field_type.tp,
+                sealdb_types::field_type::TYPE_ENUM
+                    | sealdb_types::field_type::TYPE_SET
+            )
+        })
+        .map(|c| (c.name.o().to_ascii_lowercase(), c.field_type.clone()))
+        .collect();
+    if enum_cols.is_empty() {
+        return None;
+    }
+    let coerced = coerce_enum_expr(selection, &enum_cols);
+    if coerced.restore_string() == selection.restore_string() {
+        return None;
+    }
+    let mut out = select.clone();
+    out.selection = Some(coerced);
+    Some(out)
+}
+
+fn coerce_enum_expr(
+    expr: &ExprNode,
+    enum_cols: &std::collections::HashMap<String, sealdb_types::FieldType>,
+) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => {
+            let left = coerce_enum_expr(&bin.left, enum_cols);
+            let right = coerce_enum_expr(&bin.right, enum_cols);
+            let (left, right) = if bin.op == Op::Eq {
+                match (enum_column_ft(&left, enum_cols), enum_member(&right)) {
+                    (Some(ft), Some(number)) => match enum_datum_for_number(ft, number) {
+                        Some(datum) => (left, value_expr(datum)),
+                        None => (left, right),
+                    },
+                    _ => match (enum_column_ft(&right, enum_cols), enum_member(&left)) {
+                        (Some(ft), Some(number)) => match enum_datum_for_number(ft, number) {
+                            Some(datum) => (value_expr(datum), right),
+                            None => (left, right),
+                        },
+                        _ => (left, right),
+                    },
+                }
+            } else {
+                (left, right)
+            };
+            ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(left),
+                right: Box::new(right),
+                single_cnf_item: bin.single_cnf_item,
+            })
+        }
+        ExprNode::InList(list) => {
+            let mut coerced = list.clone();
+            coerced.expr = Box::new(coerce_enum_expr(&list.expr, enum_cols));
+            if let Some(ft) = enum_column_ft(&coerced.expr, enum_cols) {
+                coerced.list = coerced
+                    .list
+                    .iter()
+                    .map(|item| match enum_member(item) {
+                        Some(number) => enum_datum_for_number(ft, number)
+                            .map(value_expr)
+                            .unwrap_or_else(|| coerce_enum_expr(item, enum_cols)),
+                        None => coerce_enum_expr(item, enum_cols),
+                    })
+                    .collect();
+            }
+            ExprNode::InList(coerced)
+        }
+        ExprNode::Unary(unary) => {
+            let mut coerced = unary.clone();
+            coerced.expr = Box::new(coerce_enum_expr(&unary.expr, enum_cols));
+            ExprNode::Unary(coerced)
+        }
+        ExprNode::IsNull(isnull) => {
+            let mut coerced = isnull.clone();
+            coerced.expr = Box::new(coerce_enum_expr(&isnull.expr, enum_cols));
+            ExprNode::IsNull(coerced)
+        }
+        other => other.clone(),
+    }
+}
+
+fn enum_column_ft<'a>(
+    expr: &ExprNode,
+    enum_cols: &'a std::collections::HashMap<String, sealdb_types::FieldType>,
+) -> Option<&'a sealdb_types::FieldType> {
+    let ExprNode::Column(column) = expr else {
+        return None;
+    };
+    enum_cols.get(&column.name.to_ascii_lowercase())
+}
+
+/// The integer a numeric constant contributes to an `ENUM` comparison.
+fn enum_member(expr: &ExprNode) -> Option<u64> {
+    let ExprNode::Value(ValueExpr { datum }) = expr else {
+        return None;
+    };
+    match datum {
+        Datum::I64(v) if *v >= 0 => Some(*v as u64),
+        Datum::U64(v) => Some(*v),
+        Datum::F64(v) if *v >= 0.0 && v.fract() == 0.0 => Some(*v as u64),
+        _ => None,
+    }
+}
+
+/// `ENUM` member `number` (1-based; 0 is the invalid empty member).
+fn enum_datum_for_number(ft: &sealdb_types::FieldType, number: u64) -> Option<Datum> {
+    if ft.tp == sealdb_types::field_type::TYPE_SET {
+        return None;
+    }
+    let elems = ft.elems.as_ref()?;
+    if number == 0 {
+        return Some(Datum::Enum(sealdb_types::EnumValue::new(Vec::new(), 0)));
+    }
+    let label = elems.get(number as usize - 1)?;
+    Some(Datum::Enum(sealdb_types::EnumValue::new(
+        label.clone().into_bytes(),
+        number,
+    )))
 }
 
 fn value_expr(datum: Datum) -> ExprNode {
