@@ -124,6 +124,15 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // `count(*)` over a LEFT JOIN whose inner side is the join-key
+                // unique (primary key fully equated) → TiDB eliminates the join
+                // and counts the probe rows through a covering index.
+                if let Some(plan) =
+                    count_star_unique_join_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
@@ -5239,6 +5248,123 @@ fn group_by_index_plan(
         }
     }
     None
+}
+
+/// `count(*)` over `LEFT JOIN` whose inner side is joined on its complete
+/// primary key. TiDB's `eliminateOuterJoin` drops the join (each probe row
+/// matches at most one inner row) and counts the probe rows through a covering
+/// index: `StreamAgg → IndexReader(index:StreamAgg) → cop StreamAgg`.
+fn count_star_unique_join_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    _prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if select.from_item.is_some()
+        || select.joins.len() != 1
+        || select.group_by.len() > 0
+        || select.having.is_some()
+        || select.selection.is_some()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.distinct
+        || select.with.is_some()
+    {
+        return None;
+    }
+    let [field] = select.fields.as_slice() else {
+        return None;
+    };
+    let ExprNode::Func(func) = &field.expr else {
+        return None;
+    };
+    if !func.name.eq_ignore_ascii_case("count") || !func.args.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let join = &select.joins[0];
+    if join.tp != sealdb_parser::ast::JoinType::LeftOuter {
+        return None;
+    }
+    let is = is?;
+    let (db, outer_name) = from.qualified(current_db);
+    let outer = is.table_by_name(&db, &outer_name)?;
+    let (inner_db, inner_name) = join.right.qualified(current_db);
+    let inner = is.table_by_name(&inner_db, &inner_name)?;
+
+    // Inner join key must cover every primary-key / handle column.
+    let inner_pk: Vec<String> = if let Some(pk) = inner.indices.iter().find(|i| i.primary) {
+        pk.columns.iter().map(|c| c.name.o().to_string()).collect()
+    } else if let Some(handle) = inner.handle_column() {
+        vec![handle.name.o().to_string()]
+    } else {
+        return None;
+    };
+    if inner_pk.is_empty() {
+        return None;
+    }
+    let mut matched = vec![false; inner_pk.len()];
+    for conjunct in join.on.split_cnf_all() {
+        let ExprNode::Binary(bin) = conjunct else {
+            continue;
+        };
+        if bin.op != sealdb_parser::opcode::Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(l), ExprNode::Column(r)) = (&*bin.left, &*bin.right) else {
+            continue;
+        };
+        for (a, b) in [(l, r), (r, l)] {
+            // `a` must reference the inner side, `b` the outer side.
+            let a_inner = a
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(&join.right.name));
+            let b_outer = b
+                .table
+                .as_deref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(&from.name));
+            if !a_inner || !b_outer {
+                continue;
+            }
+            if let Some(pos) = inner_pk
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&a.name))
+            {
+                matched[pos] = true;
+            }
+        }
+    }
+    if !matched.iter().all(|m| *m) {
+        return None;
+    }
+
+    // Prefer the narrowest secondary index for the covering count.
+    let index = outer
+        .indices
+        .iter()
+        .filter(|i| !i.primary)
+        .min_by_key(|i| i.columns.len())?;
+    let total_cols = outer.columns.len() + inner.columns.len();
+    let out_col = total_cols + 2;
+    let partial_col = out_col + 6;
+    let reader = PhysicalPlan::IndexReader {
+        table: from.name.clone(),
+        index: index.name.o().to_string(),
+        index_columns: index.columns.iter().map(|c| c.name.o().to_string()).collect(),
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: table_row_count(stats, from, current_db),
+        pushed: None,
+    };
+    Some(PhysicalPlan::stream_agg(
+        reader,
+        format!("funcs:count(Column#{partial_col})->Column#{out_col}"),
+        format!("funcs:count(1)->Column#{partial_col}"),
+        1.0,
+    ))
 }
 
 fn group_by_column_names(select: &SelectStmt) -> Option<Vec<String>> {

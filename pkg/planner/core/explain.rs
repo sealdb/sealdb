@@ -1876,10 +1876,16 @@ fn emit_cop_children(
                 scan_depth = depth + 1;
             }
             if let Some((agg_name, _, cop_info, est)) = stream_parent {
-                // GROUP BY StreamAgg needs ordered index input; a GLOBAL index
-                // HashAgg pushdown reads the index unordered.
+                // GROUP BY StreamAgg needs ordered index input; a global scalar
+                // count over a covering index reads it unordered.
                 if agg_name == "StreamAgg" {
-                    scan_info = "keep order:true, stats:pseudo".to_string();
+                    scan_info = if cop_info.is_empty() || cop_info.starts_with("group by:") {
+                        "keep order:true, stats:pseudo".to_string()
+                    } else if *row_count >= 9_000.0 {
+                        "keep order:false, stats:pseudo".to_string()
+                    } else {
+                        "keep order:false".to_string()
+                    };
                 }
                 if !cop_info.is_empty() {
                     push_explain_row(
