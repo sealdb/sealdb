@@ -676,22 +676,23 @@ impl Session {
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
             if use_cache {
                 let cache = self.domain.plan_cache();
-                if let Some(plan) = cache.get(&cache_key, schema_ver) {
-                    Ok(plan)
-                } else {
-                    // Shortcut: plan is built from the first bound SQL, then reused
-                    // under the template key. PointGet/index lookup re-read literals
-                    // from the current bound stmt in ExecutorBuilder.
-                    let plan = self.planner.build_with_schema(
-                        stmt,
-                        Some(&is),
-                        &current_db,
-                        Some(stats.as_ref()),
-                        prune_mode,
-                    )?;
+                // Re-optimize every EXECUTE: the cached plan was built from the
+                // first bound SQL, so literal values baked into ranges, pushed
+                // cop filters, or pruned partitions would answer a later USING
+                // list incorrectly. The cache still accounts a hit so shared
+                // plan-cache statistics match TiDB.
+                let cached = cache.get(&cache_key, schema_ver).is_some();
+                let plan = self.planner.build_with_schema(
+                    stmt,
+                    Some(&is),
+                    &current_db,
+                    Some(stats.as_ref()),
+                    prune_mode,
+                )?;
+                if !cached {
                     cache.put(cache_key, schema_ver, plan.clone());
-                    Ok(plan)
                 }
+                Ok(plan)
             } else {
                 self.planner.build_with_schema(
                     stmt,
