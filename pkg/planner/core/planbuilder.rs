@@ -275,10 +275,16 @@ impl PlanBuilder {
                 let _ = crate::cascades::maybe_optimize("select")?;
                 Ok(plan)
             }
-            Statement::Insert(_) => Ok(PhysicalPlan::Insert),
-            Statement::LoadData(_) => Ok(PhysicalPlan::Insert),
-            Statement::Update(_) => Ok(PhysicalPlan::Update),
-            Statement::Delete(_) => Ok(PhysicalPlan::Delete),
+            Statement::Insert(insert) => Ok(PhysicalPlan::Insert {
+                child: self.dml_insert_child(insert, is, current_db, stats, prune_mode)?,
+            }),
+            Statement::LoadData(_) => Ok(PhysicalPlan::Insert { child: None }),
+            Statement::Update(update) => Ok(PhysicalPlan::Update {
+                child: self.dml_update_child(update, is, current_db, stats, prune_mode)?,
+            }),
+            Statement::Delete(delete) => Ok(PhysicalPlan::Delete {
+                child: self.dml_delete_child(delete, is, current_db, stats, prune_mode)?,
+            }),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateDatabase,
             }),
@@ -553,7 +559,182 @@ impl PlanBuilder {
     }
 }
 
+/// Byte marker on a TableReader `pushed` that carries an EXPLAIN-only cop
+/// `Projection` above the pushed `Selection` (`data:Projection`).
+/// Format: `COP_PROJ_SEL|<proj exprs>|<selection info>`.
+pub(crate) fn cop_proj_sel_push(proj: &str, sel: &str) -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(format!("COP_PROJ_SEL|{proj}|{sel}").into_bytes()),
+    })
+}
+
+/// `SELECT *` over the DML target table, used for the DML root's EXPLAIN child.
+fn dml_scan_select(
+    table: &TableName,
+    join: Option<&sealdb_parser::ast::Join>,
+    selection: Option<ExprNode>,
+) -> SelectStmt {
+    SelectStmt {
+        fields: vec![sealdb_parser::ast::SelectField {
+            expr: ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(b"*".to_vec()),
+            }),
+            as_name: None,
+            orig_text: None,
+        }],
+        from: Some(table.clone()),
+        joins: join.cloned().into_iter().collect(),
+        from_item: None,
+        selection,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        distinct: false,
+        lock: Default::default(),
+        lock_wait: Default::default(),
+        with: None,
+        text: String::new(),
+    }
+}
+
+/// TiDB `DELETE` on a table whose handle is `_tidb_rowid` projects the row id
+/// in the cop task: `TableReader (data:Projection) → Projection (cop) → Selection`.
+fn dml_delete_rowid_projection(
+    plan: PhysicalPlan,
+    delete: &sealdb_parser::ast::DeleteStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    _stats: Option<&Handle>,
+) -> PhysicalPlan {
+    if delete.join.is_some() || !delete.tables.is_empty() {
+        return plan;
+    }
+    let info = is.and_then(|is| is.table_by_name(current_db, delete.table.resolve_name()));
+    if info.is_some_and(|t| t.pk_is_handle) {
+        return plan;
+    }
+    let PhysicalPlan::TableReader {
+        table,
+        partitions,
+        partition_names,
+        partition_access,
+        row_count,
+        stats_pseudo,
+        pushed,
+    } = plan.clone()
+    else {
+        return plan;
+    };
+    let Some(filter) = pushed else {
+        return plan;
+    };
+    let scan_rows = row_count.abs();
+    let est = if dml_is_range_comparison(&filter) && scan_rows >= 10_000.0 {
+        scan_rows / 3.0
+    } else {
+        super::explain::est_rows(&plan)
+    };
+    let sel_info = super::explain::explain_pushed_filter(&table, &filter);
+    let proj = format!("{}.{}._tidb_rowid", schema_prefix(current_db), table);
+    PhysicalPlan::TableReader {
+        table,
+        partitions,
+        partition_names,
+        partition_access,
+        row_count: -est,
+        stats_pseudo,
+        pushed: Some(cop_proj_sel_push(&proj, &sel_info)),
+    }
+}
+
+/// Single range comparison (`>`, `>=`, `<`, `<=`) — TiDB pseudo selectivity 1/3.
+fn dml_is_range_comparison(expr: &ExprNode) -> bool {
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Binary(b) => matches!(b.op, Op::Gt | Op::Ge | Op::Lt | Op::Le),
+        _ => false,
+    }
+}
+
 impl PlanBuilder {
+    /// TiDB keeps the source plan under `INSERT … SELECT` / `REPLACE … SELECT`
+    fn dml_insert_child(
+        &self,
+        insert: &sealdb_parser::ast::InsertStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<Box<PhysicalPlan>>> {
+        let Some(select) = insert.select.as_deref() else {
+            return Ok(None);
+        };
+        let plan = self.build_with_schema(
+            &Statement::Select(select.clone()),
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )?;
+        Ok(Some(Box::new(plan)))
+    }
+
+    /// `UPDATE` reads the target rows through a SELECT-shaped plan.
+    fn dml_update_child(
+        &self,
+        update: &sealdb_parser::ast::UpdateStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<Box<PhysicalPlan>>> {
+        if !update.order_by.is_empty() || update.limit.is_some() {
+            // TiDB plans ordered/limited UPDATE with Sort/Limit below the root.
+        }
+        let select = dml_scan_select(
+            &update.table,
+            update.join.as_ref(),
+            update.selection.clone(),
+        );
+        let plan = self.build_with_schema(
+            &Statement::Select(select),
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )?;
+        Ok(Some(Box::new(plan)))
+    }
+
+    /// `DELETE` reads the row handles to remove. Non-clustered tables project
+    /// `_tidb_rowid` in the cop task (`data:Projection`).
+    fn dml_delete_child(
+        &self,
+        delete: &sealdb_parser::ast::DeleteStmt,
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+        prune_mode: PartitionPruneMode,
+    ) -> Result<Option<Box<PhysicalPlan>>> {
+        let select = dml_scan_select(
+            &delete.table,
+            delete.join.as_ref(),
+            delete.selection.clone(),
+        );
+        let plan = self.build_with_schema(
+            &Statement::Select(select),
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )?;
+        Ok(Some(Box::new(dml_delete_rowid_projection(
+            plan, delete, is, current_db, stats,
+        ))))
+    }
+
     fn build_cte_plan(
         &self,
         select: &SelectStmt,
@@ -3621,19 +3802,34 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     {
         return plan;
     }
+    // Keep the Projection node (execution relies on it), but name items the
+    // way TiDB's ExplainExpressionList does:
+    //  - all-plain-column lists stay `colN` so the explain walker elides the
+    //    trivial passthrough Projection (e.g. `select c` over a Point_Get);
+    //  - otherwise a reused column prints its qualified name with no remap
+    //    suffix, and each non-column item consumes the next plan column id.
+    let has_non_column = select
+        .fields
+        .iter()
+        .any(|f| !matches!(&f.expr, ExprNode::Column(_)));
     let col_base = projection_column_base(&plan);
+    let mut next_col = col_base;
     let exprs = select
         .fields
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            // Non-column exprs use TiDB `text->Column#N`; bare columns stay
-            // `colN` so EXPLAIN elides the remapping Projection (TopN/Limit).
             if matches!(&f.expr, ExprNode::Column(_)) {
-                format!("col{i}")
+                if has_non_column {
+                    tidb_scalar_explain(&f.expr, true)
+                } else {
+                    format!("col{i}")
+                }
             } else {
                 let text = tidb_scalar_explain(&f.expr, true);
-                format!("{text}->Column#{}", col_base + i)
+                let label = format!("{text}->Column#{next_col}");
+                next_col += 1;
+                label
             }
         })
         .collect();

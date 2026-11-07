@@ -1086,7 +1086,7 @@
     {
       "name": "explain-non-select-stmt",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain-non-select-stmt.test",
       "result": "r/explain-non-select-stmt.result",
       "has_result": true,
