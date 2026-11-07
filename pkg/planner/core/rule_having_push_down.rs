@@ -632,6 +632,7 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             // scan est is still 10000 when stats_pseudo".
             row_count: -below_est,
             stats_pseudo,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,

@@ -389,13 +389,19 @@ impl ExecutorBuilder {
                         .map(|value| vec![value])
                         .collect()
                 } else {
-                    let (_, tuples, _) = selection
+                    let tuples = selection
                         .and_then(|expr| {
                             expr.split_cnf()
                                 .into_iter()
                                 .find_map(|item| item.row_in_consts_with_len())
+                                .map(|(_, tuples, _)| tuples)
                         })
-                        .ok_or_else(|| Error::unsupported("batch point get without row IN list"))?;
+                        .or_else(|| {
+                            selection.and_then(|expr| expr.dnf_const_tuples(tuple_columns))
+                        })
+                        .ok_or_else(|| {
+                            Error::unsupported("batch point get without key list")
+                        })?;
                     // Reorder row values into the unique index column order.
                     tuples
                         .into_iter()
@@ -1294,6 +1300,15 @@ fn index_lookup_values(
                     .and_then(|expr| expr.in_const_on(column))
                     .and_then(|values| values.into_iter().next())
             })?;
+        let value = match info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            .filter(|c| c.field_type.tp == sealdb_types::field_type::TYPE_BIT)
+        {
+            Some(col) => value.cast(&col.field_type).ok()?,
+            None => value,
+        };
         values.push(value);
     }
     Some(values)
@@ -1750,6 +1765,15 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
                 })
                 .to_string()
             }
+            sealdb_types::Datum::Bit(b) => {
+                // BIT literal: raw bytes as text (control chars trimmed).
+                let s = String::from_utf8_lossy(b);
+                s.trim_start_matches(|c: char| {
+                    !(c.is_ascii_alphanumeric()
+                        || (c as u32 > 0x20 && c as u32 <= 0x7e && !c.is_ascii_whitespace()))
+                })
+                .to_string()
+            }
             sealdb_types::Datum::Bytes(b) => {
                 // String literal: content with leading non-graph trimmed (TiDB #3686/#3994).
                 let s = String::from_utf8_lossy(b);
@@ -1858,6 +1882,7 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
             sealdb_types::Datum::U64(n) => n.to_string(),
             sealdb_types::Datum::F64(n) => n.to_string(),
             sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            sealdb_types::Datum::Bit(b) => String::from_utf8_lossy(b).into_owned(),
             sealdb_types::Datum::Null => "NULL".into(),
             sealdb_types::Datum::Time(t) => t.to_string(),
             sealdb_types::Datum::Decimal(d) => d.to_string(),

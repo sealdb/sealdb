@@ -996,7 +996,13 @@ fn run_backend(
         if record {
             record_suite(suite, Arc::clone(&storage))?;
         } else {
+            if std::env::var("SEALDB_ITEST_PROGRESS").is_ok() {
+                eprintln!("[itest] {} {} start", backend.as_str(), suite.name);
+            }
             compare_suite(suite, Arc::clone(&storage))?;
+            if std::env::var("SEALDB_ITEST_PROGRESS").is_ok() {
+                eprintln!("[itest] {} {} ok", backend.as_str(), suite.name);
+            }
         }
         ran += 1;
     }

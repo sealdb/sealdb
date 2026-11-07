@@ -28,6 +28,7 @@ pub use plan_cache_lru::LRUPlanCache;
 pub use plan_cache_param::normalize_prep_cache_key;
 pub use natural_join::{expand_natural_joins, stmt_has_natural_join};
 pub use planbuilder::{
-    merged_star_columns, merged_star_visible_columns, using_dropped_columns, PlanBuilder,
+    merged_star_columns, merged_star_visible_columns, normalize_bit_constants,
+    using_dropped_columns, with_explicit_txn, PlanBuilder,
 };
 pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};

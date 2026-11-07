@@ -115,6 +115,9 @@ pub fn alter_table(
             AlterTableSpec::RenameIndex { old_name, new_name } => {
                 rename_index(meta, &snapshot, stmt, old_name, new_name, current_db)?
             }
+            AlterTableSpec::AlterIndexVisibility { name, invisible } => {
+                alter_index_visibility(meta, &snapshot, stmt, name, *invisible, current_db)?
+            }
             // ALGORITHM/LOCK are accepted and ignored; SealDB DDL is in-place.
             AlterTableSpec::Algorithm(_) | AlterTableSpec::Lock(_) => {}
             AlterTableSpec::AddPartition { defs } => {
@@ -551,8 +554,41 @@ fn rename_index(
     Ok(())
 }
 
-fn column_insert_index(info: &TableInfo, position: &ColumnPosition) -> Result<usize> {
-    match position {
+fn alter_index_visibility(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    name: &str,
+    invisible: bool,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &table).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    let Some(idx) = info
+        .indices
+        .iter_mut()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+    else {
+        return Err(Error::new(
+            ERR_CANT_DROP_FIELD_OR_KEY,
+            format!("Can't DROP '{name}'; check that column/key exists"),
+        ));
+    };
+    idx.invisible = invisible;
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+fn column_insert_index(info: &TableInfo, position: &ColumnPosition) -> Result<usize> {    match position {
         ColumnPosition::None => Ok(info.columns.len()),
         ColumnPosition::First => Ok(0),
         ColumnPosition::After(name) => {

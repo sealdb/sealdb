@@ -70,6 +70,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
     let rewritten = rewrite_mysql_version_comments(&rewritten);
+    // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
+    // would otherwise drop the trailing visibility keyword.
+    let rewritten = rewrite_alter_index_visibility(&rewritten);
+    let rewritten = rewrite_primary_key_nonclustered(&rewritten);
     // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
     // drop index-option/table-option clauses sqlparser rejects.
     let rewritten = strip_tidb_create_table_options(&rewritten);
@@ -1075,8 +1079,99 @@ fn rewrite_rename_index(sql: &str) -> String {
     out
 }
 
+const NONCLUSTERED_MARKER: &str = "__sealdb_nonclustered__";
+
+/// sqlparser drops TiDB `PRIMARY KEY (...) NONCLUSTERED`. Mark the first PK
+/// column so `lower_primary_key` can record the nonclustered option; the
+/// option stripping pass then removes the keyword.
+fn rewrite_primary_key_nonclustered(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let q = bytes[i];
+            out.push(q as char);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                if bytes[i] == q {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if keyword_at(bytes, i, "PRIMARY") {
+            let after_pk = skip_ws(bytes, i + "PRIMARY".len());
+            if keyword_at(bytes, after_pk, "KEY") {
+                let after_key = skip_ws(bytes, after_pk + "KEY".len());
+                if after_key < bytes.len() && bytes[after_key] == b'('
+                    && let Some(close) = matching_paren(bytes, after_key)
+                {
+                    let after_close = skip_ws(bytes, close + 1);
+                    if keyword_at(bytes, after_close, "NONCLUSTERED") {
+                        out.push_str(&sql[i..after_key + 1]);
+                        let mut j = skip_ws(bytes, after_key + 1);
+                        if j < bytes.len() && bytes[j] == b'`' {
+                            out.push('`');
+                            j += 1;
+                        }
+                        out.push_str(NONCLUSTERED_MARKER);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
 fn escape_backticks(name: &str) -> String {
     name.replace('`', "``")
+}
+
+const ALTER_INDEX_MARKER: &str = "__sealdb_alter_index__";
+
+/// sqlparser has no `ALTER TABLE t ALTER INDEX name [IN]VISIBLE`. Rewrite to a
+/// marked `RENAME COLUMN` that `lower_alter_spec` turns back into
+/// AlterIndexVisibility.
+fn rewrite_alter_index_visibility(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "ALTER") {
+            let after_alter = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after_alter, "INDEX") {
+                let after_index = skip_ws(bytes, after_alter + "INDEX".len());
+                let (name, after_name) = read_ident(bytes, after_index);
+                let after_name = skip_ws(bytes, after_name);
+                let (visibility, after_vis) = if keyword_at(bytes, after_name, "INVISIBLE") {
+                    ("INVISIBLE", after_name + "INVISIBLE".len())
+                } else if keyword_at(bytes, after_name, "VISIBLE") {
+                    ("VISIBLE", after_name + "VISIBLE".len())
+                } else {
+                    ("", after_name)
+                };
+                if !name.is_empty() && !visibility.is_empty() {
+                    out.push_str("RENAME COLUMN `");
+                    out.push_str(ALTER_INDEX_MARKER);
+                    out.push_str(&escape_backticks(&name));
+                    out.push_str("` TO `");
+                    out.push_str(visibility);
+                    out.push('`');
+                    i = after_vis;
+                    continue;
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
 }
 
 fn split_rename_index_marker(encoded: &str) -> Result<(String, String)> {
@@ -8254,6 +8349,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 unique: true,
                 primary: false,
                 global: false,
+                nonclustered: false,
             });
         }
     }
@@ -8268,6 +8364,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     unique: true,
                     primary: true,
                     global: false,
+                    nonclustered: false,
                 },
             );
         }
@@ -9133,6 +9230,13 @@ fn lower_value(value: &Value) -> Result<Datum> {
             Ok(Datum::Bytes(s.as_bytes().to_vec()))
         }
         Value::HexStringLiteral(hex) => Ok(Datum::Bytes(decode_hex_literal(hex)?)),
+        // MySQL `b'0101'` / `B"0101"`: bit-value literal (binary number).
+        Value::SingleQuotedByteStringLiteral(bits) | Value::DoubleQuotedByteStringLiteral(bits) => {
+            let digits = if bits.is_empty() { "0" } else { bits.as_str() };
+            u64::from_str_radix(digits, 2)
+                .map(Datum::U64)
+                .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid bit literal b'{bits}'")))
+        }
         Value::Boolean(b) => Ok(Datum::I64(i64::from(*b))),
         Value::Null => Ok(Datum::Null),
         other => Err(Error::unsupported(format!("literal {other}"))),
@@ -9406,6 +9510,13 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             if old_column_name.value == RENAME_INDEX_MARKER {
                 let (old_name, new_name) = split_rename_index_marker(&new_column_name.value)?;
                 Ok(AlterTableSpec::RenameIndex { old_name, new_name })
+            } else if let Some(name) = old_column_name.value.strip_prefix(ALTER_INDEX_MARKER) {
+                Ok(AlterTableSpec::AlterIndexVisibility {
+                    name: name.to_string(),
+                    invisible: new_column_name
+                        .value
+                        .eq_ignore_ascii_case("INVISIBLE"),
+                })
             } else {
                 Ok(AlterTableSpec::RenameColumn {
                     old_name: old_column_name.value.clone(),
@@ -9449,6 +9560,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     unique: false,
                     primary: false,
                     global: index_def_global(&idx.index_options),
+                    nonclustered: false,
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -9490,6 +9602,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     unique: false,
                     primary: false,
                     global: index_def_global(&idx.index_options),
+                    nonclustered: false,
                 });
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
@@ -9534,6 +9647,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         unique: true,
         primary: false,
         global: index_def_global(&idx.index_options),
+        nonclustered: false,
     })
 }
 
@@ -9541,7 +9655,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     if idx.index_type.is_some() || !idx.include.is_empty() {
         return Err(Error::unsupported("PRIMARY KEY option"));
     }
-    let columns = idx
+    let mut columns = idx
         .columns
         .iter()
         .map(index_column_name)
@@ -9549,12 +9663,20 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     if columns.is_empty() {
         return Err(Error::unsupported("PRIMARY KEY without columns"));
     }
+    let nonclustered = match columns[0].strip_prefix(NONCLUSTERED_MARKER) {
+        Some(rest) => {
+            columns[0] = rest.to_string();
+            true
+        }
+        None => false,
+    };
     Ok(IndexDef {
         name: "PRIMARY".to_string(),
         columns,
         unique: true,
         primary: true,
         global: index_def_global(&idx.index_options),
+        nonclustered,
     })
 }
 
@@ -9592,7 +9714,9 @@ fn data_type_name(tp: &DataType) -> String {
         | DataType::TinyIntUnsigned(_)
         | DataType::Unsigned
         | DataType::UnsignedInteger => "UNSIGNED".to_string(),
-        DataType::Double(_) | DataType::Float(_) | DataType::Real => "DOUBLE".to_string(),
+        // MySQL `FLOAT` is float32; `DOUBLE`/`REAL` stay float64.
+        DataType::Float(_) => "FLOAT".to_string(),
+        DataType::Double(_) | DataType::Real => "DOUBLE".to_string(),
         DataType::Decimal(_) | DataType::Numeric(_) => "DECIMAL".to_string(),
         DataType::Char(_) | DataType::Varchar(_) | DataType::Text | DataType::String(_) => {
             "CHAR".to_string()
@@ -9717,3 +9841,4 @@ mod paren_from_tests {
         }
     }
 }
+

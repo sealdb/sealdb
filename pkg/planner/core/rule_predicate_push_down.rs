@@ -4,6 +4,7 @@
 /// outer-join inner-side filters stay residual. Completeness wave: TiKV
 /// Coprocessor DAG / CopClient.
 use super::physical_plans::{JoinType, PhysicalPlan};
+use crate::core::planbuilder::unique_eq_rows;
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::ExprNode;
 use sealdb_types::Datum;
@@ -45,6 +46,7 @@ fn push_into(
             partition_access,
             row_count,
             stats_pseudo,
+            data_limit,
             filter_est,
             range_scan,
             pushed,
@@ -63,6 +65,7 @@ fn push_into(
                         .as_ref()
                         .is_some_and(|info| full_domain_conjunct(info, expr))
                 })
+                .map(|expr| expr.rewrite_row_in_dnf())
                 .collect();
             // `pk = const` → PointGet (TiDB cte HASH_JOIN on PK CTE).
             if residual.is_empty()
@@ -87,6 +90,7 @@ fn push_into(
                     partition_access,
                     row_count,
                     stats_pseudo,
+                    data_limit,
                     filter_est,
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
                     range_scan,
@@ -112,6 +116,7 @@ fn push_into(
             selection_info,
             probe_selection_info,
             pushed,
+            ..
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
@@ -126,7 +131,35 @@ fn push_into(
                         .as_ref()
                         .is_some_and(|info| full_domain_conjunct(info, expr))
                 })
+                .map(|expr| expr.rewrite_row_in_dnf())
                 .collect();
+            // A full index scan can only push predicates whose columns live in
+            // the index; the rest filter the probed table rows (Selection(Probe)).
+            let on_probe = |expr: &ExprNode| {
+                !expr.referenced_columns().iter().all(|(_, col)| {
+                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
+                })
+            };
+            let (index_side, probe_side): (Vec<_>, Vec<_>) = if pushed.is_some() {
+                (pushable, Vec::new())
+            } else {
+                pushable.into_iter().partition(|expr| !on_probe(expr))
+            };
+            let probe_filter = if probe_side.is_empty() {
+                None
+            } else {
+                ExprNode::compose_cnf(probe_side.clone())
+            };
+            let probe_est = probe_filter.as_ref().map_or(0.0, |filter| {
+                table_info
+                    .as_ref()
+                    .and_then(|info| unique_eq_rows(info, filter))
+                    .unwrap_or(row_count)
+            });
+            let probe_selection_info = probe_filter
+                .as_ref()
+                .map(|filter| crate::core::explain::explain_pushed_filter(&table, filter))
+                .or(probe_selection_info);
             wrap_residual(
                 PhysicalPlan::IndexLookUpReader {
                     table,
@@ -137,7 +170,11 @@ fn push_into(
                     row_count,
                     selection_info,
                     probe_selection_info,
-                    pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                    probe_est,
+                    pushed: and_opt(
+                        pushed,
+                        ExprNode::compose_cnf(index_side.into_iter().chain(probe_side).collect()),
+                    ),
                 },
                 residual,
             )
@@ -202,7 +239,15 @@ fn push_into(
                     partitions,
                     partition_access,
                     row_count,
-                    pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                    pushed: and_opt(
+                        pushed,
+                        ExprNode::compose_cnf(
+                            pushable
+                                .into_iter()
+                                .map(|expr| expr.rewrite_row_in_dnf())
+                                .collect(),
+                        ),
+                    ),
                     range_scan,
                 },
                 residual,
@@ -308,6 +353,7 @@ fn push_into(
                         !is_in_list_on(expr, &column)
                     } else {
                         !is_row_in_list_on(expr, &tuple_columns)
+                            && !is_dnf_point_rows(expr, &tuple_columns)
                     }
                 })
                 .collect();
@@ -489,6 +535,8 @@ fn push_into(
                 )
             }
         }
+        // An empty plan folds away its filters (TiDB TableDual rows:0).
+        PhysicalPlan::TableDual { row_count: 0 } => PhysicalPlan::TableDual { row_count: 0 },
         other => wrap_residual(other, conjuncts),
     }
 }
@@ -686,6 +734,24 @@ fn is_row_in_list_on(expr: &ExprNode, tuple_columns: &[String]) -> bool {
                     .any(|col| col.eq_ignore_ascii_case(name))
             })
     })
+}
+
+/// OR of AND equalities whose arms exactly constrain the batch point get key.
+fn is_dnf_point_rows(expr: &ExprNode, tuple_columns: &[String]) -> bool {
+    let arms = expr.split_dnf();
+    arms.len() > 1
+        && arms.iter().all(|arm| {
+            let eqs: Vec<(String, Datum)> = arm
+                .split_cnf_all()
+                .into_iter()
+                .filter_map(|item| item.eq_column_const())
+                .collect();
+            eqs.len() == tuple_columns.len()
+                && tuple_columns.iter().all(|column| {
+                    eqs.iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(column))
+                })
+        })
 }
 
 enum Side {

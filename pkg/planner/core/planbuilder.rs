@@ -75,6 +75,16 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // BIT column constants (`0x39`, `b'…'`) compare as big-endian
+                // byte strings of the column width.
+                let bit_select;
+                let select = match normalize_bit_selection(select, is, current_db) {
+                    Some(normalized) => {
+                        bit_select = normalized;
+                        &bit_select
+                    }
+                    None => select,
+                };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` and plans a zero-row TableDual.
                 if let Some(ExprNode::Value(ValueExpr {
@@ -688,6 +698,7 @@ fn dml_delete_rowid_projection(
         partition_access,
         row_count,
         stats_pseudo,
+        data_limit,
         filter_est,
         pushed,
         ..
@@ -713,6 +724,7 @@ fn dml_delete_rowid_projection(
         partition_access,
         row_count: -est,
         stats_pseudo,
+        data_limit,
         filter_est,
         range_scan: None,
         keep_order: false,
@@ -2566,6 +2578,7 @@ fn push_inner_range_scan(plan: PhysicalPlan, range: &str) -> PhysicalPlan {
                 row_count
             },
             stats_pseudo,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -2934,6 +2947,7 @@ fn set_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
             partition_access,
             row_count,
             stats_pseudo,
+            data_limit,
             filter_est,
             range_scan,
             pushed,
@@ -2945,6 +2959,7 @@ fn set_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
             partition_access,
             row_count,
             stats_pseudo,
+            data_limit,
             filter_est,
             range_scan,
             keep_order: true,
@@ -3579,6 +3594,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Whether the plan build in progress belongs to an `EXPLAIN` statement.
     static EXPLAIN_BUILD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether the current statement runs inside an explicit transaction, where
+    /// `SELECT … FOR UPDATE` point gets report `lock` in EXPLAIN.
+    static EXPLICIT_TXN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the explicit-transaction flag visible to plan building.
+pub fn with_explicit_txn<T>(explicit: bool, f: impl FnOnce() -> T) -> T {
+    let prev = EXPLICIT_TXN.with(|c| c.replace(explicit));
+    let out = f();
+    EXPLICIT_TXN.with(|c| c.set(prev));
+    out
+}
+
+fn in_explicit_txn() -> bool {
+    EXPLICIT_TXN.with(|c| c.get())
 }
 
 /// Run `f` as part of an `EXPLAIN` plan build (`DESC`/`EXPLAIN` shape builders
@@ -4628,12 +4658,188 @@ fn projection_column_base(plan: &PhysicalPlan) -> usize {
     }
 }
 
-fn index_allowed(from: &TableName, name: &str, only_index: Option<&str>) -> bool {
-    if from
-        .ignore_indexes
+/// `BIT(n)` storage width in bytes.
+fn bit_width(ft: &sealdb_types::field_type::FieldType) -> usize {
+    ((ft.flen.max(1) as usize).div_ceil(8)).clamp(1, 8)
+}
+
+fn bit_padded_bytes(value: &Datum, width: usize) -> Option<Vec<u8>> {
+    let raw: Vec<u8> = match value {
+        Datum::Bytes(b) => b.clone(),
+        Datum::I64(v) => v.to_be_bytes().to_vec(),
+        Datum::U64(v) => v.to_be_bytes().to_vec(),
+        Datum::F64(v) => (*v as u64).to_be_bytes().to_vec(),
+        Datum::Decimal(d) => d.to_i64().ok()?.to_be_bytes().to_vec(),
+        _ => return None,
+    };
+    let mut out = vec![0u8; width];
+    let take = raw.len().min(width);
+    out[width - take..].copy_from_slice(&raw[raw.len() - take..]);
+    Some(out)
+}
+
+/// Normalize BIT column constants to the column's big-endian byte width so
+/// `0x39` / `0x0039` / `b'111001'` all compare equal to the stored value.
+fn normalize_bit_selection(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    let widths: std::collections::HashMap<String, usize> = info
+        .columns
+        .iter()
+        .filter(|c| c.field_type.tp == sealdb_types::field_type::TYPE_BIT)
+        .map(|c| (c.name.o().to_ascii_lowercase(), bit_width(&c.field_type)))
+        .collect();
+    if widths.is_empty() {
+        return None;
+    }
+    let selection = select.selection.as_ref()?;
+    let normalized = normalize_bit_expr(selection, &widths);
+    let mut out = select.clone();
+    out.selection = Some(normalized);
+    Some(out)
+}
+
+/// Rewrite BIT column constants in a SELECT's WHERE to the column's big-endian
+/// byte width. Runs before planning so executors that re-read the statement
+/// (e.g. index point gets) see the same representation as the plan.
+pub fn normalize_bit_constants(stmt: &mut Statement, is: Option<&InfoSchema>, current_db: &str) {
+    if let Statement::Select(select) = stmt
+        && let Some(normalized) = normalize_bit_selection(select, is, current_db)
+    {
+        *select = normalized;
+    }
+}
+
+fn bit_column_width(expr: &ExprNode, widths: &std::collections::HashMap<String, usize>) -> Option<usize> {
+    let ExprNode::Column(col) = expr else {
+        return None;
+    };
+    widths.get(&col.name.to_ascii_lowercase()).copied()
+}
+
+fn normalize_bit_value(expr: &ExprNode, width: usize) -> ExprNode {
+    let Some(value) = expr.const_datum() else {
+        return expr.clone();
+    };
+    match bit_padded_bytes(&value, width) {
+        Some(bytes) => ExprNode::Value(ValueExpr {
+            datum: Datum::Bit(bytes),
+        }),
+        None => expr.clone(),
+    }
+}
+
+fn normalize_bit_expr(
+    expr: &ExprNode,
+    widths: &std::collections::HashMap<String, usize>,
+) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => {
+            let left = normalize_bit_expr(&bin.left, widths);
+            let right = normalize_bit_expr(&bin.right, widths);
+            let (left, right) = if matches!(bin.op, Op::Eq | Op::NullSafeEq) {
+                if let Some(width) = bit_column_width(&left, widths) {
+                    (left, normalize_bit_value(&right, width))
+                } else if let Some(width) = bit_column_width(&right, widths) {
+                    (normalize_bit_value(&left, width), right)
+                } else {
+                    (left, right)
+                }
+            } else {
+                (left, right)
+            };
+            ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(left),
+                right: Box::new(right),
+                single_cnf_item: bin.single_cnf_item,
+            })
+        }
+        ExprNode::InList(list) => {
+            let mut out = list.clone();
+            out.expr = Box::new(normalize_bit_expr(&list.expr, widths));
+            match out.expr.as_ref() {
+                ExprNode::Column(_) => {
+                    if let Some(width) = bit_column_width(&out.expr, widths) {
+                        out.list = list
+                            .list
+                            .iter()
+                            .map(|item| normalize_bit_value(item, width))
+                            .collect();
+                    }
+                }
+                ExprNode::Row(row) => {
+                    let row_widths: Vec<Option<usize>> = row
+                        .exprs
+                        .iter()
+                        .map(|e| bit_column_width(e, widths))
+                        .collect();
+                    out.list = list
+                        .list
+                        .iter()
+                        .map(|item| {
+                            let ExprNode::Row(tuple) = item else {
+                                return item.clone();
+                            };
+                            if tuple.exprs.len() != row_widths.len() {
+                                return item.clone();
+                            }
+                            ExprNode::Row(sealdb_parser::ast::expressions::RowExpr {
+                                exprs: tuple
+                                    .exprs
+                                    .iter()
+                                    .zip(row_widths.iter())
+                                    .map(|(value, width)| match width {
+                                        Some(width) => normalize_bit_value(value, *width),
+                                        None => value.clone(),
+                                    })
+                                    .collect(),
+                            })
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+            ExprNode::InList(out)
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// `FLOAT` columns store float32: a constant that does not round-trip through
+/// float32 can never equal a stored value, so the access path is empty.
+fn point_value_hits_float(info: &sealdb_meta::TableInfo, column: &str, value: &Datum) -> bool {
+    let Some(col) = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(column))
+    else {
+        return true;
+    };
+    if col.field_type.tp != sealdb_types::TYPE_FLOAT {
+        return true;
+    }
+    let Ok(v) = value.as_f64() else {
+        return true;
+    };
+    (v as f32) as f64 == v
+}
+
+fn index_ignored(from: &TableName, name: &str) -> bool {    from.ignore_indexes
         .iter()
         .any(|ignored| ignored.eq_ignore_ascii_case(name))
-    {
+}
+
+fn index_allowed(from: &TableName, name: &str, only_index: Option<&str>) -> bool {
+    if index_ignored(from, name) {
         return false;
     }
     only_index.is_none_or(|only| only.eq_ignore_ascii_case(name))
@@ -4649,6 +4855,7 @@ fn unique_index_eq_point(
     let index = info.indices.iter().find(|idx| {
         idx.unique
             && !(idx.primary && info.pk_is_handle)
+            && !idx.invisible
             && idx.columns.len() > 1
             && index_allowed(from, idx.name.o(), only_index)
             && idx.columns.iter().all(|c| {
@@ -4656,6 +4863,13 @@ fn unique_index_eq_point(
                     .any(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
             })
     })?;
+    if index.columns.iter().any(|c| {
+        eqs.iter()
+            .find(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
+            .is_some_and(|(_, value)| !point_value_hits_float(info, c.name.o(), value))
+    }) {
+        return Some(PhysicalPlan::TableDual { row_count: 0 });
+    }
     let index_columns: Vec<String> = index
         .columns
         .iter()
@@ -4683,6 +4897,85 @@ fn unique_index_eq_point(
         index: Some(index.name.o().to_string()),
         index_columns,
         partition_names,
+        global_index: index.global,
+        lock: false,
+    })
+}
+
+/// `(a = 1 AND b = 1) OR (a = 2 AND b = 2)` → BatchPointGet on the unique key.
+fn dnf_unique_point(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    only_index: Option<&str>,
+) -> Option<PhysicalPlan> {
+    let selection = select.selection.as_ref()?;
+    let arms = selection.split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let first_eqs: Vec<(String, Datum)> = arms[0]
+        .split_cnf_all()
+        .into_iter()
+        .filter_map(|expr| expr.eq_column_const())
+        .collect();
+    let index = info.indices.iter().find(|idx| {
+        idx.unique
+            && !(idx.primary && info.pk_is_handle)
+            && !idx.invisible
+            && idx.columns.len() > 1
+            && index_allowed(from, idx.name.o(), only_index)
+            && idx.columns.iter().all(|c| {
+                first_eqs
+                    .iter()
+                    .any(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
+            })
+    })?;
+    // Every arm must be exactly one row of the unique key; extra predicates
+    // stay in the residual filter instead of silently disappearing.
+    if arms
+        .iter()
+        .any(|arm| arm.split_cnf_all().len() != index.columns.len())
+    {
+        return None;
+    }
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let tuples = selection.dnf_const_tuples(&index_columns)?;
+    let hits: Vec<bool> = tuples
+        .iter()
+        .map(|tuple| {
+            index.columns.iter().enumerate().all(|(pos, ic)| {
+                tuple
+                    .get(pos)
+                    .is_some_and(|value| point_value_hits_float(info, ic.name.o(), value))
+            })
+        })
+        .collect();
+    if !hits.is_empty() && hits.iter().all(|hit| !hit) {
+        return Some(PhysicalPlan::TableDual { row_count: 0 });
+    }
+    if hits.iter().any(|hit| !hit) {
+        return None;
+    }
+    Some(PhysicalPlan::BatchPointGet {
+        table: from.name.clone(),
+        column: index_columns.first().cloned().unwrap_or_default(),
+        index: Some(index.name.o().to_string()),
+        n_keys: tuples.len(),
+        handles: Vec::new(),
+        index_columns: index_columns.clone(),
+        tuple_columns: index_columns.clone(),
+        partition_names: tuple_partition_names(
+            info,
+            &index_columns,
+            &tuples,
+            &from.partition_names,
+            index.global,
+        ),
         global_index: index.global,
         lock: false,
     })
@@ -4738,6 +5031,16 @@ fn in_list_plan(
         if let Some(index) = info.find_unique_index_on(&column).filter(|idx| {
             index_allowed(from, idx.name.o(), only_index)
         }) {
+            let hits: Vec<bool> = values
+                .iter()
+                .map(|value| point_value_hits_float(info, &column, value))
+                .collect();
+            if !hits.is_empty() && hits.iter().all(|hit| !hit) {
+                return Some(PhysicalPlan::TableDual { row_count: 0 });
+            }
+            if hits.iter().any(|hit| !hit) {
+                continue;
+            }
             let index_columns = index
                 .columns
                 .iter()
@@ -4767,6 +5070,7 @@ fn in_list_plan(
     let (names, tuples, total) = row_list;
     let index = info.indices.iter().find(|idx| {
         idx.unique
+            && !idx.invisible
             && idx.columns.len() == names.len()
             && index_allowed(from, idx.name.o(), only_index)
             && idx.columns.iter().all(|c| {
@@ -4775,6 +5079,27 @@ fn in_list_plan(
                     .any(|name| name.eq_ignore_ascii_case(c.name.o()))
             })
     })?;
+    let column_position = |index_col: &sealdb_meta::IndexColumn| {
+        names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(index_col.name.o()))
+    };
+    let hits: Vec<bool> = tuples
+        .iter()
+        .map(|tuple| {
+            index.columns.iter().all(|ic| {
+                column_position(ic)
+                    .and_then(|pos| tuple.get(pos))
+                    .is_some_and(|value| point_value_hits_float(info, ic.name.o(), value))
+            })
+        })
+        .collect();
+    if !hits.is_empty() && hits.iter().all(|hit| !hit) {
+        return Some(PhysicalPlan::TableDual { row_count: 0 });
+    }
+    if hits.iter().any(|hit| !hit) {
+        return None;
+    }
     let index_columns: Vec<String> = index
         .columns
         .iter()
@@ -5541,6 +5866,74 @@ fn rebalance_disjunctions(expr: &ExprNode) -> ExprNode {
     }
 }
 
+/// Rows surviving a predicate that fully constrains a unique key: one for an
+/// equality conjunction, one per arm for a DNF of equalities.
+pub(crate) fn unique_eq_rows(info: &sealdb_meta::TableInfo, selection: &ExprNode) -> Option<f64> {
+    let unique_columns = |columns: &[String]| {
+        info.indices.iter().any(|idx| {
+            idx.unique
+                && !(idx.primary && info.pk_is_handle)
+                && idx.columns.len() == columns.len()
+                && idx.columns.iter().all(|c| {
+                    columns
+                        .iter()
+                        .any(|col| col.eq_ignore_ascii_case(c.name.o()))
+                })
+        })
+    };
+    if let Some((names, tuples, _)) = selection.row_in_consts_with_len()
+        && unique_columns(&names)
+    {
+        return Some(tuples.len() as f64);
+    }
+    if let Some((column, values)) = selection.column_in_consts()
+        && unique_columns(std::slice::from_ref(&column))
+    {
+        return Some(values.len() as f64);
+    }
+    let arms = selection.split_dnf();
+    let covers = |eqs: &[(String, Datum)], columns: &[sealdb_meta::IndexColumn]| {
+        eqs.len() >= columns.len()
+            && columns
+                .iter()
+                .all(|c| eqs.iter().any(|(col, _)| col.eq_ignore_ascii_case(c.name.o())))
+    };
+    if arms.len() > 1 {
+        let first: Vec<(String, Datum)> = arms[0]
+            .split_cnf_all()
+            .into_iter()
+            .filter_map(|expr| expr.eq_column_const())
+            .collect();
+        let found = info.indices.iter().any(|idx| {
+            idx.unique
+                && !(idx.primary && info.pk_is_handle)
+                && covers(&first, &idx.columns)
+                && arms.iter().all(|arm| {
+                    let eqs: Vec<(String, Datum)> = arm
+                        .split_cnf_all()
+                        .into_iter()
+                        .filter_map(|expr| expr.eq_column_const())
+                        .collect();
+                    covers(&eqs, &idx.columns)
+                })
+        });
+        return found.then_some(arms.len() as f64);
+    }
+    let eqs: Vec<(String, Datum)> = arms[0]
+        .split_cnf_all()
+        .into_iter()
+        .filter_map(|expr| expr.eq_column_const())
+        .collect();
+    info.indices
+        .iter()
+        .any(|idx| {
+            idx.unique
+                && !(idx.primary && info.pk_is_handle)
+                && covers(&eqs, &idx.columns)
+        })
+        .then_some(1.0)
+}
+
 /// Build a TableReader / PartitionUnion for a (possibly partitioned) table.
 fn partitioned_table_reader(
     from: &TableName,
@@ -5564,7 +5957,11 @@ fn partitioned_table_reader(
             partition_filter_rows(table_stats, selection)
         }
         _ => None,
-    };
+    }
+    .or_else(|| {
+        // Unique keys cap a full equality (or a DNF of them) at one row.
+        selection.and_then(|selection| unique_eq_rows(info, selection))
+    });
     // Per-partition est for static PartitionUnion children.
     let part_rows = if planned.ids.len() > 1 && stats_pseudo {
         10_000.0
@@ -5593,14 +5990,20 @@ fn partitioned_table_reader(
                 .collect();
             PhysicalPlan::PartitionUnion { children }
         }
-        PartitionPruneMode::Static => PhysicalPlan::table_reader_parts(
-            from.name.clone(),
-            planned.ids,
-            planned.names,
-            String::new(),
-            row_count,
-            stats_pseudo,
-        ),
+        PartitionPruneMode::Static => {
+            let mut reader = PhysicalPlan::table_reader_parts(
+                from.name.clone(),
+                planned.ids,
+                planned.names,
+                String::new(),
+                row_count,
+                stats_pseudo,
+            );
+            if let PhysicalPlan::TableReader { filter_est: est, .. } = &mut reader {
+                *est = filter_est;
+            }
+            reader
+        }
         PartitionPruneMode::Dynamic => {
             // Dynamic: executor prunes; EXPLAIN shows partition access on reader.
             let access = if info.partition.as_ref().is_some_and(|p| p.enable) {
@@ -5684,6 +6087,7 @@ fn index_plan(
             row_count: 10_000.0,
             selection_info: None,
             probe_selection_info: None,
+            probe_est: 0.0,
             pushed: None,
         }
     }
@@ -6229,6 +6633,22 @@ fn explain_agg_arg(qual: &impl Fn(&str) -> String, expr: &ExprNode) -> String {
     }
 }
 
+/// TiDB column ids for a scalar aggregate pushed into the coprocessor:
+/// the output column follows the table's schema (`ncols + 2`: last column +
+/// hidden handle + 1), while the partial column is allocated after the
+/// candidate index paths (`2` ids per index and per indexed column).
+fn scalar_agg_column_ids(
+    table: &str,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+) -> Option<(usize, usize)> {
+    let info = is?.table_by_name(current_db, table)?;
+    let out = info.columns.len() + 2;
+    let idx_cols: usize = info.indices.iter().map(|i| i.columns.len()).sum();
+    let aux = out + 2 * info.indices.len() + 2 * idx_cols;
+    Some((out, aux))
+}
+
 /// Attach an EXPLAIN-only `pushed` marker to an index reader.
 fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
     match plan {
@@ -6260,6 +6680,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             row_count,
             selection_info,
             probe_selection_info,
+            probe_est,
             ..
         } => PhysicalPlan::IndexLookUpReader {
             table,
@@ -6270,6 +6691,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             row_count,
             selection_info,
             probe_selection_info,
+            probe_est,
             pushed,
         },
         other => other,
@@ -6374,8 +6796,70 @@ fn build_agg_plan(
             );
         }
         // Scalar aggregation (empty-table StreamAgg push into TableReader).
-        let info = format!("funcs:count(Column#{partial_col})->Column#5");
-        let cop = format!("funcs:count(select.{table}.a)->Column#{partial_col}");
+        let (out_col, partial_col) = scalar_agg_column_ids(table, current_db, is)
+            .unwrap_or((5, partial_col));
+        let field = select.fields.first();
+        let fn_name = field
+            .and_then(|f| match &f.expr {
+                ExprNode::Func(func) => Some(func.name.to_ascii_lowercase()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "count".to_string());
+        let arg_expr = field.and_then(|f| match &f.expr {
+            ExprNode::Func(func) => func.args.first(),
+            _ => None,
+        });
+        let arg = match arg_expr {
+            Some(ExprNode::Column(col)) => format!("select.{table}.{}", col.name),
+            Some(other) => other.restore_string(),
+            None => "1".to_string(),
+        };
+        // `max(_tidb_rowid)`: TiDB scans the handle backwards and stops after
+        // one row (`StreamAgg → Limit 1 → TableReader(data:Limit) → Limit 1`).
+        if fn_name == "max"
+            && matches!(
+                arg_expr,
+                Some(ExprNode::Column(col)) if col.name.eq_ignore_ascii_case("_tidb_rowid")
+            )
+            && let PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                stats_pseudo,
+                filter_est,
+                pushed,
+                ..
+            } = plan
+        {
+            let reader = PhysicalPlan::TableReader {
+                table: table.clone(),
+                partitions,
+                partition_names,
+                partition_access,
+                row_count: 1.0,
+                stats_pseudo,
+                data_limit: true,
+                filter_est,
+                range_scan: None,
+                keep_order: true,
+                pushed,
+            };
+            let limit = PhysicalPlan::Limit {
+                child: Box::new(reader),
+                offset: 0,
+                count: 1,
+            };
+            let info = format!(
+                "funcs:max({db_qual}{table}._tidb_rowid)->Column#{out_col}"
+            );
+            return (
+                PhysicalPlan::stream_agg(limit, info, String::new(), est),
+                false,
+            );
+        }
+        let info = format!("funcs:{fn_name}(Column#{partial_col})->Column#{out_col}");
+        let cop = format!("funcs:{fn_name}({arg})->Column#{partial_col}");
         return (PhysicalPlan::stream_agg(plan, info, cop, est), false);
     }
 
@@ -6493,6 +6977,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 partition_access,
                 row_count,
                 stats_pseudo,
+                data_limit,
                 filter_est,
                 range_scan,
                 keep_order,
@@ -6504,6 +6989,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 partition_access,
                 row_count,
                 stats_pseudo,
+                data_limit,
                 filter_est,
                 range_scan,
                 keep_order,
@@ -6728,7 +7214,7 @@ fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
             index_columns,
             partition_names,
             global_index: false,
-            lock: true,
+            lock: in_explicit_txn(),
         },
         PhysicalPlan::BatchPointGet {
             table,
@@ -8004,6 +8490,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 10.0,
             stats_pseudo: false,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -8022,6 +8509,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             row_count: 10.0,
             selection_info: None,
             probe_selection_info: Some(filter_info.to_string()),
+            probe_est: 0.0,
             pushed: Some(range_push(range)),
         }),
     };
@@ -8046,6 +8534,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 536_284.0,
             stats_pseudo: false,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -8173,6 +8662,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         partition_access: String::new(),
         row_count: 64.0,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -8426,6 +8916,7 @@ fn inl_join_hint_plan(
         partition_access: String::new(),
         row_count: outer_rows,
         stats_pseudo: false,
+        data_limit: false,
         filter_est,
         range_scan: None,
         pushed: outer_pushed,
@@ -8486,6 +8977,7 @@ fn inl_join_hint_plan(
         partition_access,
         row_count: join_est,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -8700,6 +9192,7 @@ fn index_join_suite_plan(
             partition_access: String::new(),
             row_count: build_rows,
             stats_pseudo: false,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             pushed: Some(not_null(build_alias)),
@@ -8717,6 +9210,7 @@ fn index_join_suite_plan(
             row_count: probe_rows,
             selection_info: Some(format!("not(isnull({schema}.{probe_alias}.a))")),
             probe_selection_info: None,
+            probe_est: 0.0,
             pushed: Some(range_push(&range)),
         };
         let info = format!(
@@ -8756,6 +9250,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: build_rows,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(build_alias)),
@@ -8768,6 +9263,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: probe_rows,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(probe_alias)),
@@ -8919,6 +9415,7 @@ fn global_index_join_plan(
         partition_access: String::new(),
         row_count: est,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
@@ -8953,6 +9450,7 @@ fn global_index_join_plan(
             row_count: est,
             selection_info: Some(sel),
             probe_selection_info: None,
+            probe_est: 0.0,
             pushed: Some(range_push(&range_info)),
         }
     };
@@ -9092,6 +9590,7 @@ fn index_join_in_subq_plan(
         row_count: 10_000.0,
         selection_info: None,
         probe_selection_info: None,
+            probe_est: 0.0,
         pushed: Some(range_push(&range)),
     };
     let info = format!(
@@ -9159,6 +9658,7 @@ fn count_in_apply_index_join(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: None,
@@ -9186,6 +9686,7 @@ fn count_in_apply_index_join(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(range_push(&t1_range)),
@@ -9292,6 +9793,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null("b")),
@@ -9318,6 +9820,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
+        data_limit: false,
         filter_est: None,
         range_scan: None,
         pushed: Some(and_filters(&["a", "b", "c"])),
@@ -9445,6 +9948,11 @@ fn access_plan(
                     {
                         return plan;
                     }
+                    if let Some(plan) =
+                        dnf_unique_point(select, from, info, Some(hint.as_str()))
+                    {
+                        return plan;
+                    }
                     if let Some(plan) = in_list_plan(select, from, info, Some(hint.as_str())) {
                         return plan;
                     }
@@ -9485,6 +9993,9 @@ fn access_plan(
         if let Some(plan) = unique_index_eq_point(from, info, &eqs, None) {
             return plan;
         }
+        if let Some(plan) = dnf_unique_point(select, from, info, None) {
+            return plan;
+        }
         if let Some(plan) = in_list_plan(select, from, info, None) {
             return plan;
         }
@@ -9511,12 +10022,20 @@ fn access_plan(
         for (column, value) in &eqs {
             // TiDB prefers the unique index on the column for a point get over
             // a composite index that merely shares its leading column.
-            let covering = info.find_index_covering(column);
-            let preferred = info.find_unique_index_on(column).or(covering);
+            let covering = info
+                .find_index_covering(column)
+                .filter(|idx| !index_ignored(from, idx.name.o()));
+            let preferred = info
+                .find_unique_index_on(column)
+                .filter(|idx| !index_ignored(from, idx.name.o()))
+                .or(covering);
             if let Some(index) = preferred {
                 // PointGet needs every column of a unique key constrained; a
                 // composite-key prefix is an index range, not a single row.
                 if index.unique && index.columns.len() == 1 {
+                    if !point_value_hits_float(info, column, value) {
+                        return PhysicalPlan::TableDual { row_count: 0 };
+                    }
                     return PhysicalPlan::PointGet {
                         table: from.name.clone(),
                         handle: None,
@@ -9567,7 +10086,10 @@ fn access_plan(
             {
                 continue;
             }
-            if let Some(index) = info.find_index_covering(&range.column) {
+            if let Some(index) = info
+                .find_index_covering(&range.column)
+                .filter(|idx| !index_ignored(from, idx.name.o()))
+            {
                 // TiDB access-path selection sizes every index starting with the
                 // range column; the covering one wins because it avoids the
                 // table probe (`select a, b ... where a < 3` reads IDX_ab).
@@ -9575,9 +10097,11 @@ fn access_plan(
                     .indices
                     .iter()
                     .filter(|idx| {
-                        idx.columns
-                            .first()
-                            .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&range.column))
+                        !index_ignored(from, idx.name.o())
+                            && idx
+                                .columns
+                                .first()
+                                .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&range.column))
                     })
                     .find(|idx| select_covers_index(select, info, idx));
                 let index = covered.unwrap_or(index);
@@ -9606,7 +10130,7 @@ fn access_plan(
             && let Some(index) = info
                 .indices
                 .iter()
-                .filter(|idx| !idx.primary)
+                .filter(|idx| !idx.primary && !index_ignored(from, idx.name.o()))
                 .find(|idx| select_covers_index(select, info, idx))
         {
             return index_plan(select, from, info, index, prune_mode);

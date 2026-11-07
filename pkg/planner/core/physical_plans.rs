@@ -87,6 +87,10 @@ pub enum PhysicalPlan {
         /// (`keep order:true`) and drops the Sort.
         #[serde(default)]
         keep_order: bool,
+        /// `max(_tidb_rowid)`: TiDB pushes `Limit 1` into the cop task and scans
+        /// the handle in descending order (`data:Limit`, `keep order:true, desc`).
+        #[serde(default)]
+        data_limit: bool,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -157,6 +161,9 @@ pub enum PhysicalPlan {
         selection_info: Option<String>,
         /// When set, EXPLAIN Selection(Probe) wraps TableRowIDScan.
         probe_selection_info: Option<String>,
+        /// Rows kept by the probe-side Selection (EXPLAIN estRows).
+        #[serde(default)]
+        probe_est: f64,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -621,6 +628,7 @@ impl PhysicalPlan {
             partition_access: String::new(),
             row_count: 10_000.0,
             stats_pseudo: true,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -643,6 +651,7 @@ impl PhysicalPlan {
             partition_access: partition_access.into(),
             row_count,
             stats_pseudo,
+            data_limit: false,
             filter_est: None,
             range_scan: None,
             keep_order: false,

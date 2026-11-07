@@ -56,11 +56,14 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         }
         let idx_id = (offset as i64) + 1;
         // Single integer PRIMARY KEY → clustered int handle (TiDB pk_is_handle).
+        // `NONCLUSTERED` keeps a secondary PRIMARY index; BIT is not a handle.
         if index.primary
+            && !index.nonclustered
             && idx_cols.len() == 1
             && info.columns.iter().any(|c| {
                 c.offset == idx_cols[0].offset
                     && c.field_type.eval_type() == sealdb_types::field_type::EvalType::Int
+                    && c.field_type.tp != TYPE_BIT
             })
         {
             info.pk_is_handle = true;
@@ -294,7 +297,7 @@ fn lookup_select_column(col: &ColumnNameExpr, sources: &[SelectSource]) -> Resul
 
 fn type_name_from_datum(datum: &Datum) -> &'static str {
     match datum {
-        Datum::I64(_) | Datum::U64(_) => "int",
+        Datum::I64(_) | Datum::U64(_) | Datum::Bit(_) => "int",
         Datum::F64(_) => "double",
         Datum::Decimal(_) => "decimal",
         Datum::Time(_) => "datetime",

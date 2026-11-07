@@ -351,6 +351,11 @@ fn row_key(row: &[sealdb_types::Datum], idxs: &[usize]) -> Vec<u8> {
                 out.extend((b.len() as u32).to_le_bytes());
                 out.extend(b);
             }
+            sealdb_types::Datum::Bit(b) => {
+                out.push(4);
+                out.extend((b.len() as u32).to_le_bytes());
+                out.extend(b);
+            }
             sealdb_types::Datum::Decimal(d) => {
                 out.push(5);
                 out.extend(d.to_string().into_bytes());

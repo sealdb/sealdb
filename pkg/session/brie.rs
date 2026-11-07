@@ -393,7 +393,9 @@ fn datum_to_json(d: &Datum) -> serde_json::Value {
         Datum::I64(v) => serde_json::json!(*v),
         Datum::U64(v) => serde_json::json!(*v),
         Datum::F64(v) => serde_json::json!(*v),
-        Datum::Bytes(v) => serde_json::Value::String(String::from_utf8_lossy(v).into_owned()),
+        Datum::Bytes(v) | Datum::Bit(v) => {
+            serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
+        }
         Datum::Decimal(v) => serde_json::Value::String(v.to_string()),
         Datum::Time(v) => serde_json::Value::String(format!("{v:?}")),
         Datum::Enum(v) => {

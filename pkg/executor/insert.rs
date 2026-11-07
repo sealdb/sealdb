@@ -14,7 +14,7 @@ use sealdb_kv::{LockWait, TxnHandle};
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
-use sealdb_types::field_type::{FieldType, TYPE_BIT, TYPE_ENUM, TYPE_SET};
+use sealdb_types::field_type::{FieldType, TYPE_ENUM, TYPE_SET};
 use sealdb_types::EnumValue;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
@@ -572,23 +572,6 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
         return cast_enum_set(v, &col.field_type, col.name.o());
     }
     let mut out = v.cast(&col.field_type)?;
-    // TIMESTAMP columns store UTC; session wall clock → UTC on write.
-    if col.field_type.tp == TYPE_BIT {
-        // BIT(n) stores the low n bits of the numeric value (MySQL truncates).
-        let n = col.field_type.flen.max(1) as u32;
-        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-        let bits = match &out {
-            Datum::U64(v) => *v,
-            Datum::I64(v) => *v as u64,
-            Datum::F64(v) => *v as u64,
-            Datum::Decimal(d) => d.to_f64()? as u64,
-            Datum::Bytes(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0),
-            Datum::Time(t) => t.to_packed_u64(),
-            Datum::Enum(e) => e.number,
-            Datum::Null => return Ok(Datum::Null),
-        };
-        return Ok(Datum::U64(bits & mask));
-    }
     // TIMESTAMP columns store UTC; session wall clock → UTC on write.
     if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
         && let Datum::Time(t) = out

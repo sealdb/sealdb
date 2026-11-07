@@ -1400,6 +1400,7 @@ fn emit_cop_children(
             stats_pseudo,
             range_scan,
             keep_order,
+            data_limit,
             pushed,
             ..
         } => {
@@ -1453,6 +1454,43 @@ fn emit_cop_children(
             }
             // Clustered handle range: TiDB scans the PK as a table range
             // (`TableRangeScan`), eliding the pushed Selection row.
+            if *data_limit {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Limit",
+                        est: 1.0,
+                        task: scan_task,
+                        access: String::new(),
+                        info: "offset:0, count:1".to_string(),
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableFullScan",
+                        est: 1.0,
+                        task: scan_task,
+                        access: scan_access,
+                        info: "keep order:true, desc, stats:pseudo".to_string(),
+                    },
+                    if under_bushy { &scan_spine } else { &[] },
+                );
+                return true;
+            }
             if let Some(range_info) = range_scan {
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
@@ -2167,6 +2205,7 @@ fn emit_cop_children(
             row_count,
             selection_info,
             probe_selection_info,
+            probe_est,
             pushed,
         } => {
             let idx_access = index_access_cols(
@@ -2344,6 +2383,13 @@ fn emit_cop_children(
             }
             let info = if tid_sel.is_some() {
                 "keep order:false, stats:pseudo".to_string()
+            } else if probe_selection_info.is_some() {
+                // Probe-side filters display as `Selection(Probe)`, not scan pushdown.
+                if *row_count >= 9_000.0 {
+                    "keep order:false, stats:pseudo".to_string()
+                } else {
+                    "keep order:false".to_string()
+                }
             } else if let Some(filter) = pushed.as_ref() {
                 format!("pushed:{}", filter.restore_string())
             } else if *row_count >= 9_000.0 {
@@ -2418,6 +2464,31 @@ fn emit_cop_children(
                 }
                 probe_depth = depth + 1;
             }
+            // Probe-side filter for a full index scan: `a = 1` cannot be pushed
+            // into `index:bb(b, c)`, so TiDB filters table rows with Selection.
+            if let Some(probe_sel) = probe_selection_info.as_ref() {
+                push_explain_row(
+                    rows,
+                    probe_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: if *probe_est > 0.0 {
+                            *probe_est
+                        } else {
+                            scan_est
+                        },
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: probe_sel.clone(),
+                    },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
+                probe_depth += 1;
+            }
             push_explain_row(
                 rows,
                 probe_depth,
@@ -2431,7 +2502,7 @@ fn emit_cop_children(
                     info: rowid_info,
                 },
             );
-            if probe_agg.is_none() {
+            if probe_agg.is_none() && probe_selection_info.is_none() {
                 if let Some(last) = rows.last_mut() {
                     last.id.push_str("(Probe)");
                 }
@@ -3311,6 +3382,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             pushed,
             partition_access,
             range_scan,
+            data_limit,
             ..
         } => (
             "TableReader".to_string(),
@@ -3319,7 +3391,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
+            if *data_limit {
+                "data:Limit".to_string()
+            } else if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
             } else if cop_proj_sel_pushed(pushed.as_ref()).is_some() {
                 "data:Projection".to_string()
@@ -3973,6 +4047,16 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if range_pushed(Some(filter)).is_some() => *row_count,
+        PhysicalPlan::IndexLookUpReader {
+            probe_est,
+            probe_selection_info: Some(_),
+            ..
+        } if *probe_est > 0.0 => *probe_est,
+        PhysicalPlan::IndexLookUpReader {
+            pushed: None,
+            probe_est,
+            ..
+        } if *probe_est > 0.0 => *probe_est,
         PhysicalPlan::IndexLookUpReader { row_count, pushed: None, .. } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..

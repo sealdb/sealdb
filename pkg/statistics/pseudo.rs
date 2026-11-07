@@ -64,8 +64,12 @@ pub fn index_range_rows(
         return 1.0;
     }
     let mut rows = column_range_rows(table_rows, low, high);
-    for _ in 0..equal_prefix_len.min(index_columns_len.saturating_sub(1)) {
-        rows /= 100.0;
+    // A unique index already pins the prefix to one value per equality; TiDB
+    // does not add the extra 1/100 shrink for it (`range:[1,1]` on ab(a,b) is 10).
+    if !unique {
+        for _ in 0..equal_prefix_len.min(index_columns_len.saturating_sub(1)) {
+            rows /= 100.0;
+        }
     }
     if rows > table_rows {
         rows = table_rows / PSEUDO_LESS_RATE;
@@ -104,6 +108,17 @@ pub fn format_datum(value: &Datum) -> String {
 
 /// Bounds of a single `col <op> const` / `BETWEEN` conjunct.
 pub fn conjunct_column_range(expr: &ExprNode) -> Option<(String, ColumnRange)> {
+    // `col = const` ranger folds to an inclusive point range `[v, v]`.
+    if let Some((column, value)) = expr.eq_column_const() {
+        return Some((
+            column.clone(),
+            ColumnRange {
+                column,
+                low: Some((value.clone(), true)),
+                high: Some((value, true)),
+            },
+        ));
+    }
     if let Some((column, _, _)) = expr.column_cmp_const() {
         return expr
             .column_ranges()

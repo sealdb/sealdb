@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-07（green 27 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 29 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` green；21 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan` / `access_path_selection` green；19 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -214,6 +214,25 @@
 | `desc t col` | 语法 `ExplainSym TableName ColumnName`；`ShowStmt.Column` 与 `Pattern` 是两个字段 | `ShowStmt.column`；`rewrite_describe_column` 把列编码进 schema 标记，`decode_describe_column` 还原 | `desc t c1` / `desc t id` 只回该列 |
 | `SHOW COLUMNS … LIKE` | `fieldFilter` 精确匹配、`fieldPatternsLike` 模糊匹配，表头仍是 `Field` | `show_column_visible`：先精确（忽略大小写）再 LIKE | `show columns from t like 'abc%'` 只回匹配列 |
 | suite green | Gate A+B | manifest `green` | `explain_stats` Mem=1 / TiKV=1 PASS；green 26→27 |
+
+### 2.0m R3 `access_path_selection`（2026-11-07）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 标量聚合列号 | `Column#` 由“最后列 + 隐藏 handle + 1”起算，partial 列在候选索引之后（每条索引 2 个、每个索引列 2 个） | `scalar_agg_column_ids`（`ncols + 2` / `+ 2*indices + 2*idx_cols`） | `funcs:count(Column#18)->Column#4` |
+| 标量聚合函数名 | partial/cop 两侧都取真实函数名与参数（`count(1)` 保留字面量） | `agg_fn` / `arg` 从 `SelectField` 读取，`select.t.a` 限定 | `funcs:count(1)->Column#18`、`funcs:count(select.t.a)->Column#18` |
+| `max(_tidb_rowid)` | `StreamAgg → Limit 1 → TableReader(data:Limit) → Limit 1 → TableFullScan(keep order:true, desc)` | `TableReader.data_limit` + `physical_plans` 新字段；`emit_cop_children` 输出 cop `Limit` 子树 | `keep order:true, desc, stats:pseudo` |
+| 稀疏 cop 前缀 | 单链 cop 子节点逐层缩进（不是全对齐） | `data_limit` 分支使用 `scan_spine` 续列 | 差分 0 |
+| `filter_est` 通用化 | `filter_est` 的行数对任意 TableReader 生效，不再只限 `data_limit` | `explain::est_rows` 去掉 `data_limit: true` 守卫 | `executor/partition/issues` IndexJoin 0.80 复现 |
+| suite green | Gate A+B | manifest `green` | `access_path_selection` Mem=1 / TiKV=1 PASS；green 28→29 |
+
+### 2.0n PD 区域切分死循环（2026-11-07）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| Region 切分推进 | 扫描区间必须单调推进，边界键要归入**下一个** region | `split_key_ranges_via_pd`：PD 返回的 `region_end <= cursor` 时不再重问，把剩余区间作为单 span 收尾 | TiKV `executor/jointest/hash_join` 由 >15min 悬挂 → 32s PASS |
+| PD HTTP 连接复用 | 每个进程一个连接池 | `pd_http_client` 改 `OnceLock` 单例（避免 TIME_WAIT 耗尽临时端口 → `EADDRNOTAVAIL`） | TiKV green 28 套件 54s 跑完 |
+| 诊断开关 | — | `SEALDB_PD_TRACE`（PD 请求耗时）/ `SEALDB_ITEST_PROGRESS`（逐套件进度） | 定位到 1,168,664 次重复 `region/key/7200…fb` |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

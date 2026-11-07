@@ -195,6 +195,8 @@ pub struct IndexDef {
     /// TiDB `GLOBAL` index option on a partitioned table: the index spans every
     /// partition instead of being partitioned alongside the table.
     pub global: bool,
+    /// TiDB `PRIMARY KEY (...) NONCLUSTERED`: the PK is a secondary index.
+    pub nonclustered: bool,
 }
 
 impl IndexDef {
@@ -685,6 +687,11 @@ pub enum AlterTableSpec {
         old_name: String,
         new_name: String,
     },
+    /// `ALTER TABLE t ALTER INDEX name [IN]VISIBLE`.
+    AlterIndexVisibility {
+        name: String,
+        invisible: bool,
+    },
     /// `ALGORITHM [=] DEFAULT|INSTANT|INPLACE|COPY` — accepted and ignored.
     Algorithm(String),
     /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
@@ -781,6 +788,12 @@ impl AlterTableSpec {
                 ctx.write_name(old_name);
                 ctx.write_str(" TO ");
                 ctx.write_name(new_name);
+                Ok(())
+            }
+            AlterTableSpec::AlterIndexVisibility { name, invisible } => {
+                ctx.write_str("ALTER INDEX ");
+                ctx.write_name(name);
+                ctx.write_str(if *invisible { " INVISIBLE" } else { " VISIBLE" });
                 Ok(())
             }
             AlterTableSpec::Algorithm(name) => {

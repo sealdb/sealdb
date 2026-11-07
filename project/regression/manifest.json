@@ -36,7 +36,7 @@
     {
       "name": "access_path_selection",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/access_path_selection.test",
       "result": "r/access_path_selection.result",
       "has_result": true,
@@ -2146,7 +2146,7 @@
     {
       "name": "planner/core/point_get_plan",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/planner/core/point_get_plan.test",
       "result": "r/planner/core/point_get_plan.result",
       "has_result": true,

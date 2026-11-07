@@ -494,6 +494,15 @@ fn compare_bound(value: &Datum, bound: &str) -> Option<Ordering> {
             let b = bound.parse::<f64>().ok()?;
             (v as f64).partial_cmp(&b)
         }
+        Datum::Bit(b) => {
+            let v = b
+                .iter()
+                .fold(0u128, |acc, x| (acc << 8) | u128::from(*x));
+            if let Ok(bound_i) = bound.parse::<u128>() {
+                return Some(v.cmp(&bound_i));
+            }
+            (v as f64).partial_cmp(&bound.parse::<f64>().ok()?)
+        }
         Datum::F64(v) => v.partial_cmp(&bound.parse::<f64>().ok()?),
         Datum::Bytes(v) => Some(v.as_slice().cmp(bound.as_bytes())),
         Datum::Time(t) => {

@@ -51,6 +51,8 @@ pub struct Session {
     auto_analyze_ratio: Mutex<f64>,
     /// TiDB `tidb_window_concurrency` (default 5).
     window_concurrency: Mutex<u64>,
+    /// TiDB `autocommit` (default ON).
+    autocommit: Mutex<bool>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
 }
@@ -96,6 +98,7 @@ impl Session {
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
             window_concurrency: Mutex::new(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY),
+            autocommit: Mutex::new(true),
             last_warnings: Mutex::new(Vec::new()),
         }
     }
@@ -673,7 +676,14 @@ impl Session {
             .lock()
             .expect("session partition prune mode lock");
         // EXPLAIN / semi-join strings use `current_db_name()` (suite schema).
+        let explicit_txn = self
+            .txn
+            .lock()
+            .expect("session txn lock")
+            .is_explicit()
+            || !*self.autocommit.lock().expect("session autocommit lock");
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
+            sealdb_planner::with_explicit_txn(explicit_txn, || {
             if use_cache {
                 let cache = self.domain.plan_cache();
                 // Re-optimize every EXECUTE: the cached plan was built from the
@@ -702,6 +712,7 @@ impl Session {
                     prune_mode,
                 )
             }
+            })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
         let exec = if matches!(&plan, PhysicalPlan::DDL { .. }) {
@@ -2213,7 +2224,18 @@ fn apply_set(
                     .lock()
                     .expect("session auto analyze ratio lock") = ratio;
             }
-            "autocommit" | "unique_checks" | "foreign_key_checks" => {}
+            "autocommit" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "on" | "true"
+                    )
+                };
+                *session.autocommit.lock().expect("session autocommit lock") = on;
+            }
+            "unique_checks" | "foreign_key_checks" => {}
             "cte_max_recursion_depth" => {
                 // `SET … = DEFAULT` resets to TiDB's default (1000).
                 let depth = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -2438,6 +2460,7 @@ fn literal_field_name(datum: &sealdb_types::Datum) -> String {
         sealdb_types::Datum::U64(n) => n.to_string(),
         sealdb_types::Datum::F64(n) => n.to_string(),
         sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        sealdb_types::Datum::Bit(b) => String::from_utf8_lossy(b).into_owned(),
         sealdb_types::Datum::Null => "NULL".into(),
         sealdb_types::Datum::Time(t) => t.to_string(),
         sealdb_types::Datum::Decimal(d) => d.to_string(),
@@ -2494,7 +2517,13 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .lock()
             .expect("session auto analyze ratio lock")
             .to_string(),
-        "autocommit" => "1".into(),
+        "autocommit" => {
+            if *session.autocommit.lock().expect("session autocommit lock") {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "tidb_window_concurrency" => session
             .window_concurrency

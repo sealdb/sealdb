@@ -186,6 +186,7 @@ impl TableInfo {
         self.indices.iter().find(|idx| {
             // Clustered integer PRIMARY KEY is the row handle, not an index path.
             !(idx.primary && self.pk_is_handle)
+                && !idx.invisible
                 && idx.columns.first().is_some_and(|col| col.name.l() == name)
         })
     }
@@ -196,6 +197,7 @@ impl TableInfo {
         let name = column.to_ascii_lowercase();
         self.indices.iter().find(|idx| {
             !(idx.primary && self.pk_is_handle)
+                && !idx.invisible
                 && idx.unique
                 && idx.columns.len() == 1
                 && idx.columns[0].name.l() == name

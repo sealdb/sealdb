@@ -46,6 +46,9 @@ pub struct IndexInfo {
     /// TiDB `GLOBAL` index: spans every partition of a partitioned table.
     #[serde(default)]
     pub global: bool,
+    /// TiDB `INVISIBLE` index: hidden from the optimizer (ALTER INDEX).
+    #[serde(default)]
+    pub invisible: bool,
 }
 
 impl IndexInfo {
@@ -64,6 +67,7 @@ impl IndexInfo {
             unique: false,
             primary: false,
             global: false,
+            invisible: false,
         }
     }
 

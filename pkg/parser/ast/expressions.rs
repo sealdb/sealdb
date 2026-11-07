@@ -147,6 +147,28 @@ impl ExprNode {
         out
     }
 
+    /// Fold a literal constant (including unary `-`/`+`) to a datum.
+    pub fn const_datum(&self) -> Option<Datum> {
+        match self {
+            ExprNode::Value(v) => Some(v.datum.clone()),
+            ExprNode::Unary(u) if matches!(u.op, Op::UnaryMinus | Op::Minus | Op::Plus) => {
+                let inner = Self::const_datum(&u.expr)?;
+                if matches!(u.op, Op::Plus) {
+                    return Some(inner);
+                }
+                Some(match inner {
+                    Datum::I64(v) => Datum::I64(v.checked_neg()?),
+                    Datum::U64(v) if v == 1u64 << 63 => Datum::I64(i64::MIN),
+                    Datum::U64(v) if v <= i64::MAX as u64 => Datum::I64(-(v as i64)),
+                    Datum::F64(v) => Datum::F64(-v),
+                    Datum::Decimal(d) => Datum::Decimal(d.negated()),
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn eq_column_const(&self) -> Option<(String, Datum)> {
         let ExprNode::Binary(bin) = self else {
             return None;
@@ -156,9 +178,8 @@ impl ExprNode {
             return None;
         }
         match (bin.left.as_ref(), bin.right.as_ref()) {
-            (ExprNode::Column(col), ExprNode::Value(v))
-            | (ExprNode::Value(v), ExprNode::Column(col)) => {
-                Some((col.name.clone(), v.datum.clone()))
+            (ExprNode::Column(col), right) | (right, ExprNode::Column(col)) => {
+                right.const_datum().map(|value| (col.name.clone(), value))
             }
             _ => None,
         }
@@ -190,17 +211,14 @@ impl ExprNode {
         };
         let mut values = Vec::new();
         for item in &list.list {
-            let ExprNode::Value(value) = item else {
+            let Some(value) = item.const_datum() else {
                 return None;
             };
-            if value.datum.is_null() {
+            if value.is_null() {
                 continue;
             }
-            if !values
-                .iter()
-                .any(|have: &Datum| have.compare(&value.datum).is_eq())
-            {
-                values.push(value.datum.clone());
+            if !values.iter().any(|have: &Datum| have.compare(&value).is_eq()) {
+                values.push(value);
             }
         }
         Some((col.name.clone(), values, list.list.len()))
@@ -245,10 +263,7 @@ impl ExprNode {
             }
             let mut values = Vec::with_capacity(tuple.exprs.len());
             for expr in &tuple.exprs {
-                let ExprNode::Value(value) = expr else {
-                    return None;
-                };
-                values.push(value.datum.clone());
+                values.push(expr.const_datum()?);
             }
             if !tuples.iter().any(|have| {
                 have.len() == values.len()
@@ -261,6 +276,94 @@ impl ExprNode {
             }
         }
         Some((names, tuples, list.list.len()))
+    }
+
+    /// `(a = 1 AND b = 2) OR (a = 3 AND b = 4)` → constant tuples ordered by
+    /// `columns`. Used by batch point gets planned from a DNF of equalities.
+    pub fn dnf_const_tuples(&self, columns: &[String]) -> Option<Vec<Vec<Datum>>> {
+        let arms = self.split_dnf();
+        if arms.len() < 2 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(arms.len());
+        for arm in &arms {
+            let eqs: Vec<(String, Datum)> = arm
+                .split_cnf_all()
+                .into_iter()
+                .filter_map(|expr| expr.eq_column_const())
+                .collect();
+            let mut tuple = Vec::with_capacity(columns.len());
+            for column in columns {
+                tuple.push(
+                    eqs.iter()
+                        .find(|(col, _)| col.eq_ignore_ascii_case(column))
+                        .map(|(_, value)| value.clone())?,
+                );
+            }
+            out.push(tuple);
+        }
+        Some(out)
+    }
+
+    /// TiDB renders a row-value `IN` as the equivalent DNF of equalities once
+    /// it survives into a scan filter: `(a,b) IN ((1,2))` → `a = 1 AND b = 2`.
+    pub fn rewrite_row_in_dnf(&self) -> ExprNode {
+        match self {
+            ExprNode::InList(list) if !list.not => {
+                let ExprNode::Row(row) = list.expr.as_ref() else {
+                    return self.clone();
+                };
+                if !row
+                    .exprs
+                    .iter()
+                    .all(|expr| matches!(expr, ExprNode::Column(_)))
+                {
+                    return self.clone();
+                }
+                let mut arms = Vec::with_capacity(list.list.len());
+                for item in &list.list {
+                    let ExprNode::Row(tuple) = item else {
+                        return self.clone();
+                    };
+                    if tuple.exprs.len() != row.exprs.len() {
+                        return self.clone();
+                    }
+                    let mut conjuncts = Vec::with_capacity(tuple.exprs.len());
+                    for (column, value) in row.exprs.iter().zip(tuple.exprs.iter()) {
+                        let ExprNode::Value(value) = value else {
+                            return self.clone();
+                        };
+                        conjuncts.push(ExprNode::Binary(BinaryOpExpr {
+                            op: Op::Eq,
+                            left: Box::new(column.clone()),
+                            right: Box::new(ExprNode::Value(value.clone())),
+                            single_cnf_item: false,
+                        }));
+                    }
+                    match ExprNode::compose_cnf(conjuncts) {
+                        Some(arm) => arms.push(arm),
+                        None => return self.clone(),
+                    }
+                }
+                arms.into_iter()
+                    .reduce(|left, right| {
+                        ExprNode::Binary(BinaryOpExpr {
+                            op: Op::LogicOr,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            single_cnf_item: false,
+                        })
+                    })
+                    .unwrap_or_else(|| self.clone())
+            }
+            ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(bin.left.rewrite_row_in_dnf()),
+                right: Box::new(bin.right.rewrite_row_in_dnf()),
+                single_cnf_item: bin.single_cnf_item,
+            }),
+            other => other.clone(),
+        }
     }
 
     pub fn column_cmp_const(&self) -> Option<(String, Op, Datum)> {
@@ -436,6 +539,7 @@ impl ValueExpr {
                 }
             }
             Datum::Bytes(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
+            Datum::Bit(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
             Datum::Decimal(d) => d.to_string(),
             Datum::Time(t) => format!("'{t}'"),
             Datum::Enum(e) => format!(
