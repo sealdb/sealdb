@@ -107,6 +107,8 @@ pub struct Step {
     pub echo: Option<String>,
     /// TiDB `--disable_result_log`: echo the statement but suppress its rows.
     pub log_result: bool,
+    /// TiDB `--enable_info`: print `affected rows:` and the OK-packet info string.
+    pub show_info: bool,
     /// TiDB `--replace_regex /pat/repl/` applied to this statement's result.
     pub replace_regex: Vec<(regex::Regex, String)>,
     /// mysql-tester session directive (`connect` / `connection` / `disconnect`).
@@ -253,6 +255,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
     let mut sorted = false;
     let mut warnings_enabled = false;
     let mut result_log = true;
+    let mut info_enabled = false;
     let mut replace_regex: Vec<(regex::Regex, String)> = Vec::new();
     for line in src.lines() {
         let trimmed = line.trim();
@@ -286,6 +289,14 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 replace_regex = parse_replace_regex(spec.trim())?;
                 continue;
             }
+            if rest.eq_ignore_ascii_case("enable_info") {
+                info_enabled = true;
+                continue;
+            }
+            if rest.eq_ignore_ascii_case("disable_info") {
+                info_enabled = false;
+                continue;
+            }
             if rest.eq_ignore_ascii_case("enable_warnings") {
                 warnings_enabled = true;
                 continue;
@@ -302,6 +313,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     show_warnings: false,
                     echo: Some(msg.trim_start().to_string()),
                     log_result: true,
+                    show_info: false,
                     replace_regex: Vec::new(),
                     directive: None,
                 });
@@ -326,6 +338,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     show_warnings: false,
                     echo: None,
                     log_result: true,
+                    show_info: false,
                     replace_regex: Vec::new(),
                     directive: Some(directive),
                 });
@@ -346,6 +359,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 show_warnings: warnings_enabled,
                 echo: None,
                 log_result: result_log,
+                show_info: info_enabled,
                 replace_regex: std::mem::take(&mut replace_regex),
                 directive: None,
             });
@@ -668,6 +682,12 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
         eprintln!("[trace] {}", step.sql);
     }
     let result = session.execute_stmt(&step.sql);
+    if std::env::var_os("SEALDB_ITEST_TRACE").is_some() {
+        match &result {
+            Ok(qr) => eprintln!("[trace]   ok rows={}", qr.rows.len()),
+            Err(e) => eprintln!("[trace]   err {} {}", e.code, e.message),
+        }
+    }
     match (result, step.expected_error) {
         (Ok(_), Some(code)) => Err(Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
@@ -700,6 +720,10 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                 for (code, msg) in &qr.warnings {
                     lines.push(format!("Warning\t{code}\t{msg}"));
                 }
+            }
+            if step.show_info {
+                lines.push(format!("affected rows: {}", qr.affected_rows));
+                lines.push(format!("info: {}", qr.info));
             }
             let mut out = lines.join("\n");
             for (re, replacement) in &step.replace_regex {
