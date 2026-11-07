@@ -876,7 +876,7 @@
     {
       "name": "executor/partition/issues",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/partition/issues.test",
       "result": "r/executor/partition/issues.result",
       "has_result": true,
