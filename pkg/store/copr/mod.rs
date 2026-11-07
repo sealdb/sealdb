@@ -135,6 +135,14 @@ pub fn split_key_ranges_via_pd(
         } else {
             decode_pd_key(&region.end_key)?
         };
+        // PD answering for `cursor` with a boundary at (or before) the cursor
+        // means the walk cannot advance — the key sits at the region's
+        // exclusive end. Take the remainder as one span instead of re-asking.
+        if !region_end.is_empty() && region_end.as_slice() <= cursor.as_slice() {
+            out.push(KeyRange::new(cursor.clone(), end.to_vec()));
+            cursor = end.to_vec();
+            break;
+        }
         let range_start = if cursor.as_slice() > region_start.as_slice() {
             cursor.clone()
         } else {

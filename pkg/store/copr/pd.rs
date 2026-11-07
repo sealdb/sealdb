@@ -5,21 +5,47 @@ use serde::Deserialize;
 use std::time::Duration;
 
 fn pd_http_client() -> reqwest::Result<reqwest::blocking::Client> {
+    // One pooled client per process: a fresh client per request leaves every
+    // connection in TIME_WAIT and eventually exhausts ephemeral ports
+    // (`EADDRNOTAVAIL`) during large scans.
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
     // Bypass env/system proxies — Clash/SOCKS on macOS otherwise hijacks 127.0.0.1.
-    reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(4)
-        .build()
+        .pool_max_idle_per_host(8)
+        .build()?;
+    let _ = CLIENT.set(client.clone());
+    Ok(client)
 }
 
 fn pd_http_get(url: &str) -> reqwest::Result<reqwest::blocking::Response> {
     let client = pd_http_client()?;
+    let trace = std::env::var("SEALDB_PD_TRACE").is_ok();
     let mut last = None;
     for attempt in 0..3 {
+        let started = std::time::Instant::now();
         match client.get(url).send() {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                if trace {
+                    eprintln!(
+                        "[pd] {url} -> {} in {}ms",
+                        resp.status(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                return Ok(resp);
+            }
             Err(e) => {
+                if trace {
+                    eprintln!(
+                        "[pd] {url} err after {}ms: {e}",
+                        started.elapsed().as_millis()
+                    );
+                }
                 last = Some(e);
                 if attempt + 1 < 3 {
                     std::thread::sleep(Duration::from_millis(50 * (attempt + 1) as u64));
