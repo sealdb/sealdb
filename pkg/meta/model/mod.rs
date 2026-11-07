@@ -2,6 +2,7 @@ pub mod column;
 pub mod db;
 pub mod index;
 pub mod job;
+pub mod key_hash;
 pub mod partition;
 pub mod table;
 
