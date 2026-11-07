@@ -348,6 +348,7 @@ fn build_nonrecursive_all_probe(
                 partition_access,
                 row_count,
                 stats_pseudo,
+                filter_est: None,
                 pushed: Some(sel.clone()),
             },
             other => other,
@@ -486,6 +487,7 @@ fn build_recursive_arm_plan(
         partition_access: String::new(),
         row_count: 10.0,
         stats_pseudo: true,
+        filter_est: None,
         pushed: None,
     };
     // Marker table name "CTE_0" — explain recursive part maps CTETable.
@@ -649,6 +651,7 @@ fn and_expr(left: ExprNode, right: ExprNode) -> ExprNode {
         op: Op::LogicAnd,
         left: Box::new(left),
         right: Box::new(right),
+        single_cnf_item: false,
     })
 }
 
@@ -777,6 +780,7 @@ fn from_exists_cte(
         right: Box::new(ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(info.into_bytes()),
         })),
+        single_cnf_item: false,
     });
     let right_nulls = not_isnull_for_eq(&eq, &inner.name);
     let left_nulls = not_isnull_for_eq(&eq, outer_tbl);
@@ -931,6 +935,7 @@ fn from_in(
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(info.into_bytes()),
             })),
+            single_cnf_item: false,
         });
         return Some(SemiSpec {
             tp: join_tp,
@@ -975,6 +980,7 @@ fn from_in(
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(info.into_bytes()),
             })),
+            single_cnf_item: false,
         });
         return Some(SemiSpec {
             tp: join_tp,
@@ -1092,6 +1098,7 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             partition_access,
             row_count,
             stats_pseudo,
+            filter_est,
             pushed,
         } => PhysicalPlan::TableReader {
             table,
@@ -1100,6 +1107,7 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             partition_access,
             row_count,
             stats_pseudo,
+            filter_est,
             pushed: match pushed {
                 Some(prev) => ExprNode::compose_cnf(vec![prev, filter]),
                 None => Some(filter),
@@ -1316,6 +1324,7 @@ fn eq_expr(left: ExprNode, right: ExprNode) -> ExprNode {
         op: Op::Eq,
         left: Box::new(left),
         right: Box::new(right),
+        single_cnf_item: false,
     })
 }
 

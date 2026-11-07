@@ -2672,6 +2672,23 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 explain_scalar_expr(&c.expr, table)
             )
         }
+        ExprNode::InList(list) => {
+            let values = list
+                .list
+                .iter()
+                .map(|item| explain_scalar_expr(item, table))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let inner = format!(
+                "in({}, {values})",
+                explain_scalar_expr(&list.expr, table)
+            );
+            if list.not {
+                format!("not({inner})")
+            } else {
+                inner
+            }
+        }
         ExprNode::Like(l) => {
             let pattern = match l.pattern.as_ref() {
                 ExprNode::Binary(b) if b.op == Op::Plus => format!(
@@ -3343,6 +3360,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 est_rows(child) * 0.8
             }
         }
+        PhysicalPlan::TableReader {
+            filter_est: Some(est),
+            ..
+        } => *est,
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,

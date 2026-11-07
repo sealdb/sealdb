@@ -423,6 +423,7 @@ fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
             op: bin.op,
             left: Box::new(rewrite_having(&bin.left, select)),
             right: Box::new(rewrite_having(&bin.right, select)),
+            single_cnf_item: false,
         }),
         ExprNode::Unary(unary) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
             op: unary.op,

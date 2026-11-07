@@ -142,6 +142,7 @@ mod tests {
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::I64(v),
             })),
+            single_cnf_item: false,
         })
     }
 
@@ -170,6 +171,7 @@ mod tests {
                     datum: Datum::I64(2),
                 })),
             })),
+            single_cnf_item: false,
         });
         let planned = resolve_partitions(&info, Some(&expr), &[], PartitionPruneMode::Static);
         assert_eq!(planned.names, vec!["p2"]);

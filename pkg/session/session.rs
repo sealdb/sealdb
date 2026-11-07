@@ -172,7 +172,15 @@ impl Session {
         } else {
             sql
         };
-        let stmts = self.parser.parse_sql(sql)?;
+        let stmts = {
+            // `HIGH_NOT_PRECEDENCE` binds `NOT` tighter than `BETWEEN` /
+            // `IN` / `LIKE`; sqlparser always binds it looser, so the lowering
+            // needs the session mode.
+            sealdb_parser::set_high_not_precedence(sql_mode_has(&mode, "HIGH_NOT_PRECEDENCE"));
+            let parsed = self.parser.parse_sql(sql);
+            sealdb_parser::set_high_not_precedence(false);
+            parsed?
+        };
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_PARSE_ERROR,
@@ -1938,6 +1946,7 @@ fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
             op: b.op,
             left: Box::new(subst_user_vars_in_expr(session, &b.left)),
             right: Box::new(subst_user_vars_in_expr(session, &b.right)),
+            single_cnf_item: false,
         }),
         ExprNode::Unary(u) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
             op: u.op,
@@ -2851,6 +2860,7 @@ fn rewrite_updatable_view_target(
                 op: Op::LogicAnd,
                 left: Box::new(view_where),
                 right: Box::new(user_where),
+                single_cnf_item: false,
             }),
             None => view_where,
         });
@@ -3241,6 +3251,7 @@ fn try_merge_simple_view(
                 op: Op::LogicAnd,
                 left: Box::new(view_where.clone()),
                 right: Box::new(user),
+                single_cnf_item: false,
             }),
             None => view_where.clone(),
         });

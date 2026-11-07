@@ -123,6 +123,66 @@ pub struct ColumnStats {
     pub null_count: u64,
     pub histogram: Option<Histogram>,
     pub topn: Option<TopN>,
+    /// Exact per-value counts, kept for small columns so equality / IN-list /
+    /// range selectivity is exact (TiDB leans on CMSketch here). `None` when
+    /// the column is too wide to retain.
+    pub value_counts: Option<Vec<(String, u64)>>,
+}
+
+impl ColumnStats {
+    /// Exact rows equal to `value` (only for integer columns).
+    pub fn exact_point_count(&self, value: &Datum) -> Option<u64> {
+        let v = datum_i64(value)?;
+        Some(self.counts_i64()?.iter().filter(|(k, _)| *k == v).map(|(_, c)| *c).sum())
+    }
+
+    /// Exact rows whose value lies inside `[lower, upper]` with the given
+    /// inclusivity (only for integer columns).
+    pub fn exact_range_count(
+        &self,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+    ) -> Option<u64> {
+        let counts = self.counts_i64()?;
+        Some(
+            counts
+                .iter()
+                .filter(|(v, _)| {
+                    lower.is_none_or(|(lo, inc)| if inc { *v >= lo } else { *v > lo })
+                        && upper.is_none_or(|(hi, inc)| if inc { *v <= hi } else { *v < hi })
+                })
+                .map(|(_, c)| *c)
+                .sum(),
+        )
+    }
+
+    /// Exact rows for a set of point values.
+    pub fn exact_points_count(&self, values: &[Datum]) -> Option<u64> {
+        let counts = self.counts_i64()?;
+        let mut total = 0u64;
+        for value in values {
+            let v = datum_i64(value)?;
+            total += counts.iter().filter(|(k, _)| *k == v).map(|(_, c)| *c).sum::<u64>();
+        }
+        Some(total)
+    }
+
+    fn counts_i64(&self) -> Option<Vec<(i64, u64)>> {
+        let raw = self.value_counts.as_ref()?;
+        let mut out = Vec::with_capacity(raw.len());
+        for (k, c) in raw {
+            out.push((k.parse::<i64>().ok()?, *c));
+        }
+        Some(out)
+    }
+}
+
+fn datum_i64(value: &Datum) -> Option<i64> {
+    match value {
+        Datum::I64(v) => Some(*v),
+        Datum::U64(v) => i64::try_from(*v).ok(),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,6 +198,8 @@ impl Table {
     pub const PSEUDO_ROW_COUNT: u64 = 10_000;
     pub const DEFAULT_HIST_BUCKETS: usize = 8;
     pub const DEFAULT_TOPN: usize = 10;
+    /// Exact per-value counts are retained up to this many distinct values.
+    pub const MAX_VALUE_COUNTS: usize = 10_000;
     /// TiDB `AutoAnalyzeMinCnt` default is 1000; SealDB keeps no floor so
     /// MemStorage tests can exercise auto-analyze on small tables.
     pub const AUTO_ANALYZE_MIN_CNT: u64 = 0;
@@ -234,3 +296,4 @@ mod histogram_tests {
         assert_eq!(topn.lookup("b"), None);
     }
 }
+

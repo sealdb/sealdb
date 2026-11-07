@@ -307,6 +307,7 @@ fn materialize(
             op: bin.op,
             left: Box::new(materialize(&bin.left, ctx, cache)?),
             right: Box::new(materialize(&bin.right, ctx, cache)?),
+            single_cnf_item: false,
         })),
         ExprNode::Unary(unary) => Ok(ExprNode::Unary(UnaryOpExpr {
             op: unary.op,
@@ -777,6 +778,7 @@ fn bind_expr(
             op: bin.op,
             left: Box::new(bind_expr(&bin.left, ctx, inner_tables, inner_cols)),
             right: Box::new(bind_expr(&bin.right, ctx, inner_tables, inner_cols)),
+            single_cnf_item: false,
         }),
         ExprNode::Unary(unary) => ExprNode::Unary(UnaryOpExpr {
             op: unary.op,

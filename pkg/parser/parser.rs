@@ -3,6 +3,22 @@ use crate::format::RestoreCtx;
 use crate::sqlparser_bridge;
 use sealdb_errno::Result;
 use serde::Serialize;
+use std::cell::Cell;
+
+thread_local! {
+    /// TiDB `HIGH_NOT_PRECEDENCE`: `NOT` binds tighter than `BETWEEN`
+    /// (`NOT x BETWEEN a AND b` → `(NOT x) BETWEEN a AND b`). sqlparser always
+    /// binds `NOT` looser, so the lowering consults this session flag.
+    static HIGH_NOT_PRECEDENCE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_high_not_precedence(on: bool) {
+    HIGH_NOT_PRECEDENCE.with(|flag| flag.set(on));
+}
+
+pub fn high_not_precedence() -> bool {
+    HIGH_NOT_PRECEDENCE.with(Cell::get)
+}
 
 pub struct Parser;
 
@@ -113,6 +129,38 @@ mod tests {
             .parse_one_stmt("CREATE DATABASE IF NOT EXISTS db1")
             .unwrap();
         assert_eq!(db.stmt_type(), "CreateDatabaseStmt");
+    }
+
+    #[test]
+    fn test_single_value_in_list_folds_to_eq() {
+        use crate::ast::ExprNode;
+        // TiDB inToExpression: `a IN (x)` is rewritten as `a = x`.
+        let parser = Parser::new();
+        match parser
+            .parse_one_stmt("SELECT * FROM t WHERE a IN (1)")
+            .unwrap()
+        {
+            crate::ast::Statement::Select(select) => match select.selection.as_ref() {
+                Some(ExprNode::Binary(bin)) => {
+                    assert_eq!(bin.op, crate::opcode::Op::Eq);
+                }
+                other => panic!("expected eq, got {other:?}"),
+            },
+            other => panic!("expected SelectStmt, got {other:?}"),
+        }
+        // Multiple values keep the IN list.
+        match parser
+            .parse_one_stmt("SELECT * FROM t WHERE a IN (1, 2)")
+            .unwrap()
+        {
+            crate::ast::Statement::Select(select) => {
+                assert!(matches!(
+                    select.selection.as_ref(),
+                    Some(ExprNode::InList(_))
+                ));
+            }
+            other => panic!("expected SelectStmt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1248,6 +1296,7 @@ mod tests {
             in_list.as_select().unwrap().selection.as_ref(),
             Some(crate::ast::ExprNode::InList(_))
         ));
+        // `BETWEEN` lowers to `id >= 1 AND id <= 2` (TiDB predicate shape).
         assert!(matches!(
             parser
                 .parse_one_stmt("SELECT * FROM t WHERE id BETWEEN 1 AND 2")
@@ -1256,7 +1305,7 @@ mod tests {
                 .unwrap()
                 .selection
                 .as_ref(),
-            Some(crate::ast::ExprNode::Between(_))
+            Some(crate::ast::ExprNode::Binary(bin)) if bin.op == crate::opcode::Op::LogicAnd
         ));
         assert!(matches!(
             parser

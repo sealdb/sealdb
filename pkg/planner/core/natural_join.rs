@@ -218,6 +218,7 @@ fn resolve_natural(left: SideColumns, right: SideColumns) -> Result<(Vec<String>
             op: Op::LogicAnd,
             left: Box::new(acc),
             right: Box::new(next),
+            single_cnf_item: false,
         })
     });
     Ok((cols, on))
@@ -228,6 +229,7 @@ fn equi_column(col: &str, left_table: &str, right_table: &str) -> ExprNode {
         op: Op::Eq,
         left: Box::new(column_ref(left_table, col)),
         right: Box::new(column_ref(right_table, col)),
+        single_cnf_item: false,
     })
 }
 

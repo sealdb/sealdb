@@ -886,7 +886,7 @@
     {
       "name": "executor/partition/partition_boundaries",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/partition/partition_boundaries.test",
       "result": "r/executor/partition/partition_boundaries.result",
       "has_result": true,

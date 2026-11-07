@@ -45,6 +45,7 @@ fn push_into(
             partition_access,
             row_count,
             stats_pseudo,
+            filter_est,
             pushed,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
@@ -70,6 +71,7 @@ fn push_into(
                     partition_access,
                     row_count,
                     stats_pseudo,
+                    filter_est,
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
                     pushed: and_opt(ExprNode::compose_cnf(pushable), pushed),
                 },
@@ -522,6 +524,7 @@ mod tests {
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::I64(value),
             })),
+            single_cnf_item: false,
         })
     }
 
