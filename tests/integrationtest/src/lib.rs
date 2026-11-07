@@ -109,6 +109,54 @@ pub struct Step {
     pub log_result: bool,
     /// TiDB `--replace_regex /pat/repl/` applied to this statement's result.
     pub replace_regex: Vec<(regex::Regex, String)>,
+    /// mysql-tester session directive (`connect` / `connection` / `disconnect`).
+    pub directive: Option<SessionDirective>,
+}
+
+/// mysql-tester connection directives. They emit no result rows, so the golden
+/// file only shows the statements that run on the named connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionDirective {
+    /// `connect (name, host, user, pass, db)`
+    Connect(String),
+    /// `connection name`
+    Connection(String),
+    /// `disconnect name`
+    Disconnect(String),
+}
+
+/// Parse a bare `connect` / `connection` / `disconnect` line. Returns `None`
+/// for ordinary SQL so the statement buffer path keeps working.
+fn parse_session_directive(line: &str) -> Option<SessionDirective> {
+    fn name_of(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        let raw = raw.strip_prefix('(').unwrap_or(raw);
+        let name = raw
+            .split([',', ')', ';', ' ', '\t'])
+            .find(|t| !t.is_empty())?
+            .trim_matches(['\'', '"']);
+        (!name.is_empty()).then(|| name.to_string())
+    }
+    let line = line.trim();
+    for (keyword, make) in [
+        ("connection", SessionDirective::Connection as fn(String) -> SessionDirective),
+        ("disconnect", SessionDirective::Disconnect),
+        ("connect", SessionDirective::Connect),
+    ] {
+        let Some(rest) = strip_prefix_ci(line, keyword) else {
+            continue;
+        };
+        // `connect` must be a whole word (`connection` is matched above).
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        return name_of(rest).map(make);
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -255,19 +303,34 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     echo: Some(msg.trim_start().to_string()),
                     log_result: true,
                     replace_regex: Vec::new(),
+                    directive: None,
                 });
                 continue;
             }
             // TiDB directives we do not yet honor: skip with clear error on use.
             if rest.eq_ignore_ascii_case("enable_query_log")
                 || rest.eq_ignore_ascii_case("disable_query_log")
-                || strip_prefix_ci(rest, "connect").is_some()
-                || strip_prefix_ci(rest, "connection").is_some()
                 || strip_prefix_ci(rest, "sleep").is_some()
             {
                 return Err(Error::unsupported(format!("test directive -- {rest}")));
             }
             return Err(Error::unsupported(format!("test directive -- {rest}")));
+        }
+        // Session directives are standalone lines that emit no rows.
+        if buf.trim().is_empty() {
+            if let Some(directive) = parse_session_directive(trimmed) {
+                steps.push(Step {
+                    sql: String::new(),
+                    expected_error: None,
+                    sorted: false,
+                    show_warnings: false,
+                    echo: None,
+                    log_result: true,
+                    replace_regex: Vec::new(),
+                    directive: Some(directive),
+                });
+                continue;
+            }
         }
         if !buf.is_empty() {
             buf.push('\n');
@@ -284,6 +347,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 echo: None,
                 log_result: result_log,
                 replace_regex: std::mem::take(&mut replace_regex),
+                directive: None,
             });
             buf.clear();
             expected_error = None;
@@ -358,8 +422,11 @@ fn parse_replace_regex(spec: &str) -> Result<Vec<(regex::Regex, String)>> {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    // Slice by byte length, but only on a char boundary so non-ASCII SQL
+    // (e.g. identifiers starting with an emoji) cannot panic.
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        s.get(prefix.len()..)
     } else {
         None
     }
@@ -517,9 +584,48 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     let _ = session.execute_stmt(&format!("DROP DATABASE IF EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("CREATE DATABASE IF NOT EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("USE `{db}`"));
+    // `connect (conn1, …)` opens an extra session; all sessions share the same
+    // Domain, so `SET GLOBAL` values (and storage) stay visible across them.
+    let domain = session.domain();
+    let mut sessions: std::collections::HashMap<String, Session> =
+        std::collections::HashMap::new();
+    sessions.insert("default".to_string(), session);
+    let mut current = "default".to_string();
     let mut chunks = Vec::new();
     for step in &suite.steps {
-        chunks.push(run_step(&session, step)?);
+        if let Some(directive) = &step.directive {
+            match directive {
+                SessionDirective::Connect(name) => {
+                    sessions
+                        .entry(name.clone())
+                        .or_insert_with(|| Session::with_domain(Arc::clone(&domain)));
+                    current = name.clone();
+                }
+                SessionDirective::Connection(name) => {
+                    if !sessions.contains_key(name) {
+                        return Err(Error::new(
+                            sealdb_errno::ERR_UNKNOWN_ERROR,
+                            format!("connection '{name}' is not open"),
+                        ));
+                    }
+                    current = name.clone();
+                }
+                SessionDirective::Disconnect(name) => {
+                    sessions.remove(name);
+                    if current == *name {
+                        current = "default".to_string();
+                    }
+                }
+            }
+            continue;
+        }
+        let session = sessions.get(&current).ok_or_else(|| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("connection '{current}' is not open"),
+            )
+        })?;
+        chunks.push(run_step(session, step)?);
     }
     let mut out = chunks.join("\n");
     if !out.is_empty() && !out.ends_with('\n') {

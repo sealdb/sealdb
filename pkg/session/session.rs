@@ -88,7 +88,10 @@ impl Session {
             sql_mode: Mutex::new(globals.sql_mode),
             time_zone: Mutex::new("SYSTEM".to_string()),
             user_vars: Mutex::new(HashMap::new()),
-            partition_prune_mode: Mutex::new(PartitionPruneMode::Dynamic),
+            partition_prune_mode: Mutex::new(
+                PartitionPruneMode::parse(&globals.partition_prune_mode)
+                    .unwrap_or(PartitionPruneMode::Dynamic),
+            ),
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
@@ -238,8 +241,18 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::Set(set) => {
-                apply_set(self, set)?;
-                return Ok(empty_result());
+                let warnings = apply_set(self, set)?;
+                // `SET` bypasses the shared plan path below, so record its
+                // warnings here for a following `SHOW WARNINGS`.
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = warnings.clone();
+                return Ok(QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    warnings,
+                });
             }
             Statement::Do(doit) => {
                 for expr in &doit.exprs {
@@ -1848,7 +1861,12 @@ fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -
 /// TiDB-style select-list name for expressions that mention session vars.
 fn session_var_field_name(expr: &ExprNode) -> String {
     match expr {
-        ExprNode::Column(col) => col.name.clone(),
+        // TiDB names the column after the full reference, including the
+        // `@@global.` / `@@session.` scope qualifier.
+        ExprNode::Column(col) => match col.table.as_deref() {
+            Some(table) if table.starts_with('@') => format!("{table}.{}", col.name),
+            _ => col.name.clone(),
+        },
         ExprNode::Binary(b) => {
             let left = session_var_field_name(&b.left);
             let right = match b.right.as_ref() {
@@ -2034,7 +2052,11 @@ fn div_by_zero_mode(
     }
 }
 
-fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()> {
+fn apply_set(
+    session: &Session,
+    stmt: &sealdb_parser::ast::SetStmt,
+) -> Result<Vec<(i32, String)>> {
+    let mut warnings = Vec::new();
     for a in &stmt.assignments {
         if is_user_var_name(&a.name) {
             if a.scope == SetVarScope::Global {
@@ -2054,7 +2076,9 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
         let value = a.value.trim_matches(|c| c == '\'' || c == '"').to_string();
         if a.scope == SetVarScope::Global {
-            return apply_set_global(session, &name, &value);
+            let mut global_warnings = apply_set_global(session, &name, &value)?;
+            warnings.append(&mut global_warnings);
+            continue;
         }
         match name.as_str() {
             "names"
@@ -2099,12 +2123,38 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
                         format!("Variable 'tidb_partition_prune_mode' can't be set to the value of '{value}'"),
                     )
                 })?;
+                let previous = *session
+                    .partition_prune_mode
+                    .lock()
+                    .expect("session partition prune mode lock");
                 *session
                     .partition_prune_mode
                     .lock()
                     .expect("session partition prune mode lock") = mode;
                 // Prune mode changes plan shape; drop Domain-shared cached plans.
                 session.domain.plan_cache().clear();
+                // TiDB warns when a session overrides the prune mode: the
+                // static alias is deprecated, dynamic asks for global scope and
+                // for a re-ANALYZE of every partition table.
+                if mode != previous {
+                    match mode {
+                        PartitionPruneMode::Static => warnings.push((
+                            1681,
+                            "static prune mode is deprecated and will be removed in the future release."
+                                .to_string(),
+                        )),
+                        PartitionPruneMode::Dynamic => {
+                            warnings.push((
+                                1105,
+                                "Please analyze all partition tables again for consistency between partition and global stats".to_string(),
+                            ));
+                            warnings.push((
+                                1105,
+                                "Please avoid setting partition prune mode to dynamic at session level and set partition prune mode to dynamic at global level".to_string(),
+                            ));
+                        }
+                    }
+                }
             }
             "tidb_enable_auto_analyze" => {
                 let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -2200,12 +2250,45 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<()
             }
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// Domain-shared `SET GLOBAL` for the MVB variable set.
-fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
+fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i32, String)>> {
+    let mut warnings = Vec::new();
     match name {
+        "tidb_partition_prune_mode" => {
+            // `SET GLOBAL … = DEFAULT` resets to TiDB's default (dynamic).
+            let raw = if value.eq_ignore_ascii_case("DEFAULT") {
+                "dynamic"
+            } else {
+                value
+            };
+            let mode = PartitionPruneMode::parse(raw).ok_or_else(|| {
+                sealdb_errno::Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!(
+                        "Variable 'tidb_partition_prune_mode' can't be set to the value of '{value}'"
+                    ),
+                )
+            })?;
+            session
+                .domain
+                .set_global_partition_prune_mode(mode.as_str().to_string());
+            session.domain.plan_cache().clear();
+            match mode {
+                PartitionPruneMode::Static => warnings.push((
+                    1681,
+                    "static prune mode is deprecated and will be removed in the future release."
+                        .to_string(),
+                )),
+                PartitionPruneMode::Dynamic => warnings.push((
+                    1105,
+                    "Please analyze all partition tables again for consistency between partition and global stats"
+                        .to_string(),
+                )),
+            }
+        }
         "sql_mode" => {
             session.domain.set_global_sql_mode(value.to_string());
         }
@@ -2234,7 +2317,7 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult> {
@@ -2403,6 +2486,7 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
         | "character_set_results"
         | "character_set_database"
         | "character_set_server" => globals.character_set_connection,
+        "tidb_partition_prune_mode" => globals.partition_prune_mode.clone(),
         _ => return None,
     })
 }
