@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-07（green 24 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-07（green 26 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | `executor/partition/issues` green；其余 28 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | `executor/partition/issues` / `executor/partition/write` green；其余 27 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -189,6 +189,22 @@
 | PK 隐式 NOT NULL | ON 侧键列不再补 `not(isnull(...))` | `nullable_column`（PK 列视作非空） | `Selection` 仅剩 `eq(broker, "0009")` |
 | KEY 分区静态剪枝 | `KEY` 用 MD5 前 8 字节大端取 `% n`（区别于 HASH 取模） | `model/key_hash.rs`（MD5 + `key_partition_index`）；KEY 复用 `getUsedHashPartitions` 区间枚举 | `partition:p2`（5807/5808 同分区） |
 | suite green | Gate A+B | manifest `green` | `executor/partition/issues` Mem=1 / TiKV=1 PASS；green 23→24 双端复验 |
+
+### 2.0k R3 `executor/partition/write`（2026-11-07）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 多列表达式分区剪枝 | 单列约束不能推导缺失变量 | `rule_partition_processor`：`distinct_columns.len() == 1` 才改写 | `insert into t values (1,'a')` 不再误落 p3 |
+| LIST/ RANGE 错误文案 | 值越界 vs `column_list` | `locate_tuple` 单列：RANGE 报 `value 1000`，LIST 保留 `from column_list` | `Error 1526 (...): Table has no partition for value 1000` |
+| `INSERT IGNORE` 越界 | 警告 `1526` 而非报错 | `insert` 写行/目标分区两处捕获 1526 | `insert ignore ... values(1000)` → `Warning 1526` |
+| `INSERT ... PARTITION(pN)` | 落在目标集外 → `1748` | `filter_target_partitions` + IGNORE 警告 | `Warning 1748 Found a row not matching…` |
+| `UPDATE/DELETE ... PARTITION(pN)` | 只扫描目标分区，越界行跳过 | 复用 `TableName.partition_names`；`resolve_partition_ids` / `check_partition_target` | `update ignore … partition(p0) set a=101` 行保持 `1` |
+| `UPDATE IGNORE` 唯一键/越界 | 冲突行警告跳过、保留原行 | `validate_update_uniqueness` 全表快照（剪枝隐藏的其它分区也要查） | `update ignore t set a=5 where a=7` → `Warning 1062`，行 `5,7` |
+| 唯一索引 NULL 语义 | 多个 NULL 不冲突 | `encode_index_key`：unique 且含 NULL 时追加 handle 后缀 | `replace into ... set c2=NULL` 两次 `affected 1` |
+| AUTO_INCREMENT 显式赋值 | 更新显式值提升分配器 | `bump_auto_increment`（UPDATE 路径） | `update t set id=8` 后下一行 id=9 |
+| 嵌套执行器 DML 摘要 | 子查询执行不能清空外层影响行数 | `DmlSummary` 改栈式（push/pop） | `delete ignore … where id=(select '2a')` → `affected rows: 1` |
+| `NOT NULL` 1048 / SQLSTATE | `23000` | `sqlstate_of` 映射 `ERR_BAD_NULL` | `Error 1048 (23000): Column 'id' cannot be null` |
+| suite green | Gate A+B | manifest `green` | `executor/partition/write` Mem=1 / TiKV=1 PASS；green 25→26 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 

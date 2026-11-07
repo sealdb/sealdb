@@ -916,12 +916,12 @@
     {
       "name": "executor/partition/write",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/partition/write.test",
       "result": "r/executor/partition/write.result",
       "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core,distsql,store/copr"
+      "owner_hint": ""
     },
     {
       "name": "executor/password_management",
