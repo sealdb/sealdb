@@ -7,13 +7,20 @@ pub const CPU_FACTOR: f64 = 0.5;
 pub const HASH_FACTOR: f64 = 1.0;
 pub const SORT_FACTOR: f64 = 2.0;
 
+/// TiDB `stats.Table.Pseudo`: statistics only replace pseudo cardinality when
+/// the table has been analyzed (`version > 0`) *and* holds rows. An analyzed
+/// empty table stays pseudo, so EXPLAIN keeps `10000.00 … stats:pseudo`.
+pub fn has_real_stats(t: &Table) -> bool {
+    t.version > 0 && t.count > 0
+}
+
 pub fn table_row_count(stats: Option<&Handle>, from: &TableName, current_db: &str) -> f64 {
     let (db, table) = from.qualified(current_db);
     // DML `add_modify` may create a zero-count stub; only ANALYZE (`version > 0`)
     // replaces TiDB pseudo cardinality.
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| t.version > 0)
+        .filter(|t| has_real_stats(t))
         .map(|t| t.count as f64)
         .unwrap_or(Table::PSEUDO_ROW_COUNT as f64)
 }
@@ -27,7 +34,7 @@ pub fn eq_row_count(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| t.version > 0)
+        .filter(|t| has_real_stats(t))
         .map(|t| t.eq_row_count(column) as f64)
 }
 
@@ -42,7 +49,7 @@ pub fn eq_row_count_value(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| t.version > 0)
+        .filter(|t| has_real_stats(t))
         .map(|t| t.eq_row_count_value(column, value) as f64)
 }
 
