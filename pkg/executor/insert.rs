@@ -4,8 +4,10 @@ use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_DUP_ENTRY, ERR_NO_DB, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_NO_SUCH_TABLE,
-    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT, Error, Result,
+    ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_NO_DB,
+    ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION,
+    ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -43,6 +45,67 @@ impl InsertExec {
             done: false,
         }
     }
+        /// `REPLACE`: every row conflicting on any unique key is deleted, then the
+    /// new row is written. TiDB counts a rewritten-verbatim row as one affected
+    /// row and a changed replacement as delete + insert (two).
+    fn replace_rows(
+        &mut self,
+        info: &sealdb_meta::TableInfo,
+        pending: Vec<Vec<Datum>>,
+        batched: bool,
+    ) -> Result<()> {
+        let lock = crate::update::dml_row_lock(&self.txn)?;
+        let physical = sealdb_planner::core::prune_partitions(info, None);
+        let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
+        let source = pending.len() as u64;
+        let mut affected = 0u64;
+        let mut duplicates = 0u64;
+        self.txn.with_txn(|txn| {
+            for values in pending {
+                let conflicts: Vec<usize> = existing
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| index_conflict(info, &row.values, &values).is_some())
+                    .map(|(i, _)| i)
+                    .collect();
+                if conflicts.is_empty() {
+                    let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
+                    existing.push(crate::table_reader::ScannedRow {
+                        handle,
+                        physical_id,
+                        values,
+                    });
+                    affected += 1;
+                    continue;
+                }
+                duplicates += 1;
+                let unchanged =
+                    conflicts.len() == 1 && existing[conflicts[0]].values == values;
+                if unchanged {
+                    affected += 1;
+                    continue;
+                }
+                for idx in conflicts.into_iter().rev() {
+                    let row = existing.remove(idx);
+                    crate::delete::apply_row_delete(txn, info, &row)?;
+                    affected += 1;
+                }
+                let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
+                existing.push(crate::table_reader::ScannedRow {
+                    handle,
+                    physical_id,
+                    values,
+                });
+                affected += 1;
+            }
+            Ok(())
+        })?;
+        crate::internal::note_dml_affected(affected);
+        if batched {
+            crate::internal::set_dml_info(records_info(source, duplicates));
+        }
+        Ok(())
+    }
 }
 
 impl Executor for InsertExec {
@@ -58,6 +121,7 @@ impl Executor for InsertExec {
                 format!("Table '{schema}.{table}' doesn't exist"),
             )
         })?;
+        validate_insert_columns(info, &self.stmt.columns)?;
         let source_rows = if let Some(select) = &mut self.select {
             select.open()?;
             let mut rows = Vec::new();
@@ -77,8 +141,8 @@ impl Executor for InsertExec {
             self.stmt.rows.len()
         });
         if self.select.is_some() {
-            for row in &source_rows {
-                pending.push(map_insert_row(info, &self.stmt.columns, row)?);
+            for (i, row) in source_rows.iter().enumerate() {
+                pending.push(map_insert_row(info, &self.stmt.columns, row, i + 1)?);
             }
         } else {
             // VALUES may hold scalar/IN/EXISTS subqueries (`INSERT ... VALUES
@@ -89,12 +153,13 @@ impl Executor for InsertExec {
                 Arc::clone(&self.txn),
                 Some(table.clone()),
             );
-            for row in &self.stmt.rows {
+            for (i, row) in self.stmt.rows.iter().enumerate() {
                 pending.push(eval_insert_row(
                     info,
                     &self.stmt.columns,
                     row,
                     &mut subquery,
+                    i + 1,
                 )?);
             }
         }
@@ -109,20 +174,61 @@ impl Executor for InsertExec {
                 self.stmt.ignore,
             )?;
         }
+        let batched =
+            self.stmt.rows.len() > 1 || self.stmt.select.is_some() || self.stmt.select_set.is_some();
+        if self.stmt.replace {
+            return self.replace_rows(info, pending, batched);
+        }
         if self.stmt.on_duplicate.is_empty() {
             let ignore = self.stmt.ignore;
-            return self.txn.with_txn(|txn| {
+            // Unique secondary indexes need the same pre-write check TiDB does
+            // for every insert row (the KV layer only guards the PK handle).
+            let lock = crate::update::dml_row_lock(&self.txn)?;
+            let physical = sealdb_planner::core::prune_partitions(&info, None);
+            let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
+            let mut affected = 0u64;
+            let mut duplicates = 0u64;
+            self.txn.with_txn(|txn| {
                 for values in &pending {
+                    if let Some(idx) = existing
+                        .iter()
+                        .find_map(|row| index_conflict(info, &row.values, values))
+                    {
+                        let e = duplicate_error(info, idx, values);
+                        if ignore {
+                            duplicates += 1;
+                            sealdb_expression::note_warning(e.code, e.message);
+                            continue;
+                        }
+                        return Err(e);
+                    }
                     match write_row(txn, &self.domain, info, values) {
-                        Ok(_) => {}
+                        Ok((handle, physical_id)) => {
+                            existing.push(crate::table_reader::ScannedRow {
+                                handle,
+                                physical_id,
+                                values: values.clone(),
+                            });
+                            affected += 1;
+                        }
                         Err(e) if ignore && e.code == ERR_DUP_ENTRY => {
+                            duplicates += 1;
                             sealdb_expression::note_warning(e.code, e.message.clone());
+                        }
+                        // `INSERT IGNORE` past the last partition warns `1526`.
+                        Err(e) if ignore && e.code == ERR_NO_PARTITION_FOR_GIVEN_VALUE => {
+                            sealdb_expression::note_warning(e.code, e.message);
                         }
                         Err(e) => return Err(e),
                     }
                 }
                 Ok(())
-            });
+            })?;
+            crate::internal::note_dml_affected(affected);
+            if batched {
+                crate::internal::set_dml_info(records_info(pending.len() as u64, duplicates));
+            }
+            return Ok(());
         }
         // `ON DUPLICATE KEY UPDATE`: locate conflicts against a snapshot of the
         // table, then update the conflicting row instead of inserting.
@@ -189,11 +295,20 @@ impl Executor for InsertExec {
     }
 }
 
+/// MySQL OK-packet info for INSERT/REPLACE over a batched row source.
+fn records_info(records: u64, duplicates: u64) -> String {
+    format!(
+        "Records: {records}  Duplicates: {duplicates}  Warnings: {}",
+        sealdb_expression::warnings_len()
+    )
+}
+
 fn eval_insert_row(
     info: &sealdb_meta::TableInfo,
     columns: &[String],
     row: &[sealdb_parser::ast::ExprNode],
     subquery: &mut SubqueryEvalCtx,
+    row_no: usize,
 ) -> Result<Vec<Datum>> {
     let mut values = Vec::with_capacity(row.len());
     for (i, expr) in row.iter().enumerate() {
@@ -209,7 +324,7 @@ fn eval_insert_row(
         }
         values.push(subquery.eval(expr, &[], &[])?);
     }
-    map_insert_row(info, columns, &values)
+    map_insert_row(info, columns, &values, row_no)
 }
 
 /// Column at VALUES position `i`, honouring an explicit column list.
@@ -225,6 +340,40 @@ fn column_at<'a>(
     info.columns
         .iter()
         .find(|c| c.name.o().eq_ignore_ascii_case(name))
+}
+
+/// TiDB resolves the explicit column list before touching any row: unknown
+/// names are `1054` and a repeated target is `1110`.
+fn validate_insert_columns(info: &sealdb_meta::TableInfo, columns: &[String]) -> Result<()> {
+    for (i, name) in columns.iter().enumerate() {
+        if !info
+            .columns
+            .iter()
+            .any(|c| c.name.o().eq_ignore_ascii_case(name))
+        {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{name}' in 'field list'"),
+            ));
+        }
+        if columns[..i]
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(name))
+        {
+            return Err(Error::new(
+                ERR_FIELD_SPECIFIED_TWICE,
+                format!("Column '{name}' specified twice"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wrong_value_count_on_row(row_no: usize) -> Error {
+    Error::new(
+        ERR_WRONG_VALUE_COUNT_ON_ROW,
+        format!("Column count doesn't match value count at row {row_no}"),
+    )
 }
 
 /// Evaluate a column's `DEFAULT <expr>` (NULL when it has none).
@@ -249,13 +398,11 @@ fn map_insert_row(
     info: &sealdb_meta::TableInfo,
     columns: &[String],
     row: &[Datum],
+    row_no: usize,
 ) -> Result<Vec<Datum>> {
     if columns.is_empty() {
         if row.len() != info.columns.len() {
-            return Err(Error::new(
-                ERR_WRONG_VALUE_COUNT,
-                "Column count doesn't match value count",
-            ));
+            return Err(wrong_value_count_on_row(row_no));
         }
         // Cast literals to column FieldType (UNSIGNED BIGINT / DECIMAL scale).
         let mut values = Vec::with_capacity(info.columns.len());
@@ -266,10 +413,7 @@ fn map_insert_row(
         return Ok(values);
     }
     if row.len() != columns.len() {
-        return Err(Error::new(
-            ERR_WRONG_VALUE_COUNT,
-            "Column count doesn't match value count",
-        ));
+        return Err(wrong_value_count_on_row(row_no));
     }
     let mut values = Vec::with_capacity(info.columns.len());
     for col in &info.columns {
@@ -318,7 +462,14 @@ fn filter_target_partitions(
     }
     let mut kept = Vec::with_capacity(pending.len());
     for values in pending {
-        let target = locate_partition_for_row(info, &values)?;
+        let target = match locate_partition_for_row(info, &values) {
+            Ok(target) => target,
+            Err(e) if ignore && e.code == ERR_NO_PARTITION_FOR_GIVEN_VALUE => {
+                sealdb_expression::note_warning(e.code, e.message);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if targets.contains(&target) {
             kept.push(values);
         } else if ignore {
@@ -360,6 +511,27 @@ fn fill_auto_increment(
             let next = domain.next_auto_id(info.id)?;
             values[idx] = cast_for_column(&Datum::I64(next), col)?;
         } else if let Some(v) = numeric_form(&current) {
+            domain.bump_auto_id(info.id, v as i64)?;
+        }
+    }
+    Ok(())
+}
+
+/// `UPDATE` with an explicit `AUTO_INCREMENT` value raises the allocator so the
+/// id is never handed out again (TiDB `allocAutoRandomID` semantics).
+pub(crate) fn bump_auto_increment(
+    domain: &sealdb_domain::Domain,
+    info: &sealdb_meta::TableInfo,
+    values: &[Datum],
+) -> Result<()> {
+    for col in &info.columns {
+        if !col.auto_increment {
+            continue;
+        }
+        if let Some(current) = values.get(col.offset as usize)
+            && let Some(v) = numeric_form(current)
+            && v > 0.0
+        {
             domain.bump_auto_id(info.id, v as i64)?;
         }
     }
@@ -619,7 +791,7 @@ fn write_row(
 
 /// Index columns equal on every column (NULL never conflicts). Returns the
 /// first conflicting unique index, if any.
-fn index_conflict(
+pub(crate) fn index_conflict(
     info: &sealdb_meta::TableInfo,
     a: &[Datum],
     b: &[Datum],
@@ -661,7 +833,7 @@ fn find_conflict(
     })
 }
 
-fn duplicate_error(info: &sealdb_meta::TableInfo, index_idx: usize, values: &[Datum]) -> Error {
+pub(crate) fn duplicate_error(info: &sealdb_meta::TableInfo, index_idx: usize, values: &[Datum]) -> Error {
     let index = &info.indices[index_idx];
     let value = index
         .columns

@@ -491,7 +491,10 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
             let vals = def
                 .in_values
                 .iter()
-                .map(|v| v.to_string())
+                .map(|v| match v {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             format!("VALUES IN ({vals})")

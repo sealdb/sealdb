@@ -198,18 +198,27 @@ impl ExecutorBuilder {
                     Statement::Insert(s) => s.clone(),
                     _ => return Err(Error::unsupported("insert without insert statement")),
                 };
-                let select = insert
-                    .select
-                    .as_ref()
-                    .map(|select| {
-                        Self::build_select_arm(
-                            select,
-                            Arc::clone(&domain),
-                            current_db,
-                            Arc::clone(&txn),
-                        )
-                    })
-                    .transpose()?;
+                let select = if let Some(set) = insert.select_set.as_ref() {
+                    Some(Self::build_set_opr_arm(
+                        set,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?)
+                } else {
+                    insert
+                        .select
+                        .as_ref()
+                        .map(|select| {
+                            Self::build_select_arm(
+                                select,
+                                Arc::clone(&domain),
+                                current_db,
+                                Arc::clone(&txn),
+                            )
+                        })
+                        .transpose()?
+                };
                 Ok(Box::new(InsertExec::new(
                     domain,
                     insert,
@@ -914,6 +923,24 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
         ))
     }
 
+    fn build_set_opr_arm(
+        set: &sealdb_parser::ast::SetOprStmt,
+        domain: Arc<Domain>,
+        current_db: &str,
+        txn: Arc<TxnHandle>,
+    ) -> Result<Box<dyn Executor>> {
+        let stmt = Statement::SetOpr(set.clone());
+        let stats = domain.stats();
+        let plan = PlanBuilder::new().build_with_schema(
+            &stmt,
+            Some(&domain.infoschema()),
+            current_db,
+            Some(stats.as_ref()),
+            sealdb_planner::PartitionPruneMode::Dynamic,
+        )?;
+        Self::build(&plan, &stmt, domain, current_db, txn)
+    }
+
     fn build_select_arm(
         select: &SelectStmt,
         domain: Arc<Domain>,
@@ -943,6 +970,7 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
 
     pub fn run(mut exec: Box<dyn Executor>) -> Result<QueryResult> {
         with_shared_ctes(|| {
+            crate::internal::reset_dml_summary();
             exec.open()?;
             // Join schemas may keep `alias.col` for ORDER BY/WHERE; TiDB SELECT *
             // result headers are bare (duplicates allowed). Only strip a real
@@ -1000,10 +1028,17 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
                 }
             }
             exec.close()?;
+            let dml = crate::internal::take_dml_summary();
+            let (affected_rows, info) = match &dml {
+                Some(summary) => (summary.affected_rows, summary.info.clone()),
+                None => (0, String::new()),
+            };
             Ok(QueryResult {
                 columns,
                 rows,
                 warnings: sealdb_expression::take_warnings(),
+                affected_rows,
+                info,
             })
         })
     }

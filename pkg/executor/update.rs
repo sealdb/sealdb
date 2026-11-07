@@ -10,7 +10,9 @@ use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_VIEW_CHECK_FAILED, Error, Result,
+    ERR_BAD_FIELD, ERR_BAD_NULL, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION, ERR_VIEW_CHECK_FAILED,
+    Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, eval_filter, locate_partition_for_row};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
@@ -57,8 +59,6 @@ impl Executor for UpdateExec {
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
         let col_names = col_names(&info);
         let lock = dml_row_lock(&self.txn)?;
-        let physical = sealdb_planner::core::prune_partitions(&info, self.stmt.selection.as_ref());
-        let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
         let filter = match &self.stmt.selection {
             Some(expr) => Some(pre_evaluate_dml_predicate(
                 expr,
@@ -68,14 +68,23 @@ impl Executor for UpdateExec {
             )?),
             None => None,
         };
+        // Prune on the pre-evaluated predicate: a raw scalar subquery cannot be
+        // reasoned about and would prune every partition away.
+        let mut physical = sealdb_planner::core::prune_partitions(&info, filter.as_ref());
+        let targets = resolve_partition_ids(&info, &self.stmt.table.partition_names)?;
+        if !targets.is_empty() {
+            physical.retain(|id| targets.contains(id));
+        }
+        let snapshot = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
+        enforce_truncating_comparisons(&info, filter.as_ref(), self.stmt.ignore)?;
         let mut matched = Vec::new();
-        for scanned in rows {
+        for scanned in &snapshot {
             if let Some(filter) = &filter
                 && !eval_filter(filter, &col_names, &scanned.values)?
             {
                 continue;
             }
-            matched.push(scanned);
+            matched.push(scanned.clone());
         }
         sort_rows_by(&mut matched, &self.stmt.order_by, &col_names, |row| {
             &row.values
@@ -83,35 +92,72 @@ impl Executor for UpdateExec {
         if let Some(limit) = self.stmt.limit {
             matched.truncate(limit as usize);
         }
+        let matched_count = matched.len() as u64;
+        // Compute every row's new values first, so uniqueness / partition
+        // errors abort the statement before any write (TiDB statement atomicity).
+        let mut plans: Vec<(crate::table_reader::ScannedRow, Vec<Datum>)> =
+            Vec::with_capacity(matched.len());
+        for scanned in matched {
+            let mut new_values = scanned.values.clone();
+            apply_assignments(
+                &self.stmt.list,
+                &col_names,
+                &scanned.values,
+                col_names.len(),
+                Some(&mut new_values),
+                None,
+            )?;
+            crate::insert::fill_generated_columns(&info, &mut new_values)?;
+            reject_null_not_null(&info, &new_values)?;
+            crate::insert::bump_auto_increment(&self.domain, &info, &new_values)?;
+            if let Some(check) = &self.stmt.check_option_where
+                && !eval_filter(check, &col_names, &new_values)?
+            {
+                let view = self
+                    .stmt
+                    .check_option_view
+                    .clone()
+                    .unwrap_or_else(|| self.stmt.table.name.clone());
+                return Err(Error::new(
+                    ERR_VIEW_CHECK_FAILED,
+                    format!("CHECK OPTION failed '{view}'"),
+                ));
+            }
+            plans.push((scanned, new_values));
+        }
+        // Duplicate keys surface before "no partition for value" just as TiDB's
+        // row-by-row apply does for the rows it has already written.
+        let validation_snapshot = if info.indices.iter().any(|idx| idx.unique)
+            && physical.len() < info.physical_ids().len()
+        {
+            scan_table(&self.txn, &info, lock, LockWait::Block, &info.physical_ids())?
+        } else {
+            snapshot.clone()
+        };
+        let mut keep =
+            validate_update_uniqueness(&info, &validation_snapshot, &plans, self.stmt.ignore)?;
+        for (i, (_, new_values)) in plans.iter().enumerate() {
+            if keep[i] {
+                keep[i] =
+                    check_partition_target(&info, new_values, &targets, self.stmt.ignore)?;
+            }
+        }
+        let mut changed = 0u64;
         self.txn.with_txn(|txn| {
-            for scanned in matched {
-                let mut new_values = scanned.values.clone();
-                apply_assignments(
-                    &self.stmt.list,
-                    &col_names,
-                    &scanned.values,
-                    col_names.len(),
-                    Some(&mut new_values),
-                    None,
-                )?;
-                crate::insert::fill_generated_columns(&info, &mut new_values)?;
-                if let Some(check) = &self.stmt.check_option_where
-                    && !eval_filter(check, &col_names, &new_values)?
-                {
-                    let view = self
-                        .stmt
-                        .check_option_view
-                        .clone()
-                        .unwrap_or_else(|| self.stmt.table.name.clone());
-                    return Err(Error::new(
-                        ERR_VIEW_CHECK_FAILED,
-                        format!("CHECK OPTION failed '{view}'"),
-                    ));
+            for ((scanned, new_values), keep) in plans.into_iter().zip(keep) {
+                if keep && new_values != scanned.values {
+                    apply_row_update(txn, &info, &scanned, new_values)?;
+                    changed += 1;
                 }
-                apply_row_update(txn, &info, &scanned, new_values)?;
             }
             Ok(())
-        })
+        })?;
+        crate::internal::note_dml_affected(changed);
+        crate::internal::set_dml_info(format!(
+            "Rows matched: {matched_count}  Changed: {changed}  Warnings: {}",
+            sealdb_expression::warnings_len()
+        ));
+        Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
@@ -396,6 +442,267 @@ fn column_matches(schema_name: &str, table: Option<&str>, column: &str) -> bool 
         }
         None => name_ok,
     }
+}
+
+/// `NOT NULL` columns reject an explicit NULL assignment (`1048`).
+fn reject_null_not_null(info: &sealdb_meta::TableInfo, values: &[Datum]) -> Result<()> {
+    for (col, value) in info.columns.iter().zip(values.iter()) {
+        if value.is_null()
+            && col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
+        {
+            return Err(Error::new(
+                ERR_BAD_NULL,
+                format!("Column '{}' cannot be null", col.name.o()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `tbl PARTITION (p1, p2)` names to physical ids (empty = all).
+pub(crate) fn resolve_partition_ids(
+    info: &TableInfo,
+    names: &[String],
+) -> Result<Vec<i64>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(part) = info.partition.as_ref() else {
+        return Err(Error::new(
+            ERR_UNKNOWN_PARTITION,
+            format!("Unknown partition '{}' in table '{}'", names[0], info.name.o()),
+        ));
+    };
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let found = part
+            .definitions
+            .iter()
+            .find(|def| def.name.o().eq_ignore_ascii_case(name))
+            .map(|def| def.id);
+        let Some(id) = found else {
+            return Err(Error::new(
+                ERR_UNKNOWN_PARTITION,
+                format!("Unknown partition '{name}' in table '{}'", info.name.o()),
+            ));
+        };
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Enforce `PARTITION (…)` targeting and partition-routing failures for the
+/// post-update row: `UPDATE IGNORE` warns and skips (`1526` / `1748`).
+fn check_partition_target(
+    info: &TableInfo,
+    new_values: &[Datum],
+    targets: &[i64],
+    ignore: bool,
+) -> Result<bool> {
+    let located = locate_partition_for_row(info, new_values);
+    let target = match located {
+        Ok(id) => id,
+        Err(e) if ignore && e.code == ERR_NO_PARTITION_FOR_GIVEN_VALUE => {
+            sealdb_expression::note_warning(e.code, e.message);
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if targets.is_empty() || targets.contains(&target) {
+        return Ok(true);
+    }
+    if ignore {
+        sealdb_expression::note_warning(
+            ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+            "Found a row not matching the given partition set".to_string(),
+        );
+        return Ok(false);
+    }
+    Err(Error::new(
+        ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+        "Found a row not matching the given partition set",
+    ))
+}
+
+/// Reject an UPDATE that would collide with a unique index: compare every
+/// planned new row against the other rows (final state, so intra-statement
+/// swaps are allowed only when no two rows end up equal).
+fn validate_update_uniqueness(
+    info: &TableInfo,
+    snapshot: &[ScannedRow],
+    plans: &[(ScannedRow, Vec<Datum>)],
+    ignore: bool,
+) -> Result<Vec<bool>> {
+    // `keep[i]` is false for rows skipped by `UPDATE IGNORE`.
+    let mut keep = vec![true; plans.len()];
+    for i in 0..plans.len() {
+        if !keep[i] {
+            continue;
+        }
+        let new_values = &plans[i].1;
+        for j in (i + 1)..plans.len() {
+            if !keep[j] {
+                continue;
+            }
+            if let Some(idx) = crate::insert::index_conflict(info, new_values, &plans[j].1) {
+                if ignore {
+                    sealdb_expression::note_warning(
+                        crate::insert::duplicate_error(info, idx, &plans[j].1).code,
+                        crate::insert::duplicate_error(info, idx, &plans[j].1).message,
+                    );
+                    keep[j] = false;
+                } else {
+                    return Err(crate::insert::duplicate_error(info, idx, new_values));
+                }
+            }
+        }
+        for existing in snapshot {
+            let same_row = existing.handle == plans[i].0.handle
+                && existing.physical_id == plans[i].0.physical_id;
+            let also_updated = plans.iter().any(|(p, _)| {
+                p.handle == existing.handle && p.physical_id == existing.physical_id
+            });
+            if same_row || also_updated {
+                continue;
+            }
+            if let Some(idx) = crate::insert::index_conflict(info, &existing.values, new_values) {
+                if ignore {
+                    let err = crate::insert::duplicate_error(info, idx, new_values);
+                    sealdb_expression::note_warning(err.code, err.message);
+                    keep[i] = false;
+                    break;
+                }
+                return Err(crate::insert::duplicate_error(info, idx, new_values));
+            }
+        }
+    }
+    Ok(keep)
+}
+
+/// TiDB rejects a numeric predicate constant with trailing garbage (`'2a'`) in
+/// strict DML (`1292`); under `IGNORE` it warns (once per conversion).
+pub(crate) fn enforce_truncating_comparisons(
+    info: &TableInfo,
+    filter: Option<&sealdb_parser::ast::ExprNode>,
+    ignore: bool,
+) -> Result<()> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    let mut messages = Vec::new();
+    collect_truncating(info, filter, &mut messages);
+    for message in messages {
+        if ignore {
+            sealdb_expression::note_warning(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                message.clone(),
+            );
+            sealdb_expression::note_warning(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, message);
+        } else {
+            return Err(Error::new(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, message));
+        }
+    }
+    Ok(())
+}
+
+fn collect_truncating(
+    info: &TableInfo,
+    expr: &sealdb_parser::ast::ExprNode,
+    out: &mut Vec<String>,
+) {
+    use sealdb_parser::ast::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Binary(bin) => {
+            if matches!(
+                bin.op,
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::NullSafeEq
+            ) {
+                if let Some(message) = truncating_pair(info, &bin.left, &bin.right) {
+                    out.push(message);
+                }
+            }
+            collect_truncating(info, &bin.left, out);
+            collect_truncating(info, &bin.right, out);
+        }
+        ExprNode::Unary(unary) => collect_truncating(info, &unary.expr, out),
+        ExprNode::Func(func) => {
+            for arg in &func.args {
+                collect_truncating(info, arg, out);
+            }
+        }
+        ExprNode::Cast(cast) => collect_truncating(info, &cast.expr, out),
+        ExprNode::InList(list) => {
+            for item in &list.list {
+                collect_truncating(info, item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncating_pair(
+    info: &TableInfo,
+    left: &sealdb_parser::ast::ExprNode,
+    right: &sealdb_parser::ast::ExprNode,
+) -> Option<String> {
+    use sealdb_parser::ast::ExprNode;
+    let string_of = |expr: &ExprNode| match expr {
+        ExprNode::Value(v) => match &v.datum {
+            Datum::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let is_numeric_column = |expr: &ExprNode| match expr {
+        ExprNode::Column(c) => info
+            .columns
+            .iter()
+            .find(|col| col.name.o().eq_ignore_ascii_case(&c.name))
+            .is_some_and(|col| {
+                matches!(
+                    col.field_type.eval_type(),
+                    sealdb_types::field_type::EvalType::Int
+                        | sealdb_types::field_type::EvalType::Real
+                )
+            }),
+        _ => false,
+    };
+    let (string, column_side) = if is_numeric_column(left) {
+        (string_of(right)?, true)
+    } else if is_numeric_column(right) {
+        (string_of(left)?, true)
+    } else {
+        return None;
+    };
+    if !column_side || !has_truncating_numeric_prefix(&string) {
+        return None;
+    }
+    Some(format!("Truncated incorrect DOUBLE value: '{string}'"))
+}
+
+/// True when the text starts with a number but continues with non-numeric junk.
+fn has_truncating_numeric_prefix(text: &str) -> bool {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return false;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    i < bytes.len()
 }
 
 /// Rewrite one row: drop old index keys, delete the old record if the handle or

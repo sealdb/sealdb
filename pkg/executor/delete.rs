@@ -70,8 +70,6 @@ impl Executor for DeleteExec {
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
         let names = col_names(&info);
         let lock = dml_row_lock(&self.txn)?;
-        let physical = sealdb_planner::core::prune_partitions(&info, self.stmt.selection.as_ref());
-        let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
         let filter = match &self.stmt.selection {
             Some(expr) => Some(pre_evaluate_dml_predicate(
                 expr,
@@ -81,6 +79,15 @@ impl Executor for DeleteExec {
             )?),
             None => None,
         };
+        // Prune on the pre-evaluated predicate: a raw scalar subquery cannot be
+        // reasoned about and would prune every partition away.
+        let mut physical = sealdb_planner::core::prune_partitions(&info, filter.as_ref());
+        let targets = crate::update::resolve_partition_ids(&info, &self.stmt.table.partition_names)?;
+        if !targets.is_empty() {
+            physical.retain(|id| targets.contains(id));
+        }
+        let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
+        crate::update::enforce_truncating_comparisons(&info, filter.as_ref(), self.stmt.ignore)?;
         let mut matched = Vec::new();
         for scanned in rows {
             if let Some(filter) = &filter
@@ -94,12 +101,16 @@ impl Executor for DeleteExec {
         if let Some(limit) = self.stmt.limit {
             matched.truncate(limit as usize);
         }
+        let mut affected = 0u64;
         self.txn.with_txn(|txn| {
             for scanned in matched {
                 apply_row_delete(txn, &info, &scanned)?;
+                affected += 1;
             }
             Ok(())
-        })
+        })?;
+        crate::internal::note_dml_affected(affected);
+        Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
@@ -228,7 +239,7 @@ fn concat_optional(
 }
 
 /// Drop index keys then the row record for one scanned handle.
-fn apply_row_delete(
+pub(crate) fn apply_row_delete(
     txn: &mut dyn Transaction,
     info: &TableInfo,
     scanned: &ScannedRow,
