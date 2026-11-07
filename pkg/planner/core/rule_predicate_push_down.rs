@@ -58,6 +58,8 @@ fn push_into(
                     table,
                     handle: Some(handle),
                     index: None,
+                    index_columns: Vec::new(),
+                    partition_names,
                 };
             }
             wrap_residual(
@@ -154,16 +156,31 @@ fn push_into(
             table,
             handle,
             index,
+            index_columns,
+            partition_names,
         } => {
             let residual = conjuncts
                 .into_iter()
-                .filter(|expr| handle.is_none_or(|value| !is_handle_eq(expr, value)))
+                .filter(|expr| {
+                    // The unique-index equality is already the point get lookup.
+                    if index.is_some()
+                        && let Some((col, _)) = expr.eq_column_const()
+                        && index_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&col))
+                    {
+                        return false;
+                    }
+                    handle.is_none_or(|value| !is_handle_eq(expr, value))
+                })
                 .collect();
             wrap_residual(
                 PhysicalPlan::PointGet {
                     table,
                     handle,
                     index,
+                    index_columns,
+                    partition_names,
                 },
                 residual,
             )
@@ -173,6 +190,7 @@ fn push_into(
             column,
             index,
             n_keys,
+            index_columns,
         } => {
             let residual = conjuncts
                 .into_iter()
@@ -184,6 +202,7 @@ fn push_into(
                     column,
                     index,
                     n_keys,
+                    index_columns,
                 },
                 residual,
             )

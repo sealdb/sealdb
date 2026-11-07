@@ -19,6 +19,8 @@ pub struct PointGetExec {
     handle: Option<i64>,
     index: Option<String>,
     lookup: Option<Datum>,
+    /// `FROM t PARTITION (pN)` restricts the lookup to those partitions.
+    partition_names: Vec<String>,
     current_db: String,
     txn: Arc<TxnHandle>,
     lock: RowLock,
@@ -36,6 +38,7 @@ impl PointGetExec {
         handle: Option<i64>,
         index: Option<String>,
         lookup: Option<Datum>,
+        partition_names: Vec<String>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         lock: RowLock,
@@ -47,6 +50,7 @@ impl PointGetExec {
             handle,
             index,
             lookup,
+            partition_names,
             current_db: current_db.into(),
             txn,
             lock,
@@ -76,6 +80,28 @@ impl Executor for PointGetExec {
             .iter()
             .map(|c| c.name.o().to_string())
             .collect();
+        // `PARTITION (pN)` narrows both the index-key scan and the row fetch.
+        let pinned: Vec<i64> = info
+            .partition
+            .as_ref()
+            .filter(|_| !self.partition_names.is_empty())
+            .map(|part| {
+                part.definitions
+                    .iter()
+                    .filter(|def| {
+                        self.partition_names
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(def.name.o()))
+                    })
+                    .map(|def| def.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scan_ids = if pinned.is_empty() {
+            info.physical_ids()
+        } else {
+            pinned.clone()
+        };
         let handle = if let Some(index_name) = &self.index {
             let index = info
                 .indices
@@ -88,7 +114,7 @@ impl Executor for PointGetExec {
                 .clone()
                 .ok_or_else(|| Error::unsupported("index point get without lookup"))?;
             self.txn.with_txn(|txn| {
-                for physical_id in info.physical_ids() {
+                for physical_id in scan_ids.iter().copied() {
                     let key = encode_index_key(
                         physical_id,
                         index.id,
@@ -110,7 +136,9 @@ impl Executor for PointGetExec {
             self.row = None;
             return Ok(());
         };
-        let physical_ids = if info.partition.as_ref().is_some_and(|p| {
+        let physical_ids = if !pinned.is_empty() {
+            pinned
+        } else if info.partition.as_ref().is_some_and(|p| {
             p.column()
                 .eq_ignore_ascii_case(info.columns.first().map(|c| c.name.o()).unwrap_or(""))
         }) {

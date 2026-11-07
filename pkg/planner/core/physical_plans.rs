@@ -66,12 +66,21 @@ pub enum PhysicalPlan {
         table: String,
         handle: Option<i64>,
         index: Option<String>,
+        /// Columns of the unique index serving the point get (`index:uidx(c)`).
+        #[serde(default)]
+        index_columns: Vec<String>,
+        /// `FROM t PARTITION (pN)` pins the lookup to those physical partitions.
+        #[serde(default)]
+        partition_names: Vec<String>,
     },
     BatchPointGet {
         table: String,
         column: String,
         index: Option<String>,
         n_keys: usize,
+        /// Columns of the unique index serving the batch point get.
+        #[serde(default)]
+        index_columns: Vec<String>,
     },
     IndexLookUpReader {
         table: String,
@@ -377,6 +386,7 @@ impl PhysicalPlan {
                 table,
                 handle: Some(handle),
                 index: None,
+                ..
             } => format!("PointGet_{table}_{handle}"),
             PhysicalPlan::PointGet {
                 table,

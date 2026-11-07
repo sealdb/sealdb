@@ -313,6 +313,8 @@ impl ExecutorBuilder {
                 table,
                 handle,
                 index,
+                partition_names,
+                ..
             } => {
                 let select = stmt
                     .as_select()
@@ -348,6 +350,7 @@ impl ExecutorBuilder {
                     handle,
                     index.clone(),
                     lookup,
+                    partition_names.clone(),
                     current_db.to_string(),
                     txn,
                     select_row_lock(select),

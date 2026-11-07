@@ -4041,7 +4041,7 @@ fn in_list_plan(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if let Some(first) = info.columns.first() {
+    if info.pk_is_handle && let Some(first) = info.columns.first() {
         for (column, values) in &lists {
             if !first.name.o().eq_ignore_ascii_case(column) {
                 continue;
@@ -4061,19 +4061,23 @@ fn in_list_plan(
                 from,
                 column.clone(),
                 None,
+                Vec::new(),
                 handles.into_iter().map(Datum::I64).collect(),
             ));
         }
     }
     for (column, values) in lists {
-        if let Some(index) = info.find_index_covering(&column)
-            && index.unique
-            && index.columns.len() == 1
-        {
+        if let Some(index) = info.find_unique_index_on(&column) {
+            let index_columns = index
+                .columns
+                .iter()
+                .map(|c| c.name.o().to_string())
+                .collect();
             return Some(point_or_batch(
                 from,
                 column,
                 Some(index.name.o().to_string()),
+                index_columns,
                 values,
             ));
         }
@@ -4085,8 +4089,10 @@ fn point_or_batch(
     from: &TableName,
     column: String,
     index: Option<String>,
+    index_columns: Vec<String>,
     values: Vec<Datum>,
 ) -> PhysicalPlan {
+    let partition_names = from.partition_names.clone();
     if let [value] = values.as_slice() {
         let handle = match (&index, value) {
             (None, Datum::I64(handle)) => Some(*handle),
@@ -4096,6 +4102,8 @@ fn point_or_batch(
             table: from.name.clone(),
             handle,
             index,
+            index_columns,
+            partition_names,
         };
     }
     PhysicalPlan::BatchPointGet {
@@ -4103,6 +4111,7 @@ fn point_or_batch(
         column,
         index,
         n_keys: values.len(),
+        index_columns,
     }
 }
 
@@ -7105,13 +7114,19 @@ fn access_plan(
                 table: from.name.clone(),
                 handle: Some(handle),
                 index: None,
+                index_columns: Vec::new(),
+                partition_names: from.partition_names.clone(),
             };
         }
         if let Some(plan) = in_list_plan(select, from, info) {
             return plan;
         }
         for (column, value) in &eqs {
-            if let Some(index) = info.find_index_covering(column) {
+            // TiDB prefers the unique index on the column for a point get over
+            // a composite index that merely shares its leading column.
+            let covering = info.find_index_covering(column);
+            let preferred = info.find_unique_index_on(column).or(covering);
+            if let Some(index) = preferred {
                 // PointGet needs every column of a unique key constrained; a
                 // composite-key prefix is an index range, not a single row.
                 if index.unique && index.columns.len() == 1 {
@@ -7119,6 +7134,12 @@ fn access_plan(
                         table: from.name.clone(),
                         handle: None,
                         index: Some(index.name.o().to_string()),
+                        index_columns: index
+                            .columns
+                            .iter()
+                            .map(|c| c.name.o().to_string())
+                            .collect(),
+                        partition_names: from.partition_names.clone(),
                     };
                 }
                 // unanalyzed tables keep the index path.

@@ -188,6 +188,15 @@ impl TableInfo {
             .find(|idx| idx.columns.first().is_some_and(|col| col.name.l() == name))
     }
 
+    /// Unique index whose only column is `column` — the point-get access path
+    /// TiDB prefers over a composite index sharing that leading column.
+    pub fn find_unique_index_on(&self, column: &str) -> Option<&IndexInfo> {
+        let name = column.to_ascii_lowercase();
+        self.indices.iter().find(|idx| {
+            idx.unique && idx.columns.len() == 1 && idx.columns[0].name.l() == name
+        })
+    }
+
     /// `(col_id, FieldType)` pairs for v128 row decode (no type tags in the data).
     pub fn col_field_types(&self) -> Vec<(i64, FieldType)> {
         self.columns

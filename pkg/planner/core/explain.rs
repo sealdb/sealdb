@@ -2298,6 +2298,15 @@ fn render_access(access: String) -> String {
     }
 }
 
+/// `table:pt, index:uidx(c)` — TiDB prints a point-get index with its columns.
+fn point_get_index_access(table: &str, index: &str, columns: &[String]) -> String {
+    if columns.is_empty() {
+        format!("table:{table}, index:{index}")
+    } else {
+        format!("table:{table}, index:{index}({})", columns.join(", "))
+    }
+}
+
 fn table_access(table: &str, partition_names: &[String]) -> String {
     if partition_names.is_empty() {
         format!("table:{table}")
@@ -2993,6 +3002,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             table,
             handle: Some(handle),
             index: None,
+            ..
         } => (
             // TiDB EXPLAIN id is `Point_Get` (underscore before Get).
             "Point_Get".to_string(),
@@ -3002,10 +3012,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::PointGet {
             table,
             index: Some(index),
+            index_columns,
             ..
         } => (
             "Point_Get".to_string(),
-            format!("table:{table}, index:{index}"),
+            point_get_index_access(table, index, index_columns),
             String::new(),
         ),
         PhysicalPlan::PointGet { table, .. } => (
@@ -3016,17 +3027,17 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::BatchPointGet {
             table,
             index: Some(index),
-            n_keys,
+            index_columns,
             ..
         } => (
-            "BatchPointGet".to_string(),
-            format!("table:{table}, index:{index}"),
-            format!("keys:{n_keys}"),
+            "Batch_Point_Get".to_string(),
+            point_get_index_access(table, index, index_columns),
+            "keep order:false, desc:false".to_string(),
         ),
-        PhysicalPlan::BatchPointGet { table, n_keys, .. } => (
-            "BatchPointGet".to_string(),
+        PhysicalPlan::BatchPointGet { table, .. } => (
+            "Batch_Point_Get".to_string(),
             format!("table:{table}"),
-            format!("keys:{n_keys}"),
+            "keep order:false, desc:false".to_string(),
         ),
         PhysicalPlan::IndexLookUpReader {
             partition_access, ..
