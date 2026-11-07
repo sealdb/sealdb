@@ -6,6 +6,7 @@ pub mod mydecimal;
 pub mod time;
 
 pub use datum::Datum;
+pub use datum::EnumValue;
 pub use field_type::{
     EvalType, FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DECIMAL, TYPE_DOUBLE,
     TYPE_DURATION, TYPE_FLOAT, TYPE_INT24, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG,

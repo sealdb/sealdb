@@ -4,13 +4,16 @@ use crate::internal::exec::Executor;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WRONG_VALUE_COUNT, Error, Result,
+    ERR_DUP_ENTRY, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT,
+    Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
+use sealdb_types::field_type::{FieldType, TYPE_BIT, TYPE_ENUM, TYPE_SET};
+use sealdb_types::EnumValue;
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
@@ -95,6 +98,9 @@ impl Executor for InsertExec {
                 )?);
             }
         }
+        for values in &mut pending {
+            fill_auto_increment(&self.domain, info, values)?;
+        }
         if self.stmt.on_duplicate.is_empty() {
             return self.txn.with_txn(|txn| {
                 for values in &pending {
@@ -175,16 +181,45 @@ fn eval_insert_row(
     subquery: &mut SubqueryEvalCtx,
 ) -> Result<Vec<Datum>> {
     let mut values = Vec::with_capacity(row.len());
-    for expr in row {
-        // `DEFAULT` in VALUES: a generated column recomputes it below; other
-        // columns fall back to NULL until column defaults land.
+    for (i, expr) in row.iter().enumerate() {
+        // `DEFAULT` in VALUES: use the column default (NULL when none). A
+        // generated column recomputes its value below.
         if is_default_keyword(expr) {
-            values.push(Datum::Null);
+            let value = match column_at(info, columns, i) {
+                Some(col) => column_default_value(col)?,
+                None => Datum::Null,
+            };
+            values.push(value);
             continue;
         }
         values.push(subquery.eval(expr, &[], &[])?);
     }
     map_insert_row(info, columns, &values)
+}
+
+/// Column at VALUES position `i`, honouring an explicit column list.
+fn column_at<'a>(
+    info: &'a sealdb_meta::TableInfo,
+    columns: &[String],
+    i: usize,
+) -> Option<&'a sealdb_meta::ColumnInfo> {
+    if columns.is_empty() {
+        return info.columns.get(i);
+    }
+    let name = columns.get(i)?;
+    info.columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(name))
+}
+
+/// Evaluate a column's `DEFAULT <expr>` (NULL when it has none).
+fn column_default_value(col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    let Some(text) = col.default_expr.as_deref() else {
+        return Ok(Datum::Null);
+    };
+    let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+    let value = eval_expr_with_row(&expr, &[], &[])?;
+    cast_for_column(&value, col)
 }
 
 fn is_default_keyword(expr: &sealdb_parser::ast::ExprNode) -> bool {
@@ -229,11 +264,41 @@ fn map_insert_row(
         {
             values.push(cast_for_column(&row[idx], col)?);
         } else {
-            values.push(Datum::Null);
+            values.push(column_default_value(col)?);
         }
     }
     fill_generated_columns(info, &mut values)?;
     Ok(values)
+}
+
+/// Assign `AUTO_INCREMENT` values (TiDB `allocAutoRandomID` / auto-id
+/// fallback): `NULL`, `DEFAULT` and the literal `0` request a new id; an
+/// explicit non-zero value raises the allocator so it is never reused.
+fn fill_auto_increment(
+    domain: &sealdb_domain::Domain,
+    info: &sealdb_meta::TableInfo,
+    values: &mut [Datum],
+) -> Result<()> {
+    for col in &info.columns {
+        if !col.auto_increment {
+            continue;
+        }
+        let idx = col.offset as usize;
+        let Some(current) = values.get(idx).cloned() else {
+            continue;
+        };
+        let needs_alloc = match &current {
+            Datum::Null => true,
+            _ => numeric_form(&current).is_some_and(|v| v == 0.0),
+        };
+        if needs_alloc {
+            let next = domain.next_auto_id(info.id)?;
+            values[idx] = cast_for_column(&Datum::I64(next), col)?;
+        } else if let Some(v) = numeric_form(&current) {
+            domain.bump_auto_id(info.id, v as i64)?;
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate `GENERATED ALWAYS AS (expr)` columns in ascending offset order so a
@@ -263,7 +328,30 @@ pub(crate) fn fill_generated_columns(info: &sealdb_meta::TableInfo, values: &mut
 }
 
 fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    if matches!(
+        col.field_type.tp,
+        TYPE_ENUM | TYPE_SET
+    ) {
+        return cast_enum_set(v, &col.field_type, col.name.o());
+    }
     let mut out = v.cast(&col.field_type)?;
+    // TIMESTAMP columns store UTC; session wall clock → UTC on write.
+    if col.field_type.tp == TYPE_BIT {
+        // BIT(n) stores the low n bits of the numeric value (MySQL truncates).
+        let n = col.field_type.flen.max(1) as u32;
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let bits = match &out {
+            Datum::U64(v) => *v,
+            Datum::I64(v) => *v as u64,
+            Datum::F64(v) => *v as u64,
+            Datum::Decimal(d) => d.to_f64()? as u64,
+            Datum::Bytes(b) => String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0),
+            Datum::Time(t) => t.to_packed_u64(),
+            Datum::Enum(e) => e.number,
+            Datum::Null => return Ok(Datum::Null),
+        };
+        return Ok(Datum::U64(bits & mask));
+    }
     // TIMESTAMP columns store UTC; session wall clock → UTC on write.
     if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
         && let Datum::Time(t) = out
@@ -275,6 +363,151 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
         out = Datum::Time(t);
     }
     Ok(out)
+}
+
+/// TiDB `sql_mode` strictness for DML value coercion.
+fn strict_sql_mode() -> bool {
+    sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+        || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES")
+}
+
+/// MySQL treats numbers (and numeric strings) as ENUM/SET indexes.
+fn numeric_form(v: &Datum) -> Option<f64> {
+    match v {
+        Datum::I64(i) => Some(*i as f64),
+        Datum::U64(u) => Some(*u as f64),
+        Datum::F64(f) => Some(*f),
+        Datum::Decimal(d) => d.to_f64().ok(),
+        Datum::Bytes(b) => {
+            let s = std::str::from_utf8(b).ok()?.trim();
+            if s.is_empty() {
+                return None;
+            }
+            s.parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}
+
+fn label_index(elems: &[String], s: &str) -> Option<usize> {
+    elems
+        .iter()
+        .position(|e| e == s)
+        .or_else(|| elems.iter().position(|e| e.eq_ignore_ascii_case(s)))
+}
+
+/// ENUM/SET value coercion (`insert.go` `getColDefaultValue` /
+/// `FieldType.HandleWrongValue`): numeric → index, label → member, invalid →
+/// `''` with a warning (strict mode errors).
+fn cast_enum_set(v: &Datum, ft: &FieldType, col: &str) -> Result<Datum> {
+    if v.is_null() {
+        return Ok(Datum::Null);
+    }
+    let elems = ft.elems.as_deref().unwrap_or(&[]);
+    if ft.tp == TYPE_ENUM {
+        // A string literal that matches a member is that member (`b = '4'`
+        // picks the label `4`, not index 4); numeric values and unmatched
+        // numeric strings are indexes.
+        if let Datum::Bytes(_) = v {
+            let s = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+            if s.is_empty() {
+                return Ok(Datum::Enum(EnumValue::new(Vec::new(), 0)));
+            }
+            if let Some(i) = label_index(elems, &s) {
+                return Ok(Datum::Enum(EnumValue::new(
+                    elems[i].clone().into_bytes(),
+                    i as u64 + 1,
+                )));
+            }
+        }
+        if let Some(n) = numeric_form(v) {
+            let idx = n.round() as i64;
+            if idx >= 1 && (idx as usize) <= elems.len() {
+                return Ok(Datum::Enum(EnumValue::new(
+                    elems[idx as usize - 1].clone().into_bytes(),
+                    idx as u64,
+                )));
+            }
+            return invalid_enum_set_value(v, col, Datum::Enum(EnumValue::new(Vec::new(), 0)));
+        }
+        let s = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+        if s.is_empty() {
+            return Ok(Datum::Enum(EnumValue::new(Vec::new(), 0)));
+        }
+        return invalid_enum_set_value(v, col, Datum::Enum(EnumValue::new(Vec::new(), 0)));
+    }
+
+    // SET: numeric value is the bitmask; strings are comma-separated members.
+    let mut bits: u64 = 0;
+    if !matches!(v, Datum::Bytes(_))
+        && let Some(n) = numeric_form(v)
+    {
+        bits = if n <= 0.0 { 0 } else { n.round() as u64 };
+    } else {
+        let s = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+        if s.is_empty() {
+            return Ok(Datum::Enum(EnumValue::new(Vec::new(), 0)));
+        }
+        for part in s.split(',') {
+            match label_index(elems, part) {
+                Some(i) if i < 64 => bits |= 1u64 << i,
+                _ => {
+                    // MySQL drops unknown members with a truncation warning.
+                    if strict_sql_mode() {
+                        return Err(truncated_error(v, col));
+                    }
+                    sealdb_expression::note_warning(
+                        ERR_WARN_DATA_TRUNCATED,
+                        format!("Data truncated for column '{col}' at row 1"),
+                    );
+                }
+            }
+        }
+    }
+    let valid_bits = if elems.len() >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << elems.len()) - 1
+    };
+    if bits & !valid_bits != 0 {
+        if strict_sql_mode() {
+            return Err(truncated_error(v, col));
+        }
+        sealdb_expression::note_warning(
+            ERR_WARN_DATA_TRUNCATED,
+            format!("Data truncated for column '{col}' at row 1"),
+        );
+        bits &= valid_bits;
+    }
+    let mut labels: Vec<&str> = Vec::new();
+    for (i, e) in elems.iter().enumerate() {
+        if bits & (1u64 << i) != 0 {
+            labels.push(e.as_str());
+        }
+    }
+    Ok(Datum::Enum(EnumValue::new(
+        labels.join(",").into_bytes(),
+        bits,
+    )))
+}
+
+fn truncated_error(v: &Datum, col: &str) -> Error {
+    let raw = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+    Error::new(
+        ERR_WARN_DATA_TRUNCATED,
+        format!("Data truncated for column '{col}' at row 1 (value '{raw}')"),
+    )
+}
+
+fn invalid_enum_set_value(v: &Datum, col: &str, fallback: Datum) -> Result<Datum> {
+    if strict_sql_mode() {
+        return Err(truncated_error(v, col));
+    }
+    sealdb_expression::note_warning(
+        ERR_WARN_DATA_TRUNCATED,
+        format!("Data truncated for column '{col}' at row 1"),
+    );
+    Ok(fallback)
 }
 
 fn write_row(

@@ -66,6 +66,22 @@ impl Time {
         ((ymd << 17) | hms) << 24 | u64::from(self.micro)
     }
 
+    /// MySQL numeric value: `YYYYMMDD` for DATE, `YYYYMMDDHHMMSS` for the
+    /// temporal types (TiDB `Time.ToNumber`).
+    pub fn to_number(self) -> i64 {
+        let ymd =
+            i64::from(self.year) * 10_000 + i64::from(self.month) * 100 + i64::from(self.day);
+        match self.tp {
+            TimeType::Date => ymd,
+            _ => {
+                ymd * 1_000_000
+                    + i64::from(self.hour) * 10_000
+                    + i64::from(self.minute) * 100
+                    + i64::from(self.second)
+            }
+        }
+    }
+
     pub fn from_packed_u64(v: u64) -> Self {
         let ymdhms = v >> 24;
         let ymd = ymdhms >> 17;
@@ -92,9 +108,147 @@ impl Time {
     }
 }
 
+/// TiDB `ParseTimeFromNum`: numeric DATE/DATETIME/TIME forms.
+/// `20240628` → date, `10102` → `01:01:02` for TIME, `20240628153000` →
+/// datetime. Returns `None` on out-of-range components.
+pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
+    if tp == TimeType::Time {
+        if n < 0 {
+            return None;
+        }
+        let hour = n / 10_000;
+        let minute = (n / 100) % 100;
+        let second = n % 100;
+        if hour > 838 || minute > 59 || second > 59 {
+            return None;
+        }
+        return Some(Time {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: hour as u8,
+            minute: minute as u8,
+            second: second as u8,
+            micro: 0,
+            fsp: 0,
+            tp: TimeType::Time,
+        });
+    }
+    if n < 0 {
+        return None;
+    }
+    let digits = n.to_string();
+    let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
+        match digits.len() {
+        14 | 12 => {
+            let offset = digits.len() - 14;
+            let year = if offset == 0 {
+                digits[0..4].parse::<i64>().ok()?
+            } else {
+                let yy: i64 = digits[0..2].parse().ok()?;
+                if yy < 70 { 2000 + yy } else { 1900 + yy }
+            };
+            let rest = if offset == 0 { &digits[4..] } else { &digits[2..] };
+            (
+                year,
+                rest[0..2].parse().ok()?,
+                rest[2..4].parse().ok()?,
+                rest[4..6].parse().ok()?,
+                rest[6..8].parse().ok()?,
+                rest[8..10].parse().ok()?,
+            )
+        }
+        8 | 6 => {
+            let (year, rest) = if digits.len() == 8 {
+                (digits[0..4].parse::<i64>().ok()?, &digits[4..])
+            } else {
+                let yy: i64 = digits[0..2].parse().ok()?;
+                (if yy < 70 { 2000 + yy } else { 1900 + yy }, &digits[2..])
+            };
+            (
+                year,
+                rest[0..2].parse().ok()?,
+                rest[2..4].parse().ok()?,
+                0,
+                0,
+                0,
+            )
+        }
+        _ => return None,
+    };
+    if !valid_ymd(year as u16, month as u8, day as u8)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(Time {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        micro: 0,
+        fsp: 0,
+        tp,
+    })
+}
+
+/// Duration text (`'01:01:01'`, `'838:59:59'`) → TIME.
+pub fn parse_duration_string(s: &str) -> Option<Time> {
+    let s = s.trim();
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (hms, frac) = match body.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (body, None),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut hour: i64 = parts[0].trim().parse().ok()?;
+    let minute: u8 = parts[1].trim().parse().ok()?;
+    let second: u8 = parts[2].trim().parse().ok()?;
+    if negative {
+        hour = -hour;
+    }
+    if !(-838..=838).contains(&hour) || minute > 59 || second > 59 {
+        return None;
+    }
+    let mut micro = 0u32;
+    let mut fsp = 0i8;
+    if let Some(frac) = frac
+        && !frac.is_empty()
+    {
+        let digits: String = frac.chars().take(6).collect();
+        let fsp_len = digits.len() as i8;
+        let mut padded = digits.clone();
+        while padded.len() < 6 {
+            padded.push('0');
+        }
+        micro = padded.parse().ok()?;
+        fsp = fsp_len;
+    }
+    Some(Time {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: hour.unsigned_abs() as u8,
+        minute,
+        second,
+        micro,
+        fsp,
+        tp: TimeType::Time,
+    })
+}
+
 /// Howard Hinnant's civil-from-days: days since 1970-01-01 → (y, m, d).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
+fn civil_from_days(z: i64) -> (i64, i64, i64) {    let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;

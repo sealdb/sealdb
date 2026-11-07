@@ -220,6 +220,9 @@ impl ClientConn {
     }
 
     fn dispatch(&mut self, data: &[u8]) -> Result<Dispatch> {
+        // TiDB tags statement errors with the client connection id
+        // (`… [conn=17]`, e.g. error 8175 memory quota).
+        sealdb_expression::set_connection_id(u64::from(self.connection_id));
         let cmd = data[0];
         let payload = &data[1..];
         match cmd {

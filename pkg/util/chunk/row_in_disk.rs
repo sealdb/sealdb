@@ -1,5 +1,5 @@
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
-use sealdb_types::{Datum, MyDecimal, Time};
+use sealdb_types::{Datum, EnumValue, MyDecimal, Time};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
@@ -17,6 +17,7 @@ const TAG_F64: u8 = 3;
 const TAG_BYTES: u8 = 4;
 const TAG_DECIMAL: u8 = 5;
 const TAG_TIME: u8 = 6;
+const TAG_ENUM: u8 = 7;
 
 pub fn mem_row_limit() -> usize {
     std::env::var("SEALDB_SPILL_MEM_ROWS")
@@ -154,6 +155,13 @@ fn encode_datum(w: &mut impl Write, value: &Datum) -> Result<()> {
             w.write_all(&t.to_packed_u64().to_le_bytes())
                 .map_err(io_err)
         }
+        Datum::Enum(e) => {
+            w.write_all(&[TAG_ENUM]).map_err(io_err)?;
+            w.write_all(&e.number.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(e.label.len() as u32).to_le_bytes())
+                .map_err(io_err)?;
+            w.write_all(&e.label).map_err(io_err)
+        }
     }
 }
 
@@ -185,6 +193,11 @@ fn decode_datum(r: &mut impl Read) -> Result<Datum> {
         TAG_TIME => Ok(Datum::Time(Time::from_packed_u64(
             read_fixed::<8>(r).map(u64::from_le_bytes)?,
         ))),
+        TAG_ENUM => {
+            let number = read_fixed::<8>(r).map(u64::from_le_bytes)?;
+            let label = read_len_bytes(r)?;
+            Ok(Datum::Enum(EnumValue { label, number }))
+        }
         other => Err(Error::new(
             ERR_UNKNOWN_ERROR,
             format!("unknown spill datum tag {other}"),

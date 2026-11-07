@@ -16,6 +16,7 @@ rustls-pki-types = "1"
 sealdb-domain.workspace = true
 sealdb-errno.workspace = true
 sealdb-executor.workspace = true
+sealdb-expression.workspace = true
 sealdb-parser.workspace = true
 sealdb-session.workspace = true
 sealdb-types.workspace = true

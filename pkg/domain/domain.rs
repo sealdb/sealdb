@@ -459,6 +459,26 @@ impl Domain {
         Ok(next)
     }
 
+    /// Allocate the next value for a table's `AUTO_INCREMENT` column.
+    pub fn next_auto_id(&self, table_id: i64) -> Result<i64> {
+        let mut inner = self.inner.lock().expect("domain handle lock");
+        let next = inner.meta.alloc_auto_id(table_id)?;
+        if !inner.defer_persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        }
+        Ok(next)
+    }
+
+    /// Raise the `AUTO_INCREMENT` counter after an explicit user value.
+    pub fn bump_auto_id(&self, table_id: i64, value: i64) -> Result<()> {
+        let mut inner = self.inner.lock().expect("domain handle lock");
+        inner.meta.bump_auto_id(table_id, value)?;
+        if !inner.defer_persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        }
+        Ok(())
+    }
+
     /// Clone Mutator + InfoSchema as they are now, before in-txn DDL.
     pub fn schema_snap(&self) -> SchemaSnap {
         let inner = self.inner.lock().expect("domain schema snap lock");

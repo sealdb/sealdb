@@ -207,6 +207,8 @@ fn filter_outer_rows_serial(
             outer_with: outer_with.cloned(),
             outer_schema: schema.to_vec(),
             outer_row: row.clone(),
+            enclosing_tables: Vec::new(),
+            enclosing_cols: Vec::new(),
         };
         let rewritten = materialize(filter, &ctx, &mut cache)?;
         if eval_filter(&rewritten, schema, &row)? {
@@ -224,6 +226,12 @@ struct ApplyCtx {
     outer_with: Option<WithClause>,
     outer_schema: Vec<String>,
     outer_row: Vec<Datum>,
+    /// Columns of scopes between `outer_row` and the query being bound. A
+    /// reference that names one of them stays a column (the executor's Apply
+    /// resolves it against the enclosing row) instead of taking the outer
+    /// value, so nested subqueries keep inner-scope columns inner.
+    enclosing_tables: Vec<String>,
+    enclosing_cols: Vec<String>,
 }
 
 /// Runs nested subqueries while projecting a row (SELECT-list scalar subquery).
@@ -269,6 +277,8 @@ impl SubqueryEvalCtx {
             outer_with: None,
             outer_schema: schema.to_vec(),
             outer_row: row.to_vec(),
+            enclosing_tables: Vec::new(),
+            enclosing_cols: Vec::new(),
         };
         let rewritten = materialize(expr, &ctx, &mut self.cache)?;
         eval_expr_with_row(&rewritten, schema, row)
@@ -405,21 +415,58 @@ fn eval_in_subquery(
     cache: &mut HashMap<String, QueryResult>,
 ) -> Result<Datum> {
     let left_expr = materialize(&sub.expr, ctx, cache)?;
-    let left = eval_expr_with_row(&left_expr, &ctx.outer_schema, &ctx.outer_row)?;
-    if left.is_null() {
+    // Row constructors compare element-wise: `(a, b) IN (SELECT x, y …)`.
+    let left_values: Vec<Datum> = match &left_expr {
+        ExprNode::Row(row) => {
+            let mut values = Vec::with_capacity(row.exprs.len());
+            for item in &row.exprs {
+                let item = materialize(item, ctx, cache)?;
+                values.push(eval_expr_with_row(
+                    &item,
+                    &ctx.outer_schema,
+                    &ctx.outer_row,
+                )?);
+            }
+            values
+        }
+        other => vec![eval_expr_with_row(
+            other,
+            &ctx.outer_schema,
+            &ctx.outer_row,
+        )?],
+    };
+    let left_is_row = matches!(&left_expr, ExprNode::Row(_));
+    if left_values.iter().any(Datum::is_null) {
+        // Row-value `NOT IN` decorrelates to an anti semi join, where a NULL
+        // operand never matches any inner row — TiDB answers TRUE.
+        if left_is_row && sub.not {
+            return Ok(bool_datum(true));
+        }
         return Ok(Datum::Null);
     }
     let inner = bind_result_set(&sub.query, ctx)?;
     let result = run_result_set(&inner, ctx, cache)?;
     let mut saw_null = false;
     for row in &result.rows {
-        let value = row.first().cloned().unwrap_or(Datum::Null);
-        if value.is_null() {
-            saw_null = true;
-            continue;
+        let mut matched = true;
+        let mut row_null = false;
+        for (i, left) in left_values.iter().enumerate() {
+            let value = row.get(i).cloned().unwrap_or(Datum::Null);
+            if value.is_null() {
+                row_null = true;
+                matched = false;
+                break;
+            }
+            if !left.compare(&value).is_eq() {
+                matched = false;
+                break;
+            }
         }
-        if left.compare(&value).is_eq() {
+        if matched {
             return Ok(bool_datum(!sub.not));
+        }
+        if row_null {
+            saw_null = true;
         }
     }
     if saw_null {
@@ -536,26 +583,29 @@ fn bind_select_with_cte_schemas(
     // A query's own columns are qualified by the alias (`FROM t t1` → t1.x).
     // Once aliased, the physical name is only a valid qualifier for CTEs, whose
     // corpus queries sometimes reference the CTE name instead of the alias.
-    let inner_tables: Vec<String> = select
-        .from
-        .as_ref()
-        .map(|t| {
-            let mut names = vec![t.name.clone()];
-            let cte_name = t.resolve_name();
-            // An alias hides the table / CTE name (`FROM cte1 dt1` → only
-            // `dt1.x` qualifies; `cte1.x` is an outer reference).
-            let is_cte = t.physical.is_none()
-                && (prior_ctes.contains_key(&cte_name.to_ascii_lowercase())
-                    || select
-                        .with
-                        .as_ref()
-                        .is_some_and(|with| with.find(cte_name).is_some()));
-            if is_cte && !names.iter().any(|n| n.eq_ignore_ascii_case(cte_name)) {
-                names.push(cte_name.to_string());
+    // Every FROM / JOIN table is inner, not just the leading one: a correlated
+    // condition over `FROM t1, t3` must keep `t3.x` on the inner side.
+    let mut inner_tables: Vec<String> = Vec::new();
+    for t in select.join_tables() {
+        let mut push = |name: &str| {
+            if !inner_tables.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                inner_tables.push(name.to_string());
             }
-            names
-        })
-        .unwrap_or_default();
+        };
+        push(&t.name);
+        let cte_name = t.resolve_name();
+        // An alias hides the table / CTE name (`FROM cte1 dt1` → only
+        // `dt1.x` qualifies; `cte1.x` is an outer reference).
+        let is_cte = t.physical.is_none()
+            && (prior_ctes.contains_key(&cte_name.to_ascii_lowercase())
+                || select
+                    .with
+                    .as_ref()
+                    .is_some_and(|with| with.find(cte_name).is_some()));
+        if is_cte {
+            push(cte_name);
+        }
+    }
     let mut inner_cols = inner_columns(select, ctx, prior_ctes);
     // CTE output names count as inner so `WHERE b=a` keeps `b` on the CTE.
     if let Some(with) = &select.with {
@@ -638,6 +688,8 @@ fn bind_with(with: &WithClause, ctx: &ApplyCtx) -> Result<WithClause> {
         outer_with: None,
         outer_schema: ctx.outer_schema.clone(),
         outer_row: ctx.outer_row.clone(),
+        enclosing_tables: ctx.enclosing_tables.clone(),
+        enclosing_cols: ctx.enclosing_cols.clone(),
     };
     let ctx = &body_ctx;
     // Sibling CTEs: later bodies see earlier output cols as inner so
@@ -793,24 +845,56 @@ fn bind_expr(
         // and that reference must be substituted while this scope is available.
         ExprNode::Exists(exists) => ExprNode::Exists(ExistsExpr {
             not: exists.not,
-            query: Box::new(bind_nested_query(&exists.query, ctx)),
+            query: Box::new(bind_nested_query(
+                &exists.query,
+                &nested_ctx(ctx, inner_tables, inner_cols),
+            )),
         }),
         ExprNode::InSubquery(sub) => ExprNode::InSubquery(InSubqueryExpr {
             expr: Box::new(bind_expr(&sub.expr, ctx, inner_tables, inner_cols)),
             not: sub.not,
-            query: Box::new(bind_nested_query(&sub.query, ctx)),
+            query: Box::new(bind_nested_query(
+                &sub.query,
+                &nested_ctx(ctx, inner_tables, inner_cols),
+            )),
             all_ne: sub.all_ne,
         }),
         ExprNode::QuantifiedCmp(cmp) => ExprNode::QuantifiedCmp(QuantifiedCmpExpr {
             expr: Box::new(bind_expr(&cmp.expr, ctx, inner_tables, inner_cols)),
             op: cmp.op,
             all: cmp.all,
-            query: Box::new(bind_nested_query(&cmp.query, ctx)),
+            query: Box::new(bind_nested_query(
+                &cmp.query,
+                &nested_ctx(ctx, inner_tables, inner_cols),
+            )),
         }),
         ExprNode::ScalarSubquery(sub) => ExprNode::ScalarSubquery(ScalarSubqueryExpr {
-            query: Box::new(bind_nested_query(&sub.query, ctx)),
+            query: Box::new(bind_nested_query(
+                &sub.query,
+                &nested_ctx(ctx, inner_tables, inner_cols),
+            )),
         }),
         other => other.clone(),
+    }
+}
+
+/// Scope for binding a subquery nested in this one: this query's tables are
+/// enclosing scopes for it, so its references to them stay column references.
+fn nested_ctx(ctx: &ApplyCtx, inner_tables: &[String], inner_cols: &[String]) -> ApplyCtx {
+    let mut enclosing_tables = inner_tables.to_vec();
+    enclosing_tables.extend(ctx.enclosing_tables.iter().cloned());
+    let mut enclosing_cols = inner_cols.to_vec();
+    enclosing_cols.extend(ctx.enclosing_cols.iter().cloned());
+    ApplyCtx {
+        domain: Arc::clone(&ctx.domain),
+        current_db: ctx.current_db.clone(),
+        txn: Arc::clone(&ctx.txn),
+        outer_table: ctx.outer_table.clone(),
+        outer_with: ctx.outer_with.clone(),
+        outer_schema: ctx.outer_schema.clone(),
+        outer_row: ctx.outer_row.clone(),
+        enclosing_tables,
+        enclosing_cols,
     }
 }
 
@@ -826,7 +910,7 @@ fn bind_column(
     inner_tables: &[String],
     inner_cols: &[String],
 ) -> ExprNode {
-    if column_is_inner(col, inner_tables, inner_cols) {
+    if column_is_inner(col, inner_tables, inner_cols) || column_is_enclosing(col, ctx) {
         return ExprNode::Column(col.clone());
     }
     if let Some(value) = lookup_outer(col, ctx) {
@@ -850,25 +934,50 @@ fn column_is_inner(col: &ColumnNameExpr, inner_tables: &[String], inner_cols: &[
         .any(|name| name.eq_ignore_ascii_case(&col.name))
 }
 
-fn lookup_outer(col: &ColumnNameExpr, ctx: &ApplyCtx) -> Option<Datum> {
-    if let Some(table) = &col.table
-        && ctx
-            .outer_table
-            .as_ref()
-            .is_none_or(|outer| !outer.eq_ignore_ascii_case(table))
-    {
-        return None;
+fn column_is_enclosing(col: &ColumnNameExpr, ctx: &ApplyCtx) -> bool {
+    if let Some(table) = &col.table {
+        return ctx
+            .enclosing_tables
+            .iter()
+            .any(|inner| inner.eq_ignore_ascii_case(table));
     }
+    ctx.enclosing_cols
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&col.name))
+}
+
+fn lookup_outer(col: &ColumnNameExpr, ctx: &ApplyCtx) -> Option<Datum> {
+    // Outer schemas render columns as `t.c` or `db.t.c`; a qualifier is a hit
+    // when the schema entry is that qualified name or ends with it, whatever
+    // table the subquery's outer FROM started with.
+    let bare = |s: &str| s.replace('`', "");
+    let matches = |name: &str| -> bool {
+        let name = bare(name);
+        let name = name.as_str();
+        if let Some(table) = &col.table {
+            let qualified = format!("{table}.{}", col.name);
+            name.eq_ignore_ascii_case(&qualified)
+                // SELECT-list / aggregate schemas carry bare names.
+                || name.eq_ignore_ascii_case(&col.name)
+                || name
+                    .rsplit_once('.')
+                    .is_some_and(|(head, tail)| {
+                        tail.eq_ignore_ascii_case(&col.name)
+                            && head
+                                .rsplit_once('.')
+                                .map(|(_, t)| t.eq_ignore_ascii_case(table))
+                                .unwrap_or_else(|| head.eq_ignore_ascii_case(table))
+                    })
+        } else {
+            name.eq_ignore_ascii_case(&col.name)
+                || name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case(&col.name))
+        }
+    };
     ctx.outer_schema
         .iter()
-        .position(|name| {
-            name.eq_ignore_ascii_case(&col.name)
-                || name.eq_ignore_ascii_case(&format!(
-                    "{}.{}",
-                    col.table.as_deref().unwrap_or(""),
-                    col.name
-                ))
-        })
+        .position(|name| matches(name))
         .and_then(|idx| ctx.outer_row.get(idx).cloned())
 }
 

@@ -7,8 +7,8 @@
 use crate::internal::exec::Executor;
 use crate::join::hash_join_spill::{partition_count, partition_rows};
 use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
-use sealdb_expression::eval_expr_with_row;
-use sealdb_parser::ast::expressions::ExprNode;
+use sealdb_expression::{consume_query_mem, eval_expr_with_row, row_mem_size, rows_mem_size};
+use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode, ValueExpr};
 use sealdb_parser::ast::{Join, JoinType};
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
@@ -27,6 +27,15 @@ pub struct HashJoinV1Exec {
     mem_limit: usize,
     spilled: bool,
     emitted: bool,
+    /// Qualified USING columns of the null-supplying side that the SELECT
+    /// still references (`t2.a` above `t1 LEFT JOIN t2 USING(a)`). The join
+    /// output carries them as hidden columns (`\u{1}`-prefixed names) so the
+    /// parent filter/ordering sees the raw, non-coalesced value.
+    hidden_using: Vec<String>,
+    /// Coalesce USING/NATURAL columns into one output column. Disabled when the
+    /// SELECT lists qualified stars (`t1.*, t2.*`), where TiDB returns every
+    /// table's raw columns.
+    coalesce_using: bool,
 }
 
 impl HashJoinV1Exec {
@@ -40,7 +49,21 @@ impl HashJoinV1Exec {
             mem_limit: mem_row_limit(),
             spilled: false,
             emitted: false,
+            hidden_using: Vec::new(),
+            coalesce_using: true,
         }
+    }
+
+    /// Keep every raw column of both sides (qualified `t1.*` star expansion).
+    pub fn with_coalesce_using(mut self, coalesce: bool) -> Self {
+        self.coalesce_using = coalesce;
+        self
+    }
+
+    /// Expose raw (non-coalesced) USING columns from the dropped side.
+    pub fn with_hidden_using(mut self, cols: Vec<String>) -> Self {
+        self.hidden_using = cols;
+        self
     }
 
     pub fn with_mem_limit(mut self, mem_limit: usize) -> Self {
@@ -74,18 +97,55 @@ impl Executor for HashJoinV1Exec {
         // USING coalesces shared names: emit left once, drop matching right cols.
         self.schema = if self.join.tp.is_semi_anti() {
             left_raw.clone()
-        } else if self.join.using_cols.is_empty() {
+        } else if self.join.using_cols.is_empty() || !self.coalesce_using {
             left_schema
                 .iter()
                 .cloned()
                 .chain(right_schema.iter().cloned())
                 .collect()
+        } else if matches!(self.join.tp, JoinType::RightOuter) {
+            coalesce_using_schema_right(&left_schema, &right_schema, &self.join.using_cols)
         } else {
-            coalesce_using_schema(&left_raw, &right_raw, &self.join.using_cols)
+            coalesce_using_schema(&left_schema, &right_schema, &self.join.using_cols)
         };
+        let coalesce_right = matches!(self.join.tp, JoinType::RightOuter);
+        // Hidden raw USING columns from the null-supplying side (`t2.a` above
+        // `t1 LEFT JOIN t2 USING(a)`): parent filters need the pre-coalesced
+        // value, but bare-name resolution and result headers must not see them.
+        let mut hidden_idx: Vec<usize> = Vec::new();
+        if self.coalesce_using && !self.join.using_cols.is_empty() {
+            for qual in &self.hidden_using {
+                let Some((_, bare)) = qual.rsplit_once('.') else {
+                    continue;
+                };
+                let (raw, base) = if coalesce_right {
+                    (&left_raw, 0usize)
+                } else {
+                    (&right_raw, left_width)
+                };
+                if let Some(i) = raw.iter().position(|c| {
+                    c.rsplit_once('.')
+                        .map(|(_, n)| n)
+                        .unwrap_or(c)
+                        .eq_ignore_ascii_case(bare)
+                }) {
+                    hidden_idx.push(base + i);
+                    self.schema.push(format!("\u{1}{qual}"));
+                }
+            }
+        }
         let left_rows = collect_rows(self.left.as_mut())?;
         let right_rows = collect_rows(self.right.as_mut())?;
         self.spilled = false;
+        // `NOT IN` anti join: three-valued semantics — a NULL on either side
+        // never proves the row absent (unlike NOT EXISTS anti joins).
+        if self.join.tp == JoinType::Anti && contains_not_in_marker(&self.join.on) {
+            let on = strip_not_in_marker(self.join.on.clone());
+            let mut pair_schema = left_schema.clone();
+            pair_schema.extend(right_schema.iter().cloned());
+            self.rows = probe_anti_not_in(&left_rows, &right_rows, &pair_schema, &on)?;
+            return Ok(());
+        }
         // CROSS JOIN / non-equality ON (e.g. `ON (sub.col)` truthiness) →
         // cartesian product then filter; no hash keys.
         if self.join.tp == JoinType::Cross || !join_on_is_equijoin(&self.join.on) {
@@ -107,26 +167,62 @@ impl Executor for HashJoinV1Exec {
                 )?;
                 return Ok(());
             }
-            self.rows = probe_cross(&left_rows, &right_rows);
-            if !is_trivial_on_true(&self.join.on) {
-                self.rows = filter_rows_by_on(
-                    std::mem::take(&mut self.rows),
+            if matches!(self.join.tp, JoinType::LeftOuter | JoinType::RightOuter)
+                && !is_trivial_on_true(&self.join.on)
+            {
+                // No equality keys: evaluate ON per candidate pair, then
+                // null-extend the preserved side when nothing matched.
+                self.rows = probe_outer_non_equi(
+                    self.join.tp,
+                    &left_rows,
+                    &right_rows,
                     &full_schema,
                     &self.join.on,
-                )?;
-            }
-            if !self.join.using_cols.is_empty() {
-                self.rows = project_using_rows(
-                    std::mem::take(&mut self.rows),
                     left_width,
-                    &right_raw,
-                    &self.join.using_cols,
-                );
+                    right_width,
+                )?;
+            } else {
+                self.rows = probe_cross_tracked(&left_rows, &right_rows)?;
+                if !is_trivial_on_true(&self.join.on) {
+                    self.rows = filter_rows_by_on(
+                        std::mem::take(&mut self.rows),
+                        &full_schema,
+                        &self.join.on,
+                    )?;
+                }
+            }
+            if self.coalesce_using && !self.join.using_cols.is_empty() {
+                self.rows = if coalesce_right {
+                    project_using_rows_right(
+                        std::mem::take(&mut self.rows),
+                        &left_raw,
+                        &right_raw,
+                        &self.join.using_cols,
+                        &hidden_idx,
+                    )
+                } else {
+                    project_using_rows(
+                        std::mem::take(&mut self.rows),
+                        left_width,
+                        &right_raw,
+                        &self.join.using_cols,
+                        &hidden_idx,
+                    )
+                };
             }
             return Ok(());
         }
-        let (left_key, right_key) =
-            split_join_eq(&self.join.on, &self.join.left.name, &self.join.right.name)?;
+        // The hash keys are the cross-side equality; every other conjunct
+        // (`a.pk > b.pk`, single-side `t.a != 3`, ...) is a residual that must
+        // hold for each candidate pair — otherwise an outer join would report
+        // key-only matches.
+        let (left_key, right_key, residual) = split_on_conditions(
+            &self.join.on,
+            &self.join.left.name,
+            &self.join.right.name,
+            &left_schema,
+            &right_schema,
+        )?;
         if left_rows.len() < self.mem_limit && right_rows.len() < self.mem_limit {
             self.rows = probe_join(
                 self.join.tp,
@@ -136,17 +232,32 @@ impl Executor for HashJoinV1Exec {
                 &right_schema,
                 &left_key,
                 &right_key,
+                &residual,
                 left_width,
                 right_width,
             )?;
-            if !self.join.using_cols.is_empty() {
-                self.rows = project_using_rows(
-                    std::mem::take(&mut self.rows),
-                    left_width,
-                    &right_raw,
-                    &self.join.using_cols,
-                );
+            if self.coalesce_using && !self.join.using_cols.is_empty() {
+                self.rows = if coalesce_right {
+                    project_using_rows_right(
+                        std::mem::take(&mut self.rows),
+                        &left_raw,
+                        &right_raw,
+                        &self.join.using_cols,
+                        &hidden_idx,
+                    )
+                } else {
+                    project_using_rows(
+                        std::mem::take(&mut self.rows),
+                        left_width,
+                        &right_raw,
+                        &self.join.using_cols,
+                        &hidden_idx,
+                    )
+                };
             }
+            // TiDB tracks the hash-join build side (the materialized table),
+            // not the streaming probe output.
+            consume_query_mem(rows_mem_size(&right_rows))?;
             return Ok(());
         }
         self.spilled = true;
@@ -165,18 +276,30 @@ impl Executor for HashJoinV1Exec {
                 &right_schema,
                 &left_key,
                 &right_key,
+                &residual,
                 left_width,
                 right_width,
             )?);
         }
         self.rows = out;
-        if !self.join.using_cols.is_empty() {
-            self.rows = project_using_rows(
-                std::mem::take(&mut self.rows),
-                left_width,
-                &right_raw,
-                &self.join.using_cols,
-            );
+        if self.coalesce_using && !self.join.using_cols.is_empty() {
+            self.rows = if coalesce_right {
+                project_using_rows_right(
+                    std::mem::take(&mut self.rows),
+                    &left_raw,
+                    &right_raw,
+                    &self.join.using_cols,
+                    &hidden_idx,
+                )
+            } else {
+                project_using_rows(
+                    std::mem::take(&mut self.rows),
+                    left_width,
+                    &right_raw,
+                    &self.join.using_cols,
+                    &hidden_idx,
+                )
+            };
         }
         Ok(())
     }
@@ -212,6 +335,7 @@ fn probe_join(
     right_schema: &[String],
     left_key: &ExprNode,
     right_key: &ExprNode,
+    residual: &[&ExprNode],
     left_width: usize,
     right_width: usize,
 ) -> Result<Vec<Vec<Datum>>> {
@@ -223,6 +347,7 @@ fn probe_join(
             right_schema,
             left_key,
             right_key,
+            residual,
         ),
         JoinType::LeftOuter => probe_outer(
             left_rows,
@@ -231,6 +356,7 @@ fn probe_join(
             right_schema,
             left_key,
             right_key,
+            residual,
             left_width,
             right_width,
             true,
@@ -244,6 +370,7 @@ fn probe_join(
             left_schema,
             right_key,
             left_key,
+            residual,
             left_width,
             right_width,
             false,
@@ -256,6 +383,7 @@ fn probe_join(
             right_schema,
             left_key,
             right_key,
+            residual,
         ),
         JoinType::Anti => probe_anti(
             left_rows,
@@ -264,6 +392,7 @@ fn probe_join(
             right_schema,
             left_key,
             right_key,
+            residual,
         ),
     }
 }
@@ -276,15 +405,114 @@ fn probe_semi(
     right_schema: &[String],
     left_key: &ExprNode,
     right_key: &ExprNode,
+    residual: &[&ExprNode],
 ) -> Result<Vec<Vec<Datum>>> {
     let index = build_index(right_rows, right_schema, right_key)?;
+    let mut pair_schema = left_schema.to_vec();
+    pair_schema.extend(right_schema.iter().cloned());
     let mut out = Vec::new();
     for left in left_rows {
         let key = eval_expr_with_row(left_key, left_schema, left)?;
         if key.is_null() {
             continue;
         }
-        if index.contains_key(&key_text(&key)) {
+        let matched = {
+            let mut any = false;
+            for ri in matched_ids(&index, &key, right_rows, right_schema, right_key)? {
+                let right = &right_rows[ri];
+                if residual_passes(residual, &pair_schema, left, right)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        };
+        if matched {
+            out.push(left.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// `Bytes(NOT_IN_MARKER)` conjunct tagging an anti join as `NOT IN`.
+fn is_not_in_marker(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) if b.as_slice() == sealdb_planner::core::rule_semi_join::NOT_IN_MARKER.as_bytes()
+    )
+}
+
+fn contains_not_in_marker(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            contains_not_in_marker(&bin.left) || contains_not_in_marker(&bin.right)
+        }
+        _ => is_not_in_marker(expr),
+    }
+}
+
+/// Drop the `NOT IN` marker conjuncts, keeping the executable predicate.
+fn strip_not_in_marker(expr: ExprNode) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            let left = strip_not_in_marker(*bin.left);
+            let right = strip_not_in_marker(*bin.right);
+            match (keep_marker(&left), keep_marker(&right)) {
+                (None, None) => ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(1),
+                }),
+                (None, Some(r)) => r,
+                (Some(l), None) => l,
+                (Some(l), Some(r)) => ExprNode::Binary(BinaryOpExpr {
+                    op: Op::LogicAnd,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }),
+            }
+        }
+        other => other,
+    }
+}
+
+fn keep_marker(expr: &ExprNode) -> Option<ExprNode> {
+    if is_not_in_marker(expr) {
+        None
+    } else {
+        Some(expr.clone())
+    }
+}
+
+/// `NOT IN` anti join: keep the left row only when every candidate pair
+/// evaluates to FALSE (a NULL comparison or TRUE match drops it).
+fn probe_anti_not_in(
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    pair_schema: &[String],
+    on: &ExprNode,
+) -> Result<Vec<Vec<Datum>>> {
+    let mut out = Vec::new();
+    for left in left_rows {
+        let mut keep = true;
+        for right in right_rows {
+            let mut row = left.clone();
+            row.extend(right.iter().cloned());
+            let v = eval_expr_with_row(on, pair_schema, &row)?;
+            let trueish = match &v {
+                Datum::Null => true,
+                Datum::I64(n) => *n != 0,
+                Datum::U64(n) => *n != 0,
+                Datum::F64(f) => *f != 0.0,
+                Datum::Bytes(b) => !b.is_empty(),
+                _ => false,
+            };
+            if trueish {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
             out.push(left.clone());
         }
     }
@@ -299,12 +527,24 @@ fn probe_anti(
     right_schema: &[String],
     left_key: &ExprNode,
     right_key: &ExprNode,
+    residual: &[&ExprNode],
 ) -> Result<Vec<Vec<Datum>>> {
     let index = build_index(right_rows, right_schema, right_key)?;
+    let mut pair_schema = left_schema.to_vec();
+    pair_schema.extend(right_schema.iter().cloned());
     let mut out = Vec::new();
     for left in left_rows {
         let key = eval_expr_with_row(left_key, left_schema, left)?;
-        let matched = !key.is_null() && index.contains_key(&key_text(&key));
+        let mut matched = false;
+        if !key.is_null() {
+            for ri in matched_ids(&index, &key, right_rows, right_schema, right_key)? {
+                let right = &right_rows[ri];
+                if residual_passes(residual, &pair_schema, left, right)? {
+                    matched = true;
+                    break;
+                }
+            }
+        }
         if !matched {
             out.push(left.clone());
         }
@@ -318,6 +558,36 @@ fn probe_anti(
 /// other side (probe) drive the output loop; bucket chains are prepended, so
 /// matched build rows come back in reverse insertion order. With equal sizes
 /// the inner/right side is the build side.
+/// Cartesian product charged against `tidb_mem_quota_query` row by row, so a
+/// runaway cross join (TiDB integrationtest `TestCartesianJoinPanic`) aborts
+/// with error 8175 instead of exhausting memory.
+fn probe_cross_tracked(
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+) -> Result<Vec<Vec<Datum>>> {
+    let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+    let build_is_left = left_rows.len() < right_rows.len();
+    let mut push = |row: Vec<Datum>| -> Result<()> {
+        consume_query_mem(row_mem_size(&row))?;
+        out.push(row);
+        Ok(())
+    };
+    if build_is_left {
+        for right in right_rows {
+            for left in left_rows.iter().rev() {
+                push(concat_row(left, right))?;
+            }
+        }
+    } else {
+        for left in left_rows {
+            for right in right_rows.iter().rev() {
+                push(concat_row(left, right))?;
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn probe_cross(left_rows: &[Vec<Datum>], right_rows: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
     let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
     let build_is_left = left_rows.len() < right_rows.len();
@@ -398,11 +668,31 @@ fn coalesce_using_schema(left: &[String], right: &[String], using: &[String]) ->
         .collect()
 }
 
+/// RIGHT JOIN counterpart: the preserved (right) side owns the USING columns,
+/// so its columns come first and the left duplicates are dropped
+/// (`t1(a,c) RIGHT JOIN t2(a,d) USING(a)` → `t2.a, t2.d, t1.c`).
+fn coalesce_using_schema_right(left: &[String], right: &[String], using: &[String]) -> Vec<String> {
+    let drop_left: std::collections::HashSet<String> = using
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    right
+        .iter()
+        .cloned()
+        .chain(
+            left.iter()
+                .filter(|c| !drop_left.contains(&bare_col(c).to_ascii_lowercase()))
+                .cloned(),
+        )
+        .collect()
+}
+
 fn project_using_rows(
     rows: Vec<Vec<Datum>>,
     left_width: usize,
     right: &[String],
     using: &[String],
+    hidden: &[usize],
 ) -> Vec<Vec<Datum>> {
     let drop_right: std::collections::HashSet<String> = using
         .iter()
@@ -418,7 +708,44 @@ fn project_using_rows(
         }))
         .collect();
     rows.into_iter()
-        .map(|row| keep.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)).collect())
+        .map(|row| {
+            let mut out: Vec<Datum> = keep
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null))
+                .collect();
+            out.extend(hidden.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)));
+            out
+        })
+        .collect()
+}
+
+/// Rows for a RIGHT JOIN over USING columns: preserved side first.
+fn project_using_rows_right(
+    rows: Vec<Vec<Datum>>,
+    left: &[String],
+    right: &[String],
+    using: &[String],
+    hidden: &[usize],
+) -> Vec<Vec<Datum>> {
+    let drop_left: std::collections::HashSet<String> = using
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let keep: Vec<usize> = (0..right.len())
+        .map(|i| left.len() + i)
+        .chain((0..left.len()).filter(|&i| {
+            !drop_left.contains(&bare_col(&left[i]).to_ascii_lowercase())
+        }))
+        .collect();
+    rows.into_iter()
+        .map(|row| {
+            let mut out: Vec<Datum> = keep
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null))
+                .collect();
+            out.extend(hidden.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)));
+            out
+        })
         .collect()
 }
 
@@ -437,11 +764,190 @@ fn join_on_is_equijoin(on: &ExprNode) -> bool {
     }
 }
 
+/// Split `ON` into the hash key pair plus the residual conjuncts that must
+/// hold for every candidate pair. ExplainInfo byte markers (the decorated
+/// semi/anti join info string) are not predicates and are dropped.
+fn split_on_conditions<'a>(
+    on: &'a ExprNode,
+    left_table: &str,
+    right_table: &str,
+    left_schema: &[String],
+    right_schema: &[String],
+) -> Result<(ExprNode, ExprNode, Vec<&'a ExprNode>)> {
+    let mut conjuncts = Vec::new();
+    on_conjuncts(on, &mut conjuncts);
+    let mut key = None;
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        if key.is_none() {
+            // A parenthesized table group on either side exposes several table
+            // qualifiers, so classify by the child schemas first.
+            if let Ok(keys) =
+                split_join_eq_by_schema(conjunct, left_schema, right_schema)
+            {
+                key = Some(keys);
+                continue;
+            }
+            if let Ok(keys) = split_join_eq(conjunct, left_table, right_table) {
+                key = Some(keys);
+                continue;
+            }
+        }
+        residual.push(conjunct);
+    }
+    let (left_key, right_key) = key.ok_or_else(|| {
+        Error::unsupported("JOIN ON must compare columns from both tables")
+    })?;
+    Ok((left_key, right_key, residual))
+}
+
+/// `true` = accumulated left side, `false` = the right subtree.
+fn side_in_schema(
+    expr: &ExprNode,
+    left_schema: &[String],
+    right_schema: &[String],
+) -> Option<bool> {
+    let ExprNode::Column(col) = expr else {
+        return None;
+    };
+    if let Some(table) = col.table.as_deref() {
+        if schema_has_table(right_schema, table) {
+            return Some(false);
+        }
+        if schema_has_table(left_schema, table) {
+            return Some(true);
+        }
+        return None;
+    }
+    // Unqualified `ON b1 = a1`: resolve by which side owns the name.
+    let in_left = schema_has_column(left_schema, &col.name);
+    let in_right = schema_has_column(right_schema, &col.name);
+    match (in_left, in_right) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn schema_has_column(schema: &[String], column: &str) -> bool {
+    schema
+        .iter()
+        .any(|c| bare_col(c).eq_ignore_ascii_case(column))
+}
+
+fn schema_has_table(schema: &[String], table: &str) -> bool {
+    schema
+        .iter()
+        .filter_map(|c| c.rsplit_once('.').map(|(t, _)| t))
+        .any(|t| t.eq_ignore_ascii_case(table))
+}
+
+fn split_join_eq_by_schema(
+    on: &ExprNode,
+    left_schema: &[String],
+    right_schema: &[String],
+) -> Result<(ExprNode, ExprNode)> {
+    let ExprNode::Binary(bin) = on else {
+        return Err(Error::unsupported("JOIN ON must be equality"));
+    };
+    if bin.op != Op::Eq {
+        return Err(Error::unsupported("JOIN ON must be equality"));
+    }
+    match (
+        side_in_schema(&bin.left, left_schema, right_schema),
+        side_in_schema(&bin.right, left_schema, right_schema),
+    ) {
+        (Some(true), Some(false)) => Ok((*bin.left.clone(), *bin.right.clone())),
+        (Some(false), Some(true)) => Ok((*bin.right.clone(), *bin.left.clone())),
+        _ => Err(Error::unsupported(
+            "JOIN ON must compare columns from both tables",
+        )),
+    }
+}
+
+fn on_conjuncts<'a>(on: &'a ExprNode, out: &mut Vec<&'a ExprNode>) {
+    if let ExprNode::Binary(bin) = on
+        && bin.op == Op::LogicAnd
+    {
+        on_conjuncts(&bin.left, out);
+        on_conjuncts(&bin.right, out);
+        return;
+    }
+    if matches!(on, ExprNode::Value(v) if matches!(&v.datum, Datum::Bytes(_))) {
+        return;
+    }
+    out.push(on);
+}
+
+/// Every residual conjunct must evaluate to true for the candidate pair.
+fn residual_passes(
+    residual: &[&ExprNode],
+    schema: &[String],
+    left: &[Datum],
+    right: &[Datum],
+) -> Result<bool> {
+    if residual.is_empty() {
+        return Ok(true);
+    }
+    let row = concat_row(left, right);
+    for expr in residual {
+        if !row_passes_on(&row, schema, expr)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn is_trivial_on_true(on: &ExprNode) -> bool {
     matches!(
         on,
         ExprNode::Value(v) if matches!(v.datum, Datum::I64(1) | Datum::U64(1))
     )
+}
+
+/// Outer join over a non-equality `ON` (no hash keys): for every preserved
+/// row, keep the pairs that satisfy `ON`; when none do, emit the row padded
+/// with NULLs for the other side (e.g. `(t1 ⟕ t2) ⟕ (t3 ⟕ t4) ON t2.b = 1`).
+fn probe_outer_non_equi(
+    tp: JoinType,
+    left_rows: &[Vec<Datum>],
+    right_rows: &[Vec<Datum>],
+    full_schema: &[String],
+    on: &ExprNode,
+    left_width: usize,
+    right_width: usize,
+) -> Result<Vec<Vec<Datum>>> {
+    let mut out = Vec::new();
+    if tp == JoinType::RightOuter {
+        for right in right_rows {
+            let mut matched = false;
+            for left in left_rows {
+                let row = concat_row(left, right);
+                if row_passes_on(&row, full_schema, on)? {
+                    matched = true;
+                    out.push(row);
+                }
+            }
+            if !matched {
+                out.push(concat_row(&vec![Datum::Null; left_width], right));
+            }
+        }
+        return Ok(out);
+    }
+    for left in left_rows {
+        let mut matched = false;
+        for right in right_rows {
+            let row = concat_row(left, right);
+            if row_passes_on(&row, full_schema, on)? {
+                matched = true;
+                out.push(row);
+            }
+        }
+        if !matched {
+            out.push(concat_row(left, &vec![Datum::Null; right_width]));
+        }
+    }
+    Ok(out)
 }
 
 /// Semi/Anti over a non-equality `ON`: cartesian product, then keep the left
@@ -566,16 +1072,20 @@ fn probe_inner(
     build_schema: &[String],
     probe_key: &ExprNode,
     build_key: &ExprNode,
+    residual: &[&ExprNode],
 ) -> Result<Vec<Vec<Datum>>> {
     let index = build_index(build_rows, build_schema, build_key)?;
+    let mut pair_schema = probe_schema.to_vec();
+    pair_schema.extend(build_schema.iter().cloned());
     let mut out = Vec::new();
     for probe in probe_rows {
         let key = eval_expr_with_row(probe_key, probe_schema, probe)?;
         if key.is_null() {
             continue;
         }
-        if let Some(matches) = index.get(&key_text(&key)) {
-            for build in matches {
+        for bi in matched_ids(&index, &key, build_rows, build_schema, build_key)? {
+            let build = &build_rows[bi];
+            if residual_passes(residual, &pair_schema, probe, build)? {
                 out.push(concat_row(probe, build));
             }
         }
@@ -591,25 +1101,36 @@ fn probe_outer(
     inner_schema: &[String],
     outer_key: &ExprNode,
     inner_key: &ExprNode,
+    residual: &[&ExprNode],
     left_width: usize,
     right_width: usize,
     outer_is_left: bool,
 ) -> Result<Vec<Vec<Datum>>> {
     let index = build_index(inner_rows, inner_schema, inner_key)?;
+    // Row order is always `[left, right]`, even when the outer side is the
+    // right input, so the residual schema must follow that order too.
+    let pair_schema: Vec<String> = if outer_is_left {
+        outer_schema.iter().chain(inner_schema).cloned().collect()
+    } else {
+        inner_schema.iter().chain(outer_schema).cloned().collect()
+    };
     let mut out = Vec::new();
     for outer in outer_rows {
         let key = eval_expr_with_row(outer_key, outer_schema, outer)?;
         let mut matched = false;
-        if !key.is_null()
-            && let Some(matches) = index.get(&key_text(&key))
-        {
-            for inner in matches {
-                matched = true;
-                out.push(if outer_is_left {
-                    concat_row(outer, inner)
+        if !key.is_null() {
+            for ii in matched_ids(&index, &key, inner_rows, inner_schema, inner_key)? {
+                let inner = &inner_rows[ii];
+                let (left, right) = if outer_is_left {
+                    (outer, inner)
                 } else {
-                    concat_row(inner, outer)
-                });
+                    (inner, outer)
+                };
+                if !residual_passes(residual, &pair_schema, left, right)? {
+                    continue;
+                }
+                matched = true;
+                out.push(concat_row(left, right));
             }
         }
         if !matched {
@@ -627,16 +1148,8 @@ fn build_index(
     rows: &[Vec<Datum>],
     schema: &[String],
     key: &ExprNode,
-) -> Result<HashMap<String, Vec<Vec<Datum>>>> {
-    let mut index: HashMap<String, Vec<Vec<Datum>>> = HashMap::new();
-    for row in rows {
-        let value = eval_expr_with_row(key, schema, row)?;
-        if value.is_null() {
-            continue;
-        }
-        index.entry(key_text(&value)).or_default().push(row.clone());
-    }
-    Ok(index)
+) -> Result<HashMap<String, Vec<usize>>> {
+    build_index_ids(rows, schema, key)
 }
 
 fn concat_row(left: &[Datum], right: &[Datum]) -> Vec<Datum> {
@@ -645,8 +1158,111 @@ fn concat_row(left: &[Datum], right: &[Datum]) -> Vec<Datum> {
     row
 }
 
+/// Canonical join-key text. Equality on TIMESTAMP/DATETIME/DATE/string columns
+/// follows SQL comparison rules (session-local wall clock), so the hash key
+/// must not depend on the `Time` type tag nor on whether the value arrived as
+/// a string. Only real values key together: `Time` renders as a local
+/// `DATETIME`, and bytes that parse as a timestamp literal share that form.
 fn key_text(value: &Datum) -> String {
-    format!("{value:?}")
+    match value {
+        Datum::Time(t) => time_key_text(*t),
+        Datum::Bytes(b) => {
+            if let Ok(s) = std::str::from_utf8(b) {
+                if let Ok(t) = sealdb_types::time::parse_timestamp_literal(s) {
+                    return time_key_text(t);
+                }
+            }
+            format!("{value:?}")
+        }
+        // Numeric keys compare by value, not representation: a join of
+        // `int 0` with `decimal(4,2) 0.00` must match.
+        Datum::I64(v) => format!("num:{v}"),
+        Datum::U64(v) => format!("num:{v}"),
+        Datum::F64(v) if v.is_finite() && v.fract() == 0.0 && v.abs() < 9.0e18 => {
+            format!("num:{}", *v as i64)
+        }
+        Datum::Decimal(d) => {
+            let mut s = d.to_string();
+            if s.contains('.') {
+                while s.ends_with('0') {
+                    s.pop();
+                }
+                if s.ends_with('.') {
+                    s.pop();
+                }
+            }
+            if s == "-0" {
+                s = "0".to_string();
+            }
+            format!("num:{s}")
+        }
+        // ENUM/SET joins by label; the numeric form is added as a secondary
+        // key so enum ↔ number comparisons (member index / bitmask) hit too.
+        Datum::Enum(e) => key_text(&Datum::Bytes(e.label.clone())),
+        _ => format!("{value:?}"),
+    }
+}
+
+/// Hash keys a build-side value is indexed under. ENUM/SET are indexed by
+/// both their label and their numeric form so `enum_col = int_col` matches
+/// while enum ↔ enum still compares labels (verified before a pair is joined).
+fn index_keys(value: &Datum) -> Vec<String> {
+    match value {
+        Datum::Enum(e) => vec![
+            key_text(&Datum::Bytes(e.label.clone())),
+            format!("num:{}", e.number),
+        ],
+        other => vec![key_text(other)],
+    }
+}
+
+/// Hash keys to look up for a probe value (same forms as `index_keys`).
+fn probe_keys(value: &Datum) -> Vec<String> {
+    index_keys(value)
+}
+
+/// Unique build-row offsets whose join key may equal `key`. ENUM/SET probes
+/// re-check SQL equality so enum labels from different declarations never
+/// join just because their member indexes coincide.
+fn matched_ids(
+    index: &HashMap<String, Vec<usize>>,
+    key: &Datum,
+    build_rows: &[Vec<Datum>],
+    build_schema: &[String],
+    build_key: &ExprNode,
+) -> Result<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for k in probe_keys(key) {
+        let Some(ids) = index.get(&k) else {
+            continue;
+        };
+        for &i in ids {
+            if !seen.insert(i) {
+                continue;
+            }
+            if matches!(key, Datum::Enum(_)) {
+                let build_value = eval_expr_with_row(build_key, build_schema, &build_rows[i])?;
+                if !sealdb_expression::datum_sql_eq(key, &build_value)? {
+                    continue;
+                }
+            }
+            out.push(i);
+        }
+    }
+    Ok(out)
+}
+
+fn time_key_text(mut t: sealdb_types::time::Time) -> String {
+    if matches!(t.tp, sealdb_types::time::TimeType::Timestamp) {
+        if let Ok(local) = sealdb_expression::utc_to_session_local(t) {
+            t = local;
+        }
+    }
+    format!(
+        "time:{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second, t.micro
+    )
 }
 
 /// Join-side index pairs for DML. `None` marks an unmatched outer row so UPDATE /
@@ -729,10 +1345,8 @@ fn probe_inner_pairs(
         if key.is_null() {
             continue;
         }
-        if let Some(matches) = index.get(&key_text(&key)) {
-            for &build_i in matches {
-                out.push((probe_i, build_i));
-            }
+        for bi in matched_ids(&index, &key, build_rows, build_schema, build_key)? {
+            out.push((probe_i, bi));
         }
     }
     Ok(out)
@@ -753,10 +1367,8 @@ fn probe_outer_pairs(
     for (outer_i, outer) in outer_rows.iter().enumerate() {
         let key = eval_expr_with_row(outer_key, outer_schema, outer)?;
         let mut matched = false;
-        if !key.is_null()
-            && let Some(matches) = index.get(&key_text(&key))
-        {
-            for &inner_i in matches {
+        if !key.is_null() {
+            for inner_i in matched_ids(&index, &key, inner_rows, inner_schema, inner_key)? {
                 matched = true;
                 out.push(if outer_is_left {
                     (Some(outer_i), Some(inner_i))
@@ -788,7 +1400,9 @@ fn build_index_ids(
         if value.is_null() {
             continue;
         }
-        index.entry(key_text(&value)).or_default().push(i);
+        for k in index_keys(&value) {
+            index.entry(k).or_default().push(i);
+        }
     }
     Ok(index)
 }
@@ -819,6 +1433,7 @@ mod tests {
                 })),
             }),
             using_cols: Vec::new(),
+            natural: false,
             straight: false,
         }
     }

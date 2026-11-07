@@ -528,6 +528,30 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     Ok(out)
 }
 
+/// `--sorted_result` ordering: mysql-tester compares raw cell bytes, and a SQL
+/// NULL is a nil slice, so it sorts before every non-NULL value (and before the
+/// empty string). Rendered `"NULL"` cells are therefore ordered first, with the
+/// remaining cells compared bytewise.
+fn sort_rows(rows: &mut [Vec<String>]) {
+    fn cell_key(cell: &str) -> Option<&str> {
+        (cell != "NULL").then_some(cell)
+    }
+    rows.sort_by(|a, b| {
+        for (x, y) in a.iter().zip(b.iter()) {
+            match (cell_key(x), cell_key(y)) {
+                (None, None) => continue,
+                (None, Some(_)) => return std::cmp::Ordering::Less,
+                (Some(_), None) => return std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) => match x.as_bytes().cmp(y.as_bytes()) {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return other,
+                },
+            }
+        }
+        a.len().cmp(&b.len())
+    });
+}
+
 fn run_step(session: &Session, step: &Step) -> Result<String> {
     if let Some(msg) = &step.echo {
         return Ok(msg.clone());
@@ -559,7 +583,7 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                 lines.push(qr.columns.join("\t"));
                 let mut rows = qr.display_rows();
                 if step.sorted {
-                    rows.sort();
+                    sort_rows(&mut rows);
                 }
                 for row in rows {
                     lines.push(row.join("\t"));
@@ -577,10 +601,16 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
             }
             Ok(out)
         }
-        (Err(err), _) => Ok(format!(
-            "{}\nError {} ({}): {}",
-            step.sql, err.code, err.sqlstate, err.message
-        )),
+        (Err(err), _) => {
+            let mut out = format!(
+                "{}\nError {} ({}): {}",
+                step.sql, err.code, err.sqlstate, err.message
+            );
+            for (re, replacement) in &step.replace_regex {
+                out = re.replace_all(&out, replacement.as_str()).into_owned();
+            }
+            Ok(out)
+        }
     }
 }
 

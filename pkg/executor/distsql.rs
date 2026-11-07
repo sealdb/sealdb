@@ -473,6 +473,26 @@ fn rehydrate_index_datum(
             };
             Ok(Datum::Time(t))
         }
+        Datum::Bytes(b)
+            if matches!(
+                col.field_type.tp,
+                sealdb_types::TYPE_NEW_DECIMAL | sealdb_types::TYPE_DECIMAL
+            ) =>
+        {
+            // Index keys store DECIMAL as its canonical text.
+            Ok(Datum::Decimal(sealdb_types::MyDecimal::parse(
+                &String::from_utf8_lossy(&b),
+            )?))
+        }
+        Datum::Bytes(b)
+            if matches!(
+                col.field_type.tp,
+                sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+            ) =>
+        {
+            let number = col.field_type.enum_set_number(&b);
+            Ok(Datum::Enum(sealdb_types::EnumValue { label: b, number }))
+        }
         other => Ok(other),
     }
 }

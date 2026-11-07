@@ -17,6 +17,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_BAD_NULL => "ErrBadNull",
         errcode::ERR_DUP_ENTRY => "ErrDupEntry",
         errcode::ERR_DATA_OUT_OF_RANGE => "ErrDataOutOfRange",
+        errcode::ERR_WARN_DATA_TRUNCATED => "ErrWarnDataTruncated",
         errcode::ERR_TRUNCATED_WRONG_VALUE => "ErrTruncatedWrongValue",
         errcode::ERR_UNKNOWN_FUNCTION => "ErrUnknownFunction",
         errcode::ERR_WRONG_ARGUMENTS => "ErrWrongArguments",
@@ -50,6 +51,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_VIEW_INVALID => "ErrViewInvalid",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         errcode::ERR_CTE_MAX_RECURSION_DEPTH => "ErrCTEMaxRecursionDepth",
+        errcode::ERR_MEMORY_EXCEEDED => "ErrMemoryExceedForQuery",
         _ => "ErrUnknown",
     }
 }
@@ -69,8 +71,10 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_NO_SUCH_TABLE => "42S02",
         errcode::ERR_BAD_FIELD => "42S22",
         errcode::ERR_WRONG_FIELD_WITH_GROUP => "42000",
+        errcode::ERR_AMBIGUOUS_COLUMN => "23000",
         errcode::ERR_DUP_ENTRY => "23000",
         errcode::ERR_DATA_OUT_OF_RANGE => "22003",
+        errcode::ERR_WARN_DATA_TRUNCATED => "01000",
         errcode::ERR_TRUNCATED_WRONG_VALUE => "22007",
         errcode::ERR_DIVISION_BY_ZERO => "22012",
         errcode::ERR_SUBQUERY_NO_1_ROW => "21000",
