@@ -99,8 +99,19 @@ impl Executor for UpdateExec {
             Vec::with_capacity(matched.len());
         for scanned in matched {
             let mut new_values = scanned.values.clone();
-            apply_assignments(
+            // `SET c = (SELECT … WHERE inner.k = outer.k)`: bind the outer
+            // row's columns so the subquery becomes uncorrelated and can run.
+            let list = bind_outer_assignments(
                 &self.stmt.list,
+                &info,
+                &col_names,
+                &scanned.values,
+                &self.domain,
+                &self.current_db,
+                &self.txn,
+            )?;
+            apply_assignments(
+                &list,
                 &col_names,
                 &scanned.values,
                 col_names.len(),
@@ -747,4 +758,215 @@ pub(crate) fn apply_row_update(
         &encode_row(&col_ids, &new_values),
     )?;
     write_index_keys(txn, info, new_handle, &new_values, new_physical)
+}
+
+/// Bind the UPDATE row's columns inside each assignment's subqueries so the
+/// subquery can be evaluated without an Apply (`SET name = (SELECT … WHERE
+/// inner.id = outer.fk)`).
+fn bind_outer_assignments(
+    list: &[Assignment],
+    info: &TableInfo,
+    col_names: &[String],
+    values: &[Datum],
+    domain: &Arc<Domain>,
+    current_db: &str,
+    txn: &Arc<TxnHandle>,
+) -> Result<Vec<Assignment>> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        if !item.expr.has_subquery() {
+            out.push(item.clone());
+            continue;
+        }
+        let bound = bind_outer_refs(
+            &item.expr,
+            &info.name.o(),
+            col_names,
+            values,
+            &[],
+        );
+        let expr = pre_evaluate_dml_predicate(&bound, domain, current_db, txn)?;
+        out.push(Assignment {
+            table: item.table.clone(),
+            column: item.column.clone(),
+            expr,
+        });
+    }
+    Ok(out)
+}
+
+/// Replace references to the UPDATE target's columns with their current
+/// values. Inside a subquery only table-qualified references to the target
+/// table are rewritten, so inner columns of the same name stay untouched.
+fn bind_outer_refs(
+    expr: &sealdb_parser::ast::ExprNode,
+    outer_table: &str,
+    col_names: &[String],
+    values: &[Datum],
+    inner_tables: &[String],
+) -> sealdb_parser::ast::ExprNode {
+    use sealdb_parser::ast::ExprNode;
+    use sealdb_parser::ast::expressions::ValueExpr;
+
+    let inside = !inner_tables.is_empty();
+    match expr {
+        ExprNode::Column(c) => {
+            let qualified_outer = c
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(outer_table));
+            let bare_outer = c.table.is_none() && !inside;
+            let shadowed = c.table.as_deref().is_some_and(|t| {
+                inner_tables.iter().any(|i| i.eq_ignore_ascii_case(t))
+            });
+            if !shadowed && (qualified_outer || bare_outer) {
+                let name = c.name.as_str();
+                if let Some(i) = col_names
+                    .iter()
+                    .position(|n| n.rsplit('.').next().is_some_and(|b| b.eq_ignore_ascii_case(name)))
+                {
+                    return ExprNode::Value(ValueExpr {
+                        datum: values[i].clone(),
+                    });
+                }
+            }
+            expr.clone()
+        }
+        ExprNode::Binary(b) => {
+            let mut b = b.clone();
+            b.left = Box::new(bind_outer_refs(&b.left, outer_table, col_names, values, inner_tables));
+            b.right =
+                Box::new(bind_outer_refs(&b.right, outer_table, col_names, values, inner_tables));
+            ExprNode::Binary(b)
+        }
+        ExprNode::Unary(u) => {
+            let mut u = u.clone();
+            u.expr = Box::new(bind_outer_refs(&u.expr, outer_table, col_names, values, inner_tables));
+            ExprNode::Unary(u)
+        }
+        ExprNode::Func(f) => {
+            let mut f = f.clone();
+            f.args = f
+                .args
+                .iter()
+                .map(|a| bind_outer_refs(a, outer_table, col_names, values, inner_tables))
+                .collect();
+            ExprNode::Func(f)
+        }
+        ExprNode::Cast(c) => {
+            let mut c = c.clone();
+            c.expr = Box::new(bind_outer_refs(&c.expr, outer_table, col_names, values, inner_tables));
+            ExprNode::Cast(c)
+        }
+        ExprNode::InList(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(bind_outer_refs(&l.expr, outer_table, col_names, values, inner_tables));
+            l.list = l
+                .list
+                .iter()
+                .map(|e| bind_outer_refs(e, outer_table, col_names, values, inner_tables))
+                .collect();
+            ExprNode::InList(l)
+        }
+        ExprNode::Between(b) => {
+            let mut b = b.clone();
+            b.expr = Box::new(bind_outer_refs(&b.expr, outer_table, col_names, values, inner_tables));
+            b.low = Box::new(bind_outer_refs(&b.low, outer_table, col_names, values, inner_tables));
+            b.high =
+                Box::new(bind_outer_refs(&b.high, outer_table, col_names, values, inner_tables));
+            ExprNode::Between(b)
+        }
+        ExprNode::Like(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(bind_outer_refs(&l.expr, outer_table, col_names, values, inner_tables));
+            l.pattern =
+                Box::new(bind_outer_refs(&l.pattern, outer_table, col_names, values, inner_tables));
+            ExprNode::Like(l)
+        }
+        ExprNode::IsNull(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(bind_outer_refs(&i.expr, outer_table, col_names, values, inner_tables));
+            ExprNode::IsNull(i)
+        }
+        ExprNode::Case(c) => {
+            let mut c = c.clone();
+            if let Some(operand) = &c.operand {
+                c.operand = Some(Box::new(bind_outer_refs(
+                    operand,
+                    outer_table,
+                    col_names,
+                    values,
+                    inner_tables,
+                )));
+            }
+            c.when_then = c
+                .when_then
+                .iter()
+                .map(|(when, then)| {
+                    (
+                        bind_outer_refs(when, outer_table, col_names, values, inner_tables),
+                        bind_outer_refs(then, outer_table, col_names, values, inner_tables),
+                    )
+                })
+                .collect();
+            if let Some(else_expr) = &c.else_expr {
+                c.else_expr = Some(Box::new(bind_outer_refs(
+                    else_expr,
+                    outer_table,
+                    col_names,
+                    values,
+                    inner_tables,
+                )));
+            }
+            ExprNode::Case(c)
+        }
+        ExprNode::ScalarSubquery(s) => {
+            let mut s = s.clone();
+            if let sealdb_parser::ast::ResultSetNode::Select(query) = s.query.as_ref() {
+                s.query = Box::new(sealdb_parser::ast::ResultSetNode::Select(
+                    bind_outer_query(query, outer_table, col_names, values, inner_tables),
+                ));
+            }
+            ExprNode::ScalarSubquery(s)
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn bind_outer_query(
+    query: &sealdb_parser::ast::SelectStmt,
+    outer_table: &str,
+    col_names: &[String],
+    values: &[Datum],
+    outer_inner: &[String],
+) -> sealdb_parser::ast::SelectStmt {
+    let mut inner: Vec<String> = outer_inner.to_vec();
+    inner.extend(
+        query
+            .join_tables()
+            .into_iter()
+            .map(|t| t.resolve_name().to_string()),
+    );
+    let mut q = query.clone();
+    for field in &mut q.fields {
+        field.expr = bind_outer_refs(&field.expr, outer_table, col_names, values, &inner);
+    }
+    if let Some(selection) = &q.selection {
+        q.selection = Some(bind_outer_refs(selection, outer_table, col_names, values, &inner));
+    }
+    if let Some(having) = &q.having {
+        q.having = Some(bind_outer_refs(having, outer_table, col_names, values, &inner));
+    }
+    q.group_by = q
+        .group_by
+        .iter()
+        .map(|e| bind_outer_refs(e, outer_table, col_names, values, &inner))
+        .collect();
+    for item in &mut q.order_by {
+        item.expr = bind_outer_refs(&item.expr, outer_table, col_names, values, &inner);
+    }
+    for join in &mut q.joins {
+        join.on = bind_outer_refs(&join.on, outer_table, col_names, values, &inner);
+    }
+    q
 }
