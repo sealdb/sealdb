@@ -421,6 +421,8 @@ fn brie_result(op: &str, path: &str, status: &str) -> QueryResult {
             Datum::Bytes(status.as_bytes().to_vec()),
         ]],
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     }
 }
 

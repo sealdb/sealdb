@@ -33,6 +33,9 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         }
         info.default_expr = col.default.clone();
         info.auto_increment = col.auto_increment;
+        if col.not_null {
+            info.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
+        }
         columns.push(info);
     }
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
@@ -62,12 +65,22 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         {
             info.pk_is_handle = true;
         }
+        let pk_col_offsets: Vec<i32> = if index.primary {
+            idx_cols.iter().map(|ic| ic.offset).collect()
+        } else {
+            Vec::new()
+        };
         info.indices.push(
             IndexInfo::new(idx_id, index.name.clone(), info.name.o(), idx_cols)
                 .with_flags(index.unique, index.primary)
                 .with_global(index.global),
         );
         info.max_idx_id = idx_id;
+        for c in &mut info.columns {
+            if pk_col_offsets.contains(&c.offset) {
+                c.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
+            }
+        }
     }
     Ok(info)
 }
@@ -177,6 +190,7 @@ fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) 
         default: None,
         generated: None,
         auto_increment: false,
+        not_null: false,
     });
     Ok(())
 }

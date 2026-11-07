@@ -275,7 +275,10 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             } else {
                 def.in_values
                     .iter()
-                    .map(|v| v.to_string())
+                    .map(|v| match v {
+                        Some(v) => v.to_string(),
+                        None => "NULL".to_string(),
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             };

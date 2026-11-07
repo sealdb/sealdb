@@ -49,6 +49,11 @@ pub fn take_warnings() -> Vec<(i32, String)> {
     WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
+/// Number of accumulated warnings (used by MySQL OK-packet `Warnings: N`).
+pub fn warnings_len() -> usize {
+    WARNINGS.with(|w| w.borrow().len())
+}
+
 fn push_warning(code: i32, message: impl Into<String>) {
     WARNINGS.with(|w| w.borrow_mut().push((code, message.into())));
 }
@@ -1064,6 +1069,27 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             let n = v.as_i64()?.max(0) as usize;
             Ok(Datum::Bytes(vec![b' '; n]))
+        }
+        // MySQL `LENGTH`/`OCTET_LENGTH`: byte length; `CHAR_LENGTH` counts characters.
+        "LENGTH" | "OCTET_LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 1 argument", func.name),
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bytes = v.as_bytes();
+            let name = func.name.to_ascii_uppercase();
+            let n = if name == "LENGTH" || name == "OCTET_LENGTH" {
+                bytes.len() as i64
+            } else {
+                String::from_utf8_lossy(&bytes).chars().count() as i64
+            };
+            Ok(Datum::I64(n))
         }
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),

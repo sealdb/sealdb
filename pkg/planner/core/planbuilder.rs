@@ -710,6 +710,16 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<Option<Box<PhysicalPlan>>> {
+        if let Some(set) = insert.select_set.as_deref() {
+            let plan = self.build_with_schema(
+                &Statement::SetOpr(set.clone()),
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            )?;
+            return Ok(Some(Box::new(plan)));
+        }
         let Some(select) = insert.select.as_deref() else {
             return Ok(None);
         };

@@ -192,6 +192,9 @@ fn add_column(
         field_type_from_name(&column.type_name)?,
     );
     new_col.default_expr = column.default.clone();
+    if column.not_null {
+        new_col.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
+    }
     let new_id = new_col.id;
     let default_value = column_default_datum(&new_col)?;
     // Existing rows were written before this column existed, so decode them

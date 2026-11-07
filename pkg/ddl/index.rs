@@ -201,9 +201,18 @@ pub(crate) fn backfill_index(
             // same indexed values is 1062 even during write-reorg backfill.
             let ikey = encode_index_key(physical_id, index.id, &idx_vals, handle, index.unique);
             if index.unique && txn.get(ikey.as_bytes())?.is_some() {
+                let entry = idx_vals
+                    .iter()
+                    .map(Datum::display)
+                    .collect::<Vec<_>>()
+                    .join("-");
                 return Err(Error::new(
                     ERR_DUP_ENTRY,
-                    format!("Duplicate entry for key '{}'", index.name.o()),
+                    format!(
+                        "Duplicate entry '{entry}' for key '{}.{}'",
+                        info.name.o(),
+                        index.name.o()
+                    ),
                 ));
             }
             txn.set(

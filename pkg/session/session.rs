@@ -126,6 +126,8 @@ impl Session {
             columns: Vec::new(),
             rows: Vec::new(),
             warnings: Vec::new(),
+            affected_rows: 0,
+            info: String::new(),
         }))
     }
 
@@ -252,6 +254,8 @@ impl Session {
                     columns: Vec::new(),
                     rows: Vec::new(),
                     warnings,
+                    affected_rows: 0,
+                    info: String::new(),
                 });
             }
             Statement::Do(doit) => {
@@ -609,10 +613,12 @@ impl Session {
                 Some(InsertStmt {
                     table: create.table.clone(),
                     ignore: false,
+                    replace: false,
                     partitions: Vec::new(),
                     columns: Vec::new(),
                     rows: Vec::new(),
                     select: Some(select.clone()),
+                    select_set: None,
                     with: None,
                     on_duplicate: Vec::new(),
                 })
@@ -1217,6 +1223,8 @@ fn empty_result() -> QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     }
 }
 
@@ -1243,6 +1251,8 @@ fn show_warnings_result(session: &Session) -> QueryResult {
             })
             .collect(),
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     }
 }
 
@@ -1275,6 +1285,8 @@ fn table_status_result(op: &str, tables: &[TableName], current_db: &str) -> Quer
         columns,
         rows,
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     }
 }
 
@@ -2399,6 +2411,8 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
         columns,
         rows: vec![row],
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     })
 }
 
@@ -3549,10 +3563,12 @@ fn load_data_to_insert(
     Ok(InsertStmt {
         table: load.table.clone(),
         ignore: false,
+        replace: false,
         partitions: Vec::new(),
         columns,
         rows,
         select: None,
+        select_set: None,
         with: None,
         on_duplicate: Vec::new(),
     })
@@ -3644,6 +3660,8 @@ fn try_eval_nextval(
         columns: vec![col_name],
         rows: vec![vec![Datum::I64(value)]],
         warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
     }))
 }
 

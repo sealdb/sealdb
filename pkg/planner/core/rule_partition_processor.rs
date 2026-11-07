@@ -129,6 +129,16 @@ fn prune_with_expr(info: &TableInfo, selection: Option<&ExprNode>) -> Vec<i64> {
     if key_columns.is_empty() {
         return info.prune_partitions(Some(selection));
     }
+    // Deriving the key from `col = const` is only sound when the expression
+    // depends on that one column: with more columns the rest stay NULL, so the
+    // derived value (e.g. `id*2 + b*b …` → NULL for unknown `b`) is not the
+    // row's partition key.
+    let mut distinct = key_columns.clone();
+    distinct.sort_by_key(|c| c.to_ascii_lowercase());
+    distinct.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    if distinct.len() > 1 {
+        return info.prune_partitions(Some(selection));
+    }
     let monotonic = expr_is_monotonic(&key_expr);
     let rewritten = rewrite_prune_selection(
         selection,
