@@ -654,6 +654,16 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
                 |a, b| Ok(a / b),
             )
         }
+        Op::IntDiv => {
+            // MySQL `DIV`: integer division truncating toward zero; both
+            // operands are cast to integers first, `x DIV 0` is NULL.
+            if is_zero_divisor(&right)? {
+                return Ok(Datum::Null);
+            }
+            let li = datum_as_i128(&left)?;
+            let ri = datum_as_i128(&right)?;
+            Ok(Datum::I64((li / ri) as i64))
+        }
         Op::Mod => {
             if is_zero_divisor(&right)? {
                 return div_by_zero();
@@ -796,6 +806,47 @@ fn rewrite_high_not_precedence(op: Op, inner: &ExprNode) -> Option<ExprNode> {
             expr: Box::new(not_inner((*i.expr).clone())),
             not: false,
         })),
+        // `BETWEEN` is folded at lowering time into `x >= lo AND x <= hi`
+        // (negated: `x < lo OR x > hi`); rebind the negation onto `x`.
+        ExprNode::Binary(outer)
+            if matches!(
+                (outer.op, &*outer.left, &*outer.right),
+                (
+                    Op::LogicAnd,
+                    ExprNode::Binary(BinaryOpExpr { op: Op::Ge, .. }),
+                    ExprNode::Binary(BinaryOpExpr { op: Op::Le, .. })
+                ) | (
+                    Op::LogicOr,
+                    ExprNode::Binary(BinaryOpExpr { op: Op::Lt, .. }),
+                    ExprNode::Binary(BinaryOpExpr { op: Op::Gt, .. })
+                )
+            ) =>
+        {
+            let (ExprNode::Binary(l), ExprNode::Binary(r)) =
+                (outer.left.as_ref(), outer.right.as_ref())
+            else {
+                return None;
+            };
+            if l.left.restore_string() != r.left.restore_string() {
+                return None;
+            }
+            Some(ExprNode::Binary(BinaryOpExpr {
+                op: outer.op,
+                left: Box::new(ExprNode::Binary(BinaryOpExpr {
+                    op: l.op,
+                    left: Box::new(not_inner((*l.left).clone())),
+                    right: l.right.clone(),
+                    single_cnf_item: false,
+                })),
+                right: Box::new(ExprNode::Binary(BinaryOpExpr {
+                    op: r.op,
+                    left: Box::new(not_inner((*r.left).clone())),
+                    right: r.right.clone(),
+                    single_cnf_item: false,
+                })),
+                single_cnf_item: false,
+            }))
+        }
         _ => None,
     }
 }

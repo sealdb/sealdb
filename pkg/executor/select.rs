@@ -41,7 +41,7 @@ impl Executor for TableDualExec {
         }
         self.emitted += 1;
         let mut chunk = Chunk::new(self.schema.len(), 1);
-        chunk.append_row(Vec::new());
+        chunk.append_row(vec![sealdb_types::Datum::Null; self.schema.len()]);
         Ok(Some(chunk))
     }
 

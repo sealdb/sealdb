@@ -127,6 +127,7 @@ fn explain_scalar_expr(table: &str, expr: &ExprNode) -> String {
                 Op::Minus => "minus",
                 Op::Mul => "mul",
                 Op::Div => "div",
+                Op::IntDiv => "intdiv",
                 Op::Mod => "mod",
                 Op::Eq => "eq",
                 Op::Ne => "ne",

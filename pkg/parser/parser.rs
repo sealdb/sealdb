@@ -1696,7 +1696,7 @@ mod tests {
                 assert_eq!(part.tp, crate::ast::PartitionType::Range);
                 assert_eq!(part.column, "id");
                 assert_eq!(part.defs.len(), 2);
-                assert_eq!(part.defs[0].less_than, Some(10));
+                assert_eq!(part.defs[0].less_than.as_deref(), Some("10"));
                 assert_eq!(part.defs[1].less_than, None);
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
@@ -1748,8 +1748,8 @@ mod tests {
             crate::ast::Statement::CreateTable(create) => {
                 let part = create.partition.expect("range columns");
                 assert_eq!(part.columns, vec!["a".to_string(), "b".to_string()]);
-                assert_eq!(part.defs[0].less_than, Some(10));
-                assert_eq!(part.defs[0].extra_bounds, vec![Some(20)]);
+                assert_eq!(part.defs[0].less_than.as_deref(), Some("10"));
+                assert_eq!(part.defs[0].extra_bounds, vec![Some("20".to_string())]);
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
@@ -1787,7 +1787,7 @@ mod tests {
                 assert_eq!(part.tp, crate::ast::PartitionType::Range);
                 assert!(part.subpartition_ignored);
                 assert_eq!(part.defs.len(), 2);
-                assert_eq!(part.defs[0].less_than, Some(100));
+                assert_eq!(part.defs[0].less_than.as_deref(), Some("100"));
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
@@ -1802,7 +1802,7 @@ mod tests {
                 assert!(part.subpartition_ignored);
                 assert_eq!(part.defs.len(), 2);
                 assert_eq!(part.defs[0].name, "x");
-                assert_eq!(part.defs[1].less_than, Some(20));
+                assert_eq!(part.defs[1].less_than.as_deref(), Some("20"));
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
@@ -1822,7 +1822,7 @@ mod tests {
                     crate::ast::AlterTableSpec::AddPartition { defs },
                 ] => {
                     assert_eq!(defs[0].name, "p2");
-                    assert_eq!(defs[0].less_than, Some(30));
+                    assert_eq!(defs[0].less_than.as_deref(), Some("30"));
                 }
                 other => panic!("expected ADD PARTITION, got {other:?}"),
             },
