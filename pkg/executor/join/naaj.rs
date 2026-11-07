@@ -27,6 +27,8 @@ pub struct NullAwareAntiJoinExec {
     other_cond: Option<ExprNode>,
     probe_table: String,
     build_table: String,
+    /// Emit only the first N probe columns (`SELECT *`).
+    probe_width: Option<usize>,
     probe: Box<dyn Executor>,
     build: Box<dyn Executor>,
     schema: Vec<String>,
@@ -45,6 +47,7 @@ impl NullAwareAntiJoinExec {
         other_cond: Option<ExprNode>,
         probe_table: String,
         build_table: String,
+        probe_width: Option<usize>,
         probe: Box<dyn Executor>,
         build: Box<dyn Executor>,
     ) -> Self {
@@ -57,6 +60,7 @@ impl NullAwareAntiJoinExec {
             other_cond,
             probe_table,
             build_table,
+            probe_width,
             probe,
             build,
             schema: Vec::new(),
@@ -83,6 +87,8 @@ impl Executor for NullAwareAntiJoinExec {
             let mut schema = probe_schema;
             schema.push(self.bool_column.clone());
             schema
+        } else if let Some(width) = self.probe_width {
+            probe_schema.into_iter().take(width).collect()
         } else {
             probe_schema
         };
@@ -169,7 +175,11 @@ impl Executor for NullAwareAntiJoinExec {
                 row.push(bool_datum_value);
                 out.push(row);
             } else if not_in == Some(true) {
-                out.push(probe_row.clone());
+                let row = match self.probe_width {
+                    Some(width) => probe_row.iter().take(width).cloned().collect(),
+                    None => probe_row.clone(),
+                };
+                out.push(row);
             }
         }
         self.rows = out;

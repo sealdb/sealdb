@@ -1068,16 +1068,14 @@ impl PlanBuilder {
         let outer_right = &j1.right;
         let outer_side =
             self.join_side(select, outer_right, is, current_db, stats, prune_mode)?;
-        // Build=inner (nullable for right outer?); Probe=preserved t1.
-        // Right outer: preserved is right → Probe=right=t1, Build=left=inner.
-        // Our labeling: left=Probe, right=Build. For ROJ preserve right: left=inner?
-        // Golden: Build=inner (t3⋈t2), Probe=t1. So right=Build=inner, left=Probe=t1.
+        // Golden: Build=inner (t3⋈t2), Probe=t1. Right outer null-supplies the
+        // left child, so the inner join is `left` and the preserved t1 `right`.
         let plan = PhysicalPlan::HashJoin {
             tp: JoinType::RightOuter,
-            left: Box::new(outer_side),
-            right: Box::new(inner),
-            left_table: outer_right.name.clone(),
-            right_table: j0.left.name.clone(),
+            left: Box::new(inner),
+            right: Box::new(outer_side),
+            left_table: j0.left.name.clone(),
+            right_table: outer_right.name.clone(),
             on: j1.on.clone(),
         };
         let _ = preserved_name;
@@ -1175,13 +1173,28 @@ impl PlanBuilder {
         } else {
             flip_eq_for_build(outer_on, &base.name)
         };
-        let plan = PhysicalPlan::HashJoin {
-            tp: outer_tp,
-            left: Box::new(outer_side),
-            right: Box::new(inner_join),
-            left_table: outer_right.name.clone(),
-            right_table: base.name.clone(),
-            on,
+        // TiDB lists a left-outer over an inner with Build=inner, Probe=outer;
+        // a right-outer over an inner with Build=inner, Probe=outer as well,
+        // but the executor's right-outer null-supplying side is `left`, so the
+        // inner join moves to `left` only for the right-outer form.
+        let plan = if matches!(outer_tp, JoinType::RightOuter) {
+            PhysicalPlan::HashJoin {
+                tp: outer_tp,
+                left: Box::new(inner_join),
+                right: Box::new(outer_side),
+                left_table: base.name.clone(),
+                right_table: outer_right.name.clone(),
+                on,
+            }
+        } else {
+            PhysicalPlan::HashJoin {
+                tp: outer_tp,
+                left: Box::new(outer_side),
+                right: Box::new(inner_join),
+                left_table: outer_right.name.clone(),
+                right_table: base.name.clone(),
+                on,
+            }
         };
         Ok(Some(wrap_star_join_projection(
             plan, select, is, current_db,
@@ -1269,7 +1282,7 @@ impl PlanBuilder {
                     right: Box::new(right_plan),
                     left_table,
                     right_table,
-                    on: on.clone(),
+                    on: explain_on_expr(on, select),
                 };
                 if reordered {
                     Ok(wrap_star_join_projection(plan, select, is, current_db))
@@ -4576,6 +4589,47 @@ fn needs_window(select: &SelectStmt) -> bool {
     select.fields.iter().any(|f| expr_has_window(&f.expr))
 }
 
+/// TiDB `ExplainInfo` labels join keys with `OrigTblName` (`t t2` → `t.a`).
+/// Only for EXPLAIN: execution resolves columns by the SQL alias.
+fn explain_on_expr(on: &ExprNode, select: &SelectStmt) -> ExprNode {
+    let tables = if in_explain_build() {
+        select.join_tables()
+    } else {
+        return on.clone();
+    };
+    rewrite_col_tables(on, &tables)
+}
+
+fn rewrite_col_tables(
+    on: &ExprNode,
+    tables: &[&sealdb_parser::ast::TableName],
+) -> ExprNode {
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode, UnaryOpExpr};
+    match on {
+        ExprNode::Column(c) => {
+            let mut c = c.clone();
+            if let Some(t) = c.table.as_deref()
+                && let Some(tbl) = tables
+                    .iter()
+                    .find(|tbl| tbl.name.eq_ignore_ascii_case(t))
+            {
+                c.table = Some(tbl.resolve_name().to_string());
+            }
+            ExprNode::Column(c)
+        }
+        ExprNode::Binary(b) => ExprNode::Binary(BinaryOpExpr {
+            op: b.op,
+            left: Box::new(rewrite_col_tables(&b.left, tables)),
+            right: Box::new(rewrite_col_tables(&b.right, tables)),
+        }),
+        ExprNode::Unary(u) => ExprNode::Unary(UnaryOpExpr {
+            op: u.op,
+            expr: Box::new(rewrite_col_tables(&u.expr, tables)),
+        }),
+        other => other.clone(),
+    }
+}
+
 /// True when ON is an equality between `base` and `right` columns only.
 fn outer_join_on_base(on: &ExprNode, base: &str, right: &str) -> bool {
     let ExprNode::Binary(bin) = on else {
@@ -4846,12 +4900,12 @@ fn star_projection_exprs(
 ) -> Vec<String> {
     let mut tables: Vec<TableName> = select.join_tables().into_iter().cloned().collect();
     let any_qualified_star = has_qualified_star(select);
-    let right_outer = matches!(
-        select.joins.last().map(|j| map_join_type(j.tp)),
-        Some(JoinType::RightOuter)
-    );
-    // Preserved (right) side first, then the remaining sides in FROM order.
-    if right_outer && !any_qualified_star && tables.len() > 1 {
+    // `… NATURAL/USING RIGHT JOIN t` merges schemas with the preserved (right)
+    // side first. Plain ON right joins keep FROM order (see select suite).
+    let right_outer_using = select.joins.last().is_some_and(|j| {
+        matches!(map_join_type(j.tp), JoinType::RightOuter) && !j.using_cols.is_empty()
+    });
+    if right_outer_using && !any_qualified_star && tables.len() > 1 {
         let last = tables.pop().unwrap();
         tables.insert(0, last);
     }
@@ -5191,7 +5245,9 @@ fn naaj_plan(
                     });
                     info.push(format!("{outer_q}.{}", c.name.o()));
                     exprs.push(column);
-                    names.push(format!("{outer_q}.{}", c.name.o()));
+                    // Bare names: the operator exposes the probe columns as the
+                    // statement's `SELECT *` schema (EXPLAIN uses `info`).
+                    names.push(c.name.o().to_string());
                 }
             }
         }
@@ -5301,6 +5357,15 @@ fn naaj_plan(
             (outer, inner)
         })
         .collect();
+    // `SELECT *`: the operator hides the injected operand columns.
+    let probe_width = if outer_star && probe_projected {
+        is.and_then(|is| {
+            let (db, table) = outer_tbl.qualified(current_db);
+            is.table_by_name(&db, &table).map(|t| t.columns.len())
+        })
+    } else {
+        None
+    };
     let join = PhysicalPlan::NullAwareAntiJoin {
         info,
         est_rows,
@@ -5312,6 +5377,7 @@ fn naaj_plan(
         other_cond,
         probe_table: outer_name.clone(),
         build_table: inner_name.clone(),
+        probe_width,
         probe: Box::new(probe),
         build: Box::new(build),
     };
@@ -5329,32 +5395,21 @@ fn naaj_plan(
         let mut names: Vec<String> = Vec::new();
         let mut info: Vec<String> = Vec::new();
         if outer_star {
-            if !probe_projected {
-                return child;
-            }
-            if let Some(tbl) = is.and_then(|is| {
-                let (db, table) = outer_tbl.qualified(current_db);
-                is.table_by_name(&db, &table)
-            }) {
-                for c in &tbl.columns {
-                    exprs.push(naaj_column(c.name.o().to_string()));
-                    names.push(c.name.o().to_string());
-                    info.push(format!("{outer_q}.{}", c.name.o()));
+            // `SELECT *`: the anti join already emits the probe schema; the
+            // injected operand projection's extra columns are not selected.
+            return child;
+        }
+        for f in &select.fields {
+            exprs.push(naaj_strip_quals(&f.expr));
+            match &f.expr {
+                ExprNode::Column(col) => {
+                    names.push(col.name.clone());
+                    info.push(col.name.clone());
                 }
-            }
-        } else {
-            for f in &select.fields {
-                exprs.push(naaj_strip_quals(&f.expr));
-                match &f.expr {
-                    ExprNode::Column(col) => {
-                        names.push(col.name.clone());
-                        info.push(col.name.clone());
-                    }
-                    other => {
-                        let text = other.restore_string();
-                        names.push(text.clone());
-                        info.push(text);
-                    }
+                other => {
+                    let text = other.restore_string();
+                    names.push(text.clone());
+                    info.push(text);
                 }
             }
         }

@@ -69,6 +69,23 @@ impl ExecutorBuilder {
                     let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
                     return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
                 }
+                // HAVING decorates the aggregate input with a projection whose
+                // exprs are EXPLAIN placeholders (`cast(…) ->Column#13`); the
+                // aggregate executor evaluates its arguments against the child
+                // rows, so the projection only passes rows through.
+                if select.having.is_some()
+                    && !is_agg_plan(&child)
+                    && is_explain_only_projection(exprs)
+                {
+                    return Ok(child_exec);
+                }
+                // `SELECT g, count(*) … HAVING …` plans a Projection above the
+                // aggregate purely for EXPLAIN shape; the aggregate executor
+                // already emits the SELECT-list columns in order.
+                if is_agg_plan(&child) && is_agg_rename_projection(select) {
+                    let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
+                    return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
+                }
                 let (exprs, names) = expand_projection_fields(select, &from_cols);
                 let mut exec = ProjectionExec::new(exprs, names, child_exec);
                 if select.fields.iter().any(|field| field.expr.has_subquery()) {
@@ -113,6 +130,14 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::Selection { child, filter } => {
+                // TiDB's printed HAVING filter references the aggregate's
+                // `Column#N` outputs; `HashAggExec` already evaluates HAVING, so
+                // the selection is EXPLAIN-only and must not run.
+                if stmt.as_select().is_some_and(|s| s.having.is_some())
+                    && is_explain_only_filter(filter)
+                {
+                    return Self::build(child, stmt, domain, current_db, txn);
+                }
                 let under_index = matches!(
                     child.as_ref(),
                     PhysicalPlan::IndexReader { .. }
@@ -664,6 +689,7 @@ impl ExecutorBuilder {
                 other_cond,
                 probe_table,
                 build_table,
+                probe_width,
                 probe,
                 build,
                 ..
@@ -676,6 +702,7 @@ impl ExecutorBuilder {
                 other_cond.clone(),
                 probe_table.clone(),
                 build_table.clone(),
+                *probe_width,
                 Self::build(probe, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?,
                 Self::build(build, stmt, domain, current_db, txn)?,
             ))),
@@ -1301,6 +1328,50 @@ fn is_window_plan(plan: &PhysicalPlan) -> bool {
         }
         _ => false,
     }
+}
+
+/// True when the plan's top executor is an aggregation (optionally under
+/// shuffle), i.e. the executor already emits the SELECT-list columns.
+fn is_agg_plan(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::HashAgg { .. } | PhysicalPlan::StreamAgg { .. } => true,
+        PhysicalPlan::Shuffle { child, .. } | PhysicalPlan::ShuffleReceiver { child } => {
+            is_agg_plan(child)
+        }
+        // HAVING plans a Selection between the projection and the aggregation.
+        PhysicalPlan::Selection { child, .. } => is_agg_plan(child),
+        _ => false,
+    }
+}
+
+/// Projection exprs generated purely for EXPLAIN shape (`… ->Column#N`): no
+/// executor evaluates that text, so the node must not re-evaluate SELECT fields.
+fn is_explain_only_projection(exprs: &[String]) -> bool {
+    !exprs.is_empty() && exprs.iter().all(|expr| expr.contains("->Column#"))
+}
+
+/// Filter that references aggregate output placeholders (`Column#5`) instead of
+/// real columns — TiDB `ExplainInfo` text that has no executor binding.
+fn is_explain_only_filter(filter: &ExprNode) -> bool {
+    let cols = filter.referenced_columns();
+    !cols.is_empty()
+        && cols.iter().all(|(_, name)| {
+            name.strip_prefix("Column#")
+                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        })
+}
+
+/// `SELECT g, count(*) …` above an aggregate: the projection only renames the
+/// aggregate output, so re-evaluating the field expressions would call
+/// `count(*)` as a scalar function. Mixed expressions (`count(*)+1`) still need
+/// the regular projection path.
+fn is_agg_rename_projection(select: &sealdb_parser::ast::SelectStmt) -> bool {
+    !select.fields.is_empty()
+        && select.fields.iter().all(|field| match &field.expr {
+            ExprNode::Column(_) => true,
+            ExprNode::Func(f) => crate::aggfuncs::is_agg_name(&f.name),
+            _ => false,
+        })
 }
 
 /// `Column#8->Column#9` style projection emitted by the window plan builder.
