@@ -5091,6 +5091,7 @@ fn index_plan(
             partition_access,
             row_count: 10_000.0,
             pushed: None,
+            range_scan: None,
         }
     } else {
         PhysicalPlan::IndexLookUpReader {
@@ -5368,6 +5369,7 @@ fn count_star_unique_join_plan(
         partition_access: String::new(),
         row_count: table_row_count(stats, from, current_db),
         pushed: None,
+        range_scan: None,
     };
     Some(PhysicalPlan::stream_agg(
         reader,
@@ -5656,6 +5658,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             partitions,
             partition_access,
             row_count,
+            range_scan,
             ..
         } => PhysicalPlan::IndexReader {
             table,
@@ -5664,6 +5667,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             partitions,
             partition_access,
             row_count,
+            range_scan,
             pushed,
         },
         PhysicalPlan::IndexLookUpReader {
@@ -5904,6 +5908,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 partition_access,
                 row_count,
                 pushed,
+                range_scan,
             } => PhysicalPlan::IndexReader {
                 table,
                 index,
@@ -5911,6 +5916,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 partitions,
                 partition_access,
                 row_count,
+                range_scan,
                 pushed: pushed.as_ref().map(|p| rewrite_col_tables(p, tables)),
             },
             PhysicalPlan::HashJoin {
@@ -7423,6 +7429,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             partition_access: String::new(),
             row_count: 9_990.0,
             pushed: Some(bytes_info("KEEP_ORDER")),
+            range_scan: None,
         };
         let probe_sel = format!("not(isnull({schema}.s.a))");
         let probe = PhysicalPlan::IndexReader {
@@ -7435,6 +7442,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             pushed: Some(bytes_info(&format!(
                 "RANGE_SEL|{probe_sel}|decided by [eq({schema}.s.a, {schema}.t.a)]"
             ))),
+            range_scan: None,
         };
         let info = format!(
             "IndexHashJoin|inner join, inner:IndexReader, outer key:{schema}.t.a, inner key:{schema}.s.a, equal cond:eq({schema}.t.a, {schema}.s.a)"
@@ -7466,6 +7474,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         partition_access: String::new(),
         row_count: 64.0,
         pushed: Some(bytes_info(&format!("RANGE_SEL|{probe_sel}|{range}"))),
+        range_scan: None,
     };
     let build_t = || PhysicalPlan::TableReader {
         table: "t".into(),
@@ -7495,6 +7504,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
             pushed: Some(bytes_info(&format!(
                 "KEEP_ORDER_SEL|not(isnull({schema}.s.b))"
             ))),
+            range_scan: None,
         };
         let join = PhysicalPlan::MergeJoin {
             left: Box::new(build_t()),
@@ -8234,6 +8244,7 @@ fn global_index_join_plan(
             partition_access,
             row_count: est,
             pushed: Some(range_sel_push(&sel, &range_info)),
+            range_scan: None,
         }
     } else {
         PhysicalPlan::IndexLookUpReader {
@@ -8346,6 +8357,7 @@ fn index_join_in_subq_plan(
             partition_access: String::new(),
             row_count: 12_500.0,
             pushed: Some(range_push(&range)),
+            range_scan: None,
         };
         let info = format!(
             "semi join, inner:IndexReader, outer key:{schema}.t1.a, inner key:{schema}.t2.a, equal cond:eq({schema}.t1.a, {schema}.t2.a)"
@@ -8367,6 +8379,7 @@ fn index_join_in_subq_plan(
             partition_access: String::new(),
             row_count: 10_000.0,
             pushed: None,
+            range_scan: None,
         },
         format!("group by:{schema}.t2.a, funcs:firstrow({schema}.t2.a)->{schema}.t2.a"),
         "",
@@ -8465,6 +8478,7 @@ fn count_in_apply_index_join(
         partition_access: String::new(),
         row_count: 5.0,
         pushed: Some(range_push(&idx_range)),
+        range_scan: None,
     };
     let t1_range = format!("decided by [{schema}.{phys}.a]");
     let t1_reader = PhysicalPlan::TableReader {
@@ -8826,6 +8840,19 @@ fn access_plan(
                 continue;
             }
             if let Some(index) = info.find_index_covering(&range.column) {
+                // TiDB access-path selection sizes every index starting with the
+                // range column; the covering one wins because it avoids the
+                // table probe (`select a, b ... where a < 3` reads IDX_ab).
+                let covered = info
+                    .indices
+                    .iter()
+                    .filter(|idx| {
+                        idx.columns
+                            .first()
+                            .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&range.column))
+                    })
+                    .find(|idx| select_covers_index(select, info, idx));
+                let index = covered.unwrap_or(index);
                 // A non-covering range lookup adds a table probe per row; TiDB's
                 // cost model keeps the full table scan for this shape.
                 if !select_covers_index(select, info, index) {

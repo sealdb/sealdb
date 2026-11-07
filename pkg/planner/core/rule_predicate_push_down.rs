@@ -147,6 +147,7 @@ fn push_into(
             partition_access,
             row_count,
             pushed,
+            range_scan,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
@@ -162,6 +163,34 @@ fn push_into(
                         .is_some_and(|info| full_domain_conjunct(info, expr))
                 })
                 .collect();
+            // TiDB ranger: predicates on the index prefix become the access
+            // range, so they leave the cop Selection and drive estRows.
+            let mut range_scan = range_scan;
+            let pushed = pushed;
+            let mut row_count = row_count;
+            let mut pushable = pushable;
+            if range_scan.is_none()
+                && pushed.is_none()
+                && let Some(info) = table_info.as_ref()
+            {
+                let index_info = info
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(&index));
+                if let Some(index_info) = index_info
+                    && let Some(access) =
+                        super::access_range::index_access_range(info, index_info, &pushable, row_count)
+                {
+                    pushable.retain(|expr| {
+                        !access
+                            .consumed
+                            .iter()
+                            .any(|c| c.restore_string() == expr.restore_string())
+                    });
+                    row_count = access.range.filter_rows;
+                    range_scan = Some(access.range);
+                }
+            }
             wrap_residual(
                 PhysicalPlan::IndexReader {
                     table,
@@ -171,6 +200,7 @@ fn push_into(
                     partition_access,
                     row_count,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                    range_scan,
                 },
                 residual,
             )

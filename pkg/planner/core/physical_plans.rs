@@ -21,6 +21,18 @@ pub enum DdlKind {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct IndexScanRange {
+    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1,1]`, `(3,+inf]`.
+    pub text: String,
+    /// `IndexRangeScan` estRows — rows kept by the range alone.
+    pub rows: f64,
+    /// Rows kept by the range plus the residual cop Selection.
+    pub filter_rows: f64,
+    /// Unanalyzed table: EXPLAIN prints `stats:pseudo` on the scan.
+    pub pseudo: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub enum PhysicalPlan {
     TableDual {
         row_count: usize,
@@ -128,6 +140,11 @@ pub enum PhysicalPlan {
         row_count: f64,
         #[serde(skip)]
         pushed: Option<ExprNode>,
+        /// Access range from predicates on the index prefix (`None` = full
+        /// index scan). Drives the `IndexRangeScan range:…` EXPLAIN shape and
+        /// its estRows.
+        #[serde(default)]
+        range_scan: Option<IndexScanRange>,
     },
     /// Union of partial index scans (OR of indexed equalities) then table lookup.
     /// Completeness wave IndexMerge MVB; intersection / cost skyline deferred.

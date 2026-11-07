@@ -1730,6 +1730,7 @@ fn emit_cop_children(
             row_count,
             partition_access,
             pushed,
+            range_scan,
         } => {
             // The reader node carries the GLOBAL partition label; the scan keeps
             // `table:…, index:…` without the (executor-only) partition ids.
@@ -1948,6 +1949,75 @@ fn emit_cop_children(
                 } else {
                     "keep order:false, stats:pseudo".to_string()
                 };
+            }
+            // Planner-built access range: predicates on the index prefix became
+            // `range:…`; leftovers stay a cop Selection above the scan.
+            if let Some(range) = range_scan {
+                let keep = if range.pseudo {
+                    format!("range:{}, keep order:false, stats:pseudo", range.text)
+                } else {
+                    format!("range:{}, keep order:false", range.text)
+                };
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                if let Some(filter) = pushed.as_ref() {
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: *row_count,
+                            task: "cop[tikv]",
+                            access: String::new(),
+                            info: explain_pushed_filter(table, filter),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: range.rows,
+                            task: "cop[tikv]",
+                            access,
+                            info: keep,
+                        },
+                        if under_bushy { &scan_spine } else { &[] },
+                    );
+                } else {
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: range.rows,
+                            task: "cop[tikv]",
+                            access,
+                            info: keep,
+                        },
+                        if under_bushy {
+                            if scan_spine.is_empty() {
+                                cop_spine
+                            } else {
+                                &scan_spine
+                            }
+                        } else {
+                            &[]
+                        },
+                    );
+                }
+                return true;
             }
             // RANGE: marker → IndexRangeScan with decided-by info.
             if let Some(range_info) = range_pushed(pushed.as_ref()) {
@@ -3289,6 +3359,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::IndexReader {
             partition_access,
             pushed,
+            range_scan,
             ..
         } => (
             "IndexReader".to_string(),
@@ -3305,6 +3376,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 "index:Selection".to_string()
             } else if range_pushed(pushed.as_ref()).is_some() {
                 "index:IndexRangeScan".to_string()
+            } else if range_scan.is_some() {
+                if pushed.is_some() {
+                    "index:Selection".to_string()
+                } else {
+                    "index:IndexRangeScan".to_string()
+                }
             } else if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
@@ -3816,6 +3893,13 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if range_pushed(Some(filter)).is_some() => *row_count,
+        // Planner-built access range: row_count already holds the range ×
+        // residual-Selection estimate computed by the detacher.
+        PhysicalPlan::IndexReader {
+            row_count,
+            range_scan: Some(_),
+            ..
+        } => *row_count,
         PhysicalPlan::IndexReader { row_count, pushed: None, .. } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(filter),

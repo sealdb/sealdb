@@ -350,6 +350,7 @@ fn index_reader(
         partition_access: String::new(),
         row_count: 10_000.0,
         pushed: None,
+        range_scan: None,
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod access_range;
 pub mod apply;
 pub mod cte;
 pub mod explain;

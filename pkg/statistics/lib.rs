@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod handle;
+pub mod pseudo;
 pub mod table;
 
 pub use handle::{Handle, STATS_STORAGE_KEY};
