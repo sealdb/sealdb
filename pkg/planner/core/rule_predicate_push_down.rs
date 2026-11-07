@@ -326,12 +326,7 @@ fn push_into(
                 )
             }
         }
-        other => {
-            if std::env::var_os("SEALDB_PUSH_DEBUG").is_some() {
-                eprintln!("[push] fallback on {:?}", std::mem::discriminant(&other));
-            }
-            wrap_residual(other, conjuncts)
-        }
+        other => wrap_residual(other, conjuncts),
     }
 }
 

@@ -289,6 +289,9 @@ pub enum PhysicalPlan {
         /// Outer / inner table names, for qualified column resolution.
         probe_table: String,
         build_table: String,
+        /// Emit only the first N probe columns (`SELECT *` drops the injected
+        /// row-operand columns TiDB keeps internal to the operator).
+        probe_width: Option<usize>,
         probe: Box<PhysicalPlan>,
         build: Box<PhysicalPlan>,
     },
