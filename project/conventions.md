@@ -74,9 +74,16 @@ fix(session): ONLY_FULL_GROUP_BY validates CTE and derived-table bodies
   `chore` / `build` / `ci` / `revert`
 - `scope`：受影响的目录或 crate，多域用逗号分隔（`fix(meta,types,errno): …`）
 - `subject`：祈使句、小写开头、句尾不加句号
-- **行长**：标题 ≤ 80 字符；正文每行 ≤ 100 字符（URL 除外），需要连贯时先断句再换行
+- **行长**：标题 ≤ **72** 字符；正文每行 ≤ **80** 字符
+  - 个别行确有必要时允许适度突破：标题最多 80、正文最多 100，且应罕见
+  - URL、以及单个不可断词本身已超宽的行不受限制（如
+    `ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET`）
 - 标题与正文之间空一行；正文说明「改了什么 + 为什么」，不复述 diff
 - 禁止 `Co-authored-by` trailer
+
+72/80 的选择理由：`git log --oneline`、邮件引用（`> `）与 `format-patch`
+在 72~80 列内渲染最稳；`gitlint` 默认 `title-max-length = 72`、
+`body-max-line-length = 80` 即同档。
 
 校验脚本：`project/scripts/check_commit_msg.sh`。安装为本地 hook：
 
