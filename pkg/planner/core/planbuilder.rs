@@ -1,7 +1,7 @@
 use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
 use super::plan_cost::{
-    eq_row_count_value, index_lookup_cost, point_get_cost, prefer_topn, table_row_count,
-    table_scan_cost,
+    eq_row_count_value, index_lookup_cost, partition_filter_rows, point_get_cost, prefer_topn,
+    table_row_count, table_scan_cost,
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension, eq_join_edge};
@@ -63,6 +63,17 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
+                // Partition pruning evaluates the 1:1 simplified predicate:
+                // `1 = 1 AND a != 1` → `a != 1`, `1 = 0 OR …` keeps a `0`
+                // disjunct. TiDB folds this while building the datasource.
+                let folded_select;
+                let select = match fold_partition_selection(select, is, current_db) {
+                    Some(folded) => {
+                        folded_select = folded;
+                        &folded_select
+                    }
+                    None => select,
+                };
                 // TiDB quantified `!= ANY` / `= ALL` → agg + CARTESIAN join.
                 if let Some(plan) =
                     quantified_cmp_plan(select, is, current_db, stats, prune_mode)
@@ -622,6 +633,7 @@ fn dml_delete_rowid_projection(
         partition_access,
         row_count,
         stats_pseudo,
+        filter_est,
         pushed,
     } = plan.clone()
     else {
@@ -645,6 +657,7 @@ fn dml_delete_rowid_projection(
         partition_access,
         row_count: -est,
         stats_pseudo,
+        filter_est,
         pushed: Some(cop_proj_sel_push(&proj, &sel_info)),
     }
 }
@@ -2165,6 +2178,7 @@ fn push_inner_null_reject(
             op: Op::LogicAnd,
             left: Box::new(filter),
             right: Box::new(extra),
+            single_cnf_item: false,
         });
     }
     predicate_push_down(side, &filter, is, current_db)
@@ -2477,6 +2491,7 @@ fn push_inner_range_scan(plan: PhysicalPlan, range: &str) -> PhysicalPlan {
                 row_count
             },
             stats_pseudo,
+            filter_est: None,
             pushed: Some(range_push(range)),
         },
         other => other,
@@ -4015,6 +4030,7 @@ fn push_single_side_on(
                 op: Op::Eq,
                 left: Box::new(ExprNode::Column(col)),
                 right: Box::new(val),
+                single_cnf_item: false,
             });
             (side_left, filter)
         }
@@ -4311,6 +4327,219 @@ fn point_or_batch(
     }
 }
 
+/// Fold constant predicates for a single-table SELECT over a partition table.
+fn fold_partition_selection(
+    select: &SelectStmt,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    if !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    if from.physical.is_some() {
+        return None;
+    }
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    let part = info.partition.as_ref()?;
+    if !part.enable {
+        return None;
+    }
+    let selection = select.selection.as_ref()?;
+    let folded = rebalance_disjunctions(&fold_const_predicates(&push_down_not(selection, false)));
+    if folded.restore_string() == selection.restore_string() {
+        return None;
+    }
+    let mut folded_select = select.clone();
+    folded_select.selection = Some(folded);
+    Some(folded_select)
+}
+
+fn const_num(expr: &ExprNode) -> Option<i64> {
+    match expr {
+        ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => Some(*v),
+        ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => i64::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+/// TiDB `expressions.RewriteAstExpr` constant folding subset: comparison of two
+/// literals becomes `0`/`1`, and `AND` collapses around a `1` conjunct.
+fn fold_const_predicates(expr: &ExprNode) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => {
+            let left = fold_const_predicates(&bin.left);
+            let right = fold_const_predicates(&bin.right);
+            if matches!(
+                bin.op,
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            ) && let (Some(l), Some(r)) = (const_num(&left), const_num(&right))
+            {
+                let value = match bin.op {
+                    Op::Eq => l == r,
+                    Op::Ne => l != r,
+                    Op::Lt => l < r,
+                    Op::Le => l <= r,
+                    Op::Gt => l > r,
+                    Op::Ge => l >= r,
+                    _ => unreachable!(),
+                };
+                return ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(i64::from(value)),
+                });
+            }
+            if bin.op == Op::LogicAnd {
+                if const_num(&left) == Some(0) || const_num(&right) == Some(0) {
+                    return ExprNode::Value(ValueExpr {
+                        datum: Datum::I64(0),
+                    });
+                }
+                if const_num(&left) == Some(1) {
+                    return right;
+                }
+                if const_num(&right) == Some(1) {
+                    return left;
+                }
+            }
+            if bin.op == Op::LogicOr
+                && (const_num(&left).is_some_and(|v| v != 0)
+                    || const_num(&right).is_some_and(|v| v != 0))
+            {
+                return ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(1),
+                });
+            }
+            ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(left),
+                right: Box::new(right),
+                single_cnf_item: bin.single_cnf_item,
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// TiDB `expression.PushDownNot`: eliminate `NOT` so a negated predicate turns
+/// into the flipped comparison (`NOT a < 2` → `a >= 2`) and De Morgan splits
+/// into `AND`/`OR` the way `EXPLAIN` prints them.
+fn push_down_not(expr: &ExprNode, negated: bool) -> ExprNode {
+    match expr {
+        ExprNode::Unary(unary) if matches!(unary.op, Op::Not | Op::Not2) => {
+            push_down_not(&unary.expr, !negated)
+        }
+        ExprNode::Binary(bin) if matches!(bin.op, Op::LogicAnd | Op::LogicOr) => {
+            let op = if negated {
+                if bin.op == Op::LogicAnd {
+                    Op::LogicOr
+                } else {
+                    Op::LogicAnd
+                }
+            } else {
+                bin.op
+            };
+            ExprNode::Binary(BinaryOpExpr {
+                op,
+                left: Box::new(push_down_not(&bin.left, negated)),
+                right: Box::new(push_down_not(&bin.right, negated)),
+                // De Morgan turns a negated `OR` into one `AND` predicate item;
+                // TiDB keeps it whole (`EXPLAIN` prints `and(..., ...)`).
+                single_cnf_item: negated,
+            })
+        }
+        ExprNode::Binary(bin) if negated => {
+            let flipped = match bin.op {
+                Op::Eq => Op::Ne,
+                Op::Ne => Op::Eq,
+                Op::Lt => Op::Ge,
+                Op::Le => Op::Gt,
+                Op::Gt => Op::Le,
+                Op::Ge => Op::Lt,
+                _ => {
+                    return ExprNode::Unary(UnaryOpExpr {
+                        op: Op::Not,
+                        expr: Box::new(push_down_not(expr, false)),
+                    });
+                }
+            };
+            ExprNode::Binary(BinaryOpExpr {
+                op: flipped,
+                left: Box::new(push_down_not(&bin.left, false)),
+                right: Box::new(push_down_not(&bin.right, false)),
+                single_cnf_item: false,
+            })
+        }
+        ExprNode::InList(list) if negated => {
+            let mut list = list.clone();
+            list.not = !list.not;
+            ExprNode::InList(list)
+        }
+        ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(push_down_not(&bin.left, false)),
+            right: Box::new(push_down_not(&bin.right, false)),
+            single_cnf_item: false,
+        }),
+        other if negated => ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(other.clone()),
+        }),
+        other => other.clone(),
+    }
+}
+
+/// TiDB builds `OR` chains as a balanced binary tree (`Compose`), not the
+/// parser's left-deep shape; EXPLAIN prints the tree, so rebalance it.
+fn rebalance_disjunctions(expr: &ExprNode) -> ExprNode {
+    fn flatten<'a>(expr: &'a ExprNode, out: &mut Vec<&'a ExprNode>) {
+        match expr {
+            ExprNode::Binary(bin) if bin.op == Op::LogicOr => {
+                flatten(&bin.left, out);
+                flatten(&bin.right, out);
+            }
+            other => out.push(other),
+        }
+    }
+
+    fn build(op: Op, items: &[ExprNode]) -> ExprNode {
+        if items.len() == 1 {
+            return items[0].clone();
+        }
+        let mid = items.len() / 2;
+        ExprNode::Binary(BinaryOpExpr {
+            op,
+            left: Box::new(build(op, &items[..mid])),
+            right: Box::new(build(op, &items[mid..])),
+            single_cnf_item: false,
+        })
+    }
+
+    if let ExprNode::Binary(bin) = expr
+        && bin.op == Op::LogicOr
+    {
+        let mut leaves = Vec::new();
+        flatten(expr, &mut leaves);
+        if leaves.len() < 2 {
+            return expr.clone();
+        }
+        let items: Vec<ExprNode> = leaves
+            .into_iter()
+            .map(rebalance_disjunctions)
+            .collect();
+        return build(Op::LogicOr, &items);
+    }
+    match expr {
+        ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(rebalance_disjunctions(&bin.left)),
+            right: Box::new(rebalance_disjunctions(&bin.right)),
+            single_cnf_item: bin.single_cnf_item,
+        }),
+        other => other.clone(),
+    }
+}
+
 /// Build a TableReader / PartitionUnion for a (possibly partitioned) table.
 fn partitioned_table_reader(
     from: &TableName,
@@ -4323,9 +4552,18 @@ fn partitioned_table_reader(
     let planned = resolve_partitions(info, selection, &from.partition_names, prune_mode);
     let row_count = table_row_count(stats, from, current_db);
     let (db, table) = from.qualified(current_db);
-    let stats_pseudo = !stats
+    let table_stats = stats
         .and_then(|h| h.table(&db, &table))
-        .is_some_and(|t| t.version > 0);
+        .filter(|t| t.version > 0);
+    let stats_pseudo = table_stats.is_none();
+    // TiDB derives the filtered cardinality from the prune ranges; exact
+    // value counts give the same estimate for range-partitioned scans.
+    let filter_est = match (info.partition.as_ref(), table_stats.as_ref(), selection) {
+        (Some(part), Some(table_stats), Some(selection)) if part.enable => {
+            partition_filter_rows(table_stats, selection)
+        }
+        _ => None,
+    };
     // Per-partition est for static PartitionUnion children.
     let part_rows = if planned.ids.len() > 1 && stats_pseudo {
         10_000.0
@@ -4367,13 +4605,16 @@ fn partitioned_table_reader(
             let access = if info.partition.as_ref().is_some_and(|p| p.enable) {
                 if planned.all {
                     "all".to_string()
+                } else if planned.names.is_empty() {
+                    // No partition matches the predicate (TiDB scans `dual`).
+                    "dual".to_string()
                 } else {
                     planned.names.join(",")
                 }
             } else {
                 String::new()
             };
-            PhysicalPlan::table_reader_parts(
+            let mut reader = PhysicalPlan::table_reader_parts(
                 from.name.clone(),
                 // `PARTITION (pN)` narrows the scan even in dynamic mode; the
                 // executor only prunes with the filter when ids are empty.
@@ -4382,7 +4623,11 @@ fn partitioned_table_reader(
                 access,
                 row_count,
                 stats_pseudo,
-            )
+            );
+            if let PhysicalPlan::TableReader { filter_est: est, .. } = &mut reader {
+                *est = filter_est;
+            }
+            reader
         }
     }
 }
@@ -5141,6 +5386,7 @@ fn rewrite_col_tables(
             op: b.op,
             left: Box::new(rewrite_col_tables(&b.left, tables)),
             right: Box::new(rewrite_col_tables(&b.right, tables)),
+            single_cnf_item: false,
         }),
         ExprNode::Unary(u) => ExprNode::Unary(UnaryOpExpr {
             op: u.op,
@@ -5559,6 +5805,7 @@ fn flip_eq_for_build(on: &ExprNode, build_table: &str) -> ExprNode {
                     op: Op::Eq,
                     left: Box::new(ExprNode::Column(r.clone())),
                     right: Box::new(ExprNode::Column(l.clone())),
+                    single_cnf_item: false,
                 })
             } else {
                 on.clone()
@@ -6095,6 +6342,7 @@ fn naaj_eq(left: ExprNode, right: ExprNode) -> ExprNode {
         op: Op::Eq,
         left: Box::new(left),
         right: Box::new(right),
+        single_cnf_item: false,
     })
 }
 
@@ -6300,6 +6548,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 10.0,
             stats_pseudo: false,
+            filter_est: None,
             pushed: None,
         }),
     };
@@ -6339,6 +6588,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 536_284.0,
             stats_pseudo: false,
+            filter_est: None,
             pushed: Some(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(filter_null.into_bytes()),
             })),
@@ -6362,10 +6612,12 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
                 table: Some("city".into()),
                 name: "province_id".into(),
             })),
+            single_cnf_item: false,
         })),
         right: Box::new(ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(join_info.as_bytes().to_vec()),
         })),
+        single_cnf_item: false,
     });
     let hash = PhysicalPlan::HashJoin {
         tp: JoinType::LeftOuter,
@@ -6458,6 +6710,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         partition_access: String::new(),
         row_count: 64.0,
         stats_pseudo: false,
+        filter_est: None,
         pushed: Some(t_filter.clone()),
     };
     let agg = |join: PhysicalPlan| PhysicalPlan::HashAgg {
@@ -6581,6 +6834,7 @@ fn index_join_suite_plan(
             partition_access: String::new(),
             row_count: build_rows,
             stats_pseudo: false,
+            filter_est: None,
             pushed: Some(not_null(build_alias)),
         };
         let range = format!(
@@ -6634,6 +6888,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: build_rows,
         stats_pseudo: false,
+        filter_est: None,
         pushed: Some(not_null(build_alias)),
     };
     let probe = PhysicalPlan::TableReader {
@@ -6643,6 +6898,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: probe_rows,
         stats_pseudo: false,
+        filter_est: None,
         pushed: Some(not_null(probe_alias)),
     };
     let join_info = format!(
@@ -6662,10 +6918,12 @@ fn index_join_suite_plan(
                 table: Some(probe_alias.into()),
                 name: "a".into(),
             })),
+            single_cnf_item: false,
         })),
         right: Box::new(ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(join_info.into_bytes()),
         })),
+        single_cnf_item: false,
     });
     Some(PhysicalPlan::Projection {
         exprs: proj,
@@ -6789,6 +7047,7 @@ fn global_index_join_plan(
         partition_access: String::new(),
         row_count: est,
         stats_pseudo: false,
+        filter_est: None,
         pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
     };
     let range_info = format!("decided by [eq({p_name}.{}, {o_name}.{})]", p_col.name, o_col.name);
@@ -7023,6 +7282,7 @@ fn count_in_apply_index_join(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
+        filter_est: None,
         pushed: None,
     };
 
@@ -7046,6 +7306,7 @@ fn count_in_apply_index_join(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
+        filter_est: None,
         pushed: Some(range_push(&t1_range)),
     };
     let index_join = PhysicalPlan::IndexJoin {
@@ -7137,6 +7398,7 @@ fn scalar_max_eq_plan(
                 op: Op::LogicAnd,
                 left: Box::new(acc),
                 right: Box::new(next),
+                single_cnf_item: false,
             })
         })
     };
@@ -7148,6 +7410,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
+        filter_est: None,
         pushed: Some(not_null("b")),
     };
     let hash_agg = PhysicalPlan::hash_agg_cop(
@@ -7171,6 +7434,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
+        filter_est: None,
         pushed: Some(and_filters(&["a", "b", "c"])),
     };
     let join_info = format!(
@@ -7191,10 +7455,12 @@ fn scalar_max_eq_plan(
                 table: Some(phys.to_string()),
                 name: "b".into(),
             })),
+            single_cnf_item: false,
         })),
         right: Box::new(ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(join_info.into_bytes()),
         })),
+        single_cnf_item: false,
     });
     Some(PhysicalPlan::HashJoin {
         tp: JoinType::Inner,

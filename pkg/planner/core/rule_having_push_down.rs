@@ -183,6 +183,7 @@ fn compose_cnf_right(exprs: Vec<ExprNode>) -> Option<ExprNode> {
             op: Op::LogicAnd,
             left: Box::new(e),
             right: Box::new(acc),
+            single_cnf_item: false,
         });
     }
     Some(acc)
@@ -196,6 +197,7 @@ fn compose_dnf_right(exprs: Vec<ExprNode>) -> Option<ExprNode> {
             op: Op::LogicOr,
             left: Box::new(e),
             right: Box::new(acc),
+            single_cnf_item: false,
         });
     }
     Some(acc)
@@ -272,6 +274,7 @@ fn extract_pushable_dnf(expr: &ExprNode) -> Option<ExprNode> {
                 op: Op::LogicOr,
                 left: Box::new(left),
                 right: Box::new(right),
+                single_cnf_item: false,
             }))
         }
         ExprNode::Binary(b) if matches!(b.op, Op::LogicAnd) => {
@@ -594,6 +597,7 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             // scan est is still 10000 when stats_pseudo".
             row_count: -below_est,
             stats_pseudo,
+            filter_est: None,
             pushed,
         },
         other => other,

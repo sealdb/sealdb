@@ -12,7 +12,7 @@ use crate::ast::dml::{
     SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
-    BetweenExpr, BinaryOpExpr, CaseExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
+    BinaryOpExpr, CaseExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
     InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr,
     ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec,
     WindowFrameUnits, WindowFuncExpr, WindowSpec,
@@ -6732,6 +6732,7 @@ fn using_on_expr(left: &TableName, right: &TableName, cols: &[String]) -> Result
                 table: Some(right.name.clone()),
                 name: col.clone(),
             })),
+            single_cnf_item: false,
         })
     });
     let first = eqs.next().expect("non-empty cols");
@@ -6740,6 +6741,7 @@ fn using_on_expr(left: &TableName, right: &TableName, cols: &[String]) -> Result
             op: Op::LogicAnd,
             left: Box::new(acc),
             right: Box::new(next),
+            single_cnf_item: false,
         })
     }))
 }
@@ -7945,6 +7947,31 @@ fn lower_select_item(item: &SelectItem) -> Result<SelectField> {
     }
 }
 
+/// TiDB `buildBetween`: `a BETWEEN x AND y` → `a >= x AND a <= y` (and the
+/// negation to `a < x OR a > y`). Folding here keeps partition pruning / range
+/// scans and EXPLAIN in sync.
+fn between_range(inner: &ExprNode, low: &ExprNode, high: &ExprNode, negated: bool) -> ExprNode {
+    let cmp = |op, left: &ExprNode, right: &ExprNode| {
+        ExprNode::Binary(BinaryOpExpr {
+            op,
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            single_cnf_item: false,
+        })
+    };
+    let (first_op, second_op, logic) = if negated {
+        (Op::Lt, Op::Gt, Op::LogicOr)
+    } else {
+        (Op::Ge, Op::Le, Op::LogicAnd)
+    };
+    ExprNode::Binary(BinaryOpExpr {
+        op: logic,
+        left: Box::new(cmp(first_op, inner, low)),
+        right: Box::new(cmp(second_op, inner, high)),
+        single_cnf_item: false,
+    })
+}
+
 fn lower_expr(expr: &Expr) -> Result<ExprNode> {
     match expr {
         Expr::Value(v) => Ok(ExprNode::Value(ValueExpr {
@@ -7954,11 +7981,38 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             op: lower_binary_op(op)?,
             left: Box::new(lower_expr(left)?),
             right: Box::new(lower_expr(right)?),
+            single_cnf_item: false,
         })),
-        Expr::UnaryOp { op, expr } => Ok(ExprNode::Unary(UnaryOpExpr {
-            op: lower_unary_op(op)?,
-            expr: Box::new(lower_expr(expr)?),
-        })),
+        Expr::UnaryOp { op, expr } => {
+            let lowered_op = lower_unary_op(op)?;
+            // `HIGH_NOT_PRECEDENCE`: `NOT x BETWEEN a AND b` binds as
+            // `(NOT x) BETWEEN a AND b`, so the negation wraps the operand
+            // before the `BETWEEN` range comparisons are built.
+            if matches!(lowered_op, Op::Not | Op::Not2)
+                && crate::parser::high_not_precedence()
+                && let Expr::Between {
+                    expr: inner,
+                    negated: false,
+                    low,
+                    high,
+                } = expr.as_ref()
+            {
+                let negated_inner = ExprNode::Unary(UnaryOpExpr {
+                    op: lowered_op,
+                    expr: Box::new(lower_expr(inner)?),
+                });
+                return Ok(between_range(
+                    &negated_inner,
+                    &lower_expr(low)?,
+                    &lower_expr(high)?,
+                    false,
+                ));
+            }
+            Ok(ExprNode::Unary(UnaryOpExpr {
+                op: lowered_op,
+                expr: Box::new(lower_expr(expr)?),
+            }))
+        }
         Expr::Nested(inner) => lower_expr(inner),
         Expr::Cast {
             expr, data_type, ..
@@ -8034,22 +8088,41 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr,
             list,
             negated,
-        } => Ok(ExprNode::InList(InListExpr {
-            expr: Box::new(lower_expr(expr)?),
-            not: *negated,
-            list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
-        })),
+        } => {
+            let left = Box::new(lower_expr(expr)?);
+            let list = list
+                .iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>>>()?;
+            // TiDB `inToExpression`: a one-element IN list is not kept as IN,
+            // it becomes an equality (`a IN (x)` → `a = x`), which also lets
+            // partition pruning and range scans see the constant.
+            if list.len() == 1 && matches!(*left, ExprNode::Column(_)) {
+                let right = list.into_iter().next().expect("one element");
+                return Ok(ExprNode::Binary(BinaryOpExpr {
+                    op: if *negated { Op::Ne } else { Op::Eq },
+                    left,
+                    right: Box::new(right),
+                    single_cnf_item: false,
+                }));
+            }
+            Ok(ExprNode::InList(InListExpr {
+                expr: left,
+                not: *negated,
+                list,
+            }))
+        }
         Expr::Between {
             expr,
             negated,
             low,
             high,
-        } => Ok(ExprNode::Between(BetweenExpr {
-            expr: Box::new(lower_expr(expr)?),
-            not: *negated,
-            low: Box::new(lower_expr(low)?),
-            high: Box::new(lower_expr(high)?),
-        })),
+        } => Ok(between_range(
+            &lower_expr(expr)?,
+            &lower_expr(low)?,
+            &lower_expr(high)?,
+            *negated,
+        )),
         Expr::Like {
             negated,
             expr,

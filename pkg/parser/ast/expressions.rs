@@ -95,9 +95,23 @@ impl ExprNode {
 
     pub fn split_cnf(&self) -> Vec<ExprNode> {
         match self {
-            ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+            ExprNode::Binary(bin) if bin.op == Op::LogicAnd && !bin.single_cnf_item => {
                 let mut out = bin.left.split_cnf();
                 out.extend(bin.right.split_cnf());
+                out
+            }
+            other => vec![other.clone()],
+        }
+    }
+
+    /// Split the expression into CNF conjuncts, ignoring
+    /// `single_cnf_item` marks. Estimation and pruning need the plain
+    /// conjunct list even when `EXPLAIN` keeps an `AND` as one item.
+    pub fn split_cnf_all(&self) -> Vec<ExprNode> {
+        match self {
+            ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
+                let mut out = bin.left.split_cnf_all();
+                out.extend(bin.right.split_cnf_all());
                 out
             }
             other => vec![other.clone()],
@@ -122,6 +136,7 @@ impl ExprNode {
                 op: Op::LogicAnd,
                 left: Box::new(left),
                 right: Box::new(right),
+                single_cnf_item: false,
             })
         })
     }
@@ -380,6 +395,12 @@ pub struct BinaryOpExpr {
     pub op: Op,
     pub left: Box<ExprNode>,
     pub right: Box<ExprNode>,
+    /// Keep this `AND` as one predicate item instead of splitting it into
+    /// separate CNF conjuncts. TiDB splits the pushed-down predicate list into
+    /// CNF items while pushing down; an `AND` synthesized later by
+    /// `PushDownNot` (e.g. `NOT (a < 2 OR a > -1)`) stays a single item and
+    /// `EXPLAIN` prints it as `and(...)` rather than comma-joining the sides.
+    pub single_cnf_item: bool,
 }
 
 impl BinaryOpExpr {

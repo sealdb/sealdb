@@ -205,6 +205,7 @@ mod tests {
             op: Op::Eq,
             left: Box::new(col(ltable, "id")),
             right: Box::new(col(rtable, "id")),
+            single_cnf_item: false,
         })
     }
 

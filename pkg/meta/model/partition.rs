@@ -212,6 +212,25 @@ impl PartitionInfo {
     }
 
     fn prune_expr(&self, expr: &ExprNode) -> Option<Vec<i64>> {
+        // Folded boolean constants from predicate simplification.
+        if let ExprNode::Value(_) = expr {
+            return match const_datum(expr)? {
+                Datum::I64(1) => Some(self.physical_ids()),
+                Datum::I64(0) => Some(Vec::new()),
+                _ => None,
+            };
+        }
+        // `col IN (v1, v2, …)` prunes to the union of the per-value partitions.
+        if let ExprNode::InList(list) = expr
+            && !list.not
+        {
+            let mut ids = Vec::new();
+            for item in &list.list {
+                let value = const_datum(item)?;
+                ids = union(&ids, &self.prune_point(&value));
+            }
+            return Some(ids);
+        }
         let ExprNode::Binary(bin) = expr else {
             return None;
         };
@@ -258,6 +277,14 @@ impl PartitionInfo {
                 self.locate(&value).ok().map(|id| vec![id])
             }
             PartitionType::Range => Some(self.prune_range(op, &value)),
+        }
+    }
+
+    /// Partitions that can hold `value` (hash/key/list point or range bound).
+    fn prune_point(&self, value: &Datum) -> Vec<i64> {
+        match self.tp {
+            PartitionType::Range => self.prune_range(Op::Eq, value),
+            _ => self.locate(value).map(|id| vec![id]).unwrap_or_default(),
         }
     }
 
@@ -485,6 +512,7 @@ mod tests {
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::I64(v),
             })),
+            single_cnf_item: false,
         })
     }
 

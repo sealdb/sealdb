@@ -469,6 +469,7 @@ fn strip_not_in_marker(expr: ExprNode) -> ExprNode {
                     op: Op::LogicAnd,
                     left: Box::new(l),
                     right: Box::new(r),
+                    single_cnf_item: false,
                 }),
             }
         }
@@ -1431,6 +1432,7 @@ mod tests {
                     table: Some("t2".to_string()),
                     name: "id".to_string(),
                 })),
+                single_cnf_item: false,
             }),
             using_cols: Vec::new(),
             natural: false,

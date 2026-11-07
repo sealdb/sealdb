@@ -184,6 +184,13 @@ fn collect_column_stats(
         let histogram = Some(Histogram::from_sorted(&values, Table::DEFAULT_HIST_BUCKETS));
         let counts: Vec<(String, u64)> = freq.into_iter().collect();
         let topn = Some(TopN::from_counts(&counts, Table::DEFAULT_TOPN));
+        // Planner selectivity for partition pruning needs exact counts; keep
+        // them only for narrow columns.
+        let value_counts = (distinct.len() <= Table::MAX_VALUE_COUNTS).then(|| {
+            let mut exact = counts.clone();
+            exact.sort();
+            exact
+        });
         columns.push((
             col.name.o().to_string(),
             ColumnStats {
@@ -191,6 +198,7 @@ fn collect_column_stats(
                 null_count,
                 histogram,
                 topn,
+                value_counts,
             },
         ));
     }

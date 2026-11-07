@@ -94,6 +94,7 @@ impl Handle {
                                 .collect(),
                         }),
                         topn: col.topn.as_ref().map(|t| t.items.clone()),
+                        value_counts: col.value_counts.clone(),
                     })
                     .collect(),
             })
@@ -133,6 +134,7 @@ impl Handle {
                                     .collect(),
                             }),
                             topn: c.topn.map(|items| TopN { items }),
+                            value_counts: c.value_counts,
                         },
                     )
                 })
@@ -178,6 +180,8 @@ struct PersistColumn {
     histogram: Option<PersistHist>,
     #[serde(default)]
     topn: Option<Vec<(String, u64)>>,
+    #[serde(default)]
+    value_counts: Option<Vec<(String, u64)>>,
 }
 
 #[derive(Serialize, Deserialize)]

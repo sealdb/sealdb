@@ -64,6 +64,9 @@ pub enum PhysicalPlan {
         row_count: f64,
         /// When true, EXPLAIN shows `stats:pseudo` on the cop scan.
         stats_pseudo: bool,
+        /// Filtered cardinality from exact stats (TiDB partition-prune est).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_est: Option<f64>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -561,6 +564,7 @@ impl PhysicalPlan {
             partition_access: String::new(),
             row_count: 10_000.0,
             stats_pseudo: true,
+            filter_est: None,
             pushed: None,
         }
     }
@@ -580,6 +584,7 @@ impl PhysicalPlan {
             partition_access: partition_access.into(),
             row_count,
             stats_pseudo,
+            filter_est: None,
             pushed: None,
         }
     }

@@ -1966,6 +1966,7 @@ mod hex_cmp_tests {
             right: Box::new(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(vec![0x80]),
             })),
+            single_cnf_item: false,
         });
         let err = eval_expr_with_row(&expr, &schema, &row).unwrap_err();
         assert_eq!(err.code, ERR_UNKNOWN_ERROR);
