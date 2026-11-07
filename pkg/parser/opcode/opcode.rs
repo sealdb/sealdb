@@ -17,6 +17,9 @@ pub enum Op {
     LogicOr,
     /// MySQL `XOR` — logical exclusive or (three-valued).
     LogicXor,
+    /// TiDB `opcode.LeftShift` / `RightShift` (`<<`, `>>`).
+    LeftShift,
+    RightShift,
     Not,
     /// TiDB `opcode.Not2` — MySQL `!` (same truth table as `NOT`).
     Not2,
@@ -42,6 +45,8 @@ impl Op {
             Op::LogicAnd => "AND",
             Op::LogicOr => "OR",
             Op::LogicXor => "XOR",
+            Op::LeftShift => "<<",
+            Op::RightShift => ">>",
             Op::Not => "NOT",
             Op::Not2 => "!",
             Op::BitNeg => "~",

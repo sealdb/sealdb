@@ -2635,6 +2635,13 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
         ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".into(),
         ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
         ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::Time(t) }) => t.to_string(),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b),
+        }) => format!(
+            "\"{}\"",
+            String::from_utf8_lossy(b).replace('\\', "\\\\").replace('"', "\\\"")
+        ),
         ExprNode::Binary(bin) => {
             let op = match bin.op {
                 Op::Gt => "gt",
@@ -2649,6 +2656,8 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 Op::Minus => "minus",
                 Op::Mul => "mul",
                 Op::Div => "div",
+                Op::LeftShift => "leftshift",
+                Op::RightShift => "rightshift",
                 _ => return expr.restore_string(),
             };
             format!(
@@ -2704,6 +2713,14 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 pattern
             )
         }
+        ExprNode::IsNull(i) => {
+            let inner = format!("isnull({})", explain_scalar_expr(&i.expr, table));
+            if i.not {
+                format!("not({inner})")
+            } else {
+                inner
+            }
+        }
         other => other.restore_string(),
     }
 }
@@ -2725,11 +2742,13 @@ pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::Ex
     // CNF list → comma-joined (TiDB HAVING pushdown under TableReader).
     let cnf = filter.split_cnf();
     if cnf.len() > 1 {
-        return cnf
+        // TiDB `SortedExplainExpressionList`: CNF items print in sorted order.
+        let mut parts = cnf
             .iter()
             .map(|c| explain_pushed_filter(table, c))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect::<Vec<_>>();
+        parts.sort();
+        return parts.join(", ");
     }
     match filter {
         ExprNode::Binary(bin) if matches!(bin.op, Op::LogicOr | Op::LogicAnd) => {
@@ -2744,6 +2763,8 @@ pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::Ex
                 Op::Eq => "eq",
                 Op::Ne => "ne",
                 Op::Plus => "plus",
+                Op::LeftShift => "leftshift",
+                Op::RightShift => "rightshift",
                 _ => {
                     return explain_scalar_expr(filter, table);
                 }

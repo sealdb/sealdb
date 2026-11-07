@@ -896,7 +896,7 @@
     {
       "name": "executor/partition/partition_with_expression",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/partition/partition_with_expression.test",
       "result": "r/executor/partition/partition_with_expression.result",
       "has_result": true,

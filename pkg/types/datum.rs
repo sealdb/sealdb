@@ -30,6 +30,59 @@ impl EnumValue {
     }
 }
 
+/// MySQL's string-to-number conversion: the longest leading numeric prefix.
+pub fn mysql_numeric_prefix(text: &str) -> f64 {
+    let text = text.trim_start();
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let mut seen_digit = false;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+        seen_digit = true;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        let mut probe = end + 1;
+        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
+            probe += 1;
+            seen_digit = true;
+        }
+        if seen_digit {
+            end = probe;
+        }
+    }
+    if seen_digit
+        && end < bytes.len()
+        && (bytes[end] == b'e' || bytes[end] == b'E')
+    {
+        let mut probe = end + 1;
+        if probe < bytes.len() && (bytes[probe] == b'+' || bytes[probe] == b'-') {
+            probe += 1;
+        }
+        let mut exponent = false;
+        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
+            probe += 1;
+            exponent = true;
+        }
+        if exponent {
+            end = probe;
+        }
+    }
+    if !seen_digit {
+        return 0.0;
+    }
+    text[..end].parse().unwrap_or(0.0)
+}
+
+fn is_numeric_datum(datum: &Datum) -> bool {
+    matches!(
+        datum,
+        Datum::I64(_) | Datum::U64(_) | Datum::F64(_) | Datum::Decimal(_)
+    )
+}
+
 impl Datum {
     pub fn is_null(&self) -> bool {
         matches!(self, Datum::Null)
@@ -135,6 +188,18 @@ impl Datum {
                 .to_f64()
                 .unwrap_or(0.0)
                 .partial_cmp(&(b.number as f64))
+                .unwrap_or(Ordering::Equal),
+            // MySQL compares a string with a number by the string's numeric
+            // prefix (`'10ab' > 9`; `'aaa' > 0` is false).
+            (Datum::Bytes(b), other) if is_numeric_datum(other) => {
+                mysql_numeric_prefix(&String::from_utf8_lossy(b))
+                    .partial_cmp(&other.as_f64().unwrap_or(0.0))
+                    .unwrap_or(Ordering::Equal)
+            }
+            (other, Datum::Bytes(b)) if is_numeric_datum(other) => other
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&mysql_numeric_prefix(&String::from_utf8_lossy(b)))
                 .unwrap_or(Ordering::Equal),
             _ => match (self.as_f64(), other.as_f64()) {
                 (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),

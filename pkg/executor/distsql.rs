@@ -108,7 +108,7 @@ impl Executor for IndexLookUpExecutor {
         let physical = if !self.partitions.is_empty() {
             self.partitions.clone()
         } else if let Some(filter) = self.pushed.as_ref() {
-            info.prune_partitions(Some(filter))
+            sealdb_planner::core::prune_partitions(&info, Some(filter))
         } else {
             info.physical_ids()
         };
@@ -247,7 +247,7 @@ impl Executor for IndexMergeExecutor {
         let physical = if !self.partitions.is_empty() {
             self.partitions.clone()
         } else if let Some(filter) = self.pushed.as_ref() {
-            info.prune_partitions(Some(filter))
+            sealdb_planner::core::prune_partitions(&info, Some(filter))
         } else {
             info.physical_ids()
         };

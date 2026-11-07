@@ -683,6 +683,22 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
         Op::Ge => Ok(bool_datum(
             compare_datums_for_op(&left, &right, Op::Ge)?.is_ge(),
         )),
+        Op::LeftShift | Op::RightShift => {
+            if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
+                return Ok(Datum::Null);
+            }
+            // MySQL shifts as unsigned 64-bit integers.
+            let value = left.as_f64()? as i64 as u64;
+            let shift = right.as_f64()? as i64;
+            let out = if !(1..64).contains(&shift) {
+                if shift <= 0 { value } else { 0 }
+            } else if expr.op == Op::LeftShift {
+                value.wrapping_shl(shift as u32)
+            } else {
+                value >> shift
+            };
+            Ok(Datum::U64(out))
+        }
         _ => Err(Error::unsupported(format!("binary {}", expr.op.restore()))),
     }
 }
@@ -991,11 +1007,34 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "HOUR" => eval_date_part(func, schema, row, |t| i64::from(t.hour)),
         "MINUTE" => eval_date_part(func, schema, row, |t| i64::from(t.minute)),
         "SECOND" => eval_date_part(func, schema, row, |t| i64::from(t.second)),
+        "WEEKDAY" => eval_date_part(func, schema, row, |t| weekday_of(t)),
+        "FLOOR" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FLOOR requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            match value {
+                Datum::Null => Ok(Datum::Null),
+                Datum::I64(_) | Datum::U64(_) => Ok(value),
+                Datum::F64(v) => Ok(Datum::I64(v.floor() as i64)),
+                Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.floor() as i64)),
+                other => Ok(Datum::I64(other.as_f64()?.floor() as i64)),
+            }
+        }
         other => Err(Error::new(
             ERR_UNKNOWN_FUNCTION,
             format!("FUNCTION {other} does not exist"),
         )),
     }
+}
+
+/// MySQL `WEEKDAY`: Monday = 0 .. Sunday = 6.
+fn weekday_of(t: &Time) -> i64 {
+    // 1970-01-01 was a Thursday (WEEKDAY 3).
+    (days_from_civil(t.year, t.month, t.day) + 3).rem_euclid(7)
 }
 
 /// MySQL `SUBSTRING(str, pos[, len])`: 1-based; negative `pos` counts from the
@@ -1567,13 +1606,30 @@ fn eval_unix_timestamp(
             return Ok(Datum::I64(1743296400));
         }
     }
-    // Fallback naive UTC-ish.
-    Ok(Datum::I64(
-        i64::from(t.year - 1970) * 365 * 86400
-            + i64::from(t.hour) * 3600
-            + i64::from(t.minute) * 60
-            + i64::from(t.second),
-    ))
+    // Fallback: epoch seconds of the (session-local) wall clock.
+    let utc = session_local_to_utc(t)?;
+    Ok(Datum::I64(wall_secs(&utc)))
+}
+
+/// Days since the Unix epoch for a civil date (Hinnant's algorithm).
+fn days_from_civil(year: u16, month: u8, day: u8) -> i64 {
+    let y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn wall_secs(t: &Time) -> i64 {
+    days_from_civil(t.year, t.month, t.day) * 86_400
+        + i64::from(t.hour) * 3600
+        + i64::from(t.minute) * 60
+        + i64::from(t.second)
 }
 
 fn eval_from_unixtime(
@@ -1765,6 +1821,15 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         },
         _ => FieldType::new_string(),
     };
+    // MySQL casts a string to a number by its longest numeric prefix
+    // (`cast('10ab' as double)` is `10`).
+    if ft.tp == sealdb_types::TYPE_DOUBLE
+        && let Datum::Bytes(bytes) = &value
+    {
+        return Ok(Datum::F64(sealdb_types::datum::mysql_numeric_prefix(
+            &String::from_utf8_lossy(bytes),
+        )));
+    }
     value.cast(&ft)
 }
 
