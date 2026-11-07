@@ -1593,6 +1593,26 @@
 - **下一步**:
   - `executor/partition/issues` 的 `inl_join(c)` IndexJoin 形状；再依次 `executor/partition/table`、`executor/partition/write`
 
+### 2026-11-07（`executor/partition/table` 转绿）
+
+- **Phase**: R3 分区波
+- **整体快照**: [status-report.md](./status-report.md)（manifest 254 套：green 24 / in_progress 30 / pending 190 / local 8 / deferred 2）
+- **完成**:
+  - `ALTER TABLE ... EXCHANGE PARTITION ... WITH TABLE ...`：parser AST + lower 解析；DDL 侧校验列布局、目标表非分区后交换分区/表 ID（`meta::update_table_with_new_id` 负责 KV 元数据迁移），无物理行改写
+  - `_tidb_rowid` 隐藏投影：非聚簇主键/堆表在 SELECT / WHERE / ORDER BY 显式引用行句柄时，`TableReader` 与 `IndexLookUp` 追加隐藏列 `\u{1}_tidb_rowid`；表达式解析允许未限定名绑定到该隐藏列，且不泄漏进 `SELECT *`
+  - 唯一键 LEFT JOIN 上的 `count(*)` 简化：内表按完整主键等值连接时外层连接可消，改走最窄二级索引的 `StreamAgg → IndexReader → cop StreamAgg`
+  - EXPLAIN：`IndexFullScan` 在全局标量覆盖索引计数下打印 `keep order:false`（`GROUP BY` 仍为 `keep order:true`）
+  - 分区表跳过同步 auto-analyze，对齐 TiDB 的分区异步统计
+  - `SET GLOBAL tidb_partition_prune_mode`（含 `= DEFAULT`）与 mysql-tester session 指令
+- **验证**:
+  - `run-tests.sh -s memory --status green` → PASS: memory=24
+  - `run-tests.sh -s tikv --status green` → PASS: memory=0 tikv=24 skipped=230
+  - `executor/partition/table`：Mem 0 diff、TiKV 0 diff，升 `green`
+- **阻塞/风险**:
+  - `cargo test -p sealdb-session --lib` 在 HEAD 上既有 18 个陈旧单测失败（如期望 `cop` 实际 `cop[tikv]`、`2.0` vs `2.0000`、`SELECT 1 WHERE 0` 返回行），非本次改动引入；集成金样为准，单测待后续单独清理
+- **下一步**:
+  - `executor/partition/issues` 剩余形状（HashAgg / `inl_join` IndexJoin / `_N` 编号）；再做 `executor/partition/write`
+
 ### 2026-11-01
 - **Phase**: 功能波 Unlock + F01
 - **完成**:

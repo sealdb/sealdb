@@ -906,7 +906,7 @@
     {
       "name": "executor/partition/table",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/partition/table.test",
       "result": "r/executor/partition/table.result",
       "has_result": true,
