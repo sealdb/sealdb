@@ -52,6 +52,18 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
+            // NULL column: it filters nothing, so TiDB folds it away and the
+            // scan stays a bare TableFullScan.
+            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let pushable: Vec<_> = pushable
+                .into_iter()
+                .filter(|expr| {
+                    !table_info
+                        .as_ref()
+                        .is_some_and(|info| full_domain_conjunct(info, expr))
+                })
+                .collect();
             // `pk = const` → PointGet (TiDB cte HASH_JOIN on PK CTE).
             if residual.is_empty()
                 && pushed.is_none()
@@ -100,6 +112,18 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
+            // NULL column: it filters nothing, so TiDB folds it away and the
+            // scan stays a bare TableFullScan.
+            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let pushable: Vec<_> = pushable
+                .into_iter()
+                .filter(|expr| {
+                    !table_info
+                        .as_ref()
+                        .is_some_and(|info| full_domain_conjunct(info, expr))
+                })
+                .collect();
             wrap_residual(
                 PhysicalPlan::IndexLookUpReader {
                     table,
@@ -126,6 +150,18 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
+            // NULL column: it filters nothing, so TiDB folds it away and the
+            // scan stays a bare TableFullScan.
+            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let pushable: Vec<_> = pushable
+                .into_iter()
+                .filter(|expr| {
+                    !table_info
+                        .as_ref()
+                        .is_some_and(|info| full_domain_conjunct(info, expr))
+                })
+                .collect();
             wrap_residual(
                 PhysicalPlan::IndexReader {
                     table,
@@ -147,6 +183,18 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) =
                 conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
+            // NULL column: it filters nothing, so TiDB folds it away and the
+            // scan stays a bare TableFullScan.
+            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let pushable: Vec<_> = pushable
+                .into_iter()
+                .filter(|expr| {
+                    !table_info
+                        .as_ref()
+                        .is_some_and(|info| full_domain_conjunct(info, expr))
+                })
+                .collect();
             wrap_residual(
                 PhysicalPlan::IndexMerge {
                     table,
@@ -425,6 +473,108 @@ fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> 
     match (left, right) {
         (None, other) | (other, None) => other,
         (Some(left), Some(right)) => ExprNode::compose_cnf(vec![left, right]),
+    }
+}
+
+/// Integer type bounds `(min, max)` for the column's field type.
+fn int_bounds(ft: &sealdb_types::field_type::FieldType) -> Option<(i128, i128)> {
+    use sealdb_types::field_type::*;
+    let (lo, hi) = if ft.is_unsigned() {
+        match ft.tp {
+            TYPE_TINY => (0, u8::MAX as i128),
+            TYPE_SHORT => (0, u16::MAX as i128),
+            TYPE_INT24 => (0, (1i128 << 24) - 1),
+            TYPE_LONG => (0, u32::MAX as i128),
+            TYPE_LONG_LONG => (0, u64::MAX as i128),
+            _ => return None,
+        }
+    } else {
+        match ft.tp {
+            TYPE_TINY => (i8::MIN as i128, i8::MAX as i128),
+            TYPE_SHORT => (i16::MIN as i128, i16::MAX as i128),
+            TYPE_INT24 => (-(1i128 << 23), (1i128 << 23) - 1),
+            TYPE_LONG => (i32::MIN as i128, i32::MAX as i128),
+            TYPE_LONG_LONG => (i64::MIN as i128, i64::MAX as i128),
+            _ => return None,
+        }
+    };
+    Some((lo, hi))
+}
+
+/// True when the conjunct is a range bound that always holds inside the
+/// column's NOT NULL type domain (`col >= T::MIN`, `col <= T::MAX`, …).
+fn full_domain_conjunct(info: &sealdb_meta::TableInfo, expr: &ExprNode) -> bool {
+    use sealdb_parser::opcode::Op;
+    let ExprNode::Binary(bin) = expr else {
+        return false;
+    };
+    let (col, value, flipped) = match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(c), other) => (c, const_i128(other), false),
+        (other, ExprNode::Column(c)) => (c, const_i128(other), true),
+        _ => return false,
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    // Dropping a bound also drops its NULL filter, so the column must be
+    // NOT NULL: the PRIMARY KEY (clustered handle or index).
+    let non_null = (info.pk_is_handle
+        && info
+            .handle_column()
+            .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&col.name)))
+        || info.indices.iter().any(|idx| {
+            idx.primary
+                && idx
+                    .columns
+                    .iter()
+                    .any(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        });
+    if !non_null {
+        return false;
+    }
+    let Some(column) = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+    else {
+        return false;
+    };
+    let Some((lo, hi)) = int_bounds(&column.field_type) else {
+        return false;
+    };
+    let op = if flipped {
+        match bin.op {
+            Op::Lt => Op::Gt,
+            Op::Le => Op::Ge,
+            Op::Gt => Op::Lt,
+            Op::Ge => Op::Le,
+            other => other,
+        }
+    } else {
+        bin.op
+    };
+    match op {
+        Op::Ge => value <= lo,
+        Op::Le => value >= hi,
+        _ => false,
+    }
+}
+
+fn const_i128(expr: &ExprNode) -> Option<i128> {
+    match expr {
+        ExprNode::Value(v) => match &v.datum {
+            Datum::I64(v) => Some(*v as i128),
+            Datum::U64(v) => Some(*v as i128),
+            Datum::F64(v) if v.fract() == 0.0 => Some(*v as i128),
+            Datum::Decimal(d) => d.to_string().parse().ok(),
+            Datum::Bytes(b) => std::str::from_utf8(b).ok()?.trim().parse().ok(),
+            _ => None,
+        },
+        // `-9223372036854775808` parses as unary minus on a positive literal.
+        ExprNode::Unary(u) if u.op == sealdb_parser::opcode::Op::UnaryMinus => {
+            const_i128(&u.expr).map(|v| -v)
+        }
+        _ => None,
     }
 }
 
