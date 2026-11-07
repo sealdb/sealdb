@@ -109,6 +109,33 @@ impl Mutator {
         self.remove_key(key);
     }
 
+    /// TiDB `AutoIDAllocator` for a table's `AUTO_INCREMENT` column. Explicit
+    /// user values above the counter bump it via [`Mutator::bump_auto_id`].
+    pub fn alloc_auto_id(&mut self, table_id: i64) -> Result<i64> {
+        self.inc_int(format!("NextAutoID:{table_id}").as_bytes(), 1)
+    }
+
+    /// Raise the `AUTO_INCREMENT` counter to at least `value` so a later
+    /// implicit insert does not reuse an explicitly written id.
+    pub fn bump_auto_id(&mut self, table_id: i64, value: i64) -> Result<()> {
+        let key = encode_string_data_key(format!("NextAutoID:{table_id}").as_bytes()).into_bytes();
+        let current = self
+            .get(&key)
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if value > current {
+            self.put(key, value.to_string().into_bytes());
+        }
+        Ok(())
+    }
+
+    pub fn reset_auto_id(&mut self, table_id: i64) {
+        let key =
+            encode_string_data_key(format!("NextAutoID:{table_id}").as_bytes()).into_bytes();
+        self.remove_key(key);
+    }
+
     pub fn load_encoded(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>) {
         self.kv.clear();
         self.removed.clear();

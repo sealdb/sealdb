@@ -9,9 +9,10 @@ use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
 use std::collections::HashMap;
 use sealdb_types::field_type::{
-    FieldType, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION, TYPE_FLOAT,
-    TYPE_JSON, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TIMESTAMP, TYPE_TINY,
-    TYPE_VAR_STRING, TYPE_YEAR,
+    FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
+    TYPE_ENUM, TYPE_FLOAT, TYPE_JSON, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT,
+    TYPE_STRING,
+    TYPE_TIMESTAMP, TYPE_TINY, TYPE_VAR_STRING, TYPE_YEAR,
 };
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
@@ -30,6 +31,8 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
         }
+        info.default_expr = col.default.clone();
+        info.auto_increment = col.auto_increment;
         columns.push(info);
     }
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
@@ -170,7 +173,9 @@ fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) 
     cols.push(ColumnDef {
         name: name.to_string(),
         type_name,
+        default: None,
         generated: None,
+        auto_increment: false,
     });
     Ok(())
 }
@@ -278,7 +283,7 @@ fn type_name_from_datum(datum: &Datum) -> &'static str {
         Datum::F64(_) => "double",
         Datum::Decimal(_) => "decimal",
         Datum::Time(_) => "datetime",
-        Datum::Bytes(_) | Datum::Null => "varchar",
+        Datum::Bytes(_) | Datum::Null | Datum::Enum(_) => "varchar",
     }
 }
 
@@ -357,10 +362,41 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: parse_len(type_name).unwrap_or(-1),
             ..string_ft()
         },
-        // ENUM/SET stored as string for now (TiDB TYPE_ENUM value path later).
-        "ENUM" | "SET" => FieldType {
-            tp: TYPE_VAR_STRING,
+        // ENUM/SET store their member labels as text; comparisons keep the
+        // label until numeric-vs-enum coercion lands (TiDB numeric path).
+        "ENUM" => FieldType {
+            tp: TYPE_ENUM,
             flen: -1,
+            elems: Some(parse_elems(type_name)?),
+            ..string_ft()
+        },
+        "SET" => FieldType {
+            tp: TYPE_SET,
+            flen: -1,
+            elems: Some(parse_elems(type_name)?),
+            ..string_ft()
+        },
+        "BIT" => FieldType {
+            tp: TYPE_BIT,
+            // BIT(n) is an unsigned big-endian bit field (TiDB unsignedFlag).
+            flen: parse_len(type_name).unwrap_or(1),
+            flag: 32,
+            ..numeric_ft()
+        },
+        // BINARY(n) / VARBINARY(n) carry the `binary` charset: values compare
+        // byte-wise and BINARY(n) pads to n bytes on write.
+        "BINARY" => FieldType {
+            tp: TYPE_STRING,
+            flen: parse_len(type_name).unwrap_or(1),
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
+            ..string_ft()
+        },
+        "VARBINARY" => FieldType {
+            tp: TYPE_VAR_STRING,
+            flen: parse_len(type_name).unwrap_or(-1),
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
             ..string_ft()
         },
         "BLOB" => FieldType {
@@ -441,6 +477,86 @@ fn split_type(upper: &str) -> (&str, &str) {
 
 fn parse_len(type_name: &str) -> Option<i32> {
     parse_flen_decimal(type_name).map(|(flen, _)| flen)
+}
+
+/// Parse the member list of `ENUM('a','b')` / `SET('a','b')`, preserving case.
+/// Members are stored unquoted; `''` and `\'` both decode to a quote.
+fn parse_elems(type_name: &str) -> Result<Vec<String>> {
+    let start = type_name
+        .find('(')
+        .ok_or_else(|| Error::unsupported(format!("column type {type_name}")))?;
+    let end = type_name
+        .rfind(')')
+        .ok_or_else(|| Error::unsupported(format!("column type {type_name}")))?;
+    let inner = &type_name[start + 1..end];
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace() || *c == ',') {
+            chars.next();
+        }
+        let Some(&first) = chars.peek() else { break };
+        if first != '\'' && first != '"' {
+            // Unquoted member (`enum(0x61, 1)`): hex literal or bare word.
+            let mut raw = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                raw.push(c);
+                chars.next();
+            }
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            out.push(hex_literal_to_string(raw).unwrap_or_else(|| raw.to_string()));
+            continue;
+        }
+        chars.next();
+        let mut member = String::new();
+        loop {
+            match chars.next() {
+                None => return Err(Error::unsupported(format!("column type {type_name}"))),
+                Some('\\') => {
+                    if let Some(c) = chars.next() {
+                        member.push(c);
+                    }
+                }
+                Some(c) if c == first => {
+                    // Doubled quote is an escaped quote; otherwise the member ends.
+                    if chars.peek() == Some(&first) {
+                        chars.next();
+                        member.push(c);
+                    } else {
+                        break;
+                    }
+                }
+                Some(c) => member.push(c),
+            }
+        }
+        out.push(member);
+    }
+    Ok(out)
+}
+
+/// `0x6162` / `X'6162'` member literal → decoded UTF-8 text.
+fn hex_literal_to_string(raw: &str) -> Option<String> {
+    let hex = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .or_else(|| raw.strip_prefix("x'").and_then(|s| s.strip_suffix('\'')))
+        .or_else(|| raw.strip_prefix("X'").and_then(|s| s.strip_suffix('\'')))?;
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let digits = hex.as_bytes();
+    let mut i = 0;
+    while i + 1 < digits.len() {
+        let hi = (digits[i] as char).to_digit(16)?;
+        let lo = (digits[i + 1] as char).to_digit(16)?;
+        bytes.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Parse `TYPE(flen)` / `TYPE(flen, decimal)` — TiDB FieldType Flen/Decimal.

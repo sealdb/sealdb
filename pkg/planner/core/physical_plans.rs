@@ -168,6 +168,11 @@ pub enum PhysicalPlan {
         left_key: String,
         /// EXPLAIN `right key:select.t2.id`.
         right_key: String,
+        /// TiDB keeps the SQL join kind here (`left outer join …`).
+        tp: JoinType,
+        /// Full EXPLAIN info when `tp` / residual conds decorate it.
+        #[serde(skip)]
+        info: Option<String>,
         #[serde(skip)]
         on: ExprNode,
     },
@@ -288,11 +293,14 @@ pub enum PhysicalPlan {
         build: Box<PhysicalPlan>,
     },
     /// Plan-level Projection that computes row-constructor operands under a
-    /// join (TiDB `injectExtraProjection`). Execution is transparent — the
-    /// join evaluates the operand expressions on the child row itself — but
-    /// EXPLAIN prints the injected Projection.
+    /// null-aware anti join (TiDB `injectExtraProjection`). `info` is the
+    /// EXPLAIN rendering; `exprs`/`names` feed the real projection executor so
+    /// the injected `Column#N` operands exist at runtime.
     RowProjection {
         info: String,
+        #[serde(skip)]
+        exprs: Vec<ExprNode>,
+        names: Vec<String>,
         child: Box<PhysicalPlan>,
     },
 }
@@ -511,7 +519,7 @@ impl PhysicalPlan {
             PhysicalPlan::NullAwareAntiJoin { info, probe, build, .. } => {
                 format!("NullAwareAntiJoin({info}, {}, {})", probe.explain(), build.explain())
             }
-            PhysicalPlan::RowProjection { info, child } => {
+            PhysicalPlan::RowProjection { info, child, .. } => {
                 format!("RowProjection({info}) -> {}", child.explain())
             }
         }

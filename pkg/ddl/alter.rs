@@ -40,6 +40,7 @@ pub fn alter_table(
                 position,
                 *if_not_exists,
                 current_db,
+                storage,
             )?,
             AlterTableSpec::DropColumn { if_exists, name } => {
                 drop_column(meta, &snapshot, stmt, name, *if_exists, current_db)?;
@@ -144,6 +145,7 @@ fn add_column(
     position: &ColumnPosition,
     if_not_exists: bool,
     current_db: &str,
+    storage: &dyn Storage,
 ) -> Result<()> {
     let (schema, table) = resolve_name(&stmt.table, current_db)?;
     let db = is
@@ -170,19 +172,67 @@ fn add_column(
     }
     info.max_col_id += 1;
     let insert_at = column_insert_index(&info, position)?;
-    info.columns.insert(
-        insert_at,
-        ColumnInfo::new(
-            info.max_col_id,
-            insert_at as i32,
-            column.name.clone(),
-            field_type_from_name(&column.type_name)?,
-        ),
+    let mut new_col = ColumnInfo::new(
+        info.max_col_id,
+        insert_at as i32,
+        column.name.clone(),
+        field_type_from_name(&column.type_name)?,
     );
+    new_col.default_expr = column.default.clone();
+    let new_id = new_col.id;
+    let default_value = column_default_datum(&new_col)?;
+    // Existing rows were written before this column existed, so decode them
+    // with the pre-ALTER layout (offsets in `info` already include the new
+    // column and would mis-map the stored values).
+    let old_types = info.col_field_types();
+    info.columns.insert(insert_at, new_col);
     recompute_column_offsets(&mut info);
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
+    if let Some(value) = default_value {
+        backfill_added_column(storage, &info, &old_types, new_id, value)?;
+    }
     Ok(())
+}
+
+/// Evaluate a `DEFAULT <expr>` body for a freshly added column.
+fn column_default_datum(col: &ColumnInfo) -> Result<Option<sealdb_types::Datum>> {
+    let Some(text) = col.default_expr.as_deref() else {
+        return Ok(None);
+    };
+    let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+    let value = sealdb_expression::eval_expr_with_row(&expr, &[], &[])?;
+    Ok(Some(value.cast(&col.field_type)?))
+}
+
+/// `ALTER TABLE … ADD COLUMN … DEFAULT x` fills existing rows with `x`
+/// (TiDB/MySQL expose the default for rows written before the column existed).
+fn backfill_added_column(
+    storage: &dyn Storage,
+    info: &TableInfo,
+    types: &[(i64, sealdb_types::FieldType)],
+    col_id: i64,
+    value: sealdb_types::Datum,
+) -> Result<()> {
+    let mut txn = storage.begin()?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, raw) in pairs {
+            let decoded = decode_row(&raw, types);
+            if decoded.iter().any(|(id, _)| *id == col_id) {
+                continue;
+            }
+            let mut col_ids: Vec<i64> = decoded.iter().map(|(id, _)| *id).collect();
+            let mut values: Vec<sealdb_types::Datum> =
+                decoded.into_iter().map(|(_, v)| v).collect();
+            col_ids.push(col_id);
+            values.push(value.clone());
+            txn.set(&key, &encode_row(&col_ids, &values))?;
+        }
+    }
+    txn.commit()
 }
 
 fn drop_column(

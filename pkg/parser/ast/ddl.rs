@@ -79,9 +79,14 @@ impl ColumnPosition {
 pub struct ColumnDef {
     pub name: String,
     pub type_name: String,
+    /// `DEFAULT <expr>` kept as restored SQL text (evaluated on insert /
+    /// `ALTER TABLE ADD COLUMN` backfill).
+    pub default: Option<String>,
     /// `GENERATED ALWAYS AS (expr) [VIRTUAL|STORED]`; the expression is kept
     /// as restored SQL text so ColumnDef stays Eq/PartialEq.
     pub generated: Option<GeneratedColumn>,
+    /// `AUTO_INCREMENT` column option (MySQL/TiDB).
+    pub auto_increment: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,10 +100,17 @@ impl ColumnDef {
         ctx.write_name(&self.name);
         ctx.write_str(" ");
         ctx.write_str(&self.type_name);
+        if let Some(default) = &self.default {
+            ctx.write_str(" DEFAULT ");
+            ctx.write_str(default);
+        }
         if let Some(g) = &self.generated {
             ctx.write_str(" GENERATED ALWAYS AS (");
             ctx.write_str(&g.expr);
             ctx.write_str(if g.stored { ") STORED" } else { ") VIRTUAL" });
+        }
+        if self.auto_increment {
+            ctx.write_str(" AUTO_INCREMENT");
         }
         Ok(())
     }

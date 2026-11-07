@@ -19,6 +19,12 @@ pub struct ColumnInfo {
     pub generated_expr: Option<String>,
     #[serde(default)]
     pub generated_stored: bool,
+    /// `DEFAULT <expr>` body, restored as SQL text.
+    #[serde(rename = "default", default, skip_serializing_if = "Option::is_none")]
+    pub default_expr: Option<String>,
+    /// `AUTO_INCREMENT` column option (TiDB `ColumnInfo.AutoIncrement`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_increment: bool,
 }
 
 impl ColumnInfo {
@@ -32,6 +38,8 @@ impl ColumnInfo {
             version: CURR_LATEST_COLUMN_INFO_VERSION,
             generated_expr: None,
             generated_stored: false,
+            default_expr: None,
+            auto_increment: false,
         }
     }
 }

@@ -44,13 +44,24 @@ pub fn apply_having_push_down(
     }
     plan = set_agg_est(plan, agg_est);
 
-    if let Some(filter) = compose_cnf_right(residual) {
+    // The Selection above the aggregate resolves residual HAVING aggregates by
+    // their select-list output name (`Column#N`); only build it when every
+    // aggregate in HAVING is projected, otherwise the aggregate executor filters
+    // HAVING itself and no such output column exists.
+    let residual_supported = residual_aggs_projected(&residual, select);
+    if residual_supported
+        && let Some(filter) = compose_cnf_right(residual)
+    {
         plan = PhysicalPlan::Selection {
             filter: rewrite_having_agg_refs(normalize_or_right(filter), select),
             child: Box::new(plan),
         };
     }
-    wrap_having_output_projection(plan, select, current_db)
+    if residual_supported {
+        wrap_having_output_projection(plan, select, current_db)
+    } else {
+        plan
+    }
 }
 
 /// TiDB pseudo selectivity for pushed HAVING filters (cost_model_version=1 goldens).
@@ -285,6 +296,24 @@ fn expr_has_agg(expr: &ExprNode) -> bool {
         ExprNode::Binary(b) => expr_has_agg(&b.left) || expr_has_agg(&b.right),
         ExprNode::Unary(u) => expr_has_agg(&u.expr),
         ExprNode::Cast(c) => expr_has_agg(&c.expr),
+        ExprNode::InList(l) => expr_has_agg(&l.expr) || l.list.iter().any(expr_has_agg),
+        ExprNode::Between(b) => {
+            expr_has_agg(&b.expr) || expr_has_agg(&b.low) || expr_has_agg(&b.high)
+        }
+        ExprNode::Like(l) => expr_has_agg(&l.expr) || expr_has_agg(&l.pattern),
+        ExprNode::IsNull(i) => expr_has_agg(&i.expr),
+        // `count(1) >= ALL (subquery)` compares an aggregate; it can only be
+        // evaluated above the aggregation.
+        ExprNode::QuantifiedCmp(q) => expr_has_agg(&q.expr),
+        ExprNode::InSubquery(i) => expr_has_agg(&i.expr),
+        ExprNode::Row(r) => r.exprs.iter().any(expr_has_agg),
+        ExprNode::Case(c) => {
+            c.operand.as_deref().is_some_and(expr_has_agg)
+                || c.when_then
+                    .iter()
+                    .any(|(w, t)| expr_has_agg(w) || expr_has_agg(t))
+                || c.else_expr.as_deref().is_some_and(expr_has_agg)
+        }
         _ => false,
     }
 }
@@ -568,6 +597,61 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             pushed,
         },
         other => other,
+    }
+}
+
+/// True when every aggregate referenced by a residual HAVING predicate is also
+/// projected by the SELECT list, so the aggregate output names it.
+fn residual_aggs_projected(residual: &[ExprNode], select: &SelectStmt) -> bool {
+    let projected: Vec<String> = select
+        .fields
+        .iter()
+        .filter(|f| expr_has_agg(&f.expr))
+        .map(|f| f.expr.restore_string())
+        .collect();
+    residual.iter().all(|expr| {
+        let mut aggs = Vec::new();
+        collect_agg_texts(expr, &mut aggs);
+        aggs.iter().all(|text| {
+            projected
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(text))
+        })
+    })
+}
+
+fn collect_agg_texts(expr: &ExprNode, out: &mut Vec<String>) {
+    match expr {
+        ExprNode::Func(f) if is_agg_name(&f.name) => {
+            out.push(expr.restore_string());
+        }
+        ExprNode::Func(f) => f.args.iter().for_each(|a| collect_agg_texts(a, out)),
+        ExprNode::Binary(b) => {
+            collect_agg_texts(&b.left, out);
+            collect_agg_texts(&b.right, out);
+        }
+        ExprNode::Unary(u) => collect_agg_texts(&u.expr, out),
+        ExprNode::Cast(c) => collect_agg_texts(&c.expr, out),
+        ExprNode::InList(l) => {
+            collect_agg_texts(&l.expr, out);
+            for item in &l.list {
+                collect_agg_texts(item, out);
+            }
+        }
+        ExprNode::Between(b) => {
+            collect_agg_texts(&b.expr, out);
+            collect_agg_texts(&b.low, out);
+            collect_agg_texts(&b.high, out);
+        }
+        ExprNode::IsNull(i) => collect_agg_texts(&i.expr, out),
+        ExprNode::QuantifiedCmp(q) => collect_agg_texts(&q.expr, out),
+        ExprNode::InSubquery(i) => collect_agg_texts(&i.expr, out),
+        ExprNode::Row(r) => {
+            for item in &r.exprs {
+                collect_agg_texts(item, out);
+            }
+        }
+        _ => {}
     }
 }
 

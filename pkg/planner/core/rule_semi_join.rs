@@ -16,6 +16,15 @@ use sealdb_types::Datum;
 /// Recursively replace Apply nodes that carry a decorrelatable EXISTS/IN
 /// predicate with a left-deep HashJoin Semi or Anti.
 pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
+    rewrite_semi_join_ctx(plan, None, "")
+}
+
+/// InfoSchema-aware variant so `IN (SELECT * …)` can expand the star.
+pub fn rewrite_semi_join_ctx(
+    plan: PhysicalPlan,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Apply {
             child,
@@ -23,8 +32,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             probe,
             info,
         } => {
-            let child = rewrite_semi_join(*child);
-            let probe = probe.map(|p| Box::new(rewrite_semi_join(*p)));
+            let child = rewrite_semi_join_ctx(*child, is, current_db);
+            let probe = probe.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db)));
             // Dual-child Apply (count IN IndexJoin) keeps its shape.
             if probe.is_some() || info.is_some() {
                 PhysicalPlan::Apply {
@@ -34,19 +43,19 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
                     info,
                 }
             } else {
-                rewrite_apply(child, filter)
+                rewrite_apply(child, filter, is, current_db)
             }
         },
         PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             filter,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             by_info,
         },
         PhysicalPlan::TopN {
@@ -55,7 +64,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         } => PhysicalPlan::TopN {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             by_info,
             offset,
             count,
@@ -65,7 +74,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         } => PhysicalPlan::Limit {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             offset,
             count,
         },
@@ -75,7 +84,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         } => PhysicalPlan::HashAgg {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             info,
             cop_info,
             est_rows,
@@ -86,21 +95,21 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         } => PhysicalPlan::StreamAgg {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             info,
             cop_info,
             est_rows,
         },
         PhysicalPlan::Window { info, child } => PhysicalPlan::Window {
             info,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::Shuffle { info, child } => PhysicalPlan::Shuffle {
             info,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::HashJoin {
             tp,
@@ -111,8 +120,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             on,
         } => PhysicalPlan::HashJoin {
             tp,
-            left: Box::new(rewrite_semi_join(*left)),
-            right: Box::new(rewrite_semi_join(*right)),
+            left: Box::new(rewrite_semi_join_ctx(*left, is, current_db)),
+            right: Box::new(rewrite_semi_join_ctx(*right, is, current_db)),
             left_table,
             right_table,
             on,
@@ -125,12 +134,12 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::IndexJoin {
             info,
             est_rows,
-            outer: Box::new(rewrite_semi_join(*outer)),
-            inner: Box::new(rewrite_semi_join(*inner)),
+            outer: Box::new(rewrite_semi_join_ctx(*outer, is, current_db)),
+            inner: Box::new(rewrite_semi_join_ctx(*inner, is, current_db)),
         },
         PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
-            children: children.into_iter().map(|c| Box::new(rewrite_semi_join(*c))).collect(),
+            children: children.into_iter().map(|c| Box::new(rewrite_semi_join_ctx(*c, is, current_db))).collect(),
         },
         PhysicalPlan::DistinctUnion {
             info,
@@ -139,7 +148,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::DistinctUnion {
             info,
             est_rows,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::CTE {
             name,
@@ -155,8 +164,8 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             name,
             alias,
             columns,
-            seed: Box::new(rewrite_semi_join(*seed)),
-            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join(*p))),
+            seed: Box::new(rewrite_semi_join_ctx(*seed, is, current_db)),
+            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db))),
             inline,
             recursive,
             limit,
@@ -171,7 +180,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
             keys,
             fields,
             names,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::Explain {
             format,
@@ -180,7 +189,7 @@ pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::Explain {
             format,
             analyze,
-            child: Box::new(rewrite_semi_join(*child)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         other => other,
     }
@@ -195,10 +204,15 @@ struct SemiSpec {
     outer_filter: Option<ExprNode>,
 }
 
-fn rewrite_apply(mut plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
+fn rewrite_apply(
+    mut plan: PhysicalPlan,
+    filter: ExprNode,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
     let mut leftover = Vec::new();
     for item in filter.split_cnf() {
-        match try_semi_spec(&plan, &item) {
+        match try_semi_spec(&plan, &item, is, current_db) {
             Some(spec) => {
                 let left_table = plan_table(&plan).unwrap_or_else(|| spec.right_table.clone());
                 if let Some(outer_filter) = spec.outer_filter {
@@ -620,7 +634,30 @@ fn recursive_exists_cte_apply(
     })
 }
 
-fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
+/// Names the executor recognizes as the `NOT IN` null-aware anti marker.
+pub const NOT_IN_MARKER: &str = "__NOT_IN__";
+
+/// `Bytes(NOT_IN_MARKER)`: tags an anti join as `NOT IN` (three-valued logic).
+fn not_in_marker() -> ExprNode {
+    ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(NOT_IN_MARKER.as_bytes().to_vec()),
+    })
+}
+
+fn and_expr(left: ExprNode, right: ExprNode) -> ExprNode {
+    ExprNode::Binary(BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
+fn try_semi_spec(
+    outer: &PhysicalPlan,
+    expr: &ExprNode,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+) -> Option<SemiSpec> {
     match expr {
         ExprNode::Exists(exists) => exists
             .query
@@ -632,15 +669,58 @@ fn try_semi_spec(outer: &PhysicalPlan, expr: &ExprNode) -> Option<SemiSpec> {
                 query,
                 plan_table(outer).as_deref(),
                 sub.not,
+                is,
+                current_db,
             )
+            .map(|mut spec| {
+                // `NOT IN` needs three-valued anti-join semantics: a NULL on
+                // either side yields UNKNOWN (row filtered), unlike NOT EXISTS.
+                if sub.not {
+                    spec.on = and_expr(spec.on, not_in_marker());
+                }
+                spec
+            })
         }),
         _ => None,
     }
 }
 
+/// Aggregate subqueries are not plain row sets: `c = ANY (SELECT count(*))`
+/// and `EXISTS (SELECT count(*) …)` must go through Apply rather than a
+/// semi-join whose ON would evaluate the aggregate as a scalar function.
+fn query_has_aggregation(query: &SelectStmt) -> bool {
+    query.distinct
+        || !query.group_by.is_empty()
+        || query.having.is_some()
+        || query.fields.iter().any(|f| expr_has_agg(&f.expr))
+}
+
+fn expr_has_agg(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Func(f) if is_agg_name(&f.name) => true,
+        ExprNode::Func(f) => f.args.iter().any(expr_has_agg),
+        ExprNode::Binary(b) => expr_has_agg(&b.left) || expr_has_agg(&b.right),
+        ExprNode::Unary(u) => expr_has_agg(&u.expr),
+        ExprNode::Cast(c) => expr_has_agg(&c.expr),
+        ExprNode::InList(l) => expr_has_agg(&l.expr) || l.list.iter().any(expr_has_agg),
+        ExprNode::IsNull(i) => expr_has_agg(&i.expr),
+        _ => false,
+    }
+}
+
+fn is_agg_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
+}
+
 /// Correlated `EXISTS` / `NOT EXISTS` with a single equality that mentions
 /// both the inner table and some outer table.
 fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Option<SemiSpec> {
+    if query_has_aggregation(query) {
+        return None;
+    }
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
         let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
@@ -757,13 +837,71 @@ fn from_in(
     query: &SelectStmt,
     outer_table: Option<&str>,
     not: bool,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
 ) -> Option<SemiSpec> {
     let join_tp = if not { JoinType::Anti } else { JoinType::Semi };
     let join_label = if not { "anti semi join" } else { "semi join" };
+    if query_has_aggregation(query) {
+        return None;
+    }
     let inner = simple_inner(query)?;
     // ORDER BY in an IN subquery is meaningless for semi-join and is dropped.
     let (inner_filter, other_conds) = split_in_selection(query.selection.as_ref(), &inner.name)?;
-    let inner_expr = qualify_table(query.fields.first()?.expr.clone(), &inner.name);
+    // `IN (SELECT * FROM t)` compares against the table's (single) column:
+    // expand the star so the join gets a real column, not the `*` marker.
+    let inner_field = match query.fields.as_slice() {
+        [field] if is_star_field(&field.expr) => {
+            let columns = is.and_then(|is| {
+                let (db, table) = inner.qualified(current_db);
+                is.table_by_name(&db, &table).map(|info| {
+                    info.columns
+                        .iter()
+                        .map(|c| {
+                            ExprNode::Column(ColumnNameExpr {
+                                schema: None,
+                                table: None,
+                                name: c.name.o().to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })?;
+            match columns.as_slice() {
+                [only] => only.clone(),
+                _ => return None,
+            }
+        }
+        _ => query.fields.first()?.expr.clone(),
+    };
+    // `select a from t2` where `t2` has no `a`: MySQL/TiDB resolve the field to
+    // the outer query's column (correlated select list), e.g.
+    // `select * from t1 where a in (select a from t2)`.
+    let inner_field = match &inner_field {
+        ExprNode::Column(col) if col.table.is_none() => {
+            let missing = is
+                .and_then(|is| {
+                    let (db, table) = inner.qualified(current_db);
+                    is.table_by_name(&db, &table).map(|info| {
+                        !info
+                            .columns
+                            .iter()
+                            .any(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+                    })
+                })
+                .unwrap_or(false);
+            match (missing, outer_table) {
+                (true, Some(table)) => ExprNode::Column(ColumnNameExpr {
+                    schema: col.schema.clone(),
+                    table: Some(table.to_string()),
+                    name: col.name.clone(),
+                }),
+                _ => inner_field,
+            }
+        }
+        _ => inner_field,
+    };
+    let inner_expr = qualify_table(inner_field, &inner.name);
     let outer_expr = match outer_table {
         Some(table) => qualify_table(expr.clone(), table),
         None => expr.clone(),
@@ -783,13 +921,22 @@ fn from_in(
             explain_semi_pred(&outer_expr),
             explain_semi_pred(&inner_expr),
         );
+        // Executable equality under the ExplainInfo marker: the executor has
+        // no index key here, so it probes the cartesian product and filters
+        // with the real predicate (semi/anti-aware).
+        let key = eq_expr(outer_expr.clone(), inner_expr.clone());
+        let on = ExprNode::Binary(BinaryOpExpr {
+            op: Op::LogicAnd,
+            left: Box::new(key),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(info.into_bytes()),
+            })),
+        });
         return Some(SemiSpec {
             tp: join_tp,
             right_table: inner.name.clone(),
             right: PhysicalPlan::table_reader(inner.name.clone(), Vec::new()),
-            on: ExprNode::Value(ValueExpr {
-                datum: Datum::Bytes(info.into_bytes()),
-            }),
+            on,
             outer_filter: None,
         });
     }
@@ -1021,7 +1168,7 @@ fn explain_semi_eq_outer_first(eq: &ExprNode, inner: &str) -> String {
     explain_semi_eq(outer, inn)
 }
 
-fn explain_semi_pred(expr: &ExprNode) -> String {
+pub(crate) fn explain_semi_pred(expr: &ExprNode) -> String {
     match expr {
         ExprNode::Binary(bin) => {
             let op = match bin.op {
@@ -1080,6 +1227,10 @@ fn is_eq_across_tables_any(expr: &ExprNode, inner: &str) -> bool {
 }
 
 /// Single-table subquery with no grouping, limit, CTE, or extra joins.
+fn is_star_field(expr: &ExprNode) -> bool {
+    matches!(expr, ExprNode::Value(ValueExpr { datum: Datum::Bytes(b) }) if b == b"*")
+}
+
 fn simple_inner(query: &SelectStmt) -> Option<&TableName> {
     if !query.joins.is_empty()
         || !query.group_by.is_empty()

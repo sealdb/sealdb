@@ -2587,6 +2587,26 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
                 {
                     break;
                 }
+                // A parenthesized table list that is a JOIN operand keeps its
+                // grouping: `(t3, t4) LEFT JOIN (t1, t2)` is not the same as
+                // `t3, t4 LEFT JOIN t1, t2`. Nest it as CROSS JOINs instead.
+                if follows_join_keyword(bytes, close) {
+                    out.push_str(&sql[i..after]);
+                    match cross_join_comma_list(inner) {
+                        Some(body) => {
+                            out.push('(');
+                            out.push_str(&body);
+                            out.push(')');
+                        }
+                        None => {
+                            out.push('(');
+                            out.push_str(inner);
+                            out.push(')');
+                        }
+                    }
+                    i = close;
+                    continue;
+                }
                 // Emit whitespace between FROM and unwrapped body, then body.
                 out.push_str(&sql[i..after]);
                 out.push(' ');
@@ -2596,11 +2616,103 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
             }
             continue;
         }
+        if keyword_at(bytes, i, "JOIN") {
+            out.push_str(&sql[i..i + 4]);
+            i += 4;
+            let after = skip_ws_and_comments(bytes, i);
+            if after < bytes.len() && bytes[after] == b'(' {
+                let close = skip_balanced(bytes, after);
+                if close > after + 1 {
+                    let inner = sql[after + 1..close - 1].trim();
+                    let inner_bytes = inner.as_bytes();
+                    let start = skip_ws_and_comments(inner_bytes, 0);
+                    let derived = keyword_at(inner_bytes, start, "SELECT")
+                        || keyword_at(inner_bytes, start, "WITH")
+                        || keyword_at(inner_bytes, start, "VALUES")
+                        || keyword_at(inner_bytes, start, "TABLE");
+                    if !derived {
+                        if let Some(body) = cross_join_comma_list(inner) {
+                            out.push_str(&sql[i..after]);
+                            out.push('(');
+                            out.push_str(&body);
+                            out.push(')');
+                            i = close;
+                            continue;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let ch = sql[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// True when the next token after a parenthesized table group starts a JOIN.
+fn follows_join_keyword(bytes: &[u8], close: usize) -> bool {
+    let after = skip_ws_and_comments(bytes, close);
+    ["JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "NATURAL", "STRAIGHT_JOIN"]
+        .iter()
+        .any(|kw| keyword_at(bytes, after, kw))
+}
+
+/// Rewrite a top-level comma table list into explicit CROSS JOINs so it can be
+/// nested in parentheses: `t1, t2` → `t1 CROSS JOIN t2`. Returns `None` when
+/// the text has no top-level comma (single table).
+fn cross_join_comma_list(inner: &str) -> Option<String> {
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(inner.len() + 16);
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    let mut replaced = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let ch = inner[i..].chars().next().unwrap();
+        if in_sq || in_dq || in_bt {
+            out.push(ch);
+            let quote = match (in_sq, in_dq, in_bt) {
+                (true, _, _) => b'\'',
+                (_, true, _) => b'"',
+                _ => b'`',
+            };
+            if c == b'\\' && !in_bt && i + 1 < bytes.len() {
+                let esc = inner[i + 1..].chars().next().unwrap();
+                out.push(esc);
+                i += 1 + esc.len_utf8();
+                continue;
+            }
+            if c == quote {
+                in_sq = false;
+                in_dq = false;
+                in_bt = false;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push_str(" CROSS JOIN ");
+                replaced = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if replaced { Some(out) } else { None }
 }
 
 fn rewrite_lock_in_share_mode(sql: &str) -> String {
@@ -6197,7 +6309,8 @@ fn lower_from(
             tp: JoinType::Cross,
             on: true_expr(),
             using_cols: Vec::new(),
-        straight: false,
+            natural: false,
+            straight: false,
         });
         joins.extend(extra_joins);
         prev = joins.last().map(|j| j.right.clone()).unwrap_or(right);
@@ -6226,6 +6339,7 @@ fn lower_from_item_list(
             tp: JoinType::Cross,
             on: true_expr(),
             using_cols: Vec::new(),
+            natural: false,
         };
     }
     Ok((item, ctes))
@@ -6238,48 +6352,67 @@ fn lower_table_with_joins_item(
     for join in &table.joins {
         let (right, right_ctes) = table_factor_item(&join.relation)?;
         ctes.extend(right_ctes);
-        let left_name = left.tables().last().map(|t| (*t).clone());
+        // USING columns resolve to the first table of each side that exposes
+        // them (TiDB visibility rules). With a nested left side such as
+        // `(t1 NATURAL JOIN t2) JOIN t3 USING (c)`, `c` comes from `t1`, not
+        // from the last table of the left subtree.
+        let left_name = left.tables().first().map(|t| (*t).clone());
         let right_name = right.tables().first().map(|t| (*t).clone());
-        let (tp, on, using_cols) = match &join.join_operator {
+        let (tp, on, using_cols, natural) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
             | JoinOperator::Inner(JoinConstraint::On(expr))
             | JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Left(JoinConstraint::On(expr))
             | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new())
+                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::Right(JoinConstraint::On(expr))
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?, Vec::new())
+                (JoinType::RightOuter, lower_expr(expr)?, Vec::new(), false)
             }
             JoinOperator::CrossJoin(JoinConstraint::None)
             | JoinOperator::Join(JoinConstraint::None)
             | JoinOperator::Inner(JoinConstraint::None)
             | JoinOperator::StraightJoin(JoinConstraint::None) => {
-                (JoinType::Cross, true_expr(), Vec::new())
+                (JoinType::Cross, true_expr(), Vec::new(), false)
             }
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new())
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
+            }
+            // `NATURAL JOIN`: common columns are resolved against the catalog
+            // when planning (the parser has no schema).
+            JoinOperator::Join(JoinConstraint::Natural)
+            | JoinOperator::Inner(JoinConstraint::Natural)
+            | JoinOperator::StraightJoin(JoinConstraint::Natural) => {
+                (JoinType::Inner, true_expr(), Vec::new(), true)
+            }
+            JoinOperator::Left(JoinConstraint::Natural)
+            | JoinOperator::LeftOuter(JoinConstraint::Natural) => {
+                (JoinType::LeftOuter, true_expr(), Vec::new(), true)
+            }
+            JoinOperator::Right(JoinConstraint::Natural)
+            | JoinOperator::RightOuter(JoinConstraint::Natural) => {
+                (JoinType::RightOuter, true_expr(), Vec::new(), true)
             }
             JoinOperator::Join(JoinConstraint::Using(names))
             | JoinOperator::Inner(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
-                (JoinType::Inner, on, cols)
+                (JoinType::Inner, on, cols, false)
             }
             JoinOperator::Left(JoinConstraint::Using(names))
             | JoinOperator::LeftOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
-                (JoinType::LeftOuter, on, cols)
+                (JoinType::LeftOuter, on, cols, false)
             }
             JoinOperator::Right(JoinConstraint::Using(names))
             | JoinOperator::RightOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr_opt(&left_name, &right_name, &cols)?;
-                (JoinType::RightOuter, on, cols)
+                (JoinType::RightOuter, on, cols, false)
             }
             other => {
                 return Err(Error::unsupported(format!(
@@ -6291,17 +6424,18 @@ fn lower_table_with_joins_item(
         let mut alias_map = Vec::new();
         collect_from_item_aliases(&left, &mut alias_map);
         collect_from_item_aliases(&right, &mut alias_map);
-        let on = if alias_map.is_empty() {
-            on
-        } else {
-            rewrite_join_on_aliases(on, &alias_map)
-        };
+        // Keep ON on the SQL aliases: the planner/executor qualify join sides
+        // by alias (`t t3` → `t3.a`). Rewriting to the physical name collapses
+        // identities when two aliases share one table (`t t3 JOIN t t4`).
+        let _ = alias_map;
+        let on = on;
         left = crate::ast::FromItem::Join {
             left: Box::new(left),
             right: Box::new(right),
             tp,
             on,
             using_cols,
+            natural,
         };
     }
     Ok((left, ctes))
@@ -6377,6 +6511,7 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
             tp,
             on,
             using_cols,
+            natural,
         } => {
             let mut joins = flatten_from_item_joins(left);
             joins.extend(flatten_from_item_joins(right));
@@ -6389,6 +6524,7 @@ fn flatten_from_item_joins(item: &crate::ast::FromItem) -> Vec<Join> {
                     tp: *tp,
                     on: on.clone(),
                     using_cols: using_cols.clone(),
+                    natural: *natural,
                     straight: false,
                 });
             }
@@ -6411,66 +6547,81 @@ fn lower_table_with_joins(
     for join in &table.joins {
         let (right, right_alias, right_ctes) = table_factor(&join.relation)?;
         ctes.extend(right_ctes);
-        let (tp, on, using_cols, straight) = match &join.join_operator {
+        let (tp, on, using_cols, straight, natural) = match &join.join_operator {
             JoinOperator::Join(JoinConstraint::On(expr))
             | JoinOperator::Inner(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false, false)
             }
             JoinOperator::StraightJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new(), true)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), true, false)
             }
             JoinOperator::Left(JoinConstraint::On(expr))
             | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new(), false, false)
             }
             JoinOperator::Right(JoinConstraint::On(expr))
             | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::RightOuter, lower_expr(expr)?, Vec::new(), false, false)
             }
             // MySQL `JOIN` / `INNER JOIN` without ON/USING ≡ CROSS JOIN.
             JoinOperator::CrossJoin(JoinConstraint::None)
             | JoinOperator::Join(JoinConstraint::None)
             | JoinOperator::Inner(JoinConstraint::None) => {
-                (JoinType::Cross, true_expr(), Vec::new(), false)
+                (JoinType::Cross, true_expr(), Vec::new(), false, false)
             }
             JoinOperator::StraightJoin(JoinConstraint::None) => {
-                (JoinType::Cross, true_expr(), Vec::new(), true)
+                (JoinType::Cross, true_expr(), Vec::new(), true, false)
             }
             JoinOperator::CrossJoin(JoinConstraint::On(expr)) => {
-                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::Inner, lower_expr(expr)?, Vec::new(), false, false)
             }
             JoinOperator::Semi(JoinConstraint::On(expr))
             | JoinOperator::LeftSemi(JoinConstraint::On(expr)) => {
-                (JoinType::Semi, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::Semi, lower_expr(expr)?, Vec::new(), false, false)
             }
             JoinOperator::Anti(JoinConstraint::On(expr))
             | JoinOperator::LeftAnti(JoinConstraint::On(expr)) => {
-                (JoinType::Anti, lower_expr(expr)?, Vec::new(), false)
+                (JoinType::Anti, lower_expr(expr)?, Vec::new(), false, false)
+            }
+            // `NATURAL JOIN`: common columns are resolved against the catalog
+            // when planning (the parser has no schema).
+            JoinOperator::Join(JoinConstraint::Natural)
+            | JoinOperator::Inner(JoinConstraint::Natural)
+            | JoinOperator::StraightJoin(JoinConstraint::Natural) => {
+                (JoinType::Inner, true_expr(), Vec::new(), false, true)
+            }
+            JoinOperator::Left(JoinConstraint::Natural)
+            | JoinOperator::LeftOuter(JoinConstraint::Natural) => {
+                (JoinType::LeftOuter, true_expr(), Vec::new(), false, true)
+            }
+            JoinOperator::Right(JoinConstraint::Natural)
+            | JoinOperator::RightOuter(JoinConstraint::Natural) => {
+                (JoinType::RightOuter, true_expr(), Vec::new(), false, true)
             }
             JoinOperator::Join(JoinConstraint::Using(names))
             | JoinOperator::Inner(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::Inner, on, cols, false)
+                (JoinType::Inner, on, cols, false, false)
             }
             JoinOperator::StraightJoin(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::Inner, on, cols, true)
+                (JoinType::Inner, on, cols, true, false)
             }
             JoinOperator::Left(JoinConstraint::Using(names))
             | JoinOperator::LeftOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::LeftOuter, on, cols, false)
+                (JoinType::LeftOuter, on, cols, false, false)
             }
             JoinOperator::Right(JoinConstraint::Using(names))
             | JoinOperator::RightOuter(JoinConstraint::Using(names)) => {
                 let cols = using_column_names(names)?;
                 let on = using_on_expr(&prev, &right, &cols)?;
-                (JoinType::RightOuter, on, cols, false)
+                (JoinType::RightOuter, on, cols, false, false)
             }
-            // Completeness wave: NATURAL / right semi/anti / full outer.
+            // Completeness wave: right semi/anti / full outer.
             other => return Err(Error::unsupported(format!("JOIN {other:?}"))),
         };
         let mut alias_map = Vec::new();
@@ -6491,6 +6642,7 @@ fn lower_table_with_joins(
             tp,
             on,
             using_cols,
+            natural,
             straight,
         });
         prev = right;
@@ -7514,6 +7666,15 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
     }))
 }
 
+fn lower_column_default(
+    options: &[sqlparser::ast::ColumnOptionDef],
+) -> Option<String> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
+        _ => None,
+    })
+}
+
 fn lower_generated_column(
     options: &[sqlparser::ast::ColumnOptionDef],
 ) -> Result<Option<GeneratedColumn>> {
@@ -7535,6 +7696,17 @@ fn lower_generated_column(
         }
     }
     Ok(None)
+}
+
+/// TiDB `ColumnOptionAutoIncrement`: `AUTO_INCREMENT` arrives from sqlparser
+/// as a dialect-specific option token.
+fn lower_auto_increment(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
+    options.iter().any(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::DialectSpecific(tokens) => tokens.iter().any(|t| {
+            matches!(t, sqlparser::tokenizer::Token::Word(w) if w.value.eq_ignore_ascii_case("AUTO_INCREMENT"))
+        }),
+        _ => false,
+    })
 }
 
 fn lower_create_table(create: &CreateTable) -> Result<Statement> {
@@ -7569,7 +7741,9 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         cols.push(ColumnDef {
             name: col.name.value.clone(),
             type_name: col.data_type.to_string(),
+            default: lower_column_default(&col.options),
             generated: lower_generated_column(&col.options)?,
+            auto_increment: lower_auto_increment(&col.options),
         });
         for opt in &col.options {
             if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)) {
@@ -7702,13 +7876,36 @@ fn lower_select_item(item: &SelectItem) -> Result<SelectField> {
             as_name: aliases.first().map(|a| a.value.clone()),
             orig_text: None,
         }),
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => Ok(SelectField {
+        SelectItem::Wildcard(_) => Ok(SelectField {
             expr: ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(b"*".to_vec()),
             }),
             as_name: None,
             orig_text: None,
         }),
+        // `t1.*` keeps the qualifier so only that table's columns are projected.
+        SelectItem::QualifiedWildcard(kind, _) => {
+            let table = match kind {
+                sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name
+                    .0
+                    .last()
+                    .map(|p| match p {
+                        sqlparser::ast::ObjectNamePart::Identifier(id) => id.value.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(SelectField {
+                expr: ExprNode::Column(crate::ast::expressions::ColumnNameExpr {
+                    schema: None,
+                    table: Some(table),
+                    name: "*".to_string(),
+                }),
+                as_name: None,
+                orig_text: None,
+            })
+        }
     }
 }
 
@@ -7883,6 +8080,14 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr: Box::new(lower_expr(expr)?),
             not: true,
         })),
+        // `expr IS [NOT] TRUE|FALSE|UNKNOWN` — boolean predicates, lowered to
+        // scalar functions so the evaluator/planner can see the operand.
+        Expr::IsTrue(expr) => lower_is_truth(expr, "istrue"),
+        Expr::IsNotTrue(expr) => lower_is_truth(expr, "isnottrue"),
+        Expr::IsFalse(expr) => lower_is_truth(expr, "isfalse"),
+        Expr::IsNotFalse(expr) => lower_is_truth(expr, "isnotfalse"),
+        Expr::IsUnknown(expr) => lower_is_truth(expr, "isunknown"),
+        Expr::IsNotUnknown(expr) => lower_is_truth(expr, "isnotunknown"),
         Expr::Subquery(subquery) => {
             let query = lower_result_set(subquery)?;
             Ok(ExprNode::ScalarSubquery(ScalarSubqueryExpr {
@@ -7932,6 +8137,16 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             format!("expression {other} is not available in this phase"),
         )),
     }
+}
+
+/// `expr IS [NOT] TRUE|FALSE|UNKNOWN` → dedicated scalar function call; the
+/// `FuncCallExpr::restore` round-trips the original spelling.
+fn lower_is_truth(expr: &Expr, name: &str) -> Result<ExprNode> {
+    Ok(ExprNode::Func(FuncCallExpr {
+        name: name.to_string(),
+        args: vec![lower_expr(expr)?],
+        distinct: false,
+    }))
 }
 
 fn lower_function_arg(arg: &FunctionArg) -> Result<ExprNode> {
@@ -8531,7 +8746,9 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             column: ColumnDef {
                 name: column_def.name.value.clone(),
                 type_name: column_def.data_type.to_string(),
+                default: lower_column_default(&column_def.options),
                 generated: lower_generated_column(&column_def.options)?,
+                auto_increment: lower_auto_increment(&column_def.options),
             },
             position: lower_column_position(column_position),
         }),

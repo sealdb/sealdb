@@ -226,6 +226,51 @@ fn push_into(
                     Side::Residual => residual.push(expr),
                 }
             }
+            // Comma joins (`FROM a, b WHERE a.x = b.x`) plan as CARTESIAN until
+            // the WHERE equality becomes the join key. Split remaining
+            // conjuncts by the tables owned by each subtree: cross-side column
+            // equalities attach to this join (`inner join, equal:[…]`), and
+            // single-side conjuncts descend to where they belong.
+            let mut tp = tp;
+            let mut on = on;
+            if matches!(tp, JoinType::Inner | JoinType::Cross) {
+                let mut left_tables = std::collections::HashSet::new();
+                left_tables.insert(left_table.to_ascii_lowercase());
+                collect_join_tables(&left, &mut left_tables);
+                let mut right_tables = std::collections::HashSet::new();
+                right_tables.insert(right_table.to_ascii_lowercase());
+                collect_join_tables(&right, &mut right_tables);
+                let left_map = column_owners(&left_tables, is, current_db);
+                let right_map = column_owners(&right_tables, is, current_db);
+                let mut keep = Vec::new();
+                // HashJoin derives its hash key from the first equality in
+                // `ON`; further equalities stay as a filter above the join so
+                // they are still enforced (inner joins are filter-equivalent).
+                let mut key_taken = !is_true_expr(&on);
+                for expr in residual {
+                    match resolve_conjunct_side(&expr, &left_map, &right_map) {
+                        Some(Side::Left) => left_preds.push(expr),
+                        Some(Side::Right) => right_preds.push(expr),
+                        Some(Side::Residual) | None => {
+                            if let Some(key) = qualify_cross_equality(&expr, &left_map, &right_map)
+                            {
+                                if key_taken {
+                                    keep.push(key);
+                                } else {
+                                    // CROSS JOIN's placeholder `ON TRUE` gives
+                                    // way to the equality key.
+                                    on = key;
+                                    tp = JoinType::Inner;
+                                    key_taken = true;
+                                }
+                            } else {
+                                keep.push(expr);
+                            }
+                        }
+                    }
+                }
+                residual = keep;
+            }
             wrap_residual(
                 PhysicalPlan::HashJoin {
                     tp,
@@ -281,7 +326,12 @@ fn push_into(
                 )
             }
         }
-        other => wrap_residual(other, conjuncts),
+        other => {
+            if std::env::var_os("SEALDB_PUSH_DEBUG").is_some() {
+                eprintln!("[push] fallback on {:?}", std::mem::discriminant(&other));
+            }
+            wrap_residual(other, conjuncts)
+        }
     }
 }
 
@@ -506,3 +556,145 @@ mod tests {
         ));
     }
 }
+
+/// Lower-cased table names owned by a join subtree (HashJoin/MergeJoin carry
+/// both sides' table names at every level).
+fn collect_join_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<String>) {
+    match plan {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        } => {
+            out.insert(left_table.to_ascii_lowercase());
+            out.insert(right_table.to_ascii_lowercase());
+            collect_join_tables(left, out);
+            collect_join_tables(right, out);
+        }
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        } => {
+            out.insert(left_table.to_ascii_lowercase());
+            out.insert(right_table.to_ascii_lowercase());
+            collect_join_tables(left, out);
+            collect_join_tables(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn is_true_expr(expr: &ExprNode) -> bool {
+    matches!(expr, ExprNode::Value(value) if value.datum == Datum::I64(1))
+}
+
+/// Column name → owning tables for every table joined in a subtree.
+fn column_owners(
+    tables: &std::collections::HashSet<String>,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for table in tables {
+        for col in table_columns(is, current_db, table) {
+            map.entry(col.to_ascii_lowercase())
+                .or_default()
+                .push(table.clone());
+        }
+    }
+    map
+}
+
+fn owner_of(
+    table: Option<&str>,
+    col: &str,
+    map: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    if let Some(table) = table {
+        return Some(table.to_ascii_lowercase());
+    }
+    let owners = map.get(&col.to_ascii_lowercase())?;
+    (owners.len() == 1).then(|| owners[0].clone())
+}
+
+/// Which join side owns every column of `expr`; `None` when a column belongs
+/// to both sides / is unknown (so the conjunct stays residual or becomes a key).
+fn resolve_conjunct_side(
+    expr: &ExprNode,
+    left_map: &std::collections::HashMap<String, Vec<String>>,
+    right_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<Side> {
+    let cols = expr.referenced_columns();
+    if cols.is_empty() {
+        return None;
+    }
+    let mut left = true;
+    let mut right = true;
+    for (table, name) in cols {
+        let on_left = owner_of(table.as_deref(), &name, left_map).is_some();
+        let on_right = owner_of(table.as_deref(), &name, right_map).is_some();
+        if !on_left {
+            left = false;
+        }
+        if !on_right {
+            right = false;
+        }
+        if !on_left && !on_right {
+            return None;
+        }
+    }
+    match (left, right) {
+        (true, false) => Some(Side::Left),
+        (false, true) => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// `col = col` with one column on each side, rewritten to qualified column
+/// references so the executor can build the hash key.
+fn qualify_cross_equality(
+    expr: &ExprNode,
+    left_map: &std::collections::HashMap<String, Vec<String>>,
+    right_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<ExprNode> {
+    let ExprNode::Binary(binary) = expr else {
+        return None;
+    };
+    if binary.op != sealdb_parser::opcode::Op::Eq {
+        return None;
+    }
+    let (ExprNode::Column(l), ExprNode::Column(r)) = (binary.left.as_ref(), binary.right.as_ref())
+    else {
+        return None;
+    };
+    let (l_left, l_right) = (
+        owner_of(l.table.as_deref(), &l.name, left_map),
+        owner_of(l.table.as_deref(), &l.name, right_map),
+    );
+    let (r_left, r_right) = (
+        owner_of(r.table.as_deref(), &r.name, left_map),
+        owner_of(r.table.as_deref(), &r.name, right_map),
+    );
+    // Each column must be owned by exactly one side, and the two columns must
+    // sit on opposite sides for this to be a usable hash key.
+    let (l_owner, r_owner) = match (l_left, l_right, r_left, r_right) {
+        (Some(l), None, None, Some(r)) => (Some(l), Some(r)),
+        (None, Some(l), Some(r), None) => (Some(l), Some(r)),
+        _ => return None,
+    };
+    let mut new = binary.clone();
+    let mut left_col = l.clone();
+    left_col.table = l_owner;
+    let mut right_col = r.clone();
+    right_col.table = r_owner;
+    new.left = Box::new(ExprNode::Column(left_col));
+    new.right = Box::new(ExprNode::Column(right_col));
+    Some(ExprNode::Binary(new))
+}
+
