@@ -85,6 +85,14 @@ impl MyDecimal {
     pub fn encode_int_cmp(&self) -> Result<i64> {
         self.to_i64()
     }
+
+    /// Number of fractional digits in the literal (`1.500` → 3).
+    pub fn frac_digits(&self) -> i32 {
+        self.digits
+            .split_once('.')
+            .map(|(_, frac)| frac.len() as i32)
+            .unwrap_or(0)
+    }
 }
 
 impl Display for MyDecimal {
