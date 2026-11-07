@@ -261,13 +261,13 @@ fn drop_partition_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<()
 }
 
 fn range_bounds(def: &PartitionDef) -> Vec<String> {
-    let mut out = vec![match def.less_than {
-        Some(v) => v.to_string(),
+    let mut out = vec![match &def.less_than {
+        Some(v) => v.clone(),
         None => "MAXVALUE".to_string(),
     }];
     for bound in &def.extra_bounds {
         out.push(match bound {
-            Some(v) => v.to_string(),
+            Some(v) => v.clone(),
             None => "MAXVALUE".to_string(),
         });
     }

@@ -112,7 +112,7 @@ impl Executor for InsertExec {
         // `ON DUPLICATE KEY UPDATE`: locate conflicts against a snapshot of the
         // table, then update the conflicting row instead of inserting.
         let lock = crate::update::dml_row_lock(&self.txn)?;
-        let physical = info.prune_partitions(None);
+        let physical = sealdb_planner::core::prune_partitions(&info, None);
         let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
         let names = crate::update::col_names(info);
         self.txn.with_txn(|txn| {

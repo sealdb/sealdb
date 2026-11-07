@@ -4962,7 +4962,7 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
             }
             i = skip_ws(bytes, i + "THAN".len());
             let bounds = parse_less_than_bounds(bytes, i, item)?;
-            let less_than = bounds.first().copied().flatten();
+            let less_than = bounds.first().cloned().flatten();
             let extra_bounds = if bounds.len() > 1 {
                 bounds[1..].to_vec()
             } else {
@@ -5558,7 +5558,7 @@ fn parse_range_defs(body: &str) -> Result<Vec<PartitionDef>> {
         }
         i = skip_ws(bytes, i + "THAN".len());
         let bounds = parse_less_than_bounds(bytes, i, item)?;
-        let less_than = bounds.first().copied().flatten();
+        let less_than = bounds.first().cloned().flatten();
         let extra_bounds = if bounds.len() > 1 {
             bounds[1..].to_vec()
         } else {
@@ -5599,7 +5599,7 @@ fn skip_named_subpartitions(bytes: &[u8], i: usize) -> usize {
     matching_paren(bytes, i).map(|end| end + 1).unwrap_or(i)
 }
 
-fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Option<i64>>> {
+fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Option<String>>> {
     if keyword_at(bytes, i, "MAXVALUE") {
         return Ok(vec![None]);
     }
@@ -5616,17 +5616,26 @@ fn parse_less_than_bounds(bytes: &[u8], i: usize, item: &str) -> Result<Vec<Opti
         if bound.eq_ignore_ascii_case("MAXVALUE") {
             bounds.push(None);
         } else {
-            bounds.push(Some(
-                bound
-                    .parse::<i64>()
-                    .map_err(|_| Error::unsupported("non-integer LESS THAN"))?,
-            ));
+            // RANGE COLUMNS allows literal bounds (`LESS THAN ("2020-01-01")`);
+            // keep the text (unquoted) so `locate` and pruning compare typed.
+            bounds.push(Some(unquote_partition_bound(bound)));
         }
     }
     if bounds.is_empty() {
         return Err(Error::unsupported("VALUES LESS THAN"));
     }
     Ok(bounds)
+}
+
+fn unquote_partition_bound(bound: &str) -> String {
+    let bytes = bound.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        return bound[1..bound.len() - 1].to_string();
+    }
+    bound.to_string()
 }
 
 fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
@@ -8042,6 +8051,29 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             }))
         }
         Expr::Function(func) => lower_function(func),
+        // sqlparser lowers `FLOOR(x)` / `CEIL(x)` to dedicated variants.
+        Expr::Floor { expr: inner, field }
+        | Expr::Ceil { expr: inner, field } => {
+            let name = if matches!(expr, Expr::Floor { .. }) {
+                "floor"
+            } else {
+                "ceil"
+            };
+            let args = vec![lower_expr(inner)?];
+            if !matches!(
+                field,
+                sqlparser::ast::CeilFloorKind::DateTimeField(
+                    sqlparser::ast::DateTimeField::NoDateTime
+                )
+            ) {
+                return Err(Error::unsupported(format!("expression {expr}")));
+            }
+            Ok(ExprNode::Func(FuncCallExpr {
+                name: name.to_string(),
+                args,
+                distinct: false,
+            }))
+        }
         Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("null") => {
             Ok(ExprNode::Value(ValueExpr { datum: Datum::Null }))
         }
@@ -8747,6 +8779,8 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::And => Op::LogicAnd,
         BinaryOperator::Or => Op::LogicOr,
         BinaryOperator::Xor => Op::LogicXor,
+        BinaryOperator::PGBitwiseShiftLeft => Op::LeftShift,
+        BinaryOperator::PGBitwiseShiftRight => Op::RightShift,
         // MySQL/TiDB default (no PIPES_AS_CONCAT): `||` is logical OR.
         // sqlparser exposes it as StringConcat; concat mode is a later sql_mode gap.
         BinaryOperator::StringConcat => Op::LogicOr,

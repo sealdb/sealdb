@@ -74,6 +74,14 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
+                // to `0` and plans a zero-row TableDual.
+                if let Some(ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(0),
+                })) = &select.selection
+                {
+                    return Ok(PhysicalPlan::TableDual { row_count: 0 });
+                }
                 // TiDB quantified `!= ANY` / `= ALL` → agg + CARTESIAN join.
                 if let Some(plan) =
                     quantified_cmp_plan(select, is, current_db, stats, prune_mode)
@@ -4347,13 +4355,385 @@ fn fold_partition_selection(
         return None;
     }
     let selection = select.selection.as_ref()?;
-    let folded = rebalance_disjunctions(&fold_const_predicates(&push_down_not(selection, false)));
+    let folded = coerce_temporal_literals(
+        &rebalance_disjunctions(&fold_const_predicates(&push_down_not(selection, false))),
+        info,
+    );
+    let folded = coerce_numeric_literals(&folded, info);
+    let folded = simplify_partition_cnf(&folded);
     if folded.restore_string() == selection.restore_string() {
         return None;
     }
     let mut folded_select = select.clone();
     folded_select.selection = Some(folded);
     Some(folded_select)
+}
+
+/// TiDB constant folding turns a string literal compared against a temporal
+/// column into a temporal constant: `a != '2024-01-01 01:01:01'` prints as
+/// `ne(a, 2024-01-01 01:01:01.000000)`. DATETIME/TIMESTAMP constants carry six
+/// fractional digits; DATE constants print bare.
+fn coerce_temporal_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => {
+            let left = coerce_temporal_literals(&bin.left, info);
+            let right = coerce_temporal_literals(&bin.right, info);
+            let (left, right) = match column_temporal_tp(&left, info) {
+                Some(tp) => match temporal_datum(tp, &right) {
+                    Some(datum) => (left, value_expr(datum)),
+                    None => (left, right),
+                },
+                None => match column_temporal_tp(&right, info) {
+                    Some(tp) => match temporal_datum(tp, &left) {
+                        Some(datum) => (value_expr(datum), right),
+                        None => (left, right),
+                    },
+                    None => (left, right),
+                },
+            };
+            ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(left),
+                right: Box::new(right),
+                single_cnf_item: bin.single_cnf_item,
+            })
+        }
+        ExprNode::InList(list) => {
+            let mut coerced = list.clone();
+            coerced.expr = Box::new(coerce_temporal_literals(&list.expr, info));
+            if let Some(tp) = column_temporal_tp(&coerced.expr, info) {
+                coerced.list = coerced
+                    .list
+                    .iter()
+                    .map(|item| match temporal_datum(tp, item) {
+                        Some(datum) => value_expr(datum),
+                        None => item.clone(),
+                    })
+                    .collect();
+            }
+            ExprNode::InList(coerced)
+        }
+        ExprNode::Unary(unary) => {
+            let mut coerced = unary.clone();
+            coerced.expr = Box::new(coerce_temporal_literals(&unary.expr, info));
+            ExprNode::Unary(coerced)
+        }
+        ExprNode::IsNull(isnull) => {
+            let mut coerced = isnull.clone();
+            coerced.expr = Box::new(coerce_temporal_literals(&isnull.expr, info));
+            ExprNode::IsNull(coerced)
+        }
+        other => other.clone(),
+    }
+}
+
+fn value_expr(datum: Datum) -> ExprNode {
+    ExprNode::Value(ValueExpr { datum })
+}
+
+fn column_temporal_tp(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Option<u8> {
+    let ExprNode::Column(column) = expr else {
+        return None;
+    };
+    let col = info
+        .columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))?;
+    match col.field_type.tp {
+        sealdb_types::TYPE_DATE | sealdb_types::TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP => {
+            Some(col.field_type.tp)
+        }
+        _ => None,
+    }
+}
+
+fn temporal_datum(tp: u8, expr: &ExprNode) -> Option<Datum> {
+    let ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(bytes),
+    }) = expr
+    else {
+        return None;
+    };
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut time = match tp {
+        sealdb_types::TYPE_DATE => sealdb_types::parse_date_literal(text).ok()?,
+        sealdb_types::TYPE_TIMESTAMP => {
+            let mut t = sealdb_types::parse_timestamp_literal(text).ok()?;
+            t.tp = sealdb_types::TimeType::Timestamp;
+            t
+        }
+        _ => sealdb_types::parse_timestamp_literal(text).ok()?,
+    };
+    if tp != sealdb_types::TYPE_DATE {
+        time.fsp = 6;
+    }
+    Some(Datum::Time(time))
+}
+
+/// TiDB `PredicateSimplification` subset for partition predicates: an equality
+/// on a column makes further constant comparisons on it redundant
+/// (`a = 2 AND a < 3` → `a = 2`) and conflicting equalities fold to false
+/// (`a = 2 AND a = 3` → `0`).
+fn simplify_partition_cnf(expr: &ExprNode) -> ExprNode {
+    let parts = expr.split_cnf_all();
+    if parts.len() < 2 {
+        return expr.clone();
+    }
+    let Some(column) = parts.iter().find_map(|part| eq_parts(part).map(|(col, _)| col)) else {
+        return expr.clone();
+    };
+    let eqs: Vec<Datum> = parts
+        .iter()
+        .filter_map(eq_parts)
+        .filter(|(col, _)| col.eq_ignore_ascii_case(&column))
+        .map(|(_, datum)| datum)
+        .collect();
+    let Some(first_eq) = eqs.first() else {
+        return expr.clone();
+    };
+    if eqs.iter().any(|d| d.compare(first_eq) != std::cmp::Ordering::Equal) {
+        return ExprNode::Value(ValueExpr {
+            datum: Datum::I64(0),
+        });
+    }
+    let eq_value = first_eq.clone();
+    let mut kept: Vec<ExprNode> = Vec::with_capacity(parts.len());
+    let mut eq_kept = false;
+    for part in &parts {
+        if let Some((col, _)) = eq_parts(part) {
+            if col.eq_ignore_ascii_case(&column) {
+                if eq_kept {
+                    continue;
+                }
+                eq_kept = true;
+            }
+            kept.push((*part).clone());
+            continue;
+        }
+        if let Some((col, datum, op)) = cmp_parts_any(part)
+            && col.eq_ignore_ascii_case(&column)
+        {
+            match cmp_holds(&eq_value, op, &datum) {
+                Some(true) => continue,
+                Some(false) => {
+                    return ExprNode::Value(ValueExpr {
+                        datum: Datum::I64(0),
+                    });
+                }
+                None => {}
+            }
+        }
+        kept.push((*part).clone());
+    }
+    if kept.is_empty() {
+        return ExprNode::Value(ValueExpr {
+            datum: Datum::I64(1),
+        });
+    }
+    ExprNode::compose_cnf(kept).unwrap_or_else(|| expr.clone())
+}
+
+fn eq_parts(expr: &ExprNode) -> Option<(String, Datum)> {
+    let ExprNode::Binary(bin) = expr else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    let (col, datum, _) = cmp_parts_any(expr)?;
+    Some((col, datum))
+}
+
+/// `column <op> const` (either side) → `(column, const, op)` with the operator
+/// already flipped so it reads left-to-right as `column op const`.
+fn cmp_parts_any(expr: &ExprNode) -> Option<(String, Datum, Op)> {
+    let ExprNode::Binary(bin) = expr else {
+        return None;
+    };
+    let const_of = |e: &ExprNode| match e {
+        ExprNode::Value(ValueExpr { datum }) if !datum.is_null() => Some(datum.clone()),
+        _ => None,
+    };
+    let column_of = |e: &ExprNode| match e {
+        ExprNode::Column(c) => Some(c.name.clone()),
+        _ => None,
+    };
+    if let (Some(col), Some(datum)) = (column_of(&bin.left), const_of(&bin.right)) {
+        return Some((col, datum, bin.op));
+    }
+    if let (Some(datum), Some(col)) = (const_of(&bin.left), column_of(&bin.right)) {
+        return Some((col, datum, flip_cmp_op(bin.op)?));
+    }
+    None
+}
+
+fn flip_cmp_op(op: Op) -> Option<Op> {
+    Some(match op {
+        Op::Lt => Op::Gt,
+        Op::Le => Op::Ge,
+        Op::Gt => Op::Lt,
+        Op::Ge => Op::Le,
+        Op::Eq => Op::Eq,
+        Op::Ne => Op::Ne,
+        _ => return None,
+    })
+}
+
+fn cmp_holds(value: &Datum, op: Op, constant: &Datum) -> Option<bool> {
+    let ord = value.compare(constant);
+    Some(match op {
+        Op::Eq => ord == std::cmp::Ordering::Equal,
+        Op::Ne => ord != std::cmp::Ordering::Equal,
+        Op::Lt => ord == std::cmp::Ordering::Less,
+        Op::Le => ord != std::cmp::Ordering::Greater,
+        Op::Gt => ord == std::cmp::Ordering::Greater,
+        Op::Ge => ord != std::cmp::Ordering::Less,
+        _ => return None,
+    })
+}
+
+/// TiDB comparison type rules for a partial schema: a string column compared
+/// with a number is cast to `double BINARY` (`gt(cast(a, double BINARY), 0)`),
+/// and a numeric column compared with a string literal takes the literal's
+/// MySQL numeric prefix (`a > '10ab'` → `gt(a, 10)`).
+fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => {
+            let mut left = coerce_numeric_literals(&bin.left, info);
+            let mut right = coerce_numeric_literals(&bin.right, info);
+            if matches!(
+                bin.op,
+                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+            ) {
+                if column_class(&left, info) == Some(ColumnClass::String)
+                    && numeric_literal(&right)
+                {
+                    left = cast_double(left);
+                } else if column_class(&right, info) == Some(ColumnClass::String)
+                    && numeric_literal(&left)
+                {
+                    right = cast_double(right);
+                }
+                if column_class(&left, info) == Some(ColumnClass::Numeric)
+                    && let Some(datum) = bytes_number(&right)
+                {
+                    right = value_expr(datum);
+                } else if column_class(&right, info) == Some(ColumnClass::Numeric)
+                    && let Some(datum) = bytes_number(&left)
+                {
+                    left = value_expr(datum);
+                }
+            }
+            ExprNode::Binary(BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(left),
+                right: Box::new(right),
+                single_cnf_item: bin.single_cnf_item,
+            })
+        }
+        ExprNode::InList(list) => {
+            let mut coerced = list.clone();
+            coerced.expr = Box::new(coerce_numeric_literals(&list.expr, info));
+            match column_class(&coerced.expr, info) {
+                Some(ColumnClass::String)
+                    if list.list.iter().all(|item| numeric_literal(item)) =>
+                {
+                    coerced.expr = Box::new(cast_double((*coerced.expr).clone()));
+                }
+                Some(ColumnClass::Numeric) => {
+                    coerced.list = coerced
+                        .list
+                        .iter()
+                        .map(|item| match bytes_number(item) {
+                            Some(datum) => value_expr(datum),
+                            None => item.clone(),
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+            ExprNode::InList(coerced)
+        }
+        ExprNode::Unary(unary) => {
+            let mut coerced = unary.clone();
+            coerced.expr = Box::new(coerce_numeric_literals(&unary.expr, info));
+            ExprNode::Unary(coerced)
+        }
+        ExprNode::IsNull(isnull) => {
+            let mut coerced = isnull.clone();
+            coerced.expr = Box::new(coerce_numeric_literals(&isnull.expr, info));
+            ExprNode::IsNull(coerced)
+        }
+        other => other.clone(),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnClass {
+    Numeric,
+    String,
+}
+
+fn column_class(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Option<ColumnClass> {
+    let ExprNode::Column(column) = expr else {
+        return None;
+    };
+    let col = info
+        .columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))?;
+    Some(match col.field_type.tp {
+        sealdb_types::TYPE_TINY
+        | sealdb_types::TYPE_SHORT
+        | sealdb_types::TYPE_INT24
+        | sealdb_types::TYPE_LONG
+        | sealdb_types::TYPE_LONG_LONG
+        | sealdb_types::TYPE_FLOAT
+        | sealdb_types::TYPE_DOUBLE
+        | sealdb_types::TYPE_NEW_DECIMAL
+        | sealdb_types::TYPE_DECIMAL
+        | sealdb_types::TYPE_YEAR => ColumnClass::Numeric,
+        sealdb_types::TYPE_VARCHAR
+        | sealdb_types::TYPE_VAR_STRING
+        | sealdb_types::TYPE_STRING
+        | sealdb_types::TYPE_TINY_BLOB
+        | sealdb_types::TYPE_MEDIUM_BLOB
+        | sealdb_types::TYPE_BLOB
+        | sealdb_types::TYPE_LONG_BLOB => ColumnClass::String,
+        _ => return None,
+    })
+}
+
+fn numeric_literal(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::I64(_) | Datum::U64(_) | Datum::F64(_) | Datum::Decimal(_)
+        })
+    )
+}
+
+fn bytes_number(expr: &ExprNode) -> Option<Datum> {
+    let ExprNode::Value(ValueExpr {
+        datum: Datum::Bytes(bytes),
+    }) = expr
+    else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let value = sealdb_types::datum::mysql_numeric_prefix(&text);
+    if value.fract() == 0.0 && value.abs() < 9.2e18 {
+        Some(Datum::I64(value as i64))
+    } else {
+        Some(Datum::F64(value))
+    }
+}
+
+fn cast_double(expr: ExprNode) -> ExprNode {
+    ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
+        expr: Box::new(expr),
+        target: "DOUBLE".to_string(),
+    })
 }
 
 fn const_num(expr: &ExprNode) -> Option<i64> {

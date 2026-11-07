@@ -57,7 +57,7 @@ impl Executor for UpdateExec {
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
         let col_names = col_names(&info);
         let lock = dml_row_lock(&self.txn)?;
-        let physical = info.prune_partitions(self.stmt.selection.as_ref());
+        let physical = sealdb_planner::core::prune_partitions(&info, self.stmt.selection.as_ref());
         let rows = scan_table(&self.txn, &info, lock, LockWait::Block, &physical)?;
         let filter = match &self.stmt.selection {
             Some(expr) => Some(pre_evaluate_dml_predicate(
@@ -254,7 +254,7 @@ pub(crate) fn scan_dml_side(
         &info,
         lock,
         LockWait::Block,
-        &info.prune_partitions(None),
+        &sealdb_planner::core::prune_partitions(&info, None),
     )?;
     Ok((names, rows, Some(info)))
 }

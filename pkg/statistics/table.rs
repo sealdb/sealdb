@@ -1,6 +1,9 @@
 /// TiDB `statistics.Table` / `HistColl` fields for .
 /// Histograms + TopN feed selectivity; CMSketch / correlation deferred.
+use std::cmp::Ordering;
+
 use sealdb_types::Datum;
+use sealdb_types::time::TimeType;
 
 /// One equi-depth histogram bucket (TiDB `Bucket`).
 #[derive(Clone, Debug, Default)]
@@ -130,58 +133,92 @@ pub struct ColumnStats {
 }
 
 impl ColumnStats {
-    /// Exact rows equal to `value` (only for integer columns).
+    /// Exact rows equal to `value` (integer, string and temporal keys alike —
+    /// the store keeps per-value counts keyed by `datum_key`).
     pub fn exact_point_count(&self, value: &Datum) -> Option<u64> {
-        let v = datum_i64(value)?;
-        Some(self.counts_i64()?.iter().filter(|(k, _)| *k == v).map(|(_, c)| *c).sum())
-    }
-
-    /// Exact rows whose value lies inside `[lower, upper]` with the given
-    /// inclusivity (only for integer columns).
-    pub fn exact_range_count(
-        &self,
-        lower: Option<(i64, bool)>,
-        upper: Option<(i64, bool)>,
-    ) -> Option<u64> {
-        let counts = self.counts_i64()?;
+        let key = datum_key(value);
+        let raw = self.value_counts.as_ref()?;
         Some(
-            counts
-                .iter()
-                .filter(|(v, _)| {
-                    lower.is_none_or(|(lo, inc)| if inc { *v >= lo } else { *v > lo })
-                        && upper.is_none_or(|(hi, inc)| if inc { *v <= hi } else { *v < hi })
-                })
+            raw.iter()
+                .filter(|(k, _)| *k == key)
                 .map(|(_, c)| *c)
                 .sum(),
         )
     }
 
-    /// Exact rows for a set of point values.
-    pub fn exact_points_count(&self, values: &[Datum]) -> Option<u64> {
-        let counts = self.counts_i64()?;
+    /// Exact rows whose value lies inside `[lower, upper]` with the given
+    /// inclusivity. Integer keys compare numerically; datetime keys compare
+    /// lexicographically (their canonical form sorts chronologically).
+    pub fn exact_range_count(
+        &self,
+        lower: Option<(&Datum, bool)>,
+        upper: Option<(&Datum, bool)>,
+    ) -> Option<u64> {
+        let raw = self.value_counts.as_ref()?;
+        let lo = lower.map(|(d, inc)| (datum_key(d), inc));
+        let hi = upper.map(|(d, inc)| (datum_key(d), inc));
+        let order = key_order(raw, lo.as_ref(), hi.as_ref());
         let mut total = 0u64;
-        for value in values {
-            let v = datum_i64(value)?;
-            total += counts.iter().filter(|(k, _)| *k == v).map(|(_, c)| *c).sum::<u64>();
+        for (key, count) in raw {
+            if let Some((lo_key, inc)) = lo.as_ref() {
+                let ord = compare_keys(order, key, lo_key);
+                if ord == Ordering::Less || (ord == Ordering::Equal && !*inc) {
+                    continue;
+                }
+            }
+            if let Some((hi_key, inc)) = hi.as_ref() {
+                let ord = compare_keys(order, key, hi_key);
+                if ord == Ordering::Greater || (ord == Ordering::Equal && !*inc) {
+                    continue;
+                }
+            }
+            total += *count;
         }
         Some(total)
     }
 
-    fn counts_i64(&self) -> Option<Vec<(i64, u64)>> {
+    /// Exact rows for a set of point values.
+    pub fn exact_points_count(&self, values: &[Datum]) -> Option<u64> {
         let raw = self.value_counts.as_ref()?;
-        let mut out = Vec::with_capacity(raw.len());
-        for (k, c) in raw {
-            out.push((k.parse::<i64>().ok()?, *c));
+        let mut total = 0u64;
+        for value in values {
+            let key = datum_key(value);
+            total += raw.iter().filter(|(k, _)| *k == key).map(|(_, c)| *c).sum::<u64>();
         }
-        Some(out)
+        Some(total)
     }
 }
 
-fn datum_i64(value: &Datum) -> Option<i64> {
-    match value {
-        Datum::I64(v) => Some(*v),
-        Datum::U64(v) => i64::try_from(*v).ok(),
-        _ => None,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOrder {
+    Int,
+    Text,
+}
+
+fn key_order(
+    raw: &[(String, u64)],
+    lower: Option<&(String, bool)>,
+    upper: Option<&(String, bool)>,
+) -> KeyOrder {
+    let numeric = raw.iter().all(|(k, _)| k.parse::<i64>().is_ok())
+        && lower.is_none_or(|(k, _)| k.parse::<i64>().is_ok())
+        && upper.is_none_or(|(k, _)| k.parse::<i64>().is_ok());
+    if numeric {
+        return KeyOrder::Int;
+    }
+    // Temporal keys and arbitrary strings both sort by their canonical text.
+    KeyOrder::Text
+}
+
+fn compare_keys(order: KeyOrder, left: &str, right: &str) -> Ordering {
+    match order {
+        KeyOrder::Int => left
+            .parse::<i64>()
+            .map(|l| (l, right.parse::<i64>()))
+            .ok()
+            .and_then(|(l, r)| r.ok().map(|r| l.cmp(&r)))
+            .unwrap_or_else(|| left.as_bytes().cmp(right.as_bytes())),
+        KeyOrder::Text => left.as_bytes().cmp(right.as_bytes()),
     }
 }
 
@@ -269,6 +306,13 @@ pub fn datum_key(value: &Datum) -> String {
         Datum::U64(v) => v.to_string(),
         Datum::F64(v) => v.to_string(),
         Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        Datum::Time(t) => match t.tp {
+            TimeType::Date => format!("{:04}-{:02}-{:02}", t.year, t.month, t.day),
+            _ => format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
+                t.year, t.month, t.day, t.hour, t.minute, t.second, t.micro
+            ),
+        },
         other => format!("{other:?}"),
     }
 }

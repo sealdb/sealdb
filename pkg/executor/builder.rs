@@ -419,7 +419,16 @@ impl ExecutorBuilder {
                 }
                 Ok(exec)
             }
-            PhysicalPlan::TableDual { .. } => Ok(Box::new(TableDualExec::new())),
+            PhysicalPlan::TableDual { row_count } => {
+                // Headers are statement-level in TiDB; a folded `SELECT *`
+                // still reports its columns even though the plan is a dual.
+                let mut schema = Vec::new();
+                if let Some(select) = stmt.as_select() {
+                    let from_cols = select_from_column_names(select, &domain, current_db);
+                    schema = expand_projection_fields(select, &from_cols).1;
+                }
+                Ok(Box::new(TableDualExec::new(*row_count as usize, schema)))
+            }
             PhysicalPlan::HashAgg { child, .. } => {
                 let select = stmt
                     .as_select()

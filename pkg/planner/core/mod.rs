@@ -29,4 +29,4 @@ pub use natural_join::{expand_natural_joins, stmt_has_natural_join};
 pub use planbuilder::{
     merged_star_columns, merged_star_visible_columns, using_dropped_columns, PlanBuilder,
 };
-pub use rule_partition_processor::PartitionPruneMode;
+pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};

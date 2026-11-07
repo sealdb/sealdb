@@ -2,6 +2,9 @@
 /// Static prunes at plan time; dynamic defers to execute using the pushed filter.
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ExprNode;
+use sealdb_parser::ast::expressions::{
+    BinaryOpExpr, ColumnNameExpr, InListExpr, ValueExpr,
+};
 
 /// TiDB `variable.PartitionPruneMode` (legacy *-only aliases normalize here).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +66,7 @@ pub fn resolve_partitions(
         return PlannedPartitions::default();
     }
 
-    let pruned = info.prune_partitions(selection);
+    let pruned = prune_with_expr(info, selection);
     let mut defs: Vec<_> = part
         .definitions
         .iter()
@@ -102,7 +105,251 @@ pub fn resolve_partitions(
 }
 
 pub fn prune_partitions(info: &TableInfo, selection: Option<&ExprNode>) -> Vec<i64> {
-    info.prune_partitions(selection)
+    prune_with_expr(info, selection)
+}
+
+/// TiDB evaluates an expression partition key (`weekday(a)`,
+/// `floor(unix_timestamp(a))`) for the constants in the pushed predicate so the
+/// derived value can drive `locate`. Meta only stores the expression text; the
+/// rewrite happens here where the expression evaluator is available.
+fn prune_with_expr(info: &TableInfo, selection: Option<&ExprNode>) -> Vec<i64> {
+    let Some(part) = info.partition.as_ref() else {
+        return info.prune_partitions(selection);
+    };
+    if !part.enable || !part.is_expr_key() || part.definitions.is_empty() {
+        return info.prune_partitions(selection);
+    }
+    let Some(selection) = selection else {
+        return info.prune_partitions(None);
+    };
+    let Ok(key_expr) = sealdb_parser::sqlparser_bridge::parse_expr(&part.expr) else {
+        return info.prune_partitions(Some(selection));
+    };
+    let key_columns = expr_key_columns(&key_expr);
+    if key_columns.is_empty() {
+        return info.prune_partitions(Some(selection));
+    }
+    let monotonic = expr_is_monotonic(&key_expr);
+    let rewritten = rewrite_prune_selection(
+        selection,
+        &part.expr,
+        &key_expr,
+        &key_columns,
+        monotonic,
+        info,
+    );
+    if std::env::var("SEALDB_DEBUG_PRUNE").is_ok() {
+        eprintln!(
+            "DEBUG prune expr={:?} monotonic={monotonic} sel={} rewritten={}",
+            part.expr,
+            selection.restore_string(),
+            rewritten.restore_string()
+        );
+    }
+    info.prune_partitions(Some(&rewritten))
+}
+
+/// Range pruning is only valid when the partition expression is monotonic in
+/// the key column; `weekday(a)` wraps, so `a < d` cannot pin a partition.
+fn expr_is_monotonic(expr: &ExprNode) -> bool {
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Column(_) | ExprNode::Value(_) => true,
+        ExprNode::Binary(bin) if matches!(bin.op, Op::Plus | Op::Minus) => {
+            expr_is_monotonic(&bin.left) && expr_is_monotonic(&bin.right)
+        }
+        ExprNode::Func(func) => {
+            if matches!(
+                func.name.to_ascii_uppercase().as_str(),
+                "WEEKDAY"
+                    | "DAYOFWEEK"
+                    | "DAYOFMONTH"
+                    | "DAYOFYEAR"
+                    | "MONTH"
+                    | "YEAR"
+                    | "HOUR"
+                    | "MINUTE"
+                    | "SECOND"
+            ) {
+                return false;
+            }
+            func.args.iter().all(expr_is_monotonic)
+        }
+        ExprNode::Cast(c) => expr_is_monotonic(&c.expr),
+        _ => false,
+    }
+}
+
+fn expr_key_columns(expr: &ExprNode) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_key_columns(expr, &mut out);
+    out
+}
+
+fn collect_key_columns(expr: &ExprNode, out: &mut Vec<String>) {
+    match expr {
+        ExprNode::Column(c) => out.push(c.name.clone()),
+        ExprNode::Binary(bin) => {
+            collect_key_columns(&bin.left, out);
+            collect_key_columns(&bin.right, out);
+        }
+        ExprNode::Unary(unary) => collect_key_columns(&unary.expr, out),
+        ExprNode::Func(func) => {
+            for arg in &func.args {
+                collect_key_columns(arg, out);
+            }
+        }
+        ExprNode::Cast(c) => collect_key_columns(&c.expr, out),
+        _ => {}
+    }
+}
+
+/// Replace `key_col <op> const` with `<key_expr> <op> key_expr(const)` so the
+/// meta pruner can locate the derived partition value.
+fn rewrite_prune_selection(
+    expr: &ExprNode,
+    key_text: &str,
+    key_expr: &ExprNode,
+    key_columns: &[String],
+    monotonic: bool,
+    info: &TableInfo,
+) -> ExprNode {
+    use sealdb_parser::ast::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Binary(bin) => {
+            if matches!(
+                bin.op,
+                Op::Eq | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Ne
+            ) && (monotonic || bin.op == Op::Eq)
+            {
+                let lhs_key = key_column_of(&bin.left, key_columns);
+                let rhs_key = key_column_of(&bin.right, key_columns);
+                if let (Some(col), None, Some(value)) = (lhs_key, rhs_key, const_datum(&bin.right))
+                    && let Some(derived) = eval_key_expr(key_expr, info, col, &value)
+                {
+                    return make_key_cmp(bin.op, key_text, &bin.left, derived);
+                }
+                if let (None, Some(col), Some(value)) = (lhs_key, rhs_key, const_datum(&bin.left))
+                    && let Some(derived) = eval_key_expr(key_expr, info, col, &value)
+                {
+                    return make_key_cmp(flip_cmp(bin.op), key_text, &bin.right, derived);
+                }
+            }
+            if bin.op == Op::LogicAnd || bin.op == Op::LogicOr {
+                return ExprNode::Binary(BinaryOpExpr {
+                    op: bin.op,
+                    left: Box::new(rewrite_prune_selection(
+                        &bin.left,
+                        key_text,
+                        key_expr,
+                        key_columns,
+                        monotonic,
+                        info,
+                    )),
+                    right: Box::new(rewrite_prune_selection(
+                        &bin.right,
+                        key_text,
+                        key_expr,
+                        key_columns,
+                        monotonic,
+                        info,
+                    )),
+                    single_cnf_item: bin.single_cnf_item,
+                });
+            }
+            expr.clone()
+        }
+        ExprNode::InList(list) if !list.not => {
+            let Some(col) = key_column_of(&list.expr, key_columns) else {
+                return expr.clone();
+            };
+            let mut derived = Vec::with_capacity(list.list.len());
+            for item in &list.list {
+                let Some(value) = const_datum(item) else {
+                    return expr.clone();
+                };
+                let Some(value) = eval_key_expr(key_expr, info, col, &value) else {
+                    return expr.clone();
+                };
+                derived.push(ExprNode::Value(ValueExpr { datum: value }));
+            }
+            ExprNode::InList(InListExpr {
+                expr: Box::new(key_column_expr(key_text, &list.expr)),
+                list: derived,
+                not: false,
+            })
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn key_column_of<'a>(expr: &'a ExprNode, key_columns: &[String]) -> Option<&'a str> {
+    use sealdb_parser::ast::ExprNode;
+    let ExprNode::Column(c) = expr else {
+        return None;
+    };
+    key_columns
+        .iter()
+        .find(|k| k.eq_ignore_ascii_case(&c.name))
+        .map(|_| c.name.as_str())
+}
+
+fn make_key_cmp(
+    op: sealdb_parser::opcode::Op,
+    key_text: &str,
+    original: &ExprNode,
+    value: sealdb_types::Datum,
+) -> ExprNode {
+    ExprNode::Binary(BinaryOpExpr {
+        op,
+        left: Box::new(key_column_expr(key_text, original)),
+        right: Box::new(ExprNode::Value(ValueExpr { datum: value })),
+        single_cnf_item: false,
+    })
+}
+
+fn key_column_expr(key_text: &str, original: &ExprNode) -> ExprNode {
+    let (schema, table) = match original {
+        ExprNode::Column(c) => (c.schema.clone(), c.table.clone()),
+        _ => (None, None),
+    };
+    ExprNode::Column(ColumnNameExpr {
+        schema,
+        table,
+        name: key_text.to_string(),
+    })
+}
+
+fn const_datum(expr: &ExprNode) -> Option<sealdb_types::Datum> {
+    match expr {
+        ExprNode::Value(ValueExpr { datum }) if !datum.is_null() => Some(datum.clone()),
+        _ => None,
+    }
+}
+
+fn eval_key_expr(
+    key_expr: &ExprNode,
+    info: &TableInfo,
+    column: &str,
+    value: &sealdb_types::Datum,
+) -> Option<sealdb_types::Datum> {
+    let schema: Vec<String> = info.columns.iter().map(|c| c.name.o().to_string()).collect();
+    let idx = schema.iter().position(|c| c.eq_ignore_ascii_case(column))?;
+    let mut row = vec![sealdb_types::Datum::Null; schema.len()];
+    row[idx] = value.clone();
+    sealdb_expression::eval_expr_with_row(key_expr, &schema, &row).ok()
+}
+
+fn flip_cmp(op: sealdb_parser::opcode::Op) -> sealdb_parser::opcode::Op {
+    use sealdb_parser::opcode::Op;
+    match op {
+        Op::Lt => Op::Gt,
+        Op::Le => Op::Ge,
+        Op::Gt => Op::Lt,
+        Op::Ge => Op::Le,
+        other => other,
+    }
 }
 
 #[cfg(test)]

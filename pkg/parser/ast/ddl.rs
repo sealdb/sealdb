@@ -229,10 +229,11 @@ pub enum PartitionType {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartitionDef {
     pub name: String,
-    /// RANGE bound; `None` means MAXVALUE. Unused for HASH/KEY/LIST.
-    pub less_than: Option<i64>,
+    /// RANGE bound as written (integer or quoted string); `None` means
+    /// MAXVALUE. Unused for HASH/KEY/LIST.
+    pub less_than: Option<String>,
     /// RANGE COLUMNS extra bounds after the first `less_than` (`None` = MAXVALUE).
-    pub extra_bounds: Vec<Option<i64>>,
+    pub extra_bounds: Vec<Option<String>>,
     /// LIST `VALUES IN (...)` integers.
     pub in_values: Vec<i64>,
 }
@@ -346,14 +347,14 @@ impl CreateTableStmt {
                     ctx.write_name(&def.name);
                     if part.tp == PartitionType::Range {
                         ctx.write_str(" VALUES LESS THAN (");
-                        match def.less_than {
-                            Some(v) => ctx.write_str(&v.to_string()),
+                        match &def.less_than {
+                            Some(v) => write_partition_bound(ctx, v),
                             None => ctx.write_str("MAXVALUE"),
                         }
                         for bound in &def.extra_bounds {
                             ctx.write_str(", ");
                             match bound {
-                                Some(v) => ctx.write_str(&v.to_string()),
+                                Some(v) => write_partition_bound(ctx, v),
                                 None => ctx.write_str("MAXVALUE"),
                             }
                         }
@@ -795,14 +796,14 @@ impl AlterTableSpec {
                         ctx.write_str(")");
                     } else {
                         ctx.write_str(" VALUES LESS THAN (");
-                        match def.less_than {
-                            Some(v) => ctx.write_str(&v.to_string()),
+                        match &def.less_than {
+                            Some(v) => write_partition_bound(ctx, v),
                             None => ctx.write_str("MAXVALUE"),
                         }
                         for bound in &def.extra_bounds {
                             ctx.write_str(", ");
                             match bound {
-                                Some(v) => ctx.write_str(&v.to_string()),
+                                Some(v) => write_partition_bound(ctx, v),
                                 None => ctx.write_str("MAXVALUE"),
                             }
                         }
@@ -847,5 +848,17 @@ impl AlterTableStmt {
             spec.restore(ctx)?;
         }
         Ok(())
+    }
+}
+
+/// RANGE bound text: integers stay bare, literal (string/temporal) bounds are
+/// re-quoted the way TiDB prints them (`VALUES LESS THAN ("2020-01-01 00:00:00")`).
+fn write_partition_bound(ctx: &mut RestoreCtx, bound: &str) {
+    if bound.parse::<i64>().is_ok() || bound.parse::<f64>().is_ok() {
+        ctx.write_str(bound);
+    } else {
+        ctx.write_str("\"");
+        ctx.write_str(bound);
+        ctx.write_str("\"");
     }
 }

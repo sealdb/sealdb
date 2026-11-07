@@ -6,36 +6,41 @@ use sealdb_util::chunk::Chunk;
 
 pub struct TableDualExec {
     opened: bool,
-    emitted: bool,
+    emitted: usize,
+    row_count: usize,
+    schema: Vec<String>,
 }
 
 impl TableDualExec {
-    pub fn new() -> Self {
+    pub fn new(row_count: usize, schema: Vec<String>) -> Self {
         Self {
             opened: false,
-            emitted: false,
+            emitted: 0,
+            row_count,
+            schema,
         }
     }
 }
 
 impl Default for TableDualExec {
     fn default() -> Self {
-        Self::new()
+        Self::new(1, Vec::new())
     }
 }
 
 impl Executor for TableDualExec {
     fn open(&mut self) -> Result<()> {
         self.opened = true;
+        self.emitted = 0;
         Ok(())
     }
 
     fn next(&mut self) -> Result<Option<Chunk>> {
-        if !self.opened || self.emitted {
+        if !self.opened || self.emitted >= self.row_count {
             return Ok(None);
         }
-        self.emitted = true;
-        let mut chunk = Chunk::new(0, 1);
+        self.emitted += 1;
+        let mut chunk = Chunk::new(self.schema.len(), 1);
         chunk.append_row(Vec::new());
         Ok(Some(chunk))
     }
@@ -46,7 +51,7 @@ impl Executor for TableDualExec {
     }
 
     fn schema(&self) -> &[String] {
-        &[]
+        &self.schema
     }
 }
 
