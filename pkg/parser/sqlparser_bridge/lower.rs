@@ -2138,6 +2138,13 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                     out.push(' ');
                     continue;
                 }
+                // `UNIQUE KEY uk (c) /*!80000 INVISIBLE */` — MySQL index
+                // visibility. Meta has no visibility flag yet, so the option is
+                // dropped (the index is simply visible).
+                if word == "invisible" || word == "visible" {
+                    out.push(' ');
+                    continue;
+                }
                 // `UNIQUE INDEX idx(id) GLOBAL` — partition-independent index.
                 // sqlparser has no GLOBAL index option, so pass it through as an
                 // index COMMENT marker recovered in `index_def_global`.
@@ -5429,8 +5436,20 @@ fn is_partition_expr(inner: &str) -> bool {
     let bytes = inner.as_bytes();
     if bytes
         .iter()
-        .any(|b| matches!(b, b'(' | b'+' | b'*' | b'/' | b'%'))
+        .any(|b| matches!(b, b'(' | b'+' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!'))
     {
+        return true;
+    }
+    // `id DIV 2` / `id MOD 2` / `id << 1` but not a bare identifier list.
+    let lower = inner.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.iter().any(|t| matches!(*t, "div" | "mod")) {
+        return true;
+    }
+    if lower.contains('<') {
         return true;
     }
     // `id - 1` / `id-1` but not a bare identifier.
@@ -8768,6 +8787,7 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::Minus => Op::Minus,
         BinaryOperator::Multiply => Op::Mul,
         BinaryOperator::Divide => Op::Div,
+        BinaryOperator::MyIntegerDivide => Op::IntDiv,
         BinaryOperator::Modulo => Op::Mod,
         BinaryOperator::Eq => Op::Eq,
         BinaryOperator::Spaceship => Op::NullSafeEq,

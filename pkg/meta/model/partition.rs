@@ -499,7 +499,7 @@ fn range_overlaps_bound(op: Op, value: &Datum, low: Option<&str>, high: Option<&
                 _ => high_cmp == Some(Ordering::Less),
             },
         },
-        Op::Ge => high.is_none() || high_cmp != Some(Ordering::Greater),
+        Op::Ge => high.is_none() || high_cmp == Some(Ordering::Less),
         _ => true,
     }
 }
@@ -606,10 +606,10 @@ fn const_datum(expr: &ExprNode) -> Option<Datum> {
         ExprNode::Unary(u) if u.op == Op::UnaryMinus => match u.expr.as_ref() {
             ExprNode::Value(ValueExpr {
                 datum: Datum::I64(v),
-            }) => Some(Datum::I64(-*v)),
+            }) => Some(Datum::I64(v.wrapping_neg())),
             ExprNode::Value(ValueExpr {
                 datum: Datum::U64(v),
-            }) => Some(Datum::I64(-(*v as i64))),
+            }) => Some(Datum::I64((*v as i64).wrapping_neg())),
             ExprNode::Value(ValueExpr {
                 datum: Datum::F64(v),
             }) => Some(Datum::F64(-*v)),

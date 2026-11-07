@@ -2656,6 +2656,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 Op::Minus => "minus",
                 Op::Mul => "mul",
                 Op::Div => "div",
+                Op::IntDiv => "intdiv",
                 Op::LeftShift => "leftshift",
                 Op::RightShift => "rightshift",
                 _ => return expr.restore_string(),

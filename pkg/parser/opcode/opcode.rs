@@ -4,6 +4,8 @@ pub enum Op {
     Minus,
     Mul,
     Div,
+    /// MySQL `DIV` — integer division (TiDB `opcode.IntDiv`).
+    IntDiv,
     Mod,
     Eq,
     /// MySQL/TiDB null-safe equal `<=>`.
@@ -34,6 +36,7 @@ impl Op {
             Op::Minus => "-",
             Op::Mul => "*",
             Op::Div => "/",
+            Op::IntDiv => "DIV",
             Op::Mod => "%",
             Op::Eq => "=",
             Op::NullSafeEq => "<=>",

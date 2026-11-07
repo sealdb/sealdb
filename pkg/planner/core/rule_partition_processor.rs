@@ -324,6 +324,23 @@ fn key_column_expr(key_text: &str, original: &ExprNode) -> ExprNode {
 fn const_datum(expr: &ExprNode) -> Option<sealdb_types::Datum> {
     match expr {
         ExprNode::Value(ValueExpr { datum }) if !datum.is_null() => Some(datum.clone()),
+        // Negative literals parse as `UnaryMinus(Value)`.
+        ExprNode::Unary(u)
+            if u.op == sealdb_parser::opcode::Op::UnaryMinus =>
+        {
+            match u.expr.as_ref() {
+                ExprNode::Value(ValueExpr {
+                    datum: sealdb_types::Datum::I64(v),
+                }) => Some(sealdb_types::Datum::I64(v.wrapping_neg())),
+                ExprNode::Value(ValueExpr {
+                    datum: sealdb_types::Datum::U64(v),
+                }) => Some(sealdb_types::Datum::I64((*v as i64).wrapping_neg())),
+                ExprNode::Value(ValueExpr {
+                    datum: sealdb_types::Datum::F64(v),
+                }) => Some(sealdb_types::Datum::F64(-*v)),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -434,5 +451,47 @@ mod tests {
             PartitionPruneMode::Static,
         );
         assert_eq!(planned.names, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn expr_key_div_inlist_prunes() {
+        use sealdb_parser::ast::expressions::InListExpr;
+        let mut info = TableInfo::new(
+            1,
+            "t",
+            vec![ColumnInfo::new(1, 0, "col1", FieldType::new_longlong())],
+        );
+        info.partition = Some(
+            PartitionInfo::new(
+                PartitionType::Hash,
+                "COL1 DIV 80",
+                (0..6)
+                    .map(|i| PartitionDefinition::new(100 + i, format!("p{i}"), vec![]))
+                    .collect(),
+            )
+            .with_expr_key("COL1 DIV 80"),
+        );
+        let expr = ExprNode::InList(InListExpr {
+            expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: "col1".into(),
+            })),
+            list: vec![
+                // Parser produces `UnaryMinus(128)` for negative literals.
+                ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+                    op: Op::UnaryMinus,
+                    expr: Box::new(ExprNode::Value(ValueExpr {
+                        datum: Datum::I64(128),
+                    })),
+                }),
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::I64(107),
+                }),
+            ],
+            not: false,
+        });
+        let planned = resolve_partitions(&info, Some(&expr), &[], PartitionPruneMode::Static);
+        assert_eq!(planned.names, vec!["p1"]);
     }
 }

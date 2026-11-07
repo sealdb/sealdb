@@ -1190,6 +1190,7 @@ pub(crate) fn explain_semi_pred(expr: &ExprNode) -> String {
                 Op::Minus => "minus",
                 Op::Mul => "mul",
                 Op::Div => "div",
+                Op::IntDiv => "intdiv",
                 _ => return expr.restore_string(),
             };
             format!(
