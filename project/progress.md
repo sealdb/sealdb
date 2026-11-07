@@ -234,6 +234,15 @@
 | PD HTTP 连接复用 | 每个进程一个连接池 | `pd_http_client` 改 `OnceLock` 单例（避免 TIME_WAIT 耗尽临时端口 → `EADDRNOTAVAIL`） | TiKV green 28 套件 54s 跑完 |
 | 诊断开关 | — | `SEALDB_PD_TRACE`（PD 请求耗时）/ `SEALDB_ITEST_PROGRESS`（逐套件进度） | 定位到 1,168,664 次重复 `region/key/7200…fb` |
 
+### 2.0o R3 `executor/batch_point_get`（2026-11-08）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| `SLEEP(n)` | `SLEEP` 内建函数，返回 0 | `evaluator` 新增 `SLEEP`（按参数秒数阻塞，NULL → NULL） | `select sleep(0.05)` 输出 `0` |
+| ENUM 常量折叠 | 数字与 ENUM 列比较按成员下标（`a = 1` ⇒ `a = 'a'`） | `coerce_enum_selection` / `normalize_enum_constants`：plan 前把 `=`/`IN` 的数字常量换成成员 label；session 对语句做同样归一，供执行器重读 AST | `ttt.a in (1,"b")` 返回 `a`；`a = 1` 命中 |
+| `KEY` 分区字符串哈希 | 字符串按 `codec.EncodeValue` 的 8 字节长度前缀参与 MD5（整数仍是 8 字节大端） | `key_hash::key_partition_index` 对 `Datum::Bytes` 加 `u64` 长度前缀 | `tkey` 裁剪 `partition:p3`（原 `p0,p3`） |
+| 剩余差异 | `AS OF TIMESTAMP` 历史快照读（`tidb_snapshot` / stale read） | 未实现：无行级 commit_ts 读视图，TiKV/内存都只读最新 | 1 条语句仍红；suite 保持 `in_progress` |
+
 ### 2.1 历史阶段（归档，不作为对齐进度）
 
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
