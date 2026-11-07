@@ -429,6 +429,23 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: -1,
             ..string_ft()
         },
+        // TINYTEXT/MEDIUMTEXT/LONGTEXT share the blob type codes in MySQL and
+        // differ only by the utf8mb4 charset (TiDB maps them the same way).
+        "TINYTEXT" => FieldType {
+            tp: TYPE_TINY_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        "MEDIUMTEXT" => FieldType {
+            tp: TYPE_MEDIUM_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
+        "LONGTEXT" => FieldType {
+            tp: TYPE_LONG_BLOB,
+            flen: -1,
+            ..string_ft()
+        },
         "LONGBLOB" => FieldType {
             tp: TYPE_LONG_BLOB,
             flen: -1,
