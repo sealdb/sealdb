@@ -1550,8 +1550,24 @@
 - **下一步**:
   - F11 `SHOW` / `DESC`，或 F03 `INSERT` + `SELECT *`
 
-### 2026-11-01
+### 2026-11-07
 
+- **Phase**: R3 分区/谓词波
+- **完成**:
+  - `executor/partition/partition_boundaries` 1:1 对齐 TiDB 金样（Gate A+B）
+  - 统计：窄列（<=10k distinct）保留精确 value counts，分区扫描 selectivity 与 TiDB 一致
+  - Parser：`BETWEEN` 下沉为 `>=`/`<=`（`NOT BETWEEN` → `OR`），单值 `IN (x)` 折叠为 `=`，`HIGH_NOT_PRECEDENCE` 下 `NOT x BETWEEN` 绑定更紧
+  - Planner：`=`/`IN`/比较/`!=`/`AND`/`OR` 的分区裁剪；无分区命中时报 `partition:dual`；分区 filter est 走 value counts；De Morgan 产生的 `AND` 作为单个下推谓词项（EXPLAIN 打印 `and(...)` 而非逗号拼接）
+  - EXPLAIN：`IN` 列表打印 `in(col, ...)` / `not(in(col, ...))`
+- **验证**:
+  - `run-tests.sh -s memory --status green` → PASS: memory=22
+  - `run-tests.sh -s tikv --status green` → PASS: tikv=22
+- **阻塞/风险**:
+  - `local/agg` 在 HEAD 上已红：投影列名头不再带反引号（`name` vs `` `name` ``），属前序 “projection column ids” 改动的本地冒烟金样漂移，未改金样
+- **下一步**:
+  - 继续 R2/R3 分区与 planner 套件
+
+### 2026-11-01
 - **Phase**: 功能波 Unlock + F01
 - **完成**:
   - workspace 空 crate 可编译；`[workspace.dependencies]` 落地
