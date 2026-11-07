@@ -25,9 +25,9 @@ pub struct PartitionDefinition {
     /// RANGE bound as a decimal string, or `MAXVALUE`. Empty for HASH/KEY.
     #[serde(rename = "less_than", default)]
     pub less_than: Vec<String>,
-    /// LIST `VALUES IN` integers. Empty for RANGE/HASH/KEY.
+    /// LIST `VALUES IN` values (`None` is SQL `NULL`). Empty for RANGE/HASH/KEY.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub in_values: Vec<i64>,
+    pub in_values: Vec<Option<i64>>,
 }
 
 impl PartitionDefinition {
@@ -40,7 +40,7 @@ impl PartitionDefinition {
         }
     }
 
-    pub fn with_in_values(mut self, values: Vec<i64>) -> Self {
+    pub fn with_in_values(mut self, values: Vec<Option<i64>>) -> Self {
         self.in_values = values;
         self
     }
@@ -152,7 +152,7 @@ impl PartitionInfo {
                 return Ok(def.id);
             }
         }
-        Err(no_partition())
+        Err(no_partition_value(value))
     }
 
     fn locate_hash(&self, value: &Datum) -> Result<i64> {
@@ -195,7 +195,13 @@ impl PartitionInfo {
     /// less than (MAXVALUE is +inf) is the partition.
     pub fn locate_tuple(&self, values: &[Datum]) -> Result<i64> {
         if self.columns.len() <= 1 {
-            return self.locate(values.first().unwrap_or(&Datum::Null));
+            // Plain RANGE reports the offending value; LIST keeps TiDB's
+            // column-list wording for a single key column.
+            return match self.locate(values.first().unwrap_or(&Datum::Null)) {
+                Ok(id) => Ok(id),
+                Err(e) if self.tp == PartitionType::Range => Err(e),
+                Err(_) => Err(no_partition()),
+            };
         }
         for def in &self.definitions {
             if tuple_less(values, &def.less_than) {
@@ -206,21 +212,17 @@ impl PartitionInfo {
     }
 
     fn locate_list(&self, value: &Datum) -> Result<i64> {
-        if matches!(value, Datum::Null) {
-            return self
-                .definitions
-                .first()
-                .map(|d| d.id)
-                .ok_or_else(no_partition);
-        }
-        let Some(v) = datum_i64(value) else {
-            return Err(no_partition());
+        // LIST partitions accept only the declared values; `NULL` matches an
+        // explicit `NULL` list entry (TiDB `VALUES IN (…, NULL)`).
+        let want = match value {
+            Datum::Null => None,
+            other => datum_i64(other).map(Some).ok_or_else(no_partition)?,
         };
         self.definitions
             .iter()
-            .find(|def| def.in_values.contains(&v))
+            .find(|def| def.in_values.contains(&want))
             .map(|def| def.id)
-            .ok_or_else(no_partition)
+            .ok_or_else(|| no_partition_value(value))
     }
 
     pub fn prune(&self, selection: Option<&ExprNode>) -> Vec<i64> {
@@ -260,6 +262,12 @@ impl PartitionInfo {
         if let ExprNode::InList(list) = expr
             && !list.not
         {
+            // Only the partition key column may drive pruning; an unrelated
+            // column (`id IN (…)` under a different key) pins nothing.
+            let col = as_column(&list.expr)?;
+            if !col.eq_ignore_ascii_case(self.column()) {
+                return None;
+            }
             let mut ids = Vec::new();
             for item in &list.list {
                 let value = const_datum(item)?;
@@ -413,7 +421,7 @@ impl TableInfo {
     /// RANGE COLUMNS uses every partition-key column; other types keep the first.
     pub fn locate_partition_row(&self, values: &[Datum]) -> Result<i64> {
         match &self.partition {
-            Some(part) if part.enable && part.columns.len() > 1 => {
+            Some(part) if part.enable && !part.columns.is_empty() => {
                 part.locate_tuple(&self.partition_values(values))
             }
             _ => {
@@ -656,6 +664,13 @@ fn const_datum(expr: &ExprNode) -> Option<Datum> {
         },
         _ => None,
     }
+}
+
+fn no_partition_value(value: &Datum) -> Error {
+    Error::new(
+        ERR_NO_PARTITION_FOR_GIVEN_VALUE,
+        format!("Table has no partition for value {}", value.display()),
+    )
 }
 
 fn no_partition() -> Error {

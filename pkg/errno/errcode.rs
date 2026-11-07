@@ -12,6 +12,8 @@ pub const ERR_WRONG_FIELD_WITH_GROUP: i32 = 1055;
 pub const ERR_NO_SUCH_TABLE: i32 = 1146;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
+/// MySQL `ER_WRONG_VALUE_COUNT_ON_ROW`: VALUES arity differs from the columns.
+pub const ERR_WRONG_VALUE_COUNT_ON_ROW: i32 = 1136;
 pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
@@ -42,6 +44,8 @@ pub const ERR_INCORRECT_USAGE: i32 = 1221;
 /// CTE / derived / VIEW: SELECT list vs column names list (MySQL ER_VIEW_WRONG_LIST).
 pub const ERR_VIEW_WRONG_LIST: i32 = 1353;
 pub const ERR_DUP_FIELDNAME: i32 = 1060;
+/// MySQL `ER_FIELD_SPECIFIED_TWICE`: `INSERT … (c1, c1)` / duplicate SET targets.
+pub const ERR_FIELD_SPECIFIED_TWICE: i32 = 1110;
 pub const ERR_DUP_KEYNAME: i32 = 1061;
 pub const ERR_CANT_DROP_FIELD_OR_KEY: i32 = 1091;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;

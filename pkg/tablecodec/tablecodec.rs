@@ -90,7 +90,9 @@ pub fn encode_index_key(
     unique: bool,
 ) -> Key {
     let mut encoded = encode_index_values(values);
-    if !unique {
+    // Unique indexes allow repeated NULLs (SQL semantics), so those entries
+    // keep the handle suffix and never collide with each other.
+    if !unique || values.iter().any(|v| v.is_null()) {
         encode_int(&mut encoded, handle);
     }
     encode_index_seek_key(table_id, idx_id, &encoded)

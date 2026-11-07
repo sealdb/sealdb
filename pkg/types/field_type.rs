@@ -7,6 +7,9 @@ pub enum EvalType {
     Datetime,
 }
 
+/// MySQL/TiDB `NotNullFlag` (`FieldType.Flag & 1`).
+pub const NOT_NULL_FLAG: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FieldType {
     #[serde(rename = "Tp")]
