@@ -305,6 +305,10 @@ fn push_into(
                         &on,
                         &left_map,
                         &right_map,
+                        &left_table,
+                        &right_table,
+                        is_single_table_subtree(&left),
+                        is_single_table_subtree(&right),
                         &left_preds,
                         &right_preds,
                     );
@@ -627,6 +631,18 @@ fn collect_join_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<
     }
 }
 
+/// A side that holds no nested join is a single base table (or a leaf such as
+/// a CTE/derived table): every column of its ON operand belongs to it.
+fn is_single_table_subtree(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::HashJoin { .. } | PhysicalPlan::MergeJoin { .. } => false,
+        PhysicalPlan::Projection { child, .. } | PhysicalPlan::Distinct { child, .. } => {
+            is_single_table_subtree(child)
+        }
+        _ => true,
+    }
+}
+
 fn is_true_expr(expr: &ExprNode) -> bool {
     matches!(expr, ExprNode::Value(value) if value.datum == Datum::I64(1))
 }
@@ -747,6 +763,10 @@ fn derive_equal_cond_preds(
     on: &ExprNode,
     left_map: &std::collections::HashMap<String, Vec<String>>,
     right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_table: &str,
+    right_table: &str,
+    left_single: bool,
+    right_single: bool,
     left_preds: &[ExprNode],
     right_preds: &[ExprNode],
 ) -> (Vec<ExprNode>, Vec<ExprNode>) {
@@ -769,19 +789,33 @@ fn derive_equal_cond_preds(
             _ => None,
         }
     }
+    /// An alias-loaded subtree may be absent from the infoschema (the alias
+    /// itself is not a table name); an empty map then means "unknown", not
+    /// "not owned".
     fn owns(
         map: &std::collections::HashMap<String, Vec<String>>,
         name: &str,
+        single: bool,
     ) -> bool {
-        map.contains_key(&name.to_ascii_lowercase())
+        single || map.is_empty() || map.contains_key(&name.to_ascii_lowercase())
     }
     /// Alias that owns `name` in the given subtree (`None` → cannot derive).
+    /// Falls back to the join side's own alias when columns are unresolvable.
     fn alias_for(
         map: &std::collections::HashMap<String, Vec<String>>,
         name: &str,
+        fallback: &str,
+        single: bool,
     ) -> Option<String> {
-        let owners = map.get(&name.to_ascii_lowercase())?;
-        (owners.len() == 1).then(|| owners[0].clone())
+        if single {
+            return Some(fallback.to_string());
+        }
+        match map.get(&name.to_ascii_lowercase()) {
+            Some(owners) if owners.len() == 1 => Some(owners[0].clone()),
+            Some(_) => None,
+            None if map.is_empty() => Some(fallback.to_string()),
+            None => None,
+        }
     }
     fn replace(e: &ExprNode, from: &str, to: &str, alias: &str) -> Option<ExprNode> {
         if e.referenced_columns().is_empty() {
@@ -799,7 +833,7 @@ fn derive_equal_cond_preds(
                 op: b.op,
                 left: Box::new(replace(&b.left, from, to, alias)?),
                 right: Box::new(replace(&b.right, from, to, alias)?),
-                single_cnf_item: b.single_cnf_item,
+                single_cnf_item: false,
             })),
             ExprNode::Unary(u) => Some(ExprNode::Unary(UnaryOpExpr {
                 op: u.op,
@@ -831,7 +865,7 @@ fn derive_equal_cond_preds(
         };
         for p in left_preds {
             let Some(c) = single_col(p) else { continue };
-            if !owns(left_map, &c.name) {
+            if !owns(left_map, &c.name, left_single) {
                 continue;
             }
             let (from, to) = if c.name.eq_ignore_ascii_case(&a.name)
@@ -843,7 +877,7 @@ fn derive_equal_cond_preds(
             } else {
                 continue;
             };
-            let Some(alias) = alias_for(right_map, &to) else {
+            let Some(alias) = alias_for(right_map, &to, right_table, right_single) else {
                 continue;
             };
             if let Some(d) = replace(p, &from, &to, &alias) {
@@ -852,7 +886,7 @@ fn derive_equal_cond_preds(
         }
         for p in right_preds {
             let Some(c) = single_col(p) else { continue };
-            if !owns(right_map, &c.name) {
+            if !owns(right_map, &c.name, right_single) {
                 continue;
             }
             let (from, to) = if c.name.eq_ignore_ascii_case(&b.name)
@@ -864,7 +898,7 @@ fn derive_equal_cond_preds(
             } else {
                 continue;
             };
-            let Some(alias) = alias_for(left_map, &to) else {
+            let Some(alias) = alias_for(left_map, &to, left_table, left_single) else {
                 continue;
             };
             if let Some(d) = replace(p, &from, &to, &alias) {
