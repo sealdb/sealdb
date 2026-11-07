@@ -238,7 +238,7 @@ impl ExprNode {
         ranges
     }
 
-    fn collect_columns(&self, out: &mut Vec<(Option<String>, String)>) {
+    pub fn collect_columns(&self, out: &mut Vec<(Option<String>, String)>) {
         match self {
             ExprNode::Column(col) => out.push((col.table.clone(), col.name.clone())),
             ExprNode::Binary(b) => {

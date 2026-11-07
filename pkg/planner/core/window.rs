@@ -31,10 +31,12 @@ pub fn build_window_plan(
         current_db.to_string()
     };
     let win_col = window_result_column_id(select, is, current_db);
+    // The window function may not be the first field (`select b, row_number()…`).
     let (win, outer) = select
         .fields
-        .first()
+        .iter()
         .map(|f| extract_window_outer(&f.expr))
+        .find(|(w, _)| w.is_some())
         .unwrap_or((None, None));
 
     let plan_shape = window_shape(win, &schema, table, win_col);
@@ -176,7 +178,7 @@ fn window_shape(
                 ExprNode::Column(c) => format!("cast({}, decimal(10,0) BINARY)", qual(&c.name)),
                 other => other.restore_string(),
             })
-            .unwrap_or_else(|| "1".into());
+            .unwrap_or_else(|| String::new());
         format!("{fname}({arg})->Column#{win_col} {over}")
     };
 
@@ -227,17 +229,18 @@ fn format_over(part: &[String], order: &[String], win: &WindowFuncExpr) -> Strin
         s.push_str(&bound_str(&frame.start));
         s.push_str(" and ");
         s.push_str(&bound_str(&frame.end));
+    } else if win.name.eq_ignore_ascii_case("row_number") {
+        // TiDB default frame for row_number: current row only, with or
+        // without ORDER BY / PARTITION BY.
+        if !first {
+            s.push(' ');
+        }
+        s.push_str("rows between current row and current row");
     } else if !order.is_empty() {
         if !first {
             s.push(' ');
         }
         s.push_str("range between unbounded preceding and current row");
-    } else if !part.is_empty() && win.name.eq_ignore_ascii_case("row_number") {
-        // TiDB default frame for partition-only row_number.
-        if !first {
-            s.push(' ');
-        }
-        s.push_str("rows between current row and current row");
     }
     s.push(')');
     s
@@ -287,12 +290,60 @@ fn maybe_index_for_window(
     let Some(info) = is.table_by_name(schema, from.resolve_name()) else {
         return child;
     };
-    let Some(index) = info.indices.iter().find(|i| !i.primary) else {
-        return child;
+    // TiDB prefers a covering index scan when the window plan needs no table
+    // columns outside the index (`PRIMARY(b,a)` for a window over `b`/`a`).
+    // Star selects need every column, so they keep the table scan.
+    let mut referenced: Vec<(Option<String>, String)> = Vec::new();
+    let mut needs_all = false;
+    for field in &select.fields {
+        if matches!(field.expr, ExprNode::Column(ref c) if c.name == "*") {
+            needs_all = true;
+            continue;
+        }
+        field.expr.collect_columns(&mut referenced);
+    }
+    if let Some(selection) = &select.selection {
+        selection.collect_columns(&mut referenced);
+    }
+    let mut needed: Vec<String> = referenced
+        .into_iter()
+        .map(|(_, name)| name)
+        // Derived-table aliases (`rownumber`) are not table columns.
+        .filter(|name| {
+            info.columns
+                .iter()
+                .any(|c| c.name.l() == name.to_ascii_lowercase())
+        })
+        .collect();
+    needed.sort();
+    needed.dedup();
+    let covering = |index: &sealdb_meta::model::IndexInfo| -> bool {
+        !needs_all && info.index_covers(index, &needed)
     };
+    let index = info
+        .indices
+        .iter()
+        .find(|i| i.primary && covering(i))
+        .or_else(|| info.indices.iter().find(|i| covering(i)));
+    let Some(index) = index else {
+        // Nothing covers: fall back to the historical first-secondary-index
+        // choice (window suites rely on `idx(a)` for `partition by a`).
+        let Some(index) = info.indices.iter().find(|i| !i.primary) else {
+            return child;
+        };
+        return index_reader(table, partitions, index);
+    };
+    index_reader(table, partitions, index)
+}
+
+fn index_reader(
+    table: &str,
+    partitions: &Vec<i64>,
+    index: &sealdb_meta::model::IndexInfo,
+) -> PhysicalPlan {
     let index_columns: Vec<String> = index.columns.iter().map(|c| c.name.o().to_string()).collect();
     PhysicalPlan::IndexReader {
-        table: table.clone(),
+        table: table.to_string(),
         index: index.name.o().to_string(),
         index_columns,
         partitions: partitions.clone(),

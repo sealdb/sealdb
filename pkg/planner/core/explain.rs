@@ -1720,15 +1720,8 @@ fn emit_cop_children(
                 );
                 return true;
             }
-            let scan_task = if topn_parent.is_some()
-                || under_stream_agg
-                || under_window
-                || under_index_join
-            {
-                "cop[tikv]"
-            } else {
-                "cop"
-            };
+            // TiDB labels every DistSQL index scan `cop[tikv]`.
+            let scan_task = "cop[tikv]";
             // Limit pushdown: scale Selection/scan est by limit/group_est.
             let limit_scale = stream_est
                 .filter(|e| *e > 0.0 && *e < 8000.0)
@@ -2856,7 +2849,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
-                "data:IndexFullScan".to_string()
+                "index:IndexFullScan".to_string()
             },
         ),
         PhysicalPlan::IndexMerge { indexes, .. } => (
