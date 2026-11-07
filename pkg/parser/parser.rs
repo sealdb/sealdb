@@ -1723,8 +1723,8 @@ mod tests {
             crate::ast::Statement::CreateTable(create) => {
                 let part = create.partition.expect("list partition");
                 assert_eq!(part.tp, crate::ast::PartitionType::List);
-                assert_eq!(part.defs[0].in_values, vec![1, 2]);
-                assert_eq!(part.defs[1].in_values, vec![10]);
+                assert_eq!(part.defs[0].in_values, vec![Some(1), Some(2)]);
+                assert_eq!(part.defs[1].in_values, vec![Some(10)]);
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }

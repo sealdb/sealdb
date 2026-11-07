@@ -87,6 +87,8 @@ pub struct ColumnDef {
     pub generated: Option<GeneratedColumn>,
     /// `AUTO_INCREMENT` column option (MySQL/TiDB).
     pub auto_increment: bool,
+    /// Explicit `NOT NULL` (or PRIMARY KEY implied) column option.
+    pub not_null: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +110,9 @@ impl ColumnDef {
             ctx.write_str(" GENERATED ALWAYS AS (");
             ctx.write_str(&g.expr);
             ctx.write_str(if g.stored { ") STORED" } else { ") VIRTUAL" });
+        }
+        if self.not_null {
+            ctx.write_str(" NOT NULL");
         }
         if self.auto_increment {
             ctx.write_str(" AUTO_INCREMENT");
@@ -235,7 +240,7 @@ pub struct PartitionDef {
     /// RANGE COLUMNS extra bounds after the first `less_than` (`None` = MAXVALUE).
     pub extra_bounds: Vec<Option<String>>,
     /// LIST `VALUES IN (...)` integers.
-    pub in_values: Vec<i64>,
+    pub in_values: Vec<Option<i64>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -365,7 +370,10 @@ impl CreateTableStmt {
                             if j > 0 {
                                 ctx.write_str(", ");
                             }
-                            ctx.write_str(&v.to_string());
+                            match v {
+                                Some(v) => ctx.write_str(&v.to_string()),
+                                None => ctx.write_str("NULL"),
+                            }
                         }
                         ctx.write_str(")");
                     }
@@ -796,7 +804,10 @@ impl AlterTableSpec {
                             if j > 0 {
                                 ctx.write_str(", ");
                             }
-                            ctx.write_str(&v.to_string());
+                            match v {
+                                Some(v) => ctx.write_str(&v.to_string()),
+                                None => ctx.write_str("NULL"),
+                            }
                         }
                         ctx.write_str(")");
                     } else {

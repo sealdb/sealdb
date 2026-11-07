@@ -86,6 +86,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_mysql_interval_minute_second(&rewritten);
     // MySQL `FROM (t)` / `FROM (t1, t2)` — sqlparser only allows NestedJoin with JOIN.
     let rewritten = rewrite_mysql_paren_from(&rewritten);
+    let rewritten = rewrite_dml_ignore(&rewritten);
     let rewritten = rewrite_update_comma_join(&rewritten)?;
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
@@ -825,7 +826,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .iter()
                 .map(object_name_last)
                 .collect::<Result<Vec<_>>>()?;
-            let (columns, rows, select) = if !insert.assignments.is_empty() {
+            let (columns, rows, select, select_set) = if !insert.assignments.is_empty() {
                 let mut columns = Vec::with_capacity(insert.assignments.len());
                 let mut row = Vec::with_capacity(insert.assignments.len());
                 for item in &insert.assignments {
@@ -839,12 +840,18 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     }
                     row.push(lower_expr(&item.value)?);
                 }
-                (columns, vec![row], None)
+                (columns, vec![row], None, None)
             } else {
                 match insert.source.as_deref() {
                     Some(query) => match query.body.as_ref() {
-                        SetExpr::Values(values) => (columns, lower_values(values)?, None),
-                        _ => (columns, Vec::new(), Some(Box::new(lower_query(query)?))),
+                        SetExpr::Values(values) => (columns, lower_values(values)?, None, None),
+                        SetExpr::SetOperation { .. } => (
+                            columns,
+                            Vec::new(),
+                            None,
+                            Some(Box::new(lower_set_opr(query)?)),
+                        ),
+                        _ => (columns, Vec::new(), Some(Box::new(lower_query(query)?)), None),
                     },
                     None => return Err(Error::unsupported("INSERT without VALUES")),
                 }
@@ -859,10 +866,12 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             Ok(Statement::Insert(InsertStmt {
                 table,
                 ignore: insert.ignore,
+                replace: insert.replace_into,
                 partitions: insert_partition_names(insert.partitioned.as_ref())?,
                 columns,
                 rows,
                 select,
+                select_set,
                 with: None,
                 on_duplicate,
             }))
@@ -4997,10 +5006,7 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
                 if v.is_empty() {
                     continue;
                 }
-                in_values.push(
-                    v.parse::<i64>()
-                        .map_err(|_| Error::unsupported("non-integer LIST value"))?,
-                );
+                in_values.push(parse_list_value(v)?);
             }
             defs.push(PartitionDef {
                 name,
@@ -5390,6 +5396,16 @@ fn find_word(haystack: &str, word: &str, from: usize) -> Option<usize> {
 }
 
 /// `p0`, `P1`, … partition names in `INSERT … PARTITION (...)`.
+/// One `VALUES IN (…)` list entry: an integer literal or SQL `NULL`.
+fn parse_list_value(v: &str) -> Result<Option<i64>> {
+    if v.eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    v.parse::<i64>()
+        .map(Some)
+        .map_err(|_| Error::unsupported("non-integer LIST value"))
+}
+
 fn insert_partition_names(exprs: Option<&Vec<Expr>>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for e in exprs.map(Vec::as_slice).unwrap_or(&[]) {
@@ -5844,10 +5860,7 @@ fn parse_list_defs(body: &str) -> Result<Vec<PartitionDef>> {
             if v.is_empty() {
                 continue;
             }
-            in_values.push(
-                v.parse::<i64>()
-                    .map_err(|_| Error::unsupported("non-integer LIST value"))?,
-            );
+            in_values.push(parse_list_value(v)?);
         }
         let _ = skip_named_subpartitions(bytes, close + 1);
         if in_values.is_empty() {
@@ -7245,7 +7258,9 @@ fn lower_update(update: &Update) -> Result<Statement> {
     if list.is_empty() {
         return Err(Error::unsupported("UPDATE without SET"));
     }
+    let ignore = has_dml_ignore_hint(&update.optimizer_hints);
     Ok(Statement::Update(UpdateStmt {
+        ignore,
         table,
         join,
         list,
@@ -7313,7 +7328,9 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
     if join.is_some() && tables.is_empty() {
         return Err(Error::unsupported("multi-table DELETE without table list"));
     }
+    let ignore = has_dml_ignore_hint(&delete.optimizer_hints);
     Ok(Statement::Delete(DeleteStmt {
+        ignore,
         table,
         tables,
         join,
@@ -7322,6 +7339,125 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
         limit,
         with: None,
     }))
+}
+
+/// Marker optimizer hint that survives sqlparser for MySQL `UPDATE/DELETE IGNORE`.
+const DML_IGNORE_HINT: &str = "SEALDB_DML_IGNORE";
+
+fn has_dml_ignore_hint(hints: &[sqlparser::ast::OptimizerHint]) -> bool {
+    hints
+        .iter()
+        .any(|h| h.text.trim().eq_ignore_ascii_case(DML_IGNORE_HINT))
+}
+
+/// sqlparser's MySQL dialect has no `UPDATE IGNORE` / `DELETE IGNORE`; rewrite
+/// the keyword into an optimizer hint the lowering step recovers.
+fn rewrite_dml_ignore(sql: &str) -> String {
+    let chunks = split_top_level_statements(sql);
+    let mut out = String::with_capacity(sql.len() + 32);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        out.push_str(&rewrite_one_dml_ignore(chunk));
+    }
+    out
+}
+
+fn rewrite_one_dml_ignore(chunk: &str) -> String {
+    let Some((kw, rest)) = take_leading_word(chunk) else {
+        return chunk.to_string();
+    };
+    let kw_upper = kw.to_ascii_uppercase();
+    if kw_upper != "UPDATE" && kw_upper != "DELETE" {
+        return chunk.to_string();
+    }
+    let Some((word, after)) = take_leading_word(rest) else {
+        return chunk.to_string();
+    };
+    if !word.eq_ignore_ascii_case("IGNORE") {
+        return chunk.to_string();
+    }
+    let mut out = String::with_capacity(chunk.len() + 24);
+    out.push_str(kw);
+    out.push_str(rest.split_at(word_start_offset(rest)).0);
+    out.push_str(&format!("/*+ {DML_IGNORE_HINT} */ "));
+    out.push_str(after);
+    out
+}
+
+/// Byte offset where the first word of `text` starts (skips whitespace/comments).
+fn word_start_offset(text: &str) -> usize {
+    text.len() - text.trim_start_matches(is_sql_space).len()
+}
+
+fn is_sql_space(c: char) -> bool {
+    c.is_whitespace()
+}
+
+/// Split into statements on `;` outside quotes and comments.
+fn split_top_level_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && quote != b'`' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b';' => {
+                out.push(&sql[start..i]);
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push(&sql[start..]);
+    out
+}
+
+/// Leading word (skipping whitespace) plus the remaining text after it.
+fn take_leading_word(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim_start();
+    let end = trimmed
+        .char_indices()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&trimmed[..end], &trimmed[end..]))
 }
 
 /// Split `col` / `t.col` / `db.t.col` into `(table, column)` for UPDATE SET.
@@ -7918,6 +8054,16 @@ fn lower_generated_column(
 
 /// TiDB `ColumnOptionAutoIncrement`: `AUTO_INCREMENT` arrives from sqlparser
 /// as a dialect-specific option token.
+/// `NOT NULL` (and `PRIMARY KEY`, which implies it).
+fn lower_not_null(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
+    options.iter().any(|opt| {
+        matches!(
+            opt.option,
+            sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::PrimaryKey(_)
+        )
+    })
+}
+
 fn lower_auto_increment(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
     options.iter().any(|opt| match &opt.option {
         sqlparser::ast::ColumnOption::DialectSpecific(tokens) => tokens.iter().any(|t| {
@@ -7962,6 +8108,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             default: lower_column_default(&col.options),
             generated: lower_generated_column(&col.options)?,
             auto_increment: lower_auto_increment(&col.options),
+            not_null: lower_not_null(&col.options),
         });
         for opt in &col.options {
             if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)) {
@@ -7976,6 +8123,27 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         return Err(Error::unsupported("CREATE TABLE without columns"));
     }
     let mut indices = lower_table_indices(&create.constraints)?;
+    // Inline `c int UNIQUE` → unique index named after the column.
+    for col in &create.columns {
+        if col
+            .options
+            .iter()
+            .any(|opt| {
+                matches!(&opt.option, sqlparser::ast::ColumnOption::Unique(u) if u.columns.is_empty())
+            })
+            && !indices
+                .iter()
+                .any(|i| i.columns.len() == 1 && i.columns[0].eq_ignore_ascii_case(&col.name.value))
+        {
+            indices.push(IndexDef {
+                name: col.name.value.clone(),
+                columns: vec![col.name.value.clone()],
+                unique: true,
+                primary: false,
+                global: false,
+            });
+        }
+    }
     // `a int primary key` → synthetic PRIMARY KEY index (TiDB pk_is_handle).
     if let Some(name) = col_primary {
         if !indices.iter().any(|i| i.primary) {
@@ -9065,6 +9233,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 default: lower_column_default(&column_def.options),
                 generated: lower_generated_column(&column_def.options)?,
                 auto_increment: lower_auto_increment(&column_def.options),
+                not_null: lower_not_null(&column_def.options),
             },
             position: lower_column_position(column_position),
         }),

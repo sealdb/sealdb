@@ -464,11 +464,15 @@ pub struct InsertStmt {
     pub table: TableName,
     /// `INSERT IGNORE`: duplicate-key / partition-mismatch errors become warnings.
     pub ignore: bool,
+    /// `REPLACE INTO`: conflicting rows are deleted before the new row is written.
+    pub replace: bool,
     /// `INSERT INTO t PARTITION (p0, p1) ...` — target partition names.
     pub partitions: Vec<String>,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<ExprNode>>,
     pub select: Option<Box<SelectStmt>>,
+    /// `INSERT … SELECT … UNION …` body (mutually exclusive with `select`).
+    pub select_set: Option<Box<SetOprStmt>>,
     pub with: Option<WithClause>,
     /// `ON DUPLICATE KEY UPDATE col = expr, ...`
     pub on_duplicate: Vec<Assignment>,
@@ -479,7 +483,9 @@ impl InsertStmt {
         if let Some(with) = &self.with {
             with.restore(ctx)?;
         }
-        ctx.write_str(if self.ignore {
+        ctx.write_str(if self.replace {
+            "REPLACE INTO "
+        } else if self.ignore {
             "INSERT IGNORE INTO "
         } else {
             "INSERT INTO "
@@ -508,6 +514,11 @@ impl InsertStmt {
         if let Some(select) = &self.select {
             ctx.write_str(" ");
             select.restore(ctx)?;
+            return Ok(());
+        }
+        if let Some(set) = &self.select_set {
+            ctx.write_str(" ");
+            set.restore(ctx)?;
             return Ok(());
         }
         ctx.write_str(" VALUES ");
@@ -552,6 +563,8 @@ impl Assignment {
 /// ORDER BY / LIMIT are single-table only (MySQL forbids them on multi-table UPDATE).
 #[derive(Clone, Debug)]
 pub struct UpdateStmt {
+    /// MySQL `UPDATE IGNORE`: conflicting rows warn (`1062`) instead of failing.
+    pub ignore: bool,
     pub table: TableName,
     pub join: Option<Join>,
     pub list: Vec<Assignment>,
@@ -571,6 +584,9 @@ impl UpdateStmt {
             with.restore(ctx)?;
         }
         ctx.write_str("UPDATE ");
+        if self.ignore {
+            ctx.write_str("IGNORE ");
+        }
         restore_table_join(ctx, &self.table, self.join.as_ref())?;
         ctx.write_str(" SET ");
         for (i, item) in self.list.iter().enumerate() {
@@ -644,6 +660,8 @@ impl LoadDataStmt {
 /// empty means delete `table`. `join` is the FROM/USING join.
 #[derive(Clone, Debug)]
 pub struct DeleteStmt {
+    /// MySQL `DELETE IGNORE`: truncation warnings replace errors.
+    pub ignore: bool,
     pub table: TableName,
     pub tables: Vec<TableName>,
     pub join: Option<Join>,
