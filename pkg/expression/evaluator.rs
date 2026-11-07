@@ -1778,6 +1778,9 @@ fn eval_from_unixtime(
     Err(Error::unsupported(format!("FROM_UNIXTIME({ts})")))
 }
 fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if matches!(&*expr.expr, ExprNode::Row(_)) {
+        return eval_row_in_list(expr, schema, row);
+    }
     let left = eval_expr_with_row(&expr.expr, schema, row)?;
     if left.is_null() {
         return Ok(Datum::Null);
@@ -1798,6 +1801,47 @@ fn eval_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<D
     } else {
         Ok(bool_datum(expr.not))
     }
+}
+
+/// Row-value `IN`: `(a, b) IN ((1, 2), (3, 4))` matches when a list row is
+/// equal column by column. Every list row must have the left operand's arity,
+/// otherwise MySQL raises 1241 naming that arity.
+fn eval_row_in_list(expr: &InListExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    let left = row_operands(&expr.expr, schema, row)?;
+    let arity = left.len();
+    let mut saw_null = false;
+    for item in &expr.list {
+        let right = row_operands(item, schema, row)?;
+        if right.len() != arity {
+            return Err(Error::new(
+                sealdb_errno::ERR_OPERAND_COLUMNS,
+                format!("Operand should contain {arity} column(s)"),
+            ));
+        }
+        match row_equality(&left, &right)? {
+            Some(true) => return Ok(bool_datum(!expr.not)),
+            Some(false) => {}
+            None => saw_null = true,
+        }
+    }
+    if saw_null {
+        Ok(Datum::Null)
+    } else {
+        Ok(bool_datum(expr.not))
+    }
+}
+
+/// Row `=` comparison: `None` when a pair is NULL before any difference.
+fn row_equality(left: &[Datum], right: &[Datum]) -> Result<Option<bool>> {
+    for (l, r) in left.iter().zip(right.iter()) {
+        if l.is_null() || r.is_null() {
+            return Ok(None);
+        }
+        if !compare_datums(l, r)?.is_eq() {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
 }
 
 /// TiDB/MySQL CASE: the first WHEN whose condition is true wins. A NULL
