@@ -244,6 +244,84 @@ pub fn drop_partitions(
     Ok(())
 }
 
+/// `ALTER TABLE t EXCHANGE PARTITION p WITH TABLE t1`. Each partition and
+/// non-partitioned table owns a physical table id, so exchanging the two ids
+/// swaps their KV ranges without rewriting any row.
+pub fn exchange_partition(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    table: &TableName,
+    partition: &str,
+    with_table: &TableName,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, name) = resolve_name(table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &name).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{name}' doesn't exist"),
+        )
+    })?;
+    let Some(part) = info.partition.as_mut() else {
+        return Err(Error::unsupported(
+            "EXCHANGE PARTITION on non-partitioned table",
+        ));
+    };
+    let Some(pos) = part
+        .definitions
+        .iter()
+        .position(|d| d.name.o().eq_ignore_ascii_case(partition))
+    else {
+        return Err(Error::new(
+            ERR_CANT_DROP_FIELD_OR_KEY,
+            format!("Unknown partition '{partition}'"),
+        ));
+    };
+
+    let (other_schema, other_name) = resolve_name(with_table, current_db)?;
+    let other_db = is
+        .schema_by_name(&other_schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{other_schema}'")))?;
+    let mut other = is
+        .table_by_name(&other_schema, &other_name)
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{other_schema}.{other_name}' doesn't exist"),
+            )
+        })?;
+    if other.partition.is_some() {
+        return Err(Error::new(
+            1731,
+            format!("Table to exchange with partition is partitioned: '{other_name}'"),
+        ));
+    }
+    // TiDB requires the exchanged table to have the same column layout.
+    if info.columns.len() != other.columns.len()
+        || info
+            .columns
+            .iter()
+            .zip(other.columns.iter())
+            .any(|(a, b)| !a.name.o().eq_ignore_ascii_case(b.name.o()))
+    {
+        return Err(Error::new(
+            1732,
+            format!("Tables are not in the same column definitions: '{name}' and '{other_name}'"),
+        ));
+    }
+
+    let other_old_id = other.id;
+    std::mem::swap(&mut part.definitions[pos].id, &mut other.id);
+    meta.update_table(db.id, &info)?;
+    meta.update_table_with_new_id(other_db.id, other_old_id, &other)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
 fn drop_partition_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<()> {
     if physical_ids.is_empty() {
         return Ok(());

@@ -234,6 +234,31 @@ impl Mutator {
         )
     }
 
+    /// Persist `table` under a new physical table id, moving it from `old_id`.
+    /// Used by `EXCHANGE PARTITION`, which swaps a partition's id with a table's.
+    pub fn update_table_with_new_id(
+        &mut self,
+        db_id: i64,
+        old_id: i64,
+        table: &TableInfo,
+    ) -> Result<()> {
+        let db_field = db_key(db_id);
+        if self.hget(&db_field, &table_key(old_id))?.is_none() {
+            return Err(Error::new(
+                ERR_NO_SUCH_TABLE,
+                format!("Table '{db_id}.{}' doesn't exist", table.name.o()),
+            ));
+        }
+        if old_id != table.id {
+            self.hdel(&db_field, &table_key(old_id));
+        }
+        self.hset(
+            &db_field,
+            &table_key(table.id),
+            &serde_json::to_vec(table).map_err(json_err)?,
+        )
+    }
+
     pub fn drop_table_or_view(&mut self, db_id: i64, table_id: i64) -> Result<()> {
         let db_field = db_key(db_id);
         let table_field = table_key(table_id);

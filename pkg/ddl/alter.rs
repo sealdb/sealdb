@@ -4,7 +4,7 @@
 // multi-schema-state jobs.
 use crate::create_table::field_type_from_name;
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
-use crate::partition::{add_partitions, drop_partitions};
+use crate::partition::{add_partitions, drop_partitions, exchange_partition};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME,
@@ -119,6 +119,19 @@ pub fn alter_table(
             AlterTableSpec::Algorithm(_) | AlterTableSpec::Lock(_) => {}
             AlterTableSpec::AddPartition { defs } => {
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
+            }
+            AlterTableSpec::ExchangePartition {
+                partition,
+                table: with_table,
+            } => {
+                exchange_partition(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    partition,
+                    with_table,
+                    current_db,
+                )?;
             }
             AlterTableSpec::DropPartition { if_exists, names } => {
                 drop_partitions(
