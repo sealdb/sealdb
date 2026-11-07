@@ -67,6 +67,10 @@ pub enum PhysicalPlan {
         /// Filtered cardinality from exact stats (TiDB partition-prune est).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filter_est: Option<f64>,
+        /// EXPLAIN-only handle range (`[lo,hi]`) when a clustered PK scan was
+        /// widened from a range predicate; execution still filters via `pushed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range_scan: Option<String>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -565,6 +569,7 @@ impl PhysicalPlan {
             row_count: 10_000.0,
             stats_pseudo: true,
             filter_est: None,
+            range_scan: None,
             pushed: None,
         }
     }
@@ -585,6 +590,7 @@ impl PhysicalPlan {
             row_count,
             stats_pseudo,
             filter_est: None,
+            range_scan: None,
             pushed: None,
         }
     }

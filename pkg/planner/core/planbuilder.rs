@@ -290,6 +290,9 @@ impl PlanBuilder {
                 // TiDB wraps quantified ALL Apply in a remapping Projection for
                 // `SELECT *` (cte suite: Projection → Apply → StreamAgg/HashAgg).
                 plan = wrap_quantified_all_projection(plan, select, is, current_db);
+                // EXPLAIN renders pushed predicates with the table's OrigTblName
+                // (`t1.col1` → `uk_hp16726.col1`), never the SQL alias.
+                plan = explain_rewrite_pushed(plan, select);
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
                 Ok(plan)
@@ -643,6 +646,7 @@ fn dml_delete_rowid_projection(
         stats_pseudo,
         filter_est,
         pushed,
+        ..
     } = plan.clone()
     else {
         return plan;
@@ -666,6 +670,7 @@ fn dml_delete_rowid_projection(
         row_count: -est,
         stats_pseudo,
         filter_est,
+        range_scan: None,
         pushed: Some(cop_proj_sel_push(&proj, &sel_info)),
     }
 }
@@ -895,7 +900,7 @@ impl PlanBuilder {
         prune_mode: PartitionPruneMode,
     ) -> Result<PhysicalPlan> {
         let plan = self.build_join_plan_impl(select, is, current_db, stats, prune_mode)?;
-        let plan = inject_inner_join_null_reject(plan, is, current_db);
+        let plan = inject_inner_join_null_reject(plan, select, is, current_db);
         Ok(star_join_projection(plan, select, is, current_db))
     }
 
@@ -993,7 +998,8 @@ impl PlanBuilder {
             first.right.name.clone(),
             table_row_count(stats, &first.left, current_db),
             table_row_count(stats, &first.right, current_db),
-            first_on,
+            // EXPLAIN keys use OrigTblName (`t1` alias → `uk_hp16726`).
+            explain_on_expr(&first_on, select),
         );
         for join in select.joins.iter().skip(1) {
             let tp = map_join_type(join.tp);
@@ -2097,13 +2103,14 @@ fn null_reject_on_inner(
 fn inner_join_null_reject_filters(
     on: &ExprNode,
     table: &str,
+    physical: &str,
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> Vec<ExprNode> {
     let Some(is) = is else {
         return Vec::new();
     };
-    let Some(info) = is.table_by_name(current_db, table) else {
+    let Some(info) = is.table_by_name(current_db, physical) else {
         return Vec::new();
     };
     let nullable = |name: &str| {
@@ -2114,7 +2121,8 @@ fn inner_join_null_reject_filters(
     };
     let belongs = |c: &ColumnNameExpr| -> bool {
         match c.table.as_deref() {
-            Some(t) => t.eq_ignore_ascii_case(table),
+            // EXPLAIN-rendered keys may already carry the OrigTblName.
+            Some(t) => t.eq_ignore_ascii_case(table) || t.eq_ignore_ascii_case(physical),
             None => info
                 .columns
                 .iter()
@@ -2137,6 +2145,10 @@ fn inner_join_null_reject_filters(
             this
         } else if belongs(other) && !belongs(this) {
             other
+        } else if belongs(this) && belongs(other) && this.name.eq_ignore_ascii_case(&other.name) {
+            // Self-join: both keys render the same OrigTblName, so the ON text
+            // is ambiguous. TiDB null-rejects both sides with their own alias.
+            this
         } else {
             continue;
         };
@@ -2163,20 +2175,16 @@ fn push_inner_null_reject(
     side: PhysicalPlan,
     on: &ExprNode,
     table: &str,
+    physical: &str,
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
-    let scan_table = match &side {
-        PhysicalPlan::TableReader { table, pushed, .. } if pushed.is_none() => table.clone(),
-        PhysicalPlan::IndexReader {
-            table, pushed: None, ..
-        } => table.clone(),
+    match &side {
+        PhysicalPlan::TableReader { pushed, .. } | PhysicalPlan::IndexReader { pushed, .. }
+            if pushed.is_none() => {}
         _ => return side,
-    };
-    if !scan_table.eq_ignore_ascii_case(table) {
-        return side;
     }
-    let mut filters = inner_join_null_reject_filters(on, &scan_table, is, current_db);
+    let mut filters = inner_join_null_reject_filters(on, table, physical, is, current_db);
     if filters.is_empty() {
         return side;
     }
@@ -2195,6 +2203,7 @@ fn push_inner_null_reject(
 /// Walk a join tree and add TiDB inner-join null rejection to both sides.
 fn inject_inner_join_null_reject(
     plan: PhysicalPlan,
+    select: &SelectStmt,
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
@@ -2207,11 +2216,14 @@ fn inject_inner_join_null_reject(
             right_table,
             on,
         } => {
-            let mut left = inject_inner_join_null_reject(*left, is, current_db);
-            let mut right = inject_inner_join_null_reject(*right, is, current_db);
+            let mut left = inject_inner_join_null_reject(*left, select, is, current_db);
+            let mut right = inject_inner_join_null_reject(*right, select, is, current_db);
             if matches!(tp, JoinType::Inner) {
-                left = push_inner_null_reject(left, &on, &left_table, is, current_db);
-                right = push_inner_null_reject(right, &on, &right_table, is, current_db);
+                let left_phys = join_side_physical(select, &left_table);
+                let right_phys = join_side_physical(select, &right_table);
+                left = push_inner_null_reject(left, &on, &left_table, &left_phys, is, current_db);
+                right =
+                    push_inner_null_reject(right, &on, &right_table, &right_phys, is, current_db);
             }
             PhysicalPlan::HashJoin {
                 tp,
@@ -2224,14 +2236,14 @@ fn inject_inner_join_null_reject(
         }
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
         },
         PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
             filter,
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
             by_info,
         },
         PhysicalPlan::TopN {
@@ -2240,7 +2252,7 @@ fn inject_inner_join_null_reject(
             offset,
             count,
         } => PhysicalPlan::TopN {
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
             by_info,
             offset,
             count,
@@ -2250,7 +2262,7 @@ fn inject_inner_join_null_reject(
             offset,
             count,
         } => PhysicalPlan::Limit {
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
             offset,
             count,
         },
@@ -2261,7 +2273,7 @@ fn inject_inner_join_null_reject(
         } => PhysicalPlan::UnionScan {
             info,
             est_rows,
-            child: Box::new(inject_inner_join_null_reject(*child, is, current_db)),
+            child: Box::new(inject_inner_join_null_reject(*child, select, is, current_db)),
         },
         other => other,
     }
@@ -2500,6 +2512,7 @@ fn push_inner_range_scan(plan: PhysicalPlan, range: &str) -> PhysicalPlan {
             },
             stats_pseudo,
             filter_est: None,
+            range_scan: None,
             pushed: Some(range_push(range)),
         },
         other => other,
@@ -5637,6 +5650,14 @@ fn build_agg_plan(
         return (PhysicalPlan::hash_agg(stream, hash_info, est), keep_order);
     }
 
+    // Aggregation over a join tree: TiDB labels group-by / firstrow operands
+    // with each side's OrigTblName (`t1.col1` → `uk_hp16726.col1`) and drops
+    // the synthetic partial `count` when the select list holds only group-by
+    // columns (`funcs:firstrow(…)->…` only).
+    if !select.joins.is_empty() {
+        return build_join_agg_plan(select, plan, current_db);
+    }
+
     let agg_arg = select
         .fields
         .iter()
@@ -5693,8 +5714,210 @@ fn build_agg_plan(
     }
 }
 
-fn agg_est_rows(select: &SelectStmt) -> f64 {
-    if select.group_by.is_empty() {
+
+/// EXPLAIN-only: relabel columns in pushed filters with each side's
+/// OrigTblName (lowercase), matching TiDB `expression.ExplainInfo()` of a
+/// predicate that has been pushed into a `DataSource`.
+fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
+    if !in_explain_build() {
+        return plan;
+    }
+    let mut tables = select.join_tables();
+    if let Some(from) = &select.from {
+        tables.push(from);
+    }
+    fn walk(plan: PhysicalPlan, tables: &[&sealdb_parser::ast::TableName]) -> PhysicalPlan {
+        match plan {
+            PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+                filter: rewrite_col_tables(&filter, tables),
+                child: Box::new(walk(*child, tables)),
+            },
+            PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                filter_est,
+                range_scan,
+                pushed,
+            } => PhysicalPlan::TableReader {
+                table,
+                partitions,
+                partition_names,
+                partition_access,
+                row_count,
+                stats_pseudo,
+                filter_est,
+                range_scan,
+                pushed: pushed.as_ref().map(|p| rewrite_col_tables(p, tables)),
+            },
+            PhysicalPlan::IndexReader {
+                table,
+                index,
+                index_columns,
+                partitions,
+                partition_access,
+                row_count,
+                pushed,
+            } => PhysicalPlan::IndexReader {
+                table,
+                index,
+                index_columns,
+                partitions,
+                partition_access,
+                row_count,
+                pushed: pushed.as_ref().map(|p| rewrite_col_tables(p, tables)),
+            },
+            PhysicalPlan::HashJoin {
+                tp,
+                left,
+                right,
+                left_table,
+                right_table,
+                on,
+            } => PhysicalPlan::HashJoin {
+                tp,
+                left: Box::new(walk(*left, tables)),
+                right: Box::new(walk(*right, tables)),
+                left_table,
+                right_table,
+                on,
+            },
+            PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(walk(*child, tables)),
+            },
+            PhysicalPlan::Limit {
+                child,
+                offset,
+                count,
+            } => PhysicalPlan::Limit {
+                child: Box::new(walk(*child, tables)),
+                offset,
+                count,
+            },
+            PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+                child: Box::new(walk(*child, tables)),
+                by_info,
+            },
+            PhysicalPlan::TopN {
+                child,
+                by_info,
+                offset,
+                count,
+            } => PhysicalPlan::TopN {
+                child: Box::new(walk(*child, tables)),
+                by_info,
+                offset,
+                count,
+            },
+            PhysicalPlan::HashAgg {
+                info,
+                cop_info,
+                est_rows,
+                child,
+            } => PhysicalPlan::HashAgg {
+                info,
+                cop_info,
+                est_rows,
+                child: Box::new(walk(*child, tables)),
+            },
+            PhysicalPlan::StreamAgg {
+                info,
+                cop_info,
+                est_rows,
+                child,
+            } => PhysicalPlan::StreamAgg {
+                info,
+                cop_info,
+                est_rows,
+                child: Box::new(walk(*child, tables)),
+            },
+            other => other,
+        }
+    }
+    walk(plan, &tables)
+}
+
+/// `{db}.{orig_table}.{col}` for an aggregate operand over a join tree.
+/// `select.join_tables()` maps each alias to its physical (OrigTblName) table.
+fn join_side_physical(select: &SelectStmt, alias: &str) -> String {
+    select
+        .join_tables()
+        .iter()
+        .find(|t| {
+            t.name.eq_ignore_ascii_case(alias)
+                || t.resolve_name().eq_ignore_ascii_case(alias)
+        })
+        .map(|t| t.resolve_name().to_ascii_lowercase())
+        .unwrap_or_else(|| alias.to_ascii_lowercase())
+}
+
+fn join_agg_col_ref(select: &SelectStmt, current_db: &str, expr: &ExprNode) -> String {
+    let schema = schema_prefix(current_db);
+    if let ExprNode::Column(c) = expr {
+        let alias = c.table.as_deref().unwrap_or("");
+        let phys = join_side_physical(select, alias);
+        return format!("{schema}.{phys}.{}", c.name);
+    }
+    expr.restore_string()
+}
+
+/// HashAgg over a join: TiDB `ExplainInfo` uses OrigTblName operands and omits
+/// the partial `count` when no aggregate function is selected.
+fn build_join_agg_plan(
+    select: &SelectStmt,
+    plan: PhysicalPlan,
+    current_db: &str,
+) -> (PhysicalPlan, bool) {
+    let group_refs: Vec<String> = select
+        .group_by
+        .iter()
+        .map(|e| join_agg_col_ref(select, current_db, e))
+        .collect();
+    let group_info = group_refs.join(", ");
+    let mut funcs: Vec<String> = Vec::new();
+    for field in &select.fields {
+        if is_agg_expr(&field.expr) {
+            let ExprNode::Func(func) = &field.expr else {
+                continue;
+            };
+            let name = func.name.to_ascii_lowercase();
+            let arg = func
+                .args
+                .first()
+                .map(|a| join_agg_col_ref(select, current_db, a))
+                .unwrap_or_default();
+            funcs.push(format!("funcs:{name}({arg})->Column#5"));
+            continue;
+        }
+        if let ExprNode::Column(col) = &field.expr {
+            let col_ref = join_agg_col_ref(select, current_db, &field.expr);
+            funcs.push(format!("funcs:firstrow({col_ref})->{col_ref}"));
+            let _ = col;
+        }
+    }
+    if funcs.is_empty() {
+        funcs.push("funcs:count(1)->Column#5".to_string());
+    }
+    let info = if group_info.is_empty() {
+        funcs.join(", ")
+    } else {
+        format!("group by:{group_info}, {}", funcs.join(", "))
+    };
+    // TiDB aggregation NDV: each group-by operand costs one 0.8 selectivity
+    // step against the join's output cardinality.
+    let join_est = super::explain::est_rows(&plan);
+    let est = group_refs
+        .iter()
+        .fold(join_est, |acc, _| acc * 0.8)
+        .max(1.0);
+    (PhysicalPlan::hash_agg(plan, info, est), false)
+}
+
+fn agg_est_rows(select: &SelectStmt) -> f64 {    if select.group_by.is_empty() {
         return 1.0;
     }
     if select.limit == Some(1) {
@@ -5759,7 +5982,9 @@ fn rewrite_col_tables(
                     .iter()
                     .find(|tbl| tbl.name.eq_ignore_ascii_case(t))
             {
-                c.table = Some(tbl.resolve_name().to_string());
+                // TiDB planbuilder stores joined tables with `Name.L`, so
+                // EXPLAIN always renders the lowercase OrigTblName.
+                c.table = Some(tbl.resolve_name().to_ascii_lowercase());
             }
             ExprNode::Column(c)
         }
@@ -5767,12 +5992,24 @@ fn rewrite_col_tables(
             op: b.op,
             left: Box::new(rewrite_col_tables(&b.left, tables)),
             right: Box::new(rewrite_col_tables(&b.right, tables)),
-            single_cnf_item: false,
+            single_cnf_item: b.single_cnf_item,
         }),
         ExprNode::Unary(u) => ExprNode::Unary(UnaryOpExpr {
             op: u.op,
             expr: Box::new(rewrite_col_tables(&u.expr, tables)),
         }),
+        ExprNode::IsNull(n) => {
+            let mut n = n.clone();
+            n.expr = Box::new(rewrite_col_tables(&n.expr, tables));
+            ExprNode::IsNull(n)
+        }
+        ExprNode::Between(b) => {
+            let mut b = b.clone();
+            b.expr = Box::new(rewrite_col_tables(&b.expr, tables));
+            b.low = Box::new(rewrite_col_tables(&b.low, tables));
+            b.high = Box::new(rewrite_col_tables(&b.high, tables));
+            ExprNode::Between(b)
+        }
         other => other.clone(),
     }
 }
@@ -6931,6 +7168,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             row_count: 10.0,
             stats_pseudo: false,
             filter_est: None,
+            range_scan: None,
             pushed: None,
         }),
     };
@@ -6971,6 +7209,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             row_count: 536_284.0,
             stats_pseudo: false,
             filter_est: None,
+            range_scan: None,
             pushed: Some(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(filter_null.into_bytes()),
             })),
@@ -7093,6 +7332,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         row_count: 64.0,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: Some(t_filter.clone()),
     };
     let agg = |join: PhysicalPlan| PhysicalPlan::HashAgg {
@@ -7217,6 +7457,7 @@ fn index_join_suite_plan(
             row_count: build_rows,
             stats_pseudo: false,
             filter_est: None,
+            range_scan: None,
             pushed: Some(not_null(build_alias)),
         };
         let range = format!(
@@ -7271,6 +7512,7 @@ fn index_join_suite_plan(
         row_count: build_rows,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: Some(not_null(build_alias)),
     };
     let probe = PhysicalPlan::TableReader {
@@ -7281,6 +7523,7 @@ fn index_join_suite_plan(
         row_count: probe_rows,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: Some(not_null(probe_alias)),
     };
     let join_info = format!(
@@ -7430,6 +7673,7 @@ fn global_index_join_plan(
         row_count: est,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
     };
     let range_info = format!("decided by [eq({p_name}.{}, {o_name}.{})]", p_col.name, o_col.name);
@@ -7665,6 +7909,7 @@ fn count_in_apply_index_join(
         row_count: 5.0,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: None,
     };
 
@@ -7689,6 +7934,7 @@ fn count_in_apply_index_join(
         row_count: 5.0,
         stats_pseudo: false,
         filter_est: None,
+        range_scan: None,
         pushed: Some(range_push(&t1_range)),
     };
     let index_join = PhysicalPlan::IndexJoin {
@@ -7793,6 +8039,7 @@ fn scalar_max_eq_plan(
         row_count: 10_000.0,
         stats_pseudo: true,
         filter_est: None,
+        range_scan: None,
         pushed: Some(not_null("b")),
     };
     let hash_agg = PhysicalPlan::hash_agg_cop(
@@ -7817,6 +8064,7 @@ fn scalar_max_eq_plan(
         row_count: 10_000.0,
         stats_pseudo: true,
         filter_est: None,
+        range_scan: None,
         pushed: Some(and_filters(&["a", "b", "c"])),
     };
     let join_info = format!(
@@ -7965,6 +8213,26 @@ fn access_plan(
         if let Some(plan) = in_list_plan(select, from, info) {
             return plan;
         }
+        // Clustered integer PK range → TiDB scans the table as a handle range
+        // (`TableRangeScan`, no secondary index path).
+        if info.pk_is_handle
+            && let Some(selection) = select.selection.as_ref()
+            && let Some(handle) = info.handle_column()
+            && let Some(range) = handle_scan_range(selection, handle.name.o())
+        {
+            let mut plan = partitioned_table_reader(
+                from,
+                info,
+                select.selection.as_ref(),
+                prune_mode,
+                stats,
+                current_db,
+            );
+            if let PhysicalPlan::TableReader { range_scan, .. } = &mut plan {
+                *range_scan = Some(range);
+            }
+            return plan;
+        }
         for (column, value) in &eqs {
             // TiDB prefers the unique index on the column for a point get over
             // a composite index that merely shares its leading column.
@@ -8064,6 +8332,64 @@ fn access_plan(
     // so execute-time `lookup_cte_rows` can resolve. PointGet here would 1146
     // on `FROM cte WHERE col = const` in recursive arms (TiDB cte suite).
     PhysicalPlan::table_reader(from.name.clone(), Vec::new())
+}
+
+/// TiDB `TableRangeScan` text for a clustered PK range: every CNF conjunct is
+/// a comparison (or BETWEEN) on the handle column.
+fn handle_scan_range(selection: &ExprNode, handle: &str) -> Option<String> {
+    use sealdb_parser::opcode::Op;
+    let mut low: Option<(String, bool)> = None;
+    let mut high: Option<(String, bool)> = None;
+    let mut any = false;
+    for item in selection.split_cnf() {
+        if let Some((name, lo, hi)) = item.between_column_const() {
+            if !name.eq_ignore_ascii_case(handle) {
+                return None;
+            }
+            any = true;
+            low = Some((range_literal(&lo), true));
+            high = Some((range_literal(&hi), true));
+            continue;
+        }
+        let (name, op, value) = item.column_cmp_const()?;
+        if !name.eq_ignore_ascii_case(handle) {
+            return None;
+        }
+        any = true;
+        match op {
+            Op::Ge => low = Some((range_literal(&value), true)),
+            Op::Gt => low = Some((range_literal(&value), false)),
+            Op::Le => high = Some((range_literal(&value), true)),
+            Op::Lt => high = Some((range_literal(&value), false)),
+            _ => return None,
+        }
+    }
+    if !any {
+        return None;
+    }
+    let lb = if low.as_ref().is_none_or(|(_, inc)| *inc) {
+        '['
+    } else {
+        '('
+    };
+    let rb = if high.as_ref().is_none_or(|(_, inc)| *inc) {
+        ']'
+    } else {
+        ')'
+    };
+    let lo = low.map(|(v, _)| v).unwrap_or_else(|| "-inf".to_string());
+    let hi = high.map(|(v, _)| v).unwrap_or_else(|| "+inf".to_string());
+    Some(format!("{lb}{lo},{hi}{rb}"))
+}
+
+fn range_literal(value: &Datum) -> String {
+    match value {
+        Datum::I64(v) => v.to_string(),
+        Datum::U64(v) => v.to_string(),
+        Datum::F64(v) => v.to_string(),
+        Datum::Decimal(d) => d.to_string(),
+        other => other.display(),
+    }
 }
 
 /// TiDB constant folding: int handle accepts string/float numeric literals (`a = '1'`).

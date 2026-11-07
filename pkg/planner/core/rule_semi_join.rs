@@ -349,6 +349,7 @@ fn build_nonrecursive_all_probe(
                 row_count,
                 stats_pseudo,
                 filter_est: None,
+                range_scan: None,
                 pushed: Some(sel.clone()),
             },
             other => other,
@@ -488,6 +489,7 @@ fn build_recursive_arm_plan(
         row_count: 10.0,
         stats_pseudo: true,
         filter_est: None,
+        range_scan: None,
         pushed: None,
     };
     // Marker table name "CTE_0" — explain recursive part maps CTETable.
@@ -1099,7 +1101,9 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             row_count,
             stats_pseudo,
             filter_est,
+            range_scan,
             pushed,
+            ..
         } => PhysicalPlan::TableReader {
             table,
             partitions,
@@ -1108,6 +1112,7 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             row_count,
             stats_pseudo,
             filter_est,
+            range_scan,
             pushed: match pushed {
                 Some(prev) => ExprNode::compose_cnf(vec![prev, filter]),
                 None => Some(filter),
