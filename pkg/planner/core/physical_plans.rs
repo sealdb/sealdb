@@ -83,6 +83,10 @@ pub enum PhysicalPlan {
         /// widened from a range predicate; execution still filters via `pushed`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         range_scan: Option<String>,
+        /// `ORDER BY` the handle: TiDB scans the table in handle order
+        /// (`keep order:true`) and drops the Sort.
+        #[serde(default)]
+        keep_order: bool,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -100,6 +104,9 @@ pub enum PhysicalPlan {
         /// `FROM t PARTITION (pN)` pins the lookup to those physical partitions.
         #[serde(default)]
         partition_names: Vec<String>,
+        /// `FOR UPDATE` handled by the point get itself (`handle:1, lock`).
+        #[serde(default)]
+        lock: bool,
     },
     BatchPointGet {
         table: String,
@@ -109,6 +116,15 @@ pub enum PhysicalPlan {
         /// Columns of the unique index serving the batch point get.
         #[serde(default)]
         index_columns: Vec<String>,
+        /// `FOR UPDATE` handled by the batch point get (`desc:false, lock`).
+        #[serde(default)]
+        lock: bool,
+    },
+    /// Row lock above a scan (`SELECT … FOR UPDATE`).
+    SelectLock {
+        child: Box<PhysicalPlan>,
+        /// `for update 0` / `for share 0`.
+        info: String,
     },
     IndexLookUpReader {
         table: String,
@@ -481,6 +497,9 @@ impl PhysicalPlan {
                 name
             }
             PhysicalPlan::Selection { child, .. } => format!("Selection -> {}", child.explain()),
+            PhysicalPlan::SelectLock { child, .. } => {
+                format!("SelectLock -> {}", child.explain())
+            }
             PhysicalPlan::Sort { child, by_info } => {
                 format!("Sort({by_info}) -> {}", child.explain())
             }
@@ -587,6 +606,7 @@ impl PhysicalPlan {
             stats_pseudo: true,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed: None,
         }
     }
@@ -608,6 +628,7 @@ impl PhysicalPlan {
             stats_pseudo,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed: None,
         }
     }

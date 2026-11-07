@@ -634,6 +634,7 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             stats_pseudo,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed,
         },
         other => other,

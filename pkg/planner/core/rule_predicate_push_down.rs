@@ -75,6 +75,7 @@ fn push_into(
                     index: None,
                     index_columns: Vec::new(),
                     partition_names,
+                    lock: false,
                 };
             }
             wrap_residual(
@@ -88,6 +89,7 @@ fn push_into(
                     filter_est,
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
                     range_scan,
+                    keep_order: false,
                     pushed: and_opt(ExprNode::compose_cnf(pushable), pushed),
                 },
                 residual,
@@ -241,6 +243,7 @@ fn push_into(
             index,
             index_columns,
             partition_names,
+            lock,
         } => {
             let residual = conjuncts
                 .into_iter()
@@ -264,6 +267,7 @@ fn push_into(
                     index,
                     index_columns,
                     partition_names,
+                    lock,
                 },
                 residual,
             )
@@ -274,6 +278,7 @@ fn push_into(
             index,
             n_keys,
             index_columns,
+            lock,
         } => {
             let residual = conjuncts
                 .into_iter()
@@ -286,6 +291,7 @@ fn push_into(
                     index,
                     n_keys,
                     index_columns,
+                    lock,
                 },
                 residual,
             )

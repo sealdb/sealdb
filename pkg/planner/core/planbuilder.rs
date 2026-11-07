@@ -19,7 +19,8 @@ use sealdb_parser::ast::expressions::{
 };
 use sealdb_parser::ast::{
     ByItem, CommonTableExpression, CteMaterialize, FromItem, JoinType as AstJoinType,
-    ResultSetNode, SelectStmt, SetOprStmt, SetOprType, Statement, StmtNode, TableName, WithClause,
+    ResultSetNode, SelectLock, SelectStmt, SetOprStmt, SetOprType, Statement, StmtNode, TableName,
+    WithClause,
 };
 use sealdb_parser::opcode::Op;
 use sealdb_statistics::{Handle, Table};
@@ -124,6 +125,7 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                check_tidb_rowid_reference(select, is, current_db)?;
                 // `count(*)` over a LEFT JOIN whose inner side is the join-key
                 // unique (primary key fully equated) → TiDB eliminates the join
                 // and counts the probe rows through a covering index.
@@ -202,6 +204,7 @@ impl PlanBuilder {
                     plan = predicate_push_down(plan, filter, is, current_db);
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
+                plan = apply_select_lock(plan, select);
                 let mut stream_keep_order = false;
                 if needs_hash_agg(select) {
                     if needs_window(select) {
@@ -211,7 +214,7 @@ impl PlanBuilder {
                         global_index_agg_plan(select, &plan, is, current_db)
                     }) {
                         Some(agg) => (agg, false),
-                        None => build_agg_plan(select, plan, current_db),
+                        None => build_agg_plan(select, plan, current_db, is),
                     };
                     plan = agg;
                     stream_keep_order = keep_order;
@@ -238,10 +241,18 @@ impl PlanBuilder {
                     // Constant ORDER BY (`abs(2)`) is dropped (TiDB NominalSort/const prune).
                     let merge_orders = matches!(plan, PhysicalPlan::MergeJoin { .. })
                         && order_by_covered_by_merge_join(select, &plan);
+                    // `ORDER BY` the row handle reads the table in handle order:
+                    // TiDB drops the Sort and marks the scan `keep order:true`.
+                    let handle_order = matches!(plan, PhysicalPlan::TableReader { .. })
+                        && order_by_handle(select, is, current_db);
+                    if handle_order {
+                        plan = set_keep_order(plan);
+                    }
                     let need_sort = !select.order_by.is_empty()
                         && !order_by_all_constant(select)
                         && !(stream_keep_order && order_prefix_of_group_by(select))
-                        && !merge_orders;
+                        && !merge_orders
+                        && !handle_order;
                     let join_ordinal_sort = need_sort
                         && !select.joins.is_empty()
                         && select.order_by.iter().all(|item| {
@@ -252,7 +263,8 @@ impl PlanBuilder {
                             )
                         });
                     if need_sort
-                        && let Some(sorted) = sort_over_projected_subquery(plan.clone(), select)
+                        && let Some(sorted) =
+                            sort_over_projected_subquery(plan.clone(), select, is, current_db)
                     {
                         // ORDER BY a SELECT-list alias whose value needs Apply:
                         // sort the projected column (`Sort → Projection`).
@@ -297,7 +309,23 @@ impl PlanBuilder {
                         );
                         // Project after Selection/Sort so WHERE and ORDER BY still
                         // see the full child schema (TiDB extra-projection shape).
-                        plan = wrap_output_projection(plan, select);
+                        // A handle-ordered scan carries `_tidb_rowid`, so the
+                        // projection names the surviving columns explicitly.
+                        let qualified = handle_order.then(|| {
+                            let (db, table) = select
+                                .from
+                                .as_ref()
+                                .map(|from| from.qualified(current_db))
+                                .unwrap_or_default();
+                            (db, table)
+                        });
+                        plan = wrap_output_projection(
+                            plan,
+                            select,
+                            qualified.as_ref(),
+                            is,
+                            current_db,
+                        );
                     }
                 }
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
@@ -687,6 +715,7 @@ fn dml_delete_rowid_projection(
         stats_pseudo,
         filter_est,
         range_scan: None,
+        keep_order: false,
         pushed: Some(cop_proj_sel_push(&proj, &sel_info)),
     }
 }
@@ -2539,6 +2568,7 @@ fn push_inner_range_scan(plan: PhysicalPlan, range: &str) -> PhysicalPlan {
             stats_pseudo,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed: Some(range_push(range)),
         },
         other => other,
@@ -2824,10 +2854,109 @@ fn join_on_mentions_col(on: &ExprNode, alias: &str, phys: &str, col: &str) -> bo
     false
 }
 
+/// `_tidb_rowid` only exists on heap tables; a table with an integer PRIMARY
+/// KEY handle has no such column (TiDB raises 1054 in the field list).
+fn check_tidb_rowid_reference(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Result<()> {
+    fn mentions_rowid(expr: &ExprNode) -> bool {
+        match expr {
+            ExprNode::Column(col) => {
+                col.table.is_none() && col.name.eq_ignore_ascii_case("_tidb_rowid")
+            }
+            ExprNode::Func(func) => func.args.iter().any(mentions_rowid),
+            ExprNode::Binary(bin) => mentions_rowid(&bin.left) || mentions_rowid(&bin.right),
+            ExprNode::Unary(unary) => mentions_rowid(&unary.expr),
+            ExprNode::Cast(cast) => mentions_rowid(&cast.expr),
+            _ => false,
+        }
+    }
+    let Some(from) = &select.from else {
+        return Ok(());
+    };
+    let Some(info) = is.and_then(|schema| {
+        let (db, table) = from.qualified(current_db);
+        schema.table_by_name(&db, &table)
+    }) else {
+        return Ok(());
+    };
+    if !info.pk_is_handle {
+        return Ok(());
+    }
+    if select.fields.iter().any(|field| mentions_rowid(&field.expr)) {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            "Unknown column '_tidb_rowid' in 'field list'",
+        ));
+    }
+    Ok(())
+}
+
+/// TiDB: a table scan yields row-handle order, so `ORDER BY` the handle needs
+/// no Sort (`keep order:true`). Only ascending single-key ordering is modeled.
+fn order_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> bool {
+    if select.order_by.is_empty() {
+        return false;
+    }
+    let Some(from) = &select.from else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.and_then(|schema| schema.table_by_name(&db, &table)) else {
+        return false;
+    };
+    let handle = if info.pk_is_handle {
+        match info.handle_column() {
+            Some(column) => column.name.o().to_string(),
+            None => return false,
+        }
+    } else {
+        "_tidb_rowid".to_string()
+    };
+    select.order_by.iter().all(|item| {
+        !item.desc
+            && matches!(
+                &item.expr,
+                ExprNode::Column(col) if col.name.eq_ignore_ascii_case(&handle)
+            )
+    })
+}
+
+/// Mark the table scan as `keep order:true` (the Sort was dropped).
+fn set_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            filter_est,
+            range_scan,
+            pushed,
+            ..
+        } => PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            filter_est,
+            range_scan,
+            keep_order: true,
+            pushed,
+        },
+        other => other,
+    }
+}
+
 /// TiDB: MergeJoin already orders by join keys; skip outer Sort when ORDER BY
 /// is ordinals or those same columns (`ORDER BY 1, 2` on equijoin output).
-fn order_by_covered_by_merge_join(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
-    let PhysicalPlan::MergeJoin {
+fn order_by_covered_by_merge_join(select: &SelectStmt, plan: &PhysicalPlan) -> bool {    let PhysicalPlan::MergeJoin {
         left_key, right_key, ..
     } = plan
     else {
@@ -3812,7 +3941,12 @@ fn wrap_quantified_all_projection(
 /// ORDER BY a SELECT-list alias backed by a subquery (`select (select …) q
 /// from t order by q`): the sort key only exists after the output Projection,
 /// so plan `Sort → Projection` (SortExec resolves the alias by name).
-fn sort_over_projected_subquery(plan: PhysicalPlan, select: &SelectStmt) -> Option<PhysicalPlan> {
+fn sort_over_projected_subquery(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
     if select.order_by.is_empty()
         || select.limit.is_some()
         || select.offset.is_some()
@@ -3841,7 +3975,7 @@ fn sort_over_projected_subquery(plan: PhysicalPlan, select: &SelectStmt) -> Opti
     if !idxs.iter().any(|i| select.fields[*i].expr.has_subquery()) {
         return None;
     }
-    let projected = wrap_output_projection(plan, select);
+    let projected = wrap_output_projection(plan, select, None, is, current_db);
     if !matches!(projected, PhysicalPlan::Projection { .. }) {
         return None;
     }
@@ -3856,13 +3990,24 @@ fn sort_over_projected_subquery(plan: PhysicalPlan, select: &SelectStmt) -> Opti
     })
 }
 
-fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
+fn wrap_output_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    qualified_table: Option<&(String, String)>,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
     if is_star_select(select)
         || needs_hash_agg(select)
         || needs_window(select)
         || matches!(plan, PhysicalPlan::Projection { .. })
     {
         return plan;
+    }
+    // A SELECT list mixing `*`/`t.*` with other expressions expands the star
+    // into the table's columns first (TiDB `buildProjection` star item).
+    if select.joins.is_empty() && select.fields.iter().any(|f| is_star_field(&f.expr)) {
+        return wrap_star_mixed_projection(plan, select, is, current_db);
     }
     // Keep the Projection node (execution relies on it), but name items the
     // way TiDB's ExplainExpressionList does:
@@ -3882,6 +4027,12 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
         .enumerate()
         .map(|(i, f)| {
             if matches!(&f.expr, ExprNode::Column(_)) {
+                if let Some((db, table)) = qualified_table
+                    && let ExprNode::Column(col) = &f.expr
+                {
+                    let schema = if db.is_empty() { "select" } else { db.as_str() };
+                    return format!("{schema}.{table}.{}", col.name);
+                }
                 if has_non_column {
                     tidb_scalar_explain(&f.expr, true)
                 } else {
@@ -3899,6 +4050,197 @@ fn wrap_output_projection(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
         exprs,
         child: Box::new(plan),
     }
+}
+
+/// Any `*` / `t.*` SELECT item.
+fn is_star_field(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Column(c) => c.name == "*",
+        ExprNode::Value(v) => {
+            matches!(&v.datum, sealdb_types::Datum::Bytes(b) if b == b"*")
+        }
+        _ => false,
+    }
+}
+
+/// `SELECT *, date_format(b, "") …`: TiDB expands each star item to the table's
+/// columns (`db.t.col`) and then names the remaining expressions `Column#N`.
+fn wrap_star_mixed_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let prefix = schema_prefix(current_db);
+    let mut items: Vec<String> = Vec::new();
+    let mut star_cols = 0usize;
+    let mut next_col = 0usize;
+    let mut derived = false;
+    for field in &select.fields {
+        match &field.expr {
+            ExprNode::Column(c) if c.name == "*" => {
+                for (table, col) in
+                    star_columns_for_table(select, c.table.as_deref(), is, current_db)
+                {
+                    items.push(format!("{prefix}.{table}.{col}"));
+                    star_cols += 1;
+                }
+            }
+            ExprNode::Value(v)
+                if matches!(&v.datum, sealdb_types::Datum::Bytes(b) if b == b"*") =>
+            {
+                for (table, col) in star_columns_for_table(select, None, is, current_db) {
+                    items.push(format!("{prefix}.{table}.{col}"));
+                    star_cols += 1;
+                }
+            }
+            ExprNode::Column(_) => items.push(tidb_scalar_explain(&field.expr, true)),
+            other => {
+                // TiDB numbers the first derived column after the point get's
+                // output (`…, _tidb_rowid, date_format(...)->Column#4`).
+                if next_col == 0 {
+                    next_col = star_cols + 2;
+                }
+                let text = projection_expr_explain(other, select, is, current_db);
+                items.push(format!("{text}->Column#{next_col}"));
+                next_col += 1;
+                derived = true;
+            }
+        }
+    }
+    if !derived {
+        // A star-only list still needs the Projection for execution (it is
+        // what adds `_tidb_rowid` to the output), but TiDB elides it from
+        // EXPLAIN when the items are a plain passthrough.
+        let items = (0..items.len()).map(|i| format!("col{i}")).collect();
+        return PhysicalPlan::Projection {
+            exprs: items,
+            child: Box::new(plan),
+        };
+    }
+    PhysicalPlan::Projection {
+        exprs: items,
+        child: Box::new(plan),
+    }
+}
+
+/// Columns of `alias` (or of every FROM table when `alias` is None) in
+/// definition order, as `(table_name, column_name)`.
+fn star_columns_for_table(
+    select: &SelectStmt,
+    alias: Option<&str>,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for table in select.join_tables() {
+        if let Some(alias) = alias
+            && !table.name.eq_ignore_ascii_case(alias)
+            && !table.resolve_name().eq_ignore_ascii_case(alias)
+        {
+            continue;
+        }
+        let schema = table
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        let Some(info) = is.and_then(|is| is.table_by_name(schema, table.resolve_name())) else {
+            continue;
+        };
+        for col in &info.columns {
+            out.push((table.resolve_name().to_string(), col.name.o().to_string()));
+        }
+    }
+    out
+}
+
+/// Projection item text; `date_format` over a non-temporal column gets the
+/// implicit `cast(…, datetime BINARY)` TiDB adds, and its format literal is
+/// printed raw (`date_format(…, %Y)`).
+fn projection_expr_explain(
+    expr: &ExprNode,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> String {
+    use sealdb_types::Datum;
+    let ExprNode::Func(f) = expr else {
+        return tidb_scalar_explain(expr, true);
+    };
+    if !f.name.eq_ignore_ascii_case("date_format") || f.args.len() != 2 {
+        return tidb_scalar_explain(expr, true);
+    }
+    let first = match &f.args[0] {
+        ExprNode::Column(c) if column_needs_datetime_cast(c, select, is, current_db) => {
+            format!(
+                "cast({}, datetime BINARY)",
+                tidb_scalar_explain(&f.args[0], true)
+            )
+        }
+        other => tidb_scalar_explain(other, true),
+    };
+    let second = match &f.args[1] {
+        ExprNode::Value(v) => match &v.datum {
+            Datum::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+            _ => tidb_scalar_explain(&f.args[1], true),
+        },
+        other => tidb_scalar_explain(other, true),
+    };
+    format!("date_format({first}, {second})")
+}
+
+/// True when a column feeding a temporal function is stored as a number.
+fn column_needs_datetime_cast(
+    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    use sealdb_types::{
+        TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DURATION, TYPE_LONG_BLOB, TYPE_MEDIUM_BLOB,
+        TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
+    };
+    let Some(is) = is else { return false };
+    for table in select.join_tables() {
+        if let Some(tbl) = col.table.as_deref()
+            && !table.name.eq_ignore_ascii_case(tbl)
+            && !table.resolve_name().eq_ignore_ascii_case(tbl)
+        {
+            continue;
+        }
+        let schema = table
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        let Some(info) = is.table_by_name(schema, table.resolve_name()) else {
+            continue;
+        };
+        let Some(column) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        else {
+            continue;
+        };
+        return !matches!(
+            column.field_type.tp,
+            TYPE_DATE
+                | TYPE_DATETIME
+                | TYPE_TIMESTAMP
+                | TYPE_DURATION
+                | TYPE_YEAR
+                | TYPE_STRING
+                | TYPE_VAR_STRING
+                | TYPE_VARCHAR
+                | TYPE_BLOB
+                | TYPE_TINY_BLOB
+                | TYPE_MEDIUM_BLOB
+                | TYPE_LONG_BLOB
+        );
+    }
+    false
 }
 
 /// TiDB ScalarFunction ExplainInfo; `nil_as_angle` → `<nil>` (Projection) else `NULL`.
@@ -4364,6 +4706,7 @@ fn point_or_batch(
             index,
             index_columns,
             partition_names,
+            lock: false,
         };
     }
     PhysicalPlan::BatchPointGet {
@@ -4372,6 +4715,7 @@ fn point_or_batch(
         index,
         n_keys: values.len(),
         index_columns,
+        lock: false,
     }
 }
 
@@ -5701,6 +6045,7 @@ fn build_agg_plan(
     select: &SelectStmt,
     plan: PhysicalPlan,
     current_db: &str,
+    is: Option<&InfoSchema>,
 ) -> (PhysicalPlan, bool) {
     let table = select
         .from
@@ -5766,6 +6111,31 @@ fn build_agg_plan(
     }
 
     if select.group_by.is_empty() {
+        // A point get materialises the row before aggregating, so the whole
+        // aggregate runs at root (`StreamAgg → Point_Get`) instead of a
+        // partial agg pushed into cop.
+        if matches!(
+            plan,
+            PhysicalPlan::PointGet { .. } | PhysicalPlan::BatchPointGet { .. }
+        ) && let Some(field) = select.fields.first()
+        {
+            let arg = match &field.expr {
+                ExprNode::Func(f) if !f.args.is_empty() => {
+                    agg_info_text(&f.args[0], table, &db_qual)
+                }
+                other => agg_info_text(other, table, &db_qual),
+            };
+            let name = match &field.expr {
+                ExprNode::Func(f) => f.name.to_ascii_lowercase(),
+                _ => "count".to_string(),
+            };
+            let out_col = pointget_agg_column_base(select, is, current_db) + 1;
+            let info = format!("funcs:{name}({arg})->Column#{out_col}");
+            return (
+                PhysicalPlan::stream_agg(plan, info, String::new(), est),
+                false,
+            );
+        }
         // Scalar aggregation (empty-table StreamAgg push into TableReader).
         let info = format!("funcs:count(Column#{partial_col})->Column#5");
         let cop = format!("funcs:count(select.{table}.a)->Column#{partial_col}");
@@ -5888,6 +6258,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 stats_pseudo,
                 filter_est,
                 range_scan,
+                keep_order,
                 pushed,
             } => PhysicalPlan::TableReader {
                 table,
@@ -5898,6 +6269,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 stats_pseudo,
                 filter_est,
                 range_scan,
+                keep_order,
                 pushed: pushed.as_ref().map(|p| rewrite_col_tables(p, tables)),
             },
             PhysicalPlan::IndexReader {
@@ -6094,6 +6466,76 @@ fn partial_agg_column_id(select: &SelectStmt) -> usize {
         return 15;
     }
     10
+}
+
+/// `SELECT … FOR UPDATE/FOR SHARE`: a handle point get or a batch point get
+/// locks its own keys (`…, lock`); everything else gets a `SelectLock` node.
+fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
+    let info = match select.lock {
+        SelectLock::None => return plan,
+        SelectLock::ForUpdate => "for update 0",
+        SelectLock::ForShare => "for share 0",
+    };
+    match plan {
+        PhysicalPlan::PointGet {
+            table,
+            handle: Some(handle),
+            index: None,
+            index_columns,
+            partition_names,
+            ..
+        } => PhysicalPlan::PointGet {
+            table,
+            handle: Some(handle),
+            index: None,
+            index_columns,
+            partition_names,
+            lock: true,
+        },
+        PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            index_columns,
+            ..
+        } => PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            index_columns,
+            lock: true,
+        },
+        other => PhysicalPlan::SelectLock {
+            child: Box::new(other),
+            info: info.to_string(),
+        },
+    }
+}
+
+/// Column count of a point get's child table plus its handle column.
+fn pointget_agg_column_base(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> usize {
+    let Some(from) = select.from.as_ref() else {
+        return 1;
+    };
+    let schema = from
+        .schema
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(current_db);
+    is.and_then(|is| is.table_by_name(schema, from.resolve_name()))
+        .map(|info| info.columns.len() + 1)
+        .unwrap_or(1)
+}
+
+/// Aggregate argument text: columns keep their qualified table name.
+fn agg_info_text(expr: &ExprNode, _table: &str, _db_qual: &str) -> String {
+    tidb_scalar_explain(expr, true)
 }
 
 fn explain_col_ref(table: &str, expr: &ExprNode) -> String {
@@ -7318,6 +7760,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             stats_pseudo: false,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed: None,
         }),
     };
@@ -7359,6 +7802,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             stats_pseudo: false,
             filter_est: None,
             range_scan: None,
+            keep_order: false,
             pushed: Some(ExprNode::Value(ValueExpr {
                 datum: Datum::Bytes(filter_null.into_bytes()),
             })),
@@ -7485,6 +7929,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         stats_pseudo: false,
         filter_est: None,
         range_scan: None,
+        keep_order: false,
         pushed: Some(t_filter.clone()),
     };
     let agg = |join: PhysicalPlan| PhysicalPlan::HashAgg {
@@ -7738,6 +8183,7 @@ fn inl_join_hint_plan(
         filter_est,
         range_scan: None,
         pushed: outer_pushed,
+        keep_order: false,
     };
     let join_est = super::explain::est_rows(&outer_plan);
     // Inner side: the decided range carries the join keys plus its own filters.
@@ -7796,6 +8242,7 @@ fn inl_join_hint_plan(
         stats_pseudo: false,
         filter_est: None,
         range_scan: None,
+        keep_order: false,
         pushed: Some(bytes_info(&format!(
             "RANGE_SEL|{}|{}",
             sel_info.join(", "),
@@ -8010,6 +8457,7 @@ fn index_join_suite_plan(
             filter_est: None,
             range_scan: None,
             pushed: Some(not_null(build_alias)),
+            keep_order: false,
         };
         let range = format!(
             "decided by [eq({schema}.{probe_alias}.a, {schema}.{build_alias}.a)]"
@@ -8065,6 +8513,7 @@ fn index_join_suite_plan(
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(build_alias)),
+        keep_order: false,
     };
     let probe = PhysicalPlan::TableReader {
         table: probe_alias.to_string(),
@@ -8076,6 +8525,7 @@ fn index_join_suite_plan(
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(probe_alias)),
+        keep_order: false,
     };
     let join_info = format!(
         "inner join, equal:[eq({schema}.{build_alias}.a, {schema}.{probe_alias}.a)]"
@@ -8226,6 +8676,7 @@ fn global_index_join_plan(
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
+        keep_order: false,
     };
     let range_info = format!("decided by [eq({p_name}.{}, {o_name}.{})]", p_col.name, o_col.name);
     let mut sel = format!("not(isnull({p_name}.{}))", p_col.name);
@@ -8465,6 +8916,7 @@ fn count_in_apply_index_join(
         filter_est: None,
         range_scan: None,
         pushed: None,
+        keep_order: false,
     };
 
     let idx_range = format!(
@@ -8491,6 +8943,7 @@ fn count_in_apply_index_join(
         filter_est: None,
         range_scan: None,
         pushed: Some(range_push(&t1_range)),
+        keep_order: false,
     };
     let index_join = PhysicalPlan::IndexJoin {
         info: format!(
@@ -8596,6 +9049,7 @@ fn scalar_max_eq_plan(
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null("b")),
+        keep_order: false,
     };
     let hash_agg = PhysicalPlan::hash_agg_cop(
         build_scan,
@@ -8621,6 +9075,7 @@ fn scalar_max_eq_plan(
         filter_est: None,
         range_scan: None,
         pushed: Some(and_filters(&["a", "b", "c"])),
+        keep_order: false,
     };
     let join_info = format!(
         "inner join, equal:[eq({schema}.{phys}.b, {schema}.{phys}.b) eq({schema}.{phys}.c, {schema}.{phys}.b) eq({schema}.{phys}.a, Column#9)]"
@@ -8763,6 +9218,7 @@ fn access_plan(
                 index: None,
                 index_columns: Vec::new(),
                 partition_names: from.partition_names.clone(),
+                lock: false,
             };
         }
         if let Some(plan) = in_list_plan(select, from, info) {
@@ -8807,6 +9263,7 @@ fn access_plan(
                             .map(|c| c.name.o().to_string())
                             .collect(),
                         partition_names: from.partition_names.clone(),
+                        lock: false,
                     };
                 }
                 // unanalyzed tables keep the index path.

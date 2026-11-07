@@ -350,6 +350,7 @@ fn build_nonrecursive_all_probe(
                 stats_pseudo,
                 filter_est: None,
                 range_scan: None,
+                keep_order: false,
                 pushed: Some(sel.clone()),
             },
             other => other,
@@ -491,6 +492,7 @@ fn build_recursive_arm_plan(
         filter_est: None,
         range_scan: None,
         pushed: None,
+        keep_order: false,
     };
     // Marker table name "CTE_0" — explain recursive part maps CTETable.
     // `… where exists (select /*+ no_decorrelate() */ … from t …)` keeps a
@@ -1113,6 +1115,7 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             stats_pseudo,
             filter_est,
             range_scan,
+            keep_order: false,
             pushed: match pushed {
                 Some(prev) => ExprNode::compose_cnf(vec![prev, filter]),
                 None => Some(filter),

@@ -615,6 +615,15 @@ impl ExecutorBuilder {
                 current_db,
                 txn,
             ),
+            // Row locking is enforced by the point get / DML paths; the
+            // SelectLock node is EXPLAIN shape only.
+            PhysicalPlan::SelectLock { child, .. } => Self::build(
+                child,
+                stmt,
+                domain,
+                current_db,
+                txn,
+            ),
             PhysicalPlan::CTE {
                 name,
                 columns,

@@ -1399,6 +1399,7 @@ fn emit_cop_children(
             row_count,
             stats_pseudo,
             range_scan,
+            keep_order,
             pushed,
             ..
         } => {
@@ -1532,8 +1533,9 @@ fn emit_cop_children(
                 );
                 return true;
             }
-            // MergeJoin needs ordered PK input → keep order:true (TiDB).
-            let scan_info = if under_merge_join {
+            // MergeJoin needs ordered PK input → keep order:true (TiDB); an
+            // `ORDER BY` on the handle reads the table in handle order.
+            let scan_info = if under_merge_join || *keep_order {
                 if *stats_pseudo {
                     "keep order:true, stats:pseudo".to_string()
                 } else {
@@ -2542,6 +2544,15 @@ fn render_access(access: String) -> String {
 }
 
 /// `table:pt, index:uidx(c)` — TiDB prints a point-get index with its columns.
+/// TiDB appends `, lock` when the point get locks its own keys.
+fn lock_suffix(lock: bool) -> &'static str {
+    if lock {
+        ", lock"
+    } else {
+        ""
+    }
+}
+
 fn point_get_index_access(table: &str, index: &str, columns: &[String]) -> String {
     if columns.is_empty() {
         format!("table:{table}, index:{index}")
@@ -3211,7 +3222,8 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Shuffle { child, .. }
         | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::Explain { child, .. }
-        | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
+        | PhysicalPlan::Distinct { child, .. }
+        | PhysicalPlan::SelectLock { child, .. } => vec![child.as_ref()],
         PhysicalPlan::Insert { child }
         | PhysicalPlan::Update { child }
         | PhysicalPlan::Delete { child } => child.iter().map(|c| c.as_ref()).collect(),
@@ -3264,6 +3276,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             exprs.join(", "),
         ),
+        PhysicalPlan::SelectLock { info, .. } => (
+            "SelectLock".to_string(),
+            String::new(),
+            info.clone(),
+        ),
         PhysicalPlan::DDL { kind } => ("DDL".to_string(), String::new(), format!("{kind:?}")),
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
@@ -3307,12 +3324,13 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             table,
             handle: Some(handle),
             index: None,
+            lock,
             ..
         } => (
             // TiDB EXPLAIN id is `Point_Get` (underscore before Get).
             "Point_Get".to_string(),
             format!("table:{table}"),
-            format!("handle:{handle}"),
+            format!("handle:{handle}{}", lock_suffix(*lock)),
         ),
         PhysicalPlan::PointGet {
             table,
@@ -3333,16 +3351,17 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             table,
             index: Some(index),
             index_columns,
+            lock,
             ..
         } => (
             "Batch_Point_Get".to_string(),
             point_get_index_access(table, index, index_columns),
-            "keep order:false, desc:false".to_string(),
+            format!("keep order:false, desc:false{}", lock_suffix(*lock)),
         ),
-        PhysicalPlan::BatchPointGet { table, .. } => (
+        PhysicalPlan::BatchPointGet { table, lock, .. } => (
             "Batch_Point_Get".to_string(),
             format!("table:{table}"),
-            "keep order:false, desc:false".to_string(),
+            format!("keep order:false, desc:false{}", lock_suffix(*lock)),
         ),
         PhysicalPlan::IndexLookUpReader {
             partition_access, ..
@@ -3773,6 +3792,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
         PhysicalPlan::PointGet { .. } => 1.0,
         PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
+        PhysicalPlan::SelectLock { child, .. } => est_rows(child),
         PhysicalPlan::Selection { child, filter, .. } => {
             let n = not_isnull_count(filter);
             // TiDB: not(isnull) over CTEFullScan uses 0.8 (6400.80 from 8001).
