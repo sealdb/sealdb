@@ -1641,7 +1641,15 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
             continue;
         }
         stats.add_modify(&schema, &name, delta);
-        if enable && stats.needs_auto_analyze(&schema, &name, ratio) {
+        // TiDB analyzes partitioned tables asynchronously (partition jobs feed
+        // the global stats separately), so an immediate EXPLAIN after INSERT
+        // still reads the stats merged by the last explicit ANALYZE.
+        let partitioned = session
+            .domain
+            .infoschema()
+            .table_by_name(&schema, &name)
+            .is_some_and(|info| info.partition.is_some());
+        if enable && !partitioned && stats.needs_auto_analyze(&schema, &name, ratio) {
             due.push((schema, name));
         }
     }
