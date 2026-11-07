@@ -193,7 +193,7 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                 )))
             }
-            PhysicalPlan::Insert => {
+            PhysicalPlan::Insert { .. } => {
                 let insert = match stmt {
                     Statement::Insert(s) => s.clone(),
                     _ => return Err(Error::unsupported("insert without insert statement")),
@@ -223,7 +223,7 @@ impl ExecutorBuilder {
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
                 Ok(Box::new(MemTableExec::new(columns, rows)))
             }
-            PhysicalPlan::Update => {
+            PhysicalPlan::Update { .. } => {
                 let update = match stmt {
                     Statement::Update(s) => s.clone(),
                     _ => return Err(Error::unsupported("update without update statement")),
@@ -235,7 +235,7 @@ impl ExecutorBuilder {
                     txn,
                 )))
             }
-            PhysicalPlan::Delete => {
+            PhysicalPlan::Delete { .. } => {
                 let delete = match stmt {
                     Statement::Delete(s) => s.clone(),
                     _ => return Err(Error::unsupported("delete without delete statement")),

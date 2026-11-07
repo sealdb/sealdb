@@ -38,12 +38,21 @@ pub enum PhysicalPlan {
     Simple {
         kind: String,
     },
-    Insert,
+    /// `INSERT` / `REPLACE`: `child` is the source plan (`INSERT … SELECT`).
+    Insert {
+        child: Option<Box<PhysicalPlan>>,
+    },
     InfoSchema {
         table: String,
     },
-    Update,
-    Delete,
+    /// `UPDATE`: `child` reads the rows to update.
+    Update {
+        child: Option<Box<PhysicalPlan>>,
+    },
+    /// `DELETE`: `child` reads the row handles to delete.
+    Delete {
+        child: Option<Box<PhysicalPlan>>,
+    },
     TableReader {
         table: String,
         partitions: Vec<i64>,
@@ -345,10 +354,10 @@ impl PhysicalPlan {
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Simple { kind } => format!("Simple_{kind}"),
-            PhysicalPlan::Insert => "Insert".to_string(),
+            PhysicalPlan::Insert { child } => format!("Insert{}", dml_child(child)),
             PhysicalPlan::InfoSchema { table } => format!("InfoSchema_{table}"),
-            PhysicalPlan::Update => "Update".to_string(),
-            PhysicalPlan::Delete => "Delete".to_string(),
+            PhysicalPlan::Update { child } => format!("Update{}", dml_child(child)),
+            PhysicalPlan::Delete { child } => format!("Delete{}", dml_child(child)),
             PhysicalPlan::TableReader {
                 table,
                 partitions,
@@ -618,6 +627,13 @@ impl PhysicalPlan {
             offset,
             count,
         }
+    }
+}
+
+fn dml_child(child: &Option<Box<PhysicalPlan>>) -> String {
+    match child {
+        Some(child) => format!(" -> {}", child.explain()),
+        None => String::new(),
     }
 }
 

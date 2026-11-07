@@ -750,7 +750,16 @@ fn walk_with_parent(
     };
     rows.push(ExplainRow {
         id: format!("{prefix}{name}_{id}{join_role}"),
-        est_rows: format!("{row_est:.2}"),
+        est_rows: if matches!(
+            plan,
+            PhysicalPlan::Insert { .. }
+                | PhysicalPlan::Update { .. }
+                | PhysicalPlan::Delete { .. }
+        ) {
+            "N/A".to_string()
+        } else {
+            format!("{row_est:.2}")
+        },
         task: task_of(plan).to_string(),
         access: render_access(access),
         info,
@@ -1491,6 +1500,58 @@ fn emit_cop_children(
             };
             let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
             let cop_spine = cop_owned.as_slice();
+            // COP_PROJ_SEL: EXPLAIN-only cop Projection above the pushed Selection
+            // (`DELETE` on a `_tidb_rowid` table).
+            if let Some((proj, sel)) = cop_proj_sel_pushed(pushed.as_ref()) {
+                let sel_est = est_rows(plan) * apply_factor.max(1.0);
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Projection",
+                        est: sel_est,
+                        task: scan_task,
+                        access: String::new(),
+                        info: proj,
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: sel_est,
+                        task: scan_task,
+                        access: String::new(),
+                        info: sel,
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 2,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableFullScan",
+                        est: scan_est,
+                        task: scan_task,
+                        access: scan_access,
+                        info: scan_info,
+                    },
+                    if under_bushy { &scan_spine } else { &[] },
+                );
+                return true;
+            }
             if let Some(filter) = pushed.as_ref() {
                 push_explain_row_spine(
                     rows,
@@ -2483,6 +2544,13 @@ fn bytes_marker<'a>(
     }
 }
 
+/// `COP_PROJ_SEL|<proj exprs>|<sel info>`: cop Projection above a Selection.
+fn cop_proj_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(String, String)> {
+    let rest = bytes_marker(pushed)?.strip_prefix("COP_PROJ_SEL|")?;
+    let (proj, sel) = rest.split_once('|')?;
+    Some((proj.to_string(), sel.to_string()))
+}
+
 /// `KEEP_ORDER` marker: IndexFullScan keeps order for MergeJoin/IndexHashJoin.
 fn keep_order_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> bool {
     bytes_marker(pushed) == Some("KEEP_ORDER")
@@ -2624,7 +2692,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
 }
 
 /// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
-fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
@@ -2914,6 +2982,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => vec![child.as_ref()],
+        PhysicalPlan::Insert { child }
+        | PhysicalPlan::Update { child }
+        | PhysicalPlan::Delete { child } => child.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::CTE {
             recursive: true, ..
         } => Vec::new(),
@@ -2966,14 +3037,15 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::DDL { kind } => ("DDL".to_string(), String::new(), format!("{kind:?}")),
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
-        PhysicalPlan::Insert => ("Insert".to_string(), String::new(), String::new()),
+        PhysicalPlan::Insert { .. } => ("Insert".to_string(), String::new(), "N/A".to_string()),
+
         PhysicalPlan::InfoSchema { table } => (
             "MemTable".to_string(),
             format!("table:{table}"),
             String::new(),
         ),
-        PhysicalPlan::Update => ("Update".to_string(), String::new(), String::new()),
-        PhysicalPlan::Delete => ("Delete".to_string(), String::new(), String::new()),
+        PhysicalPlan::Update { .. } => ("Update".to_string(), String::new(), "N/A".to_string()),
+        PhysicalPlan::Delete { .. } => ("Delete".to_string(), String::new(), "N/A".to_string()),
         PhysicalPlan::TableReader {
             pushed,
             partition_access,
@@ -2987,6 +3059,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             },
             if range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
+            } else if cop_proj_sel_pushed(pushed.as_ref()).is_some() {
+                "data:Projection".to_string()
             } else if pushed.is_some() {
                 "data:Selection".to_string()
             } else {
