@@ -91,8 +91,10 @@ pub fn resolve_partitions(
 
     match mode {
         PartitionPruneMode::Static => PlannedPartitions { ids, names, all },
+        // Dynamic: the executor prunes with the pushed predicate, but an
+        // explicit `PARTITION (pN)` narrows the scan regardless of the mode.
         PartitionPruneMode::Dynamic => PlannedPartitions {
-            ids: Vec::new(),
+            ids: if named.is_empty() { Vec::new() } else { ids },
             names,
             all,
         },

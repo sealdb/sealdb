@@ -5,9 +5,7 @@ use super::plan_cost::{
 };
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension, eq_join_edge};
-use super::rule_partition_processor::{
-    PartitionPruneMode, plan_partitions, resolve_partitions,
-};
+use super::rule_partition_processor::{PartitionPruneMode, resolve_partitions};
 use super::rule_inject_extra_projection::{
     inject_proj_below_sort, order_by_all_constant, order_by_has_scalar_func,
 };
@@ -4162,7 +4160,9 @@ fn partitioned_table_reader(
             };
             PhysicalPlan::table_reader_parts(
                 from.name.clone(),
-                Vec::new(),
+                // `PARTITION (pN)` narrows the scan even in dynamic mode; the
+                // executor only prunes with the filter when ids are empty.
+                planned.ids,
                 Vec::new(),
                 access,
                 row_count,
@@ -4179,7 +4179,13 @@ fn index_plan(
     index: &sealdb_meta::IndexInfo,
     prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
-    let partitions = plan_partitions(info, select.selection.as_ref(), prune_mode);
+    let partitions = resolve_partitions(
+        info,
+        select.selection.as_ref(),
+        &from.partition_names,
+        prune_mode,
+    )
+    .ids;
     let index_columns: Vec<String> = index
         .columns
         .iter()
@@ -4234,7 +4240,13 @@ fn index_merge_plan(
     Some(PhysicalPlan::IndexMerge {
         table: from.name.clone(),
         indexes,
-        partitions: plan_partitions(info, select.selection.as_ref(), prune_mode),
+        partitions: resolve_partitions(
+            info,
+            select.selection.as_ref(),
+            &from.partition_names,
+            prune_mode,
+        )
+        .ids,
         pushed: None,
     })
 }
