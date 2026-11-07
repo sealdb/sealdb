@@ -1526,7 +1526,7 @@
     {
       "name": "globalindex/point_get",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/globalindex/point_get.test",
       "result": "r/globalindex/point_get.result",
       "has_result": true,
