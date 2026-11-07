@@ -136,8 +136,11 @@ fn current_time_zone() -> String {
 thread_local! {
     static CURRENT_DB: RefCell<String> = const { RefCell::new(String::new()) };
     /// TiDB `tidb_window_concurrency` (default 5; suite sets 1 / 4).
-    static WINDOW_CONCURRENCY: Cell<u64> = const { Cell::new(5) };
+    static WINDOW_CONCURRENCY: Cell<u64> = const { Cell::new(DEFAULT_WINDOW_CONCURRENCY) };
 }
+
+/// TiDB `tidb_window_concurrency` default.
+pub const DEFAULT_WINDOW_CONCURRENCY: u64 = 5;
 
 pub fn set_window_concurrency(n: u64) {
     WINDOW_CONCURRENCY.with(|c| c.set(n.max(1)));

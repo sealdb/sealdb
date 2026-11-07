@@ -18,7 +18,8 @@ pub use memquota::{
 };
 
 pub use evaluator::{
-    DivByZeroMode, clear_warnings, collation_ci, collation_mode, current_db_name, datum_sql_eq,
+    DEFAULT_WINDOW_CONCURRENCY, DivByZeroMode, clear_warnings, collation_ci, collation_mode,
+    current_db_name, datum_sql_eq,
     eval_expr,
     eval_expr_with_row, eval_filter, format_timestamp_display, locate_partition_for_row,
     note_warning, session_local_to_utc, set_window_concurrency, sql_mode_flag, take_warnings,
