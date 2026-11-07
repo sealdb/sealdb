@@ -73,7 +73,14 @@ pub fn key_partition_index(value: &sealdb_types::Datum, num: usize) -> Option<us
     let bytes: Vec<u8> = match value {
         sealdb_types::Datum::I64(v) => (*v as u64).to_be_bytes().to_vec(),
         sealdb_types::Datum::U64(v) => v.to_be_bytes().to_vec(),
-        sealdb_types::Datum::Bytes(v) => v.clone(),
+        // TiDB feeds `codec.EncodeValue` output to the hash: integers are their
+        // 8-byte big-endian form, while bytes carry a `u64` length prefix.
+        sealdb_types::Datum::Bytes(v) => {
+            let mut buf = Vec::with_capacity(8 + v.len());
+            buf.extend_from_slice(&(v.len() as u64).to_be_bytes());
+            buf.extend_from_slice(v);
+            buf
+        }
         _ => return None,
     };
     let digest = md5(&bytes);
@@ -105,5 +112,18 @@ mod tests {
         let hi = sealdb_types::Datum::U64((u64::MAX >> 1) + 1);
         assert_eq!(key_partition_index(&lo, 5), Some(2));
         assert_eq!(key_partition_index(&hi, 5), Some(2));
+    }
+
+    #[test]
+    fn string_keys_hash_with_a_length_prefix() {
+        // TiDB `KEY(col2) PARTITIONS 4` with `col2 IN ('a', 'c')` prunes to p3.
+        assert_eq!(
+            key_partition_index(&sealdb_types::Datum::Bytes(b"a".to_vec()), 4),
+            Some(3)
+        );
+        assert_eq!(
+            key_partition_index(&sealdb_types::Datum::Bytes(b"c".to_vec()), 4),
+            Some(3)
+        );
     }
 }
