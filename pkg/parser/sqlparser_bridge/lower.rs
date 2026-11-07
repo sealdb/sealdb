@@ -2025,13 +2025,17 @@ fn rewrite_mysql_version_comments(sql: &str) -> String {
 }
 
 /// Drops TiDB `CREATE TABLE` extension clauses sqlparser rejects:
-/// `PRIMARY KEY (c) CLUSTERED|NONCLUSTERED` index options and
-/// `pre_split_regions=N` / `shard_row_id_bits=N` table options.
+/// `PRIMARY KEY (c) CLUSTERED|NONCLUSTERED`, `INDEX (c) GLOBAL` index
+/// options, and `pre_split_regions=N` / `shard_row_id_bits=N` table options.
 fn strip_tidb_create_table_options(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
     let start = match lower.find("create table") {
         Some(pos) => pos,
-        None => return sql.to_string(),
+        // `ALTER TABLE … ADD [UNIQUE] INDEX (c) GLOBAL` carries the same options.
+        None => match lower.find("alter table") {
+            Some(pos) => pos,
+            None => return sql.to_string(),
+        },
     };
     const GLOBAL: [&str; 2] = ["nonclustered", "clustered"];
     const OPTIONS: [&str; 2] = ["pre_split_regions", "shard_row_id_bits"];
@@ -2117,6 +2121,11 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                 }
                 let word = lower[word_start..i].to_string();
                 if GLOBAL.contains(&word.as_str()) {
+                    out.push(' ');
+                    continue;
+                }
+                // `UNIQUE INDEX idx(id) GLOBAL` — partition-independent index.
+                if word == "global" && out.trim_end().ends_with(')') {
                     out.push(' ');
                     continue;
                 }
