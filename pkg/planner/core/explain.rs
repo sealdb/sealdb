@@ -182,6 +182,11 @@ pub fn explain_analyze_result(
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     let mut rows = Vec::new();
     let mut deferred: Vec<PhysicalPlan> = Vec::new();
+    // TiDB renders `NULL` in the access-object column for every node without an
+    // explicit object once a GLOBAL index read is pinned to named partitions
+    // (`FROM PARTITION (pN)`); unpinned reads render an empty column instead.
+    let pinned = plan_reads_pinned_global_index(plan);
+    PINNED_PARTITION.with(|c| c.set(pinned));
     walk(plan, 0, true, &mut 1, &mut rows, &mut deferred);
     // TiDB: recursive CTE producers follow the main plan as `CTE_0` siblings.
     // A CTE referenced N times is still one shared definition (CTE_0).
@@ -209,7 +214,32 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     for (i, cte) in producers.iter().enumerate() {
         emit_recursive_cte_producer(cte, i, &mut 1, &mut rows);
     }
+    PINNED_PARTITION.with(|c| c.set(false));
     rows
+}
+
+thread_local! {
+    /// Set while rendering a plan with a pinned GLOBAL index read.
+    static PINNED_PARTITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True when the plan pins a GLOBAL index reader to named partitions.
+fn plan_reads_pinned_global_index(plan: &PhysicalPlan) -> bool {
+    let access = match plan {
+        PhysicalPlan::IndexReader {
+            partition_access, ..
+        }
+        | PhysicalPlan::IndexLookUpReader {
+            partition_access, ..
+        } => partition_access,
+        _ => "",
+    };
+    if !access.is_empty() && access != "all" {
+        return true;
+    }
+    children_of(plan)
+        .into_iter()
+        .any(plan_reads_pinned_global_index)
 }
 
 pub fn explain_json(plan: &PhysicalPlan) -> String {
@@ -372,6 +402,13 @@ fn walk_with_parent(
     let id = *next_id;
     *next_id += 1;
     let (name, access, mut info) = node_meta(plan);
+    // Pinned GLOBAL reads render the empty IndexLookUp operator info as `NULL`.
+    if info.is_empty()
+        && matches!(plan, PhysicalPlan::IndexLookUpReader { .. })
+        && PINNED_PARTITION.with(|c| c.get())
+    {
+        info = "NULL".to_string();
+    }
     // Correlated predicate over a recursive CTE scan refers to the CTE's
     // original table (`cte1.tt.c1`), not the CTE name (`cte1.cte1.c1`).
     if matches!(plan, PhysicalPlan::Selection { .. })
@@ -603,6 +640,14 @@ fn walk_with_parent(
                 info = "index:StreamAgg".to_string();
             }
         }
+        // GLOBAL index aggregation: TiDB pushes HashAgg into the cop task and
+        // labels the reader `index:HashAgg`.
+        if matches!(plan, PhysicalPlan::IndexReader { .. })
+            && agg_name == "HashAgg"
+            && !cop_info.is_empty()
+        {
+            info = "index:HashAgg".to_string();
+        }
     }
     // RANGE: marker → TableRangeScan / IndexRangeScan access (overrides Selection).
     if let Some(range) = range_marker(plan) {
@@ -707,7 +752,7 @@ fn walk_with_parent(
         id: format!("{prefix}{name}_{id}{join_role}"),
         est_rows: format!("{row_est:.2}"),
         task: task_of(plan).to_string(),
-        access,
+        access: render_access(access),
         info,
     });
     // DistSQL readers expand into TiDB-shaped cop children (TableFullScan /
@@ -1516,9 +1561,21 @@ fn emit_cop_children(
             index_columns,
             partitions,
             row_count,
+            partition_access,
             pushed,
         } => {
-            let access = index_access_cols(table, index, index_columns, partitions);
+            // The reader node carries the GLOBAL partition label; the scan keeps
+            // `table:…, index:…` without the (executor-only) partition ids.
+            let access = index_access_cols(
+                table,
+                index,
+                index_columns,
+                if partition_access.is_empty() {
+                    partitions
+                } else {
+                    &[]
+                },
+            );
             let (mut scan_est, mut scan_info) = index_scan_meta(pushed.as_ref());
             // Explicit IndexReader.row_count / RANGE overrides pseudo est.
             if range_pushed(pushed.as_ref()).is_some()
@@ -1652,8 +1709,11 @@ fn emit_cop_children(
                 scan_depth = depth + 1;
             }
             if let Some((agg_name, _, cop_info, est)) = stream_parent {
-                // GROUP BY StreamAgg needs ordered index input.
-                scan_info = "keep order:true, stats:pseudo".to_string();
+                // GROUP BY StreamAgg needs ordered index input; a GLOBAL index
+                // HashAgg pushdown reads the index unordered.
+                if agg_name == "StreamAgg" {
+                    scan_info = "keep order:true, stats:pseudo".to_string();
+                }
                 if !cop_info.is_empty() {
                     push_explain_row(
                         rows,
@@ -1670,6 +1730,44 @@ fn emit_cop_children(
                     );
                     scan_depth = depth + 1;
                 }
+            }
+            // Pinned GLOBAL index read: cop Selection on `_tidb_tid`.
+            if let Some(tid) = tid_sel_pushed(pushed.as_ref()) {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut leaf_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    leaf_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: 10_000.0,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: format!("in(_tidb_tid, {tid})"),
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: 10_000.0,
+                        task: "cop[tikv]",
+                        access,
+                        info: "keep order:false, stats:pseudo".to_string(),
+                    },
+                    if under_bushy { &leaf_spine } else { &[] },
+                );
+                return true;
             }
             if under_window {
                 scan_info = if window_keep_order {
@@ -1820,12 +1918,22 @@ fn emit_cop_children(
             index,
             index_columns,
             partitions,
+            partition_access,
             row_count,
             selection_info,
             probe_selection_info,
             pushed,
         } => {
-            let idx_access = index_access_cols(table, index, index_columns, partitions);
+            let idx_access = index_access_cols(
+                table,
+                index,
+                index_columns,
+                if partition_access.is_empty() {
+                    partitions
+                } else {
+                    &[]
+                },
+            );
             let (mut scan_est, _) = index_scan_meta(pushed.as_ref());
             if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
                 scan_est = *row_count;
@@ -1962,8 +2070,36 @@ fn emit_cop_children(
                 return true;
             }
             // Full index scan IndexLookUp (USE INDEX without range): TiDB shows
-            // IndexFullScan(Build) + TableRowIDScan(Probe) on cop[tikv].
-            let info = if let Some(filter) = pushed.as_ref() {
+            // IndexFullScan(Build) + [HashAgg(Probe) →] TableRowIDScan(Probe).
+            let tid_sel = tid_sel_pushed(pushed.as_ref());
+            // Spine for the IndexLookUp children: `│` continues while a Probe
+            // sibling follows the Build side.
+            let mut build_spine = ancestors_spine(spine, depth);
+            let mut build_depth = depth;
+            if let Some(tid) = tid_sel.as_ref() {
+                push_explain_row_spine(
+                    rows,
+                    depth,
+                    false,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: 10_000.0,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: format!("in(_tidb_tid, {tid})"),
+                    },
+                    &build_spine,
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Build)");
+                }
+                build_spine.push(true);
+                build_depth = depth + 1;
+            }
+            let info = if tid_sel.is_some() {
+                "keep order:false, stats:pseudo".to_string()
+            } else if let Some(filter) = pushed.as_ref() {
                 format!("pushed:{}", filter.restore_string())
             } else if *row_count >= 9_000.0 {
                 "keep order:false, stats:pseudo".to_string()
@@ -1979,25 +2115,67 @@ fn emit_cop_children(
             } else {
                 scan_est
             };
-            push_explain_row(
-                rows,
-                depth,
-                false,
-                next_id,
-                CopRow {
-                    name: "IndexFullScan",
-                    est: scan_est,
-                    task: "cop[tikv]",
-                    access: idx_access,
-                    info,
-                },
-            );
-            if let Some(last) = rows.last_mut() {
-                last.id.push_str("(Build)");
+            if tid_sel.is_some() {
+                push_explain_row_spine(
+                    rows,
+                    build_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: scan_est,
+                        task: "cop[tikv]",
+                        access: idx_access,
+                        info,
+                    },
+                    &build_spine,
+                );
+            } else {
+                push_explain_row(
+                    rows,
+                    build_depth,
+                    false,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: scan_est,
+                        task: "cop[tikv]",
+                        access: idx_access,
+                        info,
+                    },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Build)");
+                }
+            }
+            // GLOBAL index aggregation: the cop HashAgg runs over the table-row
+            // probe, so it sits between IndexLookUp and TableRowIDScan.
+            let probe_agg = stream_parent.filter(|(name, _, cop, _)| {
+                *name == "HashAgg" && !cop.is_empty()
+            });
+            let mut probe_depth = depth;
+            if let Some((name, _, cop_info, est)) = probe_agg {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name,
+                        est,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: cop_info.to_string(),
+                    },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
+                probe_depth = depth + 1;
             }
             push_explain_row(
                 rows,
-                depth,
+                probe_depth,
                 true,
                 next_id,
                 CopRow {
@@ -2008,8 +2186,10 @@ fn emit_cop_children(
                     info: rowid_info,
                 },
             );
-            if let Some(last) = rows.last_mut() {
-                last.id.push_str("(Probe)");
+            if probe_agg.is_none() {
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
             }
             true
         }
@@ -2097,13 +2277,25 @@ fn push_explain_row_spine(
     } else {
         tree_prefix_with_spine(spine, depth, last)
     };
+    // Pinned GLOBAL index reads render empty access objects as `NULL`.
+    let access = render_access(row.access);
     rows.push(ExplainRow {
         id: format!("{prefix}{}_{id}", row.name),
         est_rows: format!("{:.2}", row.est),
         task: row.task.to_string(),
-        access: row.access,
+        access,
         info: row.info,
     });
+}
+
+/// TiDB renders an empty access object as `NULL` while a GLOBAL index read is
+/// pinned to named partitions, and as an empty column otherwise.
+fn render_access(access: String) -> String {
+    if access.is_empty() && PINNED_PARTITION.with(|c| c.get()) {
+        "NULL".to_string()
+    } else {
+        access
+    }
 }
 
 fn table_access(table: &str, partition_names: &[String]) -> String {
@@ -2299,6 +2491,13 @@ fn range_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(St
     let rest = bytes_marker(pushed)?.strip_prefix("RANGE_SEL|")?;
     let (sel, range) = rest.split_once('|')?;
     Some((sel.to_string(), range.to_string()))
+}
+
+/// `TID_SEL|<tid>`: pinned GLOBAL index read filters cop rows by `_tidb_tid`.
+fn tid_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
+    bytes_marker(pushed)?
+        .strip_prefix("TID_SEL|")
+        .map(|s| s.to_string())
 }
 
 /// TiDB keeps `not(isnull(..))` selectivity on real stats; pseudo stats scale
@@ -2829,15 +3028,29 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("table:{table}"),
             format!("keys:{n_keys}"),
         ),
-        PhysicalPlan::IndexLookUpReader { .. } => (
+        PhysicalPlan::IndexLookUpReader {
+            partition_access, ..
+        } => (
             "IndexLookUp".to_string(),
-            String::new(),
+            if partition_access.is_empty() {
+                String::new()
+            } else {
+                format!("partition:{partition_access}")
+            },
             // TiDB IndexLookUp root info is empty; Build/Probe children carry shape.
             String::new(),
         ),
-        PhysicalPlan::IndexReader { pushed, .. } => (
+        PhysicalPlan::IndexReader {
+            partition_access,
+            pushed,
+            ..
+        } => (
             "IndexReader".to_string(),
-            String::new(),
+            if partition_access.is_empty() {
+                String::new()
+            } else {
+                format!("partition:{partition_access}")
+            },
             if keep_order_sel_pushed(pushed.as_ref()).is_some() {
                 "index:Selection".to_string()
             } else if keep_order_pushed(pushed.as_ref()) {
@@ -3364,6 +3577,15 @@ fn task_of(_plan: &PhysicalPlan) -> &'static str {
 
 fn tree_prefix(depth: usize, last: bool) -> String {
     tree_prefix_with_spine(&[], depth, last)
+}
+
+/// Continuation flags for the ancestors of a node emitted at `depth`.
+fn ancestors_spine(spine: &[bool], depth: usize) -> Vec<bool> {
+    let want = depth.saturating_sub(1);
+    let mut out = spine.to_vec();
+    out.resize(want, false);
+    out.truncate(want);
+    out
 }
 
 /// `spine[i] == true` means ancestor depth i+1 still has a later sibling (`│ `).

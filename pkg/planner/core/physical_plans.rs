@@ -78,6 +78,9 @@ pub enum PhysicalPlan {
         index: String,
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// TiDB `partition:all` / `partition:p0` label for a GLOBAL index read.
+        #[serde(default)]
+        partition_access: String,
         /// Analyzed / pseudo cardinality for EXPLAIN estRows.
         row_count: f64,
         /// When set, EXPLAIN Selection(Build) wraps IndexRangeScan.
@@ -93,6 +96,9 @@ pub enum PhysicalPlan {
         /// Index column names for EXPLAIN `index:idx(b, c)`.
         index_columns: Vec<String>,
         partitions: Vec<i64>,
+        /// TiDB `partition:all` / `partition:p0` label for a GLOBAL index read.
+        #[serde(default)]
+        partition_access: String,
         /// Analyzed / pseudo cardinality for EXPLAIN estRows.
         row_count: f64,
         #[serde(skip)]

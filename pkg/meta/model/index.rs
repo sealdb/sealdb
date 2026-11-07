@@ -43,6 +43,9 @@ pub struct IndexInfo {
     pub unique: bool,
     #[serde(rename = "is_primary", default)]
     pub primary: bool,
+    /// TiDB `GLOBAL` index: spans every partition of a partitioned table.
+    #[serde(default)]
+    pub global: bool,
 }
 
 impl IndexInfo {
@@ -60,12 +63,19 @@ impl IndexInfo {
             state: STATE_PUBLIC,
             unique: false,
             primary: false,
+            global: false,
         }
     }
 
     pub fn with_flags(mut self, unique: bool, primary: bool) -> Self {
         self.unique = unique || primary;
         self.primary = primary;
+        self
+    }
+
+    /// TiDB `INDEX … GLOBAL` option.
+    pub fn with_global(mut self, global: bool) -> Self {
+        self.global = global;
         self
     }
 }

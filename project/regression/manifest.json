@@ -1386,7 +1386,7 @@
     {
       "name": "globalindex/aggregate",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/globalindex/aggregate.test",
       "result": "r/globalindex/aggregate.result",
       "has_result": true,
