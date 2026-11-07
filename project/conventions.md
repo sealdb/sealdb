@@ -85,6 +85,11 @@ fix(session): ONLY_FULL_GROUP_BY validates CTE and derived-table bodies
 在 72~80 列内渲染最稳；`gitlint` 默认 `title-max-length = 72`、
 `body-max-line-length = 80` 即同档。
 
+2026-11-07 已对 `ffd969c` 起的 300 个提交做一次性 message 整改（正文重排到
+80 列、超宽/缺 `type(scope)` 的标题逐条改写），树内容与提交数不变，只改
+SHA。改写前的链保存在分支 `backup/msg-rewrite-full-20261107`；远端
+`origin/main` 尚未同步，推送需 `--force-with-lease`。
+
 校验脚本：`project/scripts/check_commit_msg.sh`。安装为本地 hook：
 
 ```bash
