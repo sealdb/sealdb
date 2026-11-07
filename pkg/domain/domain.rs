@@ -26,6 +26,8 @@ pub struct GlobalSysVars {
     pub enable_auto_analyze: bool,
     /// Default connection charset (`character_set_connection` / SET NAMES default).
     pub character_set_connection: String,
+    /// `tidb_partition_prune_mode`; new sessions inherit this value.
+    pub partition_prune_mode: String,
 }
 
 impl Default for GlobalSysVars {
@@ -34,6 +36,7 @@ impl Default for GlobalSysVars {
             sql_mode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES".to_string(),
             enable_auto_analyze: true,
             character_set_connection: "utf8mb4".to_string(),
+            partition_prune_mode: "dynamic".to_string(),
         }
     }
 }
@@ -380,6 +383,13 @@ impl Domain {
             .lock()
             .expect("domain global vars lock")
             .sql_mode = mode;
+    }
+
+    pub fn set_global_partition_prune_mode(&self, mode: String) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .partition_prune_mode = mode;
     }
 
     pub fn set_global_enable_auto_analyze(&self, on: bool) {
