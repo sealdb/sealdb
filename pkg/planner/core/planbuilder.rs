@@ -106,6 +106,13 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // `/*+ INL_JOIN(t) */` → index nested-loop with `t` as inner.
+                if let Some(plan) =
+                    inl_join_hint_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // GLOBAL index equi-join: index nested-loop with the global
                 // index reader on the probe side (globalindex/index_join).
                 if let Some(plan) = global_index_join_plan(select, is, current_db, stats) {
@@ -7390,6 +7397,404 @@ fn bytes_info(text: &str) -> ExprNode {
     ExprNode::Value(ValueExpr {
         datum: Datum::Bytes(text.as_bytes().to_vec()),
     })
+}
+
+/// `/*+ INL_JOIN(t) */` (TiDB also accepts `TIDB_INLJ(t)`) pins an index
+/// nested-loop join with `t` as the **inner** side: rows come from the other
+/// table and `t` is probed through a range decided by the outer join keys.
+///
+/// The plan is EXPLAIN-only: execution keeps the generic hash join, which
+/// produces the same rows.
+fn inl_join_hint_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build() || select.from_item.is_some() || select.joins.len() != 1 {
+        return None;
+    }
+    let hint = inl_join_hint_alias(&select.text)?;
+    let is = is?;
+    let join = &select.joins[0];
+    if !matches!(map_join_type(join.tp), JoinType::Inner) {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    // The hint names a table alias (or the physical table it stands for).
+    let names = |t: &TableName| {
+        let mut out = vec![t.name.to_ascii_lowercase()];
+        if let Some(p) = t.physical.as_deref() {
+            out.push(p.to_ascii_lowercase());
+        }
+        out.push(t.resolve_name().to_ascii_lowercase());
+        out
+    };
+    let from_hit = names(from).contains(&hint);
+    let right_hit = names(&join.right).contains(&hint);
+    let (outer, inner) = match (from_hit, right_hit) {
+        (false, true) => (from, &join.right),
+        (true, false) => (&join.right, from),
+        _ => return None,
+    };
+    let info_of = |t: &TableName| {
+        let (db, name) = t.qualified(current_db);
+        is.table_by_name(&db, &name).cloned()
+    };
+    let outer_info = info_of(outer)?;
+    let inner_info = info_of(inner)?;
+    // Qualified column → alias/physical name decides; bare column → schema.
+    let owner = |table: Option<&str>, name: &str, t: &TableName, info: &sealdb_meta::TableInfo| {
+        if let Some(table) = table {
+            return names(t).iter().any(|n| n == &table.to_ascii_lowercase());
+        }
+        info.columns
+            .iter()
+            .any(|c| c.name.o().eq_ignore_ascii_case(name))
+    };
+    // Split WHERE + ON into single-side predicates and cross-side join keys.
+    let mut conjuncts = Vec::new();
+    if let Some(sel) = select.selection.as_ref() {
+        conjuncts.extend(sel.split_cnf());
+    }
+    conjuncts.extend(join.on.split_cnf());
+    let mut outer_preds = Vec::new();
+    let mut inner_preds = Vec::new();
+    // (outer key column, inner key column) in ON order.
+    let mut keys: Vec<(ColumnNameExpr, ColumnNameExpr)> = Vec::new();
+    for item in conjuncts {
+        if let ExprNode::Binary(bin) = &item
+            && bin.op == Op::Eq
+            && let (ExprNode::Column(a), ExprNode::Column(b)) =
+                (bin.left.as_ref(), bin.right.as_ref())
+        {
+            let a_outer = owner(a.table.as_deref(), &a.name, outer, &outer_info);
+            let b_inner = owner(b.table.as_deref(), &b.name, inner, &inner_info);
+            let b_outer = owner(b.table.as_deref(), &b.name, outer, &outer_info);
+            let a_inner = owner(a.table.as_deref(), &a.name, inner, &inner_info);
+            // Unqualified columns of self-joins belong to both sides; those
+            // equalities are not usable join keys here.
+            if a_outer && !a_inner && b_inner && !b_outer {
+                keys.push((a.clone(), b.clone()));
+                continue;
+            }
+            if b_outer && !b_inner && a_inner && !a_outer {
+                keys.push((b.clone(), a.clone()));
+                continue;
+            }
+        }
+        let cols = item.referenced_columns();
+        if cols.is_empty() {
+            continue;
+        }
+        let to_outer = cols
+            .iter()
+            .all(|(table, name)| owner(table.as_deref(), name, outer, &outer_info));
+        let to_inner = cols
+            .iter()
+            .all(|(table, name)| owner(table.as_deref(), name, inner, &inner_info));
+        match (to_outer, to_inner) {
+            (true, false) => outer_preds.push(coerce_eq_const(&outer_info, item)),
+            (false, true) => inner_preds.push(coerce_eq_const(&inner_info, item)),
+            _ => {}
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let outer_name = merge_join_orig_table(select, outer);
+    let inner_name = merge_join_orig_table(select, inner);
+    let (outer_db, outer_tbl) = outer.qualified(current_db);
+    let (_, inner_tbl) = inner.qualified(current_db);
+    // Post-ANALYZE columns (`ALTER TABLE … ADD COLUMN`) keep a pseudo 0.8
+    // selectivity and show up as `stats:partial[…]` on the scan.
+    let missing: Vec<String> = {
+        let mut out: Vec<String> = stats
+            .and_then(|handle| handle.table(&outer_db, &outer_tbl))
+            .map(|table| {
+                outer_preds
+            .iter()
+            .flat_map(|p| p.referenced_columns())
+            .chain(keys.iter().map(|(o, _)| (None, o.name.clone())))
+            .filter(|(_, name)| {
+                outer_info
+                    .columns
+                    .iter()
+                    .any(|col| col.name.o().eq_ignore_ascii_case(name))
+                    && table.column(name).is_none()
+            })
+            .map(|(_, name)| name.to_ascii_lowercase())
+            .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out.dedup();
+        out
+    };
+    let outer_rows = table_row_count(stats, outer, current_db);
+    // TiDB keeps the outer side a plain scan: its own predicates push down.
+    let mut outer_filter = outer_preds;
+    for (key, _) in &keys {
+        if nullable_column(&outer_info, &key.name) {
+            outer_filter.push(ExprNode::Unary(UnaryOpExpr {
+                op: Op::Not,
+                expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                    expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                        schema: None,
+                        table: Some(outer_name.clone()),
+                        name: key.name.clone(),
+                    })),
+                    not: false,
+                })),
+            }));
+        }
+    }
+    let outer_pushed = if missing.is_empty() {
+        ExprNode::compose_cnf(outer_filter.clone())
+    } else {
+        let sel = ExprNode::compose_cnf(outer_filter.clone())?;
+        let mut cnf = sel.split_cnf();
+        cnf.sort_by_key(|e| super::explain::explain_pushed_filter(&outer_name, e));
+        let info = cnf
+            .iter()
+            .map(|e| super::explain::explain_pushed_filter(&outer_name, e))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(bytes_info(&format!(
+            "PARTIAL_SEL|{}|{}",
+            missing.join(","),
+            info
+        )))
+    };
+    // TiDB's pseudo selectivity for a column missing from stats is 0.8.
+    let filter_est = (!missing.is_empty()).then(|| {
+        let hits = outer_filter
+            .iter()
+            .filter(|p| {
+                p.referenced_columns().iter().any(|(_, name)| {
+                    missing
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(name))
+                })
+            })
+            .count()
+            .max(1);
+        outer_rows * 0.8_f64.powi(hits as i32)
+    });
+    let outer_plan = PhysicalPlan::TableReader {
+        table: outer_tbl,
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access: String::new(),
+        row_count: outer_rows,
+        stats_pseudo: false,
+        filter_est,
+        range_scan: None,
+        pushed: outer_pushed,
+    };
+    let join_est = super::explain::est_rows(&outer_plan);
+    // Inner side: the decided range carries the join keys plus its own filters.
+    let mut sel_info = inner_preds
+        .iter()
+        .map(|e| super::explain::explain_pushed_filter(&inner_name, e))
+        .collect::<Vec<_>>();
+    sel_info.sort();
+    let range = format!(
+        "decided by [{}]",
+        keys.iter()
+            .map(|(o, i)| format!(
+                "eq({schema}.{inner_name}.{icol}, {schema}.{outer_name}.{ocol})",
+                schema = schema_prefix(current_db),
+                icol = i.name,
+                ocol = o.name
+            ))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // The decided range covers the join keys plus `col = const` bounds on the
+    // probed index; single-side non-equality filters stay a Selection.
+    let inner_bounds = inner_preds
+        .iter()
+        .filter(|e| matches!(e, ExprNode::Binary(b) if b.op == Op::Eq))
+        .map(|e| super::explain::explain_pushed_filter(&inner_name, e))
+        .collect::<Vec<_>>();
+    let range = if inner_bounds.is_empty() {
+        range
+    } else {
+        format!(
+            "{} {}]",
+            range.trim_end_matches(']'),
+            inner_bounds.join(" ")
+        )
+    };
+    let decided = range;
+    let partition_access = if inner_info.partition.as_ref().is_some_and(|p| p.enable) {
+        let planned = resolve_partitions(&inner_info, select.selection.as_ref(), &inner.partition_names, prune_mode);
+        if planned.all {
+            "all".to_string()
+        } else if planned.names.is_empty() {
+            "dual".to_string()
+        } else {
+            planned.names.join(",")
+        }
+    } else {
+        String::new()
+    };
+    let inner_plan = PhysicalPlan::TableReader {
+        table: inner_tbl,
+        partitions: Vec::new(),
+        partition_names: Vec::new(),
+        partition_access,
+        row_count: join_est,
+        stats_pseudo: false,
+        filter_est: None,
+        range_scan: None,
+        pushed: Some(bytes_info(&format!(
+            "RANGE_SEL|{}|{}",
+            sel_info.join(", "),
+            decided
+        ))),
+    };
+    let schema = schema_prefix(current_db);
+    let outer_keys = keys
+        .iter()
+        .map(|(o, _)| format!("{schema}.{outer_name}.{}", o.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner_keys = keys
+        .iter()
+        .map(|(_, i)| format!("{schema}.{inner_name}.{}", i.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // TiDB lists the hash-key conditions in reverse ON order.
+    let equal_cond = keys
+        .iter()
+        .rev()
+        .map(|(o, i)| {
+            format!(
+                "eq({schema}.{outer_name}.{ocol}, {schema}.{inner_name}.{icol})",
+                ocol = o.name,
+                icol = i.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(PhysicalPlan::IndexJoin {
+        info: format!(
+            "inner join, inner:TableReader, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
+        ),
+        est_rows: join_est,
+        outer: Box::new(outer_plan),
+        inner: Box::new(inner_plan),
+    })
+}
+
+/// `INL_JOIN(t)` / `TIDB_INLJ(t)` hint target alias, lowercased.
+fn inl_join_hint_alias(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for name in ["inl_join(", "tidb_inlj("] {
+        let mut rest = lower.as_str();
+        let mut base = 0usize;
+        while let Some(found) = rest.find(name) {
+            let start = base + found + name.len();
+            let tail = &lower[start..];
+            // `INL_MERGE_JOIN(` / `INL_HASH_JOIN(` must not match `INL_JOIN(`.
+            let before = &lower[..base + found];
+            let ok_prefix = !before.ends_with("inl_") && !before.ends_with("tidb_");
+            let target: String = tail
+                .chars()
+                .take_while(|c| !matches!(c, ')' | ',' | '@'))
+                .collect();
+            let target = target.trim().trim_matches('`').to_string();
+            if ok_prefix && !target.is_empty() && !target.contains(' ') {
+                return Some(target);
+            }
+            base = start;
+            rest = &lower[base..];
+        }
+    }
+    None
+}
+
+/// `col = '<literal>'` on a DATE/DATETIME/TIMESTAMP column: TiDB folds the
+/// constant to the column type before pushing it into the cop task
+/// (`eq(t.d, 2022-11-17 00:00:00.000000)`).
+fn coerce_eq_const(info: &sealdb_meta::TableInfo, expr: ExprNode) -> ExprNode {
+    let ExprNode::Binary(bin) = &expr else {
+        return expr;
+    };
+    if bin.op != Op::Eq {
+        return expr;
+    }
+    let (col, value, flipped) = match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(c), ExprNode::Value(v)) => (c, v, false),
+        (ExprNode::Value(v), ExprNode::Column(c)) => (c, v, true),
+        _ => return expr,
+    };
+    let Datum::Bytes(bytes) = &value.datum else {
+        return expr;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return expr;
+    };
+    let Some(column) = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+    else {
+        return expr;
+    };
+    use sealdb_types::field_type::{TYPE_DATE, TYPE_DATETIME, TYPE_TIMESTAMP};
+    if !matches!(
+        column.field_type.tp,
+        TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP
+    ) {
+        return expr;
+    }
+    let text = text.trim();
+    let parsed = sealdb_types::time::parse_timestamp_literal(text)
+        .or_else(|_| sealdb_types::time::parse_date_literal(text));
+    let Ok(mut time) = parsed else {
+        return expr;
+    };
+    // A string constant compared to a temporal column becomes a DatumTime,
+    // which TiDB always prints as a full datetime.
+    time.tp = sealdb_types::time::TimeType::Datetime;
+    time.fsp = 6;
+    let literal = ExprNode::Value(ValueExpr {
+        datum: Datum::Time(time),
+    });
+    let (left, right) = if flipped {
+        (literal, ExprNode::Column(col.clone()))
+    } else {
+        (ExprNode::Column(col.clone()), literal)
+    };
+    ExprNode::Binary(BinaryOpExpr {
+        op: Op::Eq,
+        left: Box::new(left),
+        right: Box::new(right),
+        single_cnf_item: bin.single_cnf_item,
+    })
+}
+
+/// True when `column` accepts NULL: neither declared NOT NULL nor part of the
+/// PRIMARY KEY (PK columns are implicitly NOT NULL).
+fn nullable_column(info: &sealdb_meta::TableInfo, column: &str) -> bool {
+    let in_pk = info.indices.iter().any(|idx| {
+        idx.primary
+            && idx
+                .columns
+                .iter()
+                .any(|c| c.name.o().eq_ignore_ascii_case(column))
+    });
+    if in_pk {
+        return false;
+    }
+    info.columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(column))
+        .is_some_and(|c| c.field_type.flag & 1 == 0)
 }
 
 fn index_join_suite_plan(

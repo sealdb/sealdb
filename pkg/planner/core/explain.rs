@@ -1544,6 +1544,20 @@ fn emit_cop_children(
             } else {
                 "keep order:false".to_string()
             };
+            // TiDB `stats:partial[…]`: columns analyzed after the last ANALYZE
+            // keep a pseudo selectivity and are listed on the scan.
+            let partial = partial_sel_pushed(pushed.as_ref());
+            let scan_info = match &partial {
+                Some((missing, _)) => {
+                    let cols = missing
+                        .split(',')
+                        .map(|c| format!("{}:missing", c.trim()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{scan_info}, stats:partial[{cols}]")
+                }
+                None => scan_info,
+            };
             let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
             let cop_spine = cop_owned.as_slice();
             // COP_PROJ_SEL: EXPLAIN-only cop Projection above the pushed Selection
@@ -1598,7 +1612,53 @@ fn emit_cop_children(
                 );
                 return true;
             }
+            // RANGE: `RANGE_SEL|<sel>|<decided by …>` → index/table range probed
+            // per outer row: a cop Selection above a decided range scan.
+            if let Some((sel, range_info)) = range_sel_pushed(pushed.as_ref()) {
+                let sel_est = keep_order_est(*row_count, &sel);
+                let mut keep = format!("range: {range_info}, keep order:false");
+                if *stats_pseudo {
+                    keep.push_str(", stats:pseudo");
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: sel_est,
+                        task: scan_task,
+                        access: String::new(),
+                        info: sel,
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy {
+                    scan_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRangeScan",
+                        est: sel_est,
+                        task: scan_task,
+                        access: scan_access,
+                        info: keep,
+                    },
+                    if under_bushy { &scan_spine } else { &[] },
+                );
+                return true;
+            }
             if let Some(filter) = pushed.as_ref() {
+                let sel_info = match &partial {
+                    Some((_, sel)) => sel.clone(),
+                    None => explain_pushed_filter(table, filter),
+                };
                 push_explain_row_spine(
                     rows,
                     scan_depth,
@@ -1609,7 +1669,7 @@ fn emit_cop_children(
                         est: est_rows(plan) * apply_factor.max(1.0),
                         task: scan_task,
                         access: String::new(),
-                        info: explain_pushed_filter(table, filter),
+                        info: sel_info,
                     },
                     if under_bushy { cop_spine } else { &[] },
                 );
@@ -2616,6 +2676,14 @@ fn range_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(St
     Some((sel.to_string(), range.to_string()))
 }
 
+/// `PARTIAL_SEL|<missing cols>|<sel info>`: TableReader whose pushed Selection
+/// references columns that postdate the last ANALYZE (TiDB `stats:partial[…]`).
+fn partial_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(String, String)> {
+    let rest = bytes_marker(pushed)?.strip_prefix("PARTIAL_SEL|")?;
+    let (missing, sel) = rest.split_once('|')?;
+    Some((missing.to_string(), sel.to_string()))
+}
+
 /// `TID_SEL|<tid>`: pinned GLOBAL index read filters cop rows by `_tidb_tid`.
 fn tid_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
     bytes_marker(pushed)?
@@ -2638,6 +2706,7 @@ fn keep_order_est(row_count: f64, sel_info: &str) -> f64 {
 fn marker_sel_info(filter: &sealdb_parser::ast::ExprNode) -> Option<String> {
     keep_order_sel_pushed(Some(filter))
         .or_else(|| range_sel_pushed(Some(filter)).map(|(sel, _)| sel))
+        .or_else(|| partial_sel_pushed(Some(filter)).map(|(_, sel)| sel))
 }
 
 /// TiDB prints `range:(3,+inf]` but `range: decided by [...]`.
