@@ -5,8 +5,77 @@ use super::partition::PartitionInfo;
 use sealdb_parser::model::CIStr;
 use sealdb_types::{EvalType, FieldType};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 
 pub const CURR_LATEST_TABLE_INFO_VERSION: u16 = 5;
+
+/// TiDB `tidb_enable_clustered_index` (default `ON`). Decides, at CREATE TABLE
+/// time, whether a PRIMARY KEY that names no `CLUSTERED` / `NONCLUSTERED`
+/// keyword becomes the row handle:
+/// * `ON` — every PRIMARY KEY is clustered (integer ones as `pk_is_handle`,
+///   composite / string ones as a common handle).
+/// * `INT_ONLY` — only single integer PRIMARY KEYs are clustered handles; other
+///   PRIMARY KEYs stay secondary unique indexes.
+/// * `OFF` — no PRIMARY KEY is clustered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClusteredIndexMode {
+    #[default]
+    On,
+    IntOnly,
+    Off,
+}
+
+impl ClusteredIndexMode {
+    /// TiDB `GetClusteredIndexMode`-style parse of the variable literal.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim_matches(|c| c == '\'' || c == '"').to_ascii_uppercase().as_str() {
+            "ON" | "1" | "TRUE" | "DEFAULT" => Some(Self::On),
+            "INT_ONLY" => Some(Self::IntOnly),
+            "OFF" | "0" | "FALSE" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "ON",
+            Self::IntOnly => "INT_ONLY",
+            Self::Off => "OFF",
+        }
+    }
+
+    /// Whether a single integer PRIMARY KEY becomes the integer row handle.
+    pub fn clusters_int_primary(self) -> bool {
+        matches!(self, Self::On | Self::IntOnly)
+    }
+
+    /// Whether a non-integer (composite / string) PRIMARY KEY becomes a common
+    /// handle.
+    pub fn clusters_common_primary(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+thread_local! {
+    /// DDL runs on the session thread; the session installs its
+    /// `tidb_enable_clustered_index` here for the duration of the statement so
+    /// `BuildTableInfo` need not thread session state through the DDL layer.
+    static CLUSTERED_INDEX_MODE: Cell<ClusteredIndexMode> =
+        const { Cell::new(ClusteredIndexMode::On) };
+}
+
+pub fn clustered_index_mode() -> ClusteredIndexMode {
+    CLUSTERED_INDEX_MODE.with(|mode| mode.get())
+}
+
+/// Runs `f` with `tidb_enable_clustered_index` overridden, restoring the
+/// previous value afterwards.
+pub fn with_clustered_index_mode<T>(mode: ClusteredIndexMode, f: impl FnOnce() -> T) -> T {
+    let previous = CLUSTERED_INDEX_MODE.with(|cell| cell.replace(mode));
+    let out = f();
+    CLUSTERED_INDEX_MODE.with(|cell| cell.set(previous));
+    out
+}
 
 /// TiDB `model.SequenceInfo`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +195,11 @@ pub struct TableInfo {
     pub indices: Vec<IndexInfo>,
     pub state: SchemaState,
     pub pk_is_handle: bool,
+    /// Clustered PRIMARY KEY that is not a single integer column: the handle is
+    /// the encoded PK prefix (TiDB `TableInfo.CommonHandle`). Secondary index
+    /// keys then carry the PK columns, so they cover them.
+    #[serde(default)]
+    pub common_handle: bool,
     #[serde(default)]
     pub version: u16,
     #[serde(default)]
@@ -163,6 +237,7 @@ impl TableInfo {
             indices: Vec::new(),
             state: STATE_PUBLIC,
             pk_is_handle: false,
+            common_handle: false,
             version: CURR_LATEST_TABLE_INFO_VERSION,
             max_col_id,
             max_idx_id: 0,
@@ -171,6 +246,24 @@ impl TableInfo {
             view: None,
             sequence: None,
         }
+    }
+
+    /// Clustered PRIMARY KEY: integer handle or common handle.
+    pub fn pk_is_clustered(&self) -> bool {
+        self.pk_is_handle || self.common_handle
+    }
+
+    /// Leading column of a clustered PRIMARY KEY (the seek prefix of a
+    /// `TableRangeScan` on a common handle).
+    pub fn clustered_prefix_column(&self) -> Option<&ColumnInfo> {
+        if !self.pk_is_clustered() {
+            return None;
+        }
+        let pk = self.indices.iter().find(|idx| idx.primary)?;
+        let first = pk.columns.first()?;
+        self.columns
+            .iter()
+            .find(|col| col.name.l() == first.name.l())
     }
 
     pub fn is_view(&self) -> bool {
@@ -248,6 +341,19 @@ impl TableInfo {
                 .any(|name| name.eq_ignore_ascii_case(handle_name))
             {
                 names.push(handle_name.to_string());
+            }
+        }
+        // A common handle is encoded into every secondary index key, so the PK
+        // columns are covered (`KEY idx_9(col_11)` covers `col_14` when the
+        // clustered PK starts with `col_14`).
+        if self.common_handle
+            && let Some(pk) = self.indices.iter().find(|idx| idx.primary)
+        {
+            for col in &pk.columns {
+                let name = col.name.o();
+                if !names.iter().any(|have| have.eq_ignore_ascii_case(&name)) {
+                    names.push(name.to_string());
+                }
             }
         }
         names

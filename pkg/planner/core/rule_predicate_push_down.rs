@@ -57,7 +57,7 @@ fn push_into(
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
-            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let table_info = statement_table_info(is, current_db, &table);
             let pushable: Vec<_> = pushable
                 .into_iter()
                 .filter(|expr| {
@@ -123,7 +123,7 @@ fn push_into(
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
-            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let table_info = statement_table_info(is, current_db, &table);
             let pushable: Vec<_> = pushable
                 .into_iter()
                 .filter(|expr| {
@@ -153,6 +153,7 @@ fn push_into(
                     index_info,
                     &pushable,
                     row_count,
+                    super::planbuilder::statement_stats(&table).as_ref(),
                 )
             {
                 pushable.retain(|expr| {
@@ -242,7 +243,7 @@ fn push_into(
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
-            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let table_info = statement_table_info(is, current_db, &table);
             let pushable: Vec<_> = pushable
                 .into_iter()
                 .filter(|expr| {
@@ -266,8 +267,14 @@ fn push_into(
                     .iter()
                     .find(|idx| idx.name.o().eq_ignore_ascii_case(&index));
                 if let Some(index_info) = index_info
-                    && let Some(access) =
-                        super::access_range::index_access_range(info, index_info, &pushable, row_count)
+                    && let Some(access) = super::access_range::index_access_range(
+                        info,
+                        index_info,
+                        &pushable,
+                        row_count,
+                        super::planbuilder::statement_stats(&table)
+                        .as_ref(),
+                    )
                 {
                     pushable.retain(|expr| {
                         !access
@@ -312,7 +319,7 @@ fn push_into(
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
-            let table_info = is.and_then(|is| is.table_by_name(current_db, &table));
+            let table_info = statement_table_info(is, current_db, &table);
             let pushable: Vec<_> = pushable
                 .into_iter()
                 .filter(|expr| {
@@ -344,7 +351,7 @@ fn push_into(
             // handle point get (`a = 1 AND b = 1` keeps `b = 1` as a filter).
             let handle_column = (handle.is_some() && index.is_none())
                 .then(|| {
-                    is.and_then(|is| is.table_by_name(current_db, &table))
+                    statement_table_info(is, current_db, &table)
                         .and_then(|info| info.handle_column())
                         .map(|c| c.name.o().to_string())
                 })
@@ -472,6 +479,7 @@ fn push_into(
             child: Box::new(push_into(*child, conjuncts, is, current_db)),
         },
         PhysicalPlan::HashJoin {
+            est_rows: _,
             tp,
             left,
             right,
@@ -563,6 +571,7 @@ fn push_into(
             }
             wrap_residual(
                 PhysicalPlan::HashJoin {
+                    est_rows: None,
                     tp,
                     left: Box::new(push_into(*left, left_preds, is, current_db)),
                     right: Box::new(push_into(*right, right_preds, is, current_db)),
@@ -622,6 +631,19 @@ fn push_into(
     }
 }
 
+/// Resolve the table metadata of a plan's scan node. A statement may join
+/// tables from another database (`FROM other_db.t`), and the scan node only
+/// keeps the bare table name, so the database comes from the statement scope.
+fn statement_table_info<'a>(
+    is: Option<&'a InfoSchema>,
+    current_db: &str,
+    table: &str,
+) -> Option<&'a sealdb_meta::model::table::TableInfo> {
+    let is = is?;
+    let db = super::planbuilder::statement_table_db(table).unwrap_or_else(|| current_db.to_string());
+    is.table_by_name(&db, table)
+}
+
 fn pk_eq_handle(
     is: Option<&InfoSchema>,
     current_db: &str,
@@ -632,7 +654,7 @@ fn pk_eq_handle(
         return None;
     }
     let (col, value) = conjuncts[0].eq_column_const()?;
-    let info = is?.table_by_name(current_db, table)?;
+    let info = statement_table_info(is, current_db, table)?;
     if !info.pk_is_handle {
         return None;
     }
@@ -950,7 +972,7 @@ fn table_columns(is: Option<&InfoSchema>, current_db: &str, table: &str) -> Vec<
     let Some(is) = is else {
         return Vec::new();
     };
-    is.table_by_name(current_db, table)
+    statement_table_info(Some(is), current_db, table)
         .or_else(|| {
             is.all_schemas()
                 .into_iter()

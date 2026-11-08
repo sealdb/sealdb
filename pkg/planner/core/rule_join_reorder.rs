@@ -19,6 +19,7 @@ pub fn reorder_hash_join(
 ) -> PhysicalPlan {
     if !matches!(tp, JoinType::Inner | JoinType::Cross) {
         return PhysicalPlan::HashJoin {
+            est_rows: None,
             tp,
             left: Box::new(left),
             right: Box::new(right),
@@ -42,6 +43,7 @@ pub fn reorder_hash_join(
     };
     if swap {
         PhysicalPlan::HashJoin {
+            est_rows: None,
             tp,
             left: Box::new(right),
             right: Box::new(left),
@@ -51,6 +53,7 @@ pub fn reorder_hash_join(
         }
     } else {
         PhysicalPlan::HashJoin {
+            est_rows: None,
             tp,
             left: Box::new(left),
             right: Box::new(right),

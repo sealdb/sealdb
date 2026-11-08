@@ -221,6 +221,32 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
 thread_local! {
     /// Set while rendering a plan with a pinned GLOBAL index read.
     static PINNED_PARTITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Cop `Projection` pushed above a reader's cop subtree. Set from the
+    /// marker projection the planner emits for `SELECT c … WHERE other`.
+    static COP_PROJECTION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `COP_PROJ|<exprs>` marker on a top-level projection that TiDB pushes into
+/// the cop task (`data:Projection` / `index:Projection`).
+fn cop_projection_marker(plan: &PhysicalPlan) -> Option<&str> {
+    let PhysicalPlan::Projection { exprs, child, .. } = plan else {
+        return None;
+    };
+    if !matches!(
+        child.as_ref(),
+        PhysicalPlan::TableReader { .. } | PhysicalPlan::IndexReader { .. }
+    ) {
+        return None;
+    }
+    exprs
+        .iter()
+        .find_map(|e| e.strip_prefix("COP_PROJ|"))
+}
+
+/// Active cop projection text, consumed by the reader currently being emitted.
+fn cop_projection_pending() -> Option<String> {
+    COP_PROJECTION.with(|c| c.borrow().clone())
 }
 
 /// True when the plan pins a GLOBAL index reader to named partitions.
@@ -336,6 +362,26 @@ fn walk_with_parent(
     // Keep remapping projections (`Column#5->Column#6`) used after StreamAgg+ORDER BY.
     // Also elide CTE seed column-name projections (`SELECT c1`) so MergeJoin
     // Build/Probe labels land on the TableReader.
+    // Cop Projection: TiDB keeps it inside the reader (`data:Projection`), above
+    // the reader's cop subtree, so emit the reader with the projection row.
+    if let (Some(list), PhysicalPlan::Projection { child, .. }) = (cop_projection_marker(plan), plan) {
+        let list = list.to_string();
+        COP_PROJECTION.with(|c| *c.borrow_mut() = Some(list));
+        let rendered = walk_with_parent(
+            child,
+            parent,
+            depth,
+            last,
+            next_id,
+            rows,
+            under_order_projection,
+            spine,
+            deferred,
+            apply_factor,
+        );
+        COP_PROJECTION.with(|c| *c.borrow_mut() = None);
+        return rendered;
+    }
     if let PhysicalPlan::Projection { exprs, child, .. } = plan {
         let trivial = exprs.iter().all(|e| {
             e.starts_with("col") && !e.contains("->") && !e.contains("Column#")
@@ -433,114 +479,38 @@ fn walk_with_parent(
         Some(PhysicalPlan::HashJoin {
             left, right, tp, ..
         }) => {
-            let left_p = explain_plan_ptr(left);
-            let right_p = explain_plan_ptr(right);
-            let self_p = explain_plan_ptr(plan);
-            let build = if matches!(tp, JoinType::RightOuter) {
-                left_p
+            // Build is the hashed (smaller) input; a RIGHT JOIN picks it by
+            // cardinality exactly like `children_of` above.
+            let right_outer = matches!(tp, JoinType::RightOuter);
+            let right_smaller = !right_outer || est_rows(right) < est_rows(left);
+            let (build, probe) = if right_smaller {
+                (explain_plan_ptr(right), explain_plan_ptr(left))
             } else {
-                right_p
+                (explain_plan_ptr(left), explain_plan_ptr(right))
             };
-            let probe = if matches!(tp, JoinType::RightOuter) {
-                right_p
-            } else {
-                left_p
-            };
-            if self_p == build
-                && matches!(
-                    name.as_str(),
-                    "HashJoin"
-                        | "TableReader"
-                        | "StreamAgg"
-                        | "Projection"
-                        | "Selection"
-                        | "IndexReader"
-                        | "IndexLookUp"
-                        | "Limit"
-                        | "UnionScan"
-                        | "IndexJoin"
-                        | "Sort"
-                        | "CTE"
-                        | "Point_Get"
-                        | "PointGet"
-                )
-            {
-                "(Build)"
-            } else if self_p == probe
-                && matches!(
-                    name.as_str(),
-                    "HashJoin"
-                        | "TableReader"
-                        | "Projection"
-                        | "Selection"
-                        | "IndexReader"
-                        | "IndexLookUp"
-                        | "Limit"
-                        | "UnionScan"
-                        | "IndexJoin"
-                        | "Sort"
-                        | "CTE"
-                        | "Point_Get"
-                        | "PointGet"
-                )
-            {
-                "(Probe)"
-            } else {
-                ""
-            }
+            join_role_label(name.as_str(), explain_plan_ptr(plan), build, probe)
         }
-        Some(PhysicalPlan::MergeJoin { left, right, .. })
-        | Some(PhysicalPlan::NullAwareAntiJoin {
+        // MergeJoin hashes its left input, so a RIGHT JOIN — which lists
+        // Build (left) before Probe (right) — labels left as Build.
+        Some(PhysicalPlan::MergeJoin { left, right, tp, .. }) => {
+            let (build, probe) = if matches!(tp, JoinType::RightOuter) {
+                (explain_plan_ptr(left), explain_plan_ptr(right))
+            } else {
+                (explain_plan_ptr(right), explain_plan_ptr(left))
+            };
+            join_role_label(name.as_str(), explain_plan_ptr(plan), build, probe)
+        }
+        // Null-aware anti join: Build (right) then Probe (left), like HashJoin.
+        Some(PhysicalPlan::NullAwareAntiJoin {
             probe: left,
             build: right,
             ..
-        }) => {
-            let left_p = explain_plan_ptr(left);
-            let right_p = explain_plan_ptr(right);
-            let self_p = explain_plan_ptr(plan);
-            if self_p == right_p
-                && matches!(
-                    name.as_str(),
-                    "HashJoin"
-                        | "TableReader"
-                        | "StreamAgg"
-                        | "Projection"
-                        | "Selection"
-                        | "IndexReader"
-                        | "IndexLookUp"
-                        | "Limit"
-                        | "UnionScan"
-                        | "IndexJoin"
-                        | "Sort"
-                        | "CTE"
-                        | "Point_Get"
-                        | "PointGet"
-                )
-            {
-                "(Build)"
-            } else if self_p == left_p
-                && matches!(
-                    name.as_str(),
-                    "HashJoin"
-                        | "TableReader"
-                        | "Projection"
-                        | "Selection"
-                        | "IndexReader"
-                        | "IndexLookUp"
-                        | "Limit"
-                        | "UnionScan"
-                        | "IndexJoin"
-                        | "Sort"
-                        | "CTE"
-                        | "Point_Get"
-                        | "PointGet"
-                )
-            {
-                "(Probe)"
-            } else {
-                ""
-            }
-        }
+        }) => join_role_label(
+            name.as_str(),
+            explain_plan_ptr(plan),
+            explain_plan_ptr(right),
+            explain_plan_ptr(left),
+        ),
         Some(PhysicalPlan::Apply {
             child, probe: Some(probe), ..
         })
@@ -1392,6 +1362,46 @@ fn emit_cop_children(
     apply_factor: f64,
 ) -> bool {
     let under_stream_agg = stream_parent.is_some();
+    // Cop projection pushed above a reader's cop subtree: TiDB prints it as the
+    // reader's cop child, with the scan/selection one level deeper.
+    if matches!(
+        plan,
+        PhysicalPlan::TableReader { .. } | PhysicalPlan::IndexReader { .. }
+    ) && let Some(list) = cop_projection_pending()
+    {
+        let cop_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
+        push_explain_row_spine(
+            rows,
+            depth,
+            true,
+            next_id,
+            CopRow {
+                name: "Projection",
+                est: est_rows(plan) * apply_factor.max(1.0),
+                task: "cop[tikv]",
+                access: String::new(),
+                info: list,
+            },
+            if under_bushy { cop_owned.as_slice() } else { &[] },
+        );
+        COP_PROJECTION.with(|c| *c.borrow_mut() = None);
+        return emit_cop_children(
+            plan,
+            topn_parent,
+            stream_parent,
+            under_bushy,
+            under_merge_join,
+            under_index_join,
+            under_window,
+            window_keep_order,
+            depth + 1,
+            next_id,
+            rows,
+            spine,
+            _parent_last,
+            apply_factor,
+        );
+    }
     match plan {
         PhysicalPlan::TableReader {
             table,
@@ -2863,7 +2873,7 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
                     let col = match i.expr.as_ref() {
                         ExprNode::Column(c) => {
                             let table = c.table.as_deref().unwrap_or(table);
-                            let schema = sealdb_expression::current_db_name();
+                            let schema = column_schema(c, table);
                             if schema.is_empty() {
                                 format!("select.{table}.{}", c.name)
                             } else {
@@ -2892,12 +2902,24 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
     parts.join(", ")
 }
 
+/// Schema for a column reference: the column's recorded schema, else the
+/// schema of its table in the statement being built, else the session schema.
+fn column_schema(
+    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    table: &str,
+) -> String {
+    col.schema
+        .clone()
+        .or_else(|| crate::core::planbuilder::explain_table_schema(table))
+        .unwrap_or_else(sealdb_expression::current_db_name)
+}
+
 /// `{db}.{table}.{col}` for a bare column; other expressions keep their text.
 fn explain_qualified_col(expr: &sealdb_parser::ast::ExprNode) -> String {
     match expr {
         sealdb_parser::ast::ExprNode::Column(c) => {
             let table = c.table.as_deref().unwrap_or("t");
-            let schema = sealdb_expression::current_db_name();
+            let schema = column_schema(c, table);
             if schema.is_empty() {
                 format!("select.{table}.{}", c.name)
             } else {
@@ -3034,9 +3056,9 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 c.name.clone()
             } else {
                 let tbl = c.table.as_deref().unwrap_or(table);
-                // Prefer session DB schema (suite name) when set — TiDB
-                // `agg_predicate_pushdown.t.a` vs default `select.t.a`.
-                let schema = sealdb_expression::current_db_name();
+                // TiDB `Column.ExplainInfo` uses the column's own schema
+                // (`other_db.t.a`), falling back to the session schema.
+                let schema = column_schema(c, tbl);
                 if schema.is_empty() {
                     format!("select.{tbl}.{}", c.name)
                 } else {
@@ -3047,7 +3069,13 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
         ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".into(),
         ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
         ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
-        ExprNode::Value(ValueExpr { datum: Datum::Time(t) }) => t.to_string(),
+        ExprNode::Value(ValueExpr { datum: Datum::Time(t) }) => {
+            // TiDB `Constant.ExplainInfo` prints temporal values with the
+            // full microsecond fraction (`2013-11-01 00:00:00.000000`).
+            let mut t = t.clone();
+            t.fsp = 6;
+            t.to_string()
+        }
         ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(b),
         }) => format!(
@@ -3418,6 +3446,57 @@ fn explain_plan_ptr(plan: &PhysicalPlan) -> *const PhysicalPlan {
     }
 }
 
+/// `(Build)` / `(Probe)` suffix for a join's direct child.
+fn join_role_label(
+    name: &str,
+    self_p: *const PhysicalPlan,
+    build: *const PhysicalPlan,
+    probe: *const PhysicalPlan,
+) -> &'static str {
+    if self_p == build
+        && matches!(
+            name,
+            "HashJoin"
+                | "TableReader"
+                | "StreamAgg"
+                | "Projection"
+                | "Selection"
+                | "IndexReader"
+                | "IndexLookUp"
+                | "Limit"
+                | "UnionScan"
+                | "IndexJoin"
+                | "Sort"
+                | "CTE"
+                | "Point_Get"
+                | "PointGet"
+        )
+    {
+        "(Build)"
+    } else if self_p == probe
+        && matches!(
+            name,
+            "HashJoin"
+                | "TableReader"
+                | "Projection"
+                | "Selection"
+                | "IndexReader"
+                | "IndexLookUp"
+                | "Limit"
+                | "UnionScan"
+                | "IndexJoin"
+                | "Sort"
+                | "CTE"
+                | "Point_Get"
+                | "PointGet"
+        )
+    {
+        "(Probe)"
+    } else {
+        ""
+    }
+}
+
 fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
     match plan {
         PhysicalPlan::Projection { child, .. }
@@ -3447,18 +3526,30 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
             ..
         } => vec![child.as_ref(), probe.as_ref()],
         PhysicalPlan::Apply { child, .. } => vec![child.as_ref()],
-        // TiDB HashJoin / MergeJoin lists Build (right) before Probe (left);
-        // for a RIGHT JOIN the executor builds the left (null-supplying) side.
-        PhysicalPlan::HashJoin {
+        // TiDB HashJoin lists Build before Probe. Inner joins build the right
+        // (smaller, reordered) side; a RIGHT JOIN builds whichever input is
+        // smaller — the preserved 2244-row side over a 4509-row probe, or a
+        // 2-row build subtree over a 4-row preserved side.
+        PhysicalPlan::HashJoin { left, right, tp, .. } => {
+            if matches!(tp, JoinType::RightOuter) {
+                if est_rows(right) < est_rows(left) {
+                    vec![right.as_ref(), left.as_ref()]
+                } else {
+                    vec![left.as_ref(), right.as_ref()]
+                }
+            } else {
+                vec![right.as_ref(), left.as_ref()]
+            }
+        }
+        // MergeJoin hashes the left side and keeps the preserved side as Probe,
+        // so a RIGHT JOIN lists Build (left) before Probe (right).
+        PhysicalPlan::MergeJoin {
             left,
             right,
             tp: JoinType::RightOuter,
             ..
         } => vec![left.as_ref(), right.as_ref()],
-        PhysicalPlan::HashJoin { left, right, .. }
-        | PhysicalPlan::MergeJoin { left, right, .. } => {
-            vec![right.as_ref(), left.as_ref()]
-        }
+        PhysicalPlan::MergeJoin { left, right, .. } => vec![right.as_ref(), left.as_ref()],
         // IndexJoin lists outer (Build) then inner (Probe).
         PhysicalPlan::IndexJoin { outer, inner, .. } => {
             vec![outer.as_ref(), inner.as_ref()]
@@ -3518,6 +3609,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             },
             if *data_limit {
                 "data:Limit".to_string()
+            } else if cop_projection_pending().is_some() {
+                "data:Projection".to_string()
             } else if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
             } else if cop_proj_sel_pushed(pushed.as_ref()).is_some() {
@@ -3636,7 +3729,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if keep_order_sel_pushed(pushed.as_ref()).is_some() {
+            if cop_projection_pending().is_some() {
+                "index:Projection".to_string()
+            } else if keep_order_sel_pushed(pushed.as_ref()).is_some() {
                 "index:Selection".to_string()
             } else if keep_order_pushed(pushed.as_ref()) {
                 "index:IndexFullScan".to_string()
@@ -4297,6 +4392,15 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             }
         }
         PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
+        // Planner-computed join cardinality from the key NDVs.
+        PhysicalPlan::HashJoin {
+            est_rows: Some(est),
+            ..
+        }
+        | PhysicalPlan::MergeJoin {
+            est_rows: Some(est),
+            ..
+        } => *est,
         PhysicalPlan::MergeJoin { left, right, tp, .. } => {
             // Recursive CTEFullScan side dominates (TiDB MergeJoin est = 8001).
             let cte_side = [left.as_ref(), right.as_ref()].into_iter().find_map(|p| {
@@ -4687,7 +4791,7 @@ fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> St
     // OrigTblName: alias of physical `t` stays `<db>.t.a`; real tables use
     // their name (`<db>.t1.a`), where `<db>` is the suite schema.
     let table = col.table.as_deref().unwrap_or("t");
-    let schema = sealdb_expression::current_db_name();
+    let schema = column_schema(col, table);
     if schema.is_empty() {
         format!("select.{table}.{}", col.name)
     } else {

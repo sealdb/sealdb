@@ -112,6 +112,7 @@ pub fn rewrite_semi_join_ctx(
             child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
         },
         PhysicalPlan::HashJoin {
+            est_rows,
             tp,
             left,
             right,
@@ -119,6 +120,7 @@ pub fn rewrite_semi_join_ctx(
             right_table,
             on,
         } => PhysicalPlan::HashJoin {
+            est_rows,
             tp,
             left: Box::new(rewrite_semi_join_ctx(*left, is, current_db)),
             right: Box::new(rewrite_semi_join_ctx(*right, is, current_db)),
@@ -219,6 +221,7 @@ fn rewrite_apply(
                     plan = push_isnull_filter(plan, outer_filter);
                 }
                 plan = PhysicalPlan::HashJoin {
+                    est_rows: None,
                     tp: spec.tp,
                     left: Box::new(plan),
                     right: Box::new(spec.right),
@@ -1374,6 +1377,7 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
 pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::HashJoin {
+            est_rows,
             tp,
             left,
             right,
@@ -1389,6 +1393,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
                 && let Some(key) = join_key_on_table(&on, &right_table)
             {
                 PhysicalPlan::HashJoin {
+                    est_rows,
                     tp,
                     left: Box::new(left),
                     right: Box::new(PhysicalPlan::Distinct {
@@ -1403,6 +1408,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
                 }
             } else {
                 PhysicalPlan::HashJoin {
+                    est_rows,
                     tp,
                     left: Box::new(left),
                     right: Box::new(right),

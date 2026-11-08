@@ -55,18 +55,24 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
         }
         let idx_id = (offset as i64) + 1;
-        // Single integer PRIMARY KEY → clustered int handle (TiDB pk_is_handle).
-        // `NONCLUSTERED` keeps a secondary PRIMARY index; BIT is not a handle.
-        if index.primary
-            && !index.nonclustered
-            && idx_cols.len() == 1
-            && info.columns.iter().any(|c| {
-                c.offset == idx_cols[0].offset
-                    && c.field_type.eval_type() == sealdb_types::field_type::EvalType::Int
-                    && c.field_type.tp != TYPE_BIT
-            })
-        {
-            info.pk_is_handle = true;
+        // PRIMARY KEY handle choice follows `tidb_enable_clustered_index`
+        // (TiDB `BuildTableInfo`): an explicit `CLUSTERED` / `NONCLUSTERED`
+        // wins, otherwise the mode decides. A single integer key becomes the
+        // integer row handle (`pk_is_handle`) when the mode allows; any other
+        // key becomes a common handle only in `ON` mode. BIT is not a handle.
+        if index.primary && !index.nonclustered {
+            let single_int = idx_cols.len() == 1
+                && info.columns.iter().any(|c| {
+                    c.offset == idx_cols[0].offset
+                        && c.field_type.eval_type() == sealdb_types::field_type::EvalType::Int
+                        && c.field_type.tp != TYPE_BIT
+                });
+            let mode = sealdb_meta::clustered_index_mode();
+            if single_int && (index.clustered || mode.clusters_int_primary()) {
+                info.pk_is_handle = true;
+            } else if index.clustered || mode.clusters_common_primary() {
+                info.common_handle = true;
+            }
         }
         let pk_col_offsets: Vec<i32> = if index.primary {
             idx_cols.iter().map(|ic| ic.offset).collect()

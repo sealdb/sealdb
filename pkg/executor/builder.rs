@@ -717,6 +717,7 @@ impl ExecutorBuilder {
                 right,
                 left_table,
                 right_table,
+                est_rows: _,
                 on,
             } => Self::build_hash_join(
                 *tp,

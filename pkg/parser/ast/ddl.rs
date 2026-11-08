@@ -197,6 +197,9 @@ pub struct IndexDef {
     pub global: bool,
     /// TiDB `PRIMARY KEY (...) NONCLUSTERED`: the PK is a secondary index.
     pub nonclustered: bool,
+    /// TiDB `PRIMARY KEY (...) CLUSTERED`: the PK is the row handle even when
+    /// `tidb_enable_clustered_index` would otherwise keep it secondary.
+    pub clustered: bool,
 }
 
 impl IndexDef {

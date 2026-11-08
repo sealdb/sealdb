@@ -8,7 +8,7 @@
 //! to the cardinality estimate.
 use super::physical_plans::IndexScanRange;
 use sealdb_meta::{IndexInfo, TableInfo};
-use sealdb_parser::ast::expressions::{ColumnRange, ExprNode};
+use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_statistics::pseudo;
 
 pub struct IndexAccessRange {
@@ -18,12 +18,16 @@ pub struct IndexAccessRange {
     pub consumed: Vec<ExprNode>,
 }
 
+/// Statistics snapshot of a table, as TIckDB's DataSource carries it.
+pub type TableStats = sealdb_statistics::table::Table;
+
 /// Build the leading-column access range of `index` from `conjuncts`.
 pub fn index_access_range(
     info: &TableInfo,
     index: &IndexInfo,
     conjuncts: &[ExprNode],
     table_rows: f64,
+    table_stats: Option<&TableStats>,
 ) -> Option<IndexAccessRange> {
     let leading = index.columns.first()?;
     let column = leading.name.o();
@@ -36,59 +40,144 @@ pub fn index_access_range(
     if column_info.field_type.tp == sealdb_types::TYPE_TIMESTAMP {
         return None;
     }
-    let mut bounds: pseudo::Bounds = (None, None);
+    let mut ranges: Vec<pseudo::Bounds> = Vec::new();
     let mut consumed = Vec::new();
     for conjunct in conjuncts {
-        let Some((name, range)) = pseudo::conjunct_column_range(conjunct) else {
+        let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) else {
             continue;
         };
         if !name.eq_ignore_ascii_case(&column) {
             continue;
         }
+        // Ranger converts each bound to the index column's type before building
+        // the key (`a < 5429` on a DECIMAL column seeks with a decimal key).
+        let bounds: Vec<pseudo::Bounds> = bounds
+            .into_iter()
+            .map(|(low, high)| {
+                (
+                    coerce_bound(&column_info.field_type, low),
+                    coerce_bound(&column_info.field_type, high),
+                )
+            })
+            .collect();
         // Ranger converts each bound to the column charset; a binary literal
         // that is not valid UTF-8 must surface the conversion error from the
         // cop Selection instead of being seeked as raw bytes.
-        if !bound_fits_column(&column_info.field_type, &range) {
+        if !bounds
+            .iter()
+            .all(|(low, high)| bounds_fit_column(&column_info.field_type, low, high))
+        {
             return None;
         }
-        merge_range(&mut bounds, &range);
+        // A `<>` conjunct splits into two disjoint ranges; an intersection with
+        // an existing range set keeps the empty result (TiDB drops the scan).
+        if ranges.is_empty() {
+            ranges = bounds;
+        } else {
+            pseudo::intersect_sets(&mut ranges, &bounds);
+            if ranges.is_empty() {
+                return None;
+            }
+        }
         consumed.push(conjunct.clone());
     }
-    if bounds.0.is_none() && bounds.1.is_none() {
+    if ranges.is_empty() {
         return None;
     }
     // `PrefixEqualLen`: the leading column is pinned only by `col = const`
     // bounds, which ranger folds to an inclusive point range.
-    let pinned = matches!(
-        (&bounds.0, &bounds.1),
-        (Some((low, true)), Some((high, true))) if low.compare(high) == std::cmp::Ordering::Equal
-    );
-    let rows = pseudo::index_range_rows(
+    let pinned = ranges.len() == 1
+        && matches!(
+            (&ranges[0].0, &ranges[0].1),
+            (Some((low, true)), Some((high, true))) if low.compare(high) == std::cmp::Ordering::Equal
+        );
+    let rows = pseudo::index_ranges_rows(
         table_rows,
-        bounds.0.as_ref(),
-        bounds.1.as_ref(),
+        &ranges,
         index.columns.len(),
         usize::from(pinned),
         index.unique,
     );
+    // TiDB sizes the scan from the index statistics (`IndexStats.lessRowCount`
+    // on the encoded keys); `stats:pseudo` disappears once the histogram exists.
+    let stat_ranges: Vec<sealdb_statistics::range_est::StatsRange> = ranges
+        .iter()
+        .map(|(low, high)| sealdb_statistics::range_est::StatsRange {
+            low: low.clone(),
+            high: high.clone(),
+        })
+        .collect();
+    let (rows, pseudo_scan) = match table_stats.and_then(|stats| {
+        stats
+            .index_range_estimate(index.name.o(), &column_info.field_type, &stat_ranges)
+            .map(|rows| rows.max(0.0))
+    }) {
+        Some(rows) => (rows, false),
+        None => (rows, true),
+    };
+    // Residual conjuncts (columns beyond the leading one) keep TiDB's
+    // per-column selectivity on top of the range cardinality.
+    let residual: Vec<ExprNode> = conjuncts
+        .iter()
+        .filter(|conjunct| {
+            !consumed
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
+        })
+        .cloned()
+        .collect();
+    let filter_rows = if residual.is_empty() {
+        rows
+    } else {
+        pseudo::filter_rows(&residual, rows)
+    };
     Some(IndexAccessRange {
         range: IndexScanRange {
-            text: pseudo::range_text(bounds.0.as_ref(), bounds.1.as_ref()),
+            text: pseudo::ranges_text(&ranges),
             rows,
-            filter_rows: pseudo::filter_rows(conjuncts, table_rows),
-            pseudo: true,
+            filter_rows,
+            pseudo: pseudo_scan,
         },
         consumed,
     })
 }
 
-/// Intersect one conjunct's bounds into the accumulated leading-column range.
-fn merge_range(target: &mut pseudo::Bounds, range: &ColumnRange) {
-    pseudo::merge_bounds(target, &(range.low.clone(), range.high.clone()));
+/// Convert one range bound to the index column's type (TiDB `ranger` keeps a
+/// typed key so the encoded bound can be compared with the histogram's keys).
+fn coerce_bound(
+    field_type: &sealdb_types::FieldType,
+    bound: Option<(sealdb_types::Datum, bool)>,
+) -> Option<(sealdb_types::Datum, bool)> {
+    let (value, inclusive) = bound?;
+    let value = match field_type.tp {
+        sealdb_types::TYPE_DECIMAL | sealdb_types::TYPE_NEW_DECIMAL => match &value {
+            sealdb_types::Datum::Decimal(_) => value,
+            sealdb_types::Datum::I64(v) => {
+                sealdb_types::Datum::Decimal(sealdb_types::MyDecimal::from_i64(*v))
+            }
+            sealdb_types::Datum::U64(v) => {
+                sealdb_types::Datum::Decimal(sealdb_types::MyDecimal::parse(&v.to_string()).ok()?)
+            }
+            sealdb_types::Datum::F64(v) => {
+                sealdb_types::Datum::Decimal(sealdb_types::MyDecimal::parse(&format!("{v}")).ok()?)
+            }
+            sealdb_types::Datum::Bytes(b) | sealdb_types::Datum::Bit(b) => sealdb_types::Datum::Decimal(
+                sealdb_types::MyDecimal::parse(std::str::from_utf8(b).ok()?.trim()).ok()?,
+            ),
+            // NULL bound on a NOT NULL column: keep the datum as-is.
+            _ => value,
+        },
+        _ => value,
+    };
+    Some((value, inclusive))
 }
 
 /// Can both bounds be converted to `field_type` like TiDB `ranger` does?
-fn bound_fits_column(field_type: &sealdb_types::FieldType, range: &ColumnRange) -> bool {
+fn bounds_fit_column(
+    field_type: &sealdb_types::FieldType,
+    low: &Option<(sealdb_types::Datum, bool)>,
+    high: &Option<(sealdb_types::Datum, bool)>,
+) -> bool {
     let fits = |bound: &Option<(sealdb_types::Datum, bool)>| match bound {
         // Binary values: string literals, and hex/bit literals (which arrive as
         // `Datum::Bit`) — both need a charset conversion to the column.
@@ -97,7 +186,7 @@ fn bound_fits_column(field_type: &sealdb_types::FieldType, range: &ColumnRange) 
         }
         _ => true,
     };
-    fits(&range.low) && fits(&range.high)
+    fits(low) && fits(high)
 }
 
 #[cfg(test)]
@@ -151,7 +240,7 @@ mod tests {
         let (info, index) =
             table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
         let access =
-            index_access_range(&info, &index, &selection("a < 3"), 10_000.0).expect("range");
+            index_access_range(&info, &index, &selection("a < 3"), 10_000.0, None).expect("range");
         assert_eq!(access.range.text, "[-inf,3)");
         assert!((access.range.rows - (10_000.0 / 3.0 - 10.0)).abs() < 1e-6);
         assert_eq!(access.consumed.len(), 1);
@@ -165,7 +254,7 @@ mod tests {
             false,
         );
         let access =
-            index_access_range(&info, &index, &selection("a < 3 and b < 3"), 10_000.0)
+            index_access_range(&info, &index, &selection("a < 3 and b < 3"), 10_000.0, None)
                 .expect("range");
         assert_eq!(access.range.text, "[-inf,3)");
         assert_eq!(access.consumed.len(), 1);
@@ -176,6 +265,6 @@ mod tests {
     fn test_unrelated_column_has_no_range() {
         let (info, index) =
             table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
-        assert!(index_access_range(&info, &index, &selection("b < 3"), 10_000.0).is_none());
+        assert!(index_access_range(&info, &index, &selection("b < 3"), 10_000.0, None).is_none());
     }
 }

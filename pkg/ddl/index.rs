@@ -36,6 +36,7 @@ pub fn create_index(
             primary: false,
             global: false,
             nonclustered: false,
+            clustered: false,
         },
         stmt.if_not_exists,
         current_db,

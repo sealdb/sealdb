@@ -2192,6 +2192,7 @@ dependencies = [
  "sealdb-expression",
  "sealdb-infoschema",
  "sealdb-kv",
+ "sealdb-meta",
  "sealdb-parser",
  "sealdb-planner",
  "sealdb-privilege",

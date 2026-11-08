@@ -252,6 +252,10 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         left_table: String,
         right_table: String,
+        /// Join cardinality from the key NDVs (TiDB `EstimateFullJoinRowCount`);
+        /// `None` falls back to the pseudo heuristics in `explain::est_rows`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        est_rows: Option<f64>,
         #[serde(skip)]
         on: ExprNode,
     },
@@ -268,6 +272,10 @@ pub enum PhysicalPlan {
         right_key: String,
         /// TiDB keeps the SQL join kind here (`left outer join …`).
         tp: JoinType,
+        /// Join cardinality from the key NDVs (TiDB `EstimateFullJoinRowCount`);
+        /// `None` falls back to the pseudo heuristics in `explain::est_rows`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        est_rows: Option<f64>,
         /// Full EXPLAIN info when `tp` / residual conds decorate it.
         #[serde(skip)]
         info: Option<String>,

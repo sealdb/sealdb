@@ -1082,10 +1082,11 @@ fn rewrite_rename_index(sql: &str) -> String {
 }
 
 const NONCLUSTERED_MARKER: &str = "__sealdb_nonclustered__";
+const CLUSTERED_MARKER: &str = "__sealdb_clustered__";
 
-/// sqlparser drops TiDB `PRIMARY KEY (...) NONCLUSTERED`. Mark the first PK
-/// column so `lower_primary_key` can record the nonclustered option; the
-/// option stripping pass then removes the keyword.
+/// sqlparser drops TiDB `PRIMARY KEY (...) NONCLUSTERED` / `CLUSTERED`. Mark
+/// the first PK column so `lower_primary_key` can record the option; the
+/// keyword itself is consumed here.
 fn rewrite_primary_key_nonclustered(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
@@ -1109,18 +1110,34 @@ fn rewrite_primary_key_nonclustered(sql: &str) -> String {
             let after_pk = skip_ws(bytes, i + "PRIMARY".len());
             if keyword_at(bytes, after_pk, "KEY") {
                 let after_key = skip_ws(bytes, after_pk + "KEY".len());
+                // TiDB allows an index name between `KEY` and the column list
+                // (`PRIMARY KEY idx_0 (a, b) NONCLUSTERED`).
+                let after_key = if after_key < bytes.len()
+                    && bytes[after_key] != b'('
+                {
+                    skip_index_name(bytes, after_key)
+                } else {
+                    after_key
+                };
                 if after_key < bytes.len() && bytes[after_key] == b'('
                     && let Some(close) = matching_paren(bytes, after_key)
                 {
                     let after_close = skip_ws(bytes, close + 1);
-                    if keyword_at(bytes, after_close, "NONCLUSTERED") {
+                    let marker = if keyword_at(bytes, after_close, "NONCLUSTERED") {
+                        Some(NONCLUSTERED_MARKER)
+                    } else if keyword_at(bytes, after_close, "CLUSTERED") {
+                        Some(CLUSTERED_MARKER)
+                    } else {
+                        None
+                    };
+                    if let Some(marker) = marker {
                         out.push_str(&sql[i..after_key + 1]);
                         let mut j = skip_ws(bytes, after_key + 1);
                         if j < bytes.len() && bytes[j] == b'`' {
                             out.push('`');
                             j += 1;
                         }
-                        out.push_str(NONCLUSTERED_MARKER);
+                        out.push_str(marker);
                         i = j;
                         continue;
                     }
@@ -3212,6 +3229,21 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Skip an optional index name after `PRIMARY KEY` / `KEY` / `INDEX`.
+fn skip_index_name(bytes: &[u8], mut i: usize) -> usize {
+    if i < bytes.len() && bytes[i] == b'`' {
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'`' {
+            i += 1;
+        }
+        return skip_ws(bytes, (i + 1).min(bytes.len()));
+    }
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'$') {
+        i += 1;
+    }
+    skip_ws(bytes, i)
 }
 
 /// Copy one UTF-8 character from `sql` at byte offset `i` into `out`.
@@ -8372,6 +8404,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 primary: false,
                 global: false,
                 nonclustered: false,
+            clustered: false,
             });
         }
     }
@@ -8387,6 +8420,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     primary: true,
                     global: false,
                     nonclustered: false,
+            clustered: false,
                 },
             );
         }
@@ -9597,6 +9631,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     primary: false,
                     global: index_def_global(&idx.index_options),
                     nonclustered: false,
+            clustered: false,
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -9639,6 +9674,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     primary: false,
                     global: index_def_global(&idx.index_options),
                     nonclustered: false,
+            clustered: false,
                 });
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
@@ -9684,6 +9720,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         primary: false,
         global: index_def_global(&idx.index_options),
         nonclustered: false,
+            clustered: false,
     })
 }
 
@@ -9706,6 +9743,13 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         }
         None => false,
     };
+    let clustered = match columns[0].strip_prefix(CLUSTERED_MARKER) {
+        Some(rest) => {
+            columns[0] = rest.to_string();
+            true
+        }
+        None => false,
+    };
     Ok(IndexDef {
         name: "PRIMARY".to_string(),
         columns,
@@ -9713,6 +9757,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         primary: true,
         global: index_def_global(&idx.index_options),
         nonclustered,
+        clustered,
     })
 }
 

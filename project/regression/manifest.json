@@ -96,7 +96,7 @@
     {
       "name": "clustered_index",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/clustered_index.test",
       "result": "r/clustered_index.result",
       "has_result": true,

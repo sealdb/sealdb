@@ -1,9 +1,10 @@
 use sealdb_config::Config;
 use sealdb_domain::{Domain, SchemaSnap};
-use sealdb_errno::Result;
+use sealdb_errno::{Error, Result};
 use sealdb_executor::{DDLExec, ExecutorBuilder, QueryResult};
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::IsolationLevel;
+use sealdb_meta::{ClusteredIndexMode, with_clustered_index_mode};
 use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::ExprNode;
@@ -43,6 +44,9 @@ pub struct Session {
     user_vars: Mutex<HashMap<String, sealdb_types::Datum>>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
     partition_prune_mode: Mutex<PartitionPruneMode>,
+    /// TiDB `tidb_enable_clustered_index` (default ON). Read by CREATE TABLE to
+    /// pick the row handle for an unannotated PRIMARY KEY.
+    clustered_index: Mutex<ClusteredIndexMode>,
     /// Active roles for the session (`SET ROLE`).
     active_roles: Mutex<Vec<UserIdentity>>,
     /// TiDB `tidb_enable_auto_analyze` (default ON).
@@ -94,6 +98,7 @@ impl Session {
                 PartitionPruneMode::parse(&globals.partition_prune_mode)
                     .unwrap_or(PartitionPruneMode::Dynamic),
             ),
+            clustered_index: Mutex::new(ClusteredIndexMode::On),
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
@@ -353,10 +358,13 @@ impl Session {
                 self.domain.persist_privileges()?;
                 return Ok(empty_result());
             }
+            Statement::LoadStats(stmt) => {
+                self.load_stats_file(&stmt.path)?;
+                return Ok(empty_result());
+            }
             Statement::Binlog(_)
             | Statement::Change(_)
             | Statement::AlterInstance(_)
-            | Statement::LoadStats(_)
             | Statement::LockStats(_)
             | Statement::UnlockStats(_)
             | Statement::Trace(_)
@@ -751,17 +759,23 @@ impl Session {
             .lock()
             .expect("session time_zone lock")
             .clone();
-        let mode = sealdb_expression::CollateMode::from_name(&coll.name);
+        let collate_mode = sealdb_expression::CollateMode::from_name(&coll.name);
         let div_mode = div_by_zero_mode(&sql_mode, stmt);
-        let result = sealdb_expression::with_div_by_zero_mode(div_mode, || {
-            sealdb_expression::with_sql_mode(sql_mode, || {
-                sealdb_expression::with_time_zone(time_zone, || {
-                    sealdb_expression::with_current_db(current_db.as_str(), || {
-                        sealdb_expression::with_collation(mode, || {
-                            sealdb_expression::clear_warnings();
-                            // TiDB allocates a fresh memory tracker per query.
-                            sealdb_expression::reset_query_mem_usage();
-                            ExecutorBuilder::run(exec)
+        let clustered_index = *self
+            .clustered_index
+            .lock()
+            .expect("session clustered index lock");
+        let result = with_clustered_index_mode(clustered_index, || {
+            sealdb_expression::with_div_by_zero_mode(div_mode, || {
+                sealdb_expression::with_sql_mode(sql_mode, || {
+                    sealdb_expression::with_time_zone(time_zone, || {
+                        sealdb_expression::with_current_db(current_db.as_str(), || {
+                            sealdb_expression::with_collation(collate_mode, || {
+                                sealdb_expression::clear_warnings();
+                                // TiDB allocates a fresh memory tracker per query.
+                                sealdb_expression::reset_query_mem_usage();
+                                ExecutorBuilder::run(exec)
+                            })
                         })
                     })
                 })
@@ -1223,6 +1237,52 @@ impl Session {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// `LOAD STATS '<file>'` (TiDB `handle.LoadStatsFromJSON`).
+    ///
+    /// The path is resolved relative to the process CWD first and then to the
+    /// integration-test data directory, matching TiDB's `integrationtest`
+    /// working directory (`s/…`).
+    fn load_stats_file(&self, path: &str) -> Result<()> {
+        let mut candidates = vec![std::path::PathBuf::from(path)];
+        if !std::path::Path::new(path).is_absolute() {
+            candidates.push(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/integrationtest")
+                    .join(path),
+            );
+            candidates.push(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../tests/integrationtest")
+                    .join(path),
+            );
+        }
+        let file = candidates
+            .iter()
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_UNKNOWN_ERROR,
+                    format!("LOAD STATS: file not found: {path}"),
+                )
+            })?;
+        let raw = std::fs::read_to_string(file).map_err(|e| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                format!("LOAD STATS: {e}"),
+            )
+        })?;
+        let (database, table, stats) = sealdb_statistics::table_from_tidb_json(&raw)?;
+        if database.is_empty() || table.is_empty() {
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                "LOAD STATS: JSON has no database_name/table_name",
+            ));
+        }
+        self.domain.stats().update(database, table, stats);
+        self.domain.persist_stats()?;
         Ok(())
     }
 }
@@ -2209,6 +2269,20 @@ fn apply_set(
                     }
                 }
             }
+            "tidb_enable_clustered_index" => {
+                let mode = ClusteredIndexMode::parse(&value).ok_or_else(|| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_enable_clustered_index' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                *session
+                    .clustered_index
+                    .lock()
+                    .expect("session clustered index lock") = mode;
+            }
             "tidb_enable_auto_analyze" => {
                 let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
                 *session
@@ -2505,6 +2579,12 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .partition_prune_mode
             .lock()
             .expect("session partition prune mode lock")
+            .as_str()
+            .to_string(),
+        "tidb_enable_clustered_index" => session
+            .clustered_index
+            .lock()
+            .expect("session clustered index lock")
             .as_str()
             .to_string(),
         "tidb_enable_auto_analyze" => {
