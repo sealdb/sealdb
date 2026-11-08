@@ -205,6 +205,24 @@ pub struct IndexDef {
     pub clustered: bool,
 }
 
+/// `FOREIGN KEY (a, b) REFERENCES t (c, d) ON UPDATE … ON DELETE …`.
+///
+/// Only the cascade flag of each referential action is kept: TiDB's
+/// `Foreign_Key_Check` / `Foreign_Key_Cascade` planning distinguishes CASCADE
+/// from the RESTRICT-like default, which is all EXPLAIN renders.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ForeignKeyDef {
+    /// Constraint name; MySQL generates `<table>_ibfk_<n>` when omitted.
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: Option<String>,
+    pub ref_table: String,
+    /// Referenced columns; empty means the referenced table's PRIMARY KEY.
+    pub ref_columns: Vec<String>,
+    pub on_update_cascade: bool,
+    pub on_delete_cascade: bool,
+}
+
 impl IndexDef {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         if self.primary {
@@ -297,6 +315,8 @@ pub struct CreateTableStmt {
     pub partition: Option<PartitionOption>,
     /// TiDB `TTL = …` table option.
     pub ttl: Option<TtlInfo>,
+    /// `FOREIGN KEY` constraints in definition order (TiDB `TableInfo.ForeignKeys`).
+    pub foreign_keys: Vec<ForeignKeyDef>,
     /// TiDB `ReferTable` (`CREATE TABLE t LIKE src`).
     pub refer_table: Option<TableName>,
     /// TiDB `Select` (`CREATE TABLE t AS SELECT ...`).

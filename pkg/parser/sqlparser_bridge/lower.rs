@@ -3,8 +3,8 @@ use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    GeneratedColumn, IndexDef, PartitionDef, PartitionOption, PartitionType, SequenceOptionSet,
-    TableName, TruncateTableStmt, TtlInfo,
+    GeneratedColumn, ForeignKeyDef, IndexDef, PartitionDef, PartitionOption, PartitionType,
+    SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -8571,11 +8571,57 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         table: object_table_name(&create.name)?,
         cols,
         indices,
+        foreign_keys: lower_foreign_keys(&create.constraints)?,
         partition: None,
         ttl: None,
         refer_table,
         select,
     }))
+}
+
+/// `FOREIGN KEY` constraints, in definition order (TiDB keeps them separate
+/// from indexes in `TableInfo.ForeignKeys`).
+fn lower_foreign_keys(constraints: &[TableConstraint]) -> Result<Vec<ForeignKeyDef>> {
+    let mut fks = Vec::new();
+    for constraint in constraints {
+        let TableConstraint::ForeignKey(fk) = constraint else {
+            continue;
+        };
+        let columns = fk
+            .columns
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Err(Error::unsupported("FOREIGN KEY without columns"));
+        }
+        let ref_table = object_table_name(&fk.foreign_table)?;
+        fks.push(ForeignKeyDef {
+            name: fk
+                .name
+                .as_ref()
+                .or(fk.index_name.as_ref())
+                .map(|ident| ident.value.clone())
+                .unwrap_or_default(),
+            columns,
+            ref_schema: ref_table.schema.clone(),
+            ref_table: ref_table.name.clone(),
+            ref_columns: fk
+                .referred_columns
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect(),
+            on_update_cascade: matches!(
+                fk.on_update,
+                Some(sqlparser::ast::ReferentialAction::Cascade)
+            ),
+            on_delete_cascade: matches!(
+                fk.on_delete,
+                Some(sqlparser::ast::ReferentialAction::Cascade)
+            ),
+        });
+    }
+    Ok(fks)
 }
 
 fn lower_values(values: &Values) -> Result<Vec<Vec<crate::ast::expressions::ExprNode>>> {

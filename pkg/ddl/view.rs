@@ -65,6 +65,7 @@ pub fn create_view(
         table: stmt.view_name.clone(),
         cols,
         indices: Vec::new(),
+        foreign_keys: Vec::new(),
         partition: None,
         ttl: None,
         refer_table: None,

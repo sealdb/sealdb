@@ -193,6 +193,10 @@ pub struct TableInfo {
     pub columns: Vec<ColumnInfo>,
     #[serde(rename = "index_info", default, skip_serializing_if = "Vec::is_empty")]
     pub indices: Vec<IndexInfo>,
+    /// TiDB `TableInfo.ForeignKeys`: `FOREIGN KEY` constraints in definition
+    /// order. The matching local index is created automatically at DDL time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_keys: Vec<ForeignKeyInfo>,
     pub state: SchemaState,
     pub pk_is_handle: bool,
     /// Clustered PRIMARY KEY that is not a single integer column: the handle is
@@ -225,6 +229,28 @@ pub struct TtlInfo {
     pub job_interval: String,
 }
 
+/// `FOREIGN KEY` constraint metadata (TiDB `FKInfo`).
+///
+/// Only CASCADE is distinguished from the RESTRICT-like default: that is the
+/// distinction TiDB's `Foreign_Key_Check` / `Foreign_Key_Cascade` planning
+/// (and therefore EXPLAIN) makes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ForeignKeyInfo {
+    /// Constraint name (`fk_1`); MySQL generates `<table>_ibfk_<n>` when the
+    /// DDL omits it.
+    pub name: String,
+    /// Local columns, in declaration order.
+    pub cols: Vec<String>,
+    /// Referenced table (unqualified; TiDB rejects cross-schema references).
+    pub ref_table: String,
+    /// Referenced columns; empty means the referenced table's PRIMARY KEY.
+    pub ref_cols: Vec<String>,
+    #[serde(default)]
+    pub on_update_cascade: bool,
+    #[serde(default)]
+    pub on_delete_cascade: bool,
+}
+
 impl TableInfo {
     pub fn new(id: i64, name: impl Into<String>, columns: Vec<ColumnInfo>) -> Self {
         let max_col_id = columns.iter().map(|c| c.id).max().unwrap_or(0);
@@ -235,6 +261,7 @@ impl TableInfo {
             collate: "utf8mb4_bin".to_string(),
             columns,
             indices: Vec::new(),
+            foreign_keys: Vec::new(),
             state: STATE_PUBLIC,
             pk_is_handle: false,
             common_handle: false,
