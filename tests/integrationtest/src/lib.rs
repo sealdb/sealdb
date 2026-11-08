@@ -141,7 +141,10 @@ fn parse_session_directive(line: &str) -> Option<SessionDirective> {
     }
     let line = line.trim();
     for (keyword, make) in [
-        ("connection", SessionDirective::Connection as fn(String) -> SessionDirective),
+        (
+            "connection",
+            SessionDirective::Connection as fn(String) -> SessionDirective,
+        ),
         ("disconnect", SessionDirective::Disconnect),
         ("connect", SessionDirective::Connect),
     ] {
@@ -222,10 +225,7 @@ pub fn load_manifest(path: &Path) -> Result<HashMap<String, ManifestSuite>> {
 }
 
 fn default_status_allowlist() -> HashSet<String> {
-    let mut set = HashSet::from([
-        "green".to_string(),
-        "local".to_string(),
-    ]);
+    let mut set = HashSet::from(["green".to_string(), "local".to_string()]);
     if env_flag("SEALDB_ITEST_RUN_IN_PROGRESS") {
         set.insert("in_progress".to_string());
     }
@@ -507,7 +507,12 @@ fn collect_tests(
                 name == "local/txn",
             )
         } else {
-            ("pending".to_string(), "R7".to_string(), String::new(), false)
+            (
+                "pending".to_string(),
+                "R7".to_string(),
+                String::new(),
+                false,
+            )
         };
         let src = fs::read_to_string(&path)
             .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
@@ -601,8 +606,7 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     // `connect (conn1, …)` opens an extra session; all sessions share the same
     // Domain, so `SET GLOBAL` values (and storage) stay visible across them.
     let domain = session.domain();
-    let mut sessions: std::collections::HashMap<String, Session> =
-        std::collections::HashMap::new();
+    let mut sessions: std::collections::HashMap<String, Session> = std::collections::HashMap::new();
     sessions.insert("default".to_string(), session);
     let mut current = "default".to_string();
     let mut chunks = Vec::new();
@@ -940,7 +944,7 @@ fn strip_embedded_op_ids(rest: &str) -> String {
             let next = chars.peek().copied();
             if next.is_none_or(|n| matches!(n, '\t' | ' ' | ',' | ')' | ']')) {
                 out.pop(); // drop '_'
-                          // drop digits (already consumed)
+            // drop digits (already consumed)
             } else {
                 out.push_str(&digits);
             }
@@ -1073,35 +1077,43 @@ mod tests {
         assert!(m.values().any(|s| s.status == "deferred"));
     }
 
+    /// Both CI gate tests run the whole suite; they share the tmp-dir meta, so
+    /// they must not interleave, and the planner recurses deeper than libtest's
+    /// 2 MiB thread stack allows.
+    static GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_gate(backend: StoreBackend) -> crate::RunReport {
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                run_all(
+                    &testdata_root(),
+                    &RunOptions {
+                        stores: vec![backend],
+                        require_tikv: false,
+                        statuses: Some(vec!["green".into(), "local".into()]),
+                        ..RunOptions::default()
+                    },
+                )
+                .unwrap()
+            })
+            .expect("spawn suite thread")
+            .join()
+            .expect("suite thread panicked")
+    }
+
     #[test]
     fn test_ci_suites_memory() {
         // CI gate: only green + local (default allowlist).
-        let report = run_all(
-            &testdata_root(),
-            &RunOptions {
-                stores: vec![StoreBackend::Memory],
-                require_tikv: false,
-                statuses: Some(vec!["green".into(), "local".into()]),
-                ..RunOptions::default()
-            },
-        )
-        .unwrap();
+        let report = run_gate(StoreBackend::Memory);
         assert!(report.memory > 0);
         assert_eq!(report.tikv, 0);
     }
 
     #[test]
     fn test_ci_suites_tikv() {
-        let report = run_all(
-            &testdata_root(),
-            &RunOptions {
-                stores: vec![StoreBackend::Tikv],
-                require_tikv: false,
-                statuses: Some(vec!["green".into(), "local".into()]),
-                ..RunOptions::default()
-            },
-        )
-        .unwrap();
+        let report = run_gate(StoreBackend::Tikv);
         if report.tikv_skipped {
             eprintln!("skip live tikv integrationtest (PD unreachable)");
             return;
