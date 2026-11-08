@@ -144,6 +144,10 @@ impl Domain {
         if id_base > 0 && meta.get_global_id().unwrap_or(0) == 0 {
             meta.set_global_id(id_base);
         }
+        // TiDB `bootstrap()`: the `mysql` system schema and its grant tables.
+        if sealdb_ddl::bootstrap::bootstrap_system_tables(&mut meta)? {
+            persist_meta(storage.as_ref(), &mut meta)?;
+        }
         let infoschema = InfoSchema::from_meta(&meta)?;
         // Reload mysql.user-equivalent grant snapshot when present.
         if !privilege.skip_grant_table() {
@@ -362,6 +366,10 @@ impl Domain {
     /// Reload Mutator + InfoSchema from Storage and renew the lease (MVB).
     pub fn reload_schema_from_storage(&self) -> Result<()> {
         let mut meta = load_meta(self.storage.as_ref())?;
+        // TiDB `bootstrap()`: the `mysql` system schema and its grant tables.
+        if sealdb_ddl::bootstrap::bootstrap_system_tables(&mut meta)? {
+            persist_meta(self.storage.as_ref(), &mut meta)?;
+        }
         let infoschema = InfoSchema::from_meta(&meta)?;
         {
             let mut inner = self.inner.lock().expect("domain reload lock");
