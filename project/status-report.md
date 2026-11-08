@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 31 | 12.2% |
-| `in_progress` | 23 | 9.1% |
+| `green` | 32 | 12.6% |
+| `in_progress` | 22 | 8.7% |
 | `pending` | 190 | 74.8% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -34,7 +34,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 15 | 6 | 1 | 主波完成 ~68% |
-| R3（point_get / index / partition / explain*） | 12 | 17 | 19 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 13 | 16 | 19 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 0 | 0 | 12 | 未开工 |
 | R6 | 0 | 0 | 35 | 未开工 |
@@ -44,22 +44,22 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 
 ---
 
-## 3. 已绿 suite 清单（31）
+## 3. 已绿 suite 清单（32）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_pushdown`, `window_function` |
-| R3 | `access_path_selection`, `clustered_index`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `explain-non-select-stmt`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
+| R3 | `access_path_selection`, `clustered_index`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `explain`, `explain-non-select-stmt`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 
 **复验证据**
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory --status green
-→ PASS: memory=31 tikv=0 skipped=223
+→ PASS: memory=32 tikv=0 skipped=222
 ```
 
-TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），31 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=31 skipped=223`）。
+TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），32 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=32 skipped=222`）。
 
 ---
 
@@ -67,6 +67,11 @@ TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not 
 
 | 提交 | 能力 |
 |---|---|
+| `e4dd60d` | 单索引 DNF 等值区间：一次 `IndexRangeScan` 多区间，不再误建 IndexMerge |
+| `522a281` | `mysql` 系统库 bootstrap：`user`/`global_priv`/`global_grants`/`db` 等真实表 + `i_user` 索引 |
+| `b310c1a` | `DESCRIBE` 的 `Null`/`Key` 列（`PRI`/`UNI`/`MUL`），视图常量列 NOT NULL，CAST 字符长度 |
+| `aa0b8f3` | `group_concat` 按 TiDB 在 `var_string(20)` 投影列上聚合 |
+| `a5c7fb9` | ONLY_FULL_GROUP_BY 接受 TiDB 全部聚合函数（`group_concat` 等） |
 | `14408dc` | GLOBAL 索引：解析、DDL、聚合计划（`globalindex/aggregate`）、EXPLAIN 渲染 |
 | `b08c3d1` | GLOBAL 索引等值连接的 IndexJoin（inner side 的 `TableReader` 形态对齐） |
 | `be7ea22` | GLOBAL 索引 Point_Get（`globalindex/point_get` 转绿） |

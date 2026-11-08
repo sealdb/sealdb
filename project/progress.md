@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-08（green 31 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 32 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` green；17 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` green；16 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -277,6 +277,19 @@
 | cop 输出投影 | SELECT 列未覆盖 WHERE 列时，投影下推到 cop（`data:Projection` / `index:Projection`） | `cop_output_projection` 返回带 `COP_PROJ\|` 标记的 Projection；`explain` 在 reader 内输出 cop `Projection` | `IndexReader index:Projection → Projection(cop) → IndexRangeScan` |
 | 聚簇常见句柄点查 | common handle 的全键等值仍是 `Point_Get … clustered index:PRIMARY` | `unique_index_eq_point` / `dnf_unique_point` 只排除整型句柄（`pk_is_handle`） | `where a = 1 and b = 1` → `Point_Get`（分区 `partition:p1`） |
 | suite green | Gate A+B | manifest `green` | `clustered_index` Mem=1 / TiKV=1 PASS；green 30→31 |
+
+### 2.0r R3 `explain`（2026-11-08）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| `GROUP_CONCAT` 计划 | `buildAggregation` 先把每个参数改写成 `cast(arg, var_string(20))`，聚合在其投影列上；默认分隔符 `,` | `build_group_concat_agg_plan`：Projection(`cast(…, var_string(20))->Column#N`) 位于 StreamAgg/HashAgg 之下，`funcs:group_concat(Column#N separator ",")` | 四种 explain 格式的 group_concat 段全绿 |
+| ONLY_FULL_GROUP_BY | `aggregation.GetAggFunc` 注册的多参数聚合（`group_concat` / `bit_and` / `variance` / `json_arrayagg` …）都合法 | `is_aggregate_func_name` 覆盖 TiDB 聚合注册表 | `group_concat(a, b)` 不再报 1055 |
+| CAST 字符长度 | `cast(x as CHAR(32))` 的字段类型保留长度（`varchar(32)`） | `data_type_name` 读 `CharacterLength::IntegerLength`，`VARCHAR(MAX)` 保留 `MAX` | `desc v` 列类型对齐 |
+| 视图列可空性 | 常量表达式（含 CAST 包裹）折叠后非 NULL，`CREATE VIEW` 列标记 NOT NULL | `expr_is_not_null_constant` → `ColumnDef.not_null` → `NOT_NULL_FLAG` | `desc v` 的 `event_id` 显示 `NO` |
+| SHOW COLUMNS | `Null` 取 `NOT_NULL_FLAG`；`Key` 依次为 `PRI` / `UNI` / `MUL` | `column_row` 按索引首列与主键判断 | `desc v` / `desc t` 对齐 |
+| `mysql` 系统库 | TiDB `bootstrap()` 建 `mysql` 库与 `user` / `global_priv` / `global_grants` / `db` / `tables_priv` / `columns_priv` 真实表，并建 `i_user` 索引 | `ddl::bootstrap::bootstrap_system_tables`：Domain 首次加载时建库建表并持久化 | `select * from mysql.user where user='xxx'` → `IndexLookUp` |
+| 单索引 DNF 区间 | `a=1 OR a=2` 在同一条索引上是一个多区间 `IndexRangeScan`，不建 IndexMerge；窄的二级索引优先于复合 PRIMARY 前缀 | `dnf_same_index_plan` + `pseudo::conjunct_bound_sets` 支持 DNF 等值区间 | `range:["xxx","xxx"], ["yyy","yyy"]`，20.00 |
+| suite green | Gate A+B | manifest `green` | `explain` Mem=32 / TiKV=32 PASS；green 31→32 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。

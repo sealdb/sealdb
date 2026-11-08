@@ -1096,7 +1096,7 @@
     {
       "name": "explain",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain.test",
       "result": "r/explain.result",
       "has_result": true,
