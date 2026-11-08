@@ -47,7 +47,8 @@ pub struct FkNode {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct IndexScanRange {    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1,1]`, `(3,+inf]`.
+pub struct IndexScanRange {
+    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1,1]`, `(3,+inf]`.
     pub text: String,
     /// `IndexRangeScan` estRows — rows kept by the range alone.
     pub rows: f64,
@@ -55,6 +56,10 @@ pub struct IndexScanRange {    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1
     pub filter_rows: f64,
     /// Unanalyzed table: EXPLAIN prints `stats:pseudo` on the scan.
     pub pseudo: bool,
+    /// Index key columns the table statistics do not carry: EXPLAIN prints
+    /// `stats:partial[col:missing]` on the scan.
+    #[serde(default)]
+    pub partial: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

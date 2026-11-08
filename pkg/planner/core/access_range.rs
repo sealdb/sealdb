@@ -120,6 +120,14 @@ pub fn index_access_range(
         Some(rows) => (rows, false),
         None => (rows, true),
     };
+    // TiDB `stats:partial[…]`: the index histogram is present but the column
+    // statistics of the key column is not, so EXPLAIN marks the scan.
+    let partial_columns = table_stats.and_then(|stats| {
+        if stats.column(&column).is_some() {
+            return None;
+        }
+        Some(column.to_ascii_lowercase())
+    });
     // Residual conjuncts (columns beyond the leading one) keep TiDB's
     // per-column selectivity on top of the range cardinality.
     let residual: Vec<ExprNode> = conjuncts
@@ -142,6 +150,7 @@ pub fn index_access_range(
             rows,
             filter_rows,
             pseudo: pseudo_scan,
+            partial: partial_columns,
         },
         consumed,
     })
@@ -184,6 +193,19 @@ fn bounds_fit_column(
     high: &Option<(sealdb_types::Datum, bool)>,
 ) -> bool {
     let fits = |bound: &Option<(sealdb_types::Datum, bool)>| match bound {
+        // A hex/bit literal is a binary string: ranger converts it to the key
+        // type, and a value wider than a BIT column fails that conversion
+        // (`col1 = 0x30` on `bit(1)`), so the predicate stays in the cop
+        // Selection instead of becoming a seek key.
+        Some((sealdb_types::Datum::Bit(bytes), _))
+            if field_type.tp == sealdb_types::field_type::TYPE_BIT =>
+        {
+            let width = field_type.flen.max(1) as u32;
+            let value = bytes
+                .iter()
+                .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+            width >= 64 || value >> width == 0
+        }
         // Binary values: string literals, and hex/bit literals (which arrive as
         // `Datum::Bit`) — both need a charset conversion to the column.
         Some((sealdb_types::Datum::Bytes(bytes) | sealdb_types::Datum::Bit(bytes), _)) => {

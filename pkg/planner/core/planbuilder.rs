@@ -281,6 +281,10 @@ impl PlanBuilder {
                     // here, so the null rejection (`not(isnull(key))`) for the
                     // promoted keys must be derived afterwards.
                     plan = inject_inner_join_null_reject(plan, select, is, current_db);
+                    // Predicate pushdown rebuilds join nodes, so their
+                    // cardinality (derived from the pushed-down children) has
+                    // to be recomputed before any aggregate above them.
+                    plan = fill_join_est_rows(plan, is, current_db, stats);
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
                 plan = lift_point_get_merge_join(plan, select, is, current_db);
@@ -320,9 +324,22 @@ impl PlanBuilder {
                         && order_by_covered_by_merge_join(select, &plan);
                     // `ORDER BY` the row handle reads the table in handle order:
                     // TiDB drops the Sort and marks the scan `keep order:true`.
-                    let handle_order = matches!(plan, PhysicalPlan::TableReader { .. })
-                        && order_by_handle(select, is, current_db);
+                    // A backwards handle order with `LIMIT` becomes a cop Limit.
+                    let handle_order_desc = matches!(
+                        plan,
+                        PhysicalPlan::TableReader {
+                            range_scan: None,
+                            ..
+                        }
+                    )
+                    .then(|| order_by_handle(select, is, current_db))
+                    .flatten();
+                    let handle_order = handle_order_desc
+                        .is_some_and(|desc| !desc || select.limit.is_some());
                     if handle_order {
+                        if handle_order_desc == Some(true) {
+                            plan = set_data_limit(plan);
+                        }
                         plan = set_keep_order(plan);
                     }
                     // Batch point get walks its keys in order, so an ORDER BY on
@@ -331,11 +348,17 @@ impl PlanBuilder {
                     if let Some(desc) = point_order {
                         plan = set_batch_point_order(plan, desc);
                     }
+                    // `ORDER BY` an index key prefix reads the index in key
+                    // order, so the sort is already satisfied. A multi-partition
+                    // read returns rows partition by partition, so it is not.
+                    let index_order = !select_spans_multiple_partitions(select, is, current_db)
+                        && plan_provides_order(select, &plan);
                     let need_sort = !select.order_by.is_empty()
                         && !order_by_all_constant(select)
                         && !(stream_keep_order && order_prefix_of_group_by(select))
                         && !merge_orders
                         && !handle_order
+                        && !index_order
                         && point_order.is_none();
                     let join_ordinal_sort = need_sort
                         && !select.joins.is_empty()
@@ -420,7 +443,7 @@ impl PlanBuilder {
                 plan = wrap_quantified_all_projection(plan, select, is, current_db);
                 // EXPLAIN renders pushed predicates with the table's OrigTblName
                 // (`t1.col1` → `uk_hp16726.col1`), never the SQL alias.
-                plan = explain_rewrite_pushed(plan, select);
+                plan = explain_rewrite_pushed(plan, select, is, current_db, stats);
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
                 Ok(plan)
@@ -1165,11 +1188,30 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<Option<Box<PhysicalPlan>>> {
-        let select = dml_scan_select(
+        let mut select = dml_scan_select(
             &delete.table,
             delete.join.as_ref(),
             delete.selection.clone(),
         );
+        // TiDB's DML children read the row handle only, which lets a covering
+        // secondary index serve the scan (`Delete → IndexReader`). For an
+        // integer PK the handle is the PK column itself.
+        if delete.join.is_none()
+            && let Some(handle) = is
+                .and_then(|is| is.table_by_name(current_db, delete.table.resolve_name()))
+                .filter(|t| t.pk_is_handle)
+                .and_then(|t| t.handle_column())
+        {
+            select.fields = vec![sealdb_parser::ast::SelectField {
+                expr: ExprNode::Column(sealdb_parser::ast::expressions::ColumnNameExpr {
+                    schema: None,
+                    table: None,
+                    name: handle.name.o().to_string(),
+                }),
+                as_name: None,
+                orig_text: None,
+            }];
+        }
         let plan = self.build_with_schema(
             &Statement::Select(select),
             is,
@@ -1327,6 +1369,9 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         let plan = self.build_join_plan_impl(select, is, current_db, stats, prune_mode)?;
         let plan = inject_inner_join_null_reject(plan, select, is, current_db);
+        // TiDB sizes the join on the pushed-down children (the null-rejecting
+        // Selection above each side changes the key NDV).
+        let plan = fill_join_est_rows(plan, is, current_db, stats);
         let plan = star_join_projection(plan, select, is, current_db);
         Ok(plan)
     }
@@ -2246,13 +2291,15 @@ impl PlanBuilder {
             };
             let mut a4 = side(t4)?;
             a4 = with_isnull(a4, ron, t4);
+            // TiDB keeps the preserved spine (`(t3 ⟕ t2) ⟕ t1`) as the outer
+            // side and hashes the t4 probe; EXPLAIN draws Build first either way.
             return Ok(Some(PhysicalPlan::HashJoin {
                 est_rows: None,
                 tp: JoinType::LeftOuter,
-                left: Box::new(a4),
-                right: Box::new(mid),
-                left_table: t4.name.clone(),
-                right_table: t3.name.clone(),
+                left: Box::new(mid),
+                right: Box::new(a4),
+                left_table: t3.name.clone(),
+                right_table: t4.name.clone(),
                 on: ron.clone(),
             }));
         }
@@ -3675,32 +3722,39 @@ fn check_tidb_rowid_reference(
 
 /// TiDB: a table scan yields row-handle order, so `ORDER BY` the handle needs
 /// no Sort (`keep order:true`). Only ascending single-key ordering is modeled.
-fn order_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> bool {
+/// `ORDER BY` the table handle reads the table in handle order (forward or
+/// backward) so no `Sort` is needed. Returns the direction of the required
+/// scan (`Some(true)` for descending).
+fn order_by_handle(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<bool> {
     if select.order_by.is_empty() {
-        return false;
+        return None;
     }
-    let Some(from) = &select.from else {
-        return false;
-    };
+    let from = select.from.as_ref()?;
     let (db, table) = from.qualified(current_db);
-    let Some(info) = is.and_then(|schema| schema.table_by_name(&db, &table)) else {
-        return false;
-    };
+    let info = is.and_then(|schema| schema.table_by_name(&db, &table))?;
     let handle = if info.pk_is_handle {
-        match info.handle_column() {
-            Some(column) => column.name.o().to_string(),
-            None => return false,
-        }
+        info.handle_column()?.name.o().to_string()
     } else {
         "_tidb_rowid".to_string()
     };
-    select.order_by.iter().all(|item| {
-        !item.desc
-            && matches!(
-                &item.expr,
-                ExprNode::Column(col) if col.name.eq_ignore_ascii_case(&handle)
-            )
-    })
+    let mut desc = None;
+    for item in &select.order_by {
+        let ExprNode::Column(col) = &item.expr else {
+            return None;
+        };
+        if !col.name.eq_ignore_ascii_case(&handle) {
+            return None;
+        }
+        match desc {
+            Some(prev) if prev != item.desc => return None,
+            _ => desc = Some(item.desc),
+        }
+    }
+    desc
 }
 
 /// `ORDER BY` the batch point-get key (index prefix or handle) needs no Sort:
@@ -3846,6 +3900,38 @@ fn set_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
             row_count,
             stats_pseudo,
             data_limit,
+            filter_est,
+            range_scan,
+            keep_order: true,
+            pushed,
+        },
+        other => other,
+    }
+}
+
+/// TiDB `LIMIT` over a backwards handle scan: the coprocessor `Limit` stops the
+/// scan after one row (`TableReader(data:Limit) → Limit → TableFullScan` with
+/// `keep order:true, desc`), so no `TopN` is built.
+fn set_data_limit(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            stats_pseudo,
+            filter_est,
+            range_scan,
+            pushed,
+            ..
+        } => PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count: 1.0,
+            stats_pseudo,
+            data_limit: true,
             filter_est,
             range_scan,
             keep_order: true,
@@ -5188,6 +5274,32 @@ fn cop_output_projection(
             .referenced_columns()
             .iter()
             .any(|(_, name)| !out.iter().any(|o| o.eq_ignore_ascii_case(name)));
+    // An `IndexReader` already outputs the index keys plus the row handle, so a
+    // projection that merely re-lists them is a no-op TiDB never renders.
+    let prunes = prunes
+        && !match plan {
+            PhysicalPlan::IndexReader { index_columns, .. } => {
+                let handle = select
+                    .from
+                    .as_ref()
+                    .and_then(|f| {
+                        let (db, table) = f.qualified(current_db);
+                        is.and_then(|is| is.table_by_name(&db, &table))
+                    })
+                    .and_then(|t| t.handle_column())
+                    .map(|c| c.name.o().to_string());
+                let provided = |name: &str| {
+                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+                        || handle.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(name))
+                };
+                filter
+                    .referenced_columns()
+                    .iter()
+                    .all(|(_, name)| provided(name))
+                    && out.iter().all(|o| provided(o))
+            }
+            _ => false,
+        };
     if !prunes {
         return None;
     }
@@ -5770,8 +5882,7 @@ fn cte_seed_output_names(seed: &SelectStmt) -> Vec<String> {
         .collect()
 }
 
-fn cte_field_expr(select: &SelectStmt, cte_name: &str, col: &str) -> Option<ExprNode> {
-    let with = select.with.as_ref()?;
+fn cte_field_expr(select: &SelectStmt, cte_name: &str, col: &str) -> Option<ExprNode> {    let with = select.with.as_ref()?;
     let cte = with.find(cte_name)?;
     if let Some(i) = cte
         .col_name_list
@@ -6483,6 +6594,30 @@ fn point_value_hits_float(info: &sealdb_meta::TableInfo, column: &str, value: &D
     (v as f32) as f64 == v
 }
 
+/// A hex/bit literal wider than a `BIT` column fails the ranger conversion
+/// (`col1 = 0x30` on `bit(1)`), so the equality cannot pin a point get: it
+/// stays a cop filter and the comparison yields no row.
+fn point_value_fits_column(info: &sealdb_meta::TableInfo, column: &str, value: &Datum) -> bool {
+    let Some(col) = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(column))
+    else {
+        return true;
+    };
+    if col.field_type.tp != sealdb_types::field_type::TYPE_BIT {
+        return true;
+    }
+    let Datum::Bit(bytes) = value else {
+        return true;
+    };
+    let width = col.field_type.flen.max(1) as u32;
+    let bits = bytes
+        .iter()
+        .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+    width >= 64 || bits >> width == 0
+}
+
 fn index_ignored(from: &TableName, name: &str) -> bool {
     from.ignore_indexes
         .iter()
@@ -6527,6 +6662,14 @@ fn unique_index_eq_point(
             .is_some_and(|value| !point_value_hits_float(info, c.name.o(), &value))
     }) {
         return Some(PhysicalPlan::TableDual { row_count: 0 });
+    }
+    // A literal that cannot convert to its key column keeps the predicate as a
+    // cop filter instead of pinning a single key.
+    if index.columns.iter().any(|c| {
+        value_of(&super::expr_index::part_key(info, c))
+            .is_some_and(|value| !point_value_fits_column(info, c.name.o(), &value))
+    }) {
+        return None;
     }
     let index_columns: Vec<String> = index_key_column_names(info, index);
     let values: Vec<Datum> = index
@@ -8002,7 +8145,14 @@ fn column_stats_filter_rows(
     };
     let count = table_stats.count as f64;
     let rows = if let Some(column) = not_isnull_column(conjunct) {
-        table_stats.column_not_null_count(&column)?
+        // TiDB `getNotNULLRowCount`: a column the statistics do not carry keeps
+        // the whole table count (the scan is only marked `stats:partial`).
+        match table_stats.column(&column) {
+            Some(col) if col.histogram.is_some() => {
+                count - col.null_count as f64
+            }
+            _ => count,
+        }
     } else {
         let (column, value) = ne_column_const(conjunct)?;
         let field_type = &info
@@ -8021,6 +8171,70 @@ fn column_stats_filter_rows(
 /// A clustered PRIMARY index has no histogram of its own yet, so the estimate
 /// degrades to the realtime table row count — the same shape TiDB keeps when
 /// the index histogram is missing.
+/// Ranges the handle-prefix conjuncts pin on the handle column, as planner
+/// statistics ranges.
+fn handle_scan_stats_ranges(
+    column: &str,
+    selection: &ExprNode,
+) -> Option<Vec<sealdb_statistics::range_est::StatsRange>> {
+    let mut ranges: Vec<sealdb_statistics::pseudo::Bounds> = Vec::new();
+    for item in selection.split_cnf() {
+        let (name, sets) = sealdb_statistics::pseudo::conjunct_bound_sets(&item)?;
+        if !name.eq_ignore_ascii_case(column) {
+            return None;
+        }
+        if ranges.is_empty() {
+            ranges = sets;
+        } else {
+            sealdb_statistics::pseudo::intersect_sets(&mut ranges, &sets);
+            if ranges.is_empty() {
+                return Some(Vec::new());
+            }
+        }
+    }
+    Some(
+        ranges
+            .into_iter()
+            .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
+            .collect(),
+    )
+}
+
+/// TiDB `GetRowCountByIntColumnRanges` for an integer PK handle range
+/// (`TableRangeScan` over `_tidb_rowid`).
+fn int_handle_range_rows(
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    stats: Option<&Handle>,
+    current_db: &str,
+    selection: &ExprNode,
+) -> Option<f64> {
+    let (db, table) = from.qualified(current_db);
+    let table_stats = stats
+        .and_then(|h| h.table(&db, &table))
+        .filter(|t| super::plan_cost::has_real_stats(t))?;
+    if std::env::var("SEALDB_DEBUG_HANDLE_RANGE").is_ok() {
+        eprintln!("INTHANDLE {table} has_stats=true count={}", table_stats.count);
+    }
+    let column = info.handle_column()?;
+    let stat_ranges = handle_scan_stats_ranges(column.name.o(), selection)?;
+    if std::env::var("SEALDB_DEBUG_HANDLE_RANGE").is_ok() {
+        eprintln!("INTHANDLE {table} col={} ranges={stat_ranges:?}", column.name.o());
+    }
+    if stat_ranges.is_empty() {
+        return Some(0.0);
+    }
+    let rows = table_stats.column_range_estimate(
+        column.name.o(),
+        sealdb_statistics::kind_of(&column.field_type),
+        &stat_ranges,
+    );
+    if std::env::var("SEALDB_DEBUG_HANDLE_RANGE").is_ok() {
+        eprintln!("INTHANDLE {table} rows={rows:?}");
+    }
+    Some(rows.unwrap_or(table_stats.count as f64))
+}
+
 fn clustered_range_rows(
     from: &TableName,
     info: &sealdb_meta::TableInfo,
@@ -8034,28 +8248,22 @@ fn clustered_range_rows(
         .filter(|t| super::plan_cost::has_real_stats(t))?;
     let pk = info.indices.iter().find(|idx| idx.primary)?;
     let column = info.clustered_prefix_column()?;
-    let mut ranges: Vec<sealdb_statistics::pseudo::Bounds> = Vec::new();
-    for item in selection.split_cnf() {
-        let (name, sets) = sealdb_statistics::pseudo::conjunct_bound_sets(&item)?;
-        if !name.eq_ignore_ascii_case(column.name.o()) {
-            return None;
-        }
-        if ranges.is_empty() {
-            ranges = sets;
-        } else {
-            sealdb_statistics::pseudo::intersect_sets(&mut ranges, &sets);
-            if ranges.is_empty() {
-                return Some(0.0);
-            }
-        }
+    let stat_ranges = handle_scan_stats_ranges(column.name.o(), selection)?;
+    if stat_ranges.is_empty() {
+        return Some(0.0);
     }
-    if ranges.is_empty() {
-        return None;
+    if std::env::var("SEALDB_DEBUG_CLUSTERRANGE").is_ok() {
+        eprintln!(
+            "CLUSTERRANGE pk={} col={} ranges={:?} idx={:?} primary={:?} colest={:?} count={}",
+            pk.name.o(),
+            column.name.o(),
+            stat_ranges.len(),
+            table_stats.index_range_estimate(pk.name.o(), &column.field_type, &stat_ranges),
+            table_stats.index_range_estimate("primary", &column.field_type, &stat_ranges),
+            table_stats.column_range_estimate(column.name.o(), sealdb_statistics::kind_of(&column.field_type), &stat_ranges),
+            table_stats.count
+        );
     }
-    let stat_ranges: Vec<sealdb_statistics::range_est::StatsRange> = ranges
-        .into_iter()
-        .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
-        .collect();
     Some(
         table_stats
             .index_range_estimate(pk.name.o(), &column.field_type, &stat_ranges)
@@ -8144,6 +8352,12 @@ fn partitioned_table_reader(
         row_count
     };
 
+    if std::env::var("SEALDB_DEBUG_CLUSTERRANGE").is_ok() {
+        eprintln!(
+            "PTR table={} ids={:?} row_count={row_count} filter_est={filter_est:?} stats_pseudo={stats_pseudo}",
+            from.name, planned.names
+        );
+    }
     match prune_mode {
         PartitionPruneMode::Static if planned.ids.len() > 1 => {
             let children = planned
@@ -8213,6 +8427,45 @@ fn partitioned_table_reader(
             reader
         }
     }
+}
+
+/// Rows a leading-column equality matches, sizing the index path from the
+/// index histogram when the table statistics do not carry the column.
+///
+/// `select c1, c2 from t1 where c2 = 1` on a table analyzed without `c2` keeps
+/// `stats:partial[c2:missing]`: TiDB still reads the index histogram of `c2`
+/// (`GetRowCountByIndexRanges`), so a value the histogram leaves in a bucket gap
+/// estimates zero rows and the cheap index scan wins over the table scan.
+fn index_equality_rows(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    select: &SelectStmt,
+    stats: Option<&Handle>,
+    from: &TableName,
+    current_db: &str,
+    column: &str,
+    value: &sealdb_types::Datum,
+) -> Option<f64> {
+    let (db, table) = from.qualified(current_db);
+    let table_stats = stats
+        .and_then(|handle| handle.table(&db, &table))
+        .filter(|t| super::plan_cost::has_real_stats(t));
+    let column_rows = eq_row_count_value(stats, from, current_db, column, value);
+    let Some(table_stats) = table_stats else {
+        return column_rows;
+    };
+    if table_stats.column(column).is_some() {
+        return column_rows;
+    }
+    let total = table_row_count(stats, from, current_db);
+    let conjuncts = select
+        .selection
+        .as_ref()
+        .map(|selection| selection.split_cnf())
+        .unwrap_or_default();
+    super::access_range::index_access_range(info, index, &conjuncts, total, Some(&table_stats))
+        .map(|access| access.range.filter_rows)
+        .or(column_rows)
 }
 
 fn index_plan(
@@ -9446,7 +9699,13 @@ fn group_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &st
 /// EXPLAIN-only: relabel columns in pushed filters with each side's
 /// OrigTblName (lowercase), matching TiDB `expression.ExplainInfo()` of a
 /// predicate that has been pushed into a `DataSource`.
-fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
+fn explain_rewrite_pushed(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> PhysicalPlan {
     if !in_explain_build() {
         return plan;
     }
@@ -9454,11 +9713,17 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
     if let Some(from) = &select.from {
         tables.push(from);
     }
-    fn walk(plan: PhysicalPlan, tables: &[&sealdb_parser::ast::TableName]) -> PhysicalPlan {
+    fn walk(
+        plan: PhysicalPlan,
+        tables: &[&sealdb_parser::ast::TableName],
+        is: Option<&InfoSchema>,
+        current_db: &str,
+        stats: Option<&Handle>,
+    ) -> PhysicalPlan {
         match plan {
             PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
                 filter: rewrite_col_tables(&filter, tables),
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
             },
             PhysicalPlan::TableReader {
                 table,
@@ -9472,19 +9737,30 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 range_scan,
                 keep_order,
                 pushed,
-            } => PhysicalPlan::TableReader {
-                table,
-                partitions,
-                partition_names,
-                partition_access,
-                row_count,
-                stats_pseudo,
-                data_limit,
-                filter_est,
-                range_scan,
-                keep_order,
-                pushed: pushed.as_ref().map(|p| rewrite_col_tables(p, tables)),
-            },
+            } => {
+                let pushed = pushed.as_ref().map(|p| {
+                    annotate_partial_stats(
+                        &table,
+                        rewrite_col_tables(p, tables),
+                        is,
+                        current_db,
+                        stats,
+                    )
+                });
+                PhysicalPlan::TableReader {
+                    table,
+                    partitions,
+                    partition_names,
+                    partition_access,
+                    row_count,
+                    stats_pseudo,
+                    data_limit,
+                    filter_est,
+                    range_scan,
+                    keep_order,
+                    pushed,
+                }
+            }
             PhysicalPlan::IndexReader {
                 table,
                 index,
@@ -9515,27 +9791,27 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
             } => PhysicalPlan::HashJoin {
                 est_rows,
                 tp,
-                left: Box::new(walk(*left, tables)),
-                right: Box::new(walk(*right, tables)),
+                left: Box::new(walk(*left, tables, is, current_db, stats)),
+                right: Box::new(walk(*right, tables, is, current_db, stats)),
                 left_table,
                 right_table,
-                on,
+                on: rewrite_col_tables(&on, tables),
             },
             PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
                 exprs,
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
             },
             PhysicalPlan::Limit {
                 child,
                 offset,
                 count,
             } => PhysicalPlan::Limit {
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
                 offset,
                 count,
             },
             PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
                 by_info,
             },
             PhysicalPlan::TopN {
@@ -9544,7 +9820,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 offset,
                 count,
             } => PhysicalPlan::TopN {
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
                 by_info,
                 offset,
                 count,
@@ -9558,7 +9834,7 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 info,
                 cop_info,
                 est_rows,
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
             },
             PhysicalPlan::StreamAgg {
                 info,
@@ -9569,12 +9845,76 @@ fn explain_rewrite_pushed(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPl
                 info,
                 cop_info,
                 est_rows,
-                child: Box::new(walk(*child, tables)),
+                child: Box::new(walk(*child, tables, is, current_db, stats)),
             },
             other => other,
         }
     }
-    walk(plan, &tables)
+    walk(plan, &tables, is, current_db, stats)
+}
+
+/// TiDB `stats:partial[…]` for a pushed cop filter: the table statistics exist
+/// but some referenced column does not (`LOAD STATS` recorded before the column
+/// was analyzed). EXPLAIN keeps the Selection text and marks the missing
+/// columns on the scan; the estimate already comes from the scan row count.
+fn annotate_partial_stats(
+    table: &str,
+    filter: ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> ExprNode {
+    // Bytes carry an EXPLAIN marker from an earlier rewrite.
+    if matches!(
+        &filter,
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(_)
+        })
+    ) {
+        return filter;
+    }
+    let Some(info) = is.and_then(|schema| {
+        let db = statement_table_db(table).unwrap_or_else(|| current_db.to_string());
+        schema.table_by_name(&db, table)
+    }) else {
+        return filter;
+    };
+    let db = statement_table_db(table).unwrap_or_else(|| current_db.to_string());
+    let Some(table_stats) = stats
+        .and_then(|handle| handle.table(&db, table))
+        .filter(|t| super::plan_cost::has_real_stats(t))
+    else {
+        return filter;
+    };
+    let mut missing: Vec<String> = filter
+        .split_cnf()
+        .iter()
+        .flat_map(|conjunct| conjunct.referenced_columns())
+        .filter(|(_, name)| {
+            info.columns
+                .iter()
+                .any(|col| col.name.o().eq_ignore_ascii_case(name))
+        })
+        .filter(|(_, name)| table_stats.column(name).is_none())
+        .map(|(_, name)| name.to_ascii_lowercase())
+        .collect();
+    if missing.is_empty() {
+        return filter;
+    }
+    missing.sort();
+    missing.dedup();
+    let mut cnf = filter.split_cnf();
+    cnf.sort_by_key(|conjunct| super::explain::explain_pushed_filter(table, conjunct));
+    let sel_info = cnf
+        .iter()
+        .map(|conjunct| super::explain::explain_pushed_filter(table, conjunct))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bytes_info(&format!(
+        "PARTIAL_SEL|{}|{}",
+        missing.join(","),
+        sel_info
+    ))
 }
 
 /// `{db}.{orig_table}.{col}` for an aggregate operand over a join tree.
@@ -10836,6 +11176,377 @@ fn naaj_other_conds(cond: &ExprNode, schema: &str) -> String {
     parts.join(", ")
 }
 
+/// Fill `HashJoin::est_rows` from the join-key NDVs, bottom-up.
+///
+/// TiDB `EstimateFullJoinRowCount`: `|l|·|r| / max(NDV_l, NDV_r)`, where a key
+/// column without column statistics contributes `0.8 × side rows` (index
+/// statistics are not used for join keys). An outer join then keeps at least
+/// the preserved side (`math.Max(count, outerRowCount)`).
+fn fill_join_est_rows(
+    plan: PhysicalPlan,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::HashJoin {
+            est_rows,
+            tp,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } => {
+            let left = fill_join_est_rows(*left, is, current_db, stats);
+            let right = fill_join_est_rows(*right, is, current_db, stats);
+            let est_rows = est_rows.or_else(|| {
+                join_est_by_ndv(&left, &right, tp, &on, is, current_db, stats)
+            });
+            PhysicalPlan::HashJoin {
+                est_rows,
+                tp,
+                left: Box::new(left),
+                right: Box::new(right),
+                left_table,
+                right_table,
+                on,
+            }
+        }
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+        },
+        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            filter,
+        },
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            by_info,
+        },
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            by_info,
+            offset,
+            count,
+        },
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            offset,
+            count,
+        },
+        PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+        },
+        PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed,
+            recursive_plan,
+            inline,
+            recursive,
+            limit,
+            offset,
+        } => PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed: Box::new(fill_join_est_rows(*seed, is, current_db, stats)),
+            recursive_plan: recursive_plan
+                .map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats))),
+            inline,
+            recursive,
+            limit,
+            offset,
+        },
+        PhysicalPlan::Apply {
+            child,
+            filter,
+            probe,
+            info,
+        } => PhysicalPlan::Apply {
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            filter,
+            probe: probe.map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats))),
+            info,
+        },
+        PhysicalPlan::RowProjection {
+            info,
+            exprs,
+            names,
+            child,
+        } => PhysicalPlan::RowProjection {
+            info,
+            exprs,
+            names,
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+        },
+        PhysicalPlan::PartitionUnion { children } => PhysicalPlan::PartitionUnion {
+            children: children
+                .into_iter()
+                .map(|p| fill_join_est_rows(p, is, current_db, stats))
+                .collect(),
+        },
+        PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer,
+            inner,
+        } => PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer: Box::new(fill_join_est_rows(*outer, is, current_db, stats)),
+            inner: Box::new(fill_join_est_rows(*inner, is, current_db, stats)),
+        },
+        other => other,
+    }
+}
+
+/// Equi-join key column pairs from an ON condition.
+fn join_eq_pairs(
+    on: &ExprNode,
+) -> Vec<(
+    sealdb_parser::ast::expressions::ColumnNameExpr,
+    sealdb_parser::ast::expressions::ColumnNameExpr,
+)> {
+    let mut out = Vec::new();
+    for conjunct in on.split_cnf() {
+        let ExprNode::Binary(bin) = conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        if let (ExprNode::Column(l), ExprNode::Column(r)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        {
+            out.push((l.clone(), r.clone()));
+        }
+    }
+    out
+}
+
+/// Table names a plan reads (aliases and physical names alike).
+fn plan_table_names(plan: &PhysicalPlan, out: &mut Vec<String>) {
+    match plan {
+        PhysicalPlan::TableReader { table, .. }
+        | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexLookUpReader { table, .. }
+        | PhysicalPlan::IndexMerge { table, .. }
+        | PhysicalPlan::PointGet { table, .. }
+        | PhysicalPlan::BatchPointGet { table, .. } => out.push(table.clone()),
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        }
+        | PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        } => {
+            out.push(left_table.clone());
+            out.push(right_table.clone());
+            plan_table_names(left, out);
+            plan_table_names(right, out);
+        }
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::UnionScan { child, .. }
+        | PhysicalPlan::RowProjection { child, .. }
+        | PhysicalPlan::SelectLock { child, .. }
+        | PhysicalPlan::HashAgg { child, .. }
+        | PhysicalPlan::StreamAgg { child, .. }
+        | PhysicalPlan::Window { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child, .. }
+        | PhysicalPlan::Distinct { child, .. } => plan_table_names(child, out),
+        PhysicalPlan::CTE { seed, .. } => plan_table_names(seed, out),
+        PhysicalPlan::Apply { child, probe, .. } => {
+            plan_table_names(child, out);
+            if let Some(probe) = probe {
+                plan_table_names(probe, out);
+            }
+        }
+        PhysicalPlan::PartitionUnion { children } => {
+            for child in children {
+                plan_table_names(child, out);
+            }
+        }
+        PhysicalPlan::Union { children, .. } => {
+            for child in children {
+                plan_table_names(child, out);
+            }
+        }
+        PhysicalPlan::IndexJoin { outer, inner, .. } => {
+            plan_table_names(outer, out);
+            plan_table_names(inner, out);
+        }
+        _ => {}
+    }
+}
+
+fn column_usable_ndv(
+    stats: Option<&Handle>,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    plan: &PhysicalPlan,
+    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    side_rows: f64,
+) -> Option<f64> {
+    let table = col.table.as_deref()?;
+    let db = col.schema.as_deref().unwrap_or(current_db);
+    let side = {
+        let mut names = Vec::new();
+        plan_table_names(plan, &mut names);
+        names
+    };
+    let owned = side.iter().any(|n| n.eq_ignore_ascii_case(table))
+        || is
+            .and_then(|is| is.table_by_name(db, table))
+            .is_some_and(|info| {
+                side.iter()
+                    .any(|n| n.eq_ignore_ascii_case(info.name.o()))
+            });
+    if !owned {
+        return None;
+    }
+    let table_stats = stats.and_then(|h| h.table(db, table)).filter(|t| {
+        super::plan_cost::has_real_stats(t)
+    });
+    if let Some(t) = table_stats
+        && let Some(ndv) = t.column_ndv(&col.name)
+    {
+        // TiDB scales column NDVs with the filters below the join and caps
+        // them at the side's row count.
+        let scale = if t.count > 0 {
+            (side_rows / t.count as f64).min(1.0)
+        } else {
+            1.0
+        };
+        return Some((ndv * scale).min(side_rows.max(1.0)).max(1.0));
+    }
+    // TiDB's `pseudo` join-key NDV: the statistics do not carry this column,
+    // so the estimate degrades to `pseudoLessRate × rows`. The rows come from
+    // the column's own scan subtree (filters above it included), not from the
+    // whole join side: a 2.50-row inner-join spine still sees `t4.a` as 7992,
+    // so `t4 ⟕ …` matches on the key NDV instead of the spine cardinality.
+    let rows = pseudo_column_rows(plan, table).unwrap_or_else(|| side_rows.max(1.0));
+    Some(rows * 0.8)
+}
+
+/// Rows produced by the deepest subtree that owns `table` (scan + its filters).
+fn pseudo_column_rows(plan: &PhysicalPlan, table: &str) -> Option<f64> {
+    match plan {
+        PhysicalPlan::TableReader { table: t, .. } | PhysicalPlan::IndexReader { table: t, .. } => {
+            t.eq_ignore_ascii_case(table)
+                .then(|| super::explain::est_rows(plan))
+        }
+        PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::UnionScan { child, .. } => pseudo_column_rows(child, table),
+        PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::MergeJoin { left, right, .. } => pseudo_column_rows(left, table)
+            .or_else(|| pseudo_column_rows(right, table)),
+        _ => None,
+    }
+}
+
+/// TiDB logical-join cardinality for `tp` from the key NDVs.
+fn join_est_by_ndv(
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+    tp: JoinType,
+    on: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> Option<f64> {
+    let l = super::explain::est_rows(left);
+    let r = super::explain::est_rows(right);
+    if !(l > 0.0 && r > 0.0) {
+        return None;
+    }
+    let pairs = join_eq_pairs(on);
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut ndv_l = 1.0_f64;
+    let mut ndv_r = 1.0_f64;
+    let mut seen_l = false;
+    let mut seen_r = false;
+    for (lc, rc) in &pairs {
+        if let Some(ndv) = column_usable_ndv(stats, is, current_db, left, lc, l) {
+            ndv_l = ndv_l.max(ndv);
+            seen_l = true;
+        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, right, lc, r) {
+            ndv_r = ndv_r.max(ndv);
+            seen_r = true;
+        }
+        if let Some(ndv) = column_usable_ndv(stats, is, current_db, right, rc, r) {
+            ndv_r = ndv_r.max(ndv);
+            seen_r = true;
+        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, left, rc, l) {
+            ndv_l = ndv_l.max(ndv);
+            seen_l = true;
+        }
+    }
+    if !(seen_l && seen_r) {
+        return None;
+    }
+    let equal_rows = l * r / ndv_l.max(ndv_r).max(1.0);
+    Some(match tp {
+        // An outer join keeps at least the preserved side, except when the
+        // null-supplying side has no statistics at all: TiDB then reports the
+        // key-NDV count (`t4 ⟕ (…)` with a pseudo t4 → 4.995 ≈ 5.00, not the
+        // 9990-row preserved probe).
+        JoinType::LeftOuter => {
+            if super::explain::is_pseudo_plan(right) {
+                equal_rows
+            } else {
+                equal_rows.max(l)
+            }
+        }
+        JoinType::RightOuter => {
+            if super::explain::is_pseudo_plan(left) {
+                equal_rows
+            } else {
+                equal_rows.max(r)
+            }
+        }
+        JoinType::Inner => equal_rows,
+        // Semi/anti and cartesian joins keep their dedicated estimates.
+        _ => return None,
+    })
+}
+
 fn est_rows_of(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableReader { row_count, .. } => row_count.abs(),
@@ -11846,6 +12557,7 @@ fn inl_join_hint_plan(
                 rows: inner_rows,
                 filter_rows: build_rows,
                 pseudo: table_stats.is_none(),
+                partial: None,
             }),
             pushed: None,
         };
@@ -13392,8 +14104,16 @@ fn access_plan(
                 stats,
                 current_db,
             );
-            if let PhysicalPlan::TableReader { range_scan, .. } = &mut plan {
+            if let PhysicalPlan::TableReader {
+                range_scan,
+                filter_est,
+                ..
+            } = &mut plan
+            {
                 *range_scan = Some(range);
+                // TiDB sizes an integer PK handle range from the handle
+                // column's statistics (`GetRowCountByIntColumnRanges`).
+                *filter_est = int_handle_range_rows(from, info, stats, current_db, selection);
             }
             return plan;
         }
@@ -13414,6 +14134,11 @@ fn access_plan(
                     if !point_value_hits_float(info, column, value) {
                         return PhysicalPlan::TableDual { row_count: 0 };
                     }
+                    if !point_value_fits_column(info, column, value) {
+                        // Lossy literal: TiDB keeps the equality as a cop
+                        // filter (an index range would mask it).
+                        return index_plan(select, from, info, index, prune_mode, &join_keys);
+                    }
                     return PhysicalPlan::PointGet {
                         table: from.resolve_name().to_string(),
                         handle: None,
@@ -13432,7 +14157,9 @@ fn access_plan(
                 }
                 // unanalyzed tables keep the index path.
                 // after ANALYZE, TopN/NDV drives TableReader vs index.
-                if let Some(eq_rows) = eq_row_count_value(stats, from, current_db, column, value) {
+                if let Some(eq_rows) = index_equality_rows(
+                    info, index, select, stats, from, current_db, column, value,
+                ) {
                     let scan_rows = table_row_count(stats, from, current_db);
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
                         return partitioned_table_reader(
@@ -13528,6 +14255,7 @@ fn access_plan(
             if let PhysicalPlan::TableReader {
                 range_scan,
                 filter_est,
+                row_count,
                 ..
             } = &mut plan
             {
@@ -13536,6 +14264,9 @@ fn access_plan(
                 // statistics; the clustered index carries no histogram yet, so
                 // the range falls back to the realtime table count.
                 *filter_est = clustered_range_rows(from, info, stats, current_db, selection);
+                if std::env::var("SEALDB_DEBUG_CLUSTERRANGE").is_ok() {
+                    eprintln!("CHBRANCH table={} range={:?} filter_est={:?} row_count={}", from.name, &range_scan, filter_est, row_count);
+                }
             }
             return plan;
         }
@@ -13574,6 +14305,20 @@ fn access_plan(
                 .find(|idx| index_covers_needed(idx, select, &join_keys, info, from))
         {
             return index_plan(select, from, info, index, prune_mode, &join_keys);
+        }
+        // `ORDER BY` an index key prefix: TiDB reads the index in key order
+        // (`IndexFullScan … keep order:true`) and probes the table for the
+        // remaining columns, which beats a table scan plus `Sort`.
+        if let Some(plan) = order_by_index_plan(
+            select,
+            from,
+            info,
+            prune_mode,
+            &join_keys,
+            stats,
+            current_db,
+        ) {
+            return plan;
         }
         return partitioned_table_reader(
             from,
@@ -13630,6 +14375,146 @@ fn handle_scan_range(selection: &ExprNode, handle: &str) -> Option<String> {
         return None;
     }
     Some(sealdb_statistics::pseudo::ranges_text(&ranges))
+}
+
+/// `ORDER BY` a secondary index key prefix: TiDB reads the index in key order
+/// and probes the table for the remaining columns
+/// (`IndexLookUp → IndexFullScan(Build) keep order:true / TableRowIDScan(Probe)`),
+/// which beats a table scan plus `Sort`. Only a *full* index read provides the
+/// order, so an ordered prefix that is already a decided range keeps its own
+/// access path.
+fn order_by_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+    join_keys: &[String],
+    stats: Option<&Handle>,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    if select.order_by.is_empty() || select.selection.is_some() {
+        return None;
+    }
+    // Only a single-table plan can be satisfied by the table's own index.
+    if select.join_tables().len() > 1 {
+        return None;
+    }
+    let mut columns = Vec::with_capacity(select.order_by.len());
+    for item in &select.order_by {
+        let ExprNode::Column(col) = &item.expr else {
+            return None;
+        };
+        // `keep order:true, desc` needs the reverse index scan; only the
+        // ascending shape is modeled.
+        if item.desc {
+            return None;
+        }
+        columns.push(col.name.clone());
+    }
+    let index = info
+        .indices
+        .iter()
+        .filter(|idx| {
+            !(idx.primary && info.pk_is_clustered())
+                && !index_ignored(from, idx.name.o())
+                && !super::expr_index::has_expression_part(info, idx)
+        })
+        .find(|idx| {
+            let keys = index_key_column_names(info, idx);
+            keys.len() >= columns.len()
+                && keys
+                    .iter()
+                    .zip(&columns)
+                    .all(|(key, col)| key.eq_ignore_ascii_case(col))
+        })?;
+    if index_covers_needed(index, select, join_keys, info, from) {
+        // A covering index is the plain projection path's job.
+        return None;
+    }
+    let mut plan = index_plan(select, from, info, index, prune_mode, join_keys);
+    if partition_read_spans_multiple(info, from) {
+        // Rows arrive partition by partition, so the index keys only order each
+        // partition, not the whole result.
+        return None;
+    }
+    if let PhysicalPlan::IndexLookUpReader {
+        pushed,
+        row_count,
+        ..
+    } = &mut plan
+    {
+        // The index read scans every key, so the cop task sizes the scan (and
+        // the table probe) at the table's row count.
+        *row_count = table_row_count(stats, from, current_db);
+        if in_explain_build() {
+            *pushed = Some(bytes_info("KEEP_ORDER"));
+        }
+        return Some(plan);
+    }
+    None
+}
+
+/// A read of a partitioned table that spans more than one partition returns its
+/// rows partition by partition, so handle and index order are not global.
+fn partition_read_spans_multiple(info: &sealdb_meta::TableInfo, from: &TableName) -> bool {
+    let Some(part) = info.partition.as_ref() else {
+        return false;
+    };
+    if from.partition_names.is_empty() {
+        part.definitions.len() > 1 || part.num > 1
+    } else {
+        from.partition_names.len() > 1
+    }
+}
+
+fn select_spans_multiple_partitions(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    is.and_then(|schema| schema.table_by_name(&db, &table))
+        .is_some_and(|info| partition_read_spans_multiple(info, from))
+}
+
+/// The plan already yields its rows in `ORDER BY` order (a full index read
+/// whose key prefix matches the sort), so no `Sort` is needed.
+fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {    if select.order_by.is_empty() {
+        return false;
+    }
+    // Only a full index scan keeps key order; a decided range carries its own
+    // `keep order` flag (and `Sort` semantics) in EXPLAIN. A multi-partition
+    // read returns rows partition by partition, so the keys are not ordered
+    // across the whole result.
+    let keys = match plan {
+        PhysicalPlan::IndexLookUpReader {
+            index_columns,
+            range_scan: None,
+            ..
+        }
+        | PhysicalPlan::IndexReader {
+            index_columns,
+            range_scan: None,
+            ..
+        } => index_columns,
+        _ => return false,
+    };
+    let mut keys = keys.iter();
+    for item in &select.order_by {
+        let ExprNode::Column(col) = &item.expr else {
+            return false;
+        };
+        let Some(key) = keys.next() else {
+            return false;
+        };
+        if item.desc || !key.eq_ignore_ascii_case(&col.name) {
+            return false;
+        }
+    }
+    true
 }
 
 /// TiDB constant folding: int handle accepts string/float numeric literals (`a = '1'`).

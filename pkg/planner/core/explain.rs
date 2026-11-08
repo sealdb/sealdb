@@ -180,6 +180,9 @@ pub fn explain_analyze_result(
 }
 
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
+    if std::env::var("SEALDB_DEBUG_PLAN").is_ok() {
+        debug_log(&format!("PLANDBG {plan:#?}"));
+    }
     let mut rows = Vec::new();
     let mut deferred: Vec<PhysicalPlan> = Vec::new();
     // TiDB renders `NULL` in the access-object column for every node without an
@@ -215,6 +218,20 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     }
     PINNED_PARTITION.with(|c| c.set(false));
     rows
+}
+
+pub(crate) fn debug_log(msg: &str) {
+    use std::io::Write;
+    if std::env::var("SEALDB_DEBUG_PLAN").is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sealdb-debug.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 thread_local! {
@@ -394,16 +411,28 @@ fn walk_with_parent(
         let trivial = exprs
             .iter()
             .all(|e| e.starts_with("col") && !e.contains("->") && !e.contains("Column#"));
-        let cte_seed_cols = exprs.iter().all(|e| {
+        // Plain column references, possibly qualified (`c1` / `t.c1` /
+        // `db.t.c1`): TiDB's projection elimination drops a CTE seed's
+        // column-name projection, so the parent join/sort node takes the label
+        // instead. A qualified list only reaches this path from a handle-ordered
+        // scan (`ORDER BY <pk>` → `keep order:true`), whose seed projection is
+        // the same identity list; a SELECT-list projection above a Sort is a
+        // real output node and stays.
+        let plain_cols = exprs.iter().all(|e| {
             !e.contains("->")
                 && !e.contains('(')
                 && !e.contains(',')
-                && !e.contains('.')
                 && !e.is_empty()
-        }) && matches!(
-            parent,
-            Some(PhysicalPlan::MergeJoin { .. } | PhysicalPlan::Sort { .. })
-        );
+                && e.chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        });
+        let any_qualified = exprs.iter().any(|e| e.contains('.'));
+        let cte_seed_cols = plain_cols
+            && match parent {
+                Some(PhysicalPlan::MergeJoin { .. }) => true,
+                Some(PhysicalPlan::Sort { .. }) => !any_qualified,
+                _ => false,
+            };
         if trivial || cte_seed_cols {
             return walk_with_parent(
                 child,
@@ -485,12 +514,21 @@ fn walk_with_parent(
         // HashJoin / MergeJoin: children_of lists right(Build) then left(Probe).
         // A RIGHT JOIN is executed with the left, null-supplying side as build.
         Some(PhysicalPlan::HashJoin {
-            left, right, tp, ..
+            left, right, tp, on, ..
         }) => {
-            // Build is the hashed (smaller) input; a RIGHT JOIN picks it by
-            // cardinality exactly like `children_of` above.
-            let right_outer = matches!(tp, JoinType::RightOuter);
-            let right_smaller = !right_outer || est_rows(right) < est_rows(left);
+            // Build is the hashed input. A LEFT JOIN normally hashes the right
+            // (null-supplying) side; when that side is an unanalyzed pseudo
+            // scan the smaller spine is drawn as Build (`t4 ⟕ …` → 4.00 first).
+            let right_smaller = if matches!(tp, JoinType::RightOuter) {
+                est_rows(right) < est_rows(left)
+            } else if matches!(tp, JoinType::LeftOuter)
+                && join_on_has_equijoin(on)
+                && is_pseudo_plan(right)
+            {
+                est_rows(right) <= est_rows(left)
+            } else {
+                true
+            };
             let (build, probe) = if right_smaller {
                 (explain_plan_ptr(right), explain_plan_ptr(left))
             } else {
@@ -610,6 +648,10 @@ fn walk_with_parent(
     let under_window = matches!(parent, Some(PhysicalPlan::Window { .. }));
     if topn_parent.is_some() && matches!(plan, PhysicalPlan::IndexReader { .. }) {
         info = "index:TopN".to_string();
+    }
+    // TiDB pushes TopN into the cop task when the sort keys are table columns.
+    if topn_parent.is_some() && matches!(plan, PhysicalPlan::TableReader { .. }) {
+        info = "data:TopN".to_string();
     }
     if let Some((agg_name, _, cop_info, _)) = stream_parent {
         if matches!(plan, PhysicalPlan::TableReader { .. }) && !cop_info.is_empty() {
@@ -1542,6 +1584,56 @@ fn emit_cop_children(
             }
             // Clustered handle range: TiDB scans the PK as a table range
             // (`TableRangeScan`), eliding the pushed Selection row.
+            if let Some((by_info, offset, count)) = topn_parent {
+                let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                let cop_spine = cop_owned.as_slice();
+                let mut scan_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    scan_spine.push(false);
+                }
+                let keep = if *stats_pseudo {
+                    "keep order:false, stats:pseudo".to_string()
+                } else {
+                    "keep order:false".to_string()
+                };
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TopN",
+                        est: count as f64,
+                        task: scan_task,
+                        access: String::new(),
+                        info: format!("{by_info}, offset:{offset}, count:{count}"),
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableFullScan",
+                        est: scan_est,
+                        task: scan_task,
+                        access: scan_access,
+                        info: keep,
+                    },
+                    if under_bushy {
+                        if scan_spine.is_empty() {
+                            cop_spine
+                        } else {
+                            &scan_spine
+                        }
+                    } else {
+                        &[]
+                    },
+                );
+                return true;
+            }
             if *data_limit {
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
@@ -1573,7 +1665,11 @@ fn emit_cop_children(
                         est: 1.0,
                         task: scan_task,
                         access: scan_access,
-                        info: "keep order:true, desc, stats:pseudo".to_string(),
+                        info: if *stats_pseudo {
+                            "keep order:true, desc, stats:pseudo".to_string()
+                        } else {
+                            "keep order:true, desc".to_string()
+                        },
                     },
                     if under_bushy { &scan_spine } else { &[] },
                 );
@@ -2089,11 +2185,16 @@ fn emit_cop_children(
             // Planner-built access range: predicates on the index prefix became
             // `range:…`; leftovers stay a cop Selection above the scan.
             if let Some(range) = range_scan {
-                let keep = if range.pseudo {
+                let mut keep = if range.pseudo {
                     format!("range:{}, keep order:false, stats:pseudo", range.text)
                 } else {
                     format!("range:{}, keep order:false", range.text)
                 };
+                if let Some(missing) = &range.partial {
+                    keep.push_str(", stats:partial[");
+                    keep.push_str(&missing.replace(',', ":missing, "));
+                    keep.push_str(":missing]");
+                }
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
                 let mut scan_spine = cop_spine.to_vec();
@@ -2606,6 +2707,13 @@ fn emit_cop_children(
             }
             let info = if tid_sel.is_some() {
                 "keep order:false, stats:pseudo".to_string()
+            } else if keep_order_pushed(pushed.as_ref()) {
+                // `ORDER BY` the index key: the index scan yields key order.
+                if *row_count >= 9_000.0 {
+                    "keep order:true, stats:pseudo".to_string()
+                } else {
+                    "keep order:true".to_string()
+                }
             } else if probe_selection_info.is_some() {
                 // Probe-side filters display as `Selection(Probe)`, not scan pushdown.
                 if *row_count >= 9_000.0 {
@@ -3612,11 +3720,11 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         } => vec![child.as_ref(), probe.as_ref()],
         PhysicalPlan::Apply { child, .. } => vec![child.as_ref()],
         // TiDB HashJoin lists Build before Probe. Inner joins build the right
-        // (smaller, reordered) side; a RIGHT JOIN builds whichever input is
-        // smaller — the preserved 2244-row side over a 4509-row probe, or a
-        // 2-row build subtree over a 4-row preserved side.
+        // (smaller, reordered) side; an outer join hashes whichever input is
+        // smaller — the preserved 4-row spine over a 9990-row pseudo probe, or
+        // a 2-row build subtree over a 4-row preserved side.
         PhysicalPlan::HashJoin {
-            left, right, tp, ..
+            left, right, tp, on, ..
         } => {
             if matches!(tp, JoinType::RightOuter) {
                 if est_rows(right) < est_rows(left) {
@@ -3624,6 +3732,12 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
                 } else {
                     vec![left.as_ref(), right.as_ref()]
                 }
+            } else if matches!(tp, JoinType::LeftOuter)
+                && join_on_has_equijoin(on)
+                && is_pseudo_plan(right)
+                && est_rows(left) < est_rows(right)
+            {
+                vec![left.as_ref(), right.as_ref()]
             } else {
                 vec![right.as_ref(), left.as_ref()]
             }
@@ -3671,9 +3785,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Insert { .. } => ("Insert".to_string(), String::new(), "N/A".to_string()),
 
+        // TiDB `MemTableScan`: the infoschema table's canonical (upper-case)
+        // name, not the identifier the statement used.
         PhysicalPlan::InfoSchema { table } => (
-            "MemTable".to_string(),
-            format!("table:{table}"),
+            "MemTableScan".to_string(),
+            format!("table:{}", table.to_uppercase()),
             String::new(),
         ),
         PhysicalPlan::Update { .. } => ("Update".to_string(), String::new(), "N/A".to_string()),
@@ -3971,6 +4087,27 @@ fn is_column_eq_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
                 && matches!(*bin.left, ExprNode::Column(_))
                 && matches!(*bin.right, ExprNode::Column(_))
     )
+}
+
+/// The two column references of a `column = column` conjunct name different
+/// tables (`t2.c2 = t1.c2`), i.e. an outer (correlated) reference.
+fn column_eq_is_cross_table(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let conjuncts = filter.split_cnf();
+    let [ExprNode::Binary(bin)] = conjuncts.as_slice() else {
+        return false;
+    };
+    if bin.op != Op::Eq {
+        return false;
+    }
+    match (&*bin.left, &*bin.right) {
+        (ExprNode::Column(l), ExprNode::Column(r)) => match (&l.table, &r.table) {
+            (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
@@ -4311,7 +4448,14 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             {
                 est_rows(child) * 0.8
             } else if n > 0 && n == filter.split_cnf().len() {
-                est_rows(child) * 0.999_f64.powi(n as i32)
+                // TiDB sizes null rejection from the column's real
+                // `count - null_count`; only pseudo statistics fall back to the
+                // 1/1000 `pseudoEqualRate` deduction (10000 → 9990).
+                if is_pseudo_plan(child) {
+                    est_rows(child) * 0.999_f64.powi(n as i32)
+                } else {
+                    est_rows(child)
+                }
             } else if let Some(sel) = filter_selectivity(filter) {
                 // A cast comparison keeps TiDB's default factor; OR arms
                 // combine as `1 - Π(1 - s)` (DNF selectivity).
@@ -4336,8 +4480,14 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         }
         PhysicalPlan::TableReader {
             filter_est: Some(est),
+            table,
             ..
-        } => *est,
+        } => {
+            if std::env::var("SEALDB_DEBUG_CLUSTERRANGE").is_ok() {
+                eprintln!("ESTROWS TableReader {table} filter_est={est}");
+            }
+            *est
+        }
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
@@ -4350,18 +4500,34 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
+            stats_pseudo,
             ..
         } if is_not_isnull(filter) => {
-            let n = not_isnull_count(filter).max(1);
-            (*row_count * 0.999_f64.powi(n as i32)).min(9_990.0)
+            // Pseudo stats deduct `row_count / pseudoEqualRate` per rejected
+            // null predicate; analyzed tables keep the scan count.
+            if *stats_pseudo {
+                let n = not_isnull_count(filter).max(1);
+                (*row_count * 0.999_f64.powi(n as i32)).min(9_990.0)
+            } else {
+                *row_count
+            }
         }
         // TiDB `selectionFactor` on a column-vs-column equality (`a = b` over
-        // 10000 pseudo rows estimates 8000).
+        // 10000 pseudo rows estimates 8000). A cross-table equality pushed into
+        // a single table's scan is a correlated (Apply) predicate: the outer
+        // value is fixed per row, so TiDB estimates it like `col = const`
+        // (`t2.c2 = t1.c2` over 10000 pseudo rows estimates 10).
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
             ..
-        } if is_column_eq_filter(filter) => *row_count * 0.8,
+        } if is_column_eq_filter(filter) => {
+            if column_eq_is_cross_table(filter) {
+                (*row_count * 0.001).max(1.0)
+            } else {
+                *row_count * 0.8
+            }
+        }
         // Each equality on a *distinct* column contributes its own 1/1000
         // pseudo factor (`a = 1 AND b = 2` estimates 0.01, not one match).
         PhysicalPlan::TableReader {
@@ -4440,6 +4606,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: None,
             ..
         } => *row_count,
+        PhysicalPlan::IndexLookUpReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if keep_order_pushed(Some(filter)) => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(filter),
             row_count,
@@ -4777,7 +4948,7 @@ fn bushy_cop_spine(
 }
 
 /// True when the subtree's base scan is an unanalyzed pseudo scan.
-fn is_pseudo_plan(plan: &PhysicalPlan) -> bool {
+pub fn is_pseudo_plan(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::TableReader { stats_pseudo, .. } => *stats_pseudo,
         PhysicalPlan::Selection { child, .. }
