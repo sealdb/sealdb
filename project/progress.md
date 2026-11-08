@@ -1843,6 +1843,26 @@
 - **下一步**:
   - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_stats` / `topn_push_down` 等
 
+### 2026-11-08（`explain_join_stats` 波）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - Statistics：`IndexStats::stats_ver` 落库/持久化/JSON 解析。TiDB `TableStatsFromJSON` 对无 `stats_ver` 但 histogram NDV>0 的 JSON 判为 v1；v1 的 histogram 已包含 TopN 行，`TotalRowCount` 不再重复加 TopN（v2 才加）。`idx_b = 22336` 因此取 TopN 精确值 `19977`，不再被 `realtime / total` 缩放成 `19593.26`
+  - Planner：`is_pseudo_card` 只认 10000 / 9990 两个伪统计默认值，已 analyze 的 19977 不再被当成伪统计走 `min * 1.25`
+  - Planner：标量聚合跨 join 时的输出列号按 DataSource schema 顺序分配（`e(a,b)` + `lo(a,_tidb_rowid)` → `Column#5`），与 TiDB `AllocPlanColumnID` 一致
+  - Planner：`/*+ TIDB_INLJ(e) */` 的内表按 join key 首列选二级索引，产出 `IndexLookUp` 探针：`decided range` 只编码 join key，key 的 null-reject 是 `Selection(Build)` + `IndexRangeScan`，表侧谓词留在 `Selection(Probe)`；`IndexJoin` 行数用 `outer * inner / max(NDV)`
+  - Planner：逗号 join 解析为 `Cross`，其 WHERE 等值仍作为 join key；hint 形状替换整条语句计划后重新挂上标量 `count(*)` 的 `HashAgg`
+  - EXPLAIN：`IndexRangeScan` 输出是 Build 侧基数，`Selection(Build)` 与 `TableRowIDScan` 显示 build 后的行数而不是探针估计；`Selection(Build)` 的基数只受 index 侧残差影响，探针侧谓词不再缩小它
+  - Statistics：`pseudo::filter_rows` 对 `cast(col AS double) = 0` 这类不透明表达式保留 0.8 选择率，不再当列等值按 NDV 计算（`point_get_plan` 的 `Selection(Build)` 复原为 `8.00`）
+- **验证**:
+  - `explain_join_stats`：Mem/TiKV `PASS`（两条语句全对齐：无 hint 的 `HashJoin` + `idx_b` 探针、`TIDB_INLJ(e)` 的 `IndexJoin` + `idx_a` decided range）
+  - `run-tests.sh`（green，Mem+TiKV）→ PASS: memory=44 tikv=43
+  - `cargo test -p sealdb-statistics -p sealdb-planner` 全绿
+- **阻塞/风险**:
+  - 无新增；`explain_join_stats` 已转 `green`（43 → 44 套件）
+- **下一步**:
+  - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
+
 ### 2026-10-19
 
 **决策落地**
