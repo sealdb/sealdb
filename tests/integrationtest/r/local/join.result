@@ -9,23 +9,23 @@ id	name	tag
 1	a	x
 SELECT t1.id, t2.tag FROM itest.t1 LEFT JOIN itest.t2 ON t1.id = t2.id ORDER BY t1.id;
 id	tag
-NULL	NULL
 1	x
+2	NULL
 SELECT t1.id, t1.name, t2.tag FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id WHERE t1.id = 1;
 id	name	tag
 1	a	x
 SELECT t1.id, t2.tag FROM itest.t1 CROSS JOIN itest.t2 ORDER BY t1.id, t2.tag;
 id	tag
 1	x
-1	x
-3	y
-3	y
+1	y
+2	x
+2	y
 SELECT t1.id, t2.tag FROM itest.t1, itest.t2 ORDER BY t1.id, t2.tag;
 id	tag
 1	x
-1	x
-3	y
-3	y
+1	y
+2	x
+2	y
 CREATE TABLE itest.t3 (id INT, note VARCHAR(20));
 INSERT INTO itest.t3 VALUES (1, 'n');
 SELECT t1.id, t2.tag, t3.note FROM itest.t1 JOIN itest.t2 ON t1.id = t2.id JOIN itest.t3 ON t2.id = t3.id;
@@ -64,9 +64,9 @@ SELECT * FROM (SELECT * FROM (SELECT id FROM itest.t1 WHERE id = 2) a) b;
 id
 2
 SELECT id, (SELECT tag FROM itest.t2 WHERE t2.id = t1.id) FROM itest.t1 ORDER BY id;
-id	(SELECT `tag` FROM `itest`.`t2` WHERE `t2`.`id` = `t1`.`id`)
+id	(SELECT tag FROM itest.t2 WHERE t2.id = t1.id)
 1	x
-2	y
+2	NULL
 SELECT (SELECT 1);
 (SELECT 1)
 1

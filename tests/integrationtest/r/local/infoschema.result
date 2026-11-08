@@ -17,9 +17,9 @@ itest	CREATE DATABASE `itest` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
 SHOW CREATE TABLE itest.t;
 Table	Create Table
 t	CREATE TABLE `t` (
-  `id` int,
-  `name` varchar(20)
-)
+  `id` int DEFAULT NULL,
+  `name` varchar(20) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
 SHOW FULL COLUMNS FROM itest.t;
 Field	Type	Collation	Null	Key	Default	Extra	Privileges	Comment
 id	int	NULL	YES		NULL		select,insert,update,references	

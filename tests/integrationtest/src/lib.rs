@@ -379,11 +379,21 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             sorted = false;
         }
     }
+    // mysql-tester executes the trailing buffer at EOF, so a `.test` file may
+    // end without `;` (`explain_complex_stats` ends on `set @@sql_mode=default`).
     if !buf.trim().is_empty() {
-        return Err(Error::new(
-            sealdb_errno::ERR_PARSE_ERROR,
-            format!("unterminated statement: {}", buf.trim()),
-        ));
+        steps.push(Step {
+            sql: buf.trim().to_string(),
+            expected_error,
+            sorted,
+            show_warnings: warnings_enabled,
+            echo: None,
+            log_result: result_log,
+            show_info: info_enabled,
+            replace_regex,
+            replace_column,
+            directive: None,
+        });
     }
     Ok(steps)
 }
@@ -1023,8 +1033,29 @@ fn normalize_partition_ids(rest: &str) -> String {
     out
 }
 
-fn run_backend(
-    suites: &[Suite],
+/// Drop every non-system schema so a persistent TiKV cluster starts a run with
+/// the empty catalog a fresh TiDB instance would have.
+fn reset_tikv_schemas(storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
+    let session = new_session(storage);
+    let listed = session.execute_stmt(
+        "SELECT SCHEMA_NAME FROM information_schema.schemata ORDER BY SCHEMA_NAME",
+    )?;
+    for row in listed.rows {
+        let Some(name) = row.first().map(|d| d.display()) else {
+            continue;
+        };
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "information_schema" | "mysql" | "performance_schema" | "metrics_schema" | "sys"
+        ) {
+            continue;
+        }
+        let _ = session.execute_stmt(&format!("DROP DATABASE IF EXISTS `{name}`"));
+    }
+    Ok(())
+}
+
+fn run_backend(    suites: &[Suite],
     backend: StoreBackend,
     opts: &RunOptions,
     record: bool,
@@ -1051,10 +1082,15 @@ fn run_backend(
         // MemStorage snapshots clone the whole map, so keeping every earlier
         // suite's rows alive makes later suites quadratic. TiDB runs each test
         // file against a fresh instance, so the memory backend does the same;
-        // TiKV keeps one persistent cluster and drops each suite's database.
+        // TiKV keeps one persistent cluster, so it drops every earlier suite's
+        // schema instead (an unfiltered `information_schema.views` query must
+        // not see another file's leftovers).
         let storage = match backend {
             StoreBackend::Memory => open_storage(backend, opts.pd.as_deref())?,
-            StoreBackend::Tikv => Arc::clone(&shared),
+            StoreBackend::Tikv => {
+                reset_tikv_schemas(Arc::clone(&shared))?;
+                Arc::clone(&shared)
+            }
         };
         if record {
             record_suite(suite, Arc::clone(&storage))?;
