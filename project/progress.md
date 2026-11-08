@@ -32,6 +32,15 @@
 
 实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
 
+> **收尾阶段待办（已定稿，暂不执行）— 产品命名 TiDB → SealDB**
+> 目的：计算层归属叙述用 SealDB/sealdb，不再以 TiDB 自称；对标复刻期间先保持现状，最后一阶段统一改。
+> 现状：296 个文件、149 条 commit body、20 条 subject 出现 TiDB 字样。
+> 口径三分：
+> 1. **对外兼容契约不动**：`tidb_*` / `@@tidb_*` session 变量名、TiDB 专有语法关键字（改了就与客户端/语料不兼容）。
+> 2. **内部标识符改**：如 `TiDBDialect` → `SealDBDialect`、内部 `tidb_` 前缀辅助函数/类型/测试名 → `sealdb_`。
+> 3. **出处说明保留**：注释/文档中“TiDB 在 `xxx.go` 如何实现”是对齐依据，必须留；只把“我们做了什么”的自述改成 SealDB 口径。
+> 历史 commit 不重写（保留 hash）；仅约束收尾阶段之后的提交。
+
 ### 2.0 今日 R1 `select` 落地（2026-11-05）
 
 | 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
