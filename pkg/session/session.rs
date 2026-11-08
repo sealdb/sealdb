@@ -636,6 +636,9 @@ impl Session {
         // `ENUM`/`SET` numeric constants become member labels before planning so
         // index point gets encode the stored label (`a = 1` → `a = 'a'`).
         sealdb_planner::normalize_enum_constants(&mut expanded, Some(&is), &current_db);
+        // String-vs-number comparisons get a `double` cast on the column before
+        // planning (and execution) so point gets and residuals agree.
+        sealdb_planner::normalize_comparison_literals(&mut expanded, Some(&is), &current_db);
         // `NATURAL JOIN` has no schema at parse time: resolve common columns
         // against the catalog before planning (TiDB buildNaturalJoin).
         if sealdb_planner::stmt_has_natural_join(&expanded) {

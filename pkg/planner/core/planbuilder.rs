@@ -95,6 +95,17 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // A string column compared with a number needs a `double` cast
+                // on the column side (TiDB comparison type rules); the cast also
+                // rules out point-get access on that key.
+                let coerced_select;
+                let select = match coerce_comparison_literals(select, is, current_db) {
+                    Some(coerced) => {
+                        coerced_select = coerced;
+                        &coerced_select
+                    }
+                    None => select,
+                };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` and plans a zero-row TableDual.
                 if let Some(ExprNode::Value(ValueExpr {
@@ -4835,6 +4846,103 @@ fn normalize_bit_expr(
     }
 }
 
+/// Apply TiDB comparison type rules to a single-table SELECT before planning.
+///
+/// A string column compared with a number becomes
+/// `eq(cast(col, double BINARY), n)`, which also rules out a point get —
+/// TiDB `canBeConvertedToColumnType` refuses the key when it needs the cast.
+fn coerce_comparison_literals(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let selection = select.selection.as_ref()?;
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    let coerced = expand_casted_in_lists(&coerce_numeric_literals(selection, info));
+    if coerced.restore_string() == selection.restore_string() {
+        return None;
+    }
+    let mut out = select.clone();
+    out.selection = Some(coerced);
+    Some(out)
+}
+
+/// `in(cast(col, double BINARY), 0, 1)` → `or(eq(cast(…), 0), eq(cast(…), 1))`:
+/// a cast key cannot drive an IN range, so TiDB keeps one equality per value.
+fn expand_casted_in_lists(expr: &ExprNode) -> ExprNode {
+    match expr {
+        ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(expand_casted_in_lists(&bin.left)),
+            right: Box::new(expand_casted_in_lists(&bin.right)),
+            single_cnf_item: bin.single_cnf_item,
+        }),
+        ExprNode::InList(list) if !list.not && matches!(&*list.expr, ExprNode::Cast(_)) => {
+            let items: Option<Vec<ExprNode>> = list
+                .list
+                .iter()
+                .map(|item| (item.const_datum().is_some()).then(|| expand_casted_in_lists(item)))
+                .collect();
+            let Some(items) = items.filter(|items| !items.is_empty()) else {
+                return ExprNode::InList(list.clone());
+            };
+            let mut arms = items.into_iter().map(|item| {
+                ExprNode::Binary(BinaryOpExpr {
+                    op: Op::Eq,
+                    left: Box::new((*list.expr).clone()),
+                    right: Box::new(item),
+                    single_cnf_item: false,
+                })
+            });
+            let first = arms.next().expect("non-empty IN list");
+            arms.fold(first, |acc, arm| {
+                ExprNode::Binary(BinaryOpExpr {
+                    op: Op::LogicOr,
+                    left: Box::new(acc),
+                    right: Box::new(arm),
+                    single_cnf_item: false,
+                })
+            })
+        }
+        ExprNode::InList(list) => {
+            let mut out = list.clone();
+            out.expr = Box::new(expand_casted_in_lists(&list.expr));
+            out.list = out.list.iter().map(expand_casted_in_lists).collect();
+            ExprNode::InList(out)
+        }
+        ExprNode::Unary(unary) => {
+            let mut out = unary.clone();
+            out.expr = Box::new(expand_casted_in_lists(&unary.expr));
+            ExprNode::Unary(out)
+        }
+        ExprNode::IsNull(isnull) => {
+            let mut out = isnull.clone();
+            out.expr = Box::new(expand_casted_in_lists(&isnull.expr));
+            ExprNode::IsNull(out)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Rewrite comparison literals in a statement's WHERE before planning so the
+/// executor re-reading the statement sees the same casts as the plan.
+pub fn normalize_comparison_literals(
+    stmt: &mut Statement,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) {
+    if let Statement::Select(select) = stmt
+        && let Some(coerced) = coerce_comparison_literals(select, is, current_db)
+    {
+        *select = coerced;
+    }
+}
+
 /// `FLOAT` columns store float32: a constant that does not round-trip through
 /// float32 can never equal a stored value, so the access path is empty.
 fn point_value_hits_float(info: &sealdb_meta::TableInfo, column: &str, value: &Datum) -> bool {
@@ -5730,6 +5838,18 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                     && let Some(datum) = bytes_number(&left)
                 {
                     left = value_expr(datum);
+                }
+            }
+            // Arithmetic on a string column evaluates as `double` on both sides.
+            if matches!(
+                bin.op,
+                Op::Plus | Op::Minus | Op::Mul | Op::Div | Op::IntDiv | Op::Mod
+            ) {
+                if column_class(&left, info) == Some(ColumnClass::String) {
+                    left = cast_double(left);
+                }
+                if column_class(&right, info) == Some(ColumnClass::String) {
+                    right = cast_double(right);
                 }
             }
             ExprNode::Binary(BinaryOpExpr {
