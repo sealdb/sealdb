@@ -1777,6 +1777,28 @@
 - **下一步**:
   - F02 `CREATE/DROP TABLE` 写兼容 meta key
 
+### 2026-11-08（SQL 文本保真 + 测试基线修正波）
+
+- **Phase**: 跨波次基础修正
+- **完成**:
+  - Parser/Session/Server：SQL 重写不再用 `bytes[i] as char` 拼接（该写法把 UTF-8 字节按 Latin-1 重新编码）。`rewrite_primary_key_nonclustered`、`bind_sql`（`EXECUTE … USING`）、`bind_placeholders`（COM_STMT_EXECUTE）、`normalize_sql` 全部改为按字符拷贝，`INSERT … VALUES ('孵')` / `SELECT '孵'` 不再输出 `å\u{ad}µ`
+  - Parser：`PREPARE s FROM 'SELECT ''a'', ?'` 保留完整语句文本（原先在成对引号的第一处截断，只剩 `SELECT `）；`take_explain_format` 扫描时解开 `''` 转义
+  - Parser：`.test` 末尾无 `;` 的语句按 mysql-tester EOF 语义执行（`explain_complex_stats` 以 `set @@sql_mode=default` 收尾）
+  - Session：`system_var_result` 只接管“纯常量列表”的无 FROM SELECT；带 WHERE/GROUP BY/ORDER BY/LIMIT/DISTINCT 的查询回到 planner（`SELECT 1 WHERE 0` 原先返回 1 行，现为 `TableDual rows:0`）
+  - Planner：select-list `IN (subq)` / `aggregate(IN)` / `EXISTS … HAVING agg = outer` 三个 decorrelation 形状从“按 suite 名启用”改为按查询结构识别，真实查询同样可走
+  - itest：Memory 后端每套件新建 `MemStorage`（原先共享实例，`begin()` 反复克隆累积行导致全量 gate 卡住）；TiKV 后端每套件前清空全部非系统 schema（TiDB 每文件都是全新实例，未过滤的 `information_schema.views` 不应看到其它文件的残留）
+  - itest：重录 `local/join`、`local/infoschema`（旧 golden 记录的是未对齐 TiDB 的行为：LEFT JOIN 丢未匹配行、CROSS JOIN 只出 2 行、SHOW CREATE TABLE 缺 `DEFAULT NULL`/表选项）
+  - 单测：`lower_0x80` 断言改为二进制 datum（`Datum::Bit`），与 0759561 的十六进制字面量决策一致
+- **验证**:
+  - `./run-tests.sh -s memory --status green,local` → PASS: memory=42
+  - `./run-tests.sh -s tikv --status green,local -k` → PASS: tikv=41（`local/txn` 标 skip_tikv）
+  - `cargo test -p sealdb-parser -p sealdb-bindinfo -p sealdb-server` 全绿
+- **阻塞/风险**:
+  - `cargo test -p sealdb-session` 仍有 15 条历史红灯（`SELECT 1 WHERE 0` 已修，余下为行格式 EXPLAIN 缺 `pushed:`、`t1.name` 列头、cost model / join reorder 断言等），需逐条对照 TiDB 判断是测试过期还是实现缺失；CI 跑 `cargo test --workspace`，需单独一波清理
+  - TiKV 集群被 SIGKILL 掉进程后会残留锁（`Failed to resolve lock` / `timed out locking meta persist`），本地需 `run_local_pd_tikv.sh stop` 后清空 `$SEALDB_CLUSTER_DATA` 重启
+- **下一步**:
+  - R3 `in_progress`：`explain_join_stats`（需 stats 索引等值估计 19977、HashAgg/StreamAgg 选择、`TIDB_INLJ` hint 形状）、`explain_shard_index`、`topn_push_down`、`index_merge`、表达式索引（`explain_easy` 的 `index ((a+b+1))`）
+
 ### 2026-11-08（`explain_foreign_key` 波）
 
 - **Phase**: R3 explain 波
