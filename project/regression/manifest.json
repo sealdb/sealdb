@@ -1186,7 +1186,7 @@
     {
       "name": "explain_join_stats",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_join_stats.test",
       "result": "r/explain_join_stats.result",
       "has_result": true,
