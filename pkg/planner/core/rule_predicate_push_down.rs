@@ -345,6 +345,8 @@ fn push_into(
             partition_names,
             global_index,
             lock,
+            keep_order,
+            desc,
         } => {
             let mut residual: Vec<ExprNode> = conjuncts
                 .into_iter()
@@ -371,6 +373,8 @@ fn push_into(
                     partition_names,
                     global_index,
                     lock,
+                    keep_order,
+                    desc,
                 },
                 residual,
             )

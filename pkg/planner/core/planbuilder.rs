@@ -279,11 +279,18 @@ impl PlanBuilder {
                     if handle_order {
                         plan = set_keep_order(plan);
                     }
+                    // Batch point get walks its keys in order, so an ORDER BY on
+                    // the key needs no Sort (`keep order:true, desc:…`).
+                    let point_order = point_get_order(select, &plan);
+                    if let Some(desc) = point_order {
+                        plan = set_batch_point_order(plan, desc);
+                    }
                     let need_sort = !select.order_by.is_empty()
                         && !order_by_all_constant(select)
                         && !(stream_keep_order && order_prefix_of_group_by(select))
                         && !merge_orders
-                        && !handle_order;
+                        && !handle_order
+                        && point_order.is_none();
                     let join_ordinal_sort = need_sort
                         && !select.joins.is_empty()
                         && select.order_by.iter().all(|item| {
@@ -2958,6 +2965,96 @@ fn order_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &st
     })
 }
 
+/// `ORDER BY` the batch point-get key (index prefix or handle) needs no Sort:
+/// the batch walks its keys in order (`keep order:true, desc:…`).
+/// Returns `Some(descending)` when the sort is satisfied by the key order.
+fn point_get_order(select: &SelectStmt, plan: &PhysicalPlan) -> Option<bool> {
+    let plan = inner_batch_point_get(plan)?;
+    let PhysicalPlan::BatchPointGet {
+        column,
+        index,
+        index_columns,
+        tuple_columns,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    if select.order_by.is_empty() {
+        return None;
+    }
+    let keys: Vec<&String> = if !tuple_columns.is_empty() {
+        tuple_columns.iter().collect()
+    } else if index.is_some() {
+        index_columns.iter().collect()
+    } else {
+        vec![column]
+    };
+    if keys.len() != select.order_by.len() {
+        return None;
+    }
+    let same_direction = select.order_by[0].desc;
+    if select.order_by.iter().any(|item| item.desc != same_direction) {
+        return None;
+    }
+    keys.iter()
+        .zip(select.order_by.iter())
+        .all(|(key, item)| {
+            matches!(&item.expr, ExprNode::Column(col) if col.name.eq_ignore_ascii_case(key))
+        })
+        .then_some(same_direction)
+}
+
+fn set_batch_point_order(plan: PhysicalPlan, desc: bool) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+            filter,
+            child: Box::new(set_batch_point_order(*child, desc)),
+        },
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(set_batch_point_order(*child, desc)),
+        },
+        PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            handles,
+            index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
+            lock,
+            ..
+        } => PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            handles,
+            index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
+            lock,
+            keep_order: true,
+            desc,
+        },
+        other => other,
+    }
+}
+
+fn inner_batch_point_get(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
+    match plan {
+        PhysicalPlan::BatchPointGet { .. } => Some(plan),
+        PhysicalPlan::Selection { child, .. } | PhysicalPlan::Projection { child, .. } => {
+            inner_batch_point_get(child)
+        }
+        _ => None,
+    }
+}
+
 /// Mark the table scan as `keep order:true` (the Sort was dropped).
 fn set_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
@@ -4874,6 +4971,7 @@ fn coerce_comparison_literals(
 
 /// `in(cast(col, double BINARY), 0, 1)` → `or(eq(cast(…), 0), eq(cast(…), 1))`:
 /// a cast key cannot drive an IN range, so TiDB keeps one equality per value.
+/// Row IN lists with a cast position expand to DNF the same way.
 fn expand_casted_in_lists(expr: &ExprNode) -> ExprNode {
     match expr {
         ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
@@ -4882,25 +4980,20 @@ fn expand_casted_in_lists(expr: &ExprNode) -> ExprNode {
             right: Box::new(expand_casted_in_lists(&bin.right)),
             single_cnf_item: bin.single_cnf_item,
         }),
-        ExprNode::InList(list) if !list.not && matches!(&*list.expr, ExprNode::Cast(_)) => {
-            let items: Option<Vec<ExprNode>> = list
+        ExprNode::InList(list) if !list.not && expr_contains_cast(&list.expr) => {
+            let arms: Option<Vec<ExprNode>> = list
                 .list
                 .iter()
-                .map(|item| (item.const_datum().is_some()).then(|| expand_casted_in_lists(item)))
+                .map(|item| in_list_arm(&list.expr, item))
                 .collect();
-            let Some(items) = items.filter(|items| !items.is_empty()) else {
+            let Some(mut arms) = arms else {
                 return ExprNode::InList(list.clone());
             };
-            let mut arms = items.into_iter().map(|item| {
-                ExprNode::Binary(BinaryOpExpr {
-                    op: Op::Eq,
-                    left: Box::new((*list.expr).clone()),
-                    right: Box::new(item),
-                    single_cnf_item: false,
-                })
-            });
-            let first = arms.next().expect("non-empty IN list");
-            arms.fold(first, |acc, arm| {
+            if arms.is_empty() {
+                return ExprNode::InList(list.clone());
+            }
+            let first = arms.remove(0);
+            arms.into_iter().fold(first, |acc, arm| {
                 ExprNode::Binary(BinaryOpExpr {
                     op: Op::LogicOr,
                     left: Box::new(acc),
@@ -4926,6 +5019,68 @@ fn expand_casted_in_lists(expr: &ExprNode) -> ExprNode {
             ExprNode::IsNull(out)
         }
         other => other.clone(),
+    }
+}
+
+fn expr_contains_cast(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Cast(_) => true,
+        ExprNode::Row(row) => row.exprs.iter().any(expr_contains_cast),
+        ExprNode::Binary(bin) => expr_contains_cast(&bin.left) || expr_contains_cast(&bin.right),
+        _ => false,
+    }
+}
+
+/// True when the filter compares a `cast(<column>, …)` result — such a
+/// predicate cannot produce an index range.
+fn selection_has_cast_column(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Cast(cast) => matches!(&*cast.expr, ExprNode::Column(_)),
+        ExprNode::Binary(bin) => {
+            selection_has_cast_column(&bin.left) || selection_has_cast_column(&bin.right)
+        }
+        ExprNode::Unary(unary) => selection_has_cast_column(&unary.expr),
+        ExprNode::InList(list) => {
+            selection_has_cast_column(&list.expr)
+                || list.list.iter().any(selection_has_cast_column)
+        }
+        ExprNode::IsNull(isnull) => selection_has_cast_column(&isnull.expr),
+        _ => false,
+    }
+}
+
+/// One `in` arm: `tuple` for a row list, a bare constant otherwise.
+fn in_list_arm(key: &ExprNode, item: &ExprNode) -> Option<ExprNode> {
+    match (key, item) {
+        (ExprNode::Row(row), ExprNode::Row(tuple)) if row.exprs.len() == tuple.exprs.len() => {
+            let mut eqs = row
+                .exprs
+                .iter()
+                .zip(tuple.exprs.iter())
+                .map(|(column, value)| ExprNode::Binary(BinaryOpExpr {
+                    op: Op::Eq,
+                    left: Box::new(column.clone()),
+                    right: Box::new(value.clone()),
+                    single_cnf_item: false,
+                }));
+            let first = eqs.next()?;
+            Some(eqs.fold(first, |acc, arm| {
+                ExprNode::Binary(BinaryOpExpr {
+                    op: Op::LogicAnd,
+                    left: Box::new(acc),
+                    right: Box::new(arm),
+                    single_cnf_item: false,
+                })
+            }))
+        }
+        (ExprNode::Row(_), _) => None,
+        (_, _) if item.const_datum().is_some() => Some(ExprNode::Binary(BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(key.clone()),
+            right: Box::new(item.clone()),
+            single_cnf_item: false,
+        })),
+        _ => None,
     }
 }
 
@@ -5107,6 +5262,8 @@ fn dnf_unique_point(
         ),
         global_index: index.global,
         lock: false,
+        keep_order: false,
+        desc: false,
     })
 }
 
@@ -5251,6 +5408,8 @@ fn in_list_plan(
         tuple_columns: names,
         global_index: index.global,
         lock: false,
+        keep_order: false,
+        desc: false,
     })
 }
 
@@ -5407,6 +5566,8 @@ fn point_or_batch(
         partition_names,
         global_index: index_global,
         lock: false,
+        keep_order: false,
+        desc: false,
     }
 }
 
@@ -5879,6 +6040,33 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                         .collect();
                 }
                 _ => {}
+            }
+            // `(str_col, int_col) IN ((0, 1), …)`: a string position whose
+            // constants are numbers reads through `cast(col, double)`, which
+            // also rules out a composite point get on that position.
+            if let ExprNode::Row(row) = &*coerced.expr {
+                let mut columns = row.exprs.clone();
+                let mut changed = false;
+                for (pos, column) in columns.iter_mut().enumerate() {
+                    if column_class(column, info) != Some(ColumnClass::String) {
+                        continue;
+                    }
+                    let any_numeric = coerced.list.iter().any(|item| match item {
+                        ExprNode::Row(tuple) => {
+                            tuple.exprs.get(pos).is_some_and(numeric_literal)
+                        }
+                        _ => false,
+                    });
+                    if any_numeric {
+                        *column = cast_double(column.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    coerced.expr = Box::new(ExprNode::Row(
+                        sealdb_parser::ast::expressions::RowExpr { exprs: columns },
+                    ));
+                }
             }
             ExprNode::InList(coerced)
         }
@@ -7508,6 +7696,8 @@ fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
             tuple_columns,
             partition_names,
             global_index,
+            keep_order,
+            desc,
             ..
         } => PhysicalPlan::BatchPointGet {
             table,
@@ -7520,6 +7710,8 @@ fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
             partition_names,
             global_index,
             lock: true,
+            keep_order,
+            desc,
         },
         other => PhysicalPlan::SelectLock {
             child: Box::new(other),
@@ -10420,6 +10612,23 @@ fn access_plan(
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {
             return plan;
+        }
+        // A covering index scan replaces the table scan when a filter cannot
+        // drive a range: a `cast(col, double) = …` comparison keeps the index as
+        // the narrower read, so TiDB emits `IndexFullScan` + index `Selection`.
+        if select
+            .selection
+            .as_ref()
+            .is_some_and(selection_has_cast_column)
+            && let Some(index) = info
+                .indices
+                .iter()
+                .filter(|idx| {
+                    !index_ignored(from, idx.name.o()) && !(idx.primary && info.pk_is_handle)
+                })
+                .find(|idx| select_covers_index(select, info, idx))
+        {
+            return index_plan(select, from, info, index, prune_mode);
         }
         return partitioned_table_reader(
             from,

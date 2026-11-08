@@ -2125,14 +2125,13 @@ fn emit_cop_children(
                     est_rows(plan)
                 };
                 let filter_info = explain_pushed_filter(table, filter);
-                // Full scan under StreamAgg+Selection stays IndexFullScan (not Range).
-                let leaf_name = if under_stream_agg {
-                    "IndexFullScan"
-                } else {
-                    "IndexRangeScan"
-                };
+                // No decided range reaches this point, so the reader scans the
+                // whole index: `IndexFullScan` at the index row count (also the
+                // full scan under a StreamAgg cop task).
                 if under_stream_agg {
                     scan_est = 10_000.0 * limit_scale;
+                } else {
+                    scan_est = *row_count;
                 }
                 push_explain_row_spine(
                     rows,
@@ -2158,7 +2157,7 @@ fn emit_cop_children(
                     true,
                     next_id,
                     CopRow {
-                        name: leaf_name,
+                        name: "IndexFullScan",
                         est: scan_est,
                         task: scan_task,
                         access,
@@ -3450,6 +3449,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             partition_names,
             global_index,
             lock,
+            keep_order,
+            desc,
             ..
         } => (
             "Batch_Point_Get".to_string(),
@@ -3459,19 +3460,24 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 index_columns,
                 if *global_index { &[] } else { partition_names },
             ),
-            format!("keep order:false, desc:false{}", lock_suffix(*lock)),
+            format!(
+                "keep order:{keep_order}, desc:{desc}{}",
+                lock_suffix(*lock)
+            ),
         ),
         PhysicalPlan::BatchPointGet {
             table,
             handles,
             partition_names,
             lock,
+            keep_order,
+            desc,
             ..
         } => (
             "Batch_Point_Get".to_string(),
             table_access(table, partition_names),
             format!(
-                "handle:[{}], keep order:false, desc:false{}",
+                "handle:[{}], keep order:{keep_order}, desc:{desc}{}",
                 handles
                     .iter()
                     .map(|handle| handle.to_string())
@@ -3519,7 +3525,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                     "index:IndexRangeScan".to_string()
                 }
             } else if pushed.is_some() {
-                "data:Selection".to_string()
+                // Only index columns reach a covering reader, so the filter is
+                // always an index-side cop Selection.
+                "index:Selection".to_string()
             } else {
                 "index:IndexFullScan".to_string()
             },

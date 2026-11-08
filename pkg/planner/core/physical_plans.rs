@@ -140,6 +140,12 @@ pub enum PhysicalPlan {
         /// `FOR UPDATE` handled by the batch point get (`desc:false, lock`).
         #[serde(default)]
         lock: bool,
+        /// Batch goes out in key order: `ORDER BY` the point-get key needs no Sort.
+        #[serde(default)]
+        keep_order: bool,
+        /// Key order is descending (`keep order:true, desc:true`).
+        #[serde(default)]
+        desc: bool,
     },
     /// Row lock above a scan (`SELECT … FOR UPDATE`).
     SelectLock {
