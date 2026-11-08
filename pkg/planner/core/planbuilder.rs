@@ -7800,7 +7800,7 @@ fn index_plan(
         .iter()
         .map(|c| c.name.o().to_string())
         .collect();
-    if select_covers_index(select, info, index) {
+    if select_covers_index_for(select, Some(&from.name), info, index) {
         PhysicalPlan::IndexReader {
             table: from.name.clone(),
             index: index.name.o().to_string(),
@@ -7935,6 +7935,18 @@ fn select_covers_index(
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
 ) -> bool {
+    select_covers_index_for(select, None, info, index)
+}
+
+/// `name` is the alias the statement uses for `info`. Join-key columns of that
+/// alias count as needed even when the select list is just `count(*)`: the join
+/// compares them, so a non-covering index still has to fetch the row.
+fn select_covers_index_for(
+    select: &SelectStmt,
+    name: Option<&str>,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+) -> bool {
     if is_star_select(select) {
         return info.index_covers(
             index,
@@ -7945,10 +7957,10 @@ fn select_covers_index(
                 .collect::<Vec<_>>(),
         );
     }
-    info.index_covers(index, &select_needed_columns(select))
+    info.index_covers(index, &select_needed_columns(select, name))
 }
 
-fn select_needed_columns(select: &SelectStmt) -> Vec<String> {
+fn select_needed_columns(select: &SelectStmt, table: Option<&str>) -> Vec<String> {
     let mut names = Vec::new();
     let mut push = |expr: &ExprNode| {
         for (_, name) in expr.referenced_columns() {
@@ -7974,6 +7986,24 @@ fn select_needed_columns(select: &SelectStmt) -> Vec<String> {
     }
     for item in &select.order_by {
         push(&item.expr);
+    }
+    if let Some(table) = table {
+        let owns = |qualified: &Option<String>| {
+            qualified
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(table))
+        };
+        for join in &select.joins {
+            for (qualified, name) in join.on.referenced_columns() {
+                if owns(&qualified)
+                    && !names
+                        .iter()
+                        .any(|have: &String| have.eq_ignore_ascii_case(&name))
+                {
+                    names.push(name);
+                }
+            }
+        }
     }
     names
 }
@@ -8025,7 +8055,7 @@ fn group_by_index_plan(
         if !index_has_group_prefix(index, &group_cols) {
             continue;
         }
-        if select_covers_index(select, info, index) {
+        if select_covers_index_for(select, Some(&from.name), info, index) {
             return Some(index_plan(select, from, info, index, prune_mode));
         }
     }
