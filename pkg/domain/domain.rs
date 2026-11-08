@@ -12,7 +12,8 @@ use sealdb_privilege::{Manager, PRIVILEGE_STORAGE_KEY};
 use sealdb_statistics::{Handle, STATS_STORAGE_KEY};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -673,6 +674,7 @@ fn persist_meta(storage: &dyn Storage, meta: &mut Mutator) -> Result<()> {
     txn.commit()
 }
 
+#[derive(Debug)]
 struct MetaFileLock {
     path: PathBuf,
 }
@@ -684,11 +686,28 @@ impl Drop for MetaFileLock {
 }
 
 fn meta_file_lock() -> Result<MetaFileLock> {
-    let path = std::env::temp_dir().join("sealdb-meta.lock");
-    for _ in 0..200 {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(_) => return Ok(MetaFileLock { path }),
+    meta_file_lock_at(&std::env::temp_dir().join("sealdb-meta.lock"))
+}
+
+/// Cross-process lock around `persist_meta`. The file records the owner's pid
+/// so a lock left behind by a killed run (SIGKILL skips `Drop`) does not wedge
+/// every later server on this machine forever.
+fn meta_file_lock_at(path: &Path) -> Result<MetaFileLock> {
+    for attempt in 0..200 {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                let _ = write!(file, "{}", std::process::id());
+                return Ok(MetaFileLock {
+                    path: path.to_path_buf(),
+                });
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Re-check for an abandoned lock about twice per second rather
+                // than on every 10ms retry.
+                if attempt > 0 && attempt % 50 == 0 && meta_lock_is_stale(path) {
+                    let _ = std::fs::remove_file(path);
+                    continue;
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
@@ -700,6 +719,42 @@ fn meta_file_lock() -> Result<MetaFileLock> {
         ERR_UNKNOWN_ERROR,
         "timed out locking meta persist",
     ))
+}
+
+/// A lock file is abandoned when its owner pid is gone. Liveness is checked
+/// with `kill -0`; an unparsable file is only abandoned once it is old enough
+/// that it cannot be a holder that is still writing its pid.
+fn meta_lock_is_stale(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(pid) if pid == std::process::id() => false,
+        Ok(pid) => !process_is_alive(pid),
+        Err(_) => std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= Duration::from_secs(120)),
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    match std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        // EPERM means the pid exists but is owned by someone else.
+        Ok(out) => String::from_utf8_lossy(&out.stderr).contains("permitted"),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 impl Default for Domain {
@@ -720,5 +775,36 @@ impl Storage for Domain {
     /// `SELECT ... AS OF TIMESTAMP`: snapshot at the wall clock's PD TSO.
     fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn sealdb_kv::Transaction>> {
         self.storage.begin_stale_read(unix_millis)
+    }
+}
+
+#[cfg(test)]
+mod meta_lock_tests {
+    use super::*;
+
+    fn scratch_lock(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sealdb-meta-lock-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn abandoned_lock_is_taken_over() {
+        let path = scratch_lock("abandoned");
+        // pid 4294967295 never exists; mimics a run killed while holding the lock.
+        std::fs::write(&path, "4294967295").expect("seed stale lock");
+        let lock = meta_file_lock_at(&path).expect("steal abandoned lock");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), std::process::id().to_string());
+        drop(lock);
+        assert!(!path.exists(), "lock file removed on drop");
+    }
+
+    #[test]
+    fn live_owner_is_respected() {
+        let path = scratch_lock("live");
+        // Our own pid is alive, so the lock must not be stolen (it would be a
+        // re-entrant persist deadlock, which has to surface instead).
+        std::fs::write(&path, std::process::id().to_string()).expect("seed live lock");
+        let err = meta_file_lock_at(&path).expect_err("must not steal a live lock");
+        assert!(err.message.contains("timed out locking meta persist"), "{}", err.message);
+        std::fs::remove_file(&path).ok();
     }
 }
