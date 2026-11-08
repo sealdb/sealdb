@@ -28,6 +28,10 @@ pub struct BatchPointGetExec {
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
+    /// `ORDER BY` the key: TiDB sorts the batch keys and walks them in order,
+    /// so the plan drops the Sort and keeps this flag instead.
+    keep_order: bool,
+    desc: bool,
 }
 
 impl BatchPointGetExec {
@@ -42,6 +46,8 @@ impl BatchPointGetExec {
         txn: Arc<TxnHandle>,
         lock: RowLock,
         wait: LockWait,
+        keep_order: bool,
+        desc: bool,
     ) -> Self {
         Self {
             domain,
@@ -56,6 +62,8 @@ impl BatchPointGetExec {
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
+            keep_order,
+            desc,
         }
     }
 }
@@ -99,6 +107,12 @@ impl Executor for BatchPointGetExec {
         } else {
             pinned.clone()
         };
+        let mut lookups = self.lookups.clone();
+        // TiDB sorts the batch keys before touching the store (one batch get
+        // walks keys in key order), which is what makes `keep order:true` on
+        // the plan sound and also de-duplicates repeated IN entries.
+        lookups.sort_by(|a, b| compare_tuples(a, b));
+        lookups.dedup_by(|a, b| compare_tuples(a, b) == std::cmp::Ordering::Equal);
         let handles = if let Some(index_name) = &self.index {
             let index = info
                 .indices
@@ -108,7 +122,7 @@ impl Executor for BatchPointGetExec {
                 .ok_or_else(|| Error::unsupported(format!("index {index_name}")))?;
             self.txn.with_txn(|txn| {
                 let mut handles = Vec::new();
-                for lookup in &self.lookups {
+                for lookup in &lookups {
                     for physical_id in scan_ids.iter().copied() {
                         let key = encode_index_key(
                             physical_id,
@@ -127,7 +141,7 @@ impl Executor for BatchPointGetExec {
                 Ok(handles)
             })?
         } else {
-            self.lookups
+            lookups
                 .iter()
                 .filter_map(|lookup| lookup.first())
                 .filter_map(|value| match value {
@@ -137,6 +151,14 @@ impl Executor for BatchPointGetExec {
                 })
                 .collect()
         };
+        // Rows follow the (sorted, de-duplicated) key order. A handle get must
+        // not re-sort the handles: an unsigned key above i64::MAX maps to a
+        // negative handle and the signed order would break the key order that
+        // `keep order:true` promises (the planner keeps the Sort instead).
+        let mut handles = handles;
+        if self.desc {
+            handles.reverse();
+        }
         self.rows = self.txn.with_txn(|txn| {
             if self.lock == RowLock::None {
                 get_rows_batch(txn, &info, &handles, &pinned)
@@ -223,6 +245,18 @@ fn get_row(
         }
     }
     Ok(None)
+}
+
+/// Key-tuple order for the batch key sort: column by column, NULLs first like
+/// TiDB's encoded-index-key comparison.
+fn compare_tuples(a: &[Datum], b: &[Datum]) -> std::cmp::Ordering {
+    for (left, right) in a.iter().zip(b.iter()) {
+        let ord = left.compare(right);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Unlocked BatchPointGet: one `batch_get` RPC (or Mem loop) for all row keys.

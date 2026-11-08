@@ -297,7 +297,7 @@ impl PlanBuilder {
                     }
                     // Batch point get walks its keys in order, so an ORDER BY on
                     // the key needs no Sort (`keep order:true, desc:…`).
-                    let point_order = point_get_order(select, &plan);
+                    let point_order = point_get_order(select, &plan, is, current_db);
                     if let Some(desc) = point_order {
                         plan = set_batch_point_order(plan, desc);
                     }
@@ -3380,7 +3380,12 @@ fn order_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &st
 /// `ORDER BY` the batch point-get key (index prefix or handle) needs no Sort:
 /// the batch walks its keys in order (`keep order:true, desc:…`).
 /// Returns `Some(descending)` when the sort is satisfied by the key order.
-fn point_get_order(select: &SelectStmt, plan: &PhysicalPlan) -> Option<bool> {
+fn point_get_order(
+    select: &SelectStmt,
+    plan: &PhysicalPlan,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<bool> {
     let plan = inner_batch_point_get(plan)?;
     let PhysicalPlan::BatchPointGet {
         column,
@@ -3392,6 +3397,27 @@ fn point_get_order(select: &SelectStmt, plan: &PhysicalPlan) -> Option<bool> {
     else {
         return None;
     };
+    // An unsigned integer handle is stored as its signed bit pattern, so the
+    // row-key order is not the SQL order (`bigint unsigned` 9814441339970117597
+    // sorts before 1 in the key space). TiDB keeps the Sort in that case.
+    if index.is_none()
+        && is
+            .and_then(|schema| {
+                let from = select.from.as_ref()?;
+                let (db, table) = from.qualified(current_db);
+                schema
+                    .table_by_name(&db, &table)
+                    .and_then(|info| {
+                        info.columns
+                            .iter()
+                            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+                    })
+                    .map(|c| c.field_type.is_unsigned())
+            })
+            .unwrap_or(false)
+    {
+        return None;
+    }
     if select.order_by.is_empty() {
         return None;
     }

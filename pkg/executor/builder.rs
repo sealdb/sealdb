@@ -374,6 +374,8 @@ impl ExecutorBuilder {
                 tuple_columns,
                 index_columns,
                 partition_names,
+                keep_order,
+                desc,
                 ..
             } => {
                 let select = stmt
@@ -429,6 +431,8 @@ impl ExecutorBuilder {
                     txn,
                     select_row_lock(select),
                     select_lock_wait(select),
+                    *keep_order,
+                    *desc,
                 )))
             }
             PhysicalPlan::TableReader {
