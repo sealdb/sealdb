@@ -1751,6 +1751,27 @@
 - **下一步**:
   - F02 `CREATE/DROP TABLE` 写兼容 meta key
 
+### 2026-11-08（`explain_foreign_key` 波）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - DDL：`FOREIGN KEY` 约束落 `TableInfo.ForeignKeys`（列、引用表/列、`ON UPDATE` / `ON DELETE` 是否 CASCADE）；`build_table_info` 按 TiDB `BuildTableInfo` 规则补建隐式外键索引（既非现有索引前缀覆盖、也非整型聚簇主键时才建，未命名时生成 `<table>_ibfk_<n>`）
+  - Planner：新增 `planner/core/foreign_key.rs`，在 `Insert` / `Update` / `Delete` 下按 TiDB 语义生成 `Foreign_Key_Check`（`check_exist` 引用侧、`check_not_exist` 子表侧）与 `Foreign_Key_Cascade`（`on_update:CASCADE` / `on_delete:CASCADE`）；节点按 (引用表, 子表, 外键定义序) 排序，检查在前、级联在后，覆盖多表 UPDATE/DELETE、`INSERT … ON DUPLICATE KEY UPDATE` 与自引用外键
+  - Session：`foreign_key_checks` 变量真正生效；`SET foreign_key_checks=0` 时 planner 不再生成上述节点
+  - Parser：`UPDATE t1, t2 SET …` 逗号多表支持（右侧为普通表引用时折叠为 `JOIN … ON TRUE`）
+  - EXPLAIN：`Foreign_Key_Check` / `Foreign_Key_Cascade` 行（estRows `0.00`、task `root`、access `table:…, index:…`）排在 DML 源计划之后；DML 非末位子节点的 cop 子树补齐 `│ ` 续行
+- **验证**:
+  - `explain_foreign_key`：单表 INSERT/UPDATE/DELETE、`ON DUPLICATE KEY UPDATE`、`foreign_key_checks=0`、`t5/t6` 多外键排序段 Mem 0 diff（161 行中 149 行一致），仅剩两条多表 DML 语句
+  - `run-tests.sh -s memory --status green` → PASS: memory=33（无回归）
+  - `run-tests.sh -s tikv --status green` → 结果见 `status-report.md`
+- **阻塞/风险**:
+  - `explain_foreign_key` 仍 `in_progress`，剩两条多表 DML 的 join 形状：
+    1. `update t_1,t_2 set … where t_1.id=t_2.id and t_1.id=1`：TiDB 为两侧各一个 `Point_Get`（常量经等值键传播）再 `HashJoin CARTESIAN`；当前只把常量传播到 t_1，`t_2` 仍是全表扫 + 残差 `Selection`
+    2. `delete t_1,t_2 from t_1 join t_2 where t_1.id=t_2.id and t_1.id > 0`：TiDB 走 `MergeJoin`，两侧 `TableRangeScan (0,+inf], keep order:true`（连接键范围双向传播 + 有序扫描择 MergeJoin）；当前是 `HashJoin` + Build 侧 `Selection`
+  - 两条都属多表 DML 的 join 规划（WHERE 等值键抽取 / 跨侧常量与范围传播 / MergeJoin 代价选择），需要单独一轮 planner 工作，未在本次改动内引入
+- **下一步**:
+  - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_stats` / `topn_push_down` 等
+
 ### 2026-10-19
 
 **决策落地**
