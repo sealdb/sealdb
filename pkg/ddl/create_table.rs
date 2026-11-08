@@ -39,14 +39,13 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         columns.push(info);
     }
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
-    for (offset, index) in stmt.indices.iter().enumerate() {
+    for index in stmt.indices.iter() {
         let (idx_cols, hidden) =
             crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
         for col in hidden {
             info.columns.push(col);
             info.max_col_id = info.max_col_id.max(info.columns.last().unwrap().id);
         }
-        let idx_id = (offset as i64) + 1;
         // PRIMARY KEY handle choice follows `tidb_enable_clustered_index`
         // (TiDB `BuildTableInfo`): an explicit `CLUSTERED` / `NONCLUSTERED`
         // wins, otherwise the mode decides. A single integer key becomes the
@@ -71,12 +70,20 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         } else {
             Vec::new()
         };
+        // TiDB `BuildTableInfo`: an integer row handle is not an index, so it
+        // takes no index id (`information_schema.tidb_indexes` prints the
+        // synthetic PRIMARY row with id 0 while the first real index is 1).
+        let idx_id = if index.primary && info.pk_is_handle {
+            0
+        } else {
+            info.max_idx_id + 1
+        };
         info.indices.push(
             IndexInfo::new(idx_id, index.name.clone(), info.name.o(), idx_cols)
                 .with_flags(index.unique, index.primary)
                 .with_global(index.global),
         );
-        info.max_idx_id = idx_id;
+        info.max_idx_id = info.max_idx_id.max(idx_id);
         for c in &mut info.columns {
             if pk_col_offsets.contains(&c.offset) {
                 c.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;

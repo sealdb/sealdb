@@ -219,7 +219,34 @@ fn tidb_indexes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
+        // TiDB emits a synthetic PRIMARY row for an integer row handle (it is
+        // not an index, so it carries id 0 and comes before the real indexes).
+        if table.pk_is_handle
+            && let Some(pk) = table.indices.iter().find(|idx| idx.primary)
+        {
+            for (seq, col) in pk.columns.iter().enumerate() {
+                rows.push(vec![
+                    bytes(db),
+                    bytes(table.name.o()),
+                    Datum::I64(0),
+                    bytes("PRIMARY"),
+                    Datum::I64((seq + 1) as i64),
+                    bytes(col.name.o()),
+                    Datum::Null,
+                    bytes(""),
+                    Datum::Null,
+                    Datum::I64(0),
+                    bytes("YES"),
+                    bytes("YES"),
+                    Datum::I64(0),
+                    Datum::Null,
+                ]);
+            }
+        }
         for idx in &table.indices {
+            if idx.primary && table.pk_is_handle {
+                continue;
+            }
             let clustered = idx.primary && table.pk_is_clustered();
             for (seq, col) in idx.columns.iter().enumerate() {
                 let (column_name, expression) = match table
@@ -243,8 +270,8 @@ fn tidb_indexes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     Datum::Null,
                     bytes(""),
                     expression,
-                    // TiDB index ids are 0-based per table.
-                    Datum::I64(idx.id - 1),
+                    // TiDB `IndexInfo.ID`: an integer row handle has none (0).
+                    Datum::I64(idx.id),
                     bytes("YES"),
                     bytes(if clustered { "YES" } else { "NO" }),
                     Datum::I64(0),
