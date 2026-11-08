@@ -23,6 +23,7 @@ pub use evaluator::{
     eval_expr,
     eval_expr_with_row, eval_filter, format_timestamp_display, locate_partition_for_row,
     note_warning, session_local_to_utc, set_window_concurrency, sql_mode_flag, take_warnings,
+    time_to_unix_millis,
     warnings_len,
     truthy,
     utc_to_session_local, validate_string_cmp_literals, validate_string_cmp_literals_on, window_concurrency, with_collation,

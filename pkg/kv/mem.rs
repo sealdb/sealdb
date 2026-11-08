@@ -10,7 +10,30 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Default)]
 struct VersionedValue {
     commit_ts: u64,
+    /// Wall-clock commit time (unix millis) for `AS OF TIMESTAMP` snapshots.
+    commit_millis: u64,
     value: Option<Vec<u8>>,
+}
+
+/// Value visible at `start_ts`: newest version committed at or before it.
+fn value_at(versions: &[VersionedValue], start_ts: u64) -> Option<Vec<u8>> {
+    versions
+        .iter()
+        .rev()
+        .find(|v| v.commit_ts <= start_ts)
+        .and_then(|v| v.value.clone())
+}
+
+/// Newest committed value (used by lock reads and write-conflict checks).
+fn latest_committed(versions: &[VersionedValue]) -> Option<Vec<u8>> {
+    versions.last().and_then(|v| v.value.clone())
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -28,7 +51,7 @@ impl KeyLock {
 #[derive(Default)]
 struct Store {
     next_ts: u64,
-    data: BTreeMap<Vec<u8>, VersionedValue>,
+    data: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     locks: HashMap<Vec<u8>, KeyLock>,
     /// Waiter start_ts → lock-holder start_ts (wait-for graph).
     wait_for: HashMap<u64, HashSet<u64>>,
@@ -70,6 +93,31 @@ impl MemStorage {
             pessimistic,
         }))
     }
+
+    /// Stale-read snapshot: keep only versions committed before `unix_millis`.
+    /// Millisecond-resolution commits at exactly the stale timestamp stay
+    /// invisible, matching TiDB's TSO ordering (`ts = ms << 18 | logical`).
+    fn begin_stale(&self, unix_millis: u64) -> Result<Box<dyn Transaction>> {
+        let mut store = self.store.lock().expect("mem kv");
+        store.next_ts += 1;
+        let start_ts = store.next_ts;
+        let mut snapshot = store.data.clone();
+        for versions in snapshot.values_mut() {
+            versions.retain(|v| v.commit_millis < unix_millis && v.commit_ts <= start_ts);
+        }
+        snapshot.retain(|_, versions| !versions.is_empty());
+        Ok(Box::new(MemTransaction {
+            store: Arc::clone(&self.store),
+            wait: Arc::clone(&self.wait),
+            start_ts,
+            snapshot,
+            writes: BTreeMap::new(),
+            deletes: HashSet::new(),
+            locked: HashSet::new(),
+            savepoints: Vec::new(),
+            pessimistic: false,
+        }))
+    }
 }
 
 impl Storage for MemStorage {
@@ -79,6 +127,10 @@ impl Storage for MemStorage {
 
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>> {
         self.begin_txn(true)
+    }
+
+    fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn Transaction>> {
+        self.begin_stale(unix_millis)
     }
 
     fn current_timestamp(&self) -> Result<u64> {
@@ -97,14 +149,16 @@ struct Savepoint {
 }
 
 /// In-memory optimistic/pessimistic Repeatable Read.
-/// Completeness wave / not this feature: 2PC/TiKV TSO, stale read.
+/// Completeness wave / not this feature: 2PC/TiKV TSO.
+/// Each key keeps its commit history so `AS OF TIMESTAMP` can read a past
+/// snapshot; plain transactions read at their `start_ts`.
 /// `SEALDB_LOCK_WAIT_MS` (default 50) caps blocking wait. Deadlock is a
 /// wait-for cycle (errno 1213).
 struct MemTransaction {
     store: Arc<Mutex<Store>>,
     wait: Arc<Condvar>,
     start_ts: u64,
-    snapshot: BTreeMap<Vec<u8>, VersionedValue>,
+    snapshot: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     writes: BTreeMap<Vec<u8>, Vec<u8>>,
     deletes: HashSet<Vec<u8>>,
     locked: HashSet<Vec<u8>>,
@@ -125,7 +179,20 @@ impl MemTransaction {
         if let Some(v) = writes.get(key) {
             return Some(v.clone());
         }
-        store.data.get(key).and_then(|v| v.value.clone())
+        store.data.get(key).and_then(|v| latest_committed(v))
+    }
+
+    /// Value this transaction sees for `key` (own writes, then snapshot).
+    fn visible_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        if self.deletes.contains(key) {
+            return None;
+        }
+        if let Some(v) = self.writes.get(key) {
+            return Some(v.clone());
+        }
+        self.snapshot
+            .get(key)
+            .and_then(|versions| value_at(versions, self.start_ts))
     }
 
     fn lock_wait_timeout() -> Duration {
@@ -307,11 +374,11 @@ impl MemTransaction {
         let mut keys = {
             let store = self.store.lock().expect("mem kv");
             let mut keys = Vec::new();
-            for (k, v) in store.data.range(start.to_vec()..end.to_vec()) {
+            for (k, versions) in store.data.range(start.to_vec()..end.to_vec()) {
                 if self.deletes.contains(k) {
                     continue;
                 }
-                if self.writes.contains_key(k) || v.value.is_some() {
+                if self.writes.contains_key(k) || latest_committed(versions).is_some() {
                     keys.push(k.clone());
                 }
             }
@@ -339,13 +406,7 @@ impl MemTransaction {
 
 impl Transaction for MemTransaction {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.deletes.contains(key) {
-            return Ok(None);
-        }
-        if let Some(v) = self.writes.get(key) {
-            return Ok(Some(v.clone()));
-        }
-        Ok(self.snapshot.get(key).and_then(|v| v.value.clone()))
+        Ok(self.visible_value(key))
     }
 
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -368,11 +429,15 @@ impl Transaction for MemTransaction {
 
     fn scan(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
-        for (k, v) in self.snapshot.range(start.to_vec()..end.to_vec()) {
+        for (k, versions) in self.snapshot.range(start.to_vec()..end.to_vec()) {
             if self.deletes.contains(k) {
                 continue;
             }
-            let value = self.writes.get(k).cloned().or_else(|| v.value.clone());
+            let value = self
+                .writes
+                .get(k)
+                .cloned()
+                .or_else(|| value_at(versions, self.start_ts));
             if let Some(value) = value {
                 out.push((k.clone(), value));
             }
@@ -441,7 +506,7 @@ impl Transaction for MemTransaction {
             if self.locked.contains(key) {
                 continue;
             }
-            if let Some(current) = store.data.get(key)
+            if let Some(current) = store.data.get(key).and_then(|versions| versions.last())
                 && current.commit_ts > self.start_ts
             {
                 return Err(Error::new(
@@ -455,23 +520,20 @@ impl Transaction for MemTransaction {
         }
         store.next_ts += 1;
         let commit_ts = store.next_ts;
+        let commit_millis = now_millis();
         for k in std::mem::take(&mut self.deletes) {
-            store.data.insert(
-                k,
-                VersionedValue {
-                    commit_ts,
-                    value: None,
-                },
-            );
+            store.data.entry(k).or_default().push(VersionedValue {
+                commit_ts,
+                commit_millis,
+                value: None,
+            });
         }
         for (k, v) in std::mem::take(&mut self.writes) {
-            store.data.insert(
-                k,
-                VersionedValue {
-                    commit_ts,
-                    value: Some(v),
-                },
-            );
+            store.data.entry(k).or_default().push(VersionedValue {
+                commit_ts,
+                commit_millis,
+                value: Some(v),
+            });
         }
         for key in self.locked.drain() {
             Self::release_one(&mut store, self.start_ts, &key);
@@ -565,6 +627,42 @@ impl Drop for MemTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stale_read_sees_past_snapshot() {
+        let storage = MemStorage::new();
+        let mut setup = storage.begin().unwrap();
+        setup.set(b"k", b"v1").unwrap();
+        setup.commit().unwrap();
+
+        // A stale read "now" sees the committed row.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let now = now_millis();
+        let mut stale = storage.begin_stale_read(now).unwrap();
+        assert_eq!(stale.get(b"k").unwrap(), Some(b"v1".to_vec()));
+        stale.commit().unwrap();
+
+        // Sleep so the next commit lands in a later millisecond; a snapshot
+        // taken before it must not see the new version.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let before_update = now_millis();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let mut update = storage.begin().unwrap();
+        update.set(b"k", b"v2").unwrap();
+        update.set(b"new", b"x").unwrap();
+        update.commit().unwrap();
+
+        let mut stale = storage.begin_stale_read(before_update).unwrap();
+        assert_eq!(stale.get(b"k").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(stale.get(b"new").unwrap(), None);
+        assert_eq!(stale.scan(b"", b"z").unwrap(), vec![(b"k".to_vec(), b"v1".to_vec())]);
+        stale.commit().unwrap();
+
+        // The latest snapshot sees the update.
+        let mut fresh = storage.begin().unwrap();
+        assert_eq!(fresh.get(b"k").unwrap(), Some(b"v2".to_vec()));
+    }
 
     #[test]
     fn test_optimistic_rr_snapshot_and_conflict() {

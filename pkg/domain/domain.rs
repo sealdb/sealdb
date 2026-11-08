@@ -716,4 +716,9 @@ impl Storage for Domain {
     fn begin_pessimistic(&self) -> Result<Box<dyn sealdb_kv::Transaction>> {
         self.storage.begin_pessimistic()
     }
+
+    /// `SELECT ... AS OF TIMESTAMP`: snapshot at the wall clock's PD TSO.
+    fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn sealdb_kv::Transaction>> {
+        self.storage.begin_stale_read(unix_millis)
+    }
 }

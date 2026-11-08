@@ -556,7 +556,7 @@
     {
       "name": "executor/batch_point_get",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/batch_point_get.test",
       "result": "r/executor/batch_point_get.result",
       "has_result": true,

@@ -14,6 +14,8 @@ pub struct TableName {
     pub ignore_indexes: Vec<String>,
     /// `FROM t PARTITION (p2, p1)` name filter (definition order after resolve).
     pub partition_names: Vec<String>,
+    /// `FROM t AS OF TIMESTAMP <expr>` stale read: raw expression text.
+    pub as_of_ts: Option<String>,
 }
 
 impl TableName {
@@ -25,6 +27,7 @@ impl TableName {
             use_indexes: Vec::new(),
             ignore_indexes: Vec::new(),
             partition_names: Vec::new(),
+            as_of_ts: None,
         }
     }
 

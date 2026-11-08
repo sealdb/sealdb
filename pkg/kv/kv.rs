@@ -32,6 +32,14 @@ pub enum LockWait {
 pub trait Storage: Send + Sync {
     fn begin(&self) -> Result<Box<dyn Transaction>>;
     fn begin_pessimistic(&self) -> Result<Box<dyn Transaction>>;
+    /// Stale read snapshot (`SELECT ... AS OF TIMESTAMP`). `unix_millis` is
+    /// the stale-read wall clock; the transaction sees only versions
+    /// committed strictly before it. TiKV maps it to a PD TSO the way
+    /// `oracle.GoTimeToTS` does.
+    fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn Transaction>> {
+        let _ = unix_millis;
+        Err(Error::unsupported("AS OF TIMESTAMP"))
+    }
     /// Logical timestamp for snapshot / RC refresh. TiKV uses PD TSO;
     /// MemStorage returns a monotonic local counter.
     fn current_timestamp(&self) -> Result<u64> {

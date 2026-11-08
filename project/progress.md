@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-08（green 32 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 33 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` green；16 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/batch_point_get` green；15 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -241,7 +241,7 @@
 | `SLEEP(n)` | `SLEEP` 内建函数，返回 0 | `evaluator` 新增 `SLEEP`（按参数秒数阻塞，NULL → NULL） | `select sleep(0.05)` 输出 `0` |
 | ENUM 常量折叠 | 数字与 ENUM 列比较按成员下标（`a = 1` ⇒ `a = 'a'`） | `coerce_enum_selection` / `normalize_enum_constants`：plan 前把 `=`/`IN` 的数字常量换成成员 label；session 对语句做同样归一，供执行器重读 AST | `ttt.a in (1,"b")` 返回 `a`；`a = 1` 命中 |
 | `KEY` 分区字符串哈希 | 字符串按 `codec.EncodeValue` 的 8 字节长度前缀参与 MD5（整数仍是 8 字节大端） | `key_hash::key_partition_index` 对 `Datum::Bytes` 加 `u64` 长度前缀 | `tkey` 裁剪 `partition:p3`（原 `p0,p3`） |
-| 剩余差异 | `AS OF TIMESTAMP` 历史快照读（`tidb_snapshot` / stale read） | 未实现：无行级 commit_ts 读视图，TiKV/内存都只读最新 | 1 条语句仍红；suite 保持 `in_progress` |
+| `AS OF TIMESTAMP` | 历史快照读（stale read）：`set @a=(select current_timestamp(3))` 后 `from t as of timestamp @a` 看不到之后插入的行 | 见 2.0s：解析 + 会话快照 + Mem 多版本 + TiKV `oracle.GoTimeToTS` 快照 | `select * from t as of timestamp @a where a in (1,2,3)` 空结果；suite `green`（Mem=1 / TiKV=1） |
 
 ### 2.0p R3 `planner/core/casetest/point_get_plan`（2026-11-08）
 
@@ -290,6 +290,17 @@
 | `mysql` 系统库 | TiDB `bootstrap()` 建 `mysql` 库与 `user` / `global_priv` / `global_grants` / `db` / `tables_priv` / `columns_priv` 真实表，并建 `i_user` 索引 | `ddl::bootstrap::bootstrap_system_tables`：Domain 首次加载时建库建表并持久化 | `select * from mysql.user where user='xxx'` → `IndexLookUp` |
 | 单索引 DNF 区间 | `a=1 OR a=2` 在同一条索引上是一个多区间 `IndexRangeScan`，不建 IndexMerge；窄的二级索引优先于复合 PRIMARY 前缀 | `dnf_same_index_plan` + `pseudo::conjunct_bound_sets` 支持 DNF 等值区间 | `range:["xxx","xxx"], ["yyy","yyy"]`，20.00 |
 | suite green | Gate A+B | manifest `green` | `explain` Mem=32 / TiKV=32 PASS；green 31→32 |
+
+### 2.0s R3 `AS OF TIMESTAMP` 快照读（2026-11-08）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 语法 | `TableName` 后的 `AS OF TIMESTAMP SimpleExpr`（pingcap/parser `AsOfClause`） | `rewrite_as_of_timestamp` 把子句改写成反引号 marker 别名（MySQL 方言无该语法）；`table_factor` 解出 `TableName::as_of_ts` 并丢弃 marker 别名 | `from t as of timestamp @a` 不再 1064 |
+| `SET @v = (SELECT …)` | 标量子查询求值并保留类型（`current_timestamp(3)` 为 DATETIME） | `eval_set_subquery`：解析 `(SELECT <const>)` 后用 `eval_expr` 求值（安装会话时区） | `@a` 持有真实 DATETIME，而非子查询文本 |
+| 会话快照 | stale read 打开只读快照，整个语句读同一时间点 | `stmt_as_of_millis`（用户变量 / 引号字面量）→ `Storage::begin_stale_read(unix_millis)` → `TxnManager::ensure_stale` | 语句内所有表统一快照 |
+| Mem 多版本 | 行级 commit 时间决定可见性 | `VersionedValue{commit_ts, commit_millis, value}` 版本链；`value_at(start_ts)`；`begin_stale` 按 `commit_millis < t` 裁剪 | 单测 `test_stale_read_sees_past_snapshot` |
+| TiKV 时间戳换算 | `oracle.GoTimeToTS(t) = physical_ms << 18` | `TikvStorage::begin_stale_read` 用该 TSO 建 `client.snapshot(ts, read_only)` 作为读快照 | `select … as of timestamp @a` 与 Mem 一致返回空 |
+| suite green | Gate A+B | manifest `green` | `executor/batch_point_get` Mem=1 / TiKV=1 PASS；green 32→33 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。

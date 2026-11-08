@@ -146,6 +146,30 @@ impl Storage for TikvStorage {
         self.begin_txn(true)
     }
 
+    /// Stale read (`AS OF TIMESTAMP`): read every key at the PD TSO that
+    /// corresponds to `unix_millis`, i.e. `physical_ms << 18`. This is the
+    /// same conversion TiDB applies in `oracle.GoTimeToTS`, so the snapshot
+    /// sees exactly the versions committed before that wall clock.
+    fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn Transaction>> {
+        let txn = self
+            .rt
+            .block_on(self.client.begin_optimistic())
+            .map_err(map_tikv_err)?;
+        let ts = unix_millis << 18;
+        let snapshot = self.client.snapshot(
+            <tikv_client::Timestamp as tikv_client::TimestampExt>::from_version(ts),
+            TransactionOptions::default().read_only(),
+        );
+        Ok(Box::new(TikvTransaction {
+            inner: Some(txn),
+            client: self.client.clone(),
+            rt: Arc::clone(&self.rt),
+            pessimistic: false,
+            read_snapshot: Some(snapshot),
+            writes: HashMap::new(),
+        }))
+    }
+
     fn current_timestamp(&self) -> Result<u64> {
         use tikv_client::TimestampExt;
         let ts = self

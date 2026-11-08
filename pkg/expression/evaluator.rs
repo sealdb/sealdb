@@ -1769,6 +1769,24 @@ fn eval_unix_timestamp(
     Ok(Datum::I64(wall_secs(&utc)))
 }
 
+/// Unix epoch milliseconds for a datetime/timestamp `Time` value, using the
+/// current session time zone. Used by `AS OF TIMESTAMP` stale reads.
+pub fn time_to_unix_millis(t: &Time) -> Result<u64> {
+    let mut t = t.clone();
+    if matches!(t.tp, TimeType::Timestamp) {
+        t = utc_to_session_local(t)?;
+    }
+    let utc = session_local_to_utc(t)?;
+    let secs = wall_secs(&utc);
+    if secs < 0 {
+        return Err(Error::new(
+            ERR_DATA_OUT_OF_RANGE,
+            "stale read timestamp before the Unix epoch",
+        ));
+    }
+    Ok(secs as u64 * 1000 + u64::from(utc.micro) / 1000)
+}
+
 /// Days since the Unix epoch for a civil date (Hinnant's algorithm).
 fn days_from_civil(year: u16, month: u8, day: u8) -> i64 {
     let y = i64::from(year);

@@ -173,6 +173,22 @@ impl TxnManager {
         Ok(handle)
     }
 
+    /// Autocommit stale read (`SELECT ... AS OF TIMESTAMP`): open a snapshot
+    /// at `unix_millis`. An explicit transaction keeps its own snapshot.
+    pub fn ensure_stale(
+        &mut self,
+        storage: &dyn Storage,
+        unix_millis: u64,
+    ) -> Result<Arc<TxnHandle>> {
+        if let Some(handle) = &self.handle {
+            return Ok(Arc::clone(handle));
+        }
+        let handle = Arc::new(TxnHandle::new(storage.begin_stale_read(unix_millis)?));
+        self.handle = Some(Arc::clone(&handle));
+        self.explicit = false;
+        Ok(handle)
+    }
+
     pub fn refresh_snapshot(&self) -> Result<()> {
         if let Some(handle) = &self.handle {
             handle.with_txn(|txn| txn.refresh_snapshot())?;

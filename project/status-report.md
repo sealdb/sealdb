@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-07 20:55 (+08:00)
+> 生成时间：2026-11-08 11:30 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** 做到 1:1 金样对齐并在**双引擎**上全绿（今日复验 `PASS: memory=26` / `PASS: tikv=26`）；R1 已收口，R2 完成 15/22，R3 完成 7/48 并正在主攻分区与 EXPLAIN 形状；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **33 个** 做到 1:1 金样对齐并在**双引擎**上全绿（本轮复验 `PASS: memory=33` / `PASS: tikv=33`）；R1 已收口，R2 完成 15/22，R3 完成 14/48 并正在主攻分区与 EXPLAIN 形状；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
 
 ---
 
@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 32 | 12.6% |
-| `in_progress` | 22 | 8.7% |
+| `green` | 33 | 13.0% |
+| `in_progress` | 21 | 8.3% |
 | `pending` | 190 | 74.8% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -34,7 +34,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 15 | 6 | 1 | 主波完成 ~68% |
-| R3（point_get / index / partition / explain*） | 13 | 16 | 19 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 14 | 15 | 19 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 0 | 0 | 12 | 未开工 |
 | R6 | 0 | 0 | 35 | 未开工 |
@@ -44,22 +44,22 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **26 个** �
 
 ---
 
-## 3. 已绿 suite 清单（32）
+## 3. 已绿 suite 清单（33）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
 | R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_pushdown`, `window_function` |
-| R3 | `access_path_selection`, `clustered_index`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `explain`, `explain-non-select-stmt`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
+| R3 | `access_path_selection`, `clustered_index`, `executor/batch_point_get`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `explain`, `explain-non-select-stmt`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 
 **复验证据**
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory --status green
-→ PASS: memory=32 tikv=0 skipped=222
+→ PASS: memory=33 tikv=0 skipped=221
 ```
 
-TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），32 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=32 skipped=222`）。
+TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not permitted` 连 127.0.0.1:2379），已用完整权限重启集群（PD v8.5.0，store `127.0.0.1:20160` state=Up），33 套件 TiKV 复验随本轮 gate 一起跑（`PASS: memory=0 tikv=33 skipped=221`）。
 
 ---
 

@@ -128,6 +128,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, view_checks) = extract_view_check_option(&rewritten);
     // TiDB parses a per-arm `LIMIT` before `UNION` and rejects it with 1221.
     reject_union_arm_limit(&rewritten)?;
+    // TiDB `FROM t AS OF TIMESTAMP <expr>` stale read (no sqlparser grammar).
+    let rewritten = rewrite_as_of_timestamp(&rewritten);
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
         Error::new(
             ERR_PARSE_ERROR,
@@ -2785,6 +2787,127 @@ fn try_unwrap_union_derived(sql: &str, bytes: &[u8], start: usize) -> Option<(St
 
 /// Strip MySQL parenthesized table refs that are not subqueries.
 /// `FROM (t)`, `FROM (t a, t2 b)`, `FROM (t JOIN t2)` → unwrapped for sqlparser.
+/// Marker prefix for the alias that carries a stale-read timestamp through
+/// sqlparser (its MySQL dialect has no `AS OF TIMESTAMP` grammar).
+const AS_OF_ALIAS_PREFIX: &str = "__sealdb_asof:";
+
+/// TiDB `FROM t AS OF TIMESTAMP <expr>` (stale read). sqlparser's MySQL
+/// dialect rejects the clause, so re-encode it as a backtick-quoted marker
+/// alias holding the raw expression text: ``FROM t `__sealdb_asof:@a` ``.
+/// `table_factor` turns the marker back into `TableName::as_of_ts` and keeps
+/// the physical table name (no alias was written by the user).
+fn rewrite_as_of_timestamp(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' || c == b'"' || c == b'`' {
+            let end = scan_quoted_end(bytes, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if c == b'-' && bytes.get(i + 1) == Some(&b'-')
+            || c == b'#'
+            || (c == b'/' && bytes.get(i + 1) == Some(&b'*'))
+        {
+            let end = scan_comment_end(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "AS") {
+            let of = skip_ws(bytes, i + 2);
+            if keyword_at(bytes, of, "OF") {
+                let ts = skip_ws(bytes, of + 2);
+                if keyword_at(bytes, ts, "TIMESTAMP") {
+                    let expr_start = skip_ws(bytes, ts + "TIMESTAMP".len());
+                    let expr_end = scan_as_of_expr_end(bytes, expr_start);
+                    if expr_end > expr_start {
+                        let expr = sql[expr_start..expr_end].trim();
+                        out.push('`');
+                        out.push_str(AS_OF_ALIAS_PREFIX);
+                        out.push_str(expr);
+                        out.push('`');
+                        i = expr_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+/// End (exclusive) of the quoted token starting at `start`.
+fn scan_quoted_end(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && quote != b'`' {
+            i += 2;
+            continue;
+        }
+        if b == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// End (exclusive) of a `--` / `#` / `/* */` comment starting at `start`.
+fn scan_comment_end(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    if bytes.get(start) == Some(&b'/') {
+        return sql[start + 2..]
+            .find("*/")
+            .map(|p| start + 2 + p + 2)
+            .unwrap_or(bytes.len());
+    }
+    sql[start..]
+        .find('\n')
+        .map(|p| start + p + 1)
+        .unwrap_or(bytes.len())
+}
+
+/// End (exclusive) of the `AS OF TIMESTAMP` operand. Accepts the shapes TiDB
+/// allows in practice: user/system variables, quoted literals, function
+/// calls, bracketed expressions and plain identifiers/numbers.
+fn scan_as_of_expr_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = skip_ws(bytes, start);
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'\'' | b'"' | b'`' => return scan_quoted_end(bytes, i),
+        b'(' => return matching_paren(bytes, i).map(|p| p + 1).unwrap_or(bytes.len()),
+        _ => {}
+    }
+    while i < bytes.len() {
+        let b = bytes[i];
+        if is_ident_byte(b) || b == b'@' || b == b'.' || b == b'$' || b == b':' || b == b'-' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let after = skip_ws(bytes, i);
+    if bytes.get(after) == Some(&b'(')
+        && let Some(close) = matching_paren(bytes, after)
+    {
+        return close + 1;
+    }
+    i
+}
+
 fn rewrite_mysql_paren_from(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -6975,6 +7098,15 @@ fn table_factor_item(
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
                 }
             }
+            // Stale read marker from `rewrite_as_of_timestamp`: the user wrote
+            // no alias, so keep the physical name and only take the timestamp.
+            if let Some(raw) = alias
+                .as_ref()
+                .and_then(|a| a.name.value.strip_prefix(AS_OF_ALIAS_PREFIX))
+            {
+                physical.as_of_ts = Some(raw.to_string());
+                return Ok((crate::ast::FromItem::Table(physical), Vec::new()));
+            }
             // TiDB EXPLAIN uses the table alias as the scan name (`table:t1`).
             if let Some(a) = alias {
                 physical.physical = Some(physical.name.clone());
@@ -7309,6 +7441,15 @@ fn table_factor(
                         .ignore_indexes
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
                 }
+            }
+            // Stale read marker from `rewrite_as_of_timestamp`: the user wrote
+            // no alias, so keep the physical name and only take the timestamp.
+            if let Some(raw) = alias
+                .as_ref()
+                .and_then(|a| a.name.value.strip_prefix(AS_OF_ALIAS_PREFIX))
+            {
+                physical.as_of_ts = Some(raw.to_string());
+                return Ok((physical, None, Vec::new()));
             }
             // TiDB EXPLAIN uses the table alias as the scan name (`table:t1`).
             let alias = alias.as_ref().map(|a| a.name.value.clone());

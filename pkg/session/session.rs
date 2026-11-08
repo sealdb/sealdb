@@ -696,6 +696,9 @@ impl Session {
             .expect("session txn lock")
             .is_explicit()
             || !*self.autocommit.lock().expect("session autocommit lock");
+        // `FROM t AS OF TIMESTAMP <expr>`: resolve the stale-read wall clock
+        // before opening the transaction so every read uses that snapshot.
+        let stale_millis = stmt_as_of_millis(self, stmt)?;
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
             sealdb_planner::with_explicit_txn(explicit_txn, || {
             if use_cache {
@@ -737,11 +740,13 @@ impl Session {
                 persist_ddl,
             ))
         } else {
-            let txn = self
-                .txn
-                .lock()
-                .expect("session txn lock")
-                .ensure(self.domain.as_ref())?;
+            let txn = {
+                let mut guard = self.txn.lock().expect("session txn lock");
+                match stale_millis {
+                    Some(ms) => guard.ensure_stale(self.domain.as_ref(), ms)?,
+                    None => guard.ensure(self.domain.as_ref())?,
+                }
+            };
             ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?
         };
         let coll = self
@@ -1950,6 +1955,132 @@ impl SetIntParser<'_> {
     }
 }
 
+/// `SET @v = (SELECT <expr>)`: TiDB evaluates the scalar subquery and keeps
+/// the value's type (e.g. `current_timestamp(3)` stays DATETIME, which a later
+/// `AS OF TIMESTAMP @v` reads as a wall clock).
+fn eval_set_subquery(session: &Session, value: &str) -> Result<sealdb_types::Datum> {
+    let text = value.trim();
+    let Some(inner) = text.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return Ok(parse_set_literal(value));
+    };
+    let Ok(stmt) = Parser::new().parse_one_stmt(inner) else {
+        return Ok(parse_set_literal(value));
+    };
+    let Statement::Select(select) = stmt else {
+        return Ok(parse_set_literal(value));
+    };
+    if select.from.is_some() || select.from_item.is_some() || !select.joins.is_empty() {
+        return Ok(parse_set_literal(value));
+    }
+    let [field] = select.fields.as_slice() else {
+        return Ok(parse_set_literal(value));
+    };
+    let tz = session
+        .time_zone
+        .lock()
+        .expect("session time zone lock")
+        .clone();
+    sealdb_expression::with_time_zone(tz, || sealdb_expression::eval_expr(&field.expr))
+}
+
+/// Stale read (`SELECT ... AS OF TIMESTAMP <expr>`): the wall clock in unix
+/// millis. `None` when the statement has no as-of clause.
+fn stmt_as_of_millis(session: &Session, stmt: &Statement) -> Result<Option<u64>> {
+    let Statement::Select(select) = stmt else {
+        return Ok(None);
+    };
+    let Some(raw) = select_as_of_raw(select) else {
+        return Ok(None);
+    };
+    let datum = as_of_datum(session, &raw)?;
+    let time = match datum {
+        sealdb_types::Datum::Time(t) => t,
+        sealdb_types::Datum::Bytes(bytes) => {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            sealdb_types::parse_timestamp_literal(&text).map_err(|_| {
+                Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("Incorrect timestamp value: '{text}'"),
+                )
+            })?
+        }
+        sealdb_types::Datum::Null => {
+            return Err(Error::new(
+                sealdb_errno::ERR_WRONG_ARGUMENTS,
+                "None of the timestamp is specified for AS OF TIMESTAMP",
+            ));
+        }
+        other => {
+            return Err(Error::unsupported(format!(
+                "AS OF TIMESTAMP with {other:?}"
+            )));
+        }
+    };
+    Ok(Some(sealdb_expression::time_to_unix_millis(&time)?))
+}
+
+/// First `AS OF TIMESTAMP` expression text in the statement's table sources
+/// (including CTE bodies, where derived tables are flattened).
+fn select_as_of_raw(select: &sealdb_parser::ast::dml::SelectStmt) -> Option<String> {
+    let mut tables: Vec<&TableName> = Vec::new();
+    if let Some(from) = &select.from {
+        tables.push(from);
+    }
+    if let Some(item) = &select.from_item {
+        tables.extend(item.tables());
+    }
+    for join in &select.joins {
+        tables.push(&join.left);
+        tables.push(&join.right);
+    }
+    if let Some(raw) = tables.iter().find_map(|t| t.as_of_ts.clone()) {
+        return Some(raw);
+    }
+    let with = select.with.as_ref()?;
+    for cte in &with.ctes {
+        if let Some(raw) = select_as_of_raw(&cte.query) {
+            return Some(raw);
+        }
+        let arms = cte
+            .set_rest
+            .iter()
+            .map(|(_, arm)| arm)
+            .chain(cte.recursive.iter().map(|(_, arm)| arm))
+            .chain(cte.recursive_rest.iter().map(|(_, arm)| arm));
+        for arm in arms {
+            if let Some(raw) = select_as_of_raw(arm) {
+                return Some(raw);
+            }
+        }
+    }
+    None
+}
+
+/// Evaluate the `AS OF TIMESTAMP` operand: user variables and quoted literals
+/// are the forms TiDB accepts in practice.
+fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
+    let text = raw.trim();
+    if is_user_var_name(text) {
+        let key = user_var_key(text);
+        let datum = session
+            .user_vars
+            .lock()
+            .expect("session user vars lock")
+            .get(&key)
+            .cloned();
+        return Ok(datum.unwrap_or(sealdb_types::Datum::Null));
+    }
+    if (text.starts_with('\'') && text.ends_with('\''))
+        || (text.starts_with('"') && text.ends_with('"'))
+    {
+        let inner = &text[1..text.len() - 1];
+        return Ok(sealdb_types::Datum::Bytes(inner.as_bytes().to_vec()));
+    }
+    Err(Error::unsupported(format!(
+        "AS OF TIMESTAMP with expression {text}"
+    )))
+}
+
 fn parse_set_literal(value: &str) -> sealdb_types::Datum {    let v = value.trim();
     if v.eq_ignore_ascii_case("null") {
         return sealdb_types::Datum::Null;
@@ -2207,7 +2338,11 @@ fn apply_set(
                 ));
             }
             let key = user_var_key(&a.name);
-            let datum = parse_set_literal(&a.value);
+            let datum = if a.value.trim().starts_with('(') {
+                eval_set_subquery(session, &a.value)?
+            } else {
+                parse_set_literal(&a.value)
+            };
             session
                 .user_vars
                 .lock()
