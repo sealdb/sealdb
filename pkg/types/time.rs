@@ -69,8 +69,7 @@ impl Time {
     /// MySQL numeric value: `YYYYMMDD` for DATE, `YYYYMMDDHHMMSS` for the
     /// temporal types (TiDB `Time.ToNumber`).
     pub fn to_number(self) -> i64 {
-        let ymd =
-            i64::from(self.year) * 10_000 + i64::from(self.month) * 100 + i64::from(self.day);
+        let ymd = i64::from(self.year) * 10_000 + i64::from(self.month) * 100 + i64::from(self.day);
         match self.tp {
             TimeType::Date => ymd,
             _ => {
@@ -140,47 +139,47 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
     let digits = n.to_string();
     let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
         match digits.len() {
-        14 | 12 => {
-            let offset = digits.len() - 14;
-            let year = if offset == 0 {
-                digits[0..4].parse::<i64>().ok()?
-            } else {
-                let yy: i64 = digits[0..2].parse().ok()?;
-                if yy < 70 { 2000 + yy } else { 1900 + yy }
-            };
-            let rest = if offset == 0 { &digits[4..] } else { &digits[2..] };
-            (
-                year,
-                rest[0..2].parse().ok()?,
-                rest[2..4].parse().ok()?,
-                rest[4..6].parse().ok()?,
-                rest[6..8].parse().ok()?,
-                rest[8..10].parse().ok()?,
-            )
-        }
-        8 | 6 => {
-            let (year, rest) = if digits.len() == 8 {
-                (digits[0..4].parse::<i64>().ok()?, &digits[4..])
-            } else {
-                let yy: i64 = digits[0..2].parse().ok()?;
-                (if yy < 70 { 2000 + yy } else { 1900 + yy }, &digits[2..])
-            };
-            (
-                year,
-                rest[0..2].parse().ok()?,
-                rest[2..4].parse().ok()?,
-                0,
-                0,
-                0,
-            )
-        }
-        _ => return None,
-    };
-    if !valid_ymd(year as u16, month as u8, day as u8)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+            14 | 12 => {
+                let offset = digits.len() - 14;
+                let year = if offset == 0 {
+                    digits[0..4].parse::<i64>().ok()?
+                } else {
+                    let yy: i64 = digits[0..2].parse().ok()?;
+                    if yy < 70 { 2000 + yy } else { 1900 + yy }
+                };
+                let rest = if offset == 0 {
+                    &digits[4..]
+                } else {
+                    &digits[2..]
+                };
+                (
+                    year,
+                    rest[0..2].parse().ok()?,
+                    rest[2..4].parse().ok()?,
+                    rest[4..6].parse().ok()?,
+                    rest[6..8].parse().ok()?,
+                    rest[8..10].parse().ok()?,
+                )
+            }
+            8 | 6 => {
+                let (year, rest) = if digits.len() == 8 {
+                    (digits[0..4].parse::<i64>().ok()?, &digits[4..])
+                } else {
+                    let yy: i64 = digits[0..2].parse().ok()?;
+                    (if yy < 70 { 2000 + yy } else { 1900 + yy }, &digits[2..])
+                };
+                (
+                    year,
+                    rest[0..2].parse().ok()?,
+                    rest[2..4].parse().ok()?,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            _ => return None,
+        };
+    if !valid_ymd(year as u16, month as u8, day as u8) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     Some(Time {
@@ -248,7 +247,8 @@ pub fn parse_duration_string(s: &str) -> Option<Time> {
 }
 
 /// Howard Hinnant's civil-from-days: days since 1970-01-01 → (y, m, d).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {    let z = z + 719_468;
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
@@ -263,11 +263,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {    let z = z + 719_468;
 impl Display for Time {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self.tp {
-            TimeType::Date => write!(
-                f,
-                "{:04}-{:02}-{:02}",
-                self.year, self.month, self.day
-            ),
+            TimeType::Date => write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day),
             TimeType::Time => {
                 write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)?;
                 fmt_frac(f, self.micro, self.fsp)
@@ -375,7 +371,7 @@ fn date_pattern_ok(s: &str) -> bool {
     let b = s.as_bytes();
     if b.iter().all(|c| c.is_ascii_digit()) {
         let n = b.len();
-        return (2..=8).contains(&n) && n % 2 == 0;
+        return (2..=8).contains(&n) && n.is_multiple_of(2);
     }
     let mut i = 0;
     if !take_digits(b, &mut i, 1, 4) {
@@ -497,7 +493,9 @@ fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
         2 => 28,
         _ => 0,
     }

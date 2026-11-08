@@ -28,9 +28,9 @@ pub struct BatchPointGetExec {
     schema: Vec<String>,
     rows: Vec<Vec<Datum>>,
     emitted: bool,
-    /// `ORDER BY` the key: TiDB sorts the batch keys and walks them in order,
-    /// so the plan drops the Sort and keeps this flag instead.
-    keep_order: bool,
+    /// `ORDER BY` the key descending. Keys are always sorted on `open` (one
+    /// batch get walks keys in key order, which also de-duplicates `IN`), so
+    /// the plan's `keep order` flag needs no state here.
     desc: bool,
 }
 
@@ -46,7 +46,6 @@ impl BatchPointGetExec {
         txn: Arc<TxnHandle>,
         lock: RowLock,
         wait: LockWait,
-        keep_order: bool,
         desc: bool,
     ) -> Self {
         Self {
@@ -62,7 +61,6 @@ impl BatchPointGetExec {
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
-            keep_order,
             desc,
         }
     }
@@ -124,13 +122,7 @@ impl Executor for BatchPointGetExec {
                 let mut handles = Vec::new();
                 for lookup in &lookups {
                     for physical_id in scan_ids.iter().copied() {
-                        let key = encode_index_key(
-                            physical_id,
-                            index.id,
-                            lookup,
-                            0,
-                            true,
-                        );
+                        let key = encode_index_key(physical_id, index.id, lookup, 0, true);
                         let raw = txn.get_locked(key.as_bytes(), self.lock, self.wait)?;
                         if let Some(raw) = raw {
                             handles.push(decode_handle_from_row_key(&raw)?);
@@ -165,9 +157,7 @@ impl Executor for BatchPointGetExec {
             } else {
                 let mut rows = Vec::new();
                 for handle in handles {
-                    if let Some(row) =
-                        get_row(txn, &info, handle, &pinned, self.lock, self.wait)?
-                    {
+                    if let Some(row) = get_row(txn, &info, handle, &pinned, self.lock, self.wait)? {
                         rows.push(row);
                     }
                 }

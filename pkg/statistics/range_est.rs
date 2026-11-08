@@ -13,8 +13,8 @@ use crate::table::{ColumnStats, Histogram, IndexStats, Table};
 use sealdb_types::field_type::{
     TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DECIMAL, TYPE_DOUBLE, TYPE_ENUM, TYPE_FLOAT,
     TYPE_INT24, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG, TYPE_MEDIUM_BLOB, TYPE_NEW_DATE,
-    TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY,
-    TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
+    TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
+    TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
 };
 use sealdb_types::{Datum, FieldType, Time};
 
@@ -68,9 +68,7 @@ enum Bound {
 impl Bound {
     fn cmp(&self, other: &Bound) -> std::cmp::Ordering {
         match (self, other) {
-            (Bound::Num(a), Bound::Num(b)) => {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            (Bound::Num(a), Bound::Num(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
             (Bound::Bytes(a), Bound::Bytes(b)) => a.cmp(b),
             // Mixed kinds cannot happen for one column; fall back to equality.
             _ => std::cmp::Ordering::Equal,
@@ -167,9 +165,9 @@ fn datum_scalar(kind: HistValueKind, value: &Datum) -> Option<Bound> {
         (HistValueKind::Text, Datum::Time(t)) => Some(Bound::Bytes(
             crate::table::datum_key(&Datum::Time(*t)).into_bytes(),
         )),
-        (HistValueKind::Text, other) => Some(Bound::Bytes(
-            crate::table::datum_key(other).into_bytes(),
-        )),
+        (HistValueKind::Text, other) => {
+            Some(Bound::Bytes(crate::table::datum_key(other).into_bytes()))
+        }
         (HistValueKind::Time, other) => {
             parse_time_scalar(&crate::table::datum_key(other)).map(Bound::Num)
         }
@@ -519,11 +517,7 @@ impl ColumnStats {
             }
             hist.equal_row_count(kind, value).unwrap_or_else(|| {
                 let ndv = hist.buckets.last().map(|b| b.ndv).unwrap_or(0);
-                if ndv > 0 {
-                    notnull / ndv as f64
-                } else {
-                    0.0
-                }
+                if ndv > 0 { notnull / ndv as f64 } else { 0.0 }
             })
         };
         let mut count: f64 = match (&range.low, &range.high) {
@@ -587,7 +581,11 @@ impl Table {
     /// (TopN rows are held out of the histogram).
     pub fn column_ndv(&self, column: &str) -> Option<f64> {
         let col = self.column(column)?;
-        let topn = col.topn.as_ref().map(|t| t.items.len() as f64).unwrap_or(0.0);
+        let topn = col
+            .topn
+            .as_ref()
+            .map(|t| t.items.len() as f64)
+            .unwrap_or(0.0);
         if col.ndv > 0 {
             return Some(col.ndv as f64 + topn);
         }
@@ -717,14 +715,6 @@ impl Table {
     }
 }
 
-/// TiDB `codec.EncodeKey` for one bound; `None` for an unbounded end.
-fn encode_bound(ft: &FieldType, bound: Option<&(Datum, bool)>) -> Option<Vec<u8>> {
-    match bound {
-        None => Some(vec![0x00]),
-        Some((value, _)) => encode_index_key(ft, value),
-    }
-}
-
 /// Minimal `codec.EncodeKey` subset used to compare against index histogram
 /// bounds. Returns `None` for values SealDB cannot encode yet, so callers fall
 /// back to the column histogram.
@@ -756,7 +746,11 @@ pub fn encode_index_key(ft: &FieldType, value: &Datum) -> Option<Vec<u8>> {
         }
         Datum::Decimal(d) => {
             // `Flen` carries the decimal precision, `Decimal` the scale.
-            let scale = if ft.decimal > 0 { ft.decimal as usize } else { 0 };
+            let scale = if ft.decimal > 0 {
+                ft.decimal as usize
+            } else {
+                0
+            };
             let digits = int_digits(d) + scale;
             let precision = if ft.flen > 0 {
                 (ft.flen as usize).max(digits)
@@ -801,8 +795,3 @@ pub fn prefix_next(key: &[u8]) -> Vec<u8> {
     }
     vec![0xff]
 }
-
-
-
-
-

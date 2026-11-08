@@ -156,10 +156,13 @@ impl ExecutorBuilder {
                         | PhysicalPlan::IndexLookUpReader { .. }
                         | PhysicalPlan::IndexMerge { .. }
                 );
-                Ok(Box::new(SelectionExec::new(
-                    filter.clone(),
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                ).with_index_dst_double(under_index)))
+                Ok(Box::new(
+                    SelectionExec::new(
+                        filter.clone(),
+                        Self::build(child, stmt, domain, current_db, txn)?,
+                    )
+                    .with_index_dst_double(under_index),
+                ))
             }
             PhysicalPlan::Distinct {
                 keys,
@@ -276,9 +279,8 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
                 // The reader may belong to any table of a joined SELECT (index
                 // join / applied subquery), not only the leading FROM factor.
-                let from = index_reader_table(select, table).ok_or_else(|| {
-                    Error::unsupported("index lookup without FROM")
-                })?;
+                let from = index_reader_table(select, table)
+                    .ok_or_else(|| Error::unsupported("index lookup without FROM"))?;
                 let access =
                     index_access(&domain, current_db, &from, index, select.selection.as_ref())
                         .ok_or_else(|| Error::unsupported("index lookup without access path"))?;
@@ -374,7 +376,6 @@ impl ExecutorBuilder {
                 tuple_columns,
                 index_columns,
                 partition_names,
-                keep_order,
                 desc,
                 ..
             } => {
@@ -398,12 +399,8 @@ impl ExecutorBuilder {
                                 .find_map(|item| item.row_in_consts_with_len())
                                 .map(|(_, tuples, _)| tuples)
                         })
-                        .or_else(|| {
-                            selection.and_then(|expr| expr.dnf_const_tuples(tuple_columns))
-                        })
-                        .ok_or_else(|| {
-                            Error::unsupported("batch point get without key list")
-                        })?;
+                        .or_else(|| selection.and_then(|expr| expr.dnf_const_tuples(tuple_columns)))
+                        .ok_or_else(|| Error::unsupported("batch point get without key list"))?;
                     // Reorder row values into the unique index column order.
                     tuples
                         .into_iter()
@@ -431,7 +428,6 @@ impl ExecutorBuilder {
                     txn,
                     select_row_lock(select),
                     select_lock_wait(select),
-                    *keep_order,
                     *desc,
                 )))
             }
@@ -462,11 +458,21 @@ impl ExecutorBuilder {
                 let first = iter
                     .next()
                     .ok_or_else(|| Error::unsupported("empty PartitionUnion"))?;
-                let mut exec =
-                    Self::build(first, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?;
+                let mut exec = Self::build(
+                    first,
+                    stmt,
+                    Arc::clone(&domain),
+                    current_db,
+                    Arc::clone(&txn),
+                )?;
                 for child in iter {
-                    let right =
-                        Self::build(child, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?;
+                    let right = Self::build(
+                        child,
+                        stmt,
+                        Arc::clone(&domain),
+                        current_db,
+                        Arc::clone(&txn),
+                    )?;
                     exec = Box::new(UnionExec::new(
                         exec,
                         right,
@@ -558,10 +564,8 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("stream agg without select"))?;
                 let ctx =
                     agg_subquery_ctx(select, Arc::clone(&domain), current_db, Arc::clone(&txn));
-                let mut exec = StreamAggExec::new(
-                    select,
-                    Self::build(child, stmt, domain, current_db, txn)?,
-                )?;
+                let mut exec =
+                    StreamAggExec::new(select, Self::build(child, stmt, domain, current_db, txn)?)?;
                 if let Some(ctx) = ctx {
                     exec = exec.with_subquery(ctx);
                 }
@@ -570,8 +574,10 @@ impl ExecutorBuilder {
             PhysicalPlan::Window { child, .. }
             | PhysicalPlan::Shuffle { child, .. }
             | PhysicalPlan::ShuffleReceiver { child } => {
-                if matches!(plan, PhysicalPlan::Shuffle { .. } | PhysicalPlan::ShuffleReceiver { .. })
-                {
+                if matches!(
+                    plan,
+                    PhysicalPlan::Shuffle { .. } | PhysicalPlan::ShuffleReceiver { .. }
+                ) {
                     return Self::build(child, stmt, domain, current_db, txn);
                 }
                 let select = stmt
@@ -643,29 +649,17 @@ impl ExecutorBuilder {
                     select.with.clone(),
                 )))
             }
-            PhysicalPlan::IndexJoin { outer, .. } => Self::build(
-                outer,
-                stmt,
-                domain,
-                current_db,
-                txn,
-            ),
-            PhysicalPlan::UnionScan { child, .. } => Self::build(
-                child,
-                stmt,
-                domain,
-                current_db,
-                txn,
-            ),
+            PhysicalPlan::IndexJoin { outer, .. } => {
+                Self::build(outer, stmt, domain, current_db, txn)
+            }
+            PhysicalPlan::UnionScan { child, .. } => {
+                Self::build(child, stmt, domain, current_db, txn)
+            }
             // Row locking is enforced by the point get / DML paths; the
             // SelectLock node is EXPLAIN shape only.
-            PhysicalPlan::SelectLock { child, .. } => Self::build(
-                child,
-                stmt,
-                domain,
-                current_db,
-                txn,
-            ),
+            PhysicalPlan::SelectLock { child, .. } => {
+                Self::build(child, stmt, domain, current_db, txn)
+            }
             PhysicalPlan::CTE {
                 name,
                 columns,
@@ -793,7 +787,13 @@ impl ExecutorBuilder {
                 probe_table.clone(),
                 build_table.clone(),
                 *probe_width,
-                Self::build(probe, stmt, Arc::clone(&domain), current_db, Arc::clone(&txn))?,
+                Self::build(
+                    probe,
+                    stmt,
+                    Arc::clone(&domain),
+                    current_db,
+                    Arc::clone(&txn),
+                )?,
                 Self::build(build, stmt, domain, current_db, txn)?,
             ))),
             PhysicalPlan::Explain {
@@ -826,51 +826,51 @@ impl ExecutorBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-/// Text of every `ON` condition in the statement (flat join chain and nested
-/// `FROM` items), used to decide which coalesced USING columns stay reachable.
-fn select_on_text(select: &sealdb_parser::ast::SelectStmt) -> String {
-    fn from_item_ons(item: &sealdb_parser::ast::FromItem, out: &mut String) {
-        if let sealdb_parser::ast::FromItem::Join {
-            left, right, on, ..
-        } = item
-        {
-            from_item_ons(left, out);
-            from_item_ons(right, out);
-            out.push_str(&on.restore_string());
+    /// Text of every `ON` condition in the statement (flat join chain and nested
+    /// `FROM` items), used to decide which coalesced USING columns stay reachable.
+    fn select_on_text(select: &sealdb_parser::ast::SelectStmt) -> String {
+        fn from_item_ons(item: &sealdb_parser::ast::FromItem, out: &mut String) {
+            if let sealdb_parser::ast::FromItem::Join {
+                left, right, on, ..
+            } = item
+            {
+                from_item_ons(left, out);
+                from_item_ons(right, out);
+                out.push_str(&on.restore_string());
+                out.push(' ');
+            }
+        }
+        let mut out = String::new();
+        for join in &select.joins {
+            out.push_str(&join.on.restore_string());
             out.push(' ');
         }
-    }
-    let mut out = String::new();
-    for join in &select.joins {
-        out.push_str(&join.on.restore_string());
-        out.push(' ');
-    }
-    if let Some(item) = &select.from_item {
-        from_item_ons(item, &mut out);
-    }
-    out
-}
-
-/// True when the SELECT list / ORDER BY / WHERE mentions `_tidb_rowid`.
-fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool {
-    fn mentions(expr: &ExprNode) -> bool {
-        match expr {
-            ExprNode::Column(col) => col.name.eq_ignore_ascii_case("_tidb_rowid"),
-            ExprNode::Binary(b) => mentions(&b.left) || mentions(&b.right),
-            ExprNode::Unary(u) => mentions(&u.expr),
-            ExprNode::Func(f) => f.args.iter().any(mentions),
-            ExprNode::Cast(c) => mentions(&c.expr),
-            ExprNode::InList(i) => mentions(&i.expr) || i.list.iter().any(mentions),
-            ExprNode::Between(b) => mentions(&b.expr),
-            _ => false,
+        if let Some(item) = &select.from_item {
+            from_item_ons(item, &mut out);
         }
+        out
     }
-    // The handle column is appended as a hidden (`\u{1}`) schema entry, so a
-    // `SELECT *` result never exposes it while ORDER BY can still bind to it.
-    select.fields.iter().any(|f| mentions(&f.expr))
-        || select.order_by.iter().any(|o| mentions(&o.expr))
-        || select.selection.as_ref().is_some_and(mentions)
-}
+
+    /// True when the SELECT list / ORDER BY / WHERE mentions `_tidb_rowid`.
+    fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool {
+        fn mentions(expr: &ExprNode) -> bool {
+            match expr {
+                ExprNode::Column(col) => col.name.eq_ignore_ascii_case("_tidb_rowid"),
+                ExprNode::Binary(b) => mentions(&b.left) || mentions(&b.right),
+                ExprNode::Unary(u) => mentions(&u.expr),
+                ExprNode::Func(f) => f.args.iter().any(mentions),
+                ExprNode::Cast(c) => mentions(&c.expr),
+                ExprNode::InList(i) => mentions(&i.expr) || i.list.iter().any(mentions),
+                ExprNode::Between(b) => mentions(&b.expr),
+                _ => false,
+            }
+        }
+        // The handle column is appended as a hidden (`\u{1}`) schema entry, so a
+        // `SELECT *` result never exposes it while ORDER BY can still bind to it.
+        select.fields.iter().any(|f| mentions(&f.expr))
+            || select.order_by.iter().any(|o| mentions(&o.expr))
+            || select.selection.as_ref().is_some_and(mentions)
+    }
 
     fn build_hash_join(
         tp: JoinType,
@@ -926,9 +926,9 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
         // the raw values as hidden columns for filter/order evaluation.
         let mut hidden_using: Vec<String> = Vec::new();
         let has_qualified_star = stmt.as_select().is_some_and(|select| {
-            select.fields.iter().any(|f| {
-                matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some())
-            })
+            select.fields.iter().any(
+                |f| matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some()),
+            )
         });
         if !using_cols.is_empty() {
             if let Some(select) = stmt.as_select() {
@@ -958,9 +958,7 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
                         // the raw value (chained `t1 JOIN t2 USING(a) RIGHT JOIN
                         // t3 USING(a)` evaluates `t2.a = t3.a` above this join).
                         if (text.contains(&qual) || all_ons.contains(&qual))
-                            && !hidden_using
-                                .iter()
-                                .any(|h| h.eq_ignore_ascii_case(&qual))
+                            && !hidden_using.iter().any(|h| h.eq_ignore_ascii_case(&qual))
                         {
                             hidden_using.push(format!("{table}.{col}"));
                         }
@@ -1100,9 +1098,7 @@ fn select_references_tidb_rowid(select: &sealdb_parser::ast::SelectStmt) -> bool
 fn localize_timestamp_row(row: Vec<sealdb_types::Datum>) -> Vec<sealdb_types::Datum> {
     row.into_iter()
         .map(|d| match d {
-            sealdb_types::Datum::Time(t)
-                if matches!(t.tp, sealdb_types::TimeType::Timestamp) =>
-            {
+            sealdb_types::Datum::Time(t) if matches!(t.tp, sealdb_types::TimeType::Timestamp) => {
                 match sealdb_expression::utc_to_session_local(t) {
                     Ok(mut local) => {
                         local.tp = sealdb_types::TimeType::Timestamp;
@@ -1192,9 +1188,7 @@ fn find_table_in_result_set(query: &ResultSetNode, table: &str) -> Option<TableN
 fn find_table_in_select(select: &SelectStmt, table: &str) -> Option<TableName> {
     if let Some(from) = &select.from
         && (from.name.eq_ignore_ascii_case(table)
-            || from
-                .resolve_name()
-                .eq_ignore_ascii_case(table))
+            || from.resolve_name().eq_ignore_ascii_case(table))
     {
         return Some(from.clone());
     }
@@ -1276,7 +1270,10 @@ fn find_table_in_expr(expr: &ExprNode, table: &str) -> Option<TableName> {
                     .and_then(|branch| find_table_in_expr(branch, table))
             }),
         ExprNode::Window(w) => w.args.iter().find_map(|arg| find_table_in_expr(arg, table)),
-        ExprNode::Row(r) => r.exprs.iter().find_map(|expr| find_table_in_expr(expr, table)),
+        ExprNode::Row(r) => r
+            .exprs
+            .iter()
+            .find_map(|expr| find_table_in_expr(expr, table)),
         ExprNode::Column(_) | ExprNode::Value(_) => None,
     }
 }
@@ -1326,7 +1323,10 @@ fn index_reader_table(
     table: &str,
 ) -> Option<sealdb_parser::ast::TableName> {
     let matches = |t: &sealdb_parser::ast::TableName| {
-        t.name.eq_ignore_ascii_case(table) || t.physical.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(table))
+        t.name.eq_ignore_ascii_case(table)
+            || t.physical
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(table))
     };
     if let Some(from) = select.from.as_ref().filter(|t| matches(t)) {
         return Some(from.clone());
@@ -1671,16 +1671,21 @@ fn select_from_column_names(
         // matching the child plan's schema names.
         let alias = table.name.as_str();
         let raw: Vec<String> = match is.table_by_name(&schema, &name) {
-            Some(info) => info.columns.iter().map(|c| c.name.o().to_string()).collect(),
+            Some(info) => info
+                .columns
+                .iter()
+                .map(|c| c.name.o().to_string())
+                .collect(),
             None => cte_cols(&name),
         };
         raw.into_iter().map(|c| format!("{alias}.{c}")).collect()
     };
     let mut cols = Vec::new();
     // `t1.*, t2.*` keeps every table's raw columns (no USING coalescing).
-    let qualified_star = select.fields.iter().any(|f| {
-        matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some())
-    });
+    let qualified_star = select
+        .fields
+        .iter()
+        .any(|f| matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some()));
     if qualified_star {
         for table in select.join_tables() {
             cols.extend(table_cols(table));
@@ -1736,8 +1741,7 @@ fn select_from_column_names(
         // Only the non-preserved side of each USING join loses the column; a
         // third table that shares the name keeps its own (`t1, t2 NATURAL
         // RIGHT JOIN t3` → `t1.i, t3.i`).
-        let drop =
-            sealdb_planner::using_dropped_columns(select, Some(&is), current_db);
+        let drop = sealdb_planner::using_dropped_columns(select, Some(&is), current_db);
         let mut reordered = table_cols(&last.right);
         for table in select.join_tables() {
             if table.name == last.right.name {
