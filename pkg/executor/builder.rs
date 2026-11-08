@@ -141,7 +141,7 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::Selection { child, filter } => {
+            PhysicalPlan::Selection { child, filter, .. } => {
                 // TiDB's printed HAVING filter references the aggregate's
                 // `Column#N` outputs; `HashAggExec` already evaluates HAVING, so
                 // the selection is EXPLAIN-only and must not run.
@@ -230,7 +230,7 @@ impl ExecutorBuilder {
                     select,
                 )))
             }
-            PhysicalPlan::InfoSchema { table } => {
+            PhysicalPlan::InfoSchema { table, .. } => {
                 let (columns, rows) =
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
                 Ok(Box::new(MemTableExec::new(columns, rows)))

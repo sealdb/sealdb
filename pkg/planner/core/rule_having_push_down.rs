@@ -65,6 +65,7 @@ pub fn apply_having_push_down(
         plan = PhysicalPlan::Selection {
             filter: rewrite_having_agg_refs(normalize_or_right(filter), select),
             child: Box::new(plan),
+            est_rows: None,
         };
     }
     if residual_supported && has_residual {
@@ -519,9 +520,10 @@ fn push_through_agg(
             est_rows,
             child: Box::new(predicate_push_down(*child, filter, is, current_db)),
         },
-        PhysicalPlan::Selection { filter: outer, child } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { filter: outer, child, est_rows } => PhysicalPlan::Selection {
             filter: outer,
             child: Box::new(push_through_agg(*child, filter, is, current_db)),
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -580,9 +582,10 @@ fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
             est_rows: est,
             child,
         },
-        PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
             filter,
             child: Box::new(set_agg_est(*child, est)),
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -611,9 +614,10 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             exprs,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
         },
-        PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
             filter,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
+            est_rows,
         },
         PhysicalPlan::TableReader {
             table,

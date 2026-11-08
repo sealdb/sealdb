@@ -2903,11 +2903,12 @@ fn inject_inner_join_null_reject(
                 *child, select, is, current_db,
             )),
         },
-        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
             child: Box::new(inject_inner_join_null_reject(
                 *child, select, is, current_db,
             )),
             filter,
+            est_rows,
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(inject_inner_join_null_reject(
@@ -3384,9 +3385,10 @@ fn with_filter_est(plan: PhysicalPlan, rows: f64) -> PhysicalPlan {
             keep_order,
             pushed,
         },
-        PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
             filter,
             child: Box::new(with_filter_est(*child, rows)),
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -3829,9 +3831,10 @@ fn point_get_order(
 
 fn set_batch_point_order(plan: PhysicalPlan, desc: bool) -> PhysicalPlan {
     match plan {
-        PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
             filter,
             child: Box::new(set_batch_point_order(*child, desc)),
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -9721,9 +9724,10 @@ fn explain_rewrite_pushed(
         stats: Option<&Handle>,
     ) -> PhysicalPlan {
         match plan {
-            PhysicalPlan::Selection { filter, child } => PhysicalPlan::Selection {
+            PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
                 filter: rewrite_col_tables(&filter, tables),
                 child: Box::new(walk(*child, tables, is, current_db, stats)),
+                est_rows,
             },
             PhysicalPlan::TableReader {
                 table,
@@ -11004,6 +11008,7 @@ fn naaj_plan(
             name: "Column#9".to_string(),
         }),
         child: Box::new(join),
+        est_rows: None,
     };
     if outer_star {
         // `!= ALL` keeps TiDB's projection back to the probe schema.
@@ -11182,6 +11187,110 @@ fn naaj_other_conds(cond: &ExprNode, schema: &str) -> String {
 /// column without column statistics contributes `0.8 × side rows` (index
 /// statistics are not used for join keys). An outer join then keeps at least
 /// the preserved side (`math.Max(count, outerRowCount)`).
+fn point_get_residual_est(
+    child: &PhysicalPlan,
+    filter: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> Option<f64> {
+    let table = match child {
+        PhysicalPlan::PointGet { table, .. } | PhysicalPlan::BatchPointGet { table, .. } => table,
+        _ => return None,
+    };
+    let (db, table_name) = match table.split_once('.') {
+        Some((db, name)) => (db.to_string(), name.to_string()),
+        None => (current_db.to_string(), table.clone()),
+    };
+    let table_stats = stats
+        .and_then(|handle| handle.table(&db, &table_name))
+        .filter(|t| super::plan_cost::has_real_stats(t))?;
+    // TiDB `Selectivity` short-circuits to 1.0 for an empty table.
+    let realtime = table_stats.count as f64;
+    if realtime <= 0.0 {
+        return None;
+    }
+    // `coll.ColNum() == 0 && coll.IdxNum() == 0` → `pseudoSelectivity`; the
+    // EXPLAIN pseudo heuristics already cover that path.
+    if table_stats.columns.is_empty() && table_stats.indices.is_empty() {
+        return None;
+    }
+    let info = is?.table_by_name(&db, &table_name)?;
+    let field_type = |column: &str| {
+        info.columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            .map(|c| &c.field_type)
+    };
+    let range_rows =
+        |column: &str, ranges: &[sealdb_statistics::range_est::StatsRange]| -> Option<f64> {
+            let ft = field_type(column)?;
+            table_stats
+                .column_range_estimate(column, sealdb_statistics::kind_of(ft), ranges)
+                .or_else(|| {
+                    // TiDB builds a StatsNode per index whose leading column is
+                    // constrained; a single-column index reads its histogram.
+                    info.indices
+                        .iter()
+                        .filter(|idx| !idx.primary && idx.columns.len() == 1)
+                        .find(|idx| idx.columns[0].name.o().eq_ignore_ascii_case(column))
+                        .and_then(|idx| {
+                            table_stats.index_range_estimate(idx.name.o(), ft, ranges)
+                        })
+                })
+        };
+    let to_stats = |bounds: Vec<sealdb_statistics::pseudo::Bounds>| {
+        bounds
+            .into_iter()
+            .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
+            .collect::<Vec<_>>()
+    };
+    let conjuncts = filter.split_cnf();
+    let mut sel = 1.0;
+    let mut estimated: Vec<String> = Vec::new();
+    for (column, bounds) in sealdb_statistics::pseudo::column_bound_sets(filter) {
+        if let Some(rows) = range_rows(&column, &to_stats(bounds)) {
+            sel *= rows / realtime;
+            estimated.push(column);
+        }
+    }
+    // Ranger turns `not(isnull(col))` into `(MinNotNull, MaxValue)`.
+    let not_null = to_stats(vec![(None, None)]);
+    let mut leftover = false;
+    for conjunct in &conjuncts {
+        let covered = if let Some((column, _)) =
+            sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
+        {
+            estimated
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&column))
+        } else if let Some(column) = not_isnull_column(conjunct) {
+            if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
+                true
+            } else {
+                match range_rows(&column, &not_null) {
+                    Some(rows) => {
+                        sel *= rows / realtime;
+                        estimated.push(column);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        } else {
+            false
+        };
+        if !covered {
+            leftover = true;
+        }
+    }
+    if leftover {
+        // TiDB multiplies the uncovered predicates' default factor once.
+        sel *= sealdb_statistics::pseudo::SELECTION_FACTOR;
+    }
+    Some((super::explain::est_rows(child) * sel).clamp(0.0, realtime))
+}
+
 fn fill_join_est_rows(
     plan: PhysicalPlan,
     is: Option<&InfoSchema>,
@@ -11217,10 +11326,25 @@ fn fill_join_est_rows(
             exprs,
             child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
         },
-        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+        PhysicalPlan::Selection {
+            child,
             filter,
-        },
+            est_rows,
+        } => {
+            let child = fill_join_est_rows(*child, is, current_db, stats);
+            // TiDB derives a residual Selection's cardinality from the table
+            // statistics (`cardinality.Selectivity`): a point get pins one row
+            // and the residual predicates scale it by their column / index
+            // histogram selectivity.
+            let est_rows = est_rows.or_else(|| {
+                point_get_residual_est(&child, &filter, is, current_db, stats)
+            });
+            PhysicalPlan::Selection {
+                child: Box::new(child),
+                filter,
+                est_rows,
+            }
+        }
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
             by_info,
@@ -13473,6 +13597,7 @@ fn scalar_max_eq_plan(
         filter: ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(b"not(isnull(Column#9))".to_vec()),
         }),
+        est_rows: None,
     };
     let probe = PhysicalPlan::TableReader {
         table: "t1".to_string(),
@@ -13875,7 +14000,11 @@ fn lift_point_get_merge_join(
             exprs,
             child: lift(child),
         },
-        PhysicalPlan::Selection { child, filter } => {
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => {
             // A row IN list that stayed as a residual filter over a point get
             // was already expanded to DNF for access path selection, so TiDB
             // keeps (and prints) the DNF form.
@@ -13897,6 +14026,7 @@ fn lift_point_get_merge_join(
             PhysicalPlan::Selection {
                 child: lift(child),
                 filter,
+                est_rows,
             }
         }
         PhysicalPlan::Limit {
@@ -14011,6 +14141,7 @@ fn access_plan(
     if is_information_schema(from, current_db) {
         return PhysicalPlan::InfoSchema {
             table: from.name.clone(),
+            pushed: None,
         };
     }
     if let Some(info) = is.and_then(|schema| {

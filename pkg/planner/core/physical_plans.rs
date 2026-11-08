@@ -88,6 +88,9 @@ pub enum PhysicalPlan {
     },
     InfoSchema {
         table: String,
+        /// Pushed equality ranges: `column_name:["c1"], table_name:["t1"]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pushed: Option<String>,
     },
     /// `UPDATE`: `child` reads the rows to update.
     Update {
@@ -245,6 +248,12 @@ pub enum PhysicalPlan {
         child: Box<PhysicalPlan>,
         #[serde(skip)]
         filter: ExprNode,
+        /// TiDB stats-derived cardinality of the residual filter. Filled by the
+        /// planner when the child is a point get and the table has statistics
+        /// (`cardinality.Selectivity`); EXPLAIN falls back to its pseudo
+        /// heuristics when absent.
+        #[serde(skip)]
+        est_rows: Option<f64>,
     },
     Sort {
         child: Box<PhysicalPlan>,
@@ -473,7 +482,7 @@ impl PhysicalPlan {
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Simple { kind } => format!("Simple_{kind}"),
             PhysicalPlan::Insert { child, .. } => format!("Insert{}", dml_child(child)),
-            PhysicalPlan::InfoSchema { table } => format!("InfoSchema_{table}"),
+            PhysicalPlan::InfoSchema { table, .. } => format!("InfoSchema_{table}"),
             PhysicalPlan::Update { child, .. } => format!("Update{}", dml_child(child)),
             PhysicalPlan::Delete { child, .. } => format!("Delete{}", dml_child(child)),
             PhysicalPlan::TableReader {

@@ -46,9 +46,10 @@ pub fn rewrite_semi_join_ctx(
                 rewrite_apply(child, filter, is, current_db)
             }
         },
-        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
             filter,
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
@@ -254,6 +255,7 @@ fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
         PhysicalPlan::Selection {
             child: Box::new(plan),
             filter,
+            est_rows: None,
         }
     }
 }
@@ -391,6 +393,7 @@ fn build_recursive_all_probe(
                     Vec::new(),
                 )),
                 filter: sel.clone(),
+                est_rows: None,
             }),
         }
     } else {
@@ -512,6 +515,7 @@ fn build_recursive_arm_plan(
         PhysicalPlan::Selection {
             child: Box::new(scan),
             filter: sel.clone(),
+            est_rows: None,
         }
     } else {
         scan
@@ -558,6 +562,7 @@ fn no_decorrelate_exists_apply(
         Some(sel) => PhysicalPlan::Selection {
             child: Box::new(PhysicalPlan::table_reader(from.name.clone(), Vec::new())),
             filter: sel.clone(),
+            est_rows: None,
         },
         None => PhysicalPlan::table_reader(from.name.clone(), Vec::new()),
     };
@@ -604,6 +609,7 @@ fn recursive_exists_cte_apply(
                     Vec::new(),
                 )),
                 filter: sel.clone(),
+                est_rows: None,
             }),
         }
     } else {
@@ -631,6 +637,7 @@ fn recursive_exists_cte_apply(
             child: Box::new(PhysicalPlan::Selection {
                 child: Box::new(cte_plan),
                 filter: sel.clone(),
+                est_rows: None,
             }),
             offset: 0,
             count: 1,
@@ -1057,6 +1064,7 @@ fn build_spec(
         right = PhysicalPlan::Selection {
             child: Box::new(right),
             filter,
+            est_rows: None,
         };
     }
     SemiSpec {
@@ -1131,6 +1139,7 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
         other => PhysicalPlan::Selection {
             child: Box::new(other),
             filter,
+            est_rows: None,
         },
     }
 }
@@ -1429,9 +1438,10 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             probe: probe.map(|p| Box::new(rewrite_semi_join_agg(*p))),
             info,
         },
-        PhysicalPlan::Selection { child, filter } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join_agg(*child)),
             filter,
+            est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,

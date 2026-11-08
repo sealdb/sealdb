@@ -709,6 +709,46 @@ fn push_into(
         }
         // An empty plan folds away its filters (TiDB TableDual rows:0).
         PhysicalPlan::TableDual { row_count: 0 } => PhysicalPlan::TableDual { row_count: 0 },
+        // TiDB pushes equality ranges into the infoschema memory table and
+        // prints them on the scan (`table_name:["t1"]`); the 10000-row
+        // estimate stays, and answered conjuncts leave no `Selection`.
+        PhysicalPlan::InfoSchema { table, pushed } => {
+            let mut ranges: Vec<(String, String)> = Vec::new();
+            let mut residual = Vec::new();
+            for conjunct in conjuncts {
+                match mem_table_range(&conjunct) {
+                    Some(range) => ranges.push(range),
+                    None => residual.push(conjunct),
+                }
+            }
+            ranges.sort();
+            ranges.dedup();
+            let mut text = pushed.unwrap_or_default();
+            if !ranges.is_empty() {
+                let mut attached: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i < ranges.len() {
+                    let column = ranges[i].0.clone();
+                    let mut values = Vec::new();
+                    while i < ranges.len() && ranges[i].0 == column {
+                        values.push(format!("\"{}\"", ranges[i].1));
+                        i += 1;
+                    }
+                    attached.push(format!("{column}:[{}]", values.join(",")));
+                }
+                if !text.is_empty() {
+                    text.push_str(", ");
+                }
+                text.push_str(&attached.join(", "));
+            }
+            wrap_residual(
+                PhysicalPlan::InfoSchema {
+                    table,
+                    pushed: (!text.is_empty()).then_some(text),
+                },
+                residual,
+            )
+        }
         other => wrap_residual(other, conjuncts),
     }
 }
@@ -845,8 +885,21 @@ fn reduce_pinned_dnf(expr: &ExprNode, key_columns: &[String]) -> Option<Option<E
     }))
 }
 
-fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
-    let Some(filter) = ExprNode::compose_cnf(residual) else {
+/// Infoschema memory tables answer an equality on a string column
+/// (`table_name = 'T1'` → `table_name:["t1"]`); values compare under the
+/// case-insensitive column collation, so they render lower-cased.
+fn mem_table_range(expr: &ExprNode) -> Option<(String, String)> {
+    let (column, value) = expr.eq_column_const()?;
+    let text = match value {
+        Datum::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Datum::I64(v) => v.to_string(),
+        Datum::U64(v) => v.to_string(),
+        _ => return None,
+    };
+    Some((column.to_ascii_lowercase(), text.to_lowercase()))
+}
+
+fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {    let Some(filter) = ExprNode::compose_cnf(residual) else {
         return plan;
     };
     if filter.has_subquery() {
@@ -860,6 +913,7 @@ fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
         PhysicalPlan::Selection {
             child: Box::new(plan),
             filter,
+            est_rows: None,
         }
     }
 }

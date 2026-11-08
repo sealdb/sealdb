@@ -3787,10 +3787,10 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
 
         // TiDB `MemTableScan`: the infoschema table's canonical (upper-case)
         // name, not the identifier the statement used.
-        PhysicalPlan::InfoSchema { table } => (
+        PhysicalPlan::InfoSchema { table, pushed } => (
             "MemTableScan".to_string(),
             format!("table:{}", table.to_uppercase()),
-            String::new(),
+            pushed.clone().unwrap_or_default(),
         ),
         PhysicalPlan::Update { .. } => ("Update".to_string(), String::new(), "N/A".to_string()),
         PhysicalPlan::Delete { .. } => ("Delete".to_string(), String::new(), "N/A".to_string()),
@@ -3960,7 +3960,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                     .join(", ")
             ),
         ),
-        PhysicalPlan::Selection { child, filter } => (
+        PhysicalPlan::Selection { child, filter, .. } => (
             "Selection".to_string(),
             String::new(),
             match selection_table(child) {
@@ -4429,10 +4429,14 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::PointGet { .. } => 1.0,
         PhysicalPlan::BatchPointGet { n_keys, .. } => *n_keys as f64,
         PhysicalPlan::SelectLock { child, .. } => est_rows(child),
-        PhysicalPlan::Selection { child, filter, .. } => {
-            // A residual filter over an integer-handle point get keeps one row.
-            if matches!(child.as_ref(), PhysicalPlan::PointGet { index: None, .. }) {
-                return 1.0;
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows: built_est,
+        } => {
+            // Stats-derived cardinality from plan build (`cardinality.Selectivity`).
+            if let Some(est) = built_est {
+                return *est;
             }
             let n = not_isnull_count(filter);
             // TiDB: not(isnull) over CTEFullScan uses 0.8 (6400.80 from 8001).
