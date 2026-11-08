@@ -100,6 +100,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_show_warnings(&rewritten);
+    // MySQL/TiDB `DROP TABLES …` (plural object keyword).
+    let rewritten = rewrite_drop_tables(&rewritten);
     let rewritten = rewrite_rename_index(&rewritten);
     let (rewritten, explain_formats) = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
@@ -1269,6 +1271,26 @@ fn decode_show_bindings(show: &mut ShowStmt) {
 }
 
 /// sqlparser has no `SHOW WARNINGS`; rewrite to SHOW TABLES FROM a marker schema.
+/// `DROP TABLES …` — MySQL/TiDB accept the plural object keyword.
+fn rewrite_drop_tables(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "DROP") {
+            let after = skip_ws_and_comments(bytes, i + 4);
+            if keyword_at(bytes, after, "TABLES") {
+                out.push_str(&sql[i..after]);
+                out.push_str("TABLE");
+                i = after + 6;
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
 fn rewrite_show_warnings(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
