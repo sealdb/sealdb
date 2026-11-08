@@ -98,6 +98,11 @@ pub fn column_bound_sets(expr: &ExprNode) -> Vec<(String, Vec<Bounds>)> {
 
 /// Ranges one conjunct imposes on one column.
 pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    // DNF of equalities on the same column (`a = 1 OR a = 2`) → one multi-range
+    // set. TiDB ranger builds these as `["1","1"], ["2","2"]` on a single index.
+    if let Some(sets) = dnf_eq_bound_sets(expr) {
+        return Some(sets);
+    }
     if let Some((column, value)) = expr.eq_column_const() {
         let point = (Some((value.clone(), true)), Some((value, true)));
         return Some((column, vec![point]));
@@ -128,6 +133,25 @@ pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
             .map(|range| (column, vec![(range.low, range.high)]));
     }
     None
+}
+
+/// `a = 1 OR a = 2 …` over one column: point range per DNF arm.
+fn dnf_eq_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    let arms = expr.split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut column: Option<String> = None;
+    let mut ranges = Vec::with_capacity(arms.len());
+    for arm in &arms {
+        let (name, value) = arm.eq_column_const()?;
+        match &column {
+            Some(have) if !have.eq_ignore_ascii_case(&name) => return None,
+            _ => column = Some(name),
+        }
+        ranges.push((Some((value.clone(), true)), Some((value, true))));
+    }
+    Some((column?, ranges))
 }
 
 /// Intersect two range sets over the same column (empty ranges drop out).
