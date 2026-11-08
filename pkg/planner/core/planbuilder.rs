@@ -397,13 +397,25 @@ impl PlanBuilder {
             }
             Statement::Insert(insert) => Ok(PhysicalPlan::Insert {
                 child: self.dml_insert_child(insert, is, current_db, stats, prune_mode)?,
+                fk_children: is
+                    .map(|is| super::foreign_key::insert_fk_children(insert, is, current_db))
+                    .unwrap_or_default(),
             }),
-            Statement::LoadData(_) => Ok(PhysicalPlan::Insert { child: None }),
+            Statement::LoadData(_) => Ok(PhysicalPlan::Insert {
+                child: None,
+                fk_children: Vec::new(),
+            }),
             Statement::Update(update) => Ok(PhysicalPlan::Update {
                 child: self.dml_update_child(update, is, current_db, stats, prune_mode)?,
+                fk_children: is
+                    .map(|is| super::foreign_key::update_fk_children(update, is, current_db))
+                    .unwrap_or_default(),
             }),
             Statement::Delete(delete) => Ok(PhysicalPlan::Delete {
                 child: self.dml_delete_child(delete, is, current_db, stats, prune_mode)?,
+                fk_children: is
+                    .map(|is| super::foreign_key::delete_fk_children(delete, is, current_db))
+                    .unwrap_or_default(),
             }),
             Statement::CreateDatabase(_) => Ok(PhysicalPlan::DDL {
                 kind: DdlKind::CreateDatabase,

@@ -20,9 +20,34 @@ pub enum DdlKind {
     AlterTable,
 }
 
+/// Reference action planned under a DML statement (TiDB `FKCheck` / `FKCascade`
+/// physical plans).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum FkAction {
+    /// `Foreign_Key_Check`: the inserted/updated value must exist in the parent.
+    CheckExist,
+    /// `Foreign_Key_Check`: no child row may still reference the parent key.
+    CheckNotExist,
+    /// `Foreign_Key_Cascade` on the child table.
+    OnUpdateCascade,
+    OnDeleteCascade,
+}
+
+/// One `Foreign_Key_Check` / `Foreign_Key_Cascade` child of an `Insert`,
+/// `Update` or `Delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FkNode {
+    /// Table rendered in the access object and the operator info: the
+    /// referenced (parent) table for checks, the child table for cascades.
+    pub table: String,
+    /// Index used for the lookup (`index:idx`), when not the row handle.
+    pub index: Option<String>,
+    pub fk_name: String,
+    pub action: FkAction,
+}
+
 #[derive(Clone, Debug, Serialize)]
-pub struct IndexScanRange {
-    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1,1]`, `(3,+inf]`.
+pub struct IndexScanRange {    /// TiDB `ranger.Range.String()`: `[-inf,3)`, `[1,1]`, `(3,+inf]`.
     pub text: String,
     /// `IndexRangeScan` estRows — rows kept by the range alone.
     pub rows: f64,
@@ -53,6 +78,8 @@ pub enum PhysicalPlan {
     /// `INSERT` / `REPLACE`: `child` is the source plan (`INSERT … SELECT`).
     Insert {
         child: Option<Box<PhysicalPlan>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fk_children: Vec<FkNode>,
     },
     InfoSchema {
         table: String,
@@ -60,10 +87,14 @@ pub enum PhysicalPlan {
     /// `UPDATE`: `child` reads the rows to update.
     Update {
         child: Option<Box<PhysicalPlan>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fk_children: Vec<FkNode>,
     },
     /// `DELETE`: `child` reads the row handles to delete.
     Delete {
         child: Option<Box<PhysicalPlan>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fk_children: Vec<FkNode>,
     },
     TableReader {
         table: String,
@@ -436,10 +467,10 @@ impl PhysicalPlan {
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),
             PhysicalPlan::Show { kind } => format!("Show_{kind}"),
             PhysicalPlan::Simple { kind } => format!("Simple_{kind}"),
-            PhysicalPlan::Insert { child } => format!("Insert{}", dml_child(child)),
+            PhysicalPlan::Insert { child, .. } => format!("Insert{}", dml_child(child)),
             PhysicalPlan::InfoSchema { table } => format!("InfoSchema_{table}"),
-            PhysicalPlan::Update { child } => format!("Update{}", dml_child(child)),
-            PhysicalPlan::Delete { child } => format!("Delete{}", dml_child(child)),
+            PhysicalPlan::Update { child, .. } => format!("Update{}", dml_child(child)),
+            PhysicalPlan::Delete { child, .. } => format!("Delete{}", dml_child(child)),
             PhysicalPlan::TableReader {
                 table,
                 partitions,

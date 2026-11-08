@@ -751,7 +751,17 @@ fn walk_with_parent(
     );
     // Projection/Selection/Sort/HashAgg/UnionScan/Limit→CARTESIAN: TableReader
     // sits under a unary with a non-empty spine; still need bushy cop prefixes.
+    // A DML node with foreign-key children likewise has a later sibling after
+    // its source plan, so the reader column needs its continuation bar.
     let under_bushy = under_bushy
+        || matches!(
+            parent,
+            Some(
+                PhysicalPlan::Insert { fk_children, .. }
+                    | PhysicalPlan::Update { fk_children, .. }
+                    | PhysicalPlan::Delete { fk_children, .. }
+            ) if !fk_children.is_empty()
+        )
         || (!spine.is_empty()
             && matches!(
                 parent,
@@ -787,8 +797,17 @@ fn walk_with_parent(
         return;
     }
     let children = children_of(plan);
+    // Foreign-key checks / cascades are DML children emitted after the
+    // statement's own source plan (TiDB lists them last, as siblings).
+    let fk_nodes: &[super::physical_plans::FkNode] = match plan {
+        PhysicalPlan::Insert { fk_children, .. }
+        | PhysicalPlan::Update { fk_children, .. }
+        | PhysicalPlan::Delete { fk_children, .. } => fk_children,
+        _ => &[],
+    };
+    let child_count = children.len() + fk_nodes.len();
     for (i, child) in children.iter().enumerate() {
-        let child_last = i + 1 == children.len();
+        let child_last = i + 1 == child_count;
         let mut child_spine = spine.to_vec();
         // `spine[d-1]` is the continuation column of the ancestor at depth `d`:
         // `│ ` while that ancestor still has a later sibling. Descending appends
@@ -831,6 +850,63 @@ fn walk_with_parent(
             child_apply,
         );
     }
+    for (j, fk) in fk_nodes.iter().enumerate() {
+        let fk_last = children.len() + j + 1 == child_count;
+        let mut child_spine = spine.to_vec();
+        if parent.is_some() {
+            child_spine.push(!last);
+        }
+        emit_fk_row(fk, depth + 1, fk_last, next_id, rows, &child_spine);
+    }
+}
+
+/// One `Foreign_Key_Check` / `Foreign_Key_Cascade` row: `estRows` is `0.00`
+/// (the nodes only touch a handful of keys at runtime), `task=root`.
+fn emit_fk_row(
+    fk: &super::physical_plans::FkNode,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    rows: &mut Vec<ExplainRow>,
+    spine: &[bool],
+) {
+    use super::physical_plans::FkAction;
+    let id = *next_id;
+    *next_id += 1;
+    let prefix = if spine.is_empty() {
+        tree_prefix(depth, last)
+    } else {
+        tree_prefix_with_spine(spine, depth, last)
+    };
+    let (name, info) = match fk.action {
+        FkAction::CheckExist => (
+            "Foreign_Key_Check",
+            format!("foreign_key:{}, check_exist", fk.fk_name),
+        ),
+        FkAction::CheckNotExist => (
+            "Foreign_Key_Check",
+            format!("foreign_key:{}, check_not_exist", fk.fk_name),
+        ),
+        FkAction::OnUpdateCascade => (
+            "Foreign_Key_Cascade",
+            format!("foreign_key:{}, on_update:CASCADE", fk.fk_name),
+        ),
+        FkAction::OnDeleteCascade => (
+            "Foreign_Key_Cascade",
+            format!("foreign_key:{}, on_delete:CASCADE", fk.fk_name),
+        ),
+    };
+    let access = match &fk.index {
+        Some(index) => format!("table:{}, index:{index}", fk.table),
+        None => format!("table:{}", fk.table),
+    };
+    rows.push(ExplainRow {
+        id: format!("{prefix}{name}_{id}"),
+        est_rows: "0.00".to_string(),
+        task: "root".to_string(),
+        access,
+        info,
+    });
 }
 
 fn emit_cte_full_scan(
@@ -2252,7 +2328,15 @@ fn emit_cop_children(
                 } else {
                     *row_count
                 };
-                let build_spine = ancestors_spine(spine, depth);
+                let mut build_spine = ancestors_spine(spine, depth);
+                // The IndexLookUp may be a non-last DML child (foreign-key nodes
+                // follow it): its cop rows then need the continuation bar.
+                if !_parent_last
+                    && let Some(cont) = build_spine.last_mut()
+                {
+                    *cont = true;
+                }
+                let mut probe_spine = build_spine.clone();
                 let mut build_depth = depth;
                 if let Some(sel) = selection_info.as_ref() {
                     push_explain_row_spine(
@@ -2299,7 +2383,7 @@ fn emit_cop_children(
                 }
                 let mut probe_depth = depth;
                 if let Some(probe_sel) = probe_selection_info.as_ref() {
-                    push_explain_row(
+                    push_explain_row_spine(
                         rows,
                         depth,
                         true,
@@ -2311,13 +2395,15 @@ fn emit_cop_children(
                             access: String::new(),
                             info: probe_sel.clone(),
                         },
+                        &probe_spine,
                     );
                     if let Some(last) = rows.last_mut() {
                         last.id.push_str("(Probe)");
                     }
                     probe_depth = depth + 1;
+                    probe_spine.push(false);
                 }
-                push_explain_row(
+                push_explain_row_spine(
                     rows,
                     probe_depth,
                     true,
@@ -2329,6 +2415,7 @@ fn emit_cop_children(
                         access: table_access(table, &[]),
                         info: rowid_info,
                     },
+                    &probe_spine,
                 );
                 if probe_selection_info.is_none() {
                     if let Some(last) = rows.last_mut() {
@@ -2474,6 +2561,13 @@ fn emit_cop_children(
             // Spine for the IndexLookUp children: `│` continues while a Probe
             // sibling follows the Build side.
             let mut build_spine = ancestors_spine(spine, depth);
+            // The IndexLookUp itself may be a non-last DML child (foreign-key
+            // nodes follow it): its cop subtree then needs the continuation bar.
+            if !_parent_last
+                && let Some(cont) = build_spine.last_mut()
+            {
+                *cont = true;
+            }
             let mut build_depth = depth;
             if let Some(tid) = tid_sel.as_ref() {
                 push_explain_row_spine(
@@ -3513,9 +3607,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. }
         | PhysicalPlan::SelectLock { child, .. } => vec![child.as_ref()],
-        PhysicalPlan::Insert { child }
-        | PhysicalPlan::Update { child }
-        | PhysicalPlan::Delete { child } => child.iter().map(|c| c.as_ref()).collect(),
+        PhysicalPlan::Insert { child, .. }
+        | PhysicalPlan::Update { child, .. }
+        | PhysicalPlan::Delete { child, .. } => child.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::CTE {
             recursive: true, ..
         } => Vec::new(),

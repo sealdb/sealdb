@@ -47,6 +47,9 @@ pub struct Session {
     /// TiDB `tidb_enable_clustered_index` (default ON). Read by CREATE TABLE to
     /// pick the row handle for an unannotated PRIMARY KEY.
     clustered_index: Mutex<ClusteredIndexMode>,
+    /// TiDB `foreign_key_checks` (default ON). Gates the `Foreign_Key_Check` /
+    /// `Foreign_Key_Cascade` plan nodes under DML.
+    foreign_key_checks: Mutex<bool>,
     /// Active roles for the session (`SET ROLE`).
     active_roles: Mutex<Vec<UserIdentity>>,
     /// TiDB `tidb_enable_auto_analyze` (default ON).
@@ -99,6 +102,7 @@ impl Session {
                     .unwrap_or(PartitionPruneMode::Dynamic),
             ),
             clustered_index: Mutex::new(ClusteredIndexMode::On),
+            foreign_key_checks: Mutex::new(true),
             active_roles: Mutex::new(Vec::new()),
             enable_auto_analyze: Mutex::new(globals.enable_auto_analyze),
             auto_analyze_ratio: Mutex::new(0.5),
@@ -699,7 +703,12 @@ impl Session {
         // `FROM t AS OF TIMESTAMP <expr>`: resolve the stale-read wall clock
         // before opening the transaction so every read uses that snapshot.
         let stale_millis = stmt_as_of_millis(self, stmt)?;
+        let foreign_key_checks = *self
+            .foreign_key_checks
+            .lock()
+            .expect("session foreign key checks lock");
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
+            sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
             sealdb_planner::with_explicit_txn(explicit_txn, || {
             if use_cache {
                 let cache = self.domain.plan_cache();
@@ -729,6 +738,7 @@ impl Session {
                     prune_mode,
                 )
             }
+            })
             })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
@@ -2479,7 +2489,21 @@ fn apply_set(
                 };
                 *session.autocommit.lock().expect("session autocommit lock") = on;
             }
-            "unique_checks" | "foreign_key_checks" => {}
+            "unique_checks" => {}
+            "foreign_key_checks" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "on" | "true"
+                    )
+                };
+                *session
+                    .foreign_key_checks
+                    .lock()
+                    .expect("session foreign key checks lock") = on;
+            }
             "cte_max_recursion_depth" => {
                 // `SET … = DEFAULT` resets to TiDB's default (1000).
                 let depth = if value.eq_ignore_ascii_case("DEFAULT") {
