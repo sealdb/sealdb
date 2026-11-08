@@ -131,6 +131,15 @@ impl Domain {
         Self::with_storage_and_privilege(storage, Manager::with_grant_table(), 0)
     }
 
+    /// `with_storage_and_grant_table` with an explicit global-id base (test
+    /// harnesses that share one storage across suites).
+    pub fn with_storage_and_grant_table_id_base(
+        storage: Arc<dyn Storage>,
+        id_base: i64,
+    ) -> Result<Self> {
+        Self::with_storage_and_privilege(storage, Manager::with_grant_table(), id_base)
+    }
+
     fn with_privilege(privilege: Manager) -> Self {
         Self::with_storage_and_privilege(Arc::new(MemStorage::new()), privilege, 0)
             .expect("memory meta load")

@@ -467,6 +467,36 @@ impl Manager {
             .any(|role| has_priv(&inner, role, db, table, wanted))
     }
 
+    /// Databases visible in `SHOW DATABASES`: `None` when the user holds a
+    /// global privilege (sees every database), otherwise the set of databases
+    /// where the user has a db- or table-level grant (TiDB
+    /// `ShowDatabasesExec` filters on `DBTablePrivilegeTable`).
+    pub fn visible_databases(
+        &self,
+        user: &UserIdentity,
+        active_roles: &[UserIdentity],
+    ) -> Option<HashSet<String>> {
+        if self.skip_grant_table {
+            return None;
+        }
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut out = HashSet::new();
+        for identity in std::iter::once(user).chain(active_roles.iter()) {
+            let Some(entries) = inner.grants.get(&user_key(identity)) else {
+                continue;
+            };
+            for entry in entries {
+                if entry.db.is_empty() && entry.table.is_empty() {
+                    return None;
+                }
+                if !entry.db.is_empty() {
+                    out.insert(entry.db.to_ascii_lowercase());
+                }
+            }
+        }
+        Some(out)
+    }
+
     pub fn show_grants(&self, user: &UserIdentity) -> Vec<String> {
         let inner = self.inner.lock().expect("privilege lock");
         let mut out = Vec::new();
@@ -633,12 +663,22 @@ impl Manager {
                 (user.user, user.host),
                 user.entries
                     .into_iter()
-                    .map(|e| GrantEntry {
-                        db: e.db,
-                        table: e.table,
-                        privs: PrivilegeType::from_bits(e.privs),
-                        with_grant: e.with_grant,
-                        columns: e.columns,
+                    .map(|e| {
+                        // Snapshots written before SHOW VIEW was tracked stored
+                        // the 6-bit ALL mask; treat it as today's ALL.
+                        let privs = PrivilegeType::from_bits(e.privs);
+                        let privs = if privs.bits() == 0x3f {
+                            PrivilegeType::ALL
+                        } else {
+                            privs
+                        };
+                        GrantEntry {
+                            db: e.db,
+                            table: e.table,
+                            privs,
+                            with_grant: e.with_grant,
+                            columns: e.columns,
+                        }
                     })
                     .collect(),
             );
@@ -804,4 +844,22 @@ fn format_grant(user: &UserIdentity, entry: &GrantEntry) -> String {
         s.push_str(" WITH GRANT OPTION");
     }
     s
+}
+
+thread_local! {
+    /// Identity of the session executing on this thread. Sessions are pinned
+    /// to a thread while a statement runs, so executors (e.g. `SHOW
+    /// DATABASES`) can filter by the caller without threading the identity
+    /// through every planner/executor signature (TiDB reads it from
+    /// `sessionctx.Context`).
+    static CURRENT_USER: std::cell::RefCell<Option<UserIdentity>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_thread_user(user: Option<UserIdentity>) {
+    CURRENT_USER.with(|cell| *cell.borrow_mut() = user);
+}
+
+pub fn thread_user() -> Option<UserIdentity> {
+    CURRENT_USER.with(|cell| cell.borrow().clone())
 }

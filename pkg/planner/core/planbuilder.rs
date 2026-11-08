@@ -143,6 +143,18 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // TiDB `expression.FoldConstant`: literal-only expressions are
+                // evaluated before planning (`ifnull(NULL, c1)` → `c1`,
+                // `WHERE 1 = 1` → no filter). Runs after the partition/shard
+                // rewrites so their `or(0, …)` shapes stay intact.
+                let const_folded_select;
+                let select = match super::rule_constant_fold::fold_constant_select(select) {
+                    Some(folded) => {
+                        const_folded_select = folded;
+                        &const_folded_select
+                    }
+                    None => select,
+                };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` and plans a zero-row TableDual.
                 if let Some(ExprNode::Value(ValueExpr {
@@ -288,6 +300,7 @@ impl PlanBuilder {
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
                 plan = lift_point_get_merge_join(plan, select, is, current_db);
+                plan = cast_json_join_keys(plan, select, is, current_db);
                 plan = self_join_star_projection(plan, select, is, current_db);
                 plan = apply_select_lock(plan, select);
                 let mut stream_keep_order = false;
@@ -4570,6 +4583,10 @@ thread_local! {
     /// qualify columns with their *own* schema (TiDB `Column.ExplainInfo`).
     static TABLE_DB_MAP: std::cell::RefCell<Vec<std::collections::HashMap<String, String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Alias → physical table name (`FROM t t1` → `t1` → `t`). TiDB EXPLAIN
+    /// (OrigTblName) always qualifies columns with the physical name.
+    static TABLE_PHYS_MAP: std::cell::RefCell<Vec<std::collections::HashMap<String, String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Statistics snapshots of the statement's tables (TiDB hands the
     /// DataSource its `TableStats`), so predicate pushdown can size ranges.
     static STATS_SCOPE: std::cell::RefCell<
@@ -4637,6 +4654,15 @@ impl TableDbScope {
             }
         }
         TABLE_DB_MAP.with(|stack| stack.borrow_mut().push(map));
+        let mut phys = std::collections::HashMap::new();
+        if let Statement::Select(select) = stmt {
+            for table in select.join_tables() {
+                let physical = table.resolve_name().to_ascii_lowercase();
+                phys.insert(table.name.to_ascii_lowercase(), physical.clone());
+                phys.insert(physical.clone(), physical);
+            }
+        }
+        TABLE_PHYS_MAP.with(|stack| stack.borrow_mut().push(phys));
         Self
     }
 }
@@ -4646,6 +4672,9 @@ impl Drop for TableDbScope {
         TABLE_DB_MAP.with(|stack| {
             stack.borrow_mut().pop();
         });
+        TABLE_PHYS_MAP.with(|stack| {
+            stack.borrow_mut().pop();
+        });
     }
 }
 
@@ -4653,6 +4682,18 @@ impl Drop for TableDbScope {
 /// tables and plans built outside a statement scope).
 pub(crate) fn explain_table_schema(table: &str) -> Option<String> {
     TABLE_DB_MAP.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|map| map.get(&table.to_ascii_lowercase()).cloned())
+    })
+}
+
+/// Physical (OrigTblName) table behind an alias: `FROM t t1` → `t1` → `t`.
+/// TiDB EXPLAIN qualifies column references with this name.
+pub(crate) fn explain_physical_table(table: &str) -> Option<String> {
+    TABLE_PHYS_MAP.with(|stack| {
         stack
             .borrow()
             .iter()
@@ -13915,6 +13956,34 @@ fn self_join_star_projection(
     if !orig(&left_table).eq_ignore_ascii_case(&orig(&right_table)) {
         return plan;
     }
+    // TiDB eliminates the `SELECT *` Projection when the join's output already
+    // matches the FROM order: a bare access path on the FROM-first table is
+    // the probe side and the other table is the build side. A computed probe
+    // (cast Projection), a derived/CTE side, or a swapped build/probe order
+    // reorders the columns, so the Projection stays.
+    let (left_child, right_child) = match &plan {
+        PhysicalPlan::MergeJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. } => (left.as_ref(), right.as_ref()),
+        _ => return plan,
+    };
+    let bare_access = |child: &PhysicalPlan, alias: &str| match child {
+        PhysicalPlan::TableReader { table, .. }
+        | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexLookUpReader { table, .. }
+        | PhysicalPlan::PointGet { table, .. }
+        | PhysicalPlan::BatchPointGet { table, .. } => table.eq_ignore_ascii_case(alias),
+        _ => false,
+    };
+    let tables = select.join_tables();
+    let from_first = tables.first().map(|t| t.name.clone());
+    let from_second = tables.get(1).map(|t| t.name.clone());
+    let probe_matches = from_first.as_deref() == Some(left_table.as_str())
+        && from_second.as_deref() == Some(right_table.as_str())
+        && bare_access(left_child, &left_table)
+        && bare_access(right_child, &right_table);
+    if probe_matches {
+        return plan;
+    }
     wrap_star_join_projection(plan, select, is, current_db)
 }
 
@@ -13928,6 +13997,213 @@ fn is_point_get_side(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Limit { child, .. } => is_point_get_side(child),
         _ => false,
     }
+}
+
+/// TiDB `DealWithCasting` for join keys whose types only meet in JSON: the
+/// string side keeps the `Projection` that evaluates
+/// `cast(<col>, json BINARY)->Column#N` and the JSON side is the build side,
+/// so the hash key compares two JSON values. The select list is then
+/// re-projected above the join (the probe is no longer a bare scan).
+fn cast_json_join_keys(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let Some(is) = is else {
+        return plan;
+    };
+    if !in_explain_build() {
+        return plan;
+    }
+    let PhysicalPlan::HashJoin {
+        est_rows,
+        tp,
+        left,
+        right,
+        left_table,
+        right_table,
+        on,
+    } = plan
+    else {
+        return plan;
+    };
+    let left = cast_json_join_keys(*left, select, Some(is), current_db);
+    let right = cast_json_join_keys(*right, select, Some(is), current_db);
+    let rebuild = |tp, left: PhysicalPlan, right: PhysicalPlan, left_table, right_table, on| {
+        PhysicalPlan::HashJoin {
+            est_rows,
+            tp,
+            left: Box::new(left),
+            right: Box::new(right),
+            left_table,
+            right_table,
+            on,
+        }
+    };
+    if tp != JoinType::Inner {
+        return rebuild(tp, left, right, left_table, right_table, on);
+    }
+    let ExprNode::Binary(bin) = &on else {
+        return rebuild(tp, left, right, left_table, right_table, on);
+    };
+    if bin.op != Op::Eq {
+        return rebuild(tp, left, right, left_table, right_table, on);
+    }
+    let (ExprNode::Column(lc), ExprNode::Column(rc)) = (bin.left.as_ref(), bin.right.as_ref())
+    else {
+        return rebuild(tp, left, right, left_table, right_table, on);
+    };
+    let type_of = |c: &sealdb_parser::ast::expressions::ColumnNameExpr| {
+        let table = c.table.as_deref()?;
+        json_join_cast_column_type(select, is, current_db, table, &c.name)
+    };
+    let (lt, rt) = (type_of(lc), type_of(rc));
+    // Exactly one side is JSON and the other is a string type.
+    let is_string = |tp: Option<u8>| {
+        matches!(
+            tp,
+            Some(sealdb_types::field_type::TYPE_VARCHAR)
+                | Some(sealdb_types::field_type::TYPE_VAR_STRING)
+                | Some(sealdb_types::field_type::TYPE_STRING)
+                | Some(sealdb_types::field_type::TYPE_BLOB)
+                | Some(sealdb_types::field_type::TYPE_TINY_BLOB)
+                | Some(sealdb_types::field_type::TYPE_MEDIUM_BLOB)
+                | Some(sealdb_types::field_type::TYPE_LONG_BLOB)
+        )
+    };
+    let json = Some(sealdb_types::field_type::TYPE_JSON);
+    let (string_col, json_col, string_is_left) = match (lt, rt) {
+        _ if is_string(lt) && rt == json => (lc, rc, true),
+        _ if is_string(rt) && lt == json => (rc, lc, false),
+        _ => return rebuild(tp, left, right, left_table, right_table, on),
+    };
+    // The cast `Projection` always ends up on the probe side: the string side
+    // is moved to probe when it is currently the build side.
+    let (probe_table, build_table) = if string_is_left {
+        (left_table.clone(), right_table.clone())
+    } else {
+        (right_table.clone(), left_table.clone())
+    };
+    let column_id = json_join_next_column_id(select, is, current_db);
+    let Some(probe) = json_join_cast_projection(
+        if string_is_left {
+            left.clone()
+        } else {
+            right.clone()
+        },
+        select,
+        is,
+        current_db,
+        &probe_table,
+        &string_col.name,
+        column_id,
+    ) else {
+        return rebuild(tp, left, right, left_table, right_table, on);
+    };
+    let build = if string_is_left { right } else { left };
+    let cast_ref = ExprNode::Column(sealdb_parser::ast::expressions::ColumnNameExpr {
+        schema: None,
+        table: None,
+        name: format!("Column#{column_id}"),
+    });
+    let eq = ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+        op: Op::Eq,
+        left: Box::new(ExprNode::Column(json_col.clone())),
+        right: Box::new(cast_ref),
+        single_cnf_item: bin.single_cnf_item,
+    });
+    rebuild(tp, probe, build, probe_table, build_table, eq)
+}
+
+/// Type of `{table}.{col}` for a join-key cast decision.
+fn json_join_cast_column_type(
+    select: &SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+    table: &str,
+    col: &str,
+) -> Option<u8> {
+    let tbl = select
+        .join_tables()
+        .into_iter()
+        .find(|t| t.resolve_name().eq_ignore_ascii_case(table))?;
+    let db = tbl
+        .schema
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(current_db);
+    let info = is.table_by_name(db, table)?;
+    info.columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(col))
+        .map(|c| c.field_type.tp)
+}
+
+/// TiDB `Column#N` for the hidden cast column: one ID per join-table column,
+/// plus the implicit `_tidb_rowid` of non-clustered tables.
+fn json_join_next_column_id(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> i64 {
+    let mut next = 1i64;
+    for t in select.join_tables() {
+        let db = t
+            .schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(current_db);
+        let Some(info) = is.table_by_name(db, t.resolve_name()) else {
+            continue;
+        };
+        next += info.columns.iter().filter(|c| !c.hidden).count() as i64;
+        if !(info.pk_is_handle || info.common_handle) {
+            next += 1;
+        }
+    }
+    next
+}
+
+/// `Projection` over the string side: the side's columns, then the cast.
+fn json_join_cast_projection(
+    child: PhysicalPlan,
+    select: &SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+    table: &str,
+    col: &str,
+    column_id: i64,
+) -> Option<PhysicalPlan> {
+    let tbl = select
+        .join_tables()
+        .into_iter()
+        .find(|t| t.name.eq_ignore_ascii_case(table))?;
+    let phys = tbl.resolve_name();
+    let db = tbl
+        .schema
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(current_db);
+    let info = is.table_by_name(db, phys)?;
+    let mut exprs: Vec<String> = info
+        .columns
+        .iter()
+        .filter(|c| !c.hidden)
+        .map(|c| {
+            format!(
+                "{}.{}.{}",
+                schema_prefix(current_db),
+                phys,
+                c.name.o()
+            )
+        })
+        .collect();
+    exprs.push(format!(
+        "cast({}.{}.{col}, json BINARY)->Column#{column_id}",
+        schema_prefix(current_db),
+        phys
+    ));
+    Some(PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(child),
+    })
 }
 
 /// `Point_Get ⋈ Point_Get` on the join key: both sides are single ordered

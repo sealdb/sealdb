@@ -3054,6 +3054,87 @@ fn selection_table(plan: &PhysicalPlan) -> Option<&str> {
     }
 }
 
+/// Residual predicates over an information_schema memory table print their
+/// columns as TiDB's internal `Column#N` handles: a memtable's schema has no
+/// real table identity, so only the position survives.
+fn explain_mem_table_selection(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let col_label = |c: &sealdb_parser::ast::expressions::ColumnNameExpr| {
+        mem_table_column_index(table, &c.name)
+            .map(|n| format!("Column#{n}"))
+            .unwrap_or_else(|| c.name.clone())
+    };
+    let render = |expr: &ExprNode| -> String {
+        match expr {
+            ExprNode::IsNull(i) => match i.expr.as_ref() {
+                ExprNode::Column(c) => {
+                    let inner = format!("isnull({})", col_label(c));
+                    if i.not {
+                        format!("not({inner})")
+                    } else {
+                        inner
+                    }
+                }
+                other => other.restore_string(),
+            },
+            ExprNode::Unary(u) if u.op == Op::Not => {
+                if let ExprNode::IsNull(i) = u.expr.as_ref()
+                    && let ExprNode::Column(c) = i.expr.as_ref()
+                {
+                    return format!("not(isnull({}))", col_label(c));
+                }
+                expr.restore_string()
+            }
+            other => other.restore_string(),
+        }
+    };
+    filter
+        .split_cnf()
+        .iter()
+        .map(render)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// TiDB memtable column positions (1-based `Column#N` handles).
+fn mem_table_column_index(table: &str, name: &str) -> Option<usize> {
+    if !table.eq_ignore_ascii_case("statements_summary") {
+        return None;
+    }
+    const COLUMNS: &[&str] = &[
+        "summary_begin_time",
+        "summary_end_time",
+        "stmt_type",
+        "schema_name",
+        "digest",
+        "digest_text",
+        "table_names",
+        "index_names",
+        "sample_user",
+        "exec_count",
+        "sum_latency",
+        "max_latency",
+        "min_latency",
+        "avg_latency",
+        "avg_parse_latency",
+        "avg_compile_latency",
+        "avg_cop_process_time",
+        "avg_process_time",
+        "max_process_time",
+        "avg_wait_time",
+        "avg_backoff_time",
+        "avg_total_keys",
+        "avg_processed_keys",
+        "avg_prev_stmt",
+        "exec_retry",
+    ];
+    COLUMNS
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .map(|i| i + 1)
+}
+
 fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
     explain_selection_info_on("t", filter)
 }
@@ -3963,9 +4044,16 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Selection { child, filter, .. } => (
             "Selection".to_string(),
             String::new(),
-            match selection_table(child) {
-                Some(table) => explain_selection_info_on(table, filter),
-                None => explain_selection_info(filter),
+            match child.as_ref() {
+                // TiDB memtable columns have no real table identity: residual
+                // predicates print the internal `Column#N` handle.
+                PhysicalPlan::InfoSchema { table, .. } => {
+                    explain_mem_table_selection(table, filter)
+                }
+                _ => match selection_table(child) {
+                    Some(table) => explain_selection_info_on(table, filter),
+                    None => explain_selection_info(filter),
+                },
             },
         ),
         PhysicalPlan::Sort { by_info, .. } => ("Sort".to_string(), String::new(), by_info.clone()),
@@ -4437,6 +4525,24 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             // Stats-derived cardinality from plan build (`cardinality.Selectivity`).
             if let Some(est) = built_est {
                 return *est;
+            }
+            // TiDB sizes the residual Selection of a handle point get from the
+            // point get's one row (unanalyzed tables: `RealtimeCount == 0`
+            // short-circuits selectivity to 1.0).
+            if matches!(
+                child.as_ref(),
+                PhysicalPlan::PointGet { index: None, .. }
+            ) {
+                return est_rows(child);
+            }
+            // Memory tables expose no statistics, so TiDB applies the default
+            // 0.8 `selectionFactor` (`isnull(digest)` over 10000 → 8000).
+            if matches!(child.as_ref(), PhysicalPlan::InfoSchema { .. })
+                && filter.split_cnf().iter().any(|c| {
+                    matches!(c, sealdb_parser::ast::expressions::ExprNode::IsNull(i) if !i.not)
+                })
+            {
+                return est_rows(child) * 0.8;
             }
             let n = not_isnull_count(filter);
             // TiDB: not(isnull) over CTEFullScan uses 0.8 (6400.80 from 8001).
@@ -5059,6 +5165,10 @@ fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
 /// OrigTblName: alias of physical `t` stays `<db>.t.a`; real tables use their
 /// name (`<db>.t1.a`), where `<db>` is the suite schema.
 pub(crate) fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> String {
+    // Internal `Column#N` handles (aggregate output, cast column) print bare.
+    if col.name.starts_with("Column#") {
+        return col.name.clone();
+    }
     let table = col.table.as_deref().unwrap_or("t");
     let schema = column_schema(col, table);
     if schema.is_empty() {

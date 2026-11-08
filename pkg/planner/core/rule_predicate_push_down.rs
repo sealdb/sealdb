@@ -717,7 +717,9 @@ fn push_into(
             let mut residual = Vec::new();
             for conjunct in conjuncts {
                 match mem_table_range(&conjunct) {
-                    Some(range) => ranges.push(range),
+                    Some((column, values)) => {
+                        ranges.extend(values.into_iter().map(|v| (column.clone(), v)));
+                    }
                     None => residual.push(conjunct),
                 }
             }
@@ -734,7 +736,14 @@ fn push_into(
                         values.push(format!("\"{}\"", ranges[i].1));
                         i += 1;
                     }
-                    attached.push(format!("{column}:[{}]", values.join(",")));
+                    // STATEMENTS_SUMMARY spells its digest range `digests: […]`.
+                    let (label, sep) =
+                        if table.eq_ignore_ascii_case("statements_summary") && column == "digest" {
+                            ("digests".to_string(), ": ")
+                        } else {
+                            (column, ":")
+                        };
+                    attached.push(format!("{label}{sep}[{}]", values.join(",")));
                 }
                 if !text.is_empty() {
                     text.push_str(", ");
@@ -888,15 +897,38 @@ fn reduce_pinned_dnf(expr: &ExprNode, key_columns: &[String]) -> Option<Option<E
 /// Infoschema memory tables answer an equality on a string column
 /// (`table_name = 'T1'` → `table_name:["t1"]`); values compare under the
 /// case-insensitive column collation, so they render lower-cased.
-fn mem_table_range(expr: &ExprNode) -> Option<(String, String)> {
+fn mem_table_range(expr: &ExprNode) -> Option<(String, Vec<String>)> {
+    // An IN list is a union of point ranges on one column
+    // (`digest IN ('a','b')` → `digests: ["a","b"]`).
+    if let ExprNode::InList(list) = expr {
+        if list.not {
+            return None;
+        }
+        let ExprNode::Column(col) = list.expr.as_ref() else {
+            return None;
+        };
+        let values = list
+            .list
+            .iter()
+            .map(|item| item.const_datum().and_then(mem_table_value))
+            .collect::<Option<Vec<_>>>()?;
+        return Some((col.name.to_ascii_lowercase(), values));
+    }
     let (column, value) = expr.eq_column_const()?;
+    Some((
+        column.to_ascii_lowercase(),
+        vec![mem_table_value(value)?],
+    ))
+}
+
+fn mem_table_value(value: Datum) -> Option<String> {
     let text = match value {
         Datum::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Datum::I64(v) => v.to_string(),
         Datum::U64(v) => v.to_string(),
         _ => return None,
     };
-    Some((column.to_ascii_lowercase(), text.to_lowercase()))
+    Some(text.to_lowercase())
 }
 
 fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {    let Some(filter) = ExprNode::compose_cnf(residual) else {

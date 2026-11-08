@@ -13,13 +13,17 @@ impl PrivilegeType {
     pub const DELETE: Self = Self(1 << 3);
     pub const CREATE: Self = Self(1 << 4);
     pub const DROP: Self = Self(1 << 5);
+    /// `SHOW VIEW`: required by `EXPLAIN`/`SHOW` on a VIEW (TiDB
+    /// `mysql.ShowViewPriv`, `ErrViewNoExplain` when missing).
+    pub const SHOW_VIEW: Self = Self(1 << 6);
     pub const ALL: Self = Self(
         Self::SELECT.0
             | Self::INSERT.0
             | Self::UPDATE.0
             | Self::DELETE.0
             | Self::CREATE.0
-            | Self::DROP.0,
+            | Self::DROP.0
+            | Self::SHOW_VIEW.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -63,6 +67,7 @@ impl PrivilegeType {
             (Self::DELETE, "DELETE"),
             (Self::CREATE, "CREATE"),
             (Self::DROP, "DROP"),
+            (Self::SHOW_VIEW, "SHOW VIEW"),
         ] {
             if self.contains(bit) {
                 names.push(name);

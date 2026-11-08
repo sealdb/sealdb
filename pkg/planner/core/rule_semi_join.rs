@@ -742,18 +742,167 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
     }
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
-        let (on, inner_filter) = split_semi_pred(selection, &inner.name)?;
-        return Some(build_spec(
-            if not { JoinType::Anti } else { JoinType::Semi },
-            inner.name.clone(),
-            inner_filter,
-            on,
-            None,
-        ));
+        if let Some((on, inner_filter)) = split_semi_pred(selection, &inner.name) {
+            return Some(build_spec(
+                if not { JoinType::Anti } else { JoinType::Semi },
+                inner.name.clone(),
+                inner_filter,
+                on,
+                None,
+            ));
+        }
+        // Correlated predicates without a cross-table equality: TiDB
+        // decorrelates to a CARTESIAN semi/anti join with `other cond`.
+        return cartesian_exists_spec(not, inner, selection, outer_table);
     }
     // `EXISTS (WITH cte AS (SELECT … FROM t2 WHERE corr) SELECT FROM cte)` —
     // TiDB inlines the CTE seed and decorrelates to a semi HashJoin (cte suite).
     from_exists_cte(not, query, outer_table)
+}
+
+/// `EXISTS (SELECT … FROM t WHERE <correlated non-equality>)`. TiDB
+/// decorrelates the Apply into a CARTESIAN semi/anti HashJoin carrying the
+/// cross-table predicates as `other cond`. For semi joins every two-column
+/// null-rejecting comparison additionally derives `not(isnull(col))` on both
+/// sides (TiDB `ExtractOnCondition`); anti joins derive none.
+fn cartesian_exists_spec(
+    not: bool,
+    inner: &TableName,
+    selection: &ExprNode,
+    outer_table: Option<&str>,
+) -> Option<SemiSpec> {
+    let mut other = Vec::new();
+    let mut inner_preds = Vec::new();
+    let mut outer_preds = Vec::new();
+    for item in selection.split_cnf() {
+        if item.has_subquery() {
+            return None;
+        }
+        if only_inner(&item, &inner.name) {
+            inner_preds.push(item);
+            continue;
+        }
+        let mut sees_inner = false;
+        let mut sees_outer = false;
+        for (table, _) in item.referenced_columns() {
+            match table {
+                Some(t) if t.eq_ignore_ascii_case(&inner.name) => sees_inner = true,
+                Some(_) => sees_outer = true,
+                None => sees_inner = true,
+            }
+        }
+        if sees_inner && sees_outer {
+            other.push(item);
+        } else if sees_outer {
+            outer_preds.push(item);
+        } else {
+            return None;
+        }
+    }
+    if other.is_empty() {
+        return None;
+    }
+    // A correlated predicate needs an outer query to bind against.
+    outer_table?;
+    let join_tp = if not { JoinType::Anti } else { JoinType::Semi };
+    // TiDB keeps `CARTESIAN` in the join label when there is no equal key.
+    let join_label = if not {
+        "CARTESIAN anti semi join"
+    } else {
+        "CARTESIAN semi join"
+    };
+    let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name);
+    let (right_nulls, left_nulls) = if not {
+        (None, None)
+    } else {
+        derive_comparison_null_rejects(&other, &inner.name, inner_physical)
+    };
+    let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+    if let Some(filter) = merge_filters(ExprNode::compose_cnf(inner_preds), right_nulls) {
+        right = push_isnull_filter(right, filter);
+    }
+    let info = format!(
+        "{join_label}, other cond:{}",
+        other
+            .iter()
+            .map(|c| explain_semi_pred_inner(c, &inner.name, inner_physical))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let cond = ExprNode::compose_cnf(other)?;
+    let on = ExprNode::Binary(BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(cond),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(info.into_bytes()),
+        })),
+        single_cnf_item: false,
+    });
+    Some(SemiSpec {
+        tp: join_tp,
+        right_table: inner.name.clone(),
+        right,
+        on,
+        outer_filter: merge_filters(ExprNode::compose_cnf(outer_preds), left_nulls),
+    })
+}
+
+/// TiDB `DeriveOtherConditions`: only two-column comparisons (`=`, `<>`,
+/// `<`, `<=`, `>`, `>=`) reject NULLs, so each side derives
+/// `not(isnull(col))` for its own column. IN lists / expressions derive none.
+fn derive_comparison_null_rejects(
+    conds: &[ExprNode],
+    inner_alias: &str,
+    inner_physical: &str,
+) -> (Option<ExprNode>, Option<ExprNode>) {
+    let mut inner_seen: Vec<String> = Vec::new();
+    let mut outer_seen: Vec<String> = Vec::new();
+    let mut inner = Vec::new();
+    let mut outer = Vec::new();
+    let push = |table: &str, name: &str, seen: &mut Vec<String>, out: &mut Vec<ExprNode>| {
+        if seen.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return;
+        }
+        seen.push(name.to_string());
+        out.push(ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(table.to_string()),
+                    name: name.to_string(),
+                })),
+                not: false,
+            })),
+        }));
+    };
+    for cond in conds {
+        let ExprNode::Binary(bin) = cond else {
+            continue;
+        };
+        if !matches!(
+            bin.op,
+            Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne
+        ) {
+            continue;
+        }
+        let (ExprNode::Column(l), ExprNode::Column(r)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        for col in [l, r] {
+            let on_inner = col.table.as_deref().is_some_and(|t| {
+                t.eq_ignore_ascii_case(inner_alias) || t.eq_ignore_ascii_case(inner_physical)
+            });
+            if on_inner {
+                push(inner_physical, &col.name, &mut inner_seen, &mut inner);
+            } else if let Some(table) = col.table.as_deref() {
+                push(table, &col.name, &mut outer_seen, &mut outer);
+            }
+        }
+    }
+    (ExprNode::compose_cnf(inner), ExprNode::compose_cnf(outer))
 }
 
 fn from_exists_cte(
@@ -866,6 +1015,7 @@ fn from_in(
         return None;
     }
     let inner = simple_inner(query)?;
+    let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name);
     // ORDER BY in an IN subquery is meaningless for semi-join and is dropped.
     let (inner_filter, other_conds) = split_in_selection(query.selection.as_ref(), &inner.name)?;
     // `IN (SELECT * FROM t)` compares against the table's (single) column:
@@ -939,7 +1089,7 @@ fn from_in(
         let info = format!(
             "{cart}, other cond:eq({}, {})",
             explain_semi_pred(&outer_expr),
-            explain_semi_pred(&inner_expr),
+            explain_semi_pred_inner(&inner_expr, &inner.name, inner_physical),
         );
         // Executable equality under the ExplainInfo marker: the executor has
         // no index key here, so it probes the cartesian product and filters
@@ -982,7 +1132,7 @@ fn from_in(
         let other = format!(
             "eq({}, {})",
             explain_semi_pred(&outer_expr),
-            explain_semi_pred(&inner_expr)
+            explain_semi_pred_inner(&inner_expr, &inner.name, inner_physical)
         );
         let info = format!("{join_label}, equal:[{equal_info}], other cond:{other}");
         let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
@@ -1034,10 +1184,14 @@ fn from_in(
     }
     let info = format!(
         "{join_label}, equal:[{}], other cond:{}",
-        explain_semi_eq(&outer_expr, &inner_expr),
+        explain_semi_eq(
+            &outer_expr,
+            &inner_expr,
+            Some((&inner.name, inner_physical)),
+        ),
         other_conds
             .iter()
-            .map(explain_semi_pred)
+            .map(|c| explain_semi_pred_inner(c, &inner.name, inner_physical))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -1178,11 +1332,11 @@ fn not_isnull_cols(exprs: &[ExprNode], table: &str) -> Option<ExprNode> {
     ExprNode::compose_cnf(filters)
 }
 
-fn explain_semi_eq(left: &ExprNode, right: &ExprNode) -> String {
+fn explain_semi_eq(left: &ExprNode, right: &ExprNode, inner: Option<(&str, &str)>) -> String {
     format!(
         "eq({}, {})",
-        explain_semi_col(left),
-        explain_semi_col(right)
+        explain_semi_col(left, inner),
+        explain_semi_col(right, inner)
     )
 }
 
@@ -1197,10 +1351,24 @@ fn explain_semi_eq_outer_first(eq: &ExprNode, inner: &str) -> String {
         } else {
             (bin.left.as_ref(), bin.right.as_ref())
         };
-    explain_semi_eq(outer, inn)
+    explain_semi_eq(outer, inn, None)
 }
 
 pub(crate) fn explain_semi_pred(expr: &ExprNode) -> String {
+    explain_semi_pred_with(expr, None)
+}
+
+/// `inner` names the decorrelated subquery's table so its columns print with
+/// the subquery's physical (OrigTblName) table instead of the table alias.
+fn explain_semi_pred_inner<'a>(
+    expr: &ExprNode,
+    inner_alias: &'a str,
+    inner_physical: &'a str,
+) -> String {
+    explain_semi_pred_with(expr, Some((inner_alias, inner_physical)))
+}
+
+fn explain_semi_pred_with(expr: &ExprNode, inner: Option<(&str, &str)>) -> String {
     match expr {
         ExprNode::Binary(bin) => {
             let op = match bin.op {
@@ -1219,18 +1387,42 @@ pub(crate) fn explain_semi_pred(expr: &ExprNode) -> String {
             };
             format!(
                 "{op}({}, {})",
-                explain_semi_pred(&bin.left),
-                explain_semi_pred(&bin.right)
+                explain_semi_pred_with(&bin.left, inner),
+                explain_semi_pred_with(&bin.right, inner)
             )
         }
-        other => explain_semi_col(other),
+        // TiDB renders an IN list as `in(col, e1, e2)`.
+        ExprNode::InList(list) => {
+            let mut parts = vec![explain_semi_pred_with(&list.expr, inner)];
+            parts.extend(
+                list.list
+                    .iter()
+                    .map(|e| explain_semi_pred_with(e, inner)),
+            );
+            format!(
+                "{}({})",
+                if list.not { "not in" } else { "in" },
+                parts.join(", ")
+            )
+        }
+        other => explain_semi_col(other, inner),
     }
 }
 
-fn explain_semi_col(expr: &ExprNode) -> String {
+fn explain_semi_col(expr: &ExprNode, inner: Option<(&str, &str)>) -> String {
     match expr {
         ExprNode::Column(c) => {
-            let table = c.table.as_deref().unwrap_or("t");
+            let alias = c.table.as_deref().unwrap_or("t");
+            // TiDB `OrigTblName`: aliases print as the physical table.
+            let table = match inner {
+                Some((inner_alias, inner_physical))
+                    if alias.eq_ignore_ascii_case(inner_alias) =>
+                {
+                    inner_physical.to_string()
+                }
+                _ => crate::core::planbuilder::explain_physical_table(alias)
+                    .unwrap_or_else(|| alias.to_string()),
+            };
             let schema = sealdb_expression::current_db_name();
             if schema.is_empty() {
                 format!("select.{table}.{}", c.name)

@@ -4652,6 +4652,12 @@ fn extract_role_grants(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                 i = end;
                 continue;
             }
+            if let Some((stmt, end)) = try_parse_table_priv_grant(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
         }
         if keyword_at(bytes, i, "REVOKE") {
             if let Some((stmt, end)) = try_parse_revoke_role(bytes, i)? {
@@ -4661,6 +4667,12 @@ fn extract_role_grants(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
                 continue;
             }
             if let Some((stmt, end)) = try_parse_dynamic_revoke(bytes, i)? {
+                out.push_str("SET NAMES '__sealdb_role__'");
+                ops.push(Some(stmt));
+                i = end;
+                continue;
+            }
+            if let Some((stmt, end)) = try_parse_table_priv_revoke(bytes, i)? {
                 out.push_str("SET NAMES '__sealdb_role__'");
                 ops.push(Some(stmt));
                 i = end;
@@ -4747,8 +4759,211 @@ fn try_parse_dynamic_revoke(bytes: &[u8], start: usize) -> Result<Option<(Statem
     )))
 }
 
-fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {
+/// MySQL table-level privileges sqlparser cannot parse — notably the two-word
+/// `SHOW VIEW` (`GRANT SHOW VIEW ON db.v TO u`, `GRANT SELECT, SHOW VIEW …`).
+/// Returns `None` unless the list contains such a privilege so ordinary
+/// GRANT/REVOKE statements stay on the sqlparser path.
+fn try_parse_table_priv_grant(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let i = skip_ws(bytes, start + "GRANT".len());
+    let Some((privs, after)) = parse_table_priv_list(bytes, i)? else {
+        return Ok(None);
+    };
+    let mut i = skip_ws(bytes, after);
+    if !keyword_at(bytes, i, "ON") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "ON".len());
+    let Some((level, after)) = parse_table_priv_level(bytes, i)? else {
+        return Ok(None);
+    };
+    i = skip_ws(bytes, after);
+    if !keyword_at(bytes, i, "TO") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "TO".len());
+    let (users, mut end) = parse_user_list(bytes, i)?;
+    end = skip_ws(bytes, end);
+    let mut with_grant = false;
+    if keyword_at(bytes, end, "WITH") {
+        let after_with = skip_ws(bytes, end + "WITH".len());
+        if keyword_at(bytes, after_with, "GRANT") {
+            let after_grant = skip_ws(bytes, after_with + "GRANT".len());
+            if keyword_at(bytes, after_grant, "OPTION") {
+                with_grant = true;
+                end = after_grant + "OPTION".len();
+            }
+        }
+    }
+    Ok(Some((
+        Statement::Grant(GrantStmt {
+            privs,
+            level,
+            users,
+            with_grant,
+            dynamic_privs: Vec::new(),
+        }),
+        end,
+    )))
+}
+
+fn try_parse_table_priv_revoke(bytes: &[u8], start: usize) -> Result<Option<(Statement, usize)>> {
+    let mut i = skip_ws(bytes, start + "REVOKE".len());
+    let mut grant_option = false;
+    if keyword_at(bytes, i, "GRANT") {
+        let after = skip_ws(bytes, i + "GRANT".len());
+        if keyword_at(bytes, after, "OPTION") {
+            let after = skip_ws(bytes, after + "OPTION".len());
+            if keyword_at(bytes, after, "FOR") {
+                grant_option = true;
+                i = skip_ws(bytes, after + "FOR".len());
+            }
+        }
+    }
+    let Some((privs, after)) = parse_table_priv_list(bytes, i)? else {
+        return Ok(None);
+    };
+    let mut i = skip_ws(bytes, after);
+    if !keyword_at(bytes, i, "ON") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "ON".len());
+    let Some((level, after)) = parse_table_priv_level(bytes, i)? else {
+        return Ok(None);
+    };
+    i = skip_ws(bytes, after);
+    if !keyword_at(bytes, i, "FROM") {
+        return Ok(None);
+    }
+    i = skip_ws(bytes, i + "FROM".len());
+    let (users, end) = parse_user_list(bytes, i)?;
+    Ok(Some((
+        Statement::Revoke(RevokeStmt {
+            privs,
+            level,
+            users,
+            grant_option,
+            dynamic_privs: Vec::new(),
+        }),
+        end,
+    )))
+}
+
+fn parse_table_priv_list(bytes: &[u8], mut i: usize) -> Result<Option<(Vec<PrivElem>, usize)>> {
     let mut privs = Vec::new();
+    let mut saw_show_view = false;
+    loop {
+        i = skip_ws(bytes, i);
+        let mut tp = None;
+        for (prefix, value) in [
+            ("SHOW", PrivilegeType::SHOW_VIEW),
+            ("SELECT", PrivilegeType::SELECT),
+            ("INSERT", PrivilegeType::INSERT),
+            ("UPDATE", PrivilegeType::UPDATE),
+            ("DELETE", PrivilegeType::DELETE),
+            ("CREATE", PrivilegeType::CREATE),
+            ("DROP", PrivilegeType::DROP),
+        ] {
+            if !keyword_at(bytes, i, prefix) {
+                continue;
+            }
+            let mut next = skip_ws(bytes, i + prefix.len());
+            if value == PrivilegeType::SHOW_VIEW {
+                // `SHOW VIEW` is two words.
+                if !keyword_at(bytes, next, "VIEW") {
+                    continue;
+                }
+                next = skip_ws(bytes, next + "VIEW".len());
+            }
+            tp = Some((value, next));
+            break;
+        }
+        let Some((tp, next)) = tp else {
+            if privs.is_empty() && !saw_show_view {
+                return Ok(None);
+            }
+            // Unknown privilege after a parsed list: let sqlparser try.
+            return Ok(None);
+        };
+        saw_show_view |= tp == PrivilegeType::SHOW_VIEW;
+        privs.push(PrivElem {
+            tp,
+            cols: Vec::new(),
+        });
+        i = skip_ws(bytes, next);
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if !saw_show_view {
+        return Ok(None);
+    }
+    Ok(Some((privs, i)))
+}
+
+fn parse_table_priv_level(bytes: &[u8], mut i: usize) -> Result<Option<(GrantLevel, usize)>> {
+    i = skip_ws(bytes, i);
+    if bytes.get(i) == Some(&b'*') {
+        let mut j = skip_ws(bytes, i + 1);
+        if bytes.get(j) != Some(&b'.') {
+            return Ok(None);
+        }
+        j = skip_ws(bytes, j + 1);
+        if bytes.get(j) != Some(&b'*') {
+            return Ok(None);
+        }
+        return Ok(Some((
+            GrantLevel {
+                level: GrantLevelType::Global,
+                db_name: String::new(),
+                table_name: String::new(),
+            },
+            skip_ws(bytes, j + 1),
+        )));
+    }
+    let (first, next) = read_quoted_or_ident(bytes, i);
+    if first.is_empty() {
+        return Ok(None);
+    }
+    let j = skip_ws(bytes, next);
+    if bytes.get(j) != Some(&b'.') {
+        return Ok(Some((
+            GrantLevel {
+                level: GrantLevelType::Table,
+                db_name: String::new(),
+                table_name: first,
+            },
+            j,
+        )));
+    }
+    let mut k = skip_ws(bytes, j + 1);
+    if bytes.get(k) == Some(&b'*') {
+        return Ok(Some((
+            GrantLevel {
+                level: GrantLevelType::DB,
+                db_name: first,
+                table_name: String::new(),
+            },
+            skip_ws(bytes, k + 1),
+        )));
+    }
+    let (second, end) = read_quoted_or_ident(bytes, k);
+    if second.is_empty() {
+        return Ok(None);
+    }
+    k = end;
+    Ok(Some((
+        GrantLevel {
+            level: GrantLevelType::Table,
+            db_name: first,
+            table_name: second,
+        },
+        k,
+    )))
+}
+
+fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {    let mut privs = Vec::new();
     loop {
         i = skip_ws(bytes, i);
         let (name, next) = read_quoted_or_ident(bytes, i);

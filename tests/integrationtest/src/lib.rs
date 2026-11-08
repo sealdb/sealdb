@@ -123,7 +123,13 @@ pub struct Step {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionDirective {
     /// `connect (name, host, user, pass, db)`
-    Connect(String),
+    Connect {
+        name: String,
+        /// Login user; empty keeps the default (root) identity.
+        user: String,
+        /// Initial database for the new session.
+        db: String,
+    },
     /// `connection name`
     Connection(String),
     /// `disconnect name`
@@ -149,7 +155,6 @@ fn parse_session_directive(line: &str) -> Option<SessionDirective> {
             SessionDirective::Connection as fn(String) -> SessionDirective,
         ),
         ("disconnect", SessionDirective::Disconnect),
-        ("connect", SessionDirective::Connect),
     ] {
         let Some(rest) = strip_prefix_ci(line, keyword) else {
             continue;
@@ -164,7 +169,37 @@ fn parse_session_directive(line: &str) -> Option<SessionDirective> {
         }
         return name_of(rest).map(make);
     }
-    None
+    // `connect (name, host, user, pass, db)` — TiDB mysql-tester opens the
+    // session as `user` (privilege checks run as that identity).
+    let rest = strip_prefix_ci(line, "connect")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let name = name_of(rest)?;
+    let mut parts = rest
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches([')', ';'])
+        .split(',');
+    let _ = parts.next(); // name
+    let _ = parts.next(); // host
+    let user = parts.next().unwrap_or("").trim().trim_matches(['\'', '"']);
+    let _ = parts.next(); // password
+    let db = parts
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_string();
+    Some(SessionDirective::Connect {
+        name,
+        user: user.to_string(),
+        db,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -629,8 +664,11 @@ fn open_storage(backend: StoreBackend, pd: Option<&str>) -> Result<Arc<dyn seald
 }
 
 fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
+    // Privilege tables are live so `connect (...)` sessions run as the named
+    // user (EXPLAIN/SHOW VIEW privilege checks). root holds global ALL.
     Session::with_domain(Arc::new(
-        Domain::with_storage_id_base(storage, unique_id_base()).expect("domain meta load"),
+        Domain::with_storage_and_grant_table_id_base(storage, unique_id_base())
+            .expect("domain meta load"),
     ))
 }
 
@@ -658,10 +696,20 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     for step in &suite.steps {
         if let Some(directive) = &step.directive {
             match directive {
-                SessionDirective::Connect(name) => {
-                    sessions
-                        .entry(name.clone())
-                        .or_insert_with(|| Session::with_domain(Arc::clone(&domain)));
+                SessionDirective::Connect { name, user, db } => {
+                    sessions.entry(name.clone()).or_insert_with(|| {
+                        let session = Session::with_domain(Arc::clone(&domain));
+                        if !user.is_empty() {
+                            session.set_current_user(sealdb_parser::ast::UserIdentity::new(
+                                user.clone(),
+                                "%",
+                            ));
+                        }
+                        if !db.is_empty() {
+                            let _ = session.execute_stmt(&format!("USE `{db}`"));
+                        }
+                        session
+                    });
                     current = name.clone();
                 }
                 SessionDirective::Connection(name) => {

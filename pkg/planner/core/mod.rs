@@ -13,6 +13,7 @@ pub mod plan_cache_param;
 pub mod plan_cost;
 pub mod plan_cost_ver2;
 pub mod planbuilder;
+pub mod rule_constant_fold;
 pub mod rule_having_push_down;
 pub mod rule_inject_extra_projection;
 pub mod rule_join_reorder;

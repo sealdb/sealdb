@@ -58,6 +58,9 @@ pub const ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET: i32 = 1748;
 pub const ERR_ACCESS_DENIED_ERROR: i32 = 1045;
 pub const ERR_DBACCESS_DENIED_ERROR: i32 = 1044;
 pub const ERR_TABLEACCESS_DENIED_ERROR: i32 = 1142;
+/// TiDB `ErrViewNoExplain`: EXPLAIN/SHOW on a VIEW without the needed
+/// privileges on the view / underlying tables.
+pub const ERR_VIEW_NO_EXPLAIN: i32 = 1345;
 pub const ERR_INFO_SCHEMA_EXPIRED: i32 = 8027;
 pub const ERR_INFO_SCHEMA_CHANGED: i32 = 8028;
 pub const ERR_UNKNOWN_STMT_HANDLER: i32 = 1243;

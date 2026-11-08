@@ -35,11 +35,35 @@ impl Executor for ShowExec {
         match self.stmt.kind {
             ShowStmtKind::Databases => {
                 self.schema = vec![show_column_header("Database", self.stmt.pattern.as_deref())];
-                self.rows = is
+                // Non-privileged users only see databases they hold a grant on
+                // (TiDB `ShowDatabasesExec`); `INFORMATION_SCHEMA` is always
+                // visible and listed first.
+                let visible = sealdb_privilege::thread_user().and_then(|user| {
+                    self.domain
+                        .privilege()
+                        .visible_databases(&user, &[])
+                });
+                let mut names: Vec<String> = is
                     .all_schemas()
                     .into_iter()
                     .map(|db| db.name.o().to_string())
+                    .collect();
+                if !names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("information_schema"))
+                {
+                    names.insert(0, "INFORMATION_SCHEMA".to_string());
+                }
+                self.rows = names
+                    .into_iter()
                     .filter(|name| show_like_ok(name, self.stmt.pattern.as_deref()))
+                    .filter(|name| match &visible {
+                        None => true,
+                        Some(dbs) => {
+                            name.eq_ignore_ascii_case("information_schema")
+                                || dbs.contains(&name.to_ascii_lowercase())
+                        }
+                    })
                     .map(|name| vec![Datum::Bytes(name.into_bytes())])
                     .collect();
             }

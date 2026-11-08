@@ -221,6 +221,9 @@ impl Session {
                 .lock()
                 .expect("session window_concurrency lock"),
         );
+        // Executors that filter by caller (`SHOW DATABASES`) read the identity
+        // from a thread-local; sessions are pinned to a thread per statement.
+        sealdb_privilege::set_thread_user(Some(self.current_user()));
         let mut owned = None;
         let stmt = if let Statement::Show(show) = stmt
             && show.kind == sealdb_parser::ast::ShowStmtKind::Grants
@@ -644,7 +647,18 @@ impl Session {
         let rebound = self.apply_sql_binding(stmt)?;
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         inherit_cte_scope(&mut expanded);
-        expand_views(&mut expanded, &is, &current_db)?;
+        let priv_mgr = self.domain.privilege();
+        let view_priv = ViewPrivCtx {
+            mgr: priv_mgr.as_ref(),
+            user: self.current_user(),
+            roles: self
+                .active_roles
+                .lock()
+                .expect("session active roles lock")
+                .clone(),
+            explain: matches!(stmt, Statement::Explain(_)),
+        };
+        expand_views(&mut expanded, &is, &current_db, &view_priv)?;
         // `ENUM`/`SET` numeric constants become member labels before planning so
         // index point gets encode the stored label (`a = 1` → `a = 'a'`).
         sealdb_planner::normalize_enum_constants(&mut expanded, Some(&is), &current_db);
@@ -3193,13 +3207,44 @@ fn inherit_cte_in_result_set(query: &mut sealdb_parser::ast::ResultSetNode, scop
     }
 }
 
+/// Privilege context for VIEW inlining. TiDB's `buildView` requires, while
+/// planning an `EXPLAIN`, `SHOW VIEW` on every VIEW it expands plus `SELECT`
+/// on VIEWs nested inside another VIEW's body; both failures surface as
+/// `ErrViewNoExplain` (1345).
+struct ViewPrivCtx<'a> {
+    mgr: &'a sealdb_privilege::Manager,
+    user: UserIdentity,
+    roles: Vec<UserIdentity>,
+    explain: bool,
+}
+
+impl ViewPrivCtx<'_> {
+    fn require(&self, db: &str, name: &str, privs: sealdb_parser::ast::PrivilegeType) -> Result<()> {
+        if self
+            .mgr
+            .request_verification_with_roles(&self.user, &self.roles, db, name, privs)
+        {
+            return Ok(());
+        }
+        Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_VIEW_NO_EXPLAIN,
+            "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table",
+        ))
+    }
+}
+
 /// Expand VIEW references into CTEs so planner/executor reuse derived-table paths.
-fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Result<()> {
+fn expand_views(
+    stmt: &mut Statement,
+    is: &InfoSchema,
+    current_db: &str,
+    view_priv: &ViewPrivCtx<'_>,
+) -> Result<()> {
     match stmt {
-        Statement::Select(select) => expand_views_in_select(select, is, current_db)?,
+        Statement::Select(select) => expand_views_in_select(select, is, current_db, view_priv, 0)?,
         Statement::Insert(insert) => {
             if let Some(select) = insert.select.as_mut() {
-                expand_views_in_select(select, is, current_db)?;
+                expand_views_in_select(select, is, current_db, view_priv, 0)?;
             }
         }
         Statement::Update(update) => {
@@ -3229,18 +3274,18 @@ fn expand_views(stmt: &mut Statement, is: &InfoSchema, current_db: &str) -> Resu
             }
         }
         Statement::SetOpr(set) => {
-            expand_views_in_select(&mut set.first, is, current_db)?;
+            expand_views_in_select(&mut set.first, is, current_db, view_priv, 0)?;
             for (_, select) in &mut set.rest {
-                expand_views_in_select(select, is, current_db)?;
+                expand_views_in_select(select, is, current_db, view_priv, 0)?;
             }
         }
-        Statement::Explain(explain) => expand_views(&mut explain.stmt, is, current_db)?,
+        Statement::Explain(explain) => expand_views(&mut explain.stmt, is, current_db, view_priv)?,
         Statement::CreateView(create) => {
-            expand_views_in_select(&mut create.select, is, current_db)?;
+            expand_views_in_select(&mut create.select, is, current_db, view_priv, 0)?;
         }
         Statement::CreateTable(create) => {
             if let Some(select) = create.select.as_mut() {
-                expand_views_in_select(select, is, current_db)?;
+                expand_views_in_select(select, is, current_db, view_priv, 0)?;
             }
         }
         _ => {}
@@ -3320,21 +3365,23 @@ fn expand_views_in_select(
     select: &mut SelectStmt,
     is: &InfoSchema,
     current_db: &str,
+    view_priv: &ViewPrivCtx<'_>,
+    depth: usize,
 ) -> Result<()> {
     if let Some(with) = select.with.as_mut() {
         for cte in &mut with.ctes {
-            expand_views_in_select(&mut cte.query, is, current_db)?;
+            expand_views_in_select(&mut cte.query, is, current_db, view_priv, depth)?;
             for (_, arm) in &mut cte.set_rest {
-                expand_views_in_select(arm, is, current_db)?;
+                expand_views_in_select(arm, is, current_db, view_priv, depth)?;
             }
             if let Some((_, rec)) = cte.recursive.as_mut() {
-                expand_views_in_select(rec, is, current_db)?;
+                expand_views_in_select(rec, is, current_db, view_priv, depth)?;
             }
         }
     }
     let refs: Vec<TableName> = select.join_tables().into_iter().cloned().collect();
     for table in refs {
-        inject_view_cte(select, &table, is, current_db)?;
+        inject_view_cte(select, &table, is, current_db, view_priv, depth)?;
     }
     Ok(())
 }
@@ -3344,6 +3391,8 @@ fn inject_view_cte(
     table: &TableName,
     is: &InfoSchema,
     current_db: &str,
+    view_priv: &ViewPrivCtx<'_>,
+    depth: usize,
 ) -> Result<()> {
     let (schema, name) = table.qualified(current_db);
     if schema.is_empty() {
@@ -3358,6 +3407,14 @@ fn inject_view_cte(
     let Some(view) = &info.view else {
         return Ok(());
     };
+    if view_priv.explain {
+        // `EXPLAIN` on a view needs SHOW VIEW on the view itself, and a view
+        // referenced from another view's body additionally needs SELECT.
+        if depth > 0 {
+            view_priv.require(&schema, &name, sealdb_parser::ast::PrivilegeType::SELECT)?;
+        }
+        view_priv.require(&schema, &name, sealdb_parser::ast::PrivilegeType::SHOW_VIEW)?;
+    }
     let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
     let Statement::Select(mut view_select) = parsed else {
         return Err(sealdb_errno::Error::unsupported(
@@ -3367,7 +3424,7 @@ fn inject_view_cte(
     // Unqualified base tables in the view body resolve in the view's schema
     // (`USE cte1; SELECT * FROM cte.v1` still reads cte.t2, not cte1.t2).
     qualify_view_body_tables(&mut view_select, &schema);
-    expand_views_in_select(&mut view_select, is, &schema)?;
+    expand_views_in_select(&mut view_select, is, &schema, view_priv, depth + 1)?;
     // TiDB MERGE / UNDEFINED: inline simple single-table views.
     let view_col_names: Vec<String> = view.cols.iter().map(|c| c.o().to_string()).collect();
     if !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
