@@ -7521,6 +7521,57 @@ fn index_plan(
     }
 }
 
+/// `col = a OR col = b …` on one indexed leading column: TiDB ranger seeks the
+/// index once with every arm as a range (`IndexRangeScan range:["a","a"],
+/// ["b","b"]`, then `IndexLookUp` when the index is not covering). It never
+/// builds an IndexMerge: merging only pays off when the arms use different
+/// indexes. Among the candidates TiDB picks the narrowest covering key and
+/// prefers a secondary key over a composite PRIMARY that only shares the
+/// leading column (mysql.global_grants reads `i_user(USER)`).
+fn dnf_same_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let selection = select.selection.as_ref()?;
+    let cnf = selection.split_cnf();
+    if cnf.len() != 1 {
+        return None;
+    }
+    let arms = cnf[0].split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut column: Option<String> = None;
+    for arm in &arms {
+        let (name, _) = arm.eq_column_const()?;
+        match &column {
+            Some(have) if !have.eq_ignore_ascii_case(&name) => return None,
+            _ => column = Some(name),
+        }
+    }
+    let column = column?;
+    let index = info
+        .indices
+        .iter()
+        .filter(|idx| {
+            !(idx.primary && info.pk_is_clustered())
+                && !index_ignored(from, idx.name.o())
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&column))
+        })
+        .min_by(|a, b| {
+            a.columns
+                .len()
+                .cmp(&b.columns.len())
+                .then(a.primary.cmp(&b.primary))
+        })?;
+    Some(index_plan(select, from, info, index, prune_mode))
+}
+
 /// Detect pure DNF of column=const arms where each arm has a leading-column index.
 fn index_merge_plan(
     select: &SelectStmt,
@@ -8389,6 +8440,16 @@ fn build_agg_plan(
         return build_join_agg_plan(select, plan, current_db);
     }
 
+    // `GROUP_CONCAT`: TiDB casts every argument to `var_string(20)` in a
+    // Projection under the aggregate and prints its arguments as that
+    // Projection's output columns (`group_concat(Column#5 separator ",")`).
+    if let Some(concat) = select.fields.iter().find_map(|f| match &f.expr {
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("group_concat") => Some(func),
+        _ => None,
+    }) {
+        return build_group_concat_agg_plan(select, plan, concat, table, current_db, is, est);
+    }
+
     let agg_arg = select
         .fields
         .iter()
@@ -8445,6 +8506,100 @@ fn build_agg_plan(
     }
 }
 
+
+/// `GROUP_CONCAT` over a single table (`TiDB buildAggregation`).
+///
+/// TiDB rewrites the arguments to `cast(arg, var_string(20))` and builds the
+/// aggregate over those projected columns, so the `Projection` below the
+/// aggregate is where the column ids the aggregate prints come from. The
+/// default separator is `,`; only an explicit `SEPARATOR` would change it.
+fn build_group_concat_agg_plan(
+    select: &SelectStmt,
+    plan: PhysicalPlan,
+    concat: &sealdb_parser::ast::expressions::FuncCallExpr,
+    table: &str,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+    est: f64,
+) -> (PhysicalPlan, bool) {
+    let out_col = scalar_agg_out_column(table, current_db, is).unwrap_or(4);
+    let mut exprs = Vec::new();
+    let mut args = Vec::new();
+    let mut next = out_col + 1;
+    for arg in &concat.args {
+        let col_ref = match arg {
+            ExprNode::Column(_) => explain_col_ref(table, arg),
+            other => other.restore_string(),
+        };
+        exprs.push(format!("cast({col_ref}, var_string(20))->Column#{next}"));
+        args.push(format!("Column#{next}"));
+        next += 1;
+    }
+    let mut group_ids = Vec::new();
+    for group in &select.group_by {
+        let col_ref = explain_col_ref(table, group);
+        exprs.push(format!("{col_ref}->Column#{next}"));
+        group_ids.push(format!("Column#{next}"));
+        next += 1;
+    }
+    let func = format!(
+        "funcs:group_concat({} separator \",\")->Column#{out_col}",
+        args.join(", ")
+    );
+    let info = format!("group by:{}, {func}", group_ids.join(", "));
+    // A StreamAgg needs its input ordered by the group keys. The integer
+    // handle (or the leading index prefix) already provides that order, so
+    // TiDB keeps the aggregate streaming and marks the scan `keep order:true`.
+    let ordered = group_by_handle(select, is, current_db)
+        || matches!(plan, PhysicalPlan::IndexReader { .. });
+    let plan = if ordered {
+        set_keep_order(plan)
+    } else {
+        plan
+    };
+    let projection = PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+    };
+    if ordered {
+        (
+            PhysicalPlan::stream_agg(projection, info, String::new(), est),
+            true,
+        )
+    } else {
+        (
+            PhysicalPlan::hash_agg(projection, info, est),
+            false,
+        )
+    }
+}
+
+/// `GROUP BY` exactly the integer row handle: a table scan over the handle is
+/// already grouped (`keep order:true`).
+fn group_by_handle(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> bool {
+    if select.group_by.len() != 1 {
+        return false;
+    }
+    let Some(from) = &select.from else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.and_then(|schema| schema.table_by_name(&db, &table)) else {
+        return false;
+    };
+    let handle = if info.pk_is_handle {
+        match info.handle_column() {
+            Some(column) => column.name.o().to_string(),
+            None => return false,
+        }
+    } else {
+        return false;
+    };
+    matches!(
+        &select.group_by[0],
+        ExprNode::Column(col) if col.name.eq_ignore_ascii_case(&handle)
+    )
+}
 
 /// EXPLAIN-only: relabel columns in pushed filters with each side's
 /// OrigTblName (lowercase), matching TiDB `expression.ExplainInfo()` of a
@@ -12008,6 +12163,13 @@ fn access_plan(
                 };
                 return index_plan(select, from, info, index, prune_mode);
             }
+        }
+        // OR of equalities on one indexed leading column → a single index
+        // range scan over a range set (`range:["x","x"], ["y","y"]`). A
+        // secondary index on the prefix beats a clustered PK prefix range
+        // (`mysql.global_grants` reads `i_user(USER)`, not the PRIMARY range).
+        if let Some(plan) = dnf_same_index_plan(select, from, info, prune_mode) {
+            return plan;
         }
         // Common-handle PK prefix range → `TableRangeScan`; a covering
         // secondary index on the same column wins above (fewer columns read).

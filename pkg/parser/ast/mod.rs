@@ -21,7 +21,8 @@ pub use dml::{
     SelectStmt, SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 pub use expressions::{
-    BetweenExpr, ColumnRange, ExistsExpr, ExprNode, InListExpr, InSubqueryExpr, IsNullExpr,
+    BetweenExpr, ColumnRange, ExistsExpr, ExprNode, FuncCallExpr, InListExpr,
+    InSubqueryExpr, IsNullExpr,
     PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr, WindowFrameBound, WindowFrameSpec,
     WindowFrameUnits, WindowFuncExpr, WindowSpec,
 };
