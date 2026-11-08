@@ -107,6 +107,42 @@ pub struct TopN {
     pub items: Vec<(String, u64)>,
 }
 
+/// One index histogram bucket (TiDB `Bucket` whose bounds are the raw
+/// `codec.EncodeKey` bytes stored in TiDB's stats JSON).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct IndexBucket {
+    pub lower: Vec<u8>,
+    pub upper: Vec<u8>,
+    pub count: u64,
+    pub repeats: u64,
+    pub ndv: u64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct IndexHistogram {
+    pub ndv: u64,
+    pub buckets: Vec<IndexBucket>,
+}
+
+impl IndexHistogram {
+    /// TiDB `Histogram.NotNullCount`.
+    pub fn not_null_count(&self) -> f64 {
+        self.buckets.last().map(|b| b.count as f64).unwrap_or(0.0)
+    }
+}
+
+/// TiDB `statistics.Index`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct IndexStats {
+    pub ndv: u64,
+    pub null_count: u64,
+    #[serde(default)]
+    pub histogram: Option<IndexHistogram>,
+    /// TiDB `TopN` entries as `(encoded key, count)`.
+    #[serde(default)]
+    pub topn: Vec<(Vec<u8>, u64)>,
+}
+
 impl TopN {
     pub fn from_counts(counts: &[(String, u64)], max_items: usize) -> Self {
         let mut items = counts.to_vec();
@@ -228,6 +264,10 @@ pub struct Table {
     /// Rows changed since last ANALYZE (TiDB `ModifyCount`).
     pub modify_count: u64,
     pub columns: Vec<(String, ColumnStats)>,
+    /// Index histograms (TiDB `statistics.Index`), keyed by index name.
+    /// `LOAD STATS` fills these from the JSON `indices` map; ANALYZE keeps them
+    /// empty because the planner falls back to the leading column's histogram.
+    pub indices: Vec<(String, IndexStats)>,
     pub version: u64,
 }
 

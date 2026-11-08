@@ -383,6 +383,23 @@ impl ExprNode {
         }
     }
 
+    /// `col <> const` / `const <> col` — `ranger` splits it in two ranges.
+    pub fn ne_column_const(&self) -> Option<(String, Datum)> {
+        let ExprNode::Binary(bin) = self else {
+            return None;
+        };
+        if bin.op != Op::Ne {
+            return None;
+        }
+        match (bin.left.as_ref(), bin.right.as_ref()) {
+            (ExprNode::Column(col), ExprNode::Value(v))
+            | (ExprNode::Value(v), ExprNode::Column(col)) => {
+                Some((col.name.clone(), v.datum.clone()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn between_column_const(&self) -> Option<(String, Datum, Datum)> {
         let ExprNode::Between(b) = self else {
             return None;

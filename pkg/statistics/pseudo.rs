@@ -77,6 +77,124 @@ pub fn index_range_rows(
     rows
 }
 
+/// Per-column ranges of a predicate list (TiDB `ranger`), where `<>` splits
+/// into the two disjoint ranges `(-inf,v)` and `(v,+inf)`.
+pub fn column_bound_sets(expr: &ExprNode) -> Vec<(String, Vec<Bounds>)> {
+    let mut out: Vec<(String, Vec<Bounds>)> = Vec::new();
+    for conjunct in expr.split_cnf() {
+        let Some((column, sets)) = conjunct_bound_sets(&conjunct) else {
+            continue;
+        };
+        match out
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
+        {
+            Some((_, current)) => intersect_sets(current, &sets),
+            None => out.push((column, sets)),
+        }
+    }
+    out
+}
+
+/// Ranges one conjunct imposes on one column.
+pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    if let Some((column, value)) = expr.eq_column_const() {
+        let point = (Some((value.clone(), true)), Some((value, true)));
+        return Some((column, vec![point]));
+    }
+    if let Some((column, value)) = expr.ne_column_const() {
+        // TiDB ranger: `a <> v` → `(-inf,v), (v,+inf)`.
+        let below = (None, Some((value.clone(), false)));
+        let above = (Some((value, false)), None);
+        return Some((column, vec![below, above]));
+    }
+    if let Some((column, op, value)) = expr.column_cmp_const() {
+        if op == Op::Ne {
+            let below = (None, Some((value.clone(), false)));
+            let above = (Some((value, false)), None);
+            return Some((column, vec![below, above]));
+        }
+        return expr
+            .column_ranges()
+            .into_iter()
+            .find(|range| range.column.eq_ignore_ascii_case(&column))
+            .map(|range| (column, vec![(range.low, range.high)]));
+    }
+    if let Some((column, _, _)) = expr.between_column_const() {
+        return expr
+            .column_ranges()
+            .into_iter()
+            .find(|range| range.column.eq_ignore_ascii_case(&column))
+            .map(|range| (column, vec![(range.low, range.high)]));
+    }
+    None
+}
+
+/// Intersect two range sets over the same column (empty ranges drop out).
+pub fn intersect_sets(target: &mut Vec<Bounds>, other: &[Bounds]) {
+    let mut merged = Vec::new();
+    for a in target.iter() {
+        for b in other.iter() {
+            if let Some(range) = intersect_bounds(a, b) {
+                merged.push(range);
+            }
+        }
+    }
+    *target = merged;
+}
+
+/// Intersection of two ranges; `None` when the result is empty.
+pub fn intersect_bounds(a: &Bounds, b: &Bounds) -> Option<Bounds> {
+    let low = tighter_low(a.0.clone(), b.0.clone());
+    let high = tighter_high(a.1.clone(), b.1.clone());
+    if let (Some((low_value, low_inc)), Some((high_value, high_inc))) = (&low, &high) {
+        match low_value.compare(high_value) {
+            Ordering::Greater => return None,
+            Ordering::Equal if !(*low_inc && *high_inc) => return None,
+            _ => {}
+        }
+    }
+    Some((low, high))
+}
+
+/// TiDB `ranger.Range.String()` joined for a range set:
+/// `[-inf,2013-11-01 00:00:00), (2013-11-01 00:00:00,+inf]`.
+pub fn ranges_text(ranges: &[Bounds]) -> String {
+    ranges
+        .iter()
+        .map(|(low, high)| range_text(low.as_ref(), high.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Sum of TiDB `getPseudoRowCountByIndexRanges` over a range set.
+pub fn index_ranges_rows(
+    table_rows: f64,
+    ranges: &[Bounds],
+    index_columns_len: usize,
+    equal_prefix_len: usize,
+    unique: bool,
+) -> f64 {
+    let mut rows: f64 = 0.0;
+    for (low, high) in ranges {
+        let mut range_rows = index_range_rows(
+            table_rows,
+            low.as_ref(),
+            high.as_ref(),
+            index_columns_len,
+            equal_prefix_len,
+            unique,
+        );
+        if low.is_none() && high.is_some() {
+            // Both open-ended sides already subtract the NULL share; the split
+            // ranges of `<>` must not double count it.
+            range_rows = range_rows.max(0.0);
+        }
+        rows += range_rows;
+    }
+    rows.min(table_rows)
+}
+
 /// TiDB `ranger.Range.String()` for a single-column range: `[-inf,3)`,
 /// `[1,1]`, `(3,+inf]`.
 pub fn range_text(low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> String {

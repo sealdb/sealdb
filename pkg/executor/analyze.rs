@@ -113,6 +113,7 @@ impl AnalyzeExec {
                     count: rows.len() as u64,
                     modify_count: 0,
                     columns,
+                    indices: prev.indices,
                     version: prev.version + 1,
                 }
             }
@@ -121,6 +122,7 @@ impl AnalyzeExec {
                 count: rows.len() as u64,
                 modify_count: 0,
                 columns,
+                indices: Vec::new(),
                 version: 1,
             }
         };

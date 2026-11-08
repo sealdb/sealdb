@@ -1,6 +1,8 @@
 /// in-memory stats Handle (TiDB `statistics/handle`).
 /// Persists under Storage key `mstats` (mysql.stats_* equivalent).
-use crate::table::{ColumnStats, Histogram, HistogramBucket, Table, TopN};
+use crate::table::{
+    ColumnStats, Histogram, HistogramBucket, IndexBucket, IndexHistogram, IndexStats, Table, TopN,
+};
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -73,6 +75,30 @@ impl Handle {
                 count: stats.count,
                 modify_count: stats.modify_count,
                 version: stats.version,
+                indices: stats
+                    .indices
+                    .iter()
+                    .map(|(name, idx)| PersistIndex {
+                        name: name.clone(),
+                        ndv: idx.ndv,
+                        null_count: idx.null_count,
+                        histogram: idx.histogram.as_ref().map(|h| PersistIndexHist {
+                            ndv: h.ndv,
+                            buckets: h
+                                .buckets
+                                .iter()
+                                .map(|b| PersistIndexBucket {
+                                    lower: b.lower.clone(),
+                                    upper: b.upper.clone(),
+                                    count: b.count,
+                                    repeats: b.repeats,
+                                    ndv: b.ndv,
+                                })
+                                .collect(),
+                        }),
+                        topn: idx.topn.clone(),
+                    })
+                    .collect(),
                 columns: stats
                     .columns
                     .iter()
@@ -139,12 +165,41 @@ impl Handle {
                     )
                 })
                 .collect();
+            let indices = t
+                .indices
+                .into_iter()
+                .map(|i| {
+                    (
+                        i.name,
+                        IndexStats {
+                            ndv: i.ndv,
+                            null_count: i.null_count,
+                            histogram: i.histogram.map(|h| IndexHistogram {
+                                ndv: h.ndv,
+                                buckets: h
+                                    .buckets
+                                    .into_iter()
+                                    .map(|b| IndexBucket {
+                                        lower: b.lower,
+                                        upper: b.upper,
+                                        count: b.count,
+                                        repeats: b.repeats,
+                                        ndv: b.ndv,
+                                    })
+                                    .collect(),
+                            }),
+                            topn: i.topn,
+                        },
+                    )
+                })
+                .collect();
             map.insert(
                 (t.db, t.table),
                 Table {
                     count: t.count,
                     modify_count: t.modify_count,
                     columns,
+                    indices,
                     version: t.version,
                 },
             );
@@ -168,7 +223,36 @@ struct PersistTable {
     #[serde(default)]
     modify_count: u64,
     version: u64,
+    #[serde(default)]
+    indices: Vec<PersistIndex>,
     columns: Vec<PersistColumn>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistIndex {
+    name: String,
+    ndv: u64,
+    #[serde(default)]
+    null_count: u64,
+    #[serde(default)]
+    histogram: Option<PersistIndexHist>,
+    #[serde(default)]
+    topn: Vec<(Vec<u8>, u64)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistIndexHist {
+    ndv: u64,
+    buckets: Vec<PersistIndexBucket>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistIndexBucket {
+    lower: Vec<u8>,
+    upper: Vec<u8>,
+    count: u64,
+    repeats: u64,
+    ndv: u64,
 }
 
 #[derive(Serialize, Deserialize)]

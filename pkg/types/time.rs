@@ -503,6 +503,11 @@ fn days_in_month(year: u16, month: u8) -> u8 {
     }
 }
 
+/// TiDB `types.ParseTime` for a DATETIME string literal.
+pub fn parse_datetime_literal(s: &str) -> Result<Time> {
+    parse_datetime_string(s)
+}
+
 fn parse_datetime_string(s: &str) -> Result<Time> {
     let fsp = get_fsp(s);
     let s_trim = s.trim();

@@ -14,7 +14,10 @@ pub use field_type::{
     TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_VARCHAR, TYPE_YEAR,
 };
 pub use mydecimal::MyDecimal;
-pub use time::{Time, TimeType, parse_date_literal, parse_time_literal, parse_timestamp_literal};
+pub use time::{
+    Time, TimeType, parse_date_literal, parse_datetime_literal, parse_time_literal,
+    parse_timestamp_literal,
+};
 
 #[cfg(test)]
 mod tests {
@@ -41,5 +44,29 @@ mod tests {
         let d = MyDecimal::parse("12.50").unwrap();
         assert_eq!(d.to_string(), "12.50");
         assert_eq!(d.to_i64().unwrap(), 12);
+    }
+
+    /// Bytes lifted from TiDB's `idx_3(col_0)` histogram
+    /// (`decimal(10,0)`, payload only — the header is added by the index codec).
+    #[test]
+    fn test_decimal_encode_bin_matches_tidb() {
+        let cases: [(&str, [u8; 5]); 3] = [
+            ("0", [0x80, 0x00, 0x00, 0x00, 0x00]),
+            ("8", [0x80, 0x00, 0x00, 0x00, 0x08]),
+            ("994677", [0x80, 0x00, 0x0f, 0x2d, 0x75]),
+        ];
+        for (text, expected) in cases {
+            let d = MyDecimal::parse(text).unwrap();
+            assert_eq!(d.encode_bin(10, 0).unwrap(), expected, "{text}");
+        }
+        // Negative values complement every byte before the sign bit flip.
+        let d = MyDecimal::parse("-1").unwrap();
+        assert_eq!(
+            d.encode_bin(10, 0).unwrap(),
+            vec![0x7f, 0xff, 0xff, 0xff, 0xfe]
+        );
+        // `decimal(10,2)`: the trailing group keeps two digits.
+        let d = MyDecimal::parse("12.50").unwrap();
+        assert_eq!(d.encode_bin(10, 2).unwrap(), vec![0x80, 0, 0, 12, 50]);
     }
 }
