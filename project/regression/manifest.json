@@ -1196,7 +1196,7 @@
     {
       "name": "explain_shard_index",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_shard_index.test",
       "result": "r/explain_shard_index.result",
       "has_result": true,

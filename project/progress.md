@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-08（green 34 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 35 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/batch_point_get` green；15 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/batch_point_get` / `explain_shard_index` green；14 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -320,7 +320,7 @@
 |---|---|---|
 | 子查询去关联（semi / anti / marker 列） | `explain_easy`、`index_merge`、`topn_push_down`、`explain_complex*` | `rule_semi_join` 只处理 CNF 顶层的 `EXISTS`/`IN`；子查询处在 `OR` 内时仍留 `Apply`，TiDB 会改成 `left outer semi join` + marker 列（`Column#N`） |
 | 统计驱动的访问路径与基数 | `explain_easy_stats`、`explain_join_stats`、`explain_indexmerge_stats`、`clustered_index` 剩余 | 已有直方图区间 est 与 `stats:partial` 渲染，但缺 NDV 驱动的 join 基数、`ORDER BY` 走索引的成本比较、`IndexJoin` 选择与 `TIDB_INLJ` 提示 |
-| 表达式（函数）索引 | `explain_easy`、`explain_shard_index`、`explain_generate_column_substitute` | `IndexInfo` 只有列名（`IndexColumn{name, length}`），`(a+b+1)` / `tidb_shard(a)` 在建索引阶段直接报 1235 |
+| 表达式（函数）索引 | `explain_easy`、`explain_generate_column_substitute` | 建索引/DML/点查已落地（`explain_shard_index` green），余下套件按 planner 代价与 explain 形状继续对齐 |
 | 权限与运行时统计 | `executor/explain` | 已有 `pkg/privilege` 的 GRANT/USER 落盘，但视图 `EXPLAIN` 的 `ErrViewNoExplain`(1345)/1142、`explain analyze` 的 actRows/内存/磁盘、`information_schema.statements_summary` 均缺 |
 
 顺带修掉一个真实正确性问题：`select count(*) from e, lo where lo.a=e.a and e.b=…` 把 `e` 规划成
@@ -1776,6 +1776,28 @@
   - TiKV spike 仍缺实集群；结论见 ADR-0004
 - **下一步**:
   - F02 `CREATE/DROP TABLE` 写兼容 meta key
+
+### 2026-11-08（表达式索引 + `tidb_shard` 波）
+
+- **Phase**: R3 explain 波（表达式索引解锁）
+- **完成**:
+  - DDL：`IndexInfo` 的 key part 支持表达式。`CREATE INDEX … ((expr))` 不再报 1235，而是物化为隐藏生成列（`_V$…`），并在建索引时回填、DML 时维护；`information_schema.tidb_indexes` 按 TiDB 渲染表达式 part
+  - Planner（`core/expr_index.rs`）：索引 part 的规范化键（列名或表达式文本）、隐藏列解析、`eval_part` 常量折叠、`shard_index_rewrite`。`tidb_shard(a)` 与 TiDB 一致按 Vitess DES null-key 哈希取模 256（`fix(expression)` 提交）折叠
+  - Planner：`AddPrefix4ShardIndexes` 语义——唯一索引首 part 为 `tidb_shard(col)` 时，DNF 各分支独立改写（`(tidb_shard(a)=214 AND a=1) OR (tidb_shard(a)=142 AND a=10)`），CNF 仅在其余索引列都被等值钉住时才补前缀
+  - Planner：DataSource 阶段加 `expression.PropagateConstant` 等值常量传播（`a = b AND b = 100` → `a = 100 AND b = 100`），使等值能到达 shard 改写；`updateOrPredicate` 只按“被 pin 反证”的分支做矛盾消除，字面量分支（分区裁剪产生的 `or(0, eq(a,-1))`）保持 TiDB 打印形状
+  - Planner：表达式索引表的 `SELECT *` 展开走 cop projection（`TableReader data:Projection` / `IndexReader index:Projection`），点查在表达式索引上时在计划上方补 Projection 隐藏 `_V$` 列
+  - Executor：`BatchPointGet` 的 key 值改为按表元数据计算（表达式 part 由普通 part 折叠），聚簇主键（handle）走 `index=None`；单点查仍从 `IN` 列表取首个值；row `IN` 列表即使折叠成单个 key 也保持 `Batch_Point_Get` 形状
+- **验证**:
+  - `explain_shard_index`：Mem/TiKV `PASS`（含 `Point_Get` / `Batch_Point_Get` / `IndexLookUp` + `IndexRangeScan` 形状）
+  - `run-tests.sh -s memory --status green` → PASS: memory=35
+  - `run-tests.sh -s tikv --status green` → PASS: tikv=35
+  - `--status local`：memory=8 / tikv=7（`local/txn` 标 `skip_tikv`）
+- **阻塞/风险**:
+  - 本地 PD/TiKV 数据目录若被真实 TiDB 初始化过，`mysql.tidb_ddl_notifier` 等表的 meta JSON 里 `Flen` 是 `4294967295`（TiDB 写法），当前 `FieldType.flen: i32` 读不回来；本地需清空 `$SEALDB_CLUSTER_DATA` 再起
+  - `cte` 套件仍有既有 mismatch（CTE 上多余 Projection），与本次改动无关，仍标 `in_progress`
+- **下一步**:
+  - `explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` 用已落地的表达式索引继续推
+  - R3 其余 `in_progress`：`explain_join_stats`、`topn_push_down`、`index_merge`
 
 ### 2026-11-08（SQL 文本保真 + 测试基线修正波）
 
