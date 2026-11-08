@@ -201,10 +201,9 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
         )
     }) {
         let seen = producers.iter().any(|seen| match (seen, &p) {
-            (
-                PhysicalPlan::CTE { name: a, .. },
-                PhysicalPlan::CTE { name: b, .. },
-            ) => a.eq_ignore_ascii_case(b),
+            (PhysicalPlan::CTE { name: a, .. }, PhysicalPlan::CTE { name: b, .. }) => {
+                a.eq_ignore_ascii_case(b)
+            }
             _ => false,
         });
         if !seen {
@@ -239,9 +238,7 @@ fn cop_projection_marker(plan: &PhysicalPlan) -> Option<&str> {
     ) {
         return None;
     }
-    exprs
-        .iter()
-        .find_map(|e| e.strip_prefix("COP_PROJ|"))
+    exprs.iter().find_map(|e| e.strip_prefix("COP_PROJ|"))
 }
 
 /// Active cop projection text, consumed by the reader currently being emitted.
@@ -351,7 +348,16 @@ fn walk_with_parent(
     {
         if parent.is_some() {
             deferred.push(plan.clone());
-            emit_cte_full_scan(plan, parent, depth, last, next_id, rows, spine, apply_factor);
+            emit_cte_full_scan(
+                plan,
+                parent,
+                depth,
+                last,
+                next_id,
+                rows,
+                spine,
+                apply_factor,
+            );
             return;
         }
         // Bare recursive CTE root — emit producer only.
@@ -364,7 +370,9 @@ fn walk_with_parent(
     // Build/Probe labels land on the TableReader.
     // Cop Projection: TiDB keeps it inside the reader (`data:Projection`), above
     // the reader's cop subtree, so emit the reader with the projection row.
-    if let (Some(list), PhysicalPlan::Projection { child, .. }) = (cop_projection_marker(plan), plan) {
+    if let (Some(list), PhysicalPlan::Projection { child, .. }) =
+        (cop_projection_marker(plan), plan)
+    {
         let list = list.to_string();
         COP_PROJECTION.with(|c| *c.borrow_mut() = Some(list));
         let rendered = walk_with_parent(
@@ -383,9 +391,9 @@ fn walk_with_parent(
         return rendered;
     }
     if let PhysicalPlan::Projection { exprs, child, .. } = plan {
-        let trivial = exprs.iter().all(|e| {
-            e.starts_with("col") && !e.contains("->") && !e.contains("Column#")
-        });
+        let trivial = exprs
+            .iter()
+            .all(|e| e.starts_with("col") && !e.contains("->") && !e.contains("Column#"));
         let cte_seed_cols = exprs.iter().all(|e| {
             !e.contains("->")
                 && !e.contains('(')
@@ -393,9 +401,9 @@ fn walk_with_parent(
                 && !e.contains('.')
                 && !e.is_empty()
         }) && matches!(
-                parent,
-                Some(PhysicalPlan::MergeJoin { .. } | PhysicalPlan::Sort { .. })
-            );
+            parent,
+            Some(PhysicalPlan::MergeJoin { .. } | PhysicalPlan::Sort { .. })
+        );
         if trivial || cte_seed_cols {
             return walk_with_parent(
                 child,
@@ -492,7 +500,9 @@ fn walk_with_parent(
         }
         // MergeJoin hashes its left input, so a RIGHT JOIN — which lists
         // Build (left) before Probe (right) — labels left as Build.
-        Some(PhysicalPlan::MergeJoin { left, right, tp, .. }) => {
+        Some(PhysicalPlan::MergeJoin {
+            left, right, tp, ..
+        }) => {
             let (build, probe) = if matches!(tp, JoinType::RightOuter) {
                 (explain_plan_ptr(left), explain_plan_ptr(right))
             } else {
@@ -512,7 +522,9 @@ fn walk_with_parent(
             explain_plan_ptr(left),
         ),
         Some(PhysicalPlan::Apply {
-            child, probe: Some(probe), ..
+            child,
+            probe: Some(probe),
+            ..
         })
         | Some(PhysicalPlan::IndexJoin {
             outer: child,
@@ -712,8 +724,7 @@ fn walk_with_parent(
             PhysicalPlan::Limit { .. }
                 | PhysicalPlan::Selection { .. }
                 | PhysicalPlan::Projection { .. }
-        )
-    {
+        ) {
         row_est * apply_factor
     } else {
         row_est
@@ -722,9 +733,7 @@ fn walk_with_parent(
         id: format!("{prefix}{name}_{id}{join_role}"),
         est_rows: if matches!(
             plan,
-            PhysicalPlan::Insert { .. }
-                | PhysicalPlan::Update { .. }
-                | PhysicalPlan::Delete { .. }
+            PhysicalPlan::Insert { .. } | PhysicalPlan::Update { .. } | PhysicalPlan::Delete { .. }
         ) {
             "N/A".to_string()
         } else {
@@ -821,9 +830,7 @@ fn walk_with_parent(
                 child: outer,
                 probe: Some(probe),
                 ..
-            } if explain_plan_ptr(child) == explain_plan_ptr(probe) => {
-                est_rows(outer).max(1.0)
-            }
+            } if explain_plan_ptr(child) == explain_plan_ptr(probe) => est_rows(outer).max(1.0),
             // Inner sides of a join are re-estimated by the join itself, so the
             // Apply outer-row factor must not leak through them.
             _ if matches!(
@@ -1199,15 +1206,13 @@ fn emit_cte_recursive_part(
                 PhysicalPlan::Limit { child, .. } | PhysicalPlan::Sort { child, .. } => {
                     reader = child.as_ref();
                 }
-                PhysicalPlan::Selection { child, filter: f, .. } => {
+                PhysicalPlan::Selection {
+                    child, filter: f, ..
+                } => {
                     filter = Some(f);
                     reader = child.as_ref();
                 }
-                PhysicalPlan::TableReader {
-                    table,
-                    pushed,
-                    ..
-                } => {
+                PhysicalPlan::TableReader { table, pushed, .. } => {
                     if let (None, Some(f)) = (filter, pushed.as_ref()) {
                         filter = Some(f);
                     }
@@ -1358,10 +1363,7 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
                 s = s.replace(".t.", &format!(".{orig_tbl}."));
                 s = s.replace("cte1.", &format!("{orig_tbl}."));
                 // Apply-shaped: cast(plus(...), int)->schema.tbl.col
-                if s.contains("cast(")
-                    && s.contains("->")
-                    && !s.contains("Column#")
-                {
+                if s.contains("cast(") && s.contains("->") && !s.contains("Column#") {
                     return s;
                 }
                 if let Some((left, right)) = s.split_once("->") {
@@ -1458,7 +1460,11 @@ fn emit_cop_children(
                 access: String::new(),
                 info: list,
             },
-            if under_bushy { cop_owned.as_slice() } else { &[] },
+            if under_bushy {
+                cop_owned.as_slice()
+            } else {
+                &[]
+            },
         );
         COP_PROJECTION.with(|c| *c.borrow_mut() = None);
         return emit_cop_children(
@@ -1494,11 +1500,7 @@ fn emit_cop_children(
             // Negative row_count encodes HAVING-push filtered est (|row_count|);
             // TableFullScan stays at the pseudo/analyzed scan cardinality.
             let scan_est = if *row_count < 0.0 {
-                if *stats_pseudo {
-                    10_000.0
-                } else {
-                    -*row_count
-                }
+                if *stats_pseudo { 10_000.0 } else { -*row_count }
             } else {
                 *row_count
             };
@@ -1629,9 +1631,17 @@ fn emit_cop_children(
                     scan_spine.push(false);
                 }
                 let keep = if *stats_pseudo {
-                    format!("{range}, keep order:{order}, stats:pseudo", range = range_prefix(&range_info), order = if under_merge_join { "true" } else { "false" })
+                    format!(
+                        "{range}, keep order:{order}, stats:pseudo",
+                        range = range_prefix(&range_info),
+                        order = if under_merge_join { "true" } else { "false" }
+                    )
                 } else {
-                    format!("{range}, keep order:{order}", range = range_prefix(&range_info), order = if under_merge_join { "true" } else { "false" })
+                    format!(
+                        "{range}, keep order:{order}",
+                        range = range_prefix(&range_info),
+                        order = if under_merge_join { "true" } else { "false" }
+                    )
                 };
                 push_explain_row_spine(
                     rows,
@@ -2331,9 +2341,7 @@ fn emit_cop_children(
                 let mut build_spine = ancestors_spine(spine, depth);
                 // The IndexLookUp may be a non-last DML child (foreign-key nodes
                 // follow it): its cop rows then need the continuation bar.
-                if !_parent_last
-                    && let Some(cont) = build_spine.last_mut()
-                {
+                if !_parent_last && let Some(cont) = build_spine.last_mut() {
                     *cont = true;
                 }
                 let mut probe_spine = build_spine.clone();
@@ -2563,9 +2571,7 @@ fn emit_cop_children(
             let mut build_spine = ancestors_spine(spine, depth);
             // The IndexLookUp itself may be a non-last DML child (foreign-key
             // nodes follow it): its cop subtree then needs the continuation bar.
-            if !_parent_last
-                && let Some(cont) = build_spine.last_mut()
-            {
+            if !_parent_last && let Some(cont) = build_spine.last_mut() {
                 *cont = true;
             }
             let mut build_depth = depth;
@@ -2650,9 +2656,8 @@ fn emit_cop_children(
             }
             // GLOBAL index aggregation: the cop HashAgg runs over the table-row
             // probe, so it sits between IndexLookUp and TableRowIDScan.
-            let probe_agg = stream_parent.filter(|(name, _, cop, _)| {
-                *name == "HashAgg" && !cop.is_empty()
-            });
+            let probe_agg =
+                stream_parent.filter(|(name, _, cop, _)| *name == "HashAgg" && !cop.is_empty());
             let mut probe_depth = depth;
             if let Some((name, _, cop_info, est)) = probe_agg {
                 push_explain_row(
@@ -2826,11 +2831,7 @@ fn render_access(access: String) -> String {
 /// `table:pt, index:uidx(c)` — TiDB prints a point-get index with its columns.
 /// TiDB appends `, lock` when the point get locks its own keys.
 fn lock_suffix(lock: bool) -> &'static str {
-    if lock {
-        ", lock"
-    } else {
-        ""
-    }
+    if lock { ", lock" } else { "" }
 }
 
 fn point_get_index_access(
@@ -2885,15 +2886,9 @@ fn index_access_cols(table: &str, index: &str, cols: &[String], partitions: &[i6
 fn index_scan_meta(pushed: Option<&sealdb_parser::ast::ExprNode>) -> (f64, String) {
     // TiDB unanalyzed tables: `keep order:false, stats:pseudo`.
     if pushed.is_some() {
-        (
-            8_000.0,
-            "keep order:false, stats:pseudo".to_string(),
-        )
+        (8_000.0, "keep order:false, stats:pseudo".to_string())
     } else {
-        (
-            10_000.0,
-            "keep order:false, stats:pseudo".to_string(),
-        )
+        (10_000.0, "keep order:false, stats:pseudo".to_string())
     }
 }
 
@@ -2998,33 +2993,15 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
 
 /// Schema for a column reference: the column's recorded schema, else the
 /// schema of its table in the statement being built, else the session schema.
-fn column_schema(
-    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
-    table: &str,
-) -> String {
+fn column_schema(col: &sealdb_parser::ast::expressions::ColumnNameExpr, table: &str) -> String {
     col.schema
         .clone()
         .or_else(|| crate::core::planbuilder::explain_table_schema(table))
         .unwrap_or_else(sealdb_expression::current_db_name)
 }
 
-/// `{db}.{table}.{col}` for a bare column; other expressions keep their text.
-fn explain_qualified_col(expr: &sealdb_parser::ast::ExprNode) -> String {
-    match expr {
-        sealdb_parser::ast::ExprNode::Column(c) => {
-            let table = c.table.as_deref().unwrap_or("t");
-            let schema = column_schema(c, table);
-            if schema.is_empty() {
-                format!("select.{table}.{}", c.name)
-            } else {
-                format!("{schema}.{table}.{}", c.name)
-            }
-        }
-        other => explain_scalar_expr(other, "t"),
-    }
-}
-
-fn pushed_is_bytes_info(filter: &sealdb_parser::ast::ExprNode) -> bool {    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+fn pushed_is_bytes_info(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
     matches!(
         filter,
@@ -3050,9 +3027,7 @@ fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String>
 }
 
 /// Bytes marker text on an EXPLAIN-only `pushed` field.
-fn bytes_marker<'a>(
-    pushed: Option<&'a sealdb_parser::ast::ExprNode>,
-) -> Option<&'a str> {
+fn bytes_marker<'a>(pushed: Option<&'a sealdb_parser::ast::ExprNode>) -> Option<&'a str> {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
     match pushed? {
@@ -3123,7 +3098,8 @@ fn marker_sel_info(filter: &sealdb_parser::ast::ExprNode) -> Option<String> {
 }
 
 /// TiDB prints `range:(3,+inf]` but `range: decided by [...]`.
-fn range_prefix(info: &str) -> String {    if info.starts_with("decided by") {
+fn range_prefix(info: &str) -> String {
+    if info.starts_with("decided by") {
         format!("range: {info}")
     } else {
         format!("range:{info}")
@@ -3161,9 +3137,15 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             }
         }
         ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".into(),
-        ExprNode::Value(ValueExpr { datum: Datum::I64(v) }) => v.to_string(),
-        ExprNode::Value(ValueExpr { datum: Datum::U64(v) }) => v.to_string(),
-        ExprNode::Value(ValueExpr { datum: Datum::Time(t) }) => {
+        ExprNode::Value(ValueExpr {
+            datum: Datum::I64(v),
+        }) => v.to_string(),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::U64(v),
+        }) => v.to_string(),
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Time(t),
+        }) => {
             // TiDB `Constant.ExplainInfo` prints temporal values with the
             // full microsecond fraction (`2013-11-01 00:00:00.000000`).
             let mut t = t.clone();
@@ -3174,7 +3156,9 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             datum: Datum::Bytes(b),
         }) => format!(
             "\"{}\"",
-            String::from_utf8_lossy(b).replace('\\', "\\\\").replace('"', "\\\"")
+            String::from_utf8_lossy(b)
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
         ),
         ExprNode::Binary(bin) => {
             let op = match bin.op {
@@ -3211,10 +3195,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             } else {
                 "binary"
             };
-            format!(
-                "cast({}, {target})",
-                explain_scalar_expr(&c.expr, table)
-            )
+            format!("cast({}, {target})", explain_scalar_expr(&c.expr, table))
         }
         ExprNode::InList(list) => {
             let values = list
@@ -3223,10 +3204,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
                 .map(|item| explain_scalar_expr(item, table))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let inner = format!(
-                "in({}, {values})",
-                explain_scalar_expr(&list.expr, table)
-            );
+            let inner = format!("in({}, {values})", explain_scalar_expr(&list.expr, table));
             if list.not {
                 format!("not({inner})")
             } else {
@@ -3362,11 +3340,7 @@ fn collect_dot_cop_children(
         } => {
             let scan_access = table_access(table, partition_names);
             let scan_est = if *row_count < 0.0 {
-                if *stats_pseudo {
-                    10_000.0
-                } else {
-                    -*row_count
-                }
+                if *stats_pseudo { 10_000.0 } else { -*row_count }
             } else {
                 *row_count
             };
@@ -3523,9 +3497,7 @@ fn push_dot_node(
 fn explain_plan_ptr(plan: &PhysicalPlan) -> *const PhysicalPlan {
     match plan {
         PhysicalPlan::CTE {
-            seed,
-            inline: true,
-            ..
+            seed, inline: true, ..
         } => explain_plan_ptr(seed),
         // Column-name Projection over a scan (CTE seed `SELECT c1`) unwraps for
         // Build/Probe pointer compare so TableReader gets the join role.
@@ -3624,7 +3596,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         // (smaller, reordered) side; a RIGHT JOIN builds whichever input is
         // smaller — the preserved 2244-row side over a 4509-row probe, or a
         // 2-row build subtree over a 4-row preserved side.
-        PhysicalPlan::HashJoin { left, right, tp, .. } => {
+        PhysicalPlan::HashJoin {
+            left, right, tp, ..
+        } => {
             if matches!(tp, JoinType::RightOuter) {
                 if est_rows(right) < est_rows(left) {
                     vec![right.as_ref(), left.as_ref()]
@@ -3651,7 +3625,8 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         // Null-aware anti join: Build (right) then Probe (left), like HashJoin.
         PhysicalPlan::NullAwareAntiJoin { probe, build, .. } => {
             vec![build.as_ref(), probe.as_ref()]
-        }        PhysicalPlan::RowProjection { child, .. } => vec![child.as_ref()],
+        }
+        PhysicalPlan::RowProjection { child, .. } => vec![child.as_ref()],
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::DistinctUnion { child, .. } => vec![child.as_ref()],
         PhysicalPlan::PartitionUnion { children } => children.iter().collect(),
@@ -3666,16 +3641,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("rows:{row_count}"),
         ),
-        PhysicalPlan::Projection { exprs, .. } => (
-            "Projection".to_string(),
-            String::new(),
-            exprs.join(", "),
-        ),
-        PhysicalPlan::SelectLock { info, .. } => (
-            "SelectLock".to_string(),
-            String::new(),
-            info.clone(),
-        ),
+        PhysicalPlan::Projection { exprs, .. } => {
+            ("Projection".to_string(), String::new(), exprs.join(", "))
+        }
+        PhysicalPlan::SelectLock { info, .. } => {
+            ("SelectLock".to_string(), String::new(), info.clone())
+        }
         PhysicalPlan::DDL { kind } => ("DDL".to_string(), String::new(), format!("{kind:?}")),
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
@@ -3715,11 +3686,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 "data:TableFullScan".to_string()
             },
         ),
-        PhysicalPlan::PartitionUnion { .. } => (
-            "PartitionUnion".to_string(),
-            String::new(),
-            String::new(),
-        ),
+        PhysicalPlan::PartitionUnion { .. } => {
+            ("PartitionUnion".to_string(), String::new(), String::new())
+        }
         PhysicalPlan::PointGet {
             table,
             handle: Some(handle),
@@ -3773,10 +3742,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 index_columns,
                 if *global_index { &[] } else { partition_names },
             ),
-            format!(
-                "keep order:{keep_order}, desc:{desc}{}",
-                lock_suffix(*lock)
-            ),
+            format!("keep order:{keep_order}, desc:{desc}{}", lock_suffix(*lock)),
         ),
         PhysicalPlan::BatchPointGet {
             table,
@@ -3867,9 +3833,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 None => explain_selection_info(filter),
             },
         ),
-        PhysicalPlan::Sort { by_info, .. } => {
-            ("Sort".to_string(), String::new(), by_info.clone())
-        }
+        PhysicalPlan::Sort { by_info, .. } => ("Sort".to_string(), String::new(), by_info.clone()),
         PhysicalPlan::TopN {
             by_info,
             offset,
@@ -3927,14 +3891,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 format!("inner join, left key:{left_key}, right key:{right_key}")
             }),
         ),
-        PhysicalPlan::Apply {
-            filter,
-            info,
-            ..
-        } => {
-            let info = info
-                .clone()
-                .unwrap_or_else(|| filter.restore_string());
+        PhysicalPlan::Apply { filter, info, .. } => {
+            let info = info.clone().unwrap_or_else(|| filter.restore_string());
             ("Apply".to_string(), String::new(), info)
         }
         PhysicalPlan::IndexJoin { info, .. } => {
@@ -3953,12 +3911,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::DistinctUnion { info, .. } => {
             ("HashAgg".to_string(), String::new(), info.clone())
         }
-        PhysicalPlan::Window { info, .. } => {
-            ("Window".to_string(), String::new(), info.clone())
-        }
-        PhysicalPlan::Shuffle { info, .. } => {
-            ("Shuffle".to_string(), String::new(), info.clone())
-        }
+        PhysicalPlan::Window { info, .. } => ("Window".to_string(), String::new(), info.clone()),
+        PhysicalPlan::Shuffle { info, .. } => ("Shuffle".to_string(), String::new(), info.clone()),
         PhysicalPlan::ShuffleReceiver { .. } => {
             ("ShuffleReceiver".to_string(), String::new(), String::new())
         }
@@ -4101,15 +4055,16 @@ fn pseudo_ranges_of_predicate(
             let key = col_key(&b.expr)?;
             let low = expr_to_i128_const(&b.low)?;
             let high = expr_to_i128_const(&b.high)?;
-            Some((
-                key,
-                vec![(PRangeLow::Val(low), PRangeHigh::Val(high))],
-            ))
+            Some((key, vec![(PRangeLow::Val(low), PRangeHigh::Val(high))]))
         }
         ExprNode::Binary(bin) => {
             let (col, val, op, flipped) = match (bin.left.as_ref(), bin.right.as_ref()) {
-                (ExprNode::Column(_), right) => (&bin.left, expr_to_i128_const(right)?, bin.op, false),
-                (left, ExprNode::Column(_)) => (&bin.right, expr_to_i128_const(left)?, bin.op, true),
+                (ExprNode::Column(_), right) => {
+                    (&bin.left, expr_to_i128_const(right)?, bin.op, false)
+                }
+                (left, ExprNode::Column(_)) => {
+                    (&bin.right, expr_to_i128_const(left)?, bin.op, true)
+                }
                 _ => return None,
             };
             let key = col_key(col)?;
@@ -4170,9 +4125,7 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
     match (r.0, r.1) {
         (PRangeLow::Null, PRangeHigh::MaxValue) => row_count,
         (PRangeLow::MinNotNull, PRangeHigh::MaxValue) => row_count - null_count,
-        (PRangeLow::MinNotNull, PRangeHigh::Val(_)) => {
-            (row_count / 3.0 - null_count).max(0.0)
-        }
+        (PRangeLow::MinNotNull, PRangeHigh::Val(_)) => (row_count / 3.0 - null_count).max(0.0),
         (_, PRangeHigh::MaxValue) => row_count / 3.0,
         (PRangeLow::Val(a), PRangeHigh::Val(b)) if a == b => row_count / 1000.0,
         _ => row_count / 40.0,
@@ -4181,10 +4134,7 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
 
 /// Sum per-column range counts, then combine columns independently (TiDB
 /// multiplies the per-column selectivities).
-fn pseudo_range_est(
-    conjuncts: &[sealdb_parser::ast::ExprNode],
-    row_count: f64,
-) -> Option<f64> {
+fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
     let mut per_col: Vec<(String, Vec<PRange>)> = Vec::new();
     for c in conjuncts {
         let Some((key, ranges)) = pseudo_ranges_of_predicate(c) else {
@@ -4195,10 +4145,7 @@ fn pseudo_range_est(
                 let mut merged = Vec::new();
                 for a in cur.iter() {
                     for b in ranges.iter() {
-                        let r = (
-                            prange_max_low(a.0, b.0),
-                            prange_min_high(a.1, b.1),
-                        );
+                        let r = (prange_max_low(a.0, b.0), prange_min_high(a.1, b.1));
                         if !prange_empty(&r) {
                             merged.push(r);
                         }
@@ -4229,7 +4176,6 @@ fn pseudo_range_est(
 
 /// Extra rows TiDB adds for `not(isnull(..))` saturation on analyzed stats.
 
-
 /// TiDB pseudo selectivity for one Selection conjunct
 /// (`statistics.pseudoSelectivity`): a comparison whose column side needs a
 /// cast cannot use the index, so it keeps `selectionFactor` (0.8), while a
@@ -4240,10 +4186,7 @@ fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
     let ExprNode::Binary(bin) = expr else {
         return None;
     };
-    if !matches!(
-        bin.op,
-        Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
-    ) {
+    if !matches!(bin.op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
         return None;
     }
     if expr_has_cast_operand(&bin.left) || expr_has_cast_operand(&bin.right) {
@@ -4334,11 +4277,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 (est_rows(child) * sel).max(0.0)
             } else if is_equality_filter(filter) {
                 let base = est_rows(child);
-                if base >= 10_000.0 {
-                    10.0
-                } else {
-                    1.0
-                }
+                if base >= 10_000.0 { 10.0 } else { 1.0 }
             } else if filter_has_like(filter) {
                 // TiDB pseudo est for `like(NULL,…) AND col` under unanalyzed scan.
                 // Keep unrounded so HashJoin product is 53253333.33 (not 53253300).
@@ -4401,11 +4340,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(filter),
             row_count,
             ..
-        } if range_pushed(Some(filter)).is_some()
-            || pushed_is_bytes_info(filter) =>
-        {
-            *row_count
-        }
+        } if range_pushed(Some(filter)).is_some() || pushed_is_bytes_info(filter) => *row_count,
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
@@ -4443,7 +4378,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             range_scan: Some(_),
             ..
         } => *row_count,
-        PhysicalPlan::IndexReader { row_count, pushed: None, .. } => *row_count,
+        PhysicalPlan::IndexReader {
+            row_count,
+            pushed: None,
+            ..
+        } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(filter),
             row_count,
@@ -4459,7 +4398,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             probe_est,
             ..
         } if *probe_est > 0.0 => *probe_est,
-        PhysicalPlan::IndexLookUpReader { row_count, pushed: None, .. } => *row_count,
+        PhysicalPlan::IndexLookUpReader {
+            row_count,
+            pushed: None,
+            ..
+        } => *row_count,
         // A covering reader over a full index scan sizes the cop Selection from
         // the filter's pseudo selectivity (`10000 * 0.8` / DNF combination).
         PhysicalPlan::IndexReader {
@@ -4478,7 +4421,8 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         }
         | PhysicalPlan::IndexMerge {
             pushed: Some(_), ..
-        } => 8_000.0,        PhysicalPlan::Limit { child, count, .. } => {
+        } => 8_000.0,
+        PhysicalPlan::Limit { child, count, .. } => {
             if *count > 0 {
                 est_rows(child).min(*count as f64)
             } else {
@@ -4495,7 +4439,9 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             est_rows: Some(est),
             ..
         } => *est,
-        PhysicalPlan::MergeJoin { left, right, tp, .. } => {
+        PhysicalPlan::MergeJoin {
+            left, right, tp, ..
+        } => {
             // Recursive CTEFullScan side dominates (TiDB MergeJoin est = 8001).
             let cte_side = [left.as_ref(), right.as_ref()].into_iter().find_map(|p| {
                 fn find_recursive(p: &PhysicalPlan) -> Option<f64> {
@@ -4592,11 +4538,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                     // Analyzed: ≥2× skew → max (t1⋈t3→4); else min (t2⋈t3→2).
                     let lo = l.min(r);
                     let hi = l.max(r);
-                    if hi >= lo * 2.0 {
-                        hi
-                    } else {
-                        lo
-                    }
+                    if hi >= lo * 2.0 { hi } else { lo }
                 } else if !lp && rp {
                     // Analyzed ⋈ pseudo → TiDB ~ analyzed * 1.25 (t3⋈t4 → 2.50).
                     l * 1.25
@@ -4851,9 +4793,7 @@ fn hash_join_explain_info(
         JoinType::Anti => "anti join",
     };
     // Pure CARTESIAN Cross with stub ON — no left-cond decoration.
-    if matches!(tp, JoinType::Cross)
-        && matches!(on, ExprNode::Value(_))
-    {
+    if matches!(tp, JoinType::Cross) && matches!(on, ExprNode::Value(_)) {
         return "CARTESIAN inner join".to_string();
     }
     if !join_on_has_equijoin(on) {
@@ -4881,9 +4821,10 @@ fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
     }
 }
 
-fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> String {
-    // OrigTblName: alias of physical `t` stays `<db>.t.a`; real tables use
-    // their name (`<db>.t1.a`), where `<db>` is the suite schema.
+/// `db.table.column` label used by TiDB join nodes (`left key:` / `equal:[…]`).
+/// OrigTblName: alias of physical `t` stays `<db>.t.a`; real tables use their
+/// name (`<db>.t1.a`), where `<db>` is the suite schema.
+pub(crate) fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> String {
     let table = col.table.as_deref().unwrap_or("t");
     let schema = column_schema(col, table);
     if schema.is_empty() {
@@ -4908,9 +4849,7 @@ fn is_not_in_marker_expr(expr: &sealdb_parser::ast::ExprNode) -> bool {
 fn contains_not_in_marker(expr: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     match expr {
-        ExprNode::Binary(bin)
-            if bin.op == sealdb_parser::opcode::Op::LogicAnd =>
-        {
+        ExprNode::Binary(bin) if bin.op == sealdb_parser::opcode::Op::LogicAnd => {
             contains_not_in_marker(&bin.left) || contains_not_in_marker(&bin.right)
         }
         _ => is_not_in_marker_expr(expr),

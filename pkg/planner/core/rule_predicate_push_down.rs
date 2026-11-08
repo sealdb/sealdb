@@ -169,9 +169,10 @@ fn push_into(
             // A full index scan can only push predicates whose columns live in
             // the index; the rest filter the probed table rows (Selection(Probe)).
             let on_probe = |expr: &ExprNode| {
-                !expr.referenced_columns().iter().all(|(_, col)| {
-                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
-                })
+                !expr
+                    .referenced_columns()
+                    .iter()
+                    .all(|(_, col)| index_columns.iter().any(|c| c.eq_ignore_ascii_case(col)))
             };
             let (index_side, probe_side): (Vec<_>, Vec<_>) =
                 if pushed.is_some() && access_range.is_none() {
@@ -187,9 +188,7 @@ fn push_into(
                 if let Some(sel) = crate::core::explain::filter_selectivity(&filter) {
                     row_count *= sel;
                 }
-                selection_info = Some(crate::core::explain::explain_pushed_filter(
-                    &table, &filter,
-                ));
+                selection_info = Some(crate::core::explain::explain_pushed_filter(&table, &filter));
             }
             let probe_filter = if probe_side.is_empty() {
                 None
@@ -220,9 +219,7 @@ fn push_into(
                     range_scan: access_range,
                     pushed: and_opt(
                         pushed,
-                        ExprNode::compose_cnf(
-                            index_side.into_iter().chain(probe_side).collect(),
-                        ),
+                        ExprNode::compose_cnf(index_side.into_iter().chain(probe_side).collect()),
                     ),
                 },
                 residual,
@@ -272,8 +269,7 @@ fn push_into(
                         index_info,
                         &pushable,
                         row_count,
-                        super::planbuilder::statement_stats(&table)
-                        .as_ref(),
+                        super::planbuilder::statement_stats(&table).as_ref(),
                     )
                 {
                     pushable.retain(|expr| {
@@ -363,9 +359,7 @@ fn push_into(
                     .iter()
                     .filter_map(|expr| expr.eq_column_const())
                     .filter(|(col, _)| {
-                        index_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(col))
+                        index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
                             || handle_column
                                 .as_deref()
                                 .is_some_and(|c| c.eq_ignore_ascii_case(col))
@@ -377,9 +371,7 @@ fn push_into(
                         // The unique-index equality is already the point get lookup.
                         if index.is_some()
                             && let Some((col, _)) = expr.eq_column_const()
-                            && index_columns
-                                .iter()
-                                .any(|c| c.eq_ignore_ascii_case(&col))
+                            && index_columns.iter().any(|c| c.eq_ignore_ascii_case(&col))
                         {
                             return false;
                         }
@@ -528,13 +520,28 @@ fn push_into(
                 // they are still enforced (inner joins are filter-equivalent).
                 let mut key_taken = !is_true_expr(&on);
                 for expr in residual {
-                    match resolve_conjunct_side(&expr, &left_map, &right_map) {
+                    match resolve_conjunct_side(
+                        &expr,
+                        &left_map,
+                        &right_map,
+                        &left_tables,
+                        &right_tables,
+                    ) {
                         Some(Side::Left) => left_preds.push(expr),
                         Some(Side::Right) => right_preds.push(expr),
                         Some(Side::Residual) | None => {
-                            if let Some(key) = qualify_cross_equality(&expr, &left_map, &right_map)
-                            {
-                                if key_taken {
+                            if let Some(key) = qualify_cross_equality(
+                                &expr,
+                                &left_map,
+                                &right_map,
+                                &left_tables,
+                                &right_tables,
+                            ) {
+                                // The hash key compares raw datums, while a
+                                // residual `Selection` applies MySQL coercion
+                                // (`int = bit`): only promote a type-identical
+                                // key, else the join would drop matching rows.
+                                if key_taken || !same_join_key_type(&key, is, current_db) {
                                     keep.push(key);
                                 } else {
                                     // CROSS JOIN's placeholder `ON TRUE` gives
@@ -640,7 +647,8 @@ fn statement_table_info<'a>(
     table: &str,
 ) -> Option<&'a sealdb_meta::model::table::TableInfo> {
     let is = is?;
-    let db = super::planbuilder::statement_table_db(table).unwrap_or_else(|| current_db.to_string());
+    let db =
+        super::planbuilder::statement_table_db(table).unwrap_or_else(|| current_db.to_string());
     is.table_by_name(&db, table)
 }
 
@@ -711,18 +719,21 @@ fn substitute_pinned_columns(
     };
     match expr {
         ExprNode::Column(c) => {
-            let same_table = c.table.as_deref().is_none_or(|t| {
-                t.is_empty() || t.eq_ignore_ascii_case(table)
-            });
+            let same_table = c
+                .table
+                .as_deref()
+                .is_none_or(|t| t.is_empty() || t.eq_ignore_ascii_case(table));
             if !same_table {
                 return None;
             }
             pinned
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case(&c.name))
-                .map(|(_, value)| ExprNode::Value(ValueExpr {
-                    datum: value.clone(),
-                }))
+                .map(|(_, value)| {
+                    ExprNode::Value(ValueExpr {
+                        datum: value.clone(),
+                    })
+                })
         }
         ExprNode::Value(_) => Some(expr.clone()),
         ExprNode::Binary(bin) => Some(ExprNode::Binary(BinaryOpExpr {
@@ -743,7 +754,8 @@ fn substitute_pinned_columns(
     }
 }
 
-fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {    match (left, right) {
+fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {
+    match (left, right) {
         (None, other) | (other, None) => other,
         (Some(left), Some(right)) => ExprNode::compose_cnf(vec![left, right]),
     }
@@ -1028,6 +1040,7 @@ mod tests {
     #[test]
     fn test_inner_join_splits_predicates() {
         let join = PhysicalPlan::HashJoin {
+            est_rows: None,
             tp: JoinType::Inner,
             left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
             right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
@@ -1112,8 +1125,7 @@ fn column_owners(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for table in tables {
         for col in table_columns(is, current_db, table) {
             map.entry(col.to_ascii_lowercase())
@@ -1124,13 +1136,29 @@ fn column_owners(
     map
 }
 
+/// Which table a (possibly qualified) column reference resolves to inside one
+/// join side. A qualifier is only honoured for a table that this side really
+/// owns: `eq(t1.id, t2.id)` must not look like "owned by the left side" just
+/// because `t1` is written down, otherwise a cross-table equality can never
+/// become the join key.
 fn owner_of(
     table: Option<&str>,
     col: &str,
     map: &std::collections::HashMap<String, Vec<String>>,
+    tables: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if let Some(table) = table {
-        return Some(table.to_ascii_lowercase());
+        let table = table.to_ascii_lowercase();
+        if !tables.contains(&table) {
+            return None;
+        }
+        // A known column must be listed under this table; an unresolved
+        // subtree (alias not in the infoschema) leaves `map` empty and relies
+        // on the qualifier alone.
+        return match map.get(&col.to_ascii_lowercase()) {
+            Some(owners) => owners.iter().any(|owner| *owner == table).then_some(table),
+            None => Some(table),
+        };
     }
     let owners = map.get(&col.to_ascii_lowercase())?;
     (owners.len() == 1).then(|| owners[0].clone())
@@ -1138,10 +1166,45 @@ fn owner_of(
 
 /// Which join side owns every column of `expr`; `None` when a column belongs
 /// to both sides / is unknown (so the conjunct stays residual or becomes a key).
+/// A cross-table equality can only replace the join filter when both columns
+/// have the same declared type. Unknown columns (aliases, derived sides) keep
+/// the historical behaviour and are promoted.
+fn same_join_key_type(key: &ExprNode, is: Option<&InfoSchema>, current_db: &str) -> bool {
+    use sealdb_parser::opcode::Op;
+    let ExprNode::Binary(bin) = key else {
+        return true;
+    };
+    if bin.op != Op::Eq {
+        return true;
+    }
+    let (ExprNode::Column(lhs), ExprNode::Column(rhs)) = (bin.left.as_ref(), bin.right.as_ref())
+    else {
+        return true;
+    };
+    let tp = |col: &sealdb_parser::ast::expressions::ColumnNameExpr| -> Option<u8> {
+        let table = col.table.as_deref()?;
+        let (db, table) = match table.split_once('.') {
+            Some((db, table)) => (db.to_string(), table.to_string()),
+            None => (current_db.to_string(), table.to_string()),
+        };
+        let info = is?.table_by_name(&db, &table)?;
+        info.columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+            .map(|c| c.field_type.tp)
+    };
+    match (tp(lhs), tp(rhs)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 fn resolve_conjunct_side(
     expr: &ExprNode,
     left_map: &std::collections::HashMap<String, Vec<String>>,
     right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_tables: &std::collections::HashSet<String>,
+    right_tables: &std::collections::HashSet<String>,
 ) -> Option<Side> {
     let cols = expr.referenced_columns();
     if cols.is_empty() {
@@ -1150,8 +1213,8 @@ fn resolve_conjunct_side(
     let mut left = true;
     let mut right = true;
     for (table, name) in cols {
-        let on_left = owner_of(table.as_deref(), &name, left_map).is_some();
-        let on_right = owner_of(table.as_deref(), &name, right_map).is_some();
+        let on_left = owner_of(table.as_deref(), &name, left_map, left_tables).is_some();
+        let on_right = owner_of(table.as_deref(), &name, right_map, right_tables).is_some();
         if !on_left {
             left = false;
         }
@@ -1175,6 +1238,8 @@ fn qualify_cross_equality(
     expr: &ExprNode,
     left_map: &std::collections::HashMap<String, Vec<String>>,
     right_map: &std::collections::HashMap<String, Vec<String>>,
+    left_tables: &std::collections::HashSet<String>,
+    right_tables: &std::collections::HashSet<String>,
 ) -> Option<ExprNode> {
     let ExprNode::Binary(binary) = expr else {
         return None;
@@ -1187,12 +1252,12 @@ fn qualify_cross_equality(
         return None;
     };
     let (l_left, l_right) = (
-        owner_of(l.table.as_deref(), &l.name, left_map),
-        owner_of(l.table.as_deref(), &l.name, right_map),
+        owner_of(l.table.as_deref(), &l.name, left_map, left_tables),
+        owner_of(l.table.as_deref(), &l.name, right_map, right_tables),
     );
     let (r_left, r_right) = (
-        owner_of(r.table.as_deref(), &r.name, left_map),
-        owner_of(r.table.as_deref(), &r.name, right_map),
+        owner_of(r.table.as_deref(), &r.name, left_map, left_tables),
+        owner_of(r.table.as_deref(), &r.name, right_map, right_tables),
     );
     // Each column must be owned by exactly one side, and the two columns must
     // sit on opposite sides for this to be a usable hash key.
@@ -1211,7 +1276,6 @@ fn qualify_cross_equality(
     Some(ExprNode::Binary(new))
 }
 
-
 /// TiDB derived predicates across an inner-join equality key.
 ///
 /// For each `a = b` in `ON` every single-side conjunct on `a` is mirrored onto
@@ -1229,9 +1293,7 @@ fn derive_equal_cond_preds(
     left_preds: &[ExprNode],
     right_preds: &[ExprNode],
 ) -> (Vec<ExprNode>, Vec<ExprNode>) {
-    use sealdb_parser::ast::expressions::{
-        BinaryOpExpr, ColumnNameExpr, ExprNode, UnaryOpExpr,
-    };
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode, UnaryOpExpr};
 
     fn single_col(e: &ExprNode) -> Option<ColumnNameExpr> {
         match e {
@@ -1317,8 +1379,7 @@ fn derive_equal_cond_preds(
         if bin.op != sealdb_parser::opcode::Op::Eq {
             continue;
         }
-        let (ExprNode::Column(a), ExprNode::Column(b)) =
-            (bin.left.as_ref(), bin.right.as_ref())
+        let (ExprNode::Column(a), ExprNode::Column(b)) = (bin.left.as_ref(), bin.right.as_ref())
         else {
             continue;
         };
@@ -1327,15 +1388,14 @@ fn derive_equal_cond_preds(
             if !owns(left_map, &c.name, left_single) {
                 continue;
             }
-            let (from, to) = if c.name.eq_ignore_ascii_case(&a.name)
-                && !c.name.eq_ignore_ascii_case(&b.name)
-            {
-                (a.name.clone(), b.name.clone())
-            } else if c.name.eq_ignore_ascii_case(&b.name) {
-                (b.name.clone(), a.name.clone())
-            } else {
-                continue;
-            };
+            let (from, to) =
+                if c.name.eq_ignore_ascii_case(&a.name) && !c.name.eq_ignore_ascii_case(&b.name) {
+                    (a.name.clone(), b.name.clone())
+                } else if c.name.eq_ignore_ascii_case(&b.name) {
+                    (b.name.clone(), a.name.clone())
+                } else {
+                    continue;
+                };
             let Some(alias) = alias_for(right_map, &to, right_table, right_single) else {
                 continue;
             };
@@ -1348,15 +1408,14 @@ fn derive_equal_cond_preds(
             if !owns(right_map, &c.name, right_single) {
                 continue;
             }
-            let (from, to) = if c.name.eq_ignore_ascii_case(&b.name)
-                && !c.name.eq_ignore_ascii_case(&a.name)
-            {
-                (b.name.clone(), a.name.clone())
-            } else if c.name.eq_ignore_ascii_case(&a.name) {
-                (a.name.clone(), b.name.clone())
-            } else {
-                continue;
-            };
+            let (from, to) =
+                if c.name.eq_ignore_ascii_case(&b.name) && !c.name.eq_ignore_ascii_case(&a.name) {
+                    (b.name.clone(), a.name.clone())
+                } else if c.name.eq_ignore_ascii_case(&a.name) {
+                    (a.name.clone(), b.name.clone())
+                } else {
+                    continue;
+                };
             let Some(alias) = alias_for(left_map, &to, left_table, left_single) else {
                 continue;
             };
