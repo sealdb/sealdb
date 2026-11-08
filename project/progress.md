@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-08（green 33 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 34 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -310,6 +310,16 @@
 | Mem 多版本 | 行级 commit 时间决定可见性 | `VersionedValue{commit_ts, commit_millis, value}` 版本链；`value_at(start_ts)`；`begin_stale` 按 `commit_millis < t` 裁剪 | 单测 `test_stale_read_sees_past_snapshot` |
 | TiKV 时间戳换算 | `oracle.GoTimeToTS(t) = physical_ms << 18` | `TikvStorage::begin_stale_read` 用该 TSO 建 `client.snapshot(ts, read_only)` 作为读快照 | `select … as of timestamp @a` 与 Mem 一致返回空 |
 | suite green | Gate A+B | manifest `green` | `executor/batch_point_get` Mem=1 / TiKV=1 PASS；green 32→33 |
+
+### 2.0t R3 `explain_foreign_key` 多表 DML join（2026-11-08）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| WHERE 等值键提升 | `pushDownPredicatesForJoin` 把 join 等值条件从 `Selection` 提升到 `Join.EqualConditions`，`CROSS` 修正为 `INNER` | `dml_join_conditions`：`UPDATE t1,t2 …` / `DELETE t1,t2 FROM t1 JOIN t2 …` 的 `WHERE` 中抽取 `t1.id = t2.id` 为 `ON`，把 `ON TRUE` 的 CROSS 改成 INNER | 两侧不再是 CARTESIAN 全表扫 |
+| 跨侧谓词镜像 | 等值键两侧可互相传播常量/范围（`t1.id=1` ⇒ `t2.id=1`） | `rebind_table_qualifier` 按同名键把单侧过滤复制到另一侧 | `Point_Get` ×2 / `TableRangeScan` ×2 |
+| join 形状选择 | 两侧同 handle 时键折叠为 TRUE，留 `HashJoin CARTESIAN`；两侧 handle range 有序时选 `MergeJoin` | `dml_join_shape`；MergeJoin estRows 走 null-reject `3333.33 × 1.25 = 4166.67`，Build 为语句自身表 | `update t_1,t_2 …` / `delete t_1,t_2 …` 段与金样一致 |
+| 跨表等值类型安全 | 类型不同的等值（`int = bit`）不能当 hash key，必须留在 `Selection` 走隐式转换 | `qualify_cross_equality` 校验表归属；`same_join_key_type` 校验声明类型 | `executor/jointest/join` 无回归 |
+| suite green | Gate A+B | manifest `green` | `explain_foreign_key` Mem=1 / TiKV=1 PASS；green 33→34 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
@@ -1761,14 +1771,15 @@
   - Parser：`UPDATE t1, t2 SET …` 逗号多表支持（右侧为普通表引用时折叠为 `JOIN … ON TRUE`）
   - EXPLAIN：`Foreign_Key_Check` / `Foreign_Key_Cascade` 行（estRows `0.00`、task `root`、access `table:…, index:…`）排在 DML 源计划之后；DML 非末位子节点的 cop 子树补齐 `│ ` 续行
 - **验证**:
-  - `explain_foreign_key`：单表 INSERT/UPDATE/DELETE、`ON DUPLICATE KEY UPDATE`、`foreign_key_checks=0`、`t5/t6` 多外键排序段 Mem 0 diff（161 行中 149 行一致），仅剩两条多表 DML 语句
+  - `explain_foreign_key`：Mem/TiKV `PASS`（161 行全对齐，含两条多表 DML 的 join 形状）
   - `run-tests.sh -s memory --status green` → PASS: memory=33（无回归）
-  - `run-tests.sh -s tikv --status green` → 结果见 `status-report.md`
+  - `run-tests.sh -s tikv --status green` → PASS: tikv=33
+- **多表 DML join 形状（本次补齐）**:
+  - `WHERE` 等值键抽取：`dml_join_conditions` 把 `t_1.id = t_2.id` 从 `selection` 提升为 `JOIN … ON`，把 `CROSS` 修正为 `INNER`，并把单侧过滤谓词按同名键镜像到另一侧（`t_1.id=1` → `t_2.id=1`，`t_1.id>0` → `t_2.id>0`）。这正是 TiDB `pushDownPredicatesForJoin` 的行为，两侧因此都能走 `Point_Get` 或 handle range。
+  - `dml_join_shape`：两侧同 handle 的 `Point_Get` 时等值键折叠为 TRUE，输出 `HashJoin CARTESIAN`（Build 侧为语句自身表）；两侧都是 `TableRangeScan` 时输出 `MergeJoin`（`keep order:true`），estRows 用 null-reject 选择性 `3333.33 ⋈ 3333.33 → 4166.67`。
+  - 谓词下推收紧：`qualify_cross_equality` 现在要求表限定符必须真的属于该 join 子树，才允许把跨表等值升为 hash key；新增 `same_join_key_type`，声明类型不同的跨表等值（如 `int = bit(32)`）继续留在残差 `Selection` 里走 MySQL 隐式转换，避免按原始 datum 比较丢行（回归 `executor/jointest/join`）。
 - **阻塞/风险**:
-  - `explain_foreign_key` 仍 `in_progress`，剩两条多表 DML 的 join 形状：
-    1. `update t_1,t_2 set … where t_1.id=t_2.id and t_1.id=1`：TiDB 为两侧各一个 `Point_Get`（常量经等值键传播）再 `HashJoin CARTESIAN`；当前只把常量传播到 t_1，`t_2` 仍是全表扫 + 残差 `Selection`
-    2. `delete t_1,t_2 from t_1 join t_2 where t_1.id=t_2.id and t_1.id > 0`：TiDB 走 `MergeJoin`，两侧 `TableRangeScan (0,+inf], keep order:true`（连接键范围双向传播 + 有序扫描择 MergeJoin）；当前是 `HashJoin` + Build 侧 `Selection`
-  - 两条都属多表 DML 的 join 规划（WHERE 等值键抽取 / 跨侧常量与范围传播 / MergeJoin 代价选择），需要单独一轮 planner 工作，未在本次改动内引入
+  - `explain_foreign_key` 已转 `green`（33 → 34 套件）
 - **下一步**:
   - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_stats` / `topn_push_down` 等
 

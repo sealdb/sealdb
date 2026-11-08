@@ -1156,7 +1156,7 @@
     {
       "name": "explain_foreign_key",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_foreign_key.test",
       "result": "r/explain_foreign_key.result",
       "has_result": true,
