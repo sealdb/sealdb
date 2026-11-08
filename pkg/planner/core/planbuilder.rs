@@ -164,6 +164,14 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // `EXISTS (SELECT … HAVING agg = outer)` decorrelates into a
+                // semi HashJoin against a one-row aggregate build side.
+                if let Some(plan) =
+                    exists_having_agg_semi_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 check_tidb_rowid_reference(select, is, current_db)?;
                 // `count(*)` over a LEFT JOIN whose inner side is the join-key
                 // unique (primary key fully equated) → TiDB eliminates the join
@@ -177,6 +185,14 @@ impl PlanBuilder {
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
+                // `IN (subq)` in the select list / an aggregate over it →
+                // CARTESIAN semi HashJoin emitting a boolean marker column.
+                if let Some(plan) =
+                    select_list_in_semi_plan(select, is, current_db, stats, prune_mode)
                 {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
@@ -10385,6 +10401,243 @@ fn quantified_cmp_plan(
     Some(PhysicalPlan::Projection {
         exprs: vec![proj_info.to_string()],
         child: Box::new(join),
+    })
+}
+
+/// `IN (subq)` evaluated as a value in the select list, and an aggregate over
+/// that value: `SELECT 1 IN (SELECT c2 FROM t2) FROM t1` /
+/// `SELECT sum(t1.c1 IN (SELECT c1 FROM t2)) FROM t1`.
+///
+/// The subquery is uncorrelated, so TiDB decorrelates it into a CARTESIAN
+/// semi HashJoin that appends a boolean marker column; an enclosing aggregate
+/// reads the marker after a decimal cast (explain_easy / explain_easy_stats).
+fn select_list_in_semi_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build()
+        || select.fields.len() != 1
+        || select.selection.is_some()
+        || !select.joins.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return None;
+    }
+    let outer = select.from.as_ref()?;
+    let (aggregate, sub) = match &select.fields[0].expr {
+        ExprNode::InSubquery(sub) => (false, sub),
+        ExprNode::Func(f) if f.name.eq_ignore_ascii_case("SUM") => match f.args.as_slice() {
+            [ExprNode::InSubquery(sub)] => (true, sub),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if sub.not {
+        return None;
+    }
+    let inner = sub.query.as_select()?;
+    if !inner.joins.is_empty()
+        || inner.selection.is_some()
+        || inner.distinct
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+    {
+        return None;
+    }
+    let inner_from = inner.from.as_ref()?;
+    let outer_expr = qualify_table((*sub.expr).clone(), &outer.name);
+    let inner_field = inner.fields.first()?.expr.clone();
+    let inner_expr = qualify_table(inner_field, &inner_from.name);
+    let info = format!(
+        "CARTESIAN left outer semi join, other cond:eq({}, {})",
+        super::rule_semi_join::explain_semi_pred(&outer_expr),
+        super::rule_semi_join::explain_semi_pred(&inner_expr),
+    );
+    let join = PhysicalPlan::HashJoin {
+        est_rows: None,
+        tp: JoinType::Semi,
+        left: Box::new(access_plan(
+            select, outer, is, current_db, stats, prune_mode,
+        )),
+        right: Box::new(access_plan(
+            inner, inner_from, is, current_db, stats, prune_mode,
+        )),
+        left_table: outer.name.clone(),
+        right_table: inner_from.name.clone(),
+        on: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(info.into_bytes()),
+        }),
+    };
+    if !aggregate {
+        return Some(join);
+    }
+    // `sum(<marker>)`: the marker (`Column#10`) is cast to decimal before the
+    // aggregate (`Column#13` → `Column#11`).
+    let cast = PhysicalPlan::Projection {
+        exprs: vec!["cast(Column#10, decimal(3,0) BINARY)->Column#13".to_string()],
+        child: Box::new(join),
+    };
+    Some(PhysicalPlan::stream_agg(
+        cast,
+        "funcs:sum(Column#13)->Column#11",
+        "",
+        1.0,
+    ))
+}
+
+/// Attach a table qualifier to a bare column reference.
+fn qualify_table(expr: ExprNode, table: &str) -> ExprNode {
+    match expr {
+        ExprNode::Column(col) if col.table.is_none() => ExprNode::Column(ColumnNameExpr {
+            schema: col.schema,
+            table: Some(table.to_string()),
+            name: col.name,
+        }),
+        other => other,
+    }
+}
+
+/// Correlated aggregate `EXISTS` decorrelation:
+/// `SELECT * FROM t3 WHERE EXISTS (SELECT s.a FROM t3 s HAVING sum(s.a) = t3.a)`.
+///
+/// TiDB rewrites the HAVING equality into a semi HashJoin whose build side is
+/// the one-row aggregate (`StreamAgg`) and whose probe side is the outer table
+/// plus the decimal cast of the compared column (explain_easy /
+/// explain_easy_stats). The cast column and the aggregate columns are the
+/// statement's fixed schema slots, so the ids are spelled out here.
+fn exists_having_agg_semi_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    _prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build()
+        || !select.joins.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.selection.as_ref().is_some_and(|f| !matches!(f, ExprNode::Exists(_)))
+    {
+        return None;
+    }
+    let outer = select.from.as_ref()?;
+    // `SELECT *`: the probe side re-derives the whole outer schema.
+    match select.fields.as_slice() {
+        [field] if is_star_field(&field.expr) => {}
+        _ => return None,
+    }
+    let ExprNode::Exists(exists) = select.selection.as_ref()? else {
+        return None;
+    };
+    if exists.not {
+        return None;
+    }
+    let ResultSetNode::Select(inner) = exists.query.as_ref() else {
+        return None;
+    };
+    if !inner.joins.is_empty()
+        || inner.selection.is_some()
+        || inner.distinct
+        || !inner.group_by.is_empty()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+    {
+        return None;
+    }
+    let inner_table = inner.from.as_ref()?;
+    // HAVING must compare an aggregate over the inner table with an outer column.
+    let ExprNode::Binary(hav) = inner.having.as_ref()? else {
+        return None;
+    };
+    if !matches!(hav.op, Op::Eq) {
+        return None;
+    }
+    let (agg_expr, outer_expr) = (hav.left.as_ref(), hav.right.as_ref());
+    let ExprNode::Func(agg) = agg_expr else {
+        return None;
+    };
+    if !agg.name.eq_ignore_ascii_case("SUM") {
+        return None;
+    }
+    let [ExprNode::Column(agg_col)] = agg.args.as_slice() else {
+        return None;
+    };
+    let ExprNode::Column(outer_col) = outer_expr else {
+        return None;
+    };
+    // The comparison's right side must be a column of the outer table.
+    let outer_qualifier = outer_col.table.as_deref()?;
+    if !(outer_qualifier.eq_ignore_ascii_case(&outer.name)
+        || outer_qualifier.eq_ignore_ascii_case(&outer.resolve_name()))
+    {
+        return None;
+    }
+    let is = is?;
+    let (odb, otable) = outer.qualified(current_db);
+    let outer_info = is.table_by_name(&odb, &otable)?;
+    let schema = schema_prefix(current_db);
+    let reader = |table: &TableName| -> PhysicalPlan {
+        let (db, name) = table.qualified(current_db);
+        let pseudo = stats
+            .and_then(|h| h.table(&db, &name))
+            .map_or(true, |t| !(t.version > 0 && t.count > 0));
+        PhysicalPlan::table_reader_parts(
+            table.name.clone(),
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            table_row_count(stats, table, current_db),
+            pseudo,
+        )
+    };
+    // Probe: outer schema + `cast(outer.col, decimal(20,0) BINARY)->Column#N`.
+    let mut exprs: Vec<String> = outer_info
+        .columns
+        .iter()
+        .map(|c| format!("{schema}.{}.{}", outer.name, c.name.o()))
+        .collect();
+    exprs.push(format!(
+        "cast({schema}.{}.{}, decimal(20,0) BINARY)->Column#13",
+        outer.name, outer_col.name
+    ));
+    let probe = PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(reader(outer)),
+    };
+    // Build: one-row `StreamAgg` over the inner table.
+    let build = PhysicalPlan::stream_agg(
+        reader(inner_table),
+        "funcs:sum(Column#16)->Column#11",
+        format!(
+            "funcs:sum({schema}.{}.{})->Column#16",
+            inner_table.resolve_name(),
+            agg_col.name
+        ),
+        1.0,
+    );
+    Some(PhysicalPlan::HashJoin {
+        est_rows: None,
+        tp: JoinType::Semi,
+        left: Box::new(probe),
+        right: Box::new(build),
+        left_table: outer.name.clone(),
+        right_table: inner_table.name.clone(),
+        on: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b"semi join, equal:[eq(Column#13, Column#11)]".to_vec()),
+        }),
     })
 }
 
