@@ -111,6 +111,9 @@ pub struct Step {
     pub show_info: bool,
     /// TiDB `--replace_regex /pat/repl/` applied to this statement's result.
     pub replace_regex: Vec<(regex::Regex, String)>,
+    /// TiDB `--replace_column N text …` (1-based): overwrite those result
+    /// columns, e.g. the memory/disk numbers of `EXPLAIN ANALYZE`.
+    pub replace_column: Vec<(usize, String)>,
     /// mysql-tester session directive (`connect` / `connection` / `disconnect`).
     pub directive: Option<SessionDirective>,
 }
@@ -257,6 +260,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
     let mut result_log = true;
     let mut info_enabled = false;
     let mut replace_regex: Vec<(regex::Regex, String)> = Vec::new();
+    let mut replace_column: Vec<(usize, String)> = Vec::new();
     for line in src.lines() {
         let trimmed = line.trim();
         // TiDB mysql-tester drops blank lines inside multi-line statements, so
@@ -289,6 +293,10 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 replace_regex = parse_replace_regex(spec.trim())?;
                 continue;
             }
+            if let Some(spec) = strip_prefix_ci(rest, "replace_column") {
+                replace_column = parse_replace_column(spec.trim())?;
+                continue;
+            }
             if rest.eq_ignore_ascii_case("enable_info") {
                 info_enabled = true;
                 continue;
@@ -315,6 +323,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     log_result: true,
                     show_info: false,
                     replace_regex: Vec::new(),
+                    replace_column: Vec::new(),
                     directive: None,
                 });
                 continue;
@@ -340,6 +349,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                     log_result: true,
                     show_info: false,
                     replace_regex: Vec::new(),
+                    replace_column: Vec::new(),
                     directive: Some(directive),
                 });
                 continue;
@@ -361,6 +371,7 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
                 log_result: result_log,
                 show_info: info_enabled,
                 replace_regex: std::mem::take(&mut replace_regex),
+                replace_column: std::mem::take(&mut replace_column),
                 directive: None,
             });
             buf.clear();
@@ -431,6 +442,30 @@ fn parse_replace_regex(spec: &str) -> Result<Vec<(regex::Regex, String)>> {
             )
         })?;
         out.push((re, replacement));
+    }
+    Ok(out)
+}
+
+/// Parse `--replace_column 6 <execution_info> 8 <memory>` into 1-based column
+/// indexes paired with the placeholder that replaces their value.
+fn parse_replace_column(spec: &str) -> Result<Vec<(usize, String)>> {
+    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
+        return Err(Error::unsupported(format!(
+            "test directive -- replace_column {spec}"
+        )));
+    }
+    let mut out = Vec::new();
+    for pair in tokens.chunks(2) {
+        let index: usize = pair[0]
+            .parse()
+            .map_err(|_| Error::unsupported(format!("test directive -- replace_column {spec}")))?;
+        if index == 0 {
+            return Err(Error::unsupported(format!(
+                "test directive -- replace_column {spec}"
+            )));
+        }
+        out.push((index - 1, pair[1].to_string()));
     }
     Ok(out)
 }
@@ -715,6 +750,13 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                 if step.sorted {
                     sort_rows(&mut rows);
                 }
+                for row in &mut rows {
+                    for (index, placeholder) in &step.replace_column {
+                        if let Some(cell) = row.get_mut(*index) {
+                            *cell = placeholder.clone();
+                        }
+                    }
+                }
                 for row in rows {
                     lines.push(row.join("\t"));
                 }
@@ -803,6 +845,15 @@ pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Res
     let expected_n = normalize(&expected);
     let actual_n = normalize(&actual);
     if actual_n != expected_n {
+        // Triage aid: keep the full actual output next to the diff so a large
+        // mismatch does not have to be reproduced statement by statement.
+        if let Ok(path) = std::env::var("SEALDB_ITEST_DUMP_DIR") {
+            let name = suite.name.replace('/', "__");
+            let _ = fs::write(
+                std::path::Path::new(&path).join(format!("{name}.actual")),
+                &actual,
+            );
+        }
         let hint = if suite.owner_hint.is_empty() {
             String::new()
         } else {
