@@ -141,6 +141,30 @@ pub struct IndexStats {
     /// TiDB `TopN` entries as `(encoded key, count)`.
     #[serde(default)]
     pub topn: Vec<(Vec<u8>, u64)>,
+    /// TiDB `Statistics.StatsVer`. `LOAD STATS` JSON without the field but with
+    /// a histogram NDV was collected by v4.0 or earlier, i.e. version 1, whose
+    /// histogram still contains the TopN rows (`TotalRowCount` excludes them
+    /// from the sum so the same rows are not counted twice).
+    #[serde(default)]
+    pub stats_ver: u64,
+}
+
+impl IndexStats {
+    /// TiDB `Index.TotalRowCount`: version 2 histograms hold TopN rows out, so
+    /// they are added back; version 1 histograms already cover them.
+    pub fn total_row_count(&self) -> f64 {
+        let hist = self
+            .histogram
+            .as_ref()
+            .map(|h| h.not_null_count())
+            .unwrap_or(0.0)
+            + self.null_count as f64;
+        if self.stats_ver >= 2 {
+            hist + self.topn.iter().map(|(_, c)| *c as f64).sum::<f64>()
+        } else {
+            hist
+        }
+    }
 }
 
 impl TopN {

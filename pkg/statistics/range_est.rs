@@ -366,16 +366,6 @@ impl Histogram {
 }
 
 impl IndexStats {
-    /// TiDB `Index.TotalRowCount` for stats version 2 (histogram + TopN).
-    pub fn total_row_count(&self) -> f64 {
-        let hist = self
-            .histogram
-            .as_ref()
-            .map(|h| h.not_null_count())
-            .unwrap_or(0.0);
-        hist + self.null_count as f64 + self.topn.iter().map(|(_, c)| *c as f64).sum::<f64>()
-    }
-
     /// TiDB `TopN.QueryTopN`: rows recorded for an exact encoded key.
     fn topn_lookup(&self, key: &[u8]) -> Option<f64> {
         self.topn

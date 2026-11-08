@@ -97,6 +97,7 @@ impl Handle {
                                 .collect(),
                         }),
                         topn: idx.topn.clone(),
+                        stats_ver: idx.stats_ver,
                     })
                     .collect(),
                 columns: stats
@@ -189,6 +190,7 @@ impl Handle {
                                     .collect(),
                             }),
                             topn: i.topn,
+                            stats_ver: i.stats_ver,
                         },
                     )
                 })
@@ -238,6 +240,8 @@ struct PersistIndex {
     histogram: Option<PersistIndexHist>,
     #[serde(default)]
     topn: Vec<(Vec<u8>, u64)>,
+    #[serde(default)]
+    stats_ver: u64,
 }
 
 #[derive(Serialize, Deserialize)]

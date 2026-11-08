@@ -122,11 +122,18 @@ fn index_from_json(idx: &Value) -> Result<IndexStats> {
             ));
         }
     }
+    // TiDB `TableStatsFromJSON`: an explicit `stats_ver` wins; JSON recorded by
+    // v4.0 or earlier carries no version, and a histogram NDV means version 1.
+    let stats_ver = idx
+        .get("stats_ver")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| if ndv > 0 || null_count > 0 { 1 } else { 0 });
     Ok(IndexStats {
         ndv,
         null_count,
         histogram,
         topn,
+        stats_ver,
     })
 }
 
