@@ -7,7 +7,7 @@ use sealdb_kv::IsolationLevel;
 use sealdb_meta::{ClusteredIndexMode, with_clustered_index_mode};
 use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::expressions::ExprNode;
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode};
 use sealdb_parser::ast::{
     CommonTableExpression, CteMaterialize, InsertStmt, IsolationLevel as AstIsolation,
     PrivilegeType, SelectStmt, SetVarScope, Statement, UserIdentity, WithClause,
@@ -1718,9 +1718,109 @@ fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool 
         }
     }
     let restored = expr.restore_string();
-    group_by
+    if group_by
         .iter()
         .any(|g| g.restore_string().eq_ignore_ascii_case(&restored))
+    {
+        return true;
+    }
+    // TiDB `checkOnlyFullGroupByWithGroupClause`: a select expression that is
+    // not itself a grouping item is legal as long as every column it reads is
+    // a bare grouped column (`a+1` / `if(a>2,1,0)` with `GROUP BY a`).
+    // Aggregate arguments are outside the check.
+    group_by_columns(expr, group_by)
+}
+
+/// Every non-aggregate column of `expr` is a bare column of `group_by`.
+fn group_by_columns(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
+    let grouped: Vec<&ColumnNameExpr> = group_by
+        .iter()
+        .filter_map(|g| match g {
+            ExprNode::Column(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let mut cols = Vec::new();
+    collect_group_by_check_columns(expr, &mut cols);
+    cols.iter().all(|c| {
+        grouped.iter().any(|g| {
+            g.name.eq_ignore_ascii_case(&c.name)
+                && match (g.table.as_deref(), c.table.as_deref()) {
+                    (Some(gt), Some(ct)) => gt.eq_ignore_ascii_case(ct),
+                    _ => true,
+                }
+        })
+    })
+}
+
+/// Column references that force a group-by dependency: aggregate arguments and
+/// subqueries are pruned (TiDB extracts columns from the outer expression).
+fn collect_group_by_check_columns<'a>(expr: &'a ExprNode, out: &mut Vec<&'a ColumnNameExpr>) {
+    match expr {
+        ExprNode::Column(c) => out.push(c),
+        ExprNode::Func(f) if is_aggregate_func_name(&f.name) => {}
+        ExprNode::Func(f) => {
+            for arg in &f.args {
+                collect_group_by_check_columns(arg, out);
+            }
+        }
+        ExprNode::Binary(b) => {
+            collect_group_by_check_columns(&b.left, out);
+            collect_group_by_check_columns(&b.right, out);
+        }
+        ExprNode::Unary(u) => collect_group_by_check_columns(&u.expr, out),
+        ExprNode::Cast(c) => collect_group_by_check_columns(&c.expr, out),
+        ExprNode::InList(i) => {
+            collect_group_by_check_columns(&i.expr, out);
+            for item in &i.list {
+                collect_group_by_check_columns(item, out);
+            }
+        }
+        ExprNode::Between(b) => {
+            collect_group_by_check_columns(&b.expr, out);
+            collect_group_by_check_columns(&b.low, out);
+            collect_group_by_check_columns(&b.high, out);
+        }
+        ExprNode::Like(l) => {
+            collect_group_by_check_columns(&l.expr, out);
+            collect_group_by_check_columns(&l.pattern, out);
+        }
+        ExprNode::IsNull(i) => collect_group_by_check_columns(&i.expr, out),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &c.operand {
+                collect_group_by_check_columns(operand, out);
+            }
+            for (when, then) in &c.when_then {
+                collect_group_by_check_columns(when, out);
+                collect_group_by_check_columns(then, out);
+            }
+            if let Some(else_expr) = &c.else_expr {
+                collect_group_by_check_columns(else_expr, out);
+            }
+        }
+        ExprNode::Window(w) => {
+            for arg in &w.args {
+                collect_group_by_check_columns(arg, out);
+            }
+            for part in &w.spec.partition_by {
+                collect_group_by_check_columns(part, out);
+            }
+            for item in &w.spec.order_by {
+                collect_group_by_check_columns(&item.expr, out);
+            }
+        }
+        ExprNode::Row(r) => {
+            for item in &r.exprs {
+                collect_group_by_check_columns(item, out);
+            }
+        }
+        // Subqueries carry their own scope; constants read no columns.
+        ExprNode::Value(_)
+        | ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => {}
+    }
 }
 
 /// Aggregate names TiDB registers in `aggregation.GetAggFunc` — these are the

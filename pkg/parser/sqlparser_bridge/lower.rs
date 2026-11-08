@@ -9037,6 +9037,14 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         Expr::Value(v) => Ok(ExprNode::Value(ValueExpr {
             datum: lower_value(&v.value)?,
         })),
+        // `_utf8mb4'…'` / `_binary '…'`: a charset introducer on a string
+        // literal. TiDB keeps the literal value and uses the introducer only
+        // for the literal's charset/collation.
+        Expr::Prefixed { prefix, value } if prefix.value.starts_with('_') => {
+            Ok(ExprNode::Value(ValueExpr {
+                datum: lower_value_from_expr(value)?,
+            }))
+        }
         Expr::BinaryOp { left, op, right } => Ok(ExprNode::Binary(BinaryOpExpr {
             op: lower_binary_op(op)?,
             left: Box::new(lower_expr(left)?),
@@ -9705,6 +9713,13 @@ fn lower_order_by_exprs(items: &[OrderByExpr]) -> Result<Vec<ByItem>> {
             })
         })
         .collect()
+}
+
+fn lower_value_from_expr(expr: &Expr) -> Result<Datum> {
+    match expr {
+        Expr::Value(v) => lower_value(&v.value),
+        other => Err(Error::unsupported(format!("prefixed literal {other}"))),
+    }
 }
 
 fn lower_value(value: &Value) -> Result<Datum> {

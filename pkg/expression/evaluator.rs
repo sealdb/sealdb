@@ -1113,6 +1113,33 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             Ok(Datum::Bytes(out))
         }
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        // MySQL `QUOTE(str)`: single-quoted, with `'` `\` NUL and `0x1a`
+        // escaped. Numbers print as their own text (`QUOTE(1.5)` → `'1.5'`).
+        "QUOTE" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "QUOTE requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let mut out = Vec::with_capacity(v.as_bytes().len() + 2);
+            out.push(b'\'');
+            for b in v.as_bytes() {
+                match b {
+                    b'\'' => out.extend_from_slice(b"\\'"),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    0 => out.extend_from_slice(b"\\0"),
+                    0x1a => out.extend_from_slice(b"\\Z"),
+                    other => out.push(other),
+                }
+            }
+            out.push(b'\'');
+            Ok(Datum::Bytes(out))
+        }
         // MySQL `SPACE(n)`: `n` spaces; negative length yields ''.
         "SPACE" => {
             if func.args.len() != 1 {
