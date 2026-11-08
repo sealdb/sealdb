@@ -311,7 +311,23 @@
 | TiKV 时间戳换算 | `oracle.GoTimeToTS(t) = physical_ms << 18` | `TikvStorage::begin_stale_read` 用该 TSO 建 `client.snapshot(ts, read_only)` 作为读快照 | `select … as of timestamp @a` 与 Mem 一致返回空 |
 | suite green | Gate A+B | manifest `green` | `executor/batch_point_get` Mem=1 / TiKV=1 PASS；green 32→33 |
 
-### 2.0t R3 `explain_foreign_key` 多表 DML join（2026-11-08）
+### 2.0t R3 剩余套件根因盘点（2026-11-08）
+
+`explain_foreign_key` 转绿后，对 R3 其余 `in_progress` 套件逐个跑了内存 triage（并给 harness 加了
+`--replace_column` 支持与 `SEALDB_ITEST_DUMP_DIR` 全量 actual 落盘），结论是剩余项集中在四块基础设施：
+
+| 根能力 | 直接影响 | 现状 |
+|---|---|---|
+| 子查询去关联（semi / anti / marker 列） | `explain_easy`、`index_merge`、`topn_push_down`、`explain_complex*` | `rule_semi_join` 只处理 CNF 顶层的 `EXISTS`/`IN`；子查询处在 `OR` 内时仍留 `Apply`，TiDB 会改成 `left outer semi join` + marker 列（`Column#N`） |
+| 统计驱动的访问路径与基数 | `explain_easy_stats`、`explain_join_stats`、`explain_indexmerge_stats`、`clustered_index` 剩余 | 已有直方图区间 est 与 `stats:partial` 渲染，但缺 NDV 驱动的 join 基数、`ORDER BY` 走索引的成本比较、`IndexJoin` 选择与 `TIDB_INLJ` 提示 |
+| 表达式（函数）索引 | `explain_easy`、`explain_shard_index`、`explain_generate_column_substitute` | `IndexInfo` 只有列名（`IndexColumn{name, length}`），`(a+b+1)` / `tidb_shard(a)` 在建索引阶段直接报 1235 |
+| 权限与运行时统计 | `executor/explain` | 已有 `pkg/privilege` 的 GRANT/USER 落盘，但视图 `EXPLAIN` 的 `ErrViewNoExplain`(1345)/1142、`explain analyze` 的 actRows/内存/磁盘、`information_schema.statements_summary` 均缺 |
+
+顺带修掉一个真实正确性问题：`select count(*) from e, lo where lo.a=e.a and e.b=…` 把 `e` 规划成
+`IndexReader(idx_b)`，而 join 需要比较 `e.a` —— 索引并不覆盖该列。`select_covers_index` 现在把
+「属于该表的 join key 列」也算进 needed columns，非覆盖索引回到 `IndexLookUp`。
+
+### 2.0u R3 `explain_foreign_key` 多表 DML join（2026-11-08）
 
 | 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
 |---|---|---|---|

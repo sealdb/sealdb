@@ -124,6 +124,22 @@ TiKV 侧：本地 PD/TiKV 曾因沙箱网络限制无法连通（`Operation not 
 
 策略：优先吃「同一根因能一次带绿多套」的项——EXPLAIN 节点编号/树形、IndexJoin hint、Point_Get/IndexMerge 统计形状。
 
+### 6.1 R3 在研套件的根因盘点（2026-11-08 复跑 triage）
+
+| 套件 | 首差 | 需要的根能力 |
+|---|---|---|
+| `explain_join_stats` | 根聚合 `HashAgg/count(1)`、`IndexLookUp` vs `IndexReader`、join est `19977`、`TIDB_INLJ` 提示 | NDV 驱动的 join 基数 + `IndexJoin` 物理选择 + 提示 |
+| `explain_easy_stats` | `stats:partial[c2:missing]`、PK 直方图区间 est、`ORDER BY` 走索引免 Sort、outer join est | 统计驱动的访问路径与基数 |
+| `explain_easy` | `create index … ((a+b+1))` 报 1235、`EXISTS … HAVING` 未去关联、`MemTableScan` 下推 | 表达式索引 + 去关联 + 内存表扫描 |
+| `explain_shard_index` | `unique key uk_expr((tidb_shard(a)), a)` 建表失败 | 表达式索引（含 `tidb_shard` 前缀推导） |
+| `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效 | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
+| `topn_push_down` | 根 `Limit` vs `TopN`、`dual` 单行去 Sort、驱动表/IndexJoin 选择、IN 去关联 | 去关联 + cost 驱动 join 顺序/物理算子 |
+| `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表 |
+| `executor/index_merge_reader` / `globalindex/mem_index_merge*` | 同 `index_merge` | 同上 |
+| `explain_complex*` / `explain_indexmerge_stats` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
+
+结论：R3 剩余项不再是「补渲染」型工作，而是四块基础设施——**统计驱动访问路径/基数**、**子查询去关联（semi/anti/marker）**、**表达式（函数）索引**、**权限 + 运行时统计**。建议按此四块推进，而不是逐套件硬啃。
+
 ---
 
 ## 7. 质量与纪律
