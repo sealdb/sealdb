@@ -1026,9 +1026,9 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(best.unwrap_or(Datum::Null))
         }
-        // TiDB `tidb_shard(x)` (shard index helper): CRC32 of the decimal text
-        // pushed into the high 32 bits, so shard indices spread over 2^32
-        // buckets. Used by `INDEX uk_expr((tidb_shard(a)), a)`.
+        // TiDB `tidb_shard(x)` (shard index helper): the DES/null-key hash of
+        // the argument modulo 256 buckets. Used by
+        // `INDEX uk_expr((tidb_shard(a)), a)`.
         "TIDB_SHARD" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1040,8 +1040,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             if value.is_null() {
                 return Ok(Datum::Null);
             }
-            let text = value.as_i64()?.to_string();
-            Ok(Datum::I64(i64::from(crc32_ieee(text.as_bytes())) << 32))
+            Ok(Datum::I64(crate::shard::tidb_shard(value.as_i64()?)))
         }
         "ABS" => {
             if func.args.len() != 1 {
@@ -2365,18 +2364,5 @@ mod high_not_tests {
             assert_eq!(eval_select("SELECT NOT 1 BETWEEN -5 AND 5"), Datum::I64(1));
         });
     }
-}
-
-/// CRC-32 (IEEE 802.3), the hash TiDB's `tidb_shard` builds on.
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
 }
 

@@ -1832,11 +1832,7 @@ impl PlanBuilder {
         let left_plan = PhysicalPlan::IndexReader {
             table: join.left.name.clone(),
             index: index.name.o().to_string(),
-            index_columns: index
-                .columns
-                .iter()
-                .map(|c| c.name.o().to_string())
-                .collect(),
+            index_columns: index_key_column_names(left_info, index),
             partitions: Vec::new(),
             partition_access: String::new(),
             row_count: index_rows,
@@ -5146,6 +5142,26 @@ pub(crate) fn cop_projection_marker(list: &str) -> String {
     format!("COP_PROJ|{list}")
 }
 
+/// TiDB `IndexInfo.Columns` key text: a plain column name, or the generating
+/// expression of the hidden column backing an expression key part, which is
+/// what EXPLAIN renders (`index:uk_expr(tidb_shard(`a`), a)`).
+pub(crate) fn index_key_column_names(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+) -> Vec<String> {
+    index
+        .columns
+        .iter()
+        .map(|c| {
+            info.columns
+                .iter()
+                .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o()))
+                .and_then(|col| col.generated_expr.clone())
+                .unwrap_or_else(|| c.name.o().to_string())
+        })
+        .collect()
+}
+
 /// Any `*` / `t.*` SELECT item.
 fn is_star_field(expr: &ExprNode) -> bool {
     match expr {
@@ -6238,11 +6254,7 @@ fn unique_index_eq_point(
     }) {
         return Some(PhysicalPlan::TableDual { row_count: 0 });
     }
-    let index_columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|c| c.name.o().to_string())
-        .collect();
+    let index_columns: Vec<String> = index_key_column_names(info, index);
     let values: Vec<Datum> = index_columns
         .iter()
         .map(|column| {
@@ -6310,11 +6322,7 @@ fn dnf_unique_point(
     {
         return None;
     }
-    let index_columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|c| c.name.o().to_string())
-        .collect();
+    let index_columns: Vec<String> = index_key_column_names(info, index);
     let tuples = selection.dnf_const_tuples(&index_columns)?;
     let hits: Vec<bool> = tuples
         .iter()
@@ -6415,11 +6423,7 @@ fn in_list_plan(
             if hits.iter().any(|hit| !hit) {
                 continue;
             }
-            let index_columns = index
-                .columns
-                .iter()
-                .map(|c| c.name.o().to_string())
-                .collect();
+            let index_columns = index_key_column_names(info, index);
             return Some(point_or_batch(
                 from,
                 info,
@@ -6471,11 +6475,7 @@ fn in_list_plan(
     if hits.iter().any(|hit| !hit) {
         return None;
     }
-    let index_columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|c| c.name.o().to_string())
-        .collect();
+    let index_columns: Vec<String> = index_key_column_names(info, index);
     Some(PhysicalPlan::BatchPointGet {
         table: from.name.clone(),
         column: names.first().cloned().unwrap_or_default(),
@@ -7811,11 +7811,7 @@ fn index_plan(
     } else {
         String::new()
     };
-    let index_columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|c| c.name.o().to_string())
-        .collect();
+    let index_columns: Vec<String> = index_key_column_names(info, index);
     if select_covers_index_for(select, Some(&from.name), info, index) {
         PhysicalPlan::IndexReader {
             table: from.name.clone(),
@@ -8181,11 +8177,7 @@ fn count_star_unique_join_plan(
     let reader = PhysicalPlan::IndexReader {
         table: from.name.clone(),
         index: index.name.o().to_string(),
-        index_columns: index
-            .columns
-            .iter()
-            .map(|c| c.name.o().to_string())
-            .collect(),
+        index_columns: index_key_column_names(outer, index),
         partitions: Vec::new(),
         partition_access: String::new(),
         row_count: table_row_count(stats, from, current_db),
@@ -11631,11 +11623,7 @@ fn global_index_join_plan(
         .map(|n| format!("tid{n}"));
     let build_rows = table_row_count(stats, o_tbl, current_db);
     let est = if build_rows > 0.0 { build_rows } else { 1.0 };
-    let index_columns: Vec<String> = index
-        .columns
-        .iter()
-        .map(|c| c.name.o().to_string())
-        .collect();
+    let index_columns: Vec<String> = index_key_column_names(p_info, index);
     let build = PhysicalPlan::TableReader {
         table: o_tbl.name.clone(),
         partitions: Vec::new(),
@@ -12632,11 +12620,7 @@ fn access_plan(
                         table: from.resolve_name().to_string(),
                         handle: None,
                         index: Some(index.name.o().to_string()),
-                        index_columns: index
-                            .columns
-                            .iter()
-                            .map(|c| c.name.o().to_string())
-                            .collect(),
+                        index_columns: index_key_column_names(info, index),
                         partition_names: point_partition_names(
                             info,
                             column,

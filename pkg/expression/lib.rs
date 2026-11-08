@@ -9,6 +9,7 @@ pub mod constant;
 pub mod evaluator;
 pub mod funcs;
 pub mod memquota;
+pub mod shard;
 pub mod vectorized;
 
 pub use memquota::{
