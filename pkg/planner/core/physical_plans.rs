@@ -170,6 +170,10 @@ pub enum PhysicalPlan {
         /// Rows kept by the probe-side Selection (EXPLAIN estRows).
         #[serde(default)]
         probe_est: f64,
+        /// Planner-built access range on the index prefix (`None` = full index
+        /// scan). Drives the `IndexRangeScan range:…` Build side in EXPLAIN.
+        #[serde(default)]
+        range_scan: Option<IndexScanRange>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },

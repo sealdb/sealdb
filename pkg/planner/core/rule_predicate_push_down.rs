@@ -133,6 +133,38 @@ fn push_into(
                 })
                 .map(|expr| expr.rewrite_row_in_dnf())
                 .collect();
+            // TiDB ranger: predicates on the index prefix become the access
+            // range of the Build side, so `IndexLookUp` seeks instead of
+            // scanning the whole index. The range keeps its own estRows while
+            // leftover index predicates stay a `Selection(Build)`.
+            let mut selection_info = selection_info;
+            let mut row_count = row_count;
+            let mut pushable = pushable;
+            let mut access_range = None;
+            if pushed.is_none()
+                && selection_info.is_none()
+                && let Some(info) = table_info.as_ref()
+                && let Some(index_info) = info
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(&index))
+                && let Some(access) = super::access_range::index_access_range(
+                    info,
+                    index_info,
+                    &pushable,
+                    row_count,
+                )
+            {
+                pushable.retain(|expr| {
+                    !access
+                        .consumed
+                        .iter()
+                        .any(|c| c.restore_string() == expr.restore_string())
+                });
+                selection_info = None;
+                row_count = access.range.rows;
+                access_range = Some(access.range);
+            }
             // A full index scan can only push predicates whose columns live in
             // the index; the rest filter the probed table rows (Selection(Probe)).
             let on_probe = |expr: &ExprNode| {
@@ -140,11 +172,24 @@ fn push_into(
                     index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
                 })
             };
-            let (index_side, probe_side): (Vec<_>, Vec<_>) = if pushed.is_some() {
-                (pushable, Vec::new())
-            } else {
-                pushable.into_iter().partition(|expr| !on_probe(expr))
-            };
+            let (index_side, probe_side): (Vec<_>, Vec<_>) =
+                if pushed.is_some() && access_range.is_none() {
+                    (pushable, Vec::new())
+                } else {
+                    pushable.into_iter().partition(|expr| !on_probe(expr))
+                };
+            // Build-side residual predicates (columns in the index but not
+            // encoded by the range) stay a cop `Selection(Build)`.
+            if access_range.is_some()
+                && let Some(filter) = ExprNode::compose_cnf(index_side.clone())
+            {
+                if let Some(sel) = crate::core::explain::filter_selectivity(&filter) {
+                    row_count *= sel;
+                }
+                selection_info = Some(crate::core::explain::explain_pushed_filter(
+                    &table, &filter,
+                ));
+            }
             let probe_filter = if probe_side.is_empty() {
                 None
             } else {
@@ -171,9 +216,12 @@ fn push_into(
                     selection_info,
                     probe_selection_info,
                     probe_est,
+                    range_scan: access_range,
                     pushed: and_opt(
                         pushed,
-                        ExprNode::compose_cnf(index_side.into_iter().chain(probe_side).collect()),
+                        ExprNode::compose_cnf(
+                            index_side.into_iter().chain(probe_side).collect(),
+                        ),
                     ),
                 },
                 residual,

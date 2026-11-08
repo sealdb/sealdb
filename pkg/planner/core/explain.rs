@@ -2205,6 +2205,7 @@ fn emit_cop_children(
             selection_info,
             probe_selection_info,
             probe_est,
+            range_scan,
             pushed,
         } => {
             let idx_access = index_access_cols(
@@ -2220,6 +2221,111 @@ fn emit_cop_children(
             let (mut scan_est, _) = index_scan_meta(pushed.as_ref());
             if range_pushed(pushed.as_ref()).is_some() || *row_count < 9_000.0 {
                 scan_est = *row_count;
+            }
+            // Planner-built access range: `Selection(Build)` (residual index
+            // predicates) over `IndexRangeScan` at the range's own card, then
+            // the table probe filters the rest.
+            if let Some(range) = range_scan {
+                let task = "cop[tikv]";
+                let keep = if range.pseudo {
+                    format!("range:{}, keep order:false, stats:pseudo", range.text)
+                } else {
+                    format!("range:{}, keep order:false", range.text)
+                };
+                let rowid_info = if range.pseudo {
+                    "keep order:false, stats:pseudo".to_string()
+                } else {
+                    "keep order:false".to_string()
+                };
+                let probe_row_est = if *probe_est > 0.0 {
+                    *probe_est
+                } else {
+                    *row_count
+                };
+                let build_spine = ancestors_spine(spine, depth);
+                let mut build_depth = depth;
+                if let Some(sel) = selection_info.as_ref() {
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: *row_count,
+                            task,
+                            access: String::new(),
+                            info: sel.clone(),
+                        },
+                        &build_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    build_depth = depth + 1;
+                }
+                let mut child_spine = build_spine.clone();
+                if selection_info.is_some() {
+                    child_spine.push(true);
+                }
+                push_explain_row_spine(
+                    rows,
+                    build_depth,
+                    selection_info.is_some(),
+                    next_id,
+                    CopRow {
+                        name: "IndexRangeScan",
+                        est: range.rows,
+                        task,
+                        access: idx_access.clone(),
+                        info: keep,
+                    },
+                    &child_spine,
+                );
+                if selection_info.is_none()
+                    && let Some(last) = rows.last_mut()
+                {
+                    last.id.push_str("(Build)");
+                }
+                let mut probe_depth = depth;
+                if let Some(probe_sel) = probe_selection_info.as_ref() {
+                    push_explain_row(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: probe_row_est,
+                            task,
+                            access: String::new(),
+                            info: probe_sel.clone(),
+                        },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                    probe_depth = depth + 1;
+                }
+                push_explain_row(
+                    rows,
+                    probe_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRowIDScan",
+                        est: probe_row_est,
+                        task,
+                        access: table_access(table, &[]),
+                        info: rowid_info,
+                    },
+                );
+                if probe_selection_info.is_none() {
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                }
+                return true;
             }
             // IndexJoin/UnionScan IndexLookUp: RANGE + optional Selection sides.
             if let Some(range_info) = range_pushed(pushed.as_ref()) {

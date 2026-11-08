@@ -6569,6 +6569,7 @@ fn index_plan(
             selection_info: None,
             probe_selection_info: None,
             probe_est: 0.0,
+            range_scan: None,
             pushed: None,
         }
     }
@@ -7162,6 +7163,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             selection_info,
             probe_selection_info,
             probe_est,
+            range_scan,
             ..
         } => PhysicalPlan::IndexLookUpReader {
             table,
@@ -7173,6 +7175,7 @@ fn with_pushed(plan: PhysicalPlan, pushed: Option<ExprNode>) -> PhysicalPlan {
             selection_info,
             probe_selection_info,
             probe_est,
+            range_scan,
             pushed,
         },
         other => other,
@@ -8949,6 +8952,7 @@ fn range_push(info: &str) -> ExprNode {
     })
 }
 
+
 /// index_join suite: INLJ join / IN→IndexJoin / analyzed HashJoin with not-null.
 /// `explain_union_scan`: txn dirty-read UnionScan + IndexJoin under Limit.
 fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<PhysicalPlan> {
@@ -8995,6 +8999,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             selection_info: None,
             probe_selection_info: Some(filter_info.to_string()),
             probe_est: 0.0,
+            range_scan: None,
             pushed: Some(range_push(range)),
         }),
     };
@@ -9696,6 +9701,7 @@ fn index_join_suite_plan(
             selection_info: Some(format!("not(isnull({schema}.{probe_alias}.a))")),
             probe_selection_info: None,
             probe_est: 0.0,
+            range_scan: None,
             pushed: Some(range_push(&range)),
         };
         let info = format!(
@@ -9936,6 +9942,7 @@ fn global_index_join_plan(
             selection_info: Some(sel),
             probe_selection_info: None,
             probe_est: 0.0,
+            range_scan: None,
             pushed: Some(range_push(&range_info)),
         }
     };
@@ -10076,6 +10083,7 @@ fn index_join_in_subq_plan(
         selection_info: None,
         probe_selection_info: None,
             probe_est: 0.0,
+            range_scan: None,
         pushed: Some(range_push(&range)),
     };
     let info = format!(
