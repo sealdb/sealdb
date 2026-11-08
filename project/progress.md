@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-08（green 29 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-08（green 31 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` green；18 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` green；17 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -262,6 +262,21 @@
 | 残余谓词表限定 | TiDB 用 `OrigTblName`（`from t t2` 仍打 `t.b`），无别名时用表名而非 `t.` | `rewrite_col_tables` + `explain_selection_info_on(table, …)`，`selection_table` 由子计划取表名 | `gt(...point_get_plan.t4.c, 0)` |
 | 自连接 `SELECT *` | 内连接同名表星投影去重；外连接必须保留可空侧列 | `self_join_star_projection` 仅对 `JoinType::Inner` 生效 | `testjoin RIGHT JOIN` 投影恢复 |
 | 状态 | Mem + TiKV 双端全绿 | — | `-t planner/core/casetest/point_get_plan -s both` → `PASS memory=1 tikv=1` |
+
+### 2.0q R3 `clustered_index`（2026-11-08）
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 聚簇句柄选择 | `BuildTableInfo` 里 PK 是否成为句柄由 `tidb_enable_clustered_index`（ON / INT_ONLY / OFF）决定：ON 时非整型 PK 也是 common handle，INT_ONLY 只保留单整型列 | `build_table_info` 设 `common_handle`；session 变量 `tidb_enable_clustered_index` + 线程局部模式（DDL 前安装） | `tbl_2 varchar/composite PK` 由索引路径变 `clustered index:PRIMARY` |
+| 显式 `CLUSTERED` | `PRIMARY KEY (…) CLUSTERED` 覆盖会话默认 | lower 保留 `CLUSTERED` 标记（与 `NONCLUSTERED` 同一改写通道），`IndexDef.clustered` | 套件第 8/9 行 DDL 不再丢选项 |
+| 索引名在列清单前 | `PRIMARY KEY idx_0 (a, b) NONCLUSTERED` 合法 | `rewrite_primary_key_nonclustered` 先跳过索引名 | 套件建表通过 |
+| 聚簇 PK 前缀区间 | PK 是句柄，前缀比较是 `TableRangeScan`（不是索引扫描）；覆盖二级索引更窄时仍走索引 | `access_plan`：`common_handle` + `clustered_prefix_column` → `TableRangeScan`；同列覆盖索引按列数取最窄 | `col_3 <> …` → `TableRangeScan 2244`；`col_3 >= …` → `index:idx_1` |
+| 区间行数 | 区间基数取自 PRIMARY 索引直方图（`clustered index` 无独立统计时回退实时表行数） | `clustered_range_rows` + `statistics::range_est`（桶内 NDV 估算、`<>` 拆两段） | `798.87` / `4509` / `2244` 与金样一致 |
+| 聚合方式 | 按代价在 HashAgg / StreamAgg 之间选择，读覆盖索引时部分列号按索引列数偏移 | `build_agg_plan` 区分索引扫描与表扫描的 partial 列 id | `HashAgg` / `StreamAgg` 行数与列号对齐 |
+| 右外连接基数 | 重写 semi/outer join 时要保留 `HashJoin` 的 `est_rows`，不能重置为默认 | `rule_semi_join` / `inject_inner_join_null_reject` / `lift_point_get_merge_join` 透传 | `right join` 连接段 `2533.51` 而非 `4509.00` |
+| cop 输出投影 | SELECT 列未覆盖 WHERE 列时，投影下推到 cop（`data:Projection` / `index:Projection`） | `cop_output_projection` 返回带 `COP_PROJ\|` 标记的 Projection；`explain` 在 reader 内输出 cop `Projection` | `IndexReader index:Projection → Projection(cop) → IndexRangeScan` |
+| 聚簇常见句柄点查 | common handle 的全键等值仍是 `Point_Get … clustered index:PRIMARY` | `unique_index_eq_point` / `dnf_unique_point` 只排除整型句柄（`pk_is_handle`） | `where a = 1 and b = 1` → `Point_Get`（分区 `partition:p1`） |
+| suite green | Gate A+B | manifest `green` | `clustered_index` Mem=1 / TiKV=1 PASS；green 30→31 |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
