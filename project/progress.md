@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan` / `access_path_selection` green；19 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` green；18 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
@@ -253,7 +253,15 @@
 | 行 IN 的强转展开 | `(id, d) IN ((0,'t'), …)` 展开为 `or(and(eq(cast(id,double),0), eq(d,"t")), …)` | `coerce_numeric_literals` 的行 IN 按位置强转；`expand_casted_in_lists` 把含 cast 的 IN 展开成 DNF | `t3` 变 `IndexReader` 全索引扫描（原误走 Batch_Point_Get） |
 | 批量点查保持顺序 | `ORDER BY` 点查键时去掉 `Sort`，节点打 `keep order:true, desc:…` | `BatchPointGet` 新增 `keep_order` / `desc` 字段；`point_get_order`（穿透 Selection/Projection）+ `set_batch_point_order` | `Batch_Point_Get … keep order:true, desc:true` |
 | `DROP TABLES` | MySQL/TiDB 接受复数对象关键字 | `parser::rewrite_drop_tables` | 语句不再 1064 |
-| 剩余差异 | Selection 选择率（`eq(cast)` = 0.8、DNF = 15.99/9600）、双点查 `MergeJoin` 形状、`b'00'` 位串字面量、`BIT` 主键点查越界、点查残余谓词的表限定名（`t.` vs `t4.`） | 未实现 | 该套件差分行数 78 → 48；保持 `in_progress` |
+| 二进制/位串字面量 | `b'00'`、`0x39` 作 `types.NewBinaryLiteralDatum`：数值上下文取原始值（`0x39 = 57`），字符串比较用解码字节且按列字符集转换 | `Datum::Bit` 承载两种字面量；`bit_bytes_for` 对数字文本取数值、对其余字节保持大端原值；`Datum::compare` 新增 `Bit`↔`Bytes` 原始字节分支 | `t1.col1 = 0x39` 命中 `BIT(11)` 点查；`select 0x01 + 1` = 2 |
+| 字面量字符集校验 | 二进制字面量与文本列比较时按列字符集转换，非法字节报 1105（即使扫不到行） | `validate_string_cmp_literals_on` 接收表信息：二进制字符集列（`BIT`/`BINARY`/`BLOB`）跳过转换；cop 过滤透传 `TableInfo`；`access_range` 不给非法字节建区间，退回全扫 + Selection 以冒出错误 | `select * from t3 where a > 0x80` 恢复 `Error 1105` |
+| 前缀键区间 | 复合唯一键只约束前缀时，TiDB 仍建 `IndexRangeScan range:[1,1]` | `IndexLookUpReader` 增加 `range_scan`；`rule_predicate_push_down` 用 ranger 抽取前缀区间，残余索引谓词留在 `Selection(Build)` | `t4` 的 `(id, d, c)` IN：`IndexRangeScan range:[1,1] 10.00` |
+| 双点查 `MergeJoin` | 连接键为两侧点查时，TiDB 用 `MergeJoin`（Build 在 SQL 左侧） | `derive_join_key_constants` 把常量镜像到另一侧；`lift_point_get_merge_join` 把 `HashJoin` 改为 `MergeJoin` 并交换 Build/Probe；`hash_join_merge_keys` 生成键标签 | `MergeJoin_5(Build) … Point_Get … Point_Get` |
+| 连接侧访问路径 | WHERE 按表拆分后再选访问路径，连接键的 `=` 优先于行 IN 列表 | `side_access_select` 只留本表谓词；join 中先试键等值点查，IN 列表改为残余 Selection | `Point_Get` + `Selection`（IN 已展开 DNF） |
+| 选择率 | `statistics.pseudoSelectivity`：含 cast 的比较 0.8，`col = const` 1/1000，DNF 用 `1-Π(1-s)` | `filter_selectivity` / `conjunct_selectivity`；`Selection` estRows 与 `Build`/`Probe` 行数随之对齐 | `Selection 8.00`、`15.99`、`9600.00` |
+| 残余谓词表限定 | TiDB 用 `OrigTblName`（`from t t2` 仍打 `t.b`），无别名时用表名而非 `t.` | `rewrite_col_tables` + `explain_selection_info_on(table, …)`，`selection_table` 由子计划取表名 | `gt(...point_get_plan.t4.c, 0)` |
+| 自连接 `SELECT *` | 内连接同名表星投影去重；外连接必须保留可空侧列 | `self_join_star_projection` 仅对 `JoinType::Inner` 生效 | `testjoin RIGHT JOIN` 投影恢复 |
+| 状态 | Mem + TiKV 双端全绿 | — | `-t planner/core/casetest/point_get_plan -s both` → `PASS memory=1 tikv=1` |
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。

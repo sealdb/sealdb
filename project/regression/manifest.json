@@ -1886,7 +1886,7 @@
     {
       "name": "planner/core/casetest/point_get_plan",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/planner/core/casetest/point_get_plan.test",
       "result": "r/planner/core/casetest/point_get_plan.result",
       "has_result": true,
