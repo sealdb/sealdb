@@ -243,8 +243,19 @@
 | `KEY` 分区字符串哈希 | 字符串按 `codec.EncodeValue` 的 8 字节长度前缀参与 MD5（整数仍是 8 字节大端） | `key_hash::key_partition_index` 对 `Datum::Bytes` 加 `u64` 长度前缀 | `tkey` 裁剪 `partition:p3`（原 `p0,p3`） |
 | 剩余差异 | `AS OF TIMESTAMP` 历史快照读（`tidb_snapshot` / stale read） | 未实现：无行级 commit_ts 读视图，TiKV/内存都只读最新 | 1 条语句仍红；suite 保持 `in_progress` |
 
-### 2.1 历史阶段（归档，不作为对齐进度）
+### 2.0p R3 `planner/core/casetest/point_get_plan`（2026-11-08）
 
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 字符串列比数字 | `eq(id, 0)` 在 `varchar` 列上按 `eq(cast(id, double BINARY), 0)` 比较，且**不能**走点查（`canBeConvertedToColumnType`） | 新增 `coerce_comparison_literals`：单表 SELECT 在 plan 前统一做比较/算术变换，session 同样归一语句供执行器重读 | `t1.id = 0` 由返回空 → 返回 `asdf`（与金样一致） |
+| 算术中的字符串 | `a + 1`（`a varchar`）按 `plus(cast(a, double BINARY), 1)` | `coerce_numeric_literals` 补 `+ - * / DIV %` 的 `double` 强转 | `plus(cast(...point_get_plan.t.a, double BINARY), 1)` |
+| 无法走范围时的覆盖索引 | 过滤谓词含 `cast(col)` 时 TiDB 仍读更窄的覆盖索引：`IndexReader` + `index:Selection` + `IndexFullScan` | planbuilder 覆盖索引兜底分支；EXPLAIN 对覆盖 `IndexReader` 无 range 时输出 `index:Selection` / `IndexFullScan` 且用索引行数 | `IndexReader 8000 … index:Selection` / `IndexFullScan 10000` |
+| 行 IN 的强转展开 | `(id, d) IN ((0,'t'), …)` 展开为 `or(and(eq(cast(id,double),0), eq(d,"t")), …)` | `coerce_numeric_literals` 的行 IN 按位置强转；`expand_casted_in_lists` 把含 cast 的 IN 展开成 DNF | `t3` 变 `IndexReader` 全索引扫描（原误走 Batch_Point_Get） |
+| 批量点查保持顺序 | `ORDER BY` 点查键时去掉 `Sort`，节点打 `keep order:true, desc:…` | `BatchPointGet` 新增 `keep_order` / `desc` 字段；`point_get_order`（穿透 Selection/Projection）+ `set_batch_point_order` | `Batch_Point_Get … keep order:true, desc:true` |
+| `DROP TABLES` | MySQL/TiDB 接受复数对象关键字 | `parser::rewrite_drop_tables` | 语句不再 1064 |
+| 剩余差异 | Selection 选择率（`eq(cast)` = 0.8、DNF = 15.99/9600）、双点查 `MergeJoin` 形状、`b'00'` 位串字面量、`BIT` 主键点查越界、点查残余谓词的表限定名（`t.` vs `t4.`） | 未实现 | 该套件差分行数 78 → 48；保持 `in_progress` |
+
+### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
 
 | Phase | 名称 | 归档状态 | 备注 |
