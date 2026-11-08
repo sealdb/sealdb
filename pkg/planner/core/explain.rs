@@ -2338,6 +2338,14 @@ fn emit_cop_children(
                 } else {
                     *row_count
                 };
+                // TiDB labels the index-range output as the build side; the
+                // table-row scan inherits that cardinality and the probe
+                // `Selection` shrinks it further.
+                let build_row_est = if range.filter_rows > 0.0 {
+                    range.filter_rows
+                } else {
+                    *row_count
+                };
                 let mut build_spine = ancestors_spine(spine, depth);
                 // The IndexLookUp may be a non-last DML child (foreign-key nodes
                 // follow it): its cop rows then need the continuation bar.
@@ -2354,7 +2362,7 @@ fn emit_cop_children(
                         next_id,
                         CopRow {
                             name: "Selection",
-                            est: *row_count,
+                            est: build_row_est,
                             task,
                             access: String::new(),
                             info: sel.clone(),
@@ -2418,7 +2426,7 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "TableRowIDScan",
-                        est: probe_row_est,
+                        est: build_row_est,
                         task,
                         access: table_access(table, &[]),
                         info: rowid_info,
@@ -4784,8 +4792,10 @@ fn is_pseudo_plan(plan: &PhysicalPlan) -> bool {
 }
 
 fn is_pseudo_card(rows: f64) -> bool {
-    // Pseudo table scan is 10000; null-reject Selection ≈ 9990.
-    rows >= 9_000.0
+    // A pseudo table scan is exactly 10000 rows; a null-rejecting Selection over
+    // one keeps 9990. Any other cardinality comes from real statistics (an
+    // analyzed 19977-row access path must not be mistaken for pseudo).
+    (rows - 10_000.0).abs() < 1.0 || (rows - 9_990.0).abs() < 1.0
 }
 
 fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {

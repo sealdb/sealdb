@@ -250,8 +250,10 @@ pub fn format_datum(value: &Datum) -> String {
 
 /// Bounds of a single `col <op> const` / `BETWEEN` conjunct.
 pub fn conjunct_column_range(expr: &ExprNode) -> Option<(String, ColumnRange)> {
-    // `col = const` ranger folds to an inclusive point range `[v, v]`.
-    if let Some((column, value)) = expr.eq_key_const() {
+    // `col = const` ranger folds to an inclusive point range `[v, v]`. Only a
+    // bare column gets column selectivity: `cast(col AS …) = const` is an opaque
+    // expression filter (TiDB keeps the 0.8 factor).
+    if let Some((column, value)) = expr.eq_column_const() {
         return Some((
             column.clone(),
             ColumnRange {

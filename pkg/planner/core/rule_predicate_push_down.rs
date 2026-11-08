@@ -136,6 +136,7 @@ fn push_into(
             selection_info,
             probe_selection_info,
             pushed,
+            range_scan,
             ..
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
@@ -170,8 +171,11 @@ fn push_into(
             let mut selection_info = selection_info;
             let mut row_count = row_count;
             let mut pushable = pushable;
-            let mut access_range = None;
-            if pushed.is_none()
+            // A second pushdown must not drop the range the ranger already
+            // picked (`not(isnull(key))` added by the join null rejection).
+            let mut access_range = range_scan;
+            if access_range.is_none()
+                && pushed.is_none()
                 && selection_info.is_none()
                 && let Some(info) = table_info.as_ref()
                 && let Some(index_info) = info
@@ -221,6 +225,14 @@ fn push_into(
                     row_count *= sel;
                 }
                 selection_info = Some(crate::core::explain::explain_pushed_filter(&table, &filter));
+            }
+            // The index scan feeds the build side, so its output cardinality is
+            // what remains after the *index-side* residual only; probe-side
+            // predicates must not shrink it.
+            if let Some(range) = access_range.as_mut()
+                && selection_info.is_some()
+            {
+                range.filter_rows = row_count;
             }
             let probe_filter = if probe_side.is_empty() {
                 None
