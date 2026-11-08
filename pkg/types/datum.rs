@@ -163,6 +163,10 @@ impl Datum {
             (Datum::U64(a), Datum::U64(b)) => a.cmp(b),
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
             (Datum::Bit(a), Datum::Bit(b)) => a.cmp(b),
+            // A binary literal compared with a string keeps its raw bytes
+            // (`0x39 = '9'` is true, `x'4D7953514C' = 'MySQL'` is true).
+            (Datum::Bit(a), Datum::Bytes(b)) => a.cmp(b),
+            (Datum::Bytes(a), Datum::Bit(b)) => a.cmp(b),
             (Datum::Bit(a), other) | (other, Datum::Bit(a))
                 if is_numeric_datum(other) || matches!(other, Datum::Bit(_)) =>
             {
@@ -436,8 +440,14 @@ fn bit_bytes_for(value: &Datum, flen: i32) -> Vec<u8> {
         Datum::I64(v) => *v as u64,
         Datum::F64(v) => *v as u64,
         Datum::Decimal(d) => d.to_f64().unwrap_or(0.0) as u64,
-        // Binary literals (`0x39`, `X'39'`) carry raw big-endian bytes.
-        Datum::Bytes(b) => bit_as_u64(b),
+        // A string constant read into a BIT column is a number (`'48'` → 48);
+        // non-decimal text (and hex bytes that are not digits) keeps its
+        // big-endian binary value.
+        Datum::Bytes(b) => std::str::from_utf8(b)
+            .ok()
+            .map(str::trim)
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or_else(|| bit_as_u64(b)),
         Datum::Bit(b) => bit_as_u64(b),
         Datum::Time(t) => t.to_packed_u64(),
         Datum::Enum(e) => e.number,

@@ -4783,7 +4783,18 @@ fn bit_width(ft: &sealdb_types::field_type::FieldType) -> usize {
 
 fn bit_padded_bytes(value: &Datum, width: usize) -> Option<Vec<u8>> {
     let raw: Vec<u8> = match value {
-        Datum::Bytes(b) => b.clone(),
+        // A string constant compared with a BIT column is read as a number
+        // (`id in ('0')` on BIT(64) is numeric 0, not the byte `0x30`); values
+        // that are not decimal text stay binary literals.
+        Datum::Bytes(b) => match std::str::from_utf8(b)
+            .ok()
+            .map(str::trim)
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            Some(v) => v.to_be_bytes().to_vec(),
+            None => b.clone(),
+        },
+        Datum::Bit(b) => b.clone(),
         Datum::I64(v) => v.to_be_bytes().to_vec(),
         Datum::U64(v) => v.to_be_bytes().to_vec(),
         Datum::F64(v) => (*v as u64).to_be_bytes().to_vec(),

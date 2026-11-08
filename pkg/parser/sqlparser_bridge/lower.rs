@@ -9251,18 +9251,32 @@ fn lower_value(value: &Value) -> Result<Datum> {
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
             Ok(Datum::Bytes(s.as_bytes().to_vec()))
         }
-        Value::HexStringLiteral(hex) => Ok(Datum::Bytes(decode_hex_literal(hex)?)),
-        // MySQL `b'0101'` / `B"0101"`: bit-value literal (binary number).
+        // MySQL `0x39` / `x'39'`: hex literal. TiDB builds it as a binary
+        // literal datum (`types.NewBinaryLiteralDatum`), so numeric contexts
+        // see the raw value (0x39 → 57) while string comparisons use the
+        // decoded bytes ("9").
+        Value::HexStringLiteral(hex) => Ok(Datum::Bit(decode_hex_literal(hex)?)),
+        // MySQL `b'0101'` / `B"0101"`: bit-value literal. TiDB keeps it as a
+        // binary string (`types.NewBinaryLiteralDatum`), so a comparison with
+        // a string column stays a string comparison.
         Value::SingleQuotedByteStringLiteral(bits) | Value::DoubleQuotedByteStringLiteral(bits) => {
-            let digits = if bits.is_empty() { "0" } else { bits.as_str() };
-            u64::from_str_radix(digits, 2)
-                .map(Datum::U64)
-                .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid bit literal b'{bits}'")))
+            Ok(Datum::Bit(bit_literal_bytes(bits)?))
         }
         Value::Boolean(b) => Ok(Datum::I64(i64::from(*b))),
         Value::Null => Ok(Datum::Null),
         other => Err(Error::unsupported(format!("literal {other}"))),
     }
+}
+
+/// Decode `b'0101'` bit-value digits into the minimal big-endian byte string
+/// TiDB stores (at least one byte; `b'00'` is a single `0x00` byte).
+fn bit_literal_bytes(bits: &str) -> Result<Vec<u8>> {
+    let digits = if bits.is_empty() { "0" } else { bits };
+    let value = u64::from_str_radix(digits, 2)
+        .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid bit literal b'{bits}'")))?;
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len() - 1);
+    Ok(bytes[first..].to_vec())
 }
 
 /// Decode `X'ABCD'` / `0xABCD` hex digits into raw bytes (TiDB binary literal).
