@@ -161,6 +161,23 @@ impl Datum {
         match (self, other) {
             (Datum::I64(a), Datum::I64(b)) => a.cmp(b),
             (Datum::U64(a), Datum::U64(b)) => a.cmp(b),
+            // MySQL compares a signed with an unsigned value as `uint64` (a
+            // negative value is always smaller); comparing through `f64` would
+            // collapse values above 2^53.
+            (Datum::I64(a), Datum::U64(b)) => {
+                if *a < 0 {
+                    Ordering::Less
+                } else {
+                    (*a as u64).cmp(b)
+                }
+            }
+            (Datum::U64(a), Datum::I64(b)) => {
+                if *b < 0 {
+                    Ordering::Greater
+                } else {
+                    a.cmp(&(*b as u64))
+                }
+            }
             (Datum::Bytes(a), Datum::Bytes(b)) => a.cmp(b),
             (Datum::Bit(a), Datum::Bit(b)) => a.cmp(b),
             // A binary literal compared with a string keeps its raw bytes
