@@ -677,6 +677,9 @@ fn persist_meta(storage: &dyn Storage, meta: &mut Mutator) -> Result<()> {
 #[derive(Debug)]
 struct MetaFileLock {
     path: PathBuf,
+    /// Serializes persist attempts inside this process, so a pid seen in the
+    /// lock file can only be a *previous* process that had the same pid.
+    _in_process: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for MetaFileLock {
@@ -684,6 +687,8 @@ impl Drop for MetaFileLock {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+
+static META_PERSIST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn meta_file_lock() -> Result<MetaFileLock> {
     meta_file_lock_at(&std::env::temp_dir().join("sealdb-meta.lock"))
@@ -693,12 +698,16 @@ fn meta_file_lock() -> Result<MetaFileLock> {
 /// so a lock left behind by a killed run (SIGKILL skips `Drop`) does not wedge
 /// every later server on this machine forever.
 fn meta_file_lock_at(path: &Path) -> Result<MetaFileLock> {
+    let in_process = META_PERSIST_MUTEX
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     for attempt in 0..200 {
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
                 let _ = write!(file, "{}", std::process::id());
                 return Ok(MetaFileLock {
                     path: path.to_path_buf(),
+                    _in_process: in_process,
                 });
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -729,14 +738,22 @@ fn meta_lock_is_stale(path: &Path) -> bool {
         return false;
     };
     match raw.trim().parse::<u32>() {
-        Ok(pid) if pid == std::process::id() => false,
-        Ok(pid) => !process_is_alive(pid),
-        Err(_) => std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= Duration::from_secs(120)),
+        // We hold `META_PERSIST_MUTEX`, so this file predates our process: pids
+        // are unique while alive, and this one was recycled after a kill.
+        Ok(pid) if pid == std::process::id() => true,
+        Ok(pid) => !process_is_alive(pid) || meta_lock_expired(path),
+        Err(_) => meta_lock_expired(path),
     }
+}
+
+/// A persist never legitimately holds the lock for minutes; past that the
+/// owning pid has been recycled by an unrelated long-lived process.
+fn meta_lock_expired(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= Duration::from_secs(120))
 }
 
 #[cfg(unix)]
@@ -792,7 +809,21 @@ mod meta_lock_tests {
         // pid 4294967295 never exists; mimics a run killed while holding the lock.
         std::fs::write(&path, "4294967295").expect("seed stale lock");
         let lock = meta_file_lock_at(&path).expect("steal abandoned lock");
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), std::process::id().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(lock);
+        assert!(!path.exists(), "lock file removed on drop");
+    }
+
+    #[test]
+    fn recycled_own_pid_is_taken_over() {
+        let path = scratch_lock("recycled");
+        // A killed run left the lock behind and the OS later reused its pid for
+        // this process; the in-process mutex proves we are not the holder.
+        std::fs::write(&path, std::process::id().to_string()).expect("seed recycled lock");
+        let lock = meta_file_lock_at(&path).expect("steal recycled lock");
         drop(lock);
         assert!(!path.exists(), "lock file removed on drop");
     }
@@ -800,11 +831,19 @@ mod meta_lock_tests {
     #[test]
     fn live_owner_is_respected() {
         let path = scratch_lock("live");
-        // Our own pid is alive, so the lock must not be stolen (it would be a
-        // re-entrant persist deadlock, which has to surface instead).
-        std::fs::write(&path, std::process::id().to_string()).expect("seed live lock");
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn lock owner");
+        std::fs::write(&path, child.id().to_string()).expect("seed live lock");
         let err = meta_file_lock_at(&path).expect_err("must not steal a live lock");
-        assert!(err.message.contains("timed out locking meta persist"), "{}", err.message);
+        assert!(
+            err.message.contains("timed out locking meta persist"),
+            "{}",
+            err.message
+        );
+        let _ = child.kill();
+        let _ = child.wait();
         std::fs::remove_file(&path).ok();
     }
 }
