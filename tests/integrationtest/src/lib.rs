@@ -1029,7 +1029,7 @@ fn run_backend(
     opts: &RunOptions,
     record: bool,
 ) -> Result<(usize, usize, bool)> {
-    let storage = match open_storage(backend, opts.pd.as_deref()) {
+    let shared = match open_storage(backend, opts.pd.as_deref()) {
         Ok(storage) => storage,
         Err(err) if backend == StoreBackend::Tikv && !opts.require_tikv => {
             eprintln!("skip tikv integrationtest: {err}");
@@ -1048,6 +1048,14 @@ fn run_backend(
             skipped += 1;
             continue;
         }
+        // MemStorage snapshots clone the whole map, so keeping every earlier
+        // suite's rows alive makes later suites quadratic. TiDB runs each test
+        // file against a fresh instance, so the memory backend does the same;
+        // TiKV keeps one persistent cluster and drops each suite's database.
+        let storage = match backend {
+            StoreBackend::Memory => open_storage(backend, opts.pd.as_deref())?,
+            StoreBackend::Tikv => Arc::clone(&shared),
+        };
         if record {
             record_suite(suite, Arc::clone(&storage))?;
         } else {
