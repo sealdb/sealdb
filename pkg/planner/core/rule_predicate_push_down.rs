@@ -349,24 +349,53 @@ fn push_into(
                         .map(|c| c.name.o().to_string())
                 })
                 .flatten();
-            let mut residual: Vec<ExprNode> = conjuncts
-                .into_iter()
-                .filter(|expr| {
-                    // The unique-index equality is already the point get lookup.
-                    if index.is_some()
-                        && let Some((col, _)) = expr.eq_column_const()
-                        && index_columns
+            let mut residual: Vec<ExprNode> = {
+                // Key values the point get already pins, used to fold the
+                // remaining filters (`b + 1 = 3` with `b = 2` disappears).
+                let pinned: Vec<(String, Datum)> = conjuncts
+                    .iter()
+                    .filter_map(|expr| expr.eq_column_const())
+                    .filter(|(col, _)| {
+                        index_columns
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&col))
-                    {
-                        return false;
-                    }
-                    match (&handle_column, handle) {
-                        (Some(col), Some(value)) => !is_handle_eq_on(expr, value, col),
-                        _ => handle.is_none_or(|value| !is_handle_eq(expr, value)),
-                    }
-                })
-                .collect();
+                            .any(|c| c.eq_ignore_ascii_case(col))
+                            || handle_column
+                                .as_deref()
+                                .is_some_and(|c| c.eq_ignore_ascii_case(col))
+                    })
+                    .collect();
+                conjuncts
+                    .into_iter()
+                    .filter(|expr| {
+                        // The unique-index equality is already the point get lookup.
+                        if index.is_some()
+                            && let Some((col, _)) = expr.eq_column_const()
+                            && index_columns
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&col))
+                        {
+                            return false;
+                        }
+                        match (&handle_column, handle) {
+                            (Some(col), Some(value)) => {
+                                if is_handle_eq_on(expr, value, col) {
+                                    return false;
+                                }
+                            }
+                            _ => {
+                                if handle.is_some_and(|value| is_handle_eq(expr, value)) {
+                                    return false;
+                                }
+                            }
+                        }
+                        // A filter that holds for every pinned value is a no-op.
+                        !matches!(
+                            fold_with_pinned(expr, &table, &pinned),
+                            Some(Datum::I64(1)) | Some(Datum::U64(1))
+                        )
+                    })
+                    .collect()
+            };
             // TiDB renders point-get table filters in sorted expression order.
             residual.sort_by_key(|expr| expr.restore_string());
             wrap_residual(
@@ -638,8 +667,61 @@ fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
     }
 }
 
-fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {
-    match (left, right) {
+/// Evaluate a residual filter with the point-get key values substituted:
+/// `b + 1 = 3` under `b = 2` is constantly true, so TiDB drops it.
+/// `None` when the expression cannot be folded (unknown column shape, error).
+fn fold_with_pinned(
+    expr: &ExprNode,
+    table: &str,
+    pinned: &[(String, Datum)],
+) -> Option<sealdb_types::Datum> {
+    let substituted = substitute_pinned_columns(expr, table, pinned)?;
+    sealdb_expression::eval_expr(&substituted).ok()
+}
+
+fn substitute_pinned_columns(
+    expr: &ExprNode,
+    table: &str,
+    pinned: &[(String, Datum)],
+) -> Option<ExprNode> {
+    use sealdb_parser::ast::expressions::{
+        BinaryOpExpr, ExprNode, FuncCastExpr, UnaryOpExpr, ValueExpr,
+    };
+    match expr {
+        ExprNode::Column(c) => {
+            let same_table = c.table.as_deref().is_none_or(|t| {
+                t.is_empty() || t.eq_ignore_ascii_case(table)
+            });
+            if !same_table {
+                return None;
+            }
+            pinned
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&c.name))
+                .map(|(_, value)| ExprNode::Value(ValueExpr {
+                    datum: value.clone(),
+                }))
+        }
+        ExprNode::Value(_) => Some(expr.clone()),
+        ExprNode::Binary(bin) => Some(ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(substitute_pinned_columns(&bin.left, table, pinned)?),
+            right: Box::new(substitute_pinned_columns(&bin.right, table, pinned)?),
+            single_cnf_item: bin.single_cnf_item,
+        })),
+        ExprNode::Unary(unary) => Some(ExprNode::Unary(UnaryOpExpr {
+            op: unary.op,
+            expr: Box::new(substitute_pinned_columns(&unary.expr, table, pinned)?),
+        })),
+        ExprNode::Cast(cast) => Some(ExprNode::Cast(FuncCastExpr {
+            expr: Box::new(substitute_pinned_columns(&cast.expr, table, pinned)?),
+            target: cast.target.clone(),
+        })),
+        _ => None,
+    }
+}
+
+fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {    match (left, right) {
         (None, other) | (other, None) => other,
         (Some(left), Some(right)) => ExprNode::compose_cnf(vec![left, right]),
     }

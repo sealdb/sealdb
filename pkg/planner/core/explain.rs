@@ -2823,7 +2823,27 @@ fn not_isnull_count(filter: &sealdb_parser::ast::ExprNode) -> usize {
         .count()
 }
 
+/// Table whose columns an unqualified Selection column belongs to.
+fn selection_table(plan: &PhysicalPlan) -> Option<&str> {
+    match plan {
+        PhysicalPlan::PointGet { table, .. }
+        | PhysicalPlan::BatchPointGet { table, .. }
+        | PhysicalPlan::TableReader { table, .. }
+        | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexLookUpReader { table, .. } => Some(table),
+        PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::UnionScan { child, .. } => selection_table(child),
+        _ => None,
+    }
+}
+
 fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
+    explain_selection_info_on("t", filter)
+}
+
+fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
@@ -2842,7 +2862,7 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
                 if let ExprNode::IsNull(i) = u.expr.as_ref() {
                     let col = match i.expr.as_ref() {
                         ExprNode::Column(c) => {
-                            let table = c.table.as_deref().unwrap_or("t");
+                            let table = c.table.as_deref().unwrap_or(table);
                             let schema = sealdb_expression::current_db_name();
                             if schema.is_empty() {
                                 format!("select.{table}.{}", c.name)
@@ -2859,14 +2879,14 @@ fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
                     // TiDB renders `NOT (a <=> b)` as `not(nulleq(a, b))`.
                     format!(
                         "not(nulleq({}, {}))",
-                        explain_qualified_col(&b.left),
-                        explain_qualified_col(&b.right)
+                        explain_scalar_expr(&b.left, table),
+                        explain_scalar_expr(&b.right, table)
                     )
                 } else {
-                    explain_scalar_expr(&item, "t")
+                    explain_scalar_expr(&item, table)
                 }
             }
-            other => explain_scalar_expr(other, "t"),
+            other => explain_scalar_expr(other, table),
         })
         .collect();
     parts.join(", ")
@@ -3650,10 +3670,13 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                     .join(", ")
             ),
         ),
-        PhysicalPlan::Selection { filter, .. } => (
+        PhysicalPlan::Selection { child, filter } => (
             "Selection".to_string(),
             String::new(),
-            explain_selection_info(filter),
+            match selection_table(child) {
+                Some(table) => explain_selection_info_on(table, filter),
+                None => explain_selection_info(filter),
+            },
         ),
         PhysicalPlan::Sort { by_info, .. } => {
             ("Sort".to_string(), String::new(), by_info.clone())
@@ -4018,6 +4041,78 @@ fn pseudo_range_est(
 /// Extra rows TiDB adds for `not(isnull(..))` saturation on analyzed stats.
 
 
+/// TiDB pseudo selectivity for one Selection conjunct
+/// (`statistics.pseudoSelectivity`): a comparison whose column side needs a
+/// cast cannot use the index, so it keeps `selectionFactor` (0.8), while a
+/// plain `col = const` over pseudo stats contributes `1/1000`.
+fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let ExprNode::Binary(bin) = expr else {
+        return None;
+    };
+    if !matches!(
+        bin.op,
+        Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+    ) {
+        return None;
+    }
+    if expr_has_cast_operand(&bin.left) || expr_has_cast_operand(&bin.right) {
+        return Some(0.8);
+    }
+    let column_const = |col: &ExprNode, value: &ExprNode| {
+        matches!(col, ExprNode::Column(_)) && value.const_datum().is_some()
+    };
+    if bin.op == Op::Eq
+        && (column_const(&bin.left, &bin.right) || column_const(&bin.right, &bin.left))
+    {
+        return Some(0.001);
+    }
+    None
+}
+
+/// `cast(col, …)`, or arithmetic over such a cast (`plus(cast(a, double), 1)`).
+fn expr_has_cast_operand(expr: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    match expr {
+        ExprNode::Cast(_) => true,
+        ExprNode::Binary(bin)
+            if matches!(
+                bin.op,
+                Op::Plus | Op::Minus | Op::Mul | Op::Div | Op::IntDiv | Op::Mod
+            ) =>
+        {
+            expr_has_cast_operand(&bin.left) || expr_has_cast_operand(&bin.right)
+        }
+        _ => false,
+    }
+}
+
+/// Selection selectivity: `AND` multiplies, `OR`/DNF uses `1 - Π(1 - s)`.
+/// `None` when a conjunct has no TiDB pseudo factor, so callers keep their
+/// existing estimates.
+pub(crate) fn filter_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Option<f64> {
+    let arms = filter.split_dnf();
+    if arms.len() > 1 {
+        let mut product = 1.0;
+        for arm in &arms {
+            let sel = conjunct_list_selectivity(&arm.split_cnf())?;
+            product *= 1.0 - sel;
+        }
+        return Some(1.0 - product);
+    }
+    conjunct_list_selectivity(&filter.split_cnf())
+}
+
+fn conjunct_list_selectivity(conjuncts: &[sealdb_parser::ast::ExprNode]) -> Option<f64> {
+    let mut sel = 1.0;
+    for conjunct in conjuncts {
+        sel *= conjunct_selectivity(conjunct)?;
+    }
+    Some(sel)
+}
+
 pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
         PhysicalPlan::TableDual { row_count } => *row_count as f64,
@@ -4044,6 +4139,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 est_rows(child) * 0.8
             } else if n > 0 && n == filter.split_cnf().len() {
                 est_rows(child) * 0.999_f64.powi(n as i32)
+            } else if let Some(sel) = filter_selectivity(filter) {
+                // A cast comparison keeps TiDB's default factor; OR arms
+                // combine as `1 - Π(1 - s)` (DNF selectivity).
+                (est_rows(child) * sel).max(0.0)
             } else if is_equality_filter(filter) {
                 let base = est_rows(child);
                 if base >= 10_000.0 {
@@ -4172,6 +4271,16 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             ..
         } if *probe_est > 0.0 => *probe_est,
         PhysicalPlan::IndexLookUpReader { row_count, pushed: None, .. } => *row_count,
+        // A covering reader over a full index scan sizes the cop Selection from
+        // the filter's pseudo selectivity (`10000 * 0.8` / DNF combination).
+        PhysicalPlan::IndexReader {
+            pushed: Some(filter),
+            row_count,
+            range_scan: None,
+            ..
+        } if filter_selectivity(filter).is_some() => {
+            *row_count * filter_selectivity(filter).unwrap_or(0.8)
+        }
         PhysicalPlan::IndexLookUpReader {
             pushed: Some(_), ..
         }
@@ -4180,8 +4289,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         }
         | PhysicalPlan::IndexMerge {
             pushed: Some(_), ..
-        } => 8_000.0,
-        PhysicalPlan::Limit { child, count, .. } => {
+        } => 8_000.0,        PhysicalPlan::Limit { child, count, .. } => {
             if *count > 0 {
                 est_rows(child).min(*count as f64)
             } else {
@@ -4220,6 +4328,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             ) {
                 l.max(r)
             } else if is_pseudo_card(l) && is_pseudo_card(r) {
+                l.min(r) * 1.25
+            } else if l < 1.0 || r < 1.0 {
+                // A side estimated below one row (residual filter over a point
+                // get) bounds the merge output the same way.
                 l.min(r) * 1.25
             } else {
                 l.max(r)

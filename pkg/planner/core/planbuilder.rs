@@ -235,6 +235,8 @@ impl PlanBuilder {
                     plan = predicate_push_down(plan, filter, is, current_db);
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
+                plan = lift_point_get_merge_join(plan, select, is, current_db);
+                plan = self_join_star_projection(plan, select, is, current_db);
                 plan = apply_select_lock(plan, select);
                 let mut stream_keep_order = false;
                 if needs_hash_agg(select) {
@@ -1048,8 +1050,31 @@ impl PlanBuilder {
             return Ok(plan);
         }
         let first = &select.joins[0];
-        let mut left = self.join_side(select, &first.left, is, current_db, stats, prune_mode)?;
-        let mut right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
+        // Inner-join key constant propagation: both sides must see `key = const`
+        // before access path selection so each can use the point get.
+        let (left_derived, right_derived) = if matches!(map_join_type(first.tp), JoinType::Inner) {
+            derive_join_key_constants(select, &first.left, &first.right, &first.on)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let left_select = with_derived_selection(select, left_derived);
+        let right_select = with_derived_selection(select, right_derived);
+        let mut left = self.join_side(
+            left_select.as_ref().unwrap_or(select),
+            &first.left,
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )?;
+        let mut right = self.join_side(
+            right_select.as_ref().unwrap_or(select),
+            &first.right,
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )?;
         let first_tp = map_join_type(first.tp);
         // not(isnull) goes into the null-supplying side: the right table of a
         // LEFT JOIN (build side) and the left table of a RIGHT JOIN.
@@ -10405,6 +10430,355 @@ fn classify_in_semi(
     ))
 }
 
+/// WHERE conjuncts that may drive `from`'s access path. In a join the columns
+/// carry their table alias, so another side's predicates are dropped (TiDB
+/// splits WHERE per side before access path selection). Single-table plans keep
+/// the selection untouched.
+fn side_access_select(select: &SelectStmt, from: &TableName) -> Option<SelectStmt> {
+    let selection = select.selection.as_ref()?;
+    if select.join_tables().len() < 2 {
+        return None;
+    }
+    let conjuncts = selection.split_cnf();
+    let kept: Vec<_> = conjuncts
+        .iter()
+        .filter(|expr| {
+            expr.referenced_columns().iter().all(|(table, _)| {
+                table.as_deref().is_none_or(|table| {
+                    table.is_empty()
+                        || table.eq_ignore_ascii_case(&from.name)
+                        || table.eq_ignore_ascii_case(from.resolve_name())
+                })
+            })
+        })
+        .cloned()
+        .collect();
+    if kept.len() == conjuncts.len() {
+        return None;
+    }
+    let mut side = select.clone();
+    side.selection = if kept.is_empty() {
+        None
+    } else {
+        ExprNode::compose_cnf(kept)
+    };
+    Some(side)
+}
+
+/// TiDB constant propagation over an inner-join equality key: `t1.a = '4'` plus
+/// `t1.a = t2.a` implies `t2.a = '4'`, which lets both sides use a point get on
+/// the key column. Returns the predicates to add to each side.
+fn derive_join_key_constants(
+    select: &SelectStmt,
+    left: &TableName,
+    right: &TableName,
+    on: &ExprNode,
+) -> (Vec<ExprNode>, Vec<ExprNode>) {
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode};
+    use sealdb_parser::opcode::Op;
+
+    let owned_by = |col: &ColumnNameExpr, table: &TableName| {
+        col.table.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case(&table.name) || t.eq_ignore_ascii_case(table.resolve_name())
+        })
+    };
+    let ExprNode::Binary(bin) = on else {
+        return (Vec::new(), Vec::new());
+    };
+    if bin.op != Op::Eq {
+        return (Vec::new(), Vec::new());
+    }
+    let (ExprNode::Column(lhs), ExprNode::Column(rhs)) = (bin.left.as_ref(), bin.right.as_ref())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let pinned = |column: &ColumnNameExpr, table: &TableName| -> Option<sealdb_types::Datum> {
+        select.selection.as_ref()?.split_cnf().into_iter().find_map(|expr| {
+            let ExprNode::Binary(eq) = &expr else {
+                return None;
+            };
+            if eq.op != Op::Eq {
+                return None;
+            }
+            match (eq.left.as_ref(), eq.right.as_ref()) {
+                (ExprNode::Column(col), value) | (value, ExprNode::Column(col))
+                    if owned_by(col, table)
+                        && col.name.eq_ignore_ascii_case(&column.name) =>
+                {
+                    value.const_datum()
+                }
+                _ => None,
+            }
+        })
+    };
+    // Mirror the constant onto the column of the other side.
+    let mirror = |from: &ColumnNameExpr, to: &ColumnNameExpr, to_table: &TableName| {
+        pinned(from, if owned_by(from, left) { left } else { right }).map(|value| {
+            ExprNode::Binary(BinaryOpExpr {
+                op: Op::Eq,
+                left: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(to_table.name.clone()),
+                    name: to.name.clone(),
+                })),
+                right: Box::new(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr { datum: value },
+                )),
+                single_cnf_item: false,
+            })
+        })
+    };
+    let mut left_preds = Vec::new();
+    let mut right_preds = Vec::new();
+    if owned_by(lhs, left) && owned_by(rhs, right) {
+        if let Some(pred) = mirror(lhs, rhs, right) {
+            right_preds.push(pred);
+        }
+        if let Some(pred) = mirror(rhs, lhs, left) {
+            left_preds.push(pred);
+        }
+    } else if owned_by(lhs, right) && owned_by(rhs, left) {
+        if let Some(pred) = mirror(lhs, rhs, left) {
+            left_preds.push(pred);
+        }
+        if let Some(pred) = mirror(rhs, lhs, right) {
+            right_preds.push(pred);
+        }
+    }
+    (left_preds, right_preds)
+}
+
+/// `SELECT *` over a self-join (two aliases of one table) prints the same
+/// `table.column` name twice, so TiDB adds a dedup Projection above the join.
+fn self_join_star_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let (left_table, right_table) = match &plan {
+        // Only an inner self-join needs the dedup Projection: outer joins keep
+        // the nullable side's rows and column identity, so it must not run.
+        PhysicalPlan::MergeJoin {
+            tp: JoinType::Inner,
+            left_table,
+            right_table,
+            ..
+        }
+        | PhysicalPlan::HashJoin {
+            tp: JoinType::Inner,
+            left_table,
+            right_table,
+            ..
+        } => (left_table.clone(), right_table.clone()),
+        _ => return plan,
+    };
+    if !is_star_select(select) {
+        return plan;
+    }
+    let orig = |alias: &str| {
+        select
+            .join_tables()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(alias))
+            .map(|t| t.resolve_name().to_string())
+            .unwrap_or_else(|| alias.to_string())
+    };
+    if !orig(&left_table).eq_ignore_ascii_case(&orig(&right_table)) {
+        return plan;
+    }
+    wrap_star_join_projection(plan, select, is, current_db)
+}
+
+/// Point-get / batch-point-get side that already scans in key order.
+fn is_point_get_side(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::PointGet { .. } | PhysicalPlan::BatchPointGet { .. } => true,
+        // A residual filter keeps the underlying point get ordered.
+        PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Limit { child, .. } => is_point_get_side(child),
+        _ => false,
+    }
+}
+
+/// `Point_Get ⋈ Point_Get` on the join key: both sides are single ordered
+/// streams, so TiDB keeps them and merges instead of building a hash table.
+fn lift_point_get_merge_join(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let lift = |child: Box<PhysicalPlan>| {
+        Box::new(lift_point_get_merge_join(*child, select, is, current_db))
+    };
+    match plan {
+        PhysicalPlan::HashJoin {
+            tp: JoinType::Inner,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } if is_point_get_side(&left) && is_point_get_side(&right) => {
+            let Some((left_key, right_key)) =
+                hash_join_merge_keys(select, current_db, &left_table, &right_table, &on)
+            else {
+                return PhysicalPlan::HashJoin {
+                    tp: JoinType::Inner,
+                    left: lift(left),
+                    right: lift(right),
+                    left_table,
+                    right_table,
+                    on,
+                };
+            };
+            // MergeJoin lists Build (right) before Probe (left); TiDB builds the
+            // SQL-left side, which the hash join keeps on the probe side.
+            PhysicalPlan::MergeJoin {
+                left: lift(right),
+                right: lift(left),
+                left_table: right_table,
+                right_table: left_table,
+                left_key: right_key,
+                right_key: left_key,
+                tp: JoinType::Inner,
+                info: None,
+                on,
+            }
+        }
+        PhysicalPlan::HashJoin {
+            tp,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } => PhysicalPlan::HashJoin {
+            tp,
+            left: lift(left),
+            right: lift(right),
+            left_table,
+            right_table,
+            on,
+        },
+        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+            exprs,
+            child: lift(child),
+        },
+        PhysicalPlan::Selection { child, filter } => {
+            // A row IN list that stayed as a residual filter over a point get
+            // was already expanded to DNF for access path selection, so TiDB
+            // keeps (and prints) the DNF form.
+            let mut filter = if is_point_get_side(&child) {
+                let expanded: Vec<_> = filter
+                    .split_cnf()
+                    .into_iter()
+                    .map(|c| c.rewrite_row_in_dnf())
+                    .collect();
+                ExprNode::compose_cnf(expanded).unwrap_or(filter)
+            } else {
+                filter
+            };
+            // EXPLAIN renders TiDB column names, i.e. OrigTblName even when the
+            // FROM item carries an alias (`from t t2` → `t.b`).
+            if in_explain_build() {
+                filter = rewrite_col_tables(&filter, &select.join_tables());
+            }
+            PhysicalPlan::Selection {
+                child: lift(child),
+                filter,
+            }
+        }
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
+            child: lift(child),
+            offset,
+            count,
+        },
+        other => other,
+    }
+}
+
+/// EXPLAIN key labels for a HashJoin-turned-MergeJoin: `db.orig_table.column`
+/// on each side of the first cross-side equality in `on`.
+fn hash_join_merge_keys(
+    select: &SelectStmt,
+    current_db: &str,
+    left_table: &str,
+    right_table: &str,
+    on: &ExprNode,
+) -> Option<(String, String)> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+
+    let orig = |alias: &str| {
+        select
+            .join_tables()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(alias))
+            .map(|t| t.resolve_name().to_string())
+            .unwrap_or_else(|| alias.to_string())
+    };
+    let schema = if current_db.is_empty() {
+        "select"
+    } else {
+        current_db
+    };
+    let owned = |col: &sealdb_parser::ast::expressions::ColumnNameExpr, alias: &str| {
+        col.table.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case(alias) || t.eq_ignore_ascii_case(&orig(alias))
+        })
+    };
+    for conjunct in on.split_cnf() {
+        let ExprNode::Binary(bin) = &conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(lhs), ExprNode::Column(rhs)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        // Aliases of one physical table print the same label, so try both
+        // orientations.
+        let (left_col, right_col) = if owned(lhs, left_table) && owned(rhs, right_table) {
+            (lhs, rhs)
+        } else if owned(lhs, right_table) && owned(rhs, left_table) {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        return Some((
+            format!("{schema}.{}.{}", orig(left_table), left_col.name),
+            format!("{schema}.{}.{}", orig(right_table), right_col.name),
+        ));
+    }
+    None
+}
+
+/// Clone `select` with `extra` predicates AND-ed into its selection.
+fn with_derived_selection(select: &SelectStmt, extra: Vec<ExprNode>) -> Option<SelectStmt> {
+    if extra.is_empty() {
+        return None;
+    }
+    let mut derived = select.clone();
+    derived.selection = match select.selection.clone() {
+        Some(selection) => ExprNode::compose_cnf(vec![
+            selection,
+            ExprNode::compose_cnf(extra)?,
+        ]),
+        None => ExprNode::compose_cnf(extra),
+    };
+    Some(derived)
+}
+
 fn access_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -10418,6 +10792,12 @@ fn access_plan(
     // first-column equality or range on a secondary INDEX/KEY becomes
     // IndexReader when covering, else IndexLookUpReader.
     // Completeness wave: composite prefix, costed index path enumeration.
+    //
+    // A join side plans with its own predicates only: TiDB splits WHERE per
+    // table before access path selection, so `t2`'s row IN list must not pick
+    // `t1`'s access path.
+    let side_select = side_access_select(select, from);
+    let select = side_select.as_ref().unwrap_or(select);
     if is_information_schema(from, current_db) {
         return PhysicalPlan::InfoSchema {
             table: from.name.clone(),
@@ -10468,7 +10848,7 @@ fn access_plan(
         {
             let _ = point_get_cost();
             return PhysicalPlan::PointGet {
-                table: from.name.clone(),
+                table: from.resolve_name().to_string(),
                 handle: Some(handle),
                 index: None,
                 index_columns: Vec::new(),
@@ -10486,11 +10866,16 @@ fn access_plan(
         if let Some(plan) = unique_index_eq_point(from, info, &eqs, None) {
             return plan;
         }
-        if let Some(plan) = dnf_unique_point(select, from, info, None) {
-            return plan;
-        }
-        if let Some(plan) = in_list_plan(select, from, info, None) {
-            return plan;
+        // In a join, the key equality from the join wins over a row IN list:
+        // TiDB keeps the IN as a residual Selection under the point get.
+        let joined = select.join_tables().len() > 1;
+        if !joined {
+            if let Some(plan) = dnf_unique_point(select, from, info, None) {
+                return plan;
+            }
+            if let Some(plan) = in_list_plan(select, from, info, None) {
+                return plan;
+            }
         }
         // Clustered integer PK range → TiDB scans the table as a handle range
         // (`TableRangeScan`, no secondary index path).
@@ -10530,7 +10915,7 @@ fn access_plan(
                         return PhysicalPlan::TableDual { row_count: 0 };
                     }
                     return PhysicalPlan::PointGet {
-                        table: from.name.clone(),
+                        table: from.resolve_name().to_string(),
                         handle: None,
                         index: Some(index.name.o().to_string()),
                         index_columns: index
@@ -10565,6 +10950,14 @@ fn access_plan(
                     }
                 }
                 return index_plan(select, from, info, index, prune_mode);
+            }
+        }
+        if joined {
+            if let Some(plan) = dnf_unique_point(select, from, info, None) {
+                return plan;
+            }
+            if let Some(plan) = in_list_plan(select, from, info, None) {
+                return plan;
             }
         }
         for range in select
