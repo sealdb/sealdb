@@ -1681,8 +1681,10 @@ fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool 
         return true;
     }
     if let ExprNode::Func(func) = expr {
-        let upper = func.name.to_ascii_uppercase();
-        if matches!(upper.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+        // TiDB `aggregation.IsAggFunc`: every registered aggregate takes its
+        // arguments out of the ONLY_FULL_GROUP_BY comparison, including
+        // multi-argument ones (`group_concat(a, b)`).
+        if is_aggregate_func_name(&func.name) {
             return true;
         }
     }
@@ -1690,6 +1692,33 @@ fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool 
     group_by
         .iter()
         .any(|g| g.restore_string().eq_ignore_ascii_case(&restored))
+}
+
+/// Aggregate names TiDB registers in `aggregation.GetAggFunc` — these are the
+/// ones the ONLY_FULL_GROUP_BY checker must accept inside a grouped SELECT.
+fn is_aggregate_func_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "GROUP_CONCAT"
+            | "BIT_AND"
+            | "BIT_OR"
+            | "BIT_XOR"
+            | "STD"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "JSON_ARRAYAGG"
+            | "JSON_OBJECTAGG"
+            | "APPROX_COUNT_DISTINCT"
+    )
 }
 
 /// Record DML delta and run ANALYZE when modify/count exceeds the ratio
