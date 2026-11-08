@@ -10,7 +10,7 @@ use super::rule_inject_extra_projection::{
 use super::rule_join_reorder::reorder_hash_join;
 use super::rule_join_reorder_dp::{JoinEqEdge, dp_join_steps, edge_for_extension, eq_join_edge};
 use super::rule_partition_processor::{PartitionPruneMode, resolve_partitions};
-use super::rule_predicate_push_down::{eq_column_consts, predicate_push_down};
+use super::rule_predicate_push_down::{eq_key_consts, predicate_push_down};
 use super::rule_semi_join::{rewrite_semi_join_agg, rewrite_semi_join_ctx};
 use sealdb_errno::{ERR_BAD_FIELD, Error, Result};
 use sealdb_infoschema::InfoSchema;
@@ -107,6 +107,29 @@ impl PlanBuilder {
                     Some(coerced) => {
                         coerced_select = coerced;
                         &coerced_select
+                    }
+                    None => select,
+                };
+                // TiDB `expression.PropagateConstant` at the DataSource: a
+                // `col = const` conjunct substitutes the column in the other
+                // conjuncts (`a = b AND b = 100` → `a = 100 AND b = 100`),
+                // which is what lets the equality reach the shard rewrite.
+                let propagated_select;
+                let select = match propagate_constant_select(select) {
+                    Some(propagated) => {
+                        propagated_select = propagated;
+                        &propagated_select
+                    }
+                    None => select,
+                };
+                // TiDB's shard rewrite: `a = 100` also constrains the
+                // `tidb_shard(a)` key part of `uk_expr((tidb_shard(a)), a)`,
+                // which is what turns the equality into an index point get.
+                let shard_select;
+                let select = match shard_rewrite_select(select, is, current_db) {
+                    Some(rewritten) => {
+                        shard_select = rewritten;
+                        &shard_select
                     }
                     None => select,
                 };
@@ -248,6 +271,10 @@ impl PlanBuilder {
                         child: Box::new(PhysicalPlan::TableDual { row_count: 1 }),
                     }
                 };
+                // A point get on an expression index carries the hidden
+                // generated column in its schema; TiDB projects the select
+                // list above it so clients never see that column.
+                plan = expr_index_point_projection(plan, select, is, current_db);
                 if let Some(filter) = &select.selection {
                     plan = predicate_push_down(plan, filter, is, current_db);
                     plan = star_projection_over_filter(plan, select, is, current_db);
@@ -5005,12 +5032,34 @@ fn wrap_output_projection(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
-    if is_star_select(select)
+    // A table with an expression index carries a hidden generated column in
+    // its DataSource schema; `SELECT *` still projects only the user columns,
+    // so the star list goes through the same projection path.
+    let star_hidden = is_star_select(select)
+        && select.joins.is_empty()
+        && hidden_table_info(select, is, current_db).is_some();
+    if (is_star_select(select) && !star_hidden)
         || needs_hash_agg(select)
         || needs_window(select)
         || matches!(plan, PhysicalPlan::Projection { .. })
     {
         return plan;
+    }
+    if star_hidden {
+        // TiDB pushes the projection into the cop task when the reader is a
+        // bare scan and keeps it at the root above any Selection/IndexLookUp.
+        if let Some(proj) = cop_output_projection(&plan, select, is, current_db) {
+            return proj;
+        }
+        let prefix = schema_prefix(current_db);
+        let items = star_columns_for_table(select, None, is, current_db)
+            .into_iter()
+            .map(|(table, col)| format!("{prefix}.{table}.{col}"))
+            .collect();
+        return PhysicalPlan::Projection {
+            exprs: items,
+            child: Box::new(plan),
+        };
     }
     // A SELECT list mixing `*`/`t.*` with other expressions expands the star
     // into the table's columns first (TiDB `buildProjection` star item).
@@ -5023,7 +5072,7 @@ fn wrap_output_projection(
     // them (`SELECT c FROM t WHERE b …` → `TableReader data:Projection` /
     // `IndexReader index:Projection`). When the SELECT list already covers
     // every accessed column the projections cancel and TiDB elides the node.
-    if let Some(proj) = cop_output_projection(&plan, select, current_db) {
+    if let Some(proj) = cop_output_projection(&plan, select, is, current_db) {
         return proj;
     }
     // Keep the Projection node (execution relies on it), but name items the
@@ -5081,6 +5130,7 @@ fn wrap_output_projection(
 fn cop_output_projection(
     plan: &PhysicalPlan,
     select: &SelectStmt,
+    is: Option<&InfoSchema>,
     current_db: &str,
 ) -> Option<PhysicalPlan> {
     if !select.joins.is_empty()
@@ -5101,24 +5151,37 @@ fn cop_output_projection(
     ) {
         return None;
     }
+    // The DataSource of a table with an expression index materialises the
+    // hidden generated column; the cop projection hides it from the reader
+    // output exactly like a filter-only column.
+    let hidden = hidden_table_info(select, is, current_db).is_some();
     let mut out = Vec::new();
     for field in &select.fields {
+        if is_star_field(&field.expr) {
+            if !hidden {
+                return None;
+            }
+            out.extend(
+                star_columns_for_table(select, None, is, current_db)
+                    .into_iter()
+                    .map(|(_, col)| col),
+            );
+            continue;
+        }
         let ExprNode::Column(col) = &field.expr else {
             return None;
         };
-        if col.name == "*" {
-            return None;
-        }
         out.push(col.name.clone());
     }
     if out.is_empty() {
         return None;
     }
     let filter = select.selection.as_ref()?;
-    let prunes = filter
-        .referenced_columns()
-        .iter()
-        .any(|(_, name)| !out.iter().any(|o| o.eq_ignore_ascii_case(name)));
+    let prunes = hidden
+        || filter
+            .referenced_columns()
+            .iter()
+            .any(|(_, name)| !out.iter().any(|o| o.eq_ignore_ascii_case(name)));
     if !prunes {
         return None;
     }
@@ -5230,6 +5293,120 @@ fn wrap_star_mixed_projection(
         exprs: items,
         child: Box::new(plan),
     }
+}
+
+/// TiDB `expression.PropagateConstant` over a single-table selection: every
+/// `col = const` conjunct substitutes the column in the other conjuncts.
+///
+/// Like TiDB the substitution does not fold the rewritten predicate (`b = 300`
+/// inside `a = 100 AND ...` becomes `300 = 100`), so the access-path choice
+/// still sees the original comparison structure; the constant folding happens
+/// later when the selection is simplified.
+fn propagate_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
+    if !select.joins.is_empty() {
+        return None;
+    }
+    select.from.as_ref()?;
+    let filter = select.selection.as_ref()?;
+    let conds = filter.split_cnf_all();
+    let mut pins: Vec<(String, Datum)> = Vec::new();
+    for cond in &conds {
+        let Some((key, value)) = cond.eq_key_const() else {
+            continue;
+        };
+        match pins.iter().find(|(name, _)| name.eq_ignore_ascii_case(&key)) {
+            // `a = 1 AND a = 2` is unsatisfiable and handled elsewhere.
+            Some((_, existing)) if *existing != value => return None,
+            Some(_) => {}
+            None => pins.push((key.to_ascii_lowercase(), value)),
+        }
+    }
+    if pins.is_empty() {
+        return None;
+    }
+    let mut changed = false;
+    let rewritten: Vec<ExprNode> = conds
+        .into_iter()
+        .map(|cond| {
+            let own = cond
+                .eq_key_const()
+                .map(|(key, _)| key.to_ascii_lowercase())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let pins: Vec<(String, Datum)> = pins
+                .iter()
+                .filter(|(name, _)| !own.iter().any(|own| own == name))
+                .cloned()
+                .collect();
+            if pins.is_empty() {
+                return cond;
+            }
+            match substitute_eq_columns(&cond, &pins) {
+                Some(substituted) => {
+                    changed = true;
+                    substituted
+                }
+                None => cond,
+            }
+        })
+        .collect();
+    if !changed {
+        return None;
+    }
+    let mut out = select.clone();
+    out.selection = ExprNode::compose_cnf(rewritten);
+    Some(out)
+}
+
+/// Replace `col` with its pinned constant. `None` (leave the predicate alone)
+/// for a node the rewriter does not model.
+pub(crate) fn substitute_eq_columns(expr: &ExprNode, pins: &[(String, Datum)]) -> Option<ExprNode> {
+    use sealdb_parser::ast::expressions::{
+        BinaryOpExpr, FuncCastExpr, UnaryOpExpr, ValueExpr,
+    };
+    match expr {
+        ExprNode::Column(col) => Some(
+            match pins
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&col.name))
+            {
+                Some((_, value)) => ExprNode::Value(ValueExpr {
+                    datum: value.clone(),
+                }),
+                // A column with no pin stays as it is.
+                None => expr.clone(),
+            },
+        ),
+        ExprNode::Value(_) => Some(expr.clone()),
+        ExprNode::Binary(bin) => Some(ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(substitute_eq_columns(&bin.left, pins)?),
+            right: Box::new(substitute_eq_columns(&bin.right, pins)?),
+            single_cnf_item: bin.single_cnf_item,
+        })),
+        ExprNode::Unary(unary) => Some(ExprNode::Unary(UnaryOpExpr {
+            op: unary.op,
+            expr: Box::new(substitute_eq_columns(&unary.expr, pins)?),
+        })),
+        ExprNode::Cast(cast) => Some(ExprNode::Cast(FuncCastExpr {
+            expr: Box::new(substitute_eq_columns(&cast.expr, pins)?),
+            target: cast.target.clone(),
+        })),
+        _ => None,
+    }
+}
+
+/// Table metadata when the statement reads a single table whose schema
+/// carries a hidden generated column (expression index key part).
+fn hidden_table_info<'a>(
+    select: &SelectStmt,
+    is: Option<&'a InfoSchema>,
+    current_db: &str,
+) -> Option<&'a sealdb_meta::model::table::TableInfo> {
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    is?.table_by_name(&db, &table)
+        .filter(|info| info.columns.iter().any(|c| c.hidden))
 }
 
 /// Columns of `alias` (or of every FROM table when `alias` is None) in
@@ -5923,6 +6100,93 @@ fn normalize_bit_expr(
 /// Record each column's schema so EXPLAIN can qualify it like TiDB
 /// (`Column.ExplainInfo` → `db.table.col`). Only base tables in FROM/JOIN are
 /// annotated; derived aliases keep their text.
+/// Shard rewrite for a single-table SELECT: `a = const` gains the folded
+/// `tidb_shard(a) = <bucket>` conjunct TiDB's planner adds (see
+/// [`super::expr_index::shard_index_rewrite`]).
+/// Projection TiDB puts above a point get on an expression index.
+fn expr_index_point_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let index = match &plan {
+        PhysicalPlan::PointGet {
+            index: Some(index), ..
+        }
+        | PhysicalPlan::BatchPointGet {
+            index: Some(index), ..
+        } => index.clone(),
+        _ => return plan,
+    };
+    let (Some(is), Some(from)) = (is, select.from.as_ref()) else {
+        return plan;
+    };
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return plan;
+    }
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &table) else {
+        return plan;
+    };
+    let Some(index_info) = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(&index))
+    else {
+        return plan;
+    };
+    if !super::expr_index::has_expression_part(info, index_info) {
+        return plan;
+    }
+    let exprs = if is_star_select(select) {
+        let exprs = star_projection_exprs(select, Some(is), current_db);
+        if exprs.is_empty() {
+            return plan;
+        }
+        exprs
+    } else {
+        let mut next_id = info.max_col_id + 1;
+        select
+            .fields
+            .iter()
+            .map(|field| match &field.expr {
+                ExprNode::Column(_) => {
+                    crate::core::explain::explain_pushed_filter(&from.name, &field.expr)
+                }
+                expr => {
+                    let text = format!(
+                        "{}->Column#{}",
+                        crate::core::explain::explain_pushed_filter(&from.name, expr),
+                        next_id
+                    );
+                    next_id += 1;
+                    text
+                }
+            })
+            .collect()
+    };
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+    }
+}
+
+fn shard_rewrite_select(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    let is = is?;
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is.table_by_name(&db, &table)?;
+    super::expr_index::shard_index_rewrite(select, info)
+}
+
 fn annotate_column_schemas(select: &SelectStmt, current_db: &str) -> Option<SelectStmt> {
     let tables = select.join_tables();
     if tables.is_empty() {
@@ -6233,6 +6497,11 @@ fn unique_index_eq_point(
     eqs: &[(String, Datum)],
     only_index: Option<&str>,
 ) -> Option<PhysicalPlan> {
+    let value_of = |key: &str| {
+        eqs.iter()
+            .find(|(col, _)| col.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.clone())
+    };
     let index = info.indices.iter().find(|idx| {
         idx.unique
             // A common-handle PRIMARY KEY still answers an equality point get
@@ -6242,27 +6511,22 @@ fn unique_index_eq_point(
             && !idx.invisible
             && idx.columns.len() > 1
             && index_allowed(from, idx.name.o(), only_index)
-            && idx.columns.iter().all(|c| {
-                eqs.iter()
-                    .any(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
-            })
+            && idx
+                .columns
+                .iter()
+                .all(|c| value_of(&super::expr_index::part_key(info, c)).is_some())
     })?;
     if index.columns.iter().any(|c| {
-        eqs.iter()
-            .find(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
-            .is_some_and(|(_, value)| !point_value_hits_float(info, c.name.o(), value))
+        value_of(&super::expr_index::part_key(info, c))
+            .is_some_and(|value| !point_value_hits_float(info, c.name.o(), &value))
     }) {
         return Some(PhysicalPlan::TableDual { row_count: 0 });
     }
     let index_columns: Vec<String> = index_key_column_names(info, index);
-    let values: Vec<Datum> = index_columns
+    let values: Vec<Datum> = index
+        .columns
         .iter()
-        .map(|column| {
-            eqs.iter()
-                .find(|(col, _)| col.eq_ignore_ascii_case(column))
-                .map(|(_, value)| value.clone())
-                .unwrap_or(Datum::Null)
-        })
+        .map(|part| value_of(&super::expr_index::part_key(info, part)).unwrap_or(Datum::Null))
         .collect();
     let partition_names = tuple_partition_names(
         info,
@@ -6290,15 +6554,16 @@ fn dnf_unique_point(
     only_index: Option<&str>,
 ) -> Option<PhysicalPlan> {
     let selection = select.selection.as_ref()?;
-    let arms = selection.split_dnf();
+    let arms: Vec<Vec<ExprNode>> = selection
+        .split_dnf()
+        .into_iter()
+        .map(|arm| arm.split_cnf_all())
+        .collect();
     if arms.len() < 2 {
         return None;
     }
-    let first_eqs: Vec<(String, Datum)> = arms[0]
-        .split_cnf_all()
-        .into_iter()
-        .filter_map(|expr| expr.eq_column_const())
-        .collect();
+    // Each arm pins the whole key: expression parts may fold from the plain
+    // parts (`uk_expr((tidb_shard(a)), a)` under `a = 100`).
     let index = info.indices.iter().find(|idx| {
         idx.unique
             // A common-handle PRIMARY KEY still answers an equality point get
@@ -6308,22 +6573,35 @@ fn dnf_unique_point(
             && !idx.invisible
             && idx.columns.len() > 1
             && index_allowed(from, idx.name.o(), only_index)
-            && idx.columns.iter().all(|c| {
-                first_eqs
-                    .iter()
-                    .any(|(col, _)| col.eq_ignore_ascii_case(c.name.o()))
-            })
+            && super::expr_index::pinned_tuple(info, idx, &arms[0]).is_some()
     })?;
-    // Every arm must be exactly one row of the unique key; extra predicates
-    // stay in the residual filter instead of silently disappearing.
+    let keys = super::expr_index::part_keys(info, index);
+    // Every conjunct of every arm must be part of the key; a leftover predicate
+    // stays in the residual filter instead of silently disappearing.
+    let is_key_const = |conjunct: &ExprNode| {
+        conjunct
+            .eq_key_const()
+            .is_some_and(|(key, _)| keys.iter().any(|part| part.eq_ignore_ascii_case(&key)))
+    };
     if arms
         .iter()
-        .any(|arm| arm.split_cnf_all().len() != index.columns.len())
+        .any(|conjuncts| !conjuncts.iter().all(is_key_const))
     {
         return None;
     }
-    let index_columns: Vec<String> = index_key_column_names(info, index);
-    let tuples = selection.dnf_const_tuples(&index_columns)?;
+    let mut tuples: Vec<Vec<Datum>> = Vec::with_capacity(arms.len());
+    for conjuncts in &arms {
+        let tuple = super::expr_index::pinned_tuple(info, index, conjuncts)?;
+        if !tuples.iter().any(|have| {
+            have.len() == tuple.len()
+                && have
+                    .iter()
+                    .zip(tuple.iter())
+                    .all(|(a, b)| a.compare(b).is_eq())
+        }) {
+            tuples.push(tuple);
+        }
+    }
     let hits: Vec<bool> = tuples
         .iter()
         .map(|tuple| {
@@ -6340,26 +6618,11 @@ fn dnf_unique_point(
     if hits.iter().any(|hit| !hit) {
         return None;
     }
-    Some(PhysicalPlan::BatchPointGet {
-        table: from.name.clone(),
-        column: index_columns.first().cloned().unwrap_or_default(),
-        index: Some(index.name.o().to_string()),
-        n_keys: tuples.len(),
-        handles: Vec::new(),
-        index_columns: index_columns.clone(),
-        tuple_columns: index_columns.clone(),
-        partition_names: tuple_partition_names(
-            info,
-            &index_columns,
-            &tuples,
-            &from.partition_names,
-            index.global,
-        ),
-        global_index: index.global,
-        lock: false,
-        keep_order: false,
-        desc: false,
-    })
+    let n_keys = tuples.len();
+    let column = keys.first().cloned().unwrap_or_default();
+    Some(batch_point_plan(
+        from, info, index, tuples, n_keys, column, keys,
+    ))
 }
 
 fn in_list_plan(
@@ -6434,6 +6697,26 @@ fn in_list_plan(
                 total,
             ));
         }
+        // Expression index: the plain parts come from the IN list and the
+        // expression parts fold from them (`uk_expr((tidb_shard(a)), a)` under
+        // `a IN (100, 200)` is a point get / batch point get).
+        if let Some(index) = info.indices.iter().find(|idx| {
+            idx.unique
+                && !idx.invisible
+                && super::expr_index::has_expression_part(info, idx)
+                && index_allowed(from, idx.name.o(), only_index)
+        }) && let Some(tuples) = in_list_part_tuples(info, index, &column, &values)
+        {
+            return Some(tuples_point_plan(
+                from,
+                info,
+                index,
+                tuples,
+                total,
+                column,
+                Vec::new(),
+            ));
+        }
     }
     // `(a, b) IN ((1, 2), (3, 4))` on a unique key covering exactly those
     // columns is a batch point get as well.
@@ -6446,25 +6729,18 @@ fn in_list_plan(
     let index = info.indices.iter().find(|idx| {
         idx.unique
             && !idx.invisible
-            && idx.columns.len() == names.len()
             && index_allowed(from, idx.name.o(), only_index)
-            && idx.columns.iter().all(|c| {
-                names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(c.name.o()))
-            })
+            && row_in_columns_cover(info, idx, &names)
+            && row_in_part_tuples(info, idx, &names, &tuples).is_some()
     })?;
-    let column_position = |index_col: &sealdb_meta::IndexColumn| {
-        names
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(index_col.name.o()))
-    };
-    let hits: Vec<bool> = tuples
+    let key_tuples = row_in_part_tuples(info, index, &names, &tuples)?;
+    let keys = super::expr_index::part_keys(info, index);
+    let hits: Vec<bool> = key_tuples
         .iter()
         .map(|tuple| {
-            index.columns.iter().all(|ic| {
-                column_position(ic)
-                    .and_then(|pos| tuple.get(pos))
+            index.columns.iter().enumerate().all(|(pos, ic)| {
+                tuple
+                    .get(pos)
                     .is_some_and(|value| point_value_hits_float(info, ic.name.o(), value))
             })
         })
@@ -6475,27 +6751,174 @@ fn in_list_plan(
     if hits.iter().any(|hit| !hit) {
         return None;
     }
-    let index_columns: Vec<String> = index_key_column_names(info, index);
-    Some(PhysicalPlan::BatchPointGet {
-        table: from.name.clone(),
-        column: names.first().cloned().unwrap_or_default(),
-        index: Some(index.name.o().to_string()),
-        n_keys: total,
-        handles: Vec::new(),
-        index_columns,
-        partition_names: tuple_partition_names(
+    let _ = keys;
+    Some(batch_point_plan(
+        from,
+        info,
+        index,
+        key_tuples,
+        total,
+        keys.first().cloned().unwrap_or_default(),
+        names,
+    ))
+}
+
+/// `a IN (…)`: every key part from the IN list, expression parts folded from it.
+fn in_list_part_tuples(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    column: &str,
+    values: &[Datum],
+) -> Option<Vec<Vec<Datum>>> {
+    let mut tuples = Vec::with_capacity(values.len());
+    for value in values {
+        let known = vec![(column.to_string(), value.clone())];
+        let mut tuple = Vec::with_capacity(index.columns.len());
+        for part in &index.columns {
+            let key = super::expr_index::part_key(info, part);
+            if key.eq_ignore_ascii_case(column) {
+                tuple.push(value.clone());
+            } else {
+                tuple.push(super::expr_index::eval_part(
+                    info,
+                    &super::expr_index::part_expr(info, part)?,
+                    &known,
+                )?);
+            }
+        }
+        tuples.push(tuple);
+    }
+    Some(tuples)
+}
+
+/// `(a, b) IN ((…), (…))` pins every key part, so the tuple columns must be
+/// exactly the index's plain parts: an expression part (`tidb_shard(a)`) folds
+/// from them, while a plain part left out of the tuple stays unpinned and the
+/// predicate is not a point get.
+fn row_in_columns_cover(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    names: &[String],
+) -> bool {
+    let plain: Vec<String> = index
+        .columns
+        .iter()
+        .filter(|part| super::expr_index::part_expr(info, part).is_none())
+        .map(|part| part.name.o().to_string())
+        .collect();
+    plain.len() == names.len()
+        && plain
+            .iter()
+            .all(|key| names.iter().any(|name| name.eq_ignore_ascii_case(key)))
+}
+
+/// `(a, b) IN ((…), (…))`: reorder the row values into key order and fold the
+/// expression parts (`uk_expr((tidb_shard(a)), a, b)`).
+fn row_in_part_tuples(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    names: &[String],
+    tuples: &[Vec<Datum>],
+) -> Option<Vec<Vec<Datum>>> {
+    let mut out = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        let known: Vec<(String, Datum)> = names
+            .iter()
+            .cloned()
+            .zip(tuple.iter().cloned())
+            .collect();
+        let mut key = Vec::with_capacity(index.columns.len());
+        for part in &index.columns {
+            let name = super::expr_index::part_key(info, part);
+            match names.iter().position(|n| n.eq_ignore_ascii_case(&name)) {
+                Some(pos) => key.push(tuple.get(pos)?.clone()),
+                None => key.push(super::expr_index::eval_part(
+                    info,
+                    &super::expr_index::part_expr(info, part)?,
+                    &known,
+                )?),
+            }
+        }
+        out.push(key);
+    }
+    Some(out)
+}
+
+/// Point get for one key tuple, batch point get for several.
+fn tuples_point_plan(
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    tuples: Vec<Vec<Datum>>,
+    n_keys: usize,
+    column: String,
+    tuple_columns: Vec<String>,
+) -> PhysicalPlan {
+    if tuples.len() == 1 {
+        let keys = super::expr_index::part_keys(info, index);
+        let partition_names = tuple_partition_names(
             info,
-            &names,
+            &keys,
             &tuples,
             &from.partition_names,
             index.global,
-        ),
-        tuple_columns: names,
+        );
+        return PhysicalPlan::PointGet {
+            table: from.name.clone(),
+            handle: None,
+            index: Some(index.name.o().to_string()),
+            index_columns: index_key_column_names(info, index),
+            partition_names,
+            global_index: index.global,
+            lock: false,
+        };
+    }
+    batch_point_plan(
+        from,
+        info,
+        index,
+        tuples,
+        n_keys,
+        column,
+        tuple_columns,
+    )
+}
+
+/// Batch point get over a unique index. A row `IN` list keeps this shape even
+/// when every tuple folds to one key (TiDB `Batch_Point_Get`, never a point
+/// get: the plan is derived before the list is de-duplicated).
+fn batch_point_plan(
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    tuples: Vec<Vec<Datum>>,
+    n_keys: usize,
+    column: String,
+    tuple_columns: Vec<String>,
+) -> PhysicalPlan {
+    let keys = super::expr_index::part_keys(info, index);
+    let index_columns = index_key_column_names(info, index);
+    let partition_names = tuple_partition_names(
+        info,
+        &keys,
+        &tuples,
+        &from.partition_names,
+        index.global,
+    );
+    PhysicalPlan::BatchPointGet {
+        table: from.name.clone(),
+        column,
+        index: Some(index.name.o().to_string()),
+        n_keys,
+        handles: Vec::new(),
+        index_columns,
+        tuple_columns,
+        partition_names,
         global_index: index.global,
         lock: false,
         keep_order: false,
         desc: false,
-    })
+    }
 }
 
 /// Static partition names a row-IN batch point get touches; the tuples are
@@ -7838,6 +8261,35 @@ fn index_plan(
             pushed: None,
         }
     }
+}
+
+/// Leading expression key part constrained by a comparison → index seek.
+///
+/// `where tidb_shard(a) = 8` pins `_V$_uk_expr_0`, so the ranger builds
+/// `range:[8,8]` on `uk_expr((tidb_shard(a)), a)` even though no plain column
+/// of the index is named.
+fn expr_range_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let selection = select.selection.as_ref()?;
+    let conjuncts = selection.split_cnf();
+    let index = info.indices.iter().find(|idx| {
+        // A clustered PRIMARY KEY has no separate index path.
+        !(idx.primary && info.pk_is_clustered())
+            && !index_ignored(from, idx.name.o())
+            && super::expr_index::has_expression_part(info, idx)
+            && idx.columns.first().is_some_and(|leading| {
+                let key = super::expr_index::part_key(info, leading);
+                conjuncts.iter().any(|conjunct| {
+                    sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&key))
+                })
+            })
+    })?;
+    Some(index_plan(select, from, info, index, prune_mode))
 }
 
 /// `col = a OR col = b …` on one indexed leading column: TiDB ranger seeks the
@@ -12513,7 +12965,7 @@ fn access_plan(
         schema.table_by_name(&db, &table)
     }) {
         // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
-        let eqs = eq_column_consts(select.selection.as_ref());
+        let eqs = eq_key_consts(select.selection.as_ref());
         if !from.use_indexes.is_empty() {
             for hint in &from.use_indexes {
                 if let Some(index) = info
@@ -12566,6 +13018,11 @@ fn access_plan(
             };
         }
         if let Some(plan) = unique_index_eq_point(from, info, &eqs, None) {
+            return plan;
+        }
+        // An equality or range on an expression key part seeks the index
+        // exactly like a plain leading column (`where tidb_shard(a) = 8`).
+        if let Some(plan) = expr_range_plan(select, from, info, prune_mode) {
             return plan;
         }
         // In a join, the key equality from the join wins over a row IN list:

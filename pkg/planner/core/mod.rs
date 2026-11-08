@@ -2,6 +2,7 @@ pub mod access_range;
 pub mod apply;
 pub mod cte;
 pub mod explain;
+pub mod expr_index;
 pub mod foreign_key;
 pub mod natural_join;
 pub mod physical_plans;

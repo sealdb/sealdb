@@ -7,6 +7,8 @@ use super::physical_plans::{JoinType, PhysicalPlan};
 use crate::core::planbuilder::unique_eq_rows;
 use sealdb_infoschema::InfoSchema;
 use sealdb_parser::ast::ExprNode;
+use sealdb_parser::ast::expressions::BinaryOpExpr;
+use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 
 pub fn predicate_push_down(
@@ -24,6 +26,20 @@ pub fn eq_column_consts(selection: Option<&ExprNode>) -> Vec<(String, Datum)> {
             expr.split_cnf()
                 .into_iter()
                 .filter_map(|item| item.eq_column_const())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Like [`eq_column_consts`], but an equality on an expression reports the
+/// expression's canonical text (`tidb_shard(a) = 8` → `tidb_shard(a)`), which
+/// is how an expression index part is pinned.
+pub fn eq_key_consts(selection: Option<&ExprNode>) -> Vec<(String, Datum)> {
+    selection
+        .map(|expr| {
+            expr.split_cnf()
+                .into_iter()
+                .filter_map(|item| item.eq_key_const())
                 .collect()
         })
         .unwrap_or_default()
@@ -52,8 +68,9 @@ fn push_into(
             pushed,
             ..
         } => {
-            let (pushable, residual): (Vec<_>, Vec<_>) =
-                conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -95,7 +112,10 @@ fn push_into(
                     // Newer conjuncts first (TiDB: pushed ON/like before view WHERE).
                     range_scan,
                     keep_order: false,
-                    pushed: and_opt(ExprNode::compose_cnf(pushable), pushed),
+                    pushed: and_opt(
+                        ExprNode::compose_cnf(pushable).map(simplify_or_arms),
+                        pushed,
+                    ),
                 },
                 residual,
             )
@@ -118,8 +138,9 @@ fn push_into(
             pushed,
             ..
         } => {
-            let (pushable, residual): (Vec<_>, Vec<_>) =
-                conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -132,6 +153,15 @@ fn push_into(
                         .is_some_and(|info| full_domain_conjunct(info, expr))
                 })
                 .map(|expr| expr.rewrite_row_in_dnf())
+                .collect();
+            // A predicate TiDB cannot push into cop (`tidb_shard(a) = 8`) can
+            // still become the index access range: the ranger detaches it from
+            // the filter and the scan seeks.
+            let mut residual = residual;
+            let range_candidates: Vec<ExprNode> = pushable
+                .iter()
+                .chain(residual.iter())
+                .cloned()
                 .collect();
             // TiDB ranger: predicates on the index prefix become the access
             // range of the Build side, so `IndexLookUp` seeks instead of
@@ -151,17 +181,19 @@ fn push_into(
                 && let Some(access) = super::access_range::index_access_range(
                     info,
                     index_info,
-                    &pushable,
+                    &range_candidates,
                     row_count,
                     super::planbuilder::statement_stats(&table).as_ref(),
                 )
             {
-                pushable.retain(|expr| {
-                    !access
+                let consumed = |expr: &ExprNode| {
+                    access
                         .consumed
                         .iter()
                         .any(|c| c.restore_string() == expr.restore_string())
-                });
+                };
+                pushable.retain(|expr| !consumed(expr));
+                residual.retain(|expr| !consumed(expr));
                 selection_info = None;
                 row_count = access.range.rows;
                 access_range = Some(access.range);
@@ -235,8 +267,9 @@ fn push_into(
             pushed,
             range_scan,
         } => {
-            let (pushable, residual): (Vec<_>, Vec<_>) =
-                conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -250,11 +283,14 @@ fn push_into(
                 })
                 .collect();
             // TiDB ranger: predicates on the index prefix become the access
-            // range, so they leave the cop Selection and drive estRows.
+            // range, so they leave the cop Selection and drive estRows. An
+            // expression key part (`tidb_shard(a) = 8`) is not cop-pushable but
+            // still seeks.
             let mut range_scan = range_scan;
             let pushed = pushed;
             let mut row_count = row_count;
             let mut pushable = pushable;
+            let mut residual = residual;
             if range_scan.is_none()
                 && pushed.is_none()
                 && let Some(info) = table_info.as_ref()
@@ -263,21 +299,28 @@ fn push_into(
                     .indices
                     .iter()
                     .find(|idx| idx.name.o().eq_ignore_ascii_case(&index));
+                let range_candidates: Vec<ExprNode> = pushable
+                    .iter()
+                    .chain(residual.iter())
+                    .cloned()
+                    .collect();
                 if let Some(index_info) = index_info
                     && let Some(access) = super::access_range::index_access_range(
                         info,
                         index_info,
-                        &pushable,
+                        &range_candidates,
                         row_count,
                         super::planbuilder::statement_stats(&table).as_ref(),
                     )
                 {
-                    pushable.retain(|expr| {
-                        !access
+                    let consumed = |expr: &ExprNode| {
+                        access
                             .consumed
                             .iter()
                             .any(|c| c.restore_string() == expr.restore_string())
-                    });
+                    };
+                    pushable.retain(|expr| !consumed(expr));
+                    residual.retain(|expr| !consumed(expr));
                     row_count = access.range.filter_rows;
                     range_scan = Some(access.range);
                 }
@@ -310,8 +353,9 @@ fn push_into(
             partitions,
             pushed,
         } => {
-            let (pushable, residual): (Vec<_>, Vec<_>) =
-                conjuncts.into_iter().partition(|expr| !expr.has_subquery());
+            let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -352,46 +396,51 @@ fn push_into(
                         .map(|c| c.name.o().to_string())
                 })
                 .flatten();
+            let key_columns = point_get_key_columns(
+                is,
+                current_db,
+                &table,
+                index.as_deref(),
+                handle_column.as_deref(),
+            );
             let mut residual: Vec<ExprNode> = {
                 // Key values the point get already pins, used to fold the
                 // remaining filters (`b + 1 = 3` with `b = 2` disappears).
                 let pinned: Vec<(String, Datum)> = conjuncts
                     .iter()
-                    .filter_map(|expr| expr.eq_column_const())
-                    .filter(|(col, _)| {
-                        index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
-                            || handle_column
-                                .as_deref()
-                                .is_some_and(|c| c.eq_ignore_ascii_case(col))
-                    })
+                    .filter_map(|expr| expr.eq_key_const())
+                    .filter(|(col, _)| key_columns.iter().any(|c| c.eq_ignore_ascii_case(col)))
                     .collect();
                 conjuncts
                     .into_iter()
-                    .filter(|expr| {
-                        // The unique-index equality is already the point get lookup.
-                        if index.is_some()
-                            && let Some((col, _)) = expr.eq_column_const()
-                            && index_columns.iter().any(|c| c.eq_ignore_ascii_case(&col))
-                        {
-                            return false;
+                    .filter_map(|expr| {
+                        // The key equality is already the point get lookup.
+                        if is_point_get_key(&expr, &key_columns) {
+                            return None;
+                        }
+                        if let Some(reduced) = reduce_pinned_dnf(&expr, &key_columns) {
+                            return reduced;
                         }
                         match (&handle_column, handle) {
                             (Some(col), Some(value)) => {
-                                if is_handle_eq_on(expr, value, col) {
-                                    return false;
+                                if is_handle_eq_on(&expr, value, col) {
+                                    return None;
                                 }
                             }
                             _ => {
-                                if handle.is_some_and(|value| is_handle_eq(expr, value)) {
-                                    return false;
+                                if handle.is_some_and(|value| is_handle_eq(&expr, value)) {
+                                    return None;
                                 }
                             }
                         }
                         // A filter that holds for every pinned value is a no-op.
-                        !matches!(
-                            fold_with_pinned(expr, &table, &pinned),
+                        if matches!(
+                            fold_with_pinned(&expr, &table, &pinned),
                             Some(Datum::I64(1)) | Some(Datum::U64(1))
-                        )
+                        ) {
+                            return None;
+                        }
+                        Some(expr)
                     })
                     .collect()
             };
@@ -424,15 +473,29 @@ fn push_into(
             keep_order,
             desc,
         } => {
+            let key_columns = point_get_key_columns(
+                is,
+                current_db,
+                &table,
+                index.as_deref(),
+                None,
+            );
             let mut residual: Vec<ExprNode> = conjuncts
                 .into_iter()
-                .filter(|expr| {
-                    if tuple_columns.is_empty() {
-                        !is_in_list_on(expr, &column)
-                    } else {
-                        !is_row_in_list_on(expr, &tuple_columns)
-                            && !is_dnf_point_rows(expr, &tuple_columns)
+                .filter_map(|expr| {
+                    if is_point_get_key(&expr, &key_columns) {
+                        return None;
                     }
+                    let consumed = if tuple_columns.is_empty() {
+                        is_in_list_on(&expr, &column)
+                    } else {
+                        is_row_in_list_on(&expr, &tuple_columns)
+                            || is_dnf_point_rows(&expr, &tuple_columns)
+                    };
+                    if consumed {
+                        return None;
+                    }
+                    reduce_pinned_dnf(&expr, &key_columns).unwrap_or(Some(expr))
                 })
                 .collect();
             // TiDB renders point-get table filters in sorted expression order.
@@ -678,6 +741,98 @@ fn pk_eq_handle(
     }
 }
 
+/// TiDB pushes a predicate into cop only when every function has a cop
+/// implementation. `tidb_shard` is evaluated by TiDB alone, so a predicate
+/// that mentions it stays a root `Selection` (`explain_shard_index`).
+fn cop_pushable(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Func(func) => {
+            !func.name.eq_ignore_ascii_case("tidb_shard")
+                && func.args.iter().all(cop_pushable)
+        }
+        ExprNode::Binary(bin) => cop_pushable(&bin.left) && cop_pushable(&bin.right),
+        ExprNode::Unary(unary) => cop_pushable(&unary.expr),
+        ExprNode::Cast(cast) => cop_pushable(&cast.expr),
+        ExprNode::InList(list) => cop_pushable(&list.expr) && list.list.iter().all(cop_pushable),
+        ExprNode::Between(between) => {
+            cop_pushable(&between.expr) && cop_pushable(&between.low) && cop_pushable(&between.high)
+        }
+        ExprNode::IsNull(is_null) => cop_pushable(&is_null.expr),
+        ExprNode::Like(like) => cop_pushable(&like.expr) && cop_pushable(&like.pattern),
+        ExprNode::Case(case) => {
+            case.operand.as_ref().is_none_or(|o| cop_pushable(o))
+                && case
+                    .when_then
+                    .iter()
+                    .all(|(when, then)| cop_pushable(when) && cop_pushable(then))
+                && case.else_expr.as_ref().is_none_or(|e| cop_pushable(e))
+        }
+        _ => true,
+    }
+}
+
+/// Key columns a point get pins: the index key parts (an expression part is
+/// keyed by its canonical text), or the handle column of a handle lookup.
+fn point_get_key_columns(
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    table: &str,
+    index: Option<&str>,
+    handle_column: Option<&str>,
+) -> Vec<String> {
+    match index {
+        Some(name) => statement_table_info(is, current_db, table)
+            .and_then(|info| {
+                let idx = info
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(name))?;
+                Some(super::expr_index::part_keys(info, idx))
+            })
+            .unwrap_or_default(),
+        None => handle_column.map(|c| vec![c.to_string()]).unwrap_or_default(),
+    }
+}
+
+/// Is the conjunct an equality on one of the key columns?
+fn is_point_get_key(expr: &ExprNode, key_columns: &[String]) -> bool {
+    expr.eq_key_const()
+        .is_some_and(|(key, _)| key_columns.iter().any(|c| c.eq_ignore_ascii_case(&key)))
+}
+
+/// Reduce a DNF whose key equalities the point get answers:
+/// `a = 100 AND (b = 100 OR b = 200)` keeps `or(b = 100, b = 200)`.
+///
+/// `None` when the conjunct is not a DNF over key equalities; `Some(None)` when
+/// every arm is fully answered by the lookup (the filter is redundant).
+fn reduce_pinned_dnf(expr: &ExprNode, key_columns: &[String]) -> Option<Option<ExprNode>> {
+    let arms = expr.split_dnf();
+    if arms.len() < 2 || !arms.iter().all(|arm| arm.split_cnf_all().iter().any(|c| is_point_get_key(c, key_columns))) {
+        return None;
+    }
+    let mut leftovers: Vec<ExprNode> = Vec::with_capacity(arms.len());
+    for arm in &arms {
+        let kept: Vec<ExprNode> = arm
+            .split_cnf_all()
+            .into_iter()
+            .filter(|conjunct| !is_point_get_key(conjunct, key_columns))
+            .collect();
+        match ExprNode::compose_cnf(kept) {
+            // The point get already answers this arm.
+            None => return Some(None),
+            Some(filter) => leftovers.push(filter),
+        }
+    }
+    Some(leftovers.into_iter().rev().reduce(|right, left| {
+        ExprNode::Binary(BinaryOpExpr {
+            op: Op::LogicOr,
+            left: Box::new(left),
+            right: Box::new(right),
+            single_cnf_item: false,
+        })
+    }))
+}
+
 fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
     let Some(filter) = ExprNode::compose_cnf(residual) else {
         return plan;
@@ -752,6 +907,125 @@ fn substitute_pinned_columns(
         })),
         _ => None,
     }
+}
+
+/// TiDB `PredicateSimplification` (`updateOrPredicate`) on one pushed filter:
+/// a scalar conjunct (`b = 300`) rules out the OR arms it contradicts
+/// (`a = 100 AND b = 100`), so `(a = 100 AND b = 100) OR a = 200` collapses to
+/// `a = 200`. A single surviving arm spreads into the CNF list the way TiDB
+/// prints the cop Selection.
+fn simplify_or_arms(filter: ExprNode) -> ExprNode {
+    let conjuncts = filter.split_cnf_all();
+    let top_pins: Vec<(String, Datum)> = conjuncts
+        .iter()
+        .filter_map(|cond| cond.eq_key_const())
+        .map(|(col, value)| (col.to_ascii_lowercase(), value))
+        .collect();
+    let mut out: Vec<ExprNode> = Vec::new();
+    let mut changed = false;
+    for cond in conjuncts {
+        if !matches!(&cond, ExprNode::Binary(bin) if bin.op == Op::LogicOr) {
+            out.push(cond);
+            continue;
+        }
+        let mut kept: Vec<Vec<ExprNode>> = Vec::new();
+        let mut dropped_arm = false;
+        for arm in cond.split_dnf() {
+            let arm_conjuncts = arm.split_cnf_all();
+            let mut pins = top_pins.clone();
+            for (col, value) in arm_conjuncts.iter().filter_map(|cc| cc.eq_key_const()) {
+                let col = col.to_ascii_lowercase();
+                if !pins.iter().any(|(name, _)| *name == col) {
+                    pins.push((col, value));
+                }
+            }
+            let mut alive = true;
+            let mut remaining: Vec<ExprNode> = Vec::new();
+            for conjunct in arm_conjuncts {
+                let own = conjunct
+                    .eq_key_const()
+                    .map(|(col, _)| col.to_ascii_lowercase())
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let relevant: Vec<(String, Datum)> = pins
+                    .iter()
+                    .filter(|(col, _)| !own.iter().any(|own| own == col))
+                    .cloned()
+                    .collect();
+                let rewritten = if relevant.is_empty() {
+                    conjunct
+                } else {
+                    super::planbuilder::substitute_eq_columns(&conjunct, &relevant)
+                        .unwrap_or(conjunct)
+                };
+                match constant_truth(&rewritten) {
+                    // Only a pin makes an arm contradictory. A literal arm
+                    // (`or(0, eq(a, -1))` from partition pruning) stays as
+                    // TiDB prints it.
+                    Some(false) if !relevant.is_empty() => {
+                        alive = false;
+                        break;
+                    }
+                    Some(false) | Some(true) if relevant.is_empty() => return filter,
+                    Some(false) => {
+                        alive = false;
+                        break;
+                    }
+                    Some(true) => {
+                        changed = true;
+                    }
+                    None => remaining.push(rewritten),
+                }
+            }
+            if alive {
+                kept.push(remaining);
+            } else {
+                dropped_arm = true;
+            }
+        }
+        if !dropped_arm {
+            out.push(cond);
+            continue;
+        }
+        changed = true;
+        match kept.len() {
+            0 => return filter,
+            1 => out.extend(kept.pop().unwrap_or_default()),
+            _ => {
+                let arms: Vec<ExprNode> = kept
+                    .into_iter()
+                    .filter_map(ExprNode::compose_cnf)
+                    .map(|arm| arm.rewrite_row_in_dnf())
+                    .collect();
+                if let Some(arm) = arms.into_iter().reduce(|left, right| {
+                    ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+                        op: Op::LogicOr,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        single_cnf_item: false,
+                    })
+                }) {
+                    out.push(arm);
+                }
+            }
+        }
+    }
+    if !changed {
+        return filter;
+    }
+    ExprNode::compose_cnf(out).unwrap_or(filter)
+}
+
+/// Truth value of a column-free predicate, `None` when it still reads columns.
+fn constant_truth(expr: &ExprNode) -> Option<bool> {
+    if !expr.referenced_columns().is_empty() {
+        return None;
+    }
+    let value = sealdb_expression::eval_expr(expr).ok()?;
+    if value.is_null() {
+        return Some(false);
+    }
+    Some(value.as_i64().map(|v| v != 0).unwrap_or(true))
 }
 
 fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {
@@ -912,9 +1186,17 @@ fn is_dnf_point_rows(expr: &ExprNode, tuple_columns: &[String]) -> bool {
             let eqs: Vec<(String, Datum)> = arm
                 .split_cnf_all()
                 .into_iter()
-                .filter_map(|item| item.eq_column_const())
+                .filter_map(|item| item.eq_key_const())
                 .collect();
-            eqs.len() == tuple_columns.len()
+            // Every arm conjunct must be one of the key parts (a shard rewrite
+            // adds a redundant `tidb_shard(a) = <bucket>` next to `a = 100`),
+            // and the arm must pin them all.
+            eqs.len() >= tuple_columns.len()
+                && eqs.iter().all(|(name, _)| {
+                    tuple_columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(name))
+                })
                 && tuple_columns.iter().all(|column| {
                     eqs.iter()
                         .any(|(name, _)| name.eq_ignore_ascii_case(column))

@@ -30,11 +30,16 @@ pub fn index_access_range(
     table_stats: Option<&TableStats>,
 ) -> Option<IndexAccessRange> {
     let leading = index.columns.first()?;
-    let column = leading.name.o();
-    let column_info = info
-        .columns
-        .iter()
-        .find(|c| c.name.o().eq_ignore_ascii_case(&column))?;
+    // An expression key part is seeked through its generating expression
+    // (`tidb_shard(a) = 8` → `range:[8,8]`), not through the hidden column.
+    let column = super::expr_index::part_key(info, leading);
+    let column_info = match super::expr_index::hidden_column(info, leading) {
+        Some(hidden) => hidden,
+        None => info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&column))?,
+    };
     // TIMESTAMP index keys are stored in UTC, so session-local bounds cannot be
     // pushed as a seek; the executor keeps the full scan + Selection instead.
     if column_info.field_type.tp == sealdb_types::TYPE_TIMESTAMP {

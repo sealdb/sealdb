@@ -3197,6 +3197,17 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             };
             format!("cast({}, {target})", explain_scalar_expr(&c.expr, table))
         }
+        // Expression index key part (`tidb_shard(a) = 8`): TiDB prints the
+        // scalar call with the same column spelling as its arguments.
+        ExprNode::Func(f) => {
+            let args = f
+                .args
+                .iter()
+                .map(|arg| explain_scalar_expr(arg, table))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", f.name.to_ascii_lowercase())
+        }
         ExprNode::InList(list) => {
             let values = list
                 .list
@@ -3941,6 +3952,19 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
     }
 }
 
+/// A single `column = column` conjunct (TiDB 0.8 pseudo factor).
+fn is_column_eq_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    matches!(
+        filter.split_cnf().as_slice(),
+        [ExprNode::Binary(bin)]
+            if bin.op == Op::Eq
+                && matches!(*bin.left, ExprNode::Column(_))
+                && matches!(*bin.right, ExprNode::Column(_))
+    )
+}
+
 fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
@@ -4200,6 +4224,15 @@ fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
     {
         return Some(0.001);
     }
+    // TiDB `selectionFactor`: a comparison between two columns cannot use an
+    // index statistic, so it keeps the 0.8 pseudo factor (`a = b` over 10000
+    // pseudo rows estimates 8000).
+    if bin.op == Op::Eq
+        && matches!(*bin.left, ExprNode::Column(_))
+        && matches!(*bin.right, ExprNode::Column(_))
+    {
+        return Some(0.8);
+    }
     None
 }
 
@@ -4313,6 +4346,22 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         } if is_not_isnull(filter) => {
             let n = not_isnull_count(filter).max(1);
             (*row_count * 0.999_f64.powi(n as i32)).min(9_990.0)
+        }
+        // TiDB `selectionFactor` on a column-vs-column equality (`a = b` over
+        // 10000 pseudo rows estimates 8000).
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if is_column_eq_filter(filter) => *row_count * 0.8,
+        // Each equality on a *distinct* column contributes its own 1/1000
+        // pseudo factor (`a = 1 AND b = 2` estimates 0.01, not one match).
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if filter.split_cnf().len() > 1 && filter_selectivity(filter).is_some() => {
+            (*row_count * filter_selectivity(filter).unwrap_or(0.8)).max(0.0)
         }
         PhysicalPlan::TableReader {
             pushed: Some(filter),

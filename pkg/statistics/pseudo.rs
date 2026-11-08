@@ -103,7 +103,7 @@ pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     if let Some(sets) = dnf_eq_bound_sets(expr) {
         return Some(sets);
     }
-    if let Some((column, value)) = expr.eq_column_const() {
+    if let Some((column, value)) = expr.eq_key_const() {
         let point = (Some((value.clone(), true)), Some((value, true)));
         return Some((column, vec![point]));
     }
@@ -144,7 +144,7 @@ fn dnf_eq_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     let mut column: Option<String> = None;
     let mut ranges = Vec::with_capacity(arms.len());
     for arm in &arms {
-        let (name, value) = arm.eq_column_const()?;
+        let (name, value) = arm.eq_key_const()?;
         match &column {
             Some(have) if !have.eq_ignore_ascii_case(&name) => return None,
             _ => column = Some(name),
@@ -251,7 +251,7 @@ pub fn format_datum(value: &Datum) -> String {
 /// Bounds of a single `col <op> const` / `BETWEEN` conjunct.
 pub fn conjunct_column_range(expr: &ExprNode) -> Option<(String, ColumnRange)> {
     // `col = const` ranger folds to an inclusive point range `[v, v]`.
-    if let Some((column, value)) = expr.eq_column_const() {
+    if let Some((column, value)) = expr.eq_key_const() {
         return Some((
             column.clone(),
             ColumnRange {

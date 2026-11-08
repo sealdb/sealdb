@@ -185,6 +185,91 @@ impl ExprNode {
         }
     }
 
+    /// `expr = const` on any left-hand side, keyed by [`ExprNode::expr_key`]:
+    /// a plain column reports its name, an expression reports its canonical
+    /// text, which is how a predicate matches an expression index part
+    /// (`tidb_shard(a) = 8` → key `tidb_shard(a)`).
+    pub fn eq_key_const(&self) -> Option<(String, Datum)> {
+        if let Some(hit) = self.eq_column_const() {
+            return Some(hit);
+        }
+        let ExprNode::Binary(bin) = self else {
+            return None;
+        };
+        if !matches!(bin.op, Op::Eq | Op::NullSafeEq) {
+            return None;
+        }
+        match (bin.left.as_ref(), bin.right.as_ref()) {
+            (left, right) if !matches!(left, ExprNode::Column(_)) => {
+                right.const_datum().map(|value| (left.expr_key(), value))
+            }
+            (left, right) if !matches!(right, ExprNode::Column(_)) => {
+                left.const_datum().map(|value| (right.expr_key(), value))
+            }
+            _ => None,
+        }
+    }
+
+    /// Canonical text of an expression, used to match an index key part with
+    /// the predicate that constrains it. Table qualifiers and quoting are
+    /// dropped, so `` tidb_shard(`a`) `` and `test3.a`'s `tidb_shard(test3.a)`
+    /// share the key `tidb_shard(a)`.
+    pub fn expr_key(&self) -> String {
+        let mut text = String::new();
+        self.write_expr_key(&mut text);
+        text
+    }
+
+    fn write_expr_key(&self, out: &mut String) {
+        match self {
+            ExprNode::Column(col) => out.push_str(&col.name.to_ascii_lowercase()),
+            ExprNode::Value(value) => {
+                let mut ctx = RestoreCtx::new();
+                let _ = value.restore(&mut ctx);
+                out.push_str(&ctx.into_string());
+            }
+            ExprNode::Binary(bin) => {
+                out.push('(');
+                bin.left.write_expr_key(out);
+                out.push_str(bin.op.restore());
+                bin.right.write_expr_key(out);
+                out.push(')');
+            }
+            ExprNode::Unary(unary) => {
+                out.push_str(unary.op.restore());
+                unary.expr.write_expr_key(out);
+            }
+            ExprNode::Func(func) => {
+                out.push_str(&func.name.to_ascii_lowercase());
+                out.push('(');
+                for (i, arg) in func.args.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    arg.write_expr_key(out);
+                }
+                out.push(')');
+            }
+            ExprNode::Cast(cast) => {
+                out.push_str("cast(");
+                cast.expr.write_expr_key(out);
+                out.push_str(" as ");
+                out.push_str(&cast.target.to_ascii_lowercase());
+                out.push(')');
+            }
+            // Anything else falls back to the restored SQL text with the
+            // quoting removed, which is still stable across qualifiers.
+            other => {
+                out.push_str(
+                    &other
+                        .restore_string()
+                        .replace(['`', '"'], "")
+                        .to_ascii_lowercase(),
+                );
+            }
+        }
+    }
+
     pub fn eq_const_on(&self, column: &str) -> Option<Datum> {
         self.split_cnf().into_iter().find_map(|expr| {
             expr.eq_column_const()
