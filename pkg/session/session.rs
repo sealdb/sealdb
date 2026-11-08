@@ -9172,3 +9172,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod expression_index_tests {
+    use super::*;
+
+    fn setup() -> Session {
+        let session = Session::new();
+        session.execute_stmt("create database edb").unwrap();
+        session.execute_stmt("use edb").unwrap();
+        session
+    }
+
+    /// `KEY idx ((a + b + 1))` materialises a hidden generated column, keeps it
+    /// out of client-visible output, and exposes it through `tidb_indexes`.
+    #[test]
+    fn test_expression_index_create_insert_select() {
+        let session = setup();
+        session
+            .execute_stmt("create table t4 (a int, b int, c int, index idx(a, b))")
+            .unwrap();
+        session
+            .execute_stmt("create index expr_idx on t4 ((a+b+1))")
+            .unwrap();
+        session
+            .execute_stmt("insert into t4 values (1, 2, 3), (4, 5, 6)")
+            .unwrap();
+
+        let all = session.execute_stmt("select * from t4 order by a").unwrap();
+        assert_eq!(all.columns, vec!["a", "b", "c"]);
+        assert_eq!(
+            all.display_rows(),
+            vec![
+                vec!["1".to_string(), "2".into(), "3".into()],
+                vec!["4".to_string(), "5".into(), "6".into()],
+            ]
+        );
+
+        let create = session.execute_stmt("show create table t4").unwrap();
+        let ddl = create.display_rows()[0][1].clone();
+        assert!(ddl.contains("KEY `expr_idx` ((`a` + `b` + 1))"), "{ddl}");
+        assert!(!ddl.contains("_V$"), "{ddl}");
+
+        let is = session
+            .execute_stmt(
+                "select COLUMN_NAME, Expression, INDEX_ID from information_schema.tidb_indexes                  where table_name = 't4' and key_name = 'expr_idx'",
+            )
+            .unwrap();
+        assert_eq!(
+            is.display_rows(),
+            vec![vec![
+                "NULL".to_string(),
+                "`a` + `b` + 1".into(),
+                "1".into()
+            ]]
+        );
+        assert_eq!(
+            session
+                .execute_stmt("select * from information_schema.columns where table_name = 't4'")
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+    }
+
+    /// `CREATE INDEX` on a populated table evaluates the expression for every
+    /// existing row before the index backfill.
+    #[test]
+    fn test_expression_index_backfills_existing_rows() {
+        let session = setup();
+        session
+            .execute_stmt("create table t (a int, b int)")
+            .unwrap();
+        session
+            .execute_stmt("insert into t values (1, 10), (2, 20)")
+            .unwrap();
+        session
+            .execute_stmt("create index expr_idx on t ((a+b))")
+            .unwrap();
+        let rows = session
+            .execute_stmt("select a, b from t order by a")
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        // The value must be readable back through the expression index itself.
+        let hit = session
+            .execute_stmt("select b from t where a = 2")
+            .unwrap();
+        assert_eq!(hit.display_rows(), vec![vec!["20".to_string()]]);
+    }
+
+    /// `unique key uk_expr((tidb_shard(a)), a)` is accepted (TiDB shard index).
+    #[test]
+    fn test_tidb_shard_expression_index_ddl() {
+        let session = setup();
+        session
+            .execute_stmt(
+                "create table test3(id int primary key clustered, a int, b int, \
+                 unique key uk_expr((tidb_shard(a)),a))",
+            )
+            .unwrap();
+        session
+            .execute_stmt("insert into test3 values (1, 100, 1)")
+            .unwrap();
+        let dup = session.execute_stmt("insert into test3 values (2, 100, 2)");
+        assert_eq!(dup.unwrap_err().code, sealdb_errno::ERR_DUP_ENTRY);
+        let all = session.execute_stmt("select * from test3").unwrap();
+        assert_eq!(all.columns, vec!["id", "a", "b"]);
+        let create = session.execute_stmt("show create table test3").unwrap();
+        assert!(
+            create.display_rows()[0][1].contains("UNIQUE KEY `uk_expr` ((tidb_shard(`a`)), `a`)"),
+            "{}",
+            create.display_rows()[0][1]
+        );
+    }
+
+    /// Primary keys cannot be expression indexes (TiDB 3756).
+    #[test]
+    fn test_expression_primary_key_rejected() {
+        let session = setup();
+        let err = session
+            .execute_stmt("create table t (a int, b int, primary key ((a+b)) nonclustered)")
+            .unwrap_err();
+        assert_eq!(err.code, 3756, "{err}");
+        // Disallowed functions are rejected too (TiDB 3758).
+        let err = session
+            .execute_stmt("create table t2 (a int, index ((rand())))")
+            .unwrap_err();
+        assert_eq!(err.code, 3758, "{err}");
+    }
+}

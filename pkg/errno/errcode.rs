@@ -70,3 +70,13 @@ pub const ERR_VIEW_INVALID: i32 = 1471;
 pub const ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION: i32 = 1792;
 /// TiDB `ErrCTEMaxRecursionDepth`: recursive CTE exceeded @@cte_max_recursion_depth.
 pub const ERR_CTE_MAX_RECURSION_DEPTH: i32 = 3636;
+/// TiDB `ErrFunctionalIndexOnJSONOrGeometryFunction`.
+pub const ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION: i32 = 3753;
+/// TiDB `ErrPrimaryKeyOnExprColumn`: `PRIMARY KEY ((a + b))`.
+pub const ERR_PRIMARY_KEY_ON_EXPR_COLUMN: i32 = 3756;
+/// TiDB `ErrFunctionalIndexOnField`: expression index over a disallowed function.
+pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
+/// TiDB `ErrFunctionalIndexOnBlob`: the storage engine cannot index the expr.
+pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
+/// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
+pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;

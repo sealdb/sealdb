@@ -5240,7 +5240,7 @@ fn star_columns_for_table(
         let Some(info) = is.and_then(|is| is.table_by_name(schema, table.resolve_name())) else {
             continue;
         };
-        for col in &info.columns {
+        for col in info.columns.iter().filter(|c| !c.hidden) {
             out.push((table.resolve_name().to_string(), col.name.o().to_string()));
         }
     }
@@ -9637,7 +9637,7 @@ fn star_projection_exprs(
         let Some(info) = is.and_then(|is| is.table_by_name(schema, table.resolve_name())) else {
             continue;
         };
-        for col in &info.columns {
+        for col in info.columns.iter().filter(|c| !c.hidden) {
             let key = (
                 table.resolve_name().to_ascii_lowercase(),
                 col.name.o().to_ascii_lowercase(),

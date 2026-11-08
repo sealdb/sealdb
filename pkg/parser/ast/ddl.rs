@@ -189,10 +189,46 @@ impl AlterDatabaseStmt {
     }
 }
 
+/// One key part of an index: a plain column or a TiDB expression index part
+/// (`KEY idx ((`a` + `b` + 1))`, `UNIQUE KEY uk ((tidb_shard(`a`)), a)`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexPart {
+    Column(String),
+    /// TiDB expression index part. The text is `field.Text()` spelling, which
+    /// is what `SHOW CREATE TABLE` / `information_schema.tidb_indexes` render.
+    Expression(String),
+}
+
+impl IndexPart {
+    pub fn column(name: impl Into<String>) -> Self {
+        Self::Column(name.into())
+    }
+
+    pub fn expression(text: impl Into<String>) -> Self {
+        Self::Expression(text.into())
+    }
+
+    /// Column name for a plain part, `None` for an expression part.
+    pub fn column_name(&self) -> Option<&str> {
+        match self {
+            Self::Column(name) => Some(name),
+            Self::Expression(_) => None,
+        }
+    }
+
+    /// Expression text for an expression part.
+    pub fn as_expression(&self) -> Option<&str> {
+        match self {
+            Self::Column(_) => None,
+            Self::Expression(text) => Some(text),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexDef {
     pub name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<IndexPart>,
     pub unique: bool,
     pub primary: bool,
     /// TiDB `GLOBAL` index option on a partitioned table: the index spans every
@@ -240,7 +276,16 @@ impl IndexDef {
             if i > 0 {
                 ctx.write_str(",");
             }
-            ctx.write_name(col);
+            match col {
+                IndexPart::Column(name) => ctx.write_name(name),
+                // TiDB wraps an expression index part in an extra paren pair:
+                // `KEY idx ((`a` + 1))`.
+                IndexPart::Expression(text) => {
+                    ctx.write_str("(");
+                    ctx.write_str(text);
+                    ctx.write_str(")");
+                }
+            }
         }
         ctx.write_str(")");
         // TiDB `SHOW CREATE TABLE` keeps the GLOBAL option behind a version
@@ -621,7 +666,7 @@ pub struct CreateIndexStmt {
     pub if_not_exists: bool,
     pub table: TableName,
     pub name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<IndexPart>,
     pub unique: bool,
 }
 
@@ -643,7 +688,14 @@ impl CreateIndexStmt {
             if i > 0 {
                 ctx.write_str(",");
             }
-            ctx.write_name(col);
+            match col {
+                IndexPart::Column(name) => ctx.write_name(name),
+                IndexPart::Expression(text) => {
+                    ctx.write_str("(");
+                    ctx.write_str(text);
+                    ctx.write_str(")");
+                }
+            }
         }
         ctx.write_str(")");
         Ok(())

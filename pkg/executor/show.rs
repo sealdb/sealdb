@@ -192,6 +192,7 @@ impl Executor for ShowExec {
                 self.rows = info
                     .columns
                     .iter()
+                    .filter(|col| !col.hidden)
                     .filter(|col| show_column_visible(col.name.o(), column, pattern))
                     .map(|col| column_row(info, col, full))
                     .collect();
@@ -443,6 +444,7 @@ fn render_create_table(info: &TableInfo) -> String {
     let mut cols: Vec<String> = info
         .columns
         .iter()
+        .filter(|col| !col.hidden)
         .map(|col| {
             let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
             if let Some(default) = &col.default_expr {
@@ -464,7 +466,12 @@ fn render_create_table(info: &TableInfo) -> String {
         let parts = idx
             .columns
             .iter()
-            .map(|c| format!("`{}`", c.name.o()))
+            .map(|c| match info.columns.iter().find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o())) {
+                // Expression key part: TiDB prints the generating expression
+                // wrapped in an extra paren pair.
+                Some(col) => format!("({})", col.generated_expr.clone().unwrap_or_default()),
+                None => format!("`{}`", c.name.o()),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         cols.push(format!("  {key} `{}` ({parts})", idx.name.o()));

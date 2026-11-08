@@ -1102,7 +1102,10 @@ mod tests {
             crate::ast::Statement::CreateTable(create) => {
                 assert_eq!(create.indices.len(), 1);
                 assert_eq!(create.indices[0].name, "idx_name");
-                assert_eq!(create.indices[0].columns, vec!["name".to_string()]);
+                assert_eq!(
+                    create.indices[0].columns,
+                    vec![crate::ast::IndexPart::column("name")]
+                );
                 assert!(!create.indices[0].unique);
                 assert!(!create.indices[0].primary);
             }
@@ -1114,7 +1117,7 @@ mod tests {
         {
             crate::ast::Statement::CreateIndex(create) => {
                 assert_eq!(create.name, "idx_name");
-                assert_eq!(create.columns, vec!["name".to_string()]);
+                assert_eq!(create.columns, vec![crate::ast::IndexPart::column("name")]);
                 assert!(!create.unique);
             }
             other => panic!("expected CreateIndexStmt, got {other:?}"),

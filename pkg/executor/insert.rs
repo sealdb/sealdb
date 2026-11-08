@@ -401,13 +401,17 @@ fn map_insert_row(
     row_no: usize,
 ) -> Result<Vec<Datum>> {
     if columns.is_empty() {
-        if row.len() != info.columns.len() {
+        // Hidden expression-index columns are not part of the user-visible
+        // column list, so `INSERT INTO t VALUES (...)` counts only the rest.
+        let visible: Vec<&sealdb_meta::ColumnInfo> =
+            info.columns.iter().filter(|c| !c.hidden).collect();
+        if row.len() != visible.len() {
             return Err(wrong_value_count_on_row(row_no));
         }
         // Cast literals to column FieldType (UNSIGNED BIGINT / DECIMAL scale).
-        let mut values = Vec::with_capacity(info.columns.len());
-        for (col, v) in info.columns.iter().zip(row.iter()) {
-            values.push(cast_for_column(v, col)?);
+        let mut values = vec![Datum::Null; info.columns.len()];
+        for (col, v) in visible.iter().zip(row.iter()) {
+            values[col.offset as usize] = cast_for_column(v, col)?;
         }
         fill_generated_columns(info, &mut values)?;
         return Ok(values);

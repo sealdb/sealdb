@@ -25,6 +25,11 @@ pub struct ColumnInfo {
     /// `AUTO_INCREMENT` column option (TiDB `ColumnInfo.AutoIncrement`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_increment: bool,
+    /// TiDB `ColumnInfo.Hidden`: an internal column backing an expression index
+    /// (`_V$_idx_0`). Hidden columns are stored in the row but never shown to
+    /// clients (`SELECT *`, `SHOW CREATE TABLE`, `information_schema`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 impl ColumnInfo {
@@ -40,6 +45,7 @@ impl ColumnInfo {
             generated_stored: false,
             default_expr: None,
             auto_increment: false,
+            hidden: false,
         }
     }
 }

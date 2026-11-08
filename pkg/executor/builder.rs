@@ -1674,6 +1674,7 @@ fn select_from_column_names(
             Some(info) => info
                 .columns
                 .iter()
+                .filter(|c| !c.hidden)
                 .map(|c| c.name.o().to_string())
                 .collect(),
             None => cte_cols(&name),

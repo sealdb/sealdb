@@ -84,7 +84,16 @@ impl Executor for TableReaderExec {
         self.schema = info
             .columns
             .iter()
-            .map(|c| c.name.o().to_string())
+            .map(|c| {
+                // Hidden expression-index columns keep their place in the row
+                // layout but never reach a client (`\u{1}` marks them hidden,
+                // see `ExecutorBuilder::run`).
+                if c.hidden {
+                    format!("\u{1}{}", c.name.o())
+                } else {
+                    c.name.o().to_string()
+                }
+            })
             .collect();
         // Empty partitions + pushed filter = dynamic prune at execute.
         let physical = if !self.partitions.is_empty() {

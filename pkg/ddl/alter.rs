@@ -226,8 +226,7 @@ fn column_default_datum(col: &ColumnInfo) -> Result<Option<sealdb_types::Datum>>
 
 /// `ALTER TABLE … ADD COLUMN … DEFAULT x` fills existing rows with `x`
 /// (TiDB/MySQL expose the default for rows written before the column existed).
-fn backfill_added_column(
-    storage: &dyn Storage,
+fn backfill_added_column(    storage: &dyn Storage,
     info: &TableInfo,
     types: &[(i64, sealdb_types::FieldType)],
     col_id: i64,
@@ -249,6 +248,82 @@ fn backfill_added_column(
             col_ids.push(col_id);
             values.push(value.clone());
             txn.set(&key, &encode_row(&col_ids, &values))?;
+        }
+    }
+    txn.commit()
+}
+
+/// Backfill newly added expression-index hidden columns.
+///
+/// `types` is the layout of rows already on disk (without the new columns);
+/// every missing column is evaluated from the decoded row and appended.
+pub(crate) fn backfill_generated_columns(
+    storage: &dyn Storage,
+    info: &TableInfo,
+    types: &[(i64, FieldType)],
+    new_col_ids: &[i64],
+) -> Result<()> {
+    let mut pending = Vec::with_capacity(new_col_ids.len());
+    for id in new_col_ids {
+        let col = info
+            .columns
+            .iter()
+            .find(|c| c.id == *id)
+            .ok_or_else(|| Error::new(ERR_BAD_FIELD, format!("unknown column id {id}")))?;
+        let Some(text) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        pending.push((*id, col, expr));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let schema: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let offset_of = |id: i64| {
+        info.columns
+            .iter()
+            .position(|c| c.id == id)
+            .unwrap_or(usize::MAX)
+    };
+    let mut txn = storage.begin()?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, raw) in pairs {
+            let decoded = decode_row(&raw, types);
+            let present = |id: i64| decoded.iter().any(|(d, _)| *d == id);
+            if pending.iter().all(|(id, _, _)| present(*id)) {
+                continue;
+            }
+            // Full-width row values in column-offset order, so a generated
+            // expression sees the same layout it sees on INSERT.
+            let mut values = vec![sealdb_types::Datum::Null; info.columns.len()];
+            for (id, v) in &decoded {
+                let offset = offset_of(*id);
+                if offset < values.len() {
+                    values[offset] = v.clone();
+                }
+            }
+            let mut col_ids: Vec<i64> = decoded.iter().map(|(id, _)| *id).collect();
+            let mut out: Vec<sealdb_types::Datum> =
+                decoded.into_iter().map(|(_, v)| v).collect();
+            for (id, col, expr) in &pending {
+                if col_ids.contains(id) {
+                    continue;
+                }
+                let value = sealdb_expression::eval_expr_with_row(expr, &schema, &values)?;
+                let value = value.cast(&col.field_type)?;
+                values[offset_of(*id)] = value.clone();
+                col_ids.push(*id);
+                out.push(value);
+            }
+            txn.set(&key, &encode_row(&col_ids, &out))?;
         }
     }
     txn.commit()

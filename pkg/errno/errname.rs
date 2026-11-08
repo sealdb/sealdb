@@ -57,6 +57,15 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_VIEW_INVALID => "ErrViewInvalid",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         errcode::ERR_CTE_MAX_RECURSION_DEPTH => "ErrCTEMaxRecursionDepth",
+        errcode::ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION => {
+            "ErrFunctionalIndexOnJSONOrGeometryFunction"
+        }
+        errcode::ERR_PRIMARY_KEY_ON_EXPR_COLUMN => "ErrPrimaryKeyOnExprColumn",
+        errcode::ERR_FUNCTIONAL_INDEX_ON_FIELD => "ErrFunctionalIndexOnField",
+        errcode::ERR_FUNCTIONAL_INDEX_ON_BLOB => "ErrFunctionalIndexOnBlob",
+        errcode::ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED => {
+            "ErrFunctionalIndexRowValueIsNotAllowed"
+        }
         errcode::ERR_MEMORY_EXCEEDED => "ErrMemoryExceedForQuery",
         _ => "ErrUnknown",
     }

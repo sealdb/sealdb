@@ -5,6 +5,7 @@ pub mod alter;
 pub mod bootstrap;
 pub mod create_table;
 pub mod ddl;
+pub mod expr_index;
 pub mod index;
 pub mod partition;
 pub mod reorg;

@@ -11,6 +11,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "tables" => Ok(tables(is)),
         "columns" => Ok(columns(is)),
         "statistics" => Ok(statistics(is)),
+        "tidb_indexes" => Ok(tidb_indexes(is)),
         "key_column_usage" => Ok(key_column_usage(is)),
         "table_constraints" => Ok(table_constraints(is)),
         "partitions" => Ok(partitions(is)),
@@ -112,6 +113,10 @@ fn columns(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
         for (i, col) in table.columns.iter().enumerate() {
+            // Hidden expression-index columns are internal.
+            if col.hidden {
+                continue;
+            }
             let type_name = col.field_type.type_name();
             rows.push(vec![
                 bytes("def"),
@@ -155,6 +160,16 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     for_each_table(is, |db, table| {
         for idx in &table.indices {
             for (seq, col) in idx.columns.iter().enumerate() {
+                // An expression key part reports COLUMN_NAME NULL and its
+                // generating expression instead (MySQL 8 / TiDB `Expression`).
+                let (column_name, expression) =
+                    match table.columns.iter().find(|c| c.hidden && c.name.o().eq_ignore_ascii_case(col.name.o())) {
+                        Some(hidden) => (
+                            Datum::Null,
+                            bytes(hidden.generated_expr.as_deref().unwrap_or_default()),
+                        ),
+                        None => (bytes(col.name.o()), Datum::Null),
+                    };
                 rows.push(vec![
                     bytes("def"),
                     bytes(db),
@@ -163,7 +178,7 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     bytes(db),
                     bytes(idx.name.o()),
                     Datum::I64((seq + 1) as i64),
-                    bytes(col.name.o()),
+                    column_name,
                     bytes("A"),
                     Datum::Null,
                     Datum::Null,
@@ -173,6 +188,66 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     bytes(""),
                     bytes(""),
                     bytes("YES"),
+                    expression,
+                ]);
+            }
+        }
+    });
+    (schema, rows)
+}
+
+
+/// TiDB `information_schema.tidb_indexes`: `statistics` plus the index id,
+/// visibility, clustered flag and (for expression key parts) the generating
+/// expression with `COLUMN_NAME` NULL.
+fn tidb_indexes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec![
+        "TABLE_SCHEMA".to_string(),
+        "TABLE_NAME".to_string(),
+        "NON_UNIQUE".to_string(),
+        "KEY_NAME".to_string(),
+        "SEQ_IN_INDEX".to_string(),
+        "COLUMN_NAME".to_string(),
+        "SUB_PART".to_string(),
+        "INDEX_COMMENT".to_string(),
+        "Expression".to_string(),
+        "INDEX_ID".to_string(),
+        "IS_VISIBLE".to_string(),
+        "CLUSTERED".to_string(),
+        "IS_GLOBAL".to_string(),
+        "PREDICATE".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for_each_table(is, |db, table| {
+        for idx in &table.indices {
+            let clustered = idx.primary && table.pk_is_clustered();
+            for (seq, col) in idx.columns.iter().enumerate() {
+                let (column_name, expression) = match table
+                    .columns
+                    .iter()
+                    .find(|c| c.hidden && c.name.o().eq_ignore_ascii_case(col.name.o()))
+                {
+                    Some(hidden) => (
+                        Datum::Null,
+                        bytes(hidden.generated_expr.as_deref().unwrap_or_default()),
+                    ),
+                    None => (bytes(col.name.o()), Datum::Null),
+                };
+                rows.push(vec![
+                    bytes(db),
+                    bytes(table.name.o()),
+                    Datum::I64(if idx.unique || idx.primary { 0 } else { 1 }),
+                    bytes(idx.name.o()),
+                    Datum::I64((seq + 1) as i64),
+                    column_name,
+                    Datum::Null,
+                    bytes(""),
+                    expression,
+                    // TiDB index ids are 0-based per table.
+                    Datum::I64(idx.id - 1),
+                    bytes("YES"),
+                    bytes(if clustered { "YES" } else { "NO" }),
+                    Datum::I64(0),
                     Datum::Null,
                 ]);
             }

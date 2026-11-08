@@ -40,19 +40,11 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     }
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
     for (offset, index) in stmt.indices.iter().enumerate() {
-        let mut idx_cols = Vec::with_capacity(index.columns.len());
-        for col_name in &index.columns {
-            let col = info
-                .columns
-                .iter()
-                .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
-                .ok_or_else(|| {
-                    Error::new(
-                        sealdb_errno::ERR_BAD_FIELD,
-                        format!("Unknown column '{col_name}' in index '{}'", index.name),
-                    )
-                })?;
-            idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
+        let (idx_cols, hidden) =
+            crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
+        for col in hidden {
+            info.columns.push(col);
+            info.max_col_id = info.max_col_id.max(info.columns.last().unwrap().id);
         }
         let idx_id = (offset as i64) + 1;
         // PRIMARY KEY handle choice follows `tidb_enable_clustered_index`

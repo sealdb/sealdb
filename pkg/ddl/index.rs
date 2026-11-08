@@ -5,12 +5,12 @@
 use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
-    ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME,
+    ERR_BAD_DB, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME,
     ERR_NO_SUCH_TABLE, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
-use sealdb_meta::{IndexColumn, IndexInfo, Mutator, TableInfo};
+use sealdb_meta::{IndexInfo, Mutator, TableInfo};
 use sealdb_parser::ast::{CreateIndexStmt, DropIndexStmt, IndexDef, TableName};
 use sealdb_tablecodec::{
     decode_handle_from_row_key, decode_row, encode_index_key, encode_index_seek_key,
@@ -86,19 +86,19 @@ pub fn add_index(
             format!("Duplicate key name '{}'", index.name),
         ));
     }
-    let mut idx_cols = Vec::with_capacity(index.columns.len());
-    for col_name in &index.columns {
-        let col = info
-            .columns
-            .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
-            .ok_or_else(|| {
-                Error::new(
-                    ERR_BAD_FIELD,
-                    format!("Unknown column '{col_name}' in index '{}'", index.name),
-                )
-            })?;
-        idx_cols.push(IndexColumn::new(col.name.o(), col.offset));
+    let (idx_cols, hidden) =
+        crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
+    // Expression parts add hidden VIRTUAL columns; rows written before this
+    // index lack them, so they are backfilled before the index backfill runs.
+    if !hidden.is_empty() {
+        let old_types = info.col_field_types();
+        let mut new_col_ids = Vec::with_capacity(hidden.len());
+        for col in hidden {
+            new_col_ids.push(col.id);
+            info.columns.push(col);
+            info.max_col_id = info.max_col_id.max(info.columns.last().unwrap().id);
+        }
+        crate::alter::backfill_generated_columns(storage, &info, &old_types, &new_col_ids)?;
     }
     info.max_idx_id += 1;
     let mut built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)

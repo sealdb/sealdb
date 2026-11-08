@@ -3,7 +3,7 @@ use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    GeneratedColumn, ForeignKeyDef, IndexDef, PartitionDef, PartitionOption, PartitionType,
+    GeneratedColumn, ForeignKeyDef, IndexDef, IndexPart, PartitionDef, PartitionOption, PartitionType,
     SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
 };
 use crate::ast::dml::{
@@ -35,8 +35,8 @@ use crate::ast::misc::{
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR, ERR_UNSUPPORTED, Error,
-    Result,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
+    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_UNSUPPORTED, Error, Result,
 };
 use sealdb_types::{
     parse_date_literal, parse_time_literal, parse_timestamp_literal, Datum,
@@ -8574,13 +8574,16 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             .any(|opt| {
                 matches!(&opt.option, sqlparser::ast::ColumnOption::Unique(u) if u.columns.is_empty())
             })
-            && !indices
-                .iter()
-                .any(|i| i.columns.len() == 1 && i.columns[0].eq_ignore_ascii_case(&col.name.value))
+            && !indices.iter().any(|i| {
+                i.columns.len() == 1
+                    && i.columns[0]
+                        .column_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col.name.value))
+            })
         {
             indices.push(IndexDef {
                 name: col.name.value.clone(),
-                columns: vec![col.name.value.clone()],
+                columns: vec![IndexPart::column(col.name.value.clone())],
                 unique: true,
                 primary: false,
                 global: false,
@@ -8596,7 +8599,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 0,
                 IndexDef {
                     name: "PRIMARY".into(),
-                    columns: vec![name],
+                    columns: vec![IndexPart::column(name)],
                     unique: true,
                     primary: true,
                     global: false,
@@ -9673,15 +9676,16 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
     let columns = create
         .columns
         .iter()
-        .map(index_column_name)
+        .map(index_part)
         .collect::<Result<Vec<_>>>()?;
     if columns.is_empty() {
         return Err(Error::unsupported("CREATE INDEX without columns"));
     }
     let name = match &create.name {
         Some(name) => object_name_last(name)?,
-        // MySQL/TiDB: unnamed index → first column name (not `idx_…`).
-        None => columns[0].clone(),
+        // MySQL/TiDB: unnamed index → first column name, or
+        // `expression_index` when the first key part is an expression.
+        None => default_index_name(&columns),
     };
     Ok(Statement::CreateIndex(CreateIndexStmt {
         if_not_exists: create.if_not_exists,
@@ -9838,7 +9842,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 let columns = idx
                     .columns
                     .iter()
-                    .map(index_column_name)
+                    .map(index_part)
                     .collect::<Result<Vec<_>>>()?;
                 if columns.is_empty() {
                     return Err(Error::unsupported("INDEX without columns"));
@@ -9850,7 +9854,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     .name
                     .as_ref()
                     .map(|ident| ident.value.clone())
-                    .unwrap_or_else(|| columns[0].clone());
+                    .unwrap_or_else(|| default_index_name(&columns));
                 Ok(AlterTableSpec::AddIndex(IndexDef {
                     name,
                     columns,
@@ -9879,7 +9883,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                 let columns = idx
                     .columns
                     .iter()
-                    .map(index_column_name)
+                    .map(index_part)
                     .collect::<Result<Vec<_>>>()?;
                 if columns.is_empty() {
                     return Err(Error::unsupported("INDEX without columns"));
@@ -9892,8 +9896,9 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     .name
                     .as_ref()
                     .map(|ident| ident.value.clone())
-                    // MySQL/TiDB: `KEY (b)` → index name `b`.
-                    .unwrap_or_else(|| columns[0].clone());
+                    // MySQL/TiDB: `KEY (b)` → index name `b`; an expression
+                    // key defaults to `expression_index`.
+                    .unwrap_or_else(|| default_index_name(&columns));
                 indices.push(IndexDef {
                     name,
                     columns,
@@ -9929,7 +9934,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
     let columns = idx
         .columns
         .iter()
-        .map(index_column_name)
+        .map(index_part)
         .collect::<Result<Vec<_>>>()?;
     if columns.is_empty() {
         return Err(Error::unsupported("UNIQUE INDEX without columns"));
@@ -9939,7 +9944,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         .as_ref()
         .or(idx.name.as_ref())
         .map(|ident| ident.value.clone())
-        .unwrap_or_else(|| columns[0].clone());
+        .unwrap_or_else(|| default_index_name(&columns));
     Ok(IndexDef {
         name,
         columns,
@@ -9958,21 +9963,34 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     let mut columns = idx
         .columns
         .iter()
-        .map(index_column_name)
+        .map(index_part)
         .collect::<Result<Vec<_>>>()?;
     if columns.is_empty() {
         return Err(Error::unsupported("PRIMARY KEY without columns"));
     }
-    let nonclustered = match columns[0].strip_prefix(NONCLUSTERED_MARKER) {
+    // TiDB `buildTableInfoWithCheck`: ErrPrimaryKeyOnExprColumn.
+    for part in &columns {
+        if part.as_expression().is_some() {
+            return Err(Error::new(
+                ERR_PRIMARY_KEY_ON_EXPR_COLUMN,
+                "The primary key cannot be an expression index",
+            ));
+        }
+    }
+    let strip_marker = |part: &IndexPart, marker: &str| -> Option<IndexPart> {
+        let name = part.column_name()?;
+        name.strip_prefix(marker).map(|rest| IndexPart::column(rest))
+    };
+    let nonclustered = match strip_marker(&columns[0], NONCLUSTERED_MARKER) {
         Some(rest) => {
-            columns[0] = rest.to_string();
+            columns[0] = rest;
             true
         }
         None => false,
     };
-    let clustered = match columns[0].strip_prefix(CLUSTERED_MARKER) {
+    let clustered = match strip_marker(&columns[0], CLUSTERED_MARKER) {
         Some(rest) => {
-            columns[0] = rest.to_string();
+            columns[0] = rest;
             true
         }
         None => false,
@@ -9988,12 +10006,51 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     })
 }
 
-fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {
-    match &col.column.expr {
-        Expr::Identifier(ident) => Ok(ident.value.clone()),
+/// TiDB `buildIndexInfo`: an unnamed index takes its first column's name, and
+/// an expression-only index is named `expression_index`.
+fn default_index_name(columns: &[IndexPart]) -> String {
+    match &columns[0] {
+        IndexPart::Column(name) => name.clone(),
+        IndexPart::Expression(_) => "expression_index".to_string(),
+    }
+}
+
+/// One index key part: a column, a prefix-index column, or an expression.
+///
+/// MySQL requires the extra paren pair for an expression index
+/// (`KEY idx ((a + 1))`), which sqlparser keeps as `Expr::Nested`; a bare
+/// `col(N)` stays a prefix index.
+fn index_part(col: &sqlparser::ast::IndexColumn) -> Result<IndexPart> {
+    let expr = match &col.column.expr {
+        // `((a + b + 1))` / `((tidb_shard(a)), a)`.
+        Expr::Nested(inner) => inner.as_ref(),
+        other => other,
+    };
+    match expr {
+        Expr::Identifier(ident) => Ok(IndexPart::Column(ident.value.clone())),
         // MySQL prefix index `col(N)` parses as a function call; keep the name
         // (prefix length is applied later in DDL / IndexColumn.length).
         Expr::Function(f) => {
+            let is_prefix = match &f.args {
+                sqlparser::ast::FunctionArguments::List(list) => {
+                    list.args.len() == 1
+                        && matches!(
+                            list.args.first(),
+                            Some(sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+                                    sqlparser::ast::ValueWithSpan {
+                                        value: Value::Number(_, _),
+                                        ..
+                                    }
+                                ))
+                            ))
+                        )
+                }
+                _ => false,
+            };
+            if !is_prefix {
+                return Ok(IndexPart::expression(index_expr_text(expr)?));
+            }
             let raw = f
                 .name
                 .0
@@ -10005,10 +10062,16 @@ fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {
             if name.is_empty() {
                 return Err(Error::unsupported(format!("INDEX column {f}")));
             }
-            Ok(name)
+            Ok(IndexPart::Column(name))
         }
-        other => Err(Error::unsupported(format!("INDEX column {other}"))),
+        other => Ok(IndexPart::expression(index_expr_text(other)?)),
     }
+}
+
+/// `field.Text()` spelling of an index expression, used by SHOW CREATE TABLE
+/// and `information_schema.tidb_indexes`.
+fn index_expr_text(expr: &Expr) -> Result<String> {
+    Ok(lower_expr(expr)?.restore_string())
 }
 
 /// `CHAR(32)` length text; `VARCHAR(MAX)` has no MySQL length and keeps `MAX`.
