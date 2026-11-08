@@ -3264,8 +3264,14 @@ fn rewrite_one_update_comma_join(
     let [comma] = commas[..] else {
         return Ok(None);
     };
-    let Some(right) = rewrite_simple_derived_update_side(&sql[comma + 1..set_pos]) else {
-        return Ok(None);
+    // The right-hand side is either a simple derived table or a plain table
+    // reference (`UPDATE t1, t2 SET …`); anything else stays unsupported.
+    let right = match rewrite_simple_derived_update_side(&sql[comma + 1..set_pos]) {
+        Some(right) => right,
+        None => match simple_update_table_side(&sql[comma + 1..set_pos]) {
+            Some(right) => right,
+            None => return Ok(None),
+        },
     };
     let mut fragment = String::with_capacity(set_pos - start + right.len() + 16);
     fragment.push_str(&sql[start..comma]);
@@ -3273,6 +3279,27 @@ fn rewrite_one_update_comma_join(
     fragment.push_str(&right);
     fragment.push_str(" ON TRUE ");
     Ok(Some((fragment, set_pos)))
+}
+
+/// Plain table reference for the right arm of a comma join: `t2` or `t2 alias`
+/// (identifiers may be schema-qualified / backtick-quoted).
+fn simple_update_table_side(item: &str) -> Option<String> {
+    let text = item.trim();
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() > 2 {
+        return None;
+    }
+    let identifier = |token: &str| {
+        let token = token.trim_matches('`');
+        !token.is_empty()
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.')
+    };
+    if !tokens.iter().all(|token| identifier(token)) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 /// `(SELECT a, b FROM t) t2` → `t t2` when the subquery only projects base
