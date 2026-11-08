@@ -384,40 +384,78 @@ impl ExecutorBuilder {
                     .ok_or_else(|| Error::unsupported("batch point get without FROM"))?;
                 let from = resolve_reader_table(stmt, table)?;
                 let selection = select.selection.as_ref();
+                // Key values come from the table metadata, so an expression
+                // part folds from the plain parts (`uk_expr((tidb_shard(a)), a)`
+                // under `a IN (100, 200)`).
+                let (schema_name, table_name) = from.qualified(current_db);
+                let is = domain.infoschema();
+                let info = is.table_by_name(&schema_name, &table_name);
+                let index_info = index.as_deref().and_then(|name| {
+                    info.as_ref()?
+                        .indices
+                        .iter()
+                        .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+                });
+                let key_values = |known: &[(String, sealdb_types::Datum)]| {
+                    let info = info.as_ref()?;
+                    match index_info {
+                        Some(index) => index_key_values(info, index, known),
+                        // Handle batch point get: the row key is the primary
+                        // key value, one Datum per handle column.
+                        None => {
+                            let columns: &[String] = if index_columns.is_empty() {
+                                std::slice::from_ref(column)
+                            } else {
+                                index_columns
+                            };
+                            columns
+                                .iter()
+                                .map(|col| {
+                                    known
+                                        .iter()
+                                        .find(|(name, _)| name.eq_ignore_ascii_case(col))
+                                        .map(|(_, value)| value.clone())
+                                })
+                                .collect()
+                        }
+                    }
+                };
                 let lookups: Vec<Vec<sealdb_types::Datum>> = if tuple_columns.is_empty() {
                     selection
                         .and_then(|expr| expr.in_const_on(column))
                         .ok_or_else(|| Error::unsupported("batch point get without IN list"))?
                         .into_iter()
-                        .map(|value| vec![value])
-                        .collect()
+                        .map(|value| key_values(&[(column.clone(), value)]))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Error::unsupported("batch point get key values"))?
                 } else {
-                    let tuples = selection
+                    let (names, tuples) = selection
                         .and_then(|expr| {
                             expr.split_cnf()
                                 .into_iter()
                                 .find_map(|item| item.row_in_consts_with_len())
-                                .map(|(_, tuples, _)| tuples)
+                                .map(|(names, tuples, _)| (names, tuples))
                         })
-                        .or_else(|| selection.and_then(|expr| expr.dnf_const_tuples(tuple_columns)))
+                        .or_else(|| {
+                            selection
+                                .and_then(|expr| expr.dnf_const_tuples(tuple_columns))
+                                .map(|tuples| (tuple_columns.clone(), tuples))
+                        })
                         .ok_or_else(|| Error::unsupported("batch point get without key list"))?;
-                    // Reorder row values into the unique index column order.
                     tuples
                         .into_iter()
                         .map(|tuple| {
-                            index_columns
+                            let known: Vec<(String, sealdb_types::Datum)> = names
                                 .iter()
-                                .map(|index_col| {
-                                    tuple_columns
-                                        .iter()
-                                        .position(|col| col.eq_ignore_ascii_case(index_col))
-                                        .and_then(|pos| tuple.get(pos).cloned())
-                                        .unwrap_or(sealdb_types::Datum::Null)
-                                })
-                                .collect()
+                                .cloned()
+                                .zip(tuple.iter().cloned())
+                                .collect();
+                            key_values(&known)
                         })
-                        .collect()
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Error::unsupported("batch point get key values"))?
                 };
+                let _ = index_columns;
                 Ok(Box::new(BatchPointGetExec::new(
                     domain,
                     from,
@@ -1292,26 +1330,67 @@ fn index_lookup_values(
         .indices
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
-    let mut values = Vec::with_capacity(index.columns.len());
-    for column in &index.columns {
-        let column = column.name.o();
-        let value = selection
-            .and_then(|expr| expr.eq_const_on(column))
-            .or_else(|| {
-                selection
-                    .and_then(|expr| expr.in_const_on(column))
-                    .and_then(|values| values.into_iter().next())
-            })?;
-        let value = match info
+    let mut known: Vec<(String, sealdb_types::Datum)> = selection
+        .map(|expr| {
+            expr.split_cnf()
+                .into_iter()
+                .filter_map(|conjunct| conjunct.eq_key_const())
+                .collect()
+        })
+        .unwrap_or_default();
+    // A single point get also comes from an `IN` list (`(a, b, c) IN ((1, 1,
+    // 1), …)` de-duplicated to one key): every part then takes the first
+    // listed value, like TiDB's `detachCondAndBuildRangeForIndex`.
+    for part in &index.columns {
+        let key = sealdb_planner::core::expr_index::part_key(&info, part);
+        if known.iter().any(|(name, _)| name.eq_ignore_ascii_case(&key)) {
+            continue;
+        }
+        if let Some(value) = selection
+            .and_then(|expr| expr.in_const_on(&key))
+            .and_then(|values| values.into_iter().next())
+        {
+            known.push((key, value));
+        }
+    }
+    let mut values = index_key_values(&info, index, &known)?;
+    for (pos, part) in index.columns.iter().enumerate() {
+        let Some(column) = info
             .columns
             .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            .find(|c| c.name.o().eq_ignore_ascii_case(part.name.o()))
             .filter(|c| c.field_type.tp == sealdb_types::field_type::TYPE_BIT)
-        {
-            Some(col) => value.cast(&col.field_type).ok()?,
-            None => value,
+        else {
+            continue;
         };
-        values.push(value);
+        values[pos] = values[pos].cast(&column.field_type).ok()?;
+    }
+    Some(values)
+}
+
+/// Values of every key part for one point lookup: a plain part comes from the
+/// predicate equalities, an expression part folds from them
+/// (`uk_expr((tidb_shard(a)), a)` under `a = 100`).
+fn index_key_values(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    known: &[(String, sealdb_types::Datum)],
+) -> Option<Vec<sealdb_types::Datum>> {
+    let mut values = Vec::with_capacity(index.columns.len());
+    for part in &index.columns {
+        let key = sealdb_planner::core::expr_index::part_key(info, part);
+        match known
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&key))
+        {
+            Some((_, value)) => values.push(value.clone()),
+            None => {
+                let expr = sealdb_planner::core::expr_index::part_expr(info, part)?;
+                values.push(sealdb_planner::core::expr_index::eval_part(
+                    info, &expr, known,
+                )?);
+            }
+        }
     }
     Some(values)
 }
