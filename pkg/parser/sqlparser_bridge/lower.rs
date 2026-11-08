@@ -1099,12 +1099,12 @@ fn rewrite_primary_key_nonclustered(sql: &str) -> String {
             out.push(q as char);
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
-                if bytes[i] == q {
+                if sql.as_bytes()[i] == q {
+                    out.push(q as char);
                     i += 1;
                     break;
                 }
-                i += 1;
+                i = push_sql_char(&mut out, sql, i);
             }
             continue;
         }
@@ -5204,11 +5204,24 @@ fn take_explain_format(bytes: &[u8], i: usize) -> (String, usize) {
     }
     let quote = bytes[i];
     if quote == b'\'' || quote == b'"' {
+        // MySQL escapes a quote by doubling it (`'SELECT ''x'''`), so a naive
+        // first-quote scan truncates the value (`PREPARE s FROM 'SELECT ''a'''`
+        // must keep `SELECT 'a'`, not `SELECT `).
+        let mut raw = Vec::new();
         let mut j = i + 1;
-        while j < bytes.len() && bytes[j] != quote {
+        while j < bytes.len() {
+            if bytes[j] == quote {
+                if j + 1 < bytes.len() && bytes[j + 1] == quote {
+                    raw.push(quote);
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            raw.push(bytes[j]);
             j += 1;
         }
-        let value = String::from_utf8_lossy(&bytes[i + 1..j]).into_owned();
+        let value = String::from_utf8_lossy(&raw).into_owned();
         let end = if j < bytes.len() { j + 1 } else { j };
         return (value, end);
     }
@@ -10072,7 +10085,9 @@ mod hex_literal_tests {
     fn lower_0x80() {
         let expr = crate::sqlparser_bridge::parse_expr("0x80").unwrap();
         match expr {
-            ExprNode::Value(v) => assert_eq!(v.datum, Datum::Bytes(vec![0x80])),
+            // Binary literal datum: `0x80` keeps one raw byte instead of a
+            // number, so string contexts compare and print the bytes.
+            ExprNode::Value(v) => assert_eq!(v.datum, Datum::Bit(vec![0x80])),
             other => panic!("unexpected {other:?}"),
         }
     }

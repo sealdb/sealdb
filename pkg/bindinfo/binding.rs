@@ -81,8 +81,9 @@ fn strip_index_hints(sql: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch = sql[i..].chars().next().expect("sql index in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }

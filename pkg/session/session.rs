@@ -2650,7 +2650,21 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     let Statement::Select(select) = stmt else {
         return None;
     };
-    if select.from.is_some() || !select.joins.is_empty() {
+    if select.from.is_some() || !select.joins.is_empty() || select.from_item.is_some() {
+        return None;
+    }
+    // Only a bare constant list (`SELECT 1`, `SELECT @@version`) may skip the
+    // planner: a filter/group/order/limit changes the row set (`SELECT 1 WHERE 0`
+    // is an empty dual), so those stay on the normal plan path.
+    if select.selection.is_some()
+        || select.having.is_some()
+        || !select.group_by.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.distinct
+        || select.with.is_some()
+    {
         return None;
     }
     let mut columns = Vec::new();
@@ -2843,6 +2857,13 @@ fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
     let mut next = 0usize;
+    // Copy whole UTF-8 characters: `bytes[i] as char` would Latin-1-recode
+    // multi-byte text (leading to mojibake for non-ASCII literals/identifiers).
+    let push_char = |out: &mut String, i: &mut usize| {
+        let ch = sql[*i..].chars().next().expect("sql index in bounds");
+        out.push(ch);
+        *i += ch.len_utf8();
+    };
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\'' || b == b'"' || b == b'`' {
@@ -2850,12 +2871,12 @@ fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
             out.push(b as char);
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
-                if bytes[i] == quote {
+                if sql.as_bytes()[i] == quote {
+                    out.push(quote as char);
                     i += 1;
                     break;
                 }
-                i += 1;
+                push_char(&mut out, &mut i);
             }
             continue;
         }
@@ -2873,8 +2894,7 @@ fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
             i += 1;
             continue;
         }
-        out.push(b as char);
-        i += 1;
+        push_char(&mut out, &mut i);
     }
     if next != params.len() {
         return Err(sealdb_errno::Error::new(
@@ -4051,6 +4071,48 @@ mod tests {
             .unwrap();
         assert_eq!(ok.columns[0], "TIMESTAMP '2024-01-01 14:00:00'", "{:?}", ok.columns);
         assert_eq!(ok.rows[0][0].display(), "2024-01-01 14:00:00");
+    }
+
+    /// Non-ASCII literals must round-trip byte-for-byte, including when the
+    /// column is read back through a covering secondary index.
+    #[test]
+    fn test_utf8_literal_roundtrip_through_index() {
+        let session = Session::new();
+        let ok = session.execute_stmt("SELECT '孵', '孵化投入'").unwrap();
+        assert_eq!(ok.rows[0][0].display(), "孵", "literal");
+        assert_eq!(ok.rows[0][1].display(), "孵化投入", "literal2");
+        session.execute_stmt("CREATE DATABASE IF NOT EXISTS utf8probe").unwrap();
+        session.execute_stmt("USE utf8probe").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
+        session
+            .execute_stmt(
+                "CREATE TABLE t (a varchar(20) primary key, b varchar(20), c varchar(20), \
+                 key idx_b (b, c)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+            )
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES ('k1', '孵', '孵化投入')")
+            .unwrap();
+        let ok = session.execute_stmt("SELECT b, c FROM t").unwrap();
+        assert_eq!(ok.rows[0][0].display(), "孵");
+        assert_eq!(ok.rows[0][1].display(), "孵化投入");
+        let ok = session
+            .execute_stmt("SELECT b, c FROM t use index(idx_b) WHERE b = '孵'")
+            .unwrap();
+        assert_eq!(ok.rows.len(), 1, "{:?}", ok.rows);
+        assert_eq!(ok.rows[0][1].display(), "孵化投入");
+    }
+
+    #[test]
+    fn test_utf8_prepared_statement() {
+        let session = Session::new();
+        session
+            .execute_stmt("PREPARE st FROM 'SELECT ''孵'' AS a, ? AS b'")
+            .unwrap();
+        session.execute_stmt("SET @p = '孵化投入'").unwrap();
+        let ok = session.execute_stmt("EXECUTE st USING @p").unwrap();
+        assert_eq!(ok.rows[0][0].display(), "孵");
+        assert_eq!(ok.rows[0][1].display(), "孵化投入");
     }
 
     #[test]

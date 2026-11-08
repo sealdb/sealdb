@@ -587,6 +587,13 @@ fn bind_placeholders(sql: &str, params: &[Datum]) -> Result<String> {
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
     let mut next = 0usize;
+    // Character-wise copy: byte-as-char would Latin-1-recode non-ASCII text in
+    // literals and comments.
+    fn push_char(out: &mut String, sql: &str, i: &mut usize) {
+        let ch = sql[*i..].chars().next().expect("sql index in bounds");
+        out.push(ch);
+        *i += ch.len_utf8();
+    }
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\'' || b == b'"' || b == b'`' {
@@ -594,12 +601,12 @@ fn bind_placeholders(sql: &str, params: &[Datum]) -> Result<String> {
             out.push(b as char);
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
-                if bytes[i] == q {
+                if sql.as_bytes()[i] == q {
+                    out.push(q as char);
                     i += 1;
                     break;
                 }
-                i += 1;
+                push_char(&mut out, sql, &mut i);
             }
             continue;
         }
@@ -612,8 +619,7 @@ fn bind_placeholders(sql: &str, params: &[Datum]) -> Result<String> {
             i += 1;
             continue;
         }
-        out.push(b as char);
-        i += 1;
+        push_char(&mut out, sql, &mut i);
     }
     Ok(out)
 }
