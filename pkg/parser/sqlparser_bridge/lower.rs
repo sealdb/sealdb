@@ -9784,6 +9784,14 @@ fn index_column_name(col: &sqlparser::ast::IndexColumn) -> Result<String> {
     }
 }
 
+/// `CHAR(32)` length text; `VARCHAR(MAX)` has no MySQL length and keeps `MAX`.
+fn character_length(len: &sqlparser::ast::CharacterLength) -> String {
+    match len {
+        sqlparser::ast::CharacterLength::IntegerLength { length, .. } => length.to_string(),
+        sqlparser::ast::CharacterLength::Max => "MAX".to_string(),
+    }
+}
+
 fn data_type_name(tp: &DataType) -> String {
     match tp {
         DataType::Int(_) | DataType::Integer(_) | DataType::BigInt(_) | DataType::TinyInt(_) => {
@@ -9799,9 +9807,17 @@ fn data_type_name(tp: &DataType) -> String {
         DataType::Float(_) => "FLOAT".to_string(),
         DataType::Double(_) | DataType::Real => "DOUBLE".to_string(),
         DataType::Decimal(_) | DataType::Numeric(_) => "DECIMAL".to_string(),
-        DataType::Char(_) | DataType::Varchar(_) | DataType::Text | DataType::String(_) => {
-            "CHAR".to_string()
-        }
+        // `CAST(x AS CHAR(32))` keeps its length: a view column created from
+        // it is `varchar(32)`, not a bare `varchar` (TiDB `Flen`/`Decimal`).
+        DataType::Char(len) => match len {
+            Some(len) => format!("CHAR({})", character_length(len)),
+            None => "CHAR".to_string(),
+        },
+        DataType::Varchar(len) => match len {
+            Some(len) => format!("VARCHAR({})", character_length(len)),
+            None => "VARCHAR".to_string(),
+        },
+        DataType::Text | DataType::String(_) => "CHAR".to_string(),
         other => other.to_string(),
     }
 }

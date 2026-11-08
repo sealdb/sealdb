@@ -193,7 +193,7 @@ impl Executor for ShowExec {
                     .columns
                     .iter()
                     .filter(|col| show_column_visible(col.name.o(), column, pattern))
-                    .map(|col| column_row(col, full))
+                    .map(|col| column_row(info, col, full))
                     .collect();
             }
             ShowStmtKind::Index => {
@@ -370,7 +370,9 @@ impl Executor for ShowExec {
     }
 }
 
-fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
+fn column_row(info: &TableInfo, col: &ColumnInfo, full: bool) -> Vec<Datum> {
+    // MySQL NotNullFlag — `DESCRIBE` reports `NO` for columns that reject NULL.
+    const NOT_NULL_FLAG: u32 = 1;
     let type_name = col.field_type.type_name();
     let mut row = vec![
         Datum::Bytes(col.name.o().as_bytes().to_vec()),
@@ -388,9 +390,34 @@ fn column_row(col: &ColumnInfo, full: bool) -> Vec<Datum> {
         Some(text) => Datum::Bytes(default_display(text).into_bytes()),
         None => Datum::Null,
     };
+    // `PRI` for a PRIMARY KEY member, else `UNI` / `MUL` for the first column
+    // of a unique / non-unique secondary index (MySQL `Field::Key`).
+    let in_index = |idx: &sealdb_meta::IndexInfo| {
+        idx.columns
+            .first()
+            .is_some_and(|c| c.offset == col.offset)
+    };
+    let key = if info
+        .indices
+        .iter()
+        .any(|idx| idx.primary && in_index(idx))
+    {
+        "PRI"
+    } else if info.indices.iter().any(|idx| idx.unique && in_index(idx)) {
+        "UNI"
+    } else if info.indices.iter().any(|idx| !idx.primary && in_index(idx)) {
+        "MUL"
+    } else {
+        ""
+    };
+    let null = if col.field_type.flag & NOT_NULL_FLAG != 0 {
+        "NO"
+    } else {
+        "YES"
+    };
     row.extend([
-        Datum::Bytes(b"YES".to_vec()),
-        Datum::Bytes(Vec::new()),
+        Datum::Bytes(null.as_bytes().to_vec()),
+        Datum::Bytes(key.as_bytes().to_vec()),
         default,
         Datum::Bytes(Vec::new()),
     ]);

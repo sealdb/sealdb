@@ -171,14 +171,14 @@ fn columns_from_select_scoped(
             }
             for source in &sources {
                 for (name, type_name) in &source.columns {
-                    push_select_column(&mut cols, name, type_name.clone())?;
+                    push_select_column(&mut cols, name, type_name.clone(), false)?;
                 }
             }
             continue;
         }
         let name = field_column_name(field, i);
         let type_name = type_name_from_expr(&field.expr, &sources)?;
-        push_select_column(&mut cols, &name, type_name)?;
+        push_select_column(&mut cols, &name, type_name, expr_is_not_null_constant(&field.expr))?;
     }
     if cols.is_empty() {
         return Err(Error::unsupported("CREATE TABLE AS SELECT without columns"));
@@ -186,7 +186,31 @@ fn columns_from_select_scoped(
     Ok(cols)
 }
 
-fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) -> Result<()> {
+/// A CTAS / view column is `NOT NULL` when its expression folds to a non-NULL
+/// constant: TiDB builds those with `expression.NewConstant`, which keeps the
+/// not-null flag, and a CAST carries it through
+/// (`cast(replace(substring_index(…)) as char(32))`).
+fn expr_is_not_null_constant(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Value(v) => !matches!(v.datum, Datum::Null),
+        ExprNode::Cast(c) => expr_is_not_null_constant(&c.expr),
+        ExprNode::Unary(u) => expr_is_not_null_constant(&u.expr),
+        ExprNode::Binary(b) => {
+            expr_is_not_null_constant(&b.left) && expr_is_not_null_constant(&b.right)
+        }
+        ExprNode::Func(f) => {
+            !f.args.is_empty() && f.args.iter().all(expr_is_not_null_constant)
+        }
+        _ => false,
+    }
+}
+
+fn push_select_column(
+    cols: &mut Vec<ColumnDef>,
+    name: &str,
+    type_name: String,
+    not_null: bool,
+) -> Result<()> {
     if cols.iter().any(|col| col.name.eq_ignore_ascii_case(name)) {
         return Err(Error::new(
             ERR_DUP_FIELDNAME,
@@ -199,7 +223,7 @@ fn push_select_column(cols: &mut Vec<ColumnDef>, name: &str, type_name: String) 
         default: None,
         generated: None,
         auto_increment: false,
-        not_null: false,
+        not_null,
     });
     Ok(())
 }
