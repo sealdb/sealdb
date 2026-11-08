@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cmsketch;
 pub mod handle;
 pub mod json;
 pub mod pseudo;

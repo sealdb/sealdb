@@ -61,6 +61,9 @@ impl StatsRange {
 
 #[derive(Clone, PartialEq)]
 enum Bound {
+    /// Integer bound kept exact: `bigint` handles above 2^53 collapse onto the
+    /// same `f64`, which would merge two distinct range endpoints.
+    Int(i128),
     Num(f64),
     Bytes(Vec<u8>),
 }
@@ -68,8 +71,17 @@ enum Bound {
 impl Bound {
     fn cmp(&self, other: &Bound) -> std::cmp::Ordering {
         match (self, other) {
+            (Bound::Int(a), Bound::Int(b)) => a.cmp(b),
             (Bound::Num(a), Bound::Num(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
             (Bound::Bytes(a), Bound::Bytes(b)) => a.cmp(b),
+            // Mixed numeric kinds cannot happen for one column; compare through
+            // the float space when a histogram bound is a float.
+            (Bound::Int(a), Bound::Num(b)) => (*a as f64)
+                .partial_cmp(b)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Bound::Num(a), Bound::Int(b)) => a
+                .partial_cmp(&(*b as f64))
+                .unwrap_or(std::cmp::Ordering::Equal),
             // Mixed kinds cannot happen for one column; fall back to equality.
             _ => std::cmp::Ordering::Equal,
         }
@@ -132,7 +144,15 @@ fn parse_time_scalar(text: &str) -> Option<f64> {
 }
 
 fn number_scalar(text: &str) -> Option<Bound> {
-    text.trim().parse::<f64>().ok().map(Bound::Num)
+    let text = text.trim();
+    // TiDB keeps integer bounds exact (`bigint unsigned` handle values above
+    // 2^53 must not collapse onto one `f64`).
+    if !text.contains(['.', 'e', 'E'])
+        && let Ok(value) = text.parse::<i128>()
+    {
+        return Some(Bound::Int(value));
+    }
+    text.parse::<f64>().ok().map(Bound::Num)
 }
 
 /// Convert a histogram bound (stored as text) to an ordered scalar.
@@ -148,8 +168,8 @@ fn bound_scalar(kind: HistValueKind, text: &str) -> Option<Bound> {
 fn datum_scalar(kind: HistValueKind, value: &Datum) -> Option<Bound> {
     match (kind, value) {
         (_, Datum::Null) => None,
-        (HistValueKind::Number, Datum::I64(v)) => Some(Bound::Num(*v as f64)),
-        (HistValueKind::Number, Datum::U64(v)) => Some(Bound::Num(*v as f64)),
+        (HistValueKind::Number, Datum::I64(v)) => Some(Bound::Int(*v as i128)),
+        (HistValueKind::Number, Datum::U64(v)) => Some(Bound::Int(*v as i128)),
         (HistValueKind::Number, Datum::F64(v)) => Some(Bound::Num(*v)),
         (HistValueKind::Number, Datum::Decimal(d)) => d.to_f64().ok().map(Bound::Num),
         (HistValueKind::Number, Datum::Bytes(b) | Datum::Bit(b)) => {
@@ -231,6 +251,11 @@ impl Histogram {
     fn calc_fraction(lower: &Bound, upper: &Bound, value: &Bound) -> f64 {
         let (l, u, v) = match (lower, upper, value) {
             (Bound::Num(l), Bound::Num(u), Bound::Num(v)) => (*l, *u, *v),
+            (Bound::Int(l), Bound::Int(u), Bound::Int(v)) => (
+                (*l as f64),
+                (*u as f64),
+                (*v as f64),
+            ),
             // Strings interpolate on the base-256 value of the common suffix.
             (Bound::Bytes(l), Bound::Bytes(u), Bound::Bytes(v)) => {
                 let prefix = common_prefix(l, u);
@@ -326,6 +351,12 @@ impl Histogram {
         if bucket.ndv > 1 {
             return Some((bucket_count - bucket.repeats as f64) / (bucket.ndv as f64 - 1.0));
         }
+        // v1 histogram: buckets carry no NDV. TiDB estimates a single value as
+        // `realtimeRowCount / Histogram.NDV` (`equalRowCountOnColumn`), not the
+        // whole bucket row count.
+        if self.ndv > 0 {
+            return Some(self.not_null_count() / self.ndv as f64);
+        }
         Some(bucket_count)
     }
 
@@ -355,7 +386,7 @@ impl Histogram {
         let less_high = self.less_row_count(kind, high);
         let mut range_est = less_high - less_low;
         let notnull = self.not_null_count();
-        let ndv = self.buckets.last().map(|b| b.ndv).unwrap_or(0);
+        let ndv = self.ndv;
         let low_equal = self.equal_row_count(kind, low).unwrap_or(0.0);
         let ndv_avg = if ndv > 0 { notnull / ndv as f64 } else { 0.0 };
         if range_est < low_equal.max(ndv_avg) && ndv > 0 {
@@ -505,10 +536,7 @@ impl ColumnStats {
             if let Some(count) = self.eq_from_topn(value) {
                 return count;
             }
-            hist.equal_row_count(kind, value).unwrap_or_else(|| {
-                let ndv = hist.buckets.last().map(|b| b.ndv).unwrap_or(0);
-                if ndv > 0 { notnull / ndv as f64 } else { 0.0 }
-            })
+            hist.equal_row_count(kind, value).unwrap_or(0.0)
         };
         let mut count: f64 = match (&range.low, &range.high) {
             (None, None) => notnull,
@@ -567,18 +595,20 @@ impl Table {
         Some(self.count.saturating_sub(col.null_count) as f64)
     }
 
-    /// TiDB `Column.NDV`: the histogram's distinct count plus every TopN entry
-    /// (TopN rows are held out of the histogram).
+    /// TiDB `Column.NDV`: the column's distinct count. ANALYZE (`distinct.len()`)
+    /// and the statistics JSON already carry the total, so TopN entries are not
+    /// added on top; only a histogram without a column NDV falls back to its
+    /// last bucket plus the TopN rows it holds out.
     pub fn column_ndv(&self, column: &str) -> Option<f64> {
         let col = self.column(column)?;
+        if col.ndv > 0 {
+            return Some(col.ndv as f64);
+        }
         let topn = col
             .topn
             .as_ref()
             .map(|t| t.items.len() as f64)
             .unwrap_or(0.0);
-        if col.ndv > 0 {
-            return Some(col.ndv as f64 + topn);
-        }
         let hist = col.histogram.as_ref()?;
         if hist.buckets.is_empty() {
             return None;
@@ -656,7 +686,15 @@ impl Table {
                     let key = encode_index_key(field_type, low_val)?;
                     match idx.topn_lookup(&key) {
                         Some(count) => count,
-                        None => idx.equal_row_count(&key),
+                        // TiDB `equalRowCountOnIndex` for stats version 1 reads
+                        // the CM sketch before the histogram: a value the sketch
+                        // puts at zero estimates no rows even inside a bucket.
+                        None => match &idx.cm_sketch {
+                            Some(sketch) if idx.stats_ver < 2 => {
+                                sketch.query_bytes(&key) as f64
+                            }
+                            _ => idx.equal_row_count(&key),
+                        },
                     }
                 }
                 (low, high) => {
@@ -694,7 +732,10 @@ impl Table {
             };
             count += counted;
         }
-        Some((count * increase).clamp(1.0, realtime))
+        // TiDB `GetRowCountByIndexRanges` caps the estimate at the realtime row
+        // count but never lifts a zero: an equality that falls in a gap between
+        // two histogram buckets estimates no rows.
+        Some((count * increase).min(realtime))
     }
 
     pub fn index(&self, name: &str) -> Option<&IndexStats> {

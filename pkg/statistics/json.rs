@@ -74,7 +74,7 @@ fn column_from_json(col: &Value) -> Result<ColumnStats> {
                 }
             }
             let ndv = hist.get("ndv").and_then(Value::as_u64).unwrap_or(0);
-            (Some(Histogram { buckets }), ndv)
+            (Some(Histogram { ndv, buckets }), ndv)
         }
         None => (None, 0),
     };
@@ -122,6 +122,33 @@ fn index_from_json(idx: &Value) -> Result<IndexStats> {
             ));
         }
     }
+    // TiDB `DecodeCMSketch`: row/counter grid plus the sample's default value.
+    let cm_sketch = idx
+        .get("cm_sketch")
+        .and_then(|c| c.get("rows"))
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            let rows: Vec<Vec<u32>> = rows
+                .iter()
+                .map(|row| {
+                    row.get("counters")
+                        .and_then(Value::as_array)
+                        .map(|counters| {
+                            counters
+                                .iter()
+                                .map(|c| c.as_u64().unwrap_or(0) as u32)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            let default_value = idx
+                .get("cm_sketch")
+                .and_then(|c| c.get("default_value"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            crate::cmsketch::CmSketch::from_rows(rows, default_value)
+        });
     // TiDB `TableStatsFromJSON`: an explicit `stats_ver` wins; JSON recorded by
     // v4.0 or earlier carries no version, and a histogram NDV means version 1.
     let stats_ver = idx
@@ -133,6 +160,7 @@ fn index_from_json(idx: &Value) -> Result<IndexStats> {
         null_count,
         histogram,
         topn,
+        cm_sketch,
         stats_ver,
     })
 }

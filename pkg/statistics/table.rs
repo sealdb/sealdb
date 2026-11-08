@@ -18,6 +18,9 @@ pub struct HistogramBucket {
 
 #[derive(Clone, Debug, Default)]
 pub struct Histogram {
+    /// Column NDV from the statistics JSON (`Histogram.NDV`). v1 histograms
+    /// carry no per-bucket NDV, so point estimates fall back to `rows / NDV`.
+    pub ndv: u64,
     pub buckets: Vec<HistogramBucket>,
 }
 
@@ -61,7 +64,13 @@ impl Histogram {
                 break;
             }
         }
-        Self { buckets }
+        let mut ndv = 0u64;
+        for (i, v) in values.iter().enumerate() {
+            if i == 0 || values[i - 1] != *v {
+                ndv += 1;
+            }
+        }
+        Self { ndv, buckets }
     }
 
     /// Fraction of rows with value in `[lower, upper]` (inclusive string compare).
@@ -141,6 +150,9 @@ pub struct IndexStats {
     /// TiDB `TopN` entries as `(encoded key, count)`.
     #[serde(default)]
     pub topn: Vec<(Vec<u8>, u64)>,
+    /// TiDB `CMSketch`: the point-frequency sketch of a version-1 index.
+    #[serde(default)]
+    pub cm_sketch: Option<crate::cmsketch::CmSketch>,
     /// TiDB `Statistics.StatsVer`. `LOAD STATS` JSON without the field but with
     /// a histogram NDV was collected by v4.0 or earlier, i.e. version 1, whose
     /// histogram still contains the TopN rows (`TotalRowCount` excludes them

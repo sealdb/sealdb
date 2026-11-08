@@ -97,6 +97,7 @@ impl Handle {
                                 .collect(),
                         }),
                         topn: idx.topn.clone(),
+                        cm_sketch: idx.cm_sketch.clone(),
                         stats_ver: idx.stats_ver,
                     })
                     .collect(),
@@ -148,6 +149,7 @@ impl Handle {
                             ndv: c.ndv,
                             null_count: c.null_count,
                             histogram: c.histogram.map(|h| Histogram {
+                                ndv: c.ndv,
                                 buckets: h
                                     .buckets
                                     .into_iter()
@@ -190,6 +192,7 @@ impl Handle {
                                     .collect(),
                             }),
                             topn: i.topn,
+                            cm_sketch: i.cm_sketch,
                             stats_ver: i.stats_ver,
                         },
                     )
@@ -240,6 +243,8 @@ struct PersistIndex {
     histogram: Option<PersistIndexHist>,
     #[serde(default)]
     topn: Vec<(Vec<u8>, u64)>,
+    #[serde(default)]
+    cm_sketch: Option<crate::cmsketch::CmSketch>,
     #[serde(default)]
     stats_ver: u64,
 }
