@@ -67,7 +67,7 @@ impl Executor for TableReaderExec {
         let cte_key = self.table.resolve_name();
         if let Some((schema, rows)) = crate::cte::lookup_cte_rows(cte_key) {
             self.schema = schema;
-            self.rows = filter_rows(rows, &self.schema, self.pushed.as_ref())?;
+            self.rows = filter_rows(rows, &self.schema, self.pushed.as_ref(), None)?;
             return Ok(());
         }
         let (schema, name) = self.table.qualified(&self.current_db);
@@ -112,6 +112,7 @@ impl Executor for TableReaderExec {
                 .collect(),
             &self.schema,
             self.pushed.as_ref(),
+            Some(&info),
         )?;
         if expose_rowid {
             self.schema.push("\u{1}_tidb_rowid".to_string());

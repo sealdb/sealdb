@@ -215,6 +215,12 @@ fn compare_datums(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
             return Ok(compare_bytes(mode, &lb, &rb));
         }
     }
+    // A binary literal compared with a string takes the string's charset, so
+    // bytes that are not valid utf8mb4 fail the same way
+    // (`a > 0x80` on a utf8mb4 column).
+    if let (Datum::Bit(b), Datum::Bytes(_)) | (Datum::Bytes(_), Datum::Bit(b)) = (left, right) {
+        ensure_utf8mb4_convertible(b)?;
+    }
     // TIMESTAMP/DATETIME vs string: compare as session-local wall clocks.
     if let Some(ord) = try_compare_as_time(left, right, DstWarnMode::Once)? {
         return Ok(ord);
@@ -450,6 +456,17 @@ pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<
 /// Reject binary literals that cannot convert to utf8mb4 when compared to a
 /// column (TiDB charset convert), even if the scan yields no rows.
 pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {
+    validate_string_cmp_literals_on(expr, None)
+}
+
+/// Same, with the scanned table's column types: a binary-charset column
+/// (`BIT`, `BINARY`, `BLOB`) compares raw bytes, so a hex/bit literal needs no
+/// charset conversion there.
+pub fn validate_string_cmp_literals_on(
+    expr: &ExprNode,
+    info: Option<&TableInfo>,
+) -> Result<()> {
+    let walk = |child: &ExprNode| validate_string_cmp_literals_on(child, info);
     match expr {
         ExprNode::Binary(b)
             if matches!(
@@ -457,55 +474,74 @@ pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {
                 Op::Eq | Op::NullSafeEq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
             ) =>
         {
-            check_col_vs_bytes_literal(&b.left, &b.right)?;
-            check_col_vs_bytes_literal(&b.right, &b.left)?;
-            validate_string_cmp_literals(&b.left)?;
-            validate_string_cmp_literals(&b.right)
+            check_col_vs_literal(&b.left, &b.right, info)?;
+            check_col_vs_literal(&b.right, &b.left, info)?;
+            walk(&b.left)?;
+            walk(&b.right)
         }
         ExprNode::Binary(b) => {
-            validate_string_cmp_literals(&b.left)?;
-            validate_string_cmp_literals(&b.right)
+            walk(&b.left)?;
+            walk(&b.right)
         }
-        ExprNode::Unary(u) => validate_string_cmp_literals(&u.expr),
+        ExprNode::Unary(u) => walk(&u.expr),
         ExprNode::Func(f) => {
             for arg in &f.args {
-                validate_string_cmp_literals(arg)?;
+                walk(arg)?;
             }
             Ok(())
         }
         ExprNode::InList(i) => {
-            validate_string_cmp_literals(&i.expr)?;
+            walk(&i.expr)?;
             for item in &i.list {
-                validate_string_cmp_literals(item)?;
+                walk(item)?;
             }
             Ok(())
         }
         ExprNode::Between(b) => {
-            validate_string_cmp_literals(&b.expr)?;
-            validate_string_cmp_literals(&b.low)?;
-            validate_string_cmp_literals(&b.high)
+            walk(&b.expr)?;
+            walk(&b.low)?;
+            walk(&b.high)
         }
         ExprNode::Like(l) => {
-            validate_string_cmp_literals(&l.expr)?;
-            validate_string_cmp_literals(&l.pattern)
+            walk(&l.expr)?;
+            walk(&l.pattern)
         }
-        ExprNode::IsNull(i) => validate_string_cmp_literals(&i.expr),
-        ExprNode::Cast(c) => validate_string_cmp_literals(&c.expr),
+        ExprNode::IsNull(i) => walk(&i.expr),
+        ExprNode::Cast(c) => walk(&c.expr),
         _ => Ok(()),
     }
 }
 
-fn check_col_vs_bytes_literal(col_side: &ExprNode, lit_side: &ExprNode) -> Result<()> {
-    if !matches!(col_side, ExprNode::Column(_)) {
+fn check_col_vs_literal(
+    col_side: &ExprNode,
+    lit_side: &ExprNode,
+    info: Option<&TableInfo>,
+) -> Result<()> {
+    let ExprNode::Column(col) = col_side else {
         return Ok(());
-    }
+    };
     let ExprNode::Value(v) = lit_side else {
         return Ok(());
     };
-    if let Datum::Bytes(b) = &v.datum {
-        ensure_utf8mb4_convertible(b)?;
-    }
-    Ok(())
+    let bytes = match &v.datum {
+        Datum::Bytes(b) => b,
+        // `0x39` / `b'…'` are binary literals: they take the column charset
+        // unless the column itself is binary.
+        Datum::Bit(b) => {
+            let binary_column = info.is_some_and(|info| {
+                info.columns
+                    .iter()
+                    .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+                    .is_some_and(|c| c.field_type.charset == "binary")
+            });
+            if binary_column {
+                return Ok(());
+            }
+            b
+        }
+        _ => return Ok(()),
+    };
+    ensure_utf8mb4_convertible(bytes)
 }
 
 /// Locate the physical partition id for `values`, evaluating expression keys.

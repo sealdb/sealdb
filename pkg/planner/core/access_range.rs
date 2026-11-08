@@ -90,7 +90,9 @@ fn merge_range(target: &mut pseudo::Bounds, range: &ColumnRange) {
 /// Can both bounds be converted to `field_type` like TiDB `ranger` does?
 fn bound_fits_column(field_type: &sealdb_types::FieldType, range: &ColumnRange) -> bool {
     let fits = |bound: &Option<(sealdb_types::Datum, bool)>| match bound {
-        Some((sealdb_types::Datum::Bytes(bytes), _)) => {
+        // Binary values: string literals, and hex/bit literals (which arrive as
+        // `Datum::Bit`) — both need a charset conversion to the column.
+        Some((sealdb_types::Datum::Bytes(bytes) | sealdb_types::Datum::Bit(bytes), _)) => {
             field_type.charset == "binary" || std::str::from_utf8(bytes).is_ok()
         }
         _ => true,

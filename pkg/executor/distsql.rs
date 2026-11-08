@@ -166,6 +166,7 @@ impl Executor for IndexLookUpExecutor {
                 std::mem::take(&mut self.rows),
                 &self.schema,
                 self.pushed.as_ref(),
+                Some(&info),
             )
         })?;
         if expose_rowid {
@@ -317,6 +318,7 @@ impl Executor for IndexMergeExecutor {
             std::mem::take(&mut self.rows),
             &self.schema,
             self.pushed.as_ref(),
+            Some(&info),
         )?;
         Ok(())
     }
