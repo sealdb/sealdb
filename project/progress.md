@@ -1863,6 +1863,26 @@
 - **下一步**:
   - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
 
+### 2026-11-08（`select` / `jointest/join` 估行波）
+
+- **Phase**: R1/R2/R3 收口
+- **完成**:
+  - Types：`Datum::compare` 的 `I64 ↔ U64` 不再走 `f64`（2^53 以上会塌缩），负数一律更小；分区表 `BETWEEN 9223372036854775807 AND 9223372036854775808` 估行回到 2.00
+  - Statistics：histogram 边界保留 `i128` 精确整数（`Bound::Int`）；v1 histogram 单值估行用 `realtime/NDV`；CM sketch 随 index 统计解析/落盘；`column_ndv` 在 `col.ndv > 0` 时不再重复叠加 TopN
+  - Planner：分区表跨多个分区读取不再用 index/handle 顺序顶掉 `Sort`（`partition_read_spans_multiple`）；CTE seed 上方的恒等投影按 TiDB 消除；`column_eq_is_cross_table` 区分同表等值（0.8）与跨表相关等值（0.001）
+  - Planner：join 估行走 `EstimateFullJoinRowCount`（`fill_join_est_rows` / `join_est_by_ndv`）。伪统计 key 的 NDV 取该列自身 scan 子树行数 × 0.8（`t4.a` 在 2.50 行 join 脊柱下仍按 7992 计），null-supplying 侧是伪统计时外连接取 key 基数而非保留侧行数（`t4 ⟕ …` → 5.00/4.00）
+  - EXPLAIN：外连接 Build/Probe 顺序与 TiDB 一致——null-supplying 侧是伪统计时较小脊柱画成 `Build`（`bushy (J1)⟕(J2)` 的 `t2.a=t3.a` 分支）
+  - Planner：`try_bushy_quad_outer` 的 `ON t2.a=t3.a` 分支把保留脊柱放底层左输入（此前 `t4 ⟕ mid` 会把 t4 当保留侧，t4 为空时返回 0 行）
+  - Access path：hex/bit 字面量超出 `BIT(n)` 宽度时不做 point get / seek key（留 cop Selection）；`stats:partial[col:missing]` 标注；`ORDER BY` handle / index 前缀走 keep-order 扫描 + cop `Limit`；`int_handle_range_rows` / `index_equality_rows` 用 TiDB 整数范围与 index histogram 估行
+- **验证**:
+  - `sealdb-itest -t select -s memory` → PASS
+  - `run-tests.sh`（green，Mem+TiKV）→ `PASS: memory=44 tikv=43`
+  - 四表 bushy 外连接结果集（t4 空表 → 4 行 null 扩展）逐行核对
+- **阻塞/风险**:
+  - 无新增
+- **下一步**:
+  - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
+
 ### 2026-10-19
 
 **决策落地**
