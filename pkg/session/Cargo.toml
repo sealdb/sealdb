@@ -24,6 +24,7 @@ sealdb-privilege.workspace = true
 sealdb-sessiontxn.workspace = true
 sealdb-statistics.workspace = true
 sealdb-store.workspace = true
+sealdb-tablecodec.workspace = true
 sealdb-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

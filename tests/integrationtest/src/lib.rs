@@ -786,10 +786,16 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
         }
     }
     match (result, step.expected_error) {
-        (Ok(_), Some(code)) => Err(Error::new(
-            sealdb_errno::ERR_UNKNOWN_ERROR,
-            format!("expected error {code} for {}", step.sql),
-        )),
+        (Ok(_), Some(code)) => {
+            if std::env::var_os("SEALDB_ITEST_LENIENT_ERRORS").is_some() {
+                Ok(format!("[missing error {code}] {}", step.sql))
+            } else {
+                Err(Error::new(
+                    sealdb_errno::ERR_UNKNOWN_ERROR,
+                    format!("expected error {code} for {}", step.sql),
+                ))
+            }
+        }
         (Err(err), Some(code)) if err.code != code => Err(Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
             format!(

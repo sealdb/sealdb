@@ -66,8 +66,15 @@ pub fn index_range_rows(
     let mut rows = column_range_rows(table_rows, low, high);
     // A unique index already pins the prefix to one value per equality; TiDB
     // does not add the extra 1/100 shrink for it (`range:[1,1]` on ab(a,b) is 10).
+    // TiDB `getPseudoRowCountByIndexRanges` divides once per pinned prefix
+    // column *before* the last one (`i = min(PrefixEqualLen, len(LowVal)-1)`),
+    // so a point that pins only the leading column (`idx(a, c)` with `a = 1`,
+    // `LowVal = [1]`) shrinks nothing and stays at the 1/1000 equal rate: 10.
     if !unique {
-        for _ in 0..equal_prefix_len.min(index_columns_len.saturating_sub(1)) {
+        for _ in 0..equal_prefix_len
+            .saturating_sub(1)
+            .min(index_columns_len.saturating_sub(1))
+        {
             rows /= 100.0;
         }
     }
@@ -314,10 +321,10 @@ fn tighter_high(current: Option<(Datum, bool)>, other: Option<(Datum, bool)>) ->
 /// range keeps `range_rows / table_rows`, unrecognized predicates `0.8`.
 pub fn filter_rows(conjuncts: &[ExprNode], table_rows: f64) -> f64 {
     let mut per_column: Vec<(String, Bounds)> = Vec::new();
-    let mut selectivity = 1.0f64;
+    let mut total = 1.0f64;
     for conjunct in conjuncts {
         let Some((column, range)) = conjunct_column_range(conjunct) else {
-            selectivity *= SELECTION_FACTOR;
+            total *= SELECTION_FACTOR;
             continue;
         };
         let bounds = (range.low.clone(), range.high.clone());
@@ -331,9 +338,113 @@ pub fn filter_rows(conjuncts: &[ExprNode], table_rows: f64) -> f64 {
     }
     for (_, bounds) in &per_column {
         let rows = column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref());
-        selectivity *= rows / table_rows;
+        total *= rows / table_rows;
     }
-    (table_rows * selectivity).clamp(0.0, table_rows)
+    (table_rows * total).clamp(0.0, table_rows)
+}
+
+/// TiDB `cardinality.Selectivity` over an unanalyzed table's pushed-down
+/// filters, as a selectivity instead of a row count.
+///
+/// Columns keep `range_rows / table_rows` (a row handle's point range is
+/// exactly one row), `not(isnull(col))` is the `(MinNotNull, MaxValue)` range,
+/// and a DNF arm combines its terms under the independence assumption
+/// (`1 - Π(1 - sᵢ)`). Predicates with no range keep `selectionFactor`.
+/// Returns `None` for a DNF arm it cannot model, so callers can fall back.
+pub fn selectivity(conjuncts: &[ExprNode], table_rows: f64, handle: Option<&str>) -> Option<f64> {
+    if table_rows <= 0.0 {
+        return Some(1.0);
+    }
+    let mut per_column: Vec<(String, Bounds)> = Vec::new();
+    let mut dnf: Vec<ExprNode> = Vec::new();
+    let mut total = 1.0f64;
+    for conjunct in conjuncts {
+        let (column, bounds) = if let Some(column) = not_isnull_column(conjunct) {
+            // `not(isnull(col))` seeks `(MinNotNull, MaxValue)` on the column.
+            (column, (None, None))
+        } else if let Some((column, range)) = conjunct_column_range(conjunct) {
+            (column, (range.low.clone(), range.high.clone()))
+        } else if matches!(conjunct, ExprNode::Binary(bin) if bin.op == Op::LogicOr) {
+            dnf.push(conjunct.clone());
+            continue;
+        } else {
+            total *= SELECTION_FACTOR;
+            continue;
+        };
+        match per_column
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&column))
+        {
+            Some((_, current)) => merge_bounds(current, &bounds),
+            None => per_column.push((column, bounds)),
+        }
+    }
+    for (column, bounds) in &per_column {
+        let rows = if handle.is_some_and(|name| name.eq_ignore_ascii_case(column)) {
+            handle_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
+        } else {
+            column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
+        };
+        total *= rows / table_rows;
+    }
+    for cond in &dnf {
+        let items = cond.split_dnf();
+        // TiDB leaves a single-arm DNF (or a failed flatten) to the default
+        // selection factor.
+        if items.len() <= 1 {
+            total *= SELECTION_FACTOR;
+            continue;
+        }
+        let mut dnf_selectivity = 0.0f64;
+        for item in items {
+            let arm = selectivity(&item.split_cnf(), table_rows, handle)?;
+            dnf_selectivity = dnf_selectivity + arm - dnf_selectivity * arm;
+        }
+        total *= dnf_selectivity;
+    }
+    Some(total)
+}
+
+/// Column of a `not(isnull(col))` conjunct (either `UnaryNot(IsNull)` form).
+fn not_isnull_column(expr: &ExprNode) -> Option<String> {
+    let (is_null, negated) = match expr {
+        ExprNode::IsNull(is_null) => (is_null, false),
+        ExprNode::Unary(unary) if unary.op == Op::Not => {
+            let ExprNode::IsNull(is_null) = unary.expr.as_ref() else {
+                return None;
+            };
+            (is_null, true)
+        }
+        _ => return None,
+    };
+    if is_null.not == negated {
+        return None;
+    }
+    let ExprNode::Column(column) = is_null.expr.as_ref() else {
+        return None;
+    };
+    Some(column.name.clone())
+}
+
+/// TiDB `getPseudoRowCountBySignedIntRanges`: a row handle is unique, so an
+/// equality is exactly one row instead of `table_rows / pseudoEqualRate`.
+fn handle_range_rows(
+    table_rows: f64,
+    low: Option<&(Datum, bool)>,
+    high: Option<&(Datum, bool)>,
+) -> f64 {
+    let rows = match (low, high) {
+        (None, None) => table_rows,
+        (None, Some(_)) | (Some(_), None) => table_rows / PSEUDO_LESS_RATE,
+        (Some((low, _)), Some((high, _))) => {
+            if low.compare(high) == Ordering::Equal {
+                1.0
+            } else {
+                table_rows / PSEUDO_BETWEEN_RATE
+            }
+        }
+    };
+    rows.min(table_rows)
 }
 
 /// `IS NULL` / `NOT IS NULL` conjuncts carry no `ColumnRange`; the leading
@@ -346,6 +457,7 @@ pub fn is_null_predicate(expr: &ExprNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sealdb_parser::sqlparser_bridge::parse_expr;
 
     fn int(v: i64) -> Datum {
         Datum::I64(v)
@@ -368,6 +480,27 @@ mod tests {
     fn test_between_uses_between_rate() {
         let rows = column_range_rows(10_000.0, Some(&(int(1), true)), Some(&(int(3), true)));
         assert_eq!(rows, 250.0);
+    }
+
+    #[test]
+    fn test_not_isnull_keeps_all_but_pseudo_nulls() {
+        // TiDB `select * from t where c is not null` on 10000 pseudo rows: 9990.
+        let conds = [parse_expr("c is not null").expect("parsed")];
+        let sel = selectivity(&conds, 10_000.0, Some("a")).expect("modeled");
+        assert!((sel - 0.999).abs() < 1e-9, "{sel}");
+    }
+
+    #[test]
+    fn test_dnf_over_handle_and_column_is_independent() {
+        // TiDB: `not(isnull(c)) and (a = 1 or b = 1)` with `a` the int handle
+        // over 10000 pseudo rows → 0.999 * (1 - (1 - 1/10000)(1 - 1/1000)).
+        let conds = [
+            parse_expr("c is not null").expect("parsed"),
+            parse_expr("a = 1 or b = 1").expect("parsed"),
+        ];
+        let sel = selectivity(&conds, 10_000.0, Some("a")).expect("modeled");
+        // TiDB reports 10.988001 rows for this filter list.
+        assert!((sel * 10_000.0 - 10.988_001).abs() < 1e-5, "{}", sel * 10_000.0);
     }
 
     #[test]
@@ -418,6 +551,25 @@ mod tests {
                 Some(&(int(7), true)),
                 Some(&(int(7), true)),
                 1,
+                1,
+                false
+            ),
+            10.0
+        );
+    }
+
+    #[test]
+    fn test_index_range_rows_multi_column_prefix_point_keeps_equal_rate() {
+        // `a = 7` on `idx(a, c)` builds the ranger range `[1,1]` whose LowVal
+        // holds only the pinned leading column, so TiDB's shrink loop runs
+        // `min(prefixEqualLen, len(LowVal)-1) = 0` times and the arm stays at
+        // the 1/1000 equal rate (TiDB v8.5.8: 10.00, not 0.10).
+        assert_eq!(
+            index_range_rows(
+                10_000.0,
+                Some(&(int(7), true)),
+                Some(&(int(7), true)),
+                2,
                 1,
                 false
             ),

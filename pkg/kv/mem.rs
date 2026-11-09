@@ -85,6 +85,7 @@ impl MemStorage {
             store: Arc::clone(&self.store),
             wait: Arc::clone(&self.wait),
             start_ts,
+            read_ts: start_ts,
             snapshot: store.data.clone(),
             writes: BTreeMap::new(),
             deletes: HashSet::new(),
@@ -110,6 +111,7 @@ impl MemStorage {
             store: Arc::clone(&self.store),
             wait: Arc::clone(&self.wait),
             start_ts,
+            read_ts: start_ts,
             snapshot,
             writes: BTreeMap::new(),
             deletes: HashSet::new(),
@@ -158,6 +160,9 @@ struct MemTransaction {
     store: Arc<Mutex<Store>>,
     wait: Arc<Condvar>,
     start_ts: u64,
+    /// Read timestamp for snapshot reads. `READ COMMITTED` advances it per
+    /// statement (`refresh_snapshot`); write-conflict checks keep `start_ts`.
+    read_ts: u64,
     snapshot: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
     writes: BTreeMap<Vec<u8>, Vec<u8>>,
     deletes: HashSet<Vec<u8>>,
@@ -192,7 +197,7 @@ impl MemTransaction {
         }
         self.snapshot
             .get(key)
-            .and_then(|versions| value_at(versions, self.start_ts))
+            .and_then(|versions| value_at(versions, self.read_ts))
     }
 
     fn lock_wait_timeout() -> Duration {
@@ -405,6 +410,14 @@ impl MemTransaction {
 }
 
 impl Transaction for MemTransaction {
+    fn dirty_keys(&self) -> Vec<Vec<u8>> {
+        self.writes
+            .keys()
+            .chain(self.deletes.iter())
+            .cloned()
+            .collect()
+    }
+
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.visible_value(key))
     }
@@ -437,7 +450,7 @@ impl Transaction for MemTransaction {
                 .writes
                 .get(k)
                 .cloned()
-                .or_else(|| value_at(versions, self.start_ts));
+                .or_else(|| value_at(versions, self.read_ts));
             if let Some(value) = value {
                 out.push((k.clone(), value));
             }
@@ -612,7 +625,9 @@ impl Transaction for MemTransaction {
     }
 
     fn refresh_snapshot(&mut self) -> Result<()> {
-        let store = self.store.lock().expect("mem kv");
+        let mut store = self.store.lock().expect("mem kv");
+        store.next_ts += 1;
+        self.read_ts = store.next_ts;
         self.snapshot = store.data.clone();
         Ok(())
     }

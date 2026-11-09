@@ -46,6 +46,14 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
     }
 }
 
+/// Column names a virtual table exposes, without building its rows.
+pub fn virtual_columns(table: &str) -> Vec<String> {
+    let empty = InfoSchema::empty();
+    virtual_rows(table, &empty)
+        .map(|(columns, _)| columns)
+        .unwrap_or_default()
+}
+
 fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     let schema = vec![
         "CATALOG_NAME".to_string(),

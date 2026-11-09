@@ -62,6 +62,42 @@ pub struct IndexScanRange {
     pub partial: Option<String>,
 }
 
+/// Inclusive/exclusive bounds of one index range, `None` meaning the
+/// `-inf` / `+inf` sentinels (TiDB `ranger.Range`).
+pub type IndexBounds = (
+    Option<(sealdb_types::Datum, bool)>,
+    Option<(sealdb_types::Datum, bool)>,
+);
+
+#[derive(Clone, Debug, Serialize)]
+/// One partial path of a TiDB `IndexMerge`: the index name plus the range the
+/// path scans. `range: None` means the path scans the whole index (pseudo
+/// statistics / non-range predicate).
+pub struct IndexMergePath {
+    pub index: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<IndexScanRange>,
+    /// Clustered PRIMARY KEY / integer handle arm: the path scans table rows
+    /// (`TableRangeScan` in EXPLAIN) instead of a secondary index.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub table_range: bool,
+    /// Index key columns, for the `index:idx(a, c)` access-object text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_columns: Vec<String>,
+    /// The arm reads the index in key order (`keep order:true`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_order: bool,
+    /// Backward key order (`keep order:true, desc`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub desc: bool,
+    /// Limit embedded into the arm (`Limit(Build)` over the scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<(u64, u64)>,
+    /// KV seek bounds; `range` carries the EXPLAIN text / cardinality.
+    #[serde(skip)]
+    pub ranges: Vec<IndexBounds>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub enum PhysicalPlan {
     TableDual {
@@ -91,6 +127,10 @@ pub enum PhysicalPlan {
         /// Pushed equality ranges: `column_name:["c1"], table_name:["t1"]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pushed: Option<String>,
+        /// The same ranges in structured form: the memtable scan applies them
+        /// to its rows (TiDB `MemTableScan` ranges), so no `Selection` prints.
+        #[serde(skip)]
+        ranges: Vec<(String, String)>,
     },
     /// `UPDATE`: `child` reads the rows to update.
     Update {
@@ -235,14 +275,45 @@ pub enum PhysicalPlan {
         #[serde(default)]
         range_scan: Option<IndexScanRange>,
     },
-    /// Union of partial index scans (OR of indexed equalities) then table lookup.
-    /// Completeness wave IndexMerge MVB; intersection / cost skyline deferred.
+    /// Union / intersection of partial index scans, then table lookup.
+    /// TiDB `PhysicalIndexMergeReader` (EXPLAIN `type: union` / `type: intersection`).
     IndexMerge {
         table: String,
         indexes: Vec<String>,
         partitions: Vec<i64>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
+        /// TiDB `IndexMerge` intersection: keep only row IDs present in every
+        /// partial path (AND of indexed predicates). `false` = union (OR arms).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        intersection: bool,
+        /// Partial paths in plan/EXPLAIN order; empty for the legacy union
+        /// shape that derives arms from the selection at execution time.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<IndexMergePath>,
+        /// TiDB `IndexMerge` root cardinality (after the probe filters).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        est_rows: Option<f64>,
+        /// Cardinality of the `TableRowIDScan` (merged row IDs, before the
+        /// probe Selection filters them).
+        #[serde(default)]
+        probe_est: f64,
+        /// Residual filter above `TableRowIDScan` (`Selection(Probe)`).
+        #[serde(skip)]
+        probe_selection: Option<ExprNode>,
+        /// Limit pushed into the IndexMerge root
+        /// (`limit embedded(offset:0, count:N)`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<(u64, u64)>,
+        /// IndexMerge already returns rows in the query's ORDER BY order.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_order: bool,
+        /// Order column whose key order the merged arms provide.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order_column: Option<String>,
+        /// `ORDER BY <order_column> DESC`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        order_desc: bool,
     },
     Selection {
         child: Box<PhysicalPlan>,
@@ -564,6 +635,7 @@ impl PhysicalPlan {
                 indexes,
                 partitions,
                 pushed,
+                ..
             } => {
                 let mut name = if partitions.is_empty() {
                     format!("IndexMerge_{table}_{}", indexes.join("+"))

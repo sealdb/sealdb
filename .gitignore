@@ -54,3 +54,6 @@ tests/integrationtest/s/
 
 # itest triage scratch output
 project/regression/waves/*-triage.txt
+
+# Local oracle scratch (TiDB server logs / data)
+.tmp-tidb/

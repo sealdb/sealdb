@@ -1,7 +1,7 @@
-use super::physical_plans::{DdlKind, JoinType, PhysicalPlan};
+use super::physical_plans::{DdlKind, IndexMergePath, JoinType, PhysicalPlan};
 use super::plan_cost::{
-    eq_row_count_value, index_lookup_cost, partition_filter_rows, point_get_cost, prefer_topn,
-    table_row_count, table_scan_cost,
+    eq_row_count_value, has_real_stats, index_lookup_cost, partition_filter_rows, point_get_cost,
+    prefer_topn, table_row_count, table_scan_cost,
 };
 use super::rule_having_push_down::apply_having_push_down;
 use super::rule_inject_extra_projection::{
@@ -52,8 +52,15 @@ impl PlanBuilder {
         // Statement-wide CTE reference counts (TiDB `computeCTEInlineFlag`).
         // Computed once for the outermost statement and reused by nested
         // subquery builds.
+        let read = match stmt {
+            Statement::Select(_) => true,
+            Statement::Explain(explain) => matches!(explain.stmt.as_ref(), Statement::Select(_)),
+            _ => false,
+        };
         let plan = with_statement_cte_refs(stmt, || {
-            self.build_with_schema_inner(stmt, is, current_db, stats, prune_mode)
+            with_read_statement(read, || {
+                self.build_with_schema_inner(stmt, is, current_db, stats, prune_mode)
+            })
         });
         plan
     }
@@ -446,6 +453,11 @@ impl PlanBuilder {
                             is,
                             current_db,
                         );
+                        // A keep-order merge on a rowid table reads `_tidb_rowid`
+                        // to keep the arms aligned, so TiDB prunes it with an
+                        // extra Projection (`index_merge_reader`:
+                        // `Projection → Limit → UnionScan → IndexMerge`).
+                        plan = merge_extra_projection(plan, select, is, current_db);
                     }
                 }
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
@@ -3989,6 +4001,18 @@ fn apply_order_limit(
     est_rows: f64,
     by_info: String,
 ) -> PhysicalPlan {
+    // IndexMerge already carries the pushed LIMIT (`limit embedded(...)`), so no
+    // Limit node is added above it.
+    if !ordered
+        && let PhysicalPlan::IndexMerge {
+            limit: Some((_, count)),
+            ..
+        } = &plan
+        && Some(*count) == limit
+        && offset.unwrap_or(0) == 0
+    {
+        return plan;
+    }
     if ordered && let Some(lim) = limit {
         // join-cost: costed TopN vs Sort+Limit (offset forces Sort+Limit).
         // TiDB still uses TopN when offset=0; prefer_topn may also allow small offsets.
@@ -4601,6 +4625,49 @@ thread_local! {
     /// Whether the current statement runs inside an explicit transaction, where
     /// `SELECT … FOR UPDATE` point gets report `lock` in EXPLAIN.
     static EXPLICIT_TXN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Table ids the current transaction has written (TiDB dirty `MemBuffer`):
+    /// their reads become `UnionScan` over snapshot ∪ pending writes.
+    static DIRTY_TABLES: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether the statement being built is a read (`SELECT` / `EXPLAIN
+    /// SELECT`): only those gather dirty rows through a `UnionScan`.
+    static READ_STATEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// TiDB `tidb_cost_model_version`: 1 keeps the legacy double-read charge for
+    /// an `IndexLookUp`, 2 (the 8.x default) prices the probe as one scan.
+    static COST_MODEL_VERSION: std::cell::Cell<i32> = const { std::cell::Cell::new(2) };
+}
+
+/// Run `f` with the session's `tidb_cost_model_version` visible to cost models.
+pub fn with_cost_model_version<T>(version: i32, f: impl FnOnce() -> T) -> T {
+    let prev = COST_MODEL_VERSION.with(|c| c.replace(version));
+    let out = f();
+    COST_MODEL_VERSION.with(|c| c.set(prev));
+    out
+}
+
+/// Session `tidb_cost_model_version` (defaults to TiDB 8.x `2`).
+pub fn cost_model_version() -> i32 {
+    COST_MODEL_VERSION.with(|c| c.get())
+}
+
+/// Mark the plan build in progress as a read statement (see [`READ_STATEMENT`]).
+fn with_read_statement<T>(read: bool, f: impl FnOnce() -> T) -> T {
+    let prev = READ_STATEMENT.with(|c| c.replace(read));
+    let out = f();
+    READ_STATEMENT.with(|c| c.set(prev));
+    out
+}
+
+/// Run `f` with the transaction's dirty table ids visible to plan building.
+pub fn with_dirty_tables<T>(tables: Vec<i64>, f: impl FnOnce() -> T) -> T {
+    let prev = DIRTY_TABLES.with(|c| c.replace(tables));
+    let out = f();
+    DIRTY_TABLES.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
+fn table_is_dirty(table_id: i64) -> bool {
+    DIRTY_TABLES.with(|c| c.borrow().contains(&table_id))
 }
 
 /// Run `f` with the explicit-transaction flag visible to plan building.
@@ -4972,7 +5039,7 @@ fn using_output_table(select: &SelectStmt, name: &str) -> Option<String> {
     None
 }
 
-fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
+pub(crate) fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
     let table = select.from.as_ref().map(|t| t.name.as_str());
     let from_derived_union = select.with.as_ref().is_some_and(|w| {
         table.is_some_and(|t| w.find(t).is_some_and(|cte| !cte.set_rest.is_empty()))
@@ -5106,6 +5173,93 @@ fn wrap_quantified_all_projection(
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(plan),
+    }
+}
+
+/// TiDB's extra projection over a paths-based IndexMerge (`needExtraProj`):
+/// the merge's table scan ships the handle (and, when an arm keeps order, the
+/// sort columns) into the reader schema, so the DataSource keeps a Projection
+/// that prunes back to the SELECT list. TiDB elides it for `SELECT *` (nothing
+/// to prune) except on a rowid table whose merge keeps order — there the handle
+/// is `_tidb_rowid`, an extra column the star list never showed.
+fn merge_extra_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    if !select.joins.is_empty() {
+        return plan;
+    }
+    let Some(from) = &select.from else {
+        return plan;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.and_then(|is| is.table_by_name(&db, &table)) else {
+        return plan;
+    };
+    let star = is_star_select(select);
+    let rowid = !info.pk_is_handle && !info.pk_is_clustered();
+    // `Projection` sitting directly on the access path whose items are the
+    // trivial `colN` passthrough the explain walker drops; it still prunes the
+    // handle columns for execution.
+    fn passthrough(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
+        if let PhysicalPlan::Projection { exprs, child } = plan
+            && !exprs.is_empty()
+            && exprs.iter().all(|e| {
+                e.strip_prefix("col")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        {
+            return Some(child);
+        }
+        None
+    }
+    fn merge(p: &PhysicalPlan) -> Option<&PhysicalPlan> {
+        match p {
+            PhysicalPlan::UnionScan { child, .. } | PhysicalPlan::Limit { child, .. } => merge(child),
+            PhysicalPlan::IndexMerge { paths, .. } if !paths.is_empty() => Some(p),
+            _ => None,
+        }
+    }
+    let keep_order = |p: &PhysicalPlan| match merge(p) {
+        Some(PhysicalPlan::IndexMerge { keep_order, .. }) => *keep_order,
+        _ => false,
+    };
+    // Star lists only need the projection when the merge keeps order on a
+    // rowid table; other SELECT lists always prune the merge's extra columns.
+    let existing = passthrough(&plan);
+    let access = existing.unwrap_or(&plan);
+    if merge(access).is_none() || (star && !(rowid && keep_order(access))) {
+        return plan;
+    }
+    let prefix = schema_prefix(current_db);
+    // TiDB prints the *physical* table name for these items even when the query
+    // aliases the table (`from tk x` → `projection: probe_im.tk.a`).
+    let exprs: Vec<String> = if star {
+        info.columns
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| format!("{prefix}.{}.{}", from.name, c.name.o()))
+            .collect()
+    } else {
+        let mut items = Vec::with_capacity(select.fields.len());
+        for field in &select.fields {
+            let ExprNode::Column(col) = &field.expr else {
+                // Expressions keep the regular output projection.
+                return plan;
+            };
+            items.push(format!("{prefix}.{}.{}", from.name, col.name));
+        }
+        items
+    };
+    let child = match plan {
+        PhysicalPlan::Projection { child, .. } if existing.is_some() => *child,
+        other => other,
+    };
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(child),
     }
 }
 
@@ -6662,6 +6816,27 @@ fn point_value_fits_column(info: &sealdb_meta::TableInfo, column: &str, value: &
     width >= 64 || bits >> width == 0
 }
 
+/// A range bound on a TIMESTAMP column: its index keys store UTC, so the
+/// session-local bound cannot build a byte seek.
+fn has_timestamp_bound(
+    column: &str,
+    info: &sealdb_meta::TableInfo,
+    conjuncts: &[ExprNode],
+) -> bool {
+    let Some(col) = info
+        .columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(column))
+    else {
+        return false;
+    };
+    col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
+        && conjuncts.iter().any(|conjunct| {
+            sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(column))
+        })
+}
+
 fn index_ignored(from: &TableName, name: &str) -> bool {
     from.ignore_indexes
         .iter()
@@ -6673,6 +6848,15 @@ fn index_allowed(from: &TableName, name: &str, only_index: Option<&str>) -> bool
         return false;
     }
     only_index.is_none_or(|only| only.eq_ignore_ascii_case(name))
+}
+
+/// TiDB index visibility: an `INVISIBLE` index is never an access path unless a
+/// `USE INDEX` / `FORCE INDEX` hint names it.
+fn index_visible(from: &TableName, index: &sealdb_meta::model::IndexInfo) -> bool {    !index.invisible
+        || from
+            .use_indexes
+            .iter()
+            .any(|hinted| hinted.eq_ignore_ascii_case(index.name.o()))
 }
 
 /// `a = 1 AND b = 2 …` fully constrains a multi-column unique key → PointGet.
@@ -8649,32 +8833,563 @@ fn dnf_same_index_plan(
     Some(index_plan(select, from, info, index, prune_mode, join_keys))
 }
 
-/// Detect pure DNF of column=const arms where each arm has a leading-column index.
+/// `USE_INDEX_MERGE(t, idx…)` hint targeting one table factor. An empty index
+/// list lets TiDB pick the access path per DNF item / filter.
+#[derive(Clone)]
+struct IndexMergeHint {
+    indexes: Vec<String>,
+}
+
+/// TiDB `use_index_merge(<table>, <index>, …)`: the first argument names the
+/// table factor (alias), the rest the indexes the hint allows.
+fn index_merge_hint(text: &str, target: &str) -> Option<IndexMergeHint> {
+    let lower = text.to_ascii_lowercase();
+    let name = "use_index_merge(";
+    let mut base = 0usize;
+    while let Some(found) = lower[base..].find(name) {
+        let open = base + found + name.len();
+        let Some(close_rel) = lower[open..].find(')') else {
+            return None;
+        };
+        let inside = &text[open..open + close_rel];
+        let mut parts = inside.split(',');
+        let hint_target = parts.next().unwrap_or("").trim().trim_matches('`');
+        if hint_target.eq_ignore_ascii_case(target) {
+            let indexes = parts
+                .map(|part| part.trim().trim_matches('`').to_ascii_lowercase())
+                .filter(|part| !part.is_empty())
+                .collect();
+            return Some(IndexMergeHint { indexes });
+        }
+        base = open + close_rel + 1;
+    }
+    None
+}
+
+/// Hint name → index, with TiDB's `PRIMARY` alias for the clustered key.
+fn hint_index<'a>(info: &'a sealdb_meta::TableInfo, name: &str) -> Option<&'a sealdb_meta::IndexInfo> {
+    if name.eq_ignore_ascii_case("primary") {
+        info.indices.iter().find(|idx| idx.primary)
+    } else {
+        info.indices
+            .iter()
+            .find(|idx| idx.name.o().eq_ignore_ascii_case(name))
+    }
+}
+
+/// Leading column of the row handle when the PRIMARY KEY is clustered.
+fn clustered_handle_column(info: &sealdb_meta::TableInfo) -> Option<&str> {
+    if !info.pk_is_clustered() {
+        return None;
+    }
+    info.clustered_prefix_column().map(|col| col.name.o())
+}
+
+/// TiDB pseudo estimate of an integer-handle range (`GetRowCountByIntColumnRanges`):
+/// a point pins one row, a one-sided range `1/3` of the table, a bounded range
+/// `1/40`. Unlike a secondary index the handle is unique and NOT NULL, so no
+/// `1/1000` boundary row is subtracted.
+fn int_handle_pseudo_rows(table_rows: f64, ranges: &[sealdb_statistics::pseudo::Bounds]) -> f64 {
+    let mut rows = 0.0;
+    for (low, high) in ranges {
+        let cnt = match (low, high) {
+            (None, None) => table_rows,
+            (Some((low, _)), Some((high, _))) if low.compare(high) == std::cmp::Ordering::Equal => 1.0,
+            (None, _) | (_, None) => table_rows / 3.0,
+            _ => table_rows / 40.0,
+        };
+        rows += cnt;
+    }
+    rows.min(table_rows)
+}
+
+/// One index arm: the seek range the index builds from `conds`, plus the
+/// conjuncts fully encoded by that range.
+fn index_merge_index_arm(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    conds: &[ExprNode],
+    table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
+) -> Option<(IndexMergePath, Vec<ExprNode>)> {
+    let access =
+        super::access_range::index_access_range(info, index, conds, table_rows, table_stats)?;
+    Some((
+        IndexMergePath {
+            index: index.name.o().to_string(),
+            range: Some(access.range),
+            table_range: false,
+            index_columns: index_key_column_names(info, index),
+            keep_order: false,
+            desc: false,
+            limit: None,
+            ranges: access.ranges,
+        },
+        access.consumed,
+    ))
+}
+
+/// One clustered-handle arm (`TableRangeScan` in EXPLAIN).
+fn index_merge_handle_arm(
+    info: &sealdb_meta::TableInfo,
+    conds: &[ExprNode],
+    table_rows: f64,
+) -> Option<(IndexMergePath, Vec<ExprNode>)> {
+    let column = clustered_handle_column(info)?;
+    let mut ranges: Vec<sealdb_statistics::pseudo::Bounds> = Vec::new();
+    let mut consumed = Vec::new();
+    for cond in conds {
+        let bounds = sealdb_statistics::pseudo::conjunct_bound_sets(cond);
+        if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+            eprintln!("IM handle arm cond={} bounds_name={:?}", cond.restore_string(), bounds.as_ref().map(|(n, s)| (n.clone(), s.len())));
+        }
+        let Some((name, sets)) = bounds else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(column) {
+            continue;
+        }
+        if ranges.is_empty() {
+            ranges = sets;
+        } else {
+            sealdb_statistics::pseudo::intersect_sets(&mut ranges, &sets);
+            if ranges.is_empty() {
+                return None;
+            }
+        }
+        consumed.push(cond.clone());
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    let pinned = ranges.len() == 1
+        && matches!(
+            (&ranges[0].0, &ranges[0].1),
+            (Some((low, true)), Some((high, true))) if low.compare(high) == std::cmp::Ordering::Equal
+        );
+    let rows = if info.pk_is_handle {
+        int_handle_pseudo_rows(table_rows, &ranges)
+    } else {
+        sealdb_statistics::pseudo::index_ranges_rows(
+            table_rows,
+            &ranges,
+            1,
+            usize::from(pinned),
+            true,
+        )
+    };
+    Some((
+        IndexMergePath {
+            index: String::new(),
+            range: Some(super::physical_plans::IndexScanRange {
+                text: sealdb_statistics::pseudo::ranges_text(&ranges),
+                rows,
+                filter_rows: rows,
+                pseudo: true,
+                partial: None,
+            }),
+            table_range: true,
+            index_columns: Vec::new(),
+            keep_order: false,
+            desc: false,
+            limit: None,
+            ranges,
+        },
+        consumed,
+    ))
+}
+
+/// Index a union arm reads: the hinted index whose leading column the DNF item
+/// constrains, or any visible leading-column index when the hint lists none.
+fn index_merge_arm_index<'a>(
+    info: &'a sealdb_meta::TableInfo,
+    hint: &IndexMergeHint,
+    conds: &[ExprNode],
+) -> Option<&'a sealdb_meta::IndexInfo> {
+    let columns: Vec<String> = conds
+        .iter()
+        .filter_map(|cond| {
+            sealdb_statistics::pseudo::conjunct_bound_sets(cond).map(|(name, _)| name)
+        })
+        .collect();
+    let candidates: Vec<&sealdb_meta::IndexInfo> = if hint.indexes.is_empty() {
+        info.indices.iter().collect()
+    } else {
+        hint.indexes
+            .iter()
+            .filter_map(|name| hint_index(info, name))
+            .collect()
+    };
+    candidates.into_iter().find(|idx| {
+        !(idx.primary && info.pk_is_handle)
+            && !idx.invisible
+            && idx.columns.first().is_some_and(|col| {
+                let key = super::expr_index::part_key(info, col);
+                columns.iter().any(|name| name.eq_ignore_ascii_case(&key))
+            })
+    })
+}
+
+/// Build one union arm for a DNF item; the handle wins when the item pins it.
+fn index_merge_union_arm(
+    info: &sealdb_meta::TableInfo,
+    hint: &IndexMergeHint,
+    conds: &[ExprNode],
+    table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
+) -> Option<(IndexMergePath, Vec<ExprNode>)> {
+    let handle = clustered_handle_column(info);
+    if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+        eprintln!(
+            "IM arm handle={:?} pk_is_handle={} common_handle={} primary_cols={:?}",
+            handle,
+            info.pk_is_handle,
+            info.common_handle,
+            info.indices
+                .iter()
+                .find(|i| i.primary)
+                .map(|i| i.columns.iter().map(|c| c.name.o().to_string()).collect::<Vec<_>>())
+        );
+    }
+    if handle.is_some_and(|handle| {
+        conds.iter().any(|cond| {
+            sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+        })
+    }) {
+        return index_merge_handle_arm(info, conds, table_rows);
+    }
+    let index = index_merge_arm_index(info, hint, conds)?;
+    index_merge_index_arm(info, index, conds, table_rows, table_stats)
+}
+
+/// TiDB `buildIndexMergeOrPath`: one arm per DNF item over the index it seeks.
+fn index_merge_union_paths(
+    cnf: &[ExprNode],
+    or_pos: usize,
+    hint: &IndexMergeHint,
+    info: &sealdb_meta::TableInfo,
+    table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
+) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
+    let items = cnf[or_pos].split_dnf();
+    if items.len() < 2 {
+        return None;
+    }
+    let mut paths = Vec::with_capacity(items.len());
+    let mut fully_consumed = true;
+    for item in &items {
+        let conds = item.split_cnf();
+        let built = index_merge_union_arm(info, hint, &conds, table_rows, table_stats);
+        if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+            eprintln!("IM arm conds={:?} ok={}", conds.iter().map(|c| c.restore_string()).collect::<Vec<_>>(), built.is_some());
+        }
+        let (path, consumed) = built?;
+        if consumed.len() != conds.len() {
+            fully_consumed = false;
+        }
+        paths.push(path);
+    }
+    let mut residual: Vec<ExprNode> = cnf
+        .iter()
+        .enumerate()
+        .filter(|(pos, _)| *pos != or_pos)
+        .map(|(_, conjunct)| conjunct.clone())
+        .collect();
+    // A DNF filter survives in the probe plan unless every arm fully covers it.
+    if !fully_consumed {
+        residual.insert(0, cnf[or_pos].clone());
+    }
+    Some((paths, residual))
+}
+
+/// TiDB `buildIndexMergeIntersectionPath`: one arm per hinted index, consuming
+/// the CNF conjuncts that seek it.
+fn index_merge_intersection_paths(
+    cnf: &[ExprNode],
+    hint: &IndexMergeHint,
+    info: &sealdb_meta::TableInfo,
+    table_rows: f64,
+    table_stats: Option<&super::access_range::TableStats>,
+) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
+    if hint.indexes.len() < 2 {
+        return None;
+    }
+    let mut remaining: Vec<ExprNode> = cnf.to_vec();
+    let mut paths = Vec::new();
+    for name in &hint.indexes {
+        let Some(index) = hint_index(info, name) else {
+            continue;
+        };
+        let built = if index.primary && info.pk_is_clustered() {
+            index_merge_handle_arm(info, &remaining, table_rows)
+        } else {
+            index_merge_index_arm(info, index, &remaining, table_rows, table_stats)
+        };
+        let Some((path, consumed)) = built else {
+            continue;
+        };
+        remaining.retain(|cond| {
+            !consumed
+                .iter()
+                .any(|used| used.restore_string() == cond.restore_string())
+        });
+        paths.push(path);
+    }
+    if paths.len() < 2 {
+        return None;
+    }
+    Some((paths, remaining))
+}
+
+/// TiDB `Selectivity()` estimate for one DNF item on an int handle column.
+///
+/// A union arm's own `CountAfterAccess` (3333.33 for `pk < 10`) is not what the
+/// DNF independence formula consumes: `cardinality.Selectivity` rebuilds a
+/// column range with `ranger.BuildColumnRange`, whose open lower bound is
+/// `MinNotNull` rather than `Int64`. `GetRowCountByIntColumnRanges` therefore
+/// takes the **unsigned** pseudo helper, where `MinNotNull` becomes 0 and the
+/// count is clamped to `high - 0` — `pk < 10` on 10000 pseudo rows is 10 rows,
+/// not 1/3 of the table.
+fn int_handle_item_rows(table_rows: f64, ranges: &[sealdb_statistics::pseudo::Bounds]) -> f64 {
+    let mut rows = 0.0;
+    for (low, high) in ranges {
+        let low_v = low
+            .as_ref()
+            .map(|(value, _)| value.as_f64().unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let high_v = high
+            .as_ref()
+            .map(|(value, _)| value.as_f64().unwrap_or(f64::INFINITY))
+            .unwrap_or(f64::INFINITY);
+        let cnt = match (low, high) {
+            (None, None) => table_rows,
+            (None, _) | (_, None) => table_rows / sealdb_statistics::pseudo::PSEUDO_LESS_RATE,
+            _ if low_v == high_v => 1.0,
+            _ => table_rows / sealdb_statistics::pseudo::PSEUDO_BETWEEN_RATE,
+        };
+        let span = high_v - low_v;
+        rows += if span > 0.0 && cnt > span { span } else { cnt };
+    }
+    rows.min(table_rows)
+}
+
+/// One union arm's selectivity inside TiDB's DNF independence formula.
+fn index_merge_union_arm_selectivity(
+    info: &sealdb_meta::TableInfo,
+    path: &IndexMergePath,
+    table_rows: f64,
+    real_stats: bool,
+) -> f64 {
+    let rows = if !real_stats && path.table_range && info.pk_is_handle {
+        int_handle_item_rows(table_rows, &path.ranges)
+    } else {
+        path.range.as_ref().map_or(table_rows, |range| range.rows)
+    };
+    (rows / table_rows).clamp(0.0, 1.0)
+}
+
+/// TiDB probe-side selectivity for a residual filter. A DNF filter that was
+/// only partially covered comes back whole (`or(eq(c,10), and(...))`), and its
+/// pseudo selectivity is the OR of its items, not the `0.8` default.
+fn index_merge_residual_rows(residual: &[ExprNode], rows: f64) -> f64 {
+    if let [only] = residual
+        && only.split_dnf().len() > 1
+    {
+        let mut selectivity = 0.0;
+        for item in only.split_dnf() {
+            let mut item_sel = 1.0;
+            for cond in item.split_cnf() {
+                let per = match sealdb_statistics::pseudo::conjunct_bound_sets(&cond) {
+                    Some((_, sets)) => sets
+                        .iter()
+                        .map(|(low, high)| {
+                            sealdb_statistics::pseudo::column_range_rows(
+                                1.0,
+                                low.as_ref(),
+                                high.as_ref(),
+                            )
+                        })
+                        .sum::<f64>(),
+                    None => sealdb_statistics::pseudo::SELECTION_FACTOR,
+                };
+                item_sel *= per;
+            }
+            selectivity = selectivity + item_sel - selectivity * item_sel;
+        }
+        return (rows * selectivity).clamp(0.0, rows);
+    }
+    sealdb_statistics::pseudo::filter_rows(residual, rows)
+}
+
+/// TiDB index-merge access path: a union of DNF arms (OR) or an intersection of
+/// hinted indexes (AND), followed by a probe-side table lookup. The limit is
+/// embedded into the merge root when the order is not provided by the arms.
 fn index_merge_plan(
     select: &SelectStmt,
     from: &TableName,
     info: &sealdb_meta::TableInfo,
     prune_mode: PartitionPruneMode,
+    stats: Option<&Handle>,
+    current_db: &str,
 ) -> Option<PhysicalPlan> {
+    let hinted = index_merge_hint(&select.text, &from.name).or_else(|| {
+        from.physical
+            .as_deref()
+            .and_then(|name| index_merge_hint(&select.text, name))
+    });
+    // TiDB `indexMergeOR` runs in logical optimization without any hint: an OR
+    // whose arms each seek a *different* index becomes an IndexMerge union when
+    // its cost beats a table scan. Intersection merges still come only from an
+    // explicit `USE_INDEX_MERGE` hint.
+    let hint = hinted
+        .clone()
+        .unwrap_or(IndexMergeHint { indexes: Vec::new() });
     let selection = select.selection.as_ref()?;
-    // Only a single top-level OR tree (no AND wrappers) for the MVB.
+    let table_rows = table_row_count(stats, from, current_db).max(1.0);
+    let table_stats = stats
+        .and_then(|handle| {
+            let (db, table) = from.qualified(current_db);
+            handle.table(&db, &table)
+        })
+        .filter(|table| super::plan_cost::has_real_stats(table));
     let cnf = selection.split_cnf();
-    if cnf.len() != 1 {
+    let or_pos = cnf.iter().position(|conjunct| conjunct.split_dnf().len() > 1);
+    if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+        eprintln!("IM hint={:?} cnf={} or_pos={:?} rows={table_rows}", hint.indexes, cnf.len(), or_pos);
+    }
+    let (mut paths, residual, intersection) = match or_pos {
+        Some(pos) => {
+            let (paths, residual) = index_merge_union_paths(
+                &cnf,
+                pos,
+                &hint,
+                info,
+                table_rows,
+                table_stats.as_ref(),
+            )?;
+            (paths, residual, false)
+        }
+        None => {
+            hinted.as_ref()?;
+            let (paths, residual) = index_merge_intersection_paths(
+                &cnf,
+                &hint,
+                info,
+                table_rows,
+                table_stats.as_ref(),
+            )?;
+            (paths, residual, true)
+        }
+    };
+    if hinted.is_none() {
+        // An automatic union needs one distinct secondary index per arm; a
+        // handle arm or two arms on the same index stay a table scan.
+        let mut seen = std::collections::HashSet::new();
+        if paths
+            .iter()
+            .any(|path| path.table_range || path.index.is_empty())
+            || !paths
+                .iter()
+                .all(|path| seen.insert(path.index.to_ascii_lowercase()))
+        {
+            return None;
+        }
+    }
+    let path_rows = |path: &IndexMergePath| path.range.as_ref().map_or(table_rows, |r| r.rows);
+    // TiDB combine: union is `1 - Π(1 - selᵢ)`; intersection multiplies the
+    // per-path selectivities (every arm must hold).
+    let mut rowid_est = if intersection {
+        let selectivity = paths
+            .iter()
+            .fold(1.0, |acc, path| acc * path_rows(path) / table_rows);
+        table_rows * selectivity
+    } else {
+        let mut selectivity = 0.0;
+        for path in &paths {
+            let arm =
+                index_merge_union_arm_selectivity(info, path, table_rows, table_stats.is_some());
+            selectivity = selectivity + arm - selectivity * arm;
+        }
+        table_rows * selectivity
+    };
+    if hinted.is_none()
+        && super::plan_cost::index_lookup_cost(rowid_est)
+            >= super::plan_cost::table_scan_cost(table_rows)
+    {
+        // Union (index ranges + row lookups) costs more than scanning the
+        // table once: TiDB keeps the TableFullScan + Selection.
         return None;
     }
-    let arms = cnf[0].split_dnf();
-    if arms.len() < 2 {
-        return None;
+    // ORDER BY a suffix key column of every arm → the merge reads in that order
+    // (`keep order:true`), and the LIMIT above must not be embedded.
+    let order = match select.order_by.as_slice() {
+        [item] => match &item.expr {
+            ExprNode::Column(col) => Some((col.name.clone(), item.desc)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut keep_order = false;
+    let mut order_column = None;
+    let mut order_desc = false;
+    if !intersection
+        && let Some((column, desc)) = &order
+        && paths.iter().all(|path| {
+            !path.table_range
+                && path
+                    .index_columns
+                    .iter()
+                    .position(|key| key.eq_ignore_ascii_case(column))
+                    .is_some_and(|pos| pos > 0)
+        })
+    {
+        keep_order = true;
+        order_column = Some(column.clone());
+        order_desc = *desc;
+        for path in &mut paths {
+            path.keep_order = true;
+            path.desc = *desc;
+        }
     }
-    let mut indexes = Vec::with_capacity(arms.len());
-    for arm in &arms {
-        let (column, _) = arm.eq_column_const()?;
-        let index = info.find_index_covering(&column)?;
-        indexes.push(index.name.o().to_string());
+    // TiDB `AdjustRowCountForIndexScanByLimit`: LIMIT shrinks the merge's
+    // cardinality and each arm's scan (`expectedCnt / selectivity`).
+    let expected = select.limit.map(|count| (count + select.offset.unwrap_or(0)) as f64);
+    if let Some(expected) = expected
+        && rowid_est > 0.0
+    {
+        let factor = (expected / rowid_est).min(1.0);
+        for path in &mut paths {
+            if let Some(range) = path.range.as_mut() {
+                range.rows = (range.rows * factor).min(range.rows);
+                range.filter_rows = range.filter_rows.min(range.rows);
+            }
+        }
+        rowid_est *= factor;
+    }
+    let probe_est = if residual.is_empty() {
+        rowid_est
+    } else {
+        index_merge_residual_rows(&residual, rowid_est)
+    };
+    let embedded = select
+        .limit
+        .filter(|_| select.order_by.is_empty())
+        .map(|count| (0u64, count));
+    if let Some(limit) = embedded
+        && !keep_order
+    {
+        for path in &mut paths {
+            path.limit = Some(limit);
+        }
     }
     Some(PhysicalPlan::IndexMerge {
         table: from.name.clone(),
-        indexes,
+        indexes: paths
+            .iter()
+            .map(|path| path.index.clone())
+            .filter(|index| !index.is_empty())
+            .collect(),
         partitions: resolve_partitions(
             info,
             select.selection.as_ref(),
@@ -8683,6 +9398,15 @@ fn index_merge_plan(
         )
         .ids,
         pushed: None,
+        intersection,
+        paths,
+        est_rows: Some(probe_est),
+        probe_est: rowid_est,
+        probe_selection: ExprNode::compose_cnf(residual),
+        limit: embedded.filter(|_| !keep_order),
+        keep_order,
+        order_column,
+        order_desc,
     })
 }
 
@@ -11712,9 +12436,26 @@ fn join_est_by_ndv(
     })
 }
 
+/// estRows of the build side as TiDB sees it: its pushed-down filters have
+/// already shrunk the stats the probe side multiplies by.
+fn driver_rows(plan: &PhysicalPlan) -> f64 {
+    match plan {
+        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::Projection { child, .. } => {
+            driver_rows(child)
+        }
+        other => super::explain::est_rows(other),
+    }
+}
+
 fn est_rows_of(plan: &PhysicalPlan) -> f64 {
     match plan {
-        PhysicalPlan::TableReader { row_count, .. } => row_count.abs(),
+        // A preset `filter_est` is the reader's own cardinality (TiDB prints it
+        // on the reader row), so a join built above it inherits that estimate.
+        PhysicalPlan::TableReader {
+            row_count,
+            filter_est,
+            ..
+        } => filter_est.unwrap_or_else(|| row_count.abs()),
         PhysicalPlan::RowProjection { child, .. } => est_rows_of(child),
         _ => 10_000.0,
     }
@@ -12442,6 +13183,12 @@ fn inl_join_hint_plan(
     let inner_name = merge_join_orig_table(select, inner);
     let (outer_db, outer_tbl) = outer.qualified(current_db);
     let (_, inner_tbl) = inner.qualified(current_db);
+    // TiDB binds an alias to the real table, so the pushed filters print the
+    // physical name (`t`) even when the FROM item is aliased (`t t2`).
+    let inner_preds: Vec<ExprNode> = inner_preds
+        .into_iter()
+        .map(|pred| rebind_table_qualifier(&pred, &inner.name, &inner_tbl).unwrap_or(pred))
+        .collect();
     // Post-ANALYZE columns (`ALTER TABLE … ADD COLUMN`) keep a pseudo 0.8
     // selectivity and show up as `stats:partial[…]` on the scan.
     let missing: Vec<String> = {
@@ -12515,55 +13262,22 @@ fn inl_join_hint_plan(
             .max(1);
         outer_rows * 0.8_f64.powi(hits as i32)
     });
+    let outer_table_stats = stats.and_then(|handle| handle.table(&outer_db, &outer_tbl));
     let outer_plan = PhysicalPlan::TableReader {
-        table: outer_tbl.clone(),
+        // TiDB prints the FROM-item name in `table:…` (the alias when present);
+        // column qualifiers keep the real table name.
+        table: outer.name.clone(),
         partitions: Vec::new(),
         partition_names: Vec::new(),
         partition_access: String::new(),
         row_count: outer_rows,
-        stats_pseudo: false,
+        stats_pseudo: !outer_table_stats.as_ref().is_some_and(has_real_stats),
         data_limit: false,
         filter_est,
         range_scan: None,
         pushed: outer_pushed,
         keep_order: false,
     };
-    let join_est = super::explain::est_rows(&outer_plan);
-    // Inner side: the decided range carries the join keys plus its own filters.
-    let mut sel_info = inner_preds
-        .iter()
-        .map(|e| super::explain::explain_pushed_filter(&inner_name, e))
-        .collect::<Vec<_>>();
-    sel_info.sort();
-    let range = format!(
-        "decided by [{}]",
-        keys.iter()
-            .map(|(o, i)| format!(
-                "eq({schema}.{inner_name}.{icol}, {schema}.{outer_name}.{ocol})",
-                schema = schema_prefix(current_db),
-                icol = i.name,
-                ocol = o.name
-            ))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    // The decided range covers the join keys plus `col = const` bounds on the
-    // probed index; single-side non-equality filters stay a Selection.
-    let inner_bounds = inner_preds
-        .iter()
-        .filter(|e| matches!(e, ExprNode::Binary(b) if b.op == Op::Eq))
-        .map(|e| super::explain::explain_pushed_filter(&inner_name, e))
-        .collect::<Vec<_>>();
-    let range = if inner_bounds.is_empty() {
-        range
-    } else {
-        format!(
-            "{} {}]",
-            range.trim_end_matches(']'),
-            inner_bounds.join(" ")
-        )
-    };
-    let decided = range;
     let partition_access = if inner_info.partition.as_ref().is_some_and(|p| p.enable) {
         let planned = resolve_partitions(
             &inner_info,
@@ -12610,10 +13324,9 @@ fn inl_join_hint_plan(
             .map(|(_, i)| format!("{schema}.{inner_name}.{}", i.name))
             .collect::<Vec<_>>()
             .join(", ");
-        // TiDB lists the hash-key conditions in reverse ON order.
-        let cond = keys
+        // TiDB prints equal conditions through `SortedExplainExpressionList`.
+        let mut cond = keys
             .iter()
-            .rev()
             .map(|(o, i)| {
                 format!(
                     "eq({schema}.{outer_name}.{ocol}, {schema}.{inner_name}.{icol})",
@@ -12621,9 +13334,9 @@ fn inl_join_hint_plan(
                     icol = i.name
                 )
             })
-            .collect::<Vec<_>>()
-            .join(", ");
-        (outer, inner, cond)
+            .collect::<Vec<_>>();
+        cond.sort();
+        (outer, inner, cond.join(", "))
     };
     if let Some(index) = key_index {
         let (inner_db, _) = inner.qualified(current_db);
@@ -12741,37 +13454,307 @@ fn inl_join_hint_plan(
             },
         ));
     }
+    // TiDB `buildIndexJoinInner2TableScan`: the inner side probes the table by
+    // the clustered-key prefix the join keys pin, so only those equalities
+    // build the seek range. The rest stay hash keys (`equal cond`), the
+    // inner-side filters ride a cop Selection above the decided range, and a
+    // predicate on a seek column also stays an `other cond` on the join.
+    let clustered = clustered_handle_columns(&inner_info);
+    let mut matched: Vec<usize> = Vec::new();
+    let mut const_seek: Vec<(String, String)> = Vec::new();
+    for column in &clustered {
+        if let Some(pos) = keys
+            .iter()
+            .position(|(_, key)| key.name.eq_ignore_ascii_case(column))
+        {
+            if !matched.contains(&pos) {
+                matched.push(pos);
+            }
+            continue;
+        }
+        let Some(value) = inner_preds.iter().find_map(|pred| {
+            let (name, range) = sealdb_statistics::pseudo::conjunct_column_range(pred)?;
+            if !name.eq_ignore_ascii_case(column) {
+                return None;
+            }
+            match (&range.low, &range.high) {
+                (Some((low, true)), Some((high, true))) if low.compare(high).is_eq() => {
+                    Some(sealdb_statistics::pseudo::format_datum(low))
+                }
+                _ => None,
+            }
+        }) else {
+            break;
+        };
+        const_seek.push((column.clone(), value));
+    }
+    if matched.is_empty() {
+        // No handle column is pinned: TiDB gives the hint up (plain HashJoin).
+        return None;
+    }
+    let seek_keys = matched
+        .iter()
+        .map(|&pos| &keys[pos])
+        .collect::<Vec<&(ColumnNameExpr, ColumnNameExpr)>>();
+    let (inner_db2, inner_table) = inner.qualified(current_db);
+    let inner_table_stats = stats.and_then(|handle| handle.table(&inner_db2, &inner_table));
+    let inner_rows = table_row_count(stats, inner, current_db);
+    // A decided range never returns NULLs, so TiDB scales the scan by the
+    // nullable join keys' null-rejects; the cop Selection lists them again and
+    // scales a second time (both are visible in EXPLAIN).
+    let mut scan_rows = inner_rows;
+    let mut cop_filters: Vec<ExprNode> = Vec::new();
+    for (_, key) in &keys {
+        if !nullable_column(&inner_info, &key.name) {
+            continue;
+        }
+        scan_rows *= inner_null_reject(inner_table_stats.as_ref(), &key.name);
+        cop_filters.push(ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(inner_name.clone()),
+                    name: key.name.clone(),
+                })),
+                not: false,
+            })),
+        }));
+    }
+    cop_filters.extend(inner_preds.iter().cloned());
+    // TiDB prints the decided range's join equalities in handle order, then
+    // the constant equalities that fill the gaps (`chosenAccess`).
+    let handle = clustered.first().cloned();
+    let mut decided_columns: Vec<String> =
+        seek_keys.iter().map(|(_, key)| key.name.clone()).collect();
+    let mut decided: Vec<String> = seek_keys
+        .iter()
+        .map(|(o, i)| {
+            if inner_info.pk_is_handle {
+                format!("{schema}.{outer_tbl}.{}", o.name)
+            } else {
+                format!(
+                    "eq({schema}.{inner_tbl}.{icol}, {schema}.{outer_tbl}.{ocol})",
+                    icol = i.name,
+                    ocol = o.name
+                )
+            }
+        })
+        .collect();
+    for (column, text) in &const_seek {
+        decided.push(if inner_info.pk_is_handle {
+            text.clone()
+        } else {
+            format!("eq({schema}.{inner_tbl}.{column}, {text})")
+        });
+        decided_columns.push(column.clone());
+    }
+    // Conjuncts the decided range already paid must not scale the estimate a
+    // second time. The probe Selection counts the join keys' null rejects again
+    // (as TiDB prints it); the join input keeps the scan's own estimate.
+    let mut residual: Vec<ExprNode> = Vec::new();
+    for conjunct in &cop_filters {
+        let consumed = sealdb_statistics::pseudo::conjunct_column_range(conjunct).is_some_and(
+            |(name, _)| {
+                decided_columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&name))
+            },
+        );
+        if !consumed {
+            residual.push(conjunct.clone());
+        }
+    }
+    let filter_sel =
+        sealdb_statistics::pseudo::selectivity(&residual, inner_rows, handle.as_deref())
+            .unwrap_or(1.0);
+    // TiDB's inner `selectivity` covers every pushed filter, including the
+    // hash keys' `not(isnull(..))` rejects.
+    let probe_sel = filter_sel;
+    // The join input reads the same filters but the range already paid the
+    // null rejects, so they stay on the Selection only.
+    let join_input: Vec<ExprNode> = residual
+        .iter()
+        .filter(|conjunct| !sealdb_statistics::pseudo::is_null_predicate(conjunct))
+        .cloned()
+        .collect();
+    let residual_sel =
+        sealdb_statistics::pseudo::selectivity(&join_input, inner_rows, handle.as_deref())
+            .unwrap_or(1.0);
+    let join_inner_rows = scan_rows * residual_sel;
+    let mut cop_info: Vec<String> = cop_filters
+        .iter()
+        .map(|expr| super::explain::explain_pushed_filter(&inner_name, expr))
+        .collect();
+    cop_info.sort();
+    // An int handle prints the seek columns (`decided by [t.a]`), a common
+    // handle the equality pairs (`decided by [eq(t.a, t.b)]`).
+    let decided = format!("decided by [{}]", decided.join(" "));
+    // Both children list the seek keys in ON order (hash keys that cannot be
+    // probed stay out); `equal cond` keeps every join equality, which TiDB
+    // prints through `SortedExplainExpressionList`.
+    let mut equal_cond = keys
+        .iter()
+        .map(|(o, i)| {
+            format!(
+                "eq({schema}.{outer_name}.{ocol}, {schema}.{inner_name}.{icol})",
+                ocol = o.name,
+                icol = i.name
+            )
+        })
+        .collect::<Vec<_>>();
+    equal_cond.sort();
+    let equal_cond = equal_cond.join(", ");
+    let outer_keys = seek_keys
+        .iter()
+        .map(|(o, _)| format!("{schema}.{outer_name}.{}", o.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner_keys = seek_keys
+        .iter()
+        .map(|(_, i)| format!("{schema}.{inner_name}.{}", i.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A predicate that seeks a handle column survives as a join-side filter.
+    let other_cond = inner_preds
+        .iter()
+        .filter(|pred| matches!(pred, ExprNode::Binary(bin) if bin.op == Op::LogicOr))
+        .filter(|pred| {
+            pred.referenced_columns().iter().any(|(_, name)| {
+                seek_keys
+                    .iter()
+                    .any(|(_, key)| key.name.eq_ignore_ascii_case(name))
+            })
+        })
+        .map(|pred| super::explain::explain_pushed_filter(&inner_name, pred))
+        .collect::<Vec<_>>();
+    let info = if other_cond.is_empty() {
+        format!("inner join, inner:TableReader, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}")
+    } else {
+        format!(
+            "inner join, inner:TableReader, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}, other cond:{}",
+            other_cond.join(", ")
+        )
+    };
+    // TiDB's join estimate: an unanalyzed side falls back to
+    // `min(sides) * 1.25`, analyzed sides divide by the join-key NDV.
+    let outer_est = est_rows_of(&outer_plan);
+    // The inner side's cardinality is the decided range's estimate scaled by
+    // the residual filters (the null rejects are already in the scan).
+    let inner_est = join_inner_rows;
+    let outer_pseudo = !outer_table_stats.as_ref().is_some_and(has_real_stats);
+    let inner_pseudo = !inner_table_stats.as_ref().is_some_and(has_real_stats);
+    let join_est = if !outer_pseudo && !inner_pseudo {
+        let ndv = join_key_ndv(
+            stats,
+            &inner_db2,
+            &inner_table,
+            &inner_info,
+            &keys[0].1.name,
+            inner_est,
+        )
+        .max(join_key_ndv(
+            stats,
+            &outer_db,
+            &outer_tbl,
+            &outer_info,
+            &keys[0].0.name,
+            outer_est,
+        ));
+        outer_est * inner_est / ndv.max(1.0)
+    } else if outer_pseudo && inner_pseudo {
+        outer_est.min(inner_est) * 1.25
+    } else if outer_pseudo {
+        inner_est * 1.25
+    } else {
+        outer_est * 1.25
+    };
+    // TiDB scales a probe-side plan by the number of probes (the build side's
+    // row count) when it prints `estRows`, and clamps the inner scan to one row
+    // per probe: `scan = min(1, avg/sel) * probes`, while the `Selection` and
+    // `TableReader` carry `min(sel, avg) * probes`.
+    let probe_cnt = driver_rows(&outer_plan);
+    let avg_inner = if probe_cnt > 0.0 {
+        join_est / probe_cnt
+    } else {
+        0.0
+    };
+    let scan_per_probe = if probe_sel > 0.0 {
+        (avg_inner / probe_sel).min(1.0)
+    } else {
+        1.0
+    };
+    let sel_per_probe = avg_inner.min(probe_sel);
     let inner_plan = PhysicalPlan::TableReader {
-        table: inner_tbl,
+        table: inner.name.clone(),
         partitions: Vec::new(),
         partition_names: Vec::new(),
         partition_access,
-        row_count: join_est,
-        stats_pseudo: false,
+        row_count: sel_per_probe * probe_cnt,
+        stats_pseudo: !inner_table_stats.as_ref().is_some_and(has_real_stats),
         data_limit: false,
         filter_est: None,
         range_scan: None,
         keep_order: false,
         pushed: Some(bytes_info(&format!(
-            "RANGE_SEL|{}|{}",
-            sel_info.join(", "),
-            decided
+            "RANGE_SEL|{}|{}|{}",
+            cop_info.join(", "),
+            decided,
+            scan_per_probe * probe_cnt
         ))),
     };
-    let (outer_keys, inner_keys, equal_cond) = join_keys(&outer_name, &inner_name);
-    Some(wrap_scalar_count_agg(
-        select,
-        current_db,
-        is,
-        PhysicalPlan::IndexJoin {
-            info: format!(
-                "inner join, inner:TableReader, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
-            ),
-            est_rows: join_est,
-            outer: Box::new(outer_plan),
-            inner: Box::new(inner_plan),
-        },
-    ))
+    let plan = PhysicalPlan::IndexJoin {
+        info,
+        est_rows: join_est,
+        outer: Box::new(outer_plan),
+        inner: Box::new(inner_plan),
+    };
+    // The join schema follows the logical child order (join reorder puts the
+    // cheaper side first), so `SELECT *` in FROM order needs a Projection.
+    let from_est = if from_hit { inner_est } else { outer_est };
+    let right_est = if from_hit { outer_est } else { inner_est };
+    let plan = if is_star_select(select) && right_est < from_est {
+        PhysicalPlan::Projection {
+            exprs: star_projection_exprs(select, Some(is), current_db),
+            child: Box::new(plan),
+        }
+    } else {
+        plan
+    };
+    Some(wrap_scalar_count_agg(select, current_db, is, plan))
+}
+
+/// Clustered-key columns of a table, in key order (a seek prefix).
+fn clustered_handle_columns(info: &sealdb_meta::TableInfo) -> Vec<String> {
+    if !info.pk_is_clustered() {
+        return Vec::new();
+    }
+    info.indices
+        .iter()
+        .find(|idx| idx.primary)
+        .map(|idx| {
+            idx.columns
+                .iter()
+                .map(|column| column.name.o().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Share of a table that survives `not(isnull(col))`: the real null count when
+/// the table is analyzed, TiDB's pseudo `1 - 1/1000` otherwise.
+fn inner_null_reject(table: Option<&sealdb_statistics::Table>, column: &str) -> f64 {
+    table
+        .filter(|t| has_real_stats(t))
+        .and_then(|t| {
+            let stats = t.column(column)?;
+            Some(if t.count == 0 {
+                1.0
+            } else {
+                t.count.saturating_sub(stats.null_count) as f64 / t.count as f64
+            })
+        })
+        .unwrap_or(0.999)
 }
 
 /// `SELECT count(*) FROM …` still needs its `HashAgg` above the join tree;
@@ -14398,6 +15381,92 @@ fn access_plan(
     stats: Option<&Handle>,
     prune_mode: PartitionPruneMode,
 ) -> PhysicalPlan {
+    let plan = access_plan_inner(select, from, is, current_db, stats, prune_mode);
+    union_scan_over_dirty(plan, select, from, is, current_db)
+}
+
+/// TiDB `PhysicalUnionScan`: a table this transaction has written reads as
+/// snapshot ∪ pending writes, so the access path is wrapped in a `UnionScan`
+/// that re-applies the table's own filters to the uncommitted rows.
+fn union_scan_over_dirty(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    from: &TableName,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let Some(is) = is else {
+        return plan;
+    };
+    if !READ_STATEMENT.with(|c| c.get()) || DIRTY_TABLES.with(|c| c.borrow().is_empty()) {
+        return plan;
+    }
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &table) else {
+        return plan;
+    };
+    if !table_is_dirty(info.id) {
+        return plan;
+    }
+    // TiDB reads a `Point_Get` straight from the transaction's snapshot plus
+    // pending writes, so its EXPLAIN has no `UnionScan` above it.
+    if matches!(plan, PhysicalPlan::PointGet { .. }) {
+        return plan;
+    }
+    // The UnionScan carries the filters this table's rows must satisfy; TiDB
+    // prints them sorted (`SortedExplainExpressionList`).
+    let aliases = table_alias_names(from);
+    let mut filters: Vec<String> = select
+        .selection
+        .as_ref()
+        .map(|selection| {
+            selection
+                .split_cnf()
+                .into_iter()
+                .filter(|conjunct| {
+                    let cols = conjunct.referenced_columns();
+                    !cols.is_empty()
+                        && cols.iter().all(|(qualifier, name)| {
+                            qualifier
+                                .as_deref()
+                                .is_none_or(|q| aliases.iter().any(|a| a.eq_ignore_ascii_case(q)))
+                                || info
+                                    .columns
+                                    .iter()
+                                    .any(|c| c.name.o().eq_ignore_ascii_case(name))
+                        })
+                })
+                .map(|conjunct| super::explain::explain_pushed_filter(from.resolve_name(), &conjunct))
+                .collect()
+        })
+        .unwrap_or_default();
+    filters.sort();
+    let est_rows = super::explain::est_rows(&plan);
+    PhysicalPlan::UnionScan {
+        info: filters.join(", "),
+        est_rows,
+        child: Box::new(plan),
+    }
+}
+
+/// Names a FROM item answers to: its alias and the physical table.
+fn table_alias_names(from: &TableName) -> Vec<String> {
+    let mut out = vec![from.name.to_ascii_lowercase()];
+    if let Some(physical) = from.physical.as_deref() {
+        out.push(physical.to_ascii_lowercase());
+    }
+    out.push(from.resolve_name().to_ascii_lowercase());
+    out
+}
+
+fn access_plan_inner(
+    select: &SelectStmt,
+    from: &TableName,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> PhysicalPlan {
     // integer handle PointGet still wins; unique-index equality
     // is PointGet; handle/unique IN lists are BatchPointGet; otherwise
     // first-column equality or range on a secondary INDEX/KEY becomes
@@ -14418,12 +15487,34 @@ fn access_plan(
         return PhysicalPlan::InfoSchema {
             table: from.name.clone(),
             pushed: None,
+            ranges: Vec::new(),
         };
     }
     if let Some(info) = is.and_then(|schema| {
         let (db, table) = from.qualified(current_db);
         schema.table_by_name(&db, &table)
     }) {
+        // Estimates keep reading the invisible index's statistics (TiDB sizes
+        // `c1 = 10` from the unique key even when `c1` is INVISIBLE); only the
+        // access-path search is narrowed to the visible indexes.
+        let estimate_info = info;
+        // TiDB access paths skip `INVISIBLE` indexes; a `USE INDEX` /
+        // `FORCE INDEX` hint naming one brings it back for this query.
+        let visible_info;
+        let info = if info.indices.iter().all(|idx| index_visible(from, idx)) {
+            info
+        } else {
+            visible_info = sealdb_meta::TableInfo {
+                indices: info
+                    .indices
+                    .iter()
+                    .filter(|idx| index_visible(from, idx))
+                    .cloned()
+                    .collect(),
+                ..info.clone()
+            };
+            &visible_info
+        };
         // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
         let eqs = eq_key_consts(select.selection.as_ref());
         if !from.use_indexes.is_empty() {
@@ -14501,7 +15592,7 @@ fn access_plan(
         if info.pk_is_handle
             && let Some(selection) = select.selection.as_ref()
             && let Some(handle) = info.handle_column()
-            && let Some(range) = handle_scan_range(selection, handle.name.o())
+            && let Some(range) = handle_scan_range(selection, handle)
         {
             let mut plan = partitioned_table_reader(
                 from,
@@ -14571,7 +15662,7 @@ fn access_plan(
                     if table_scan_cost(scan_rows) < index_lookup_cost(eq_rows) {
                         return partitioned_table_reader(
                             from,
-                            info,
+                            estimate_info,
                             select.selection.as_ref(),
                             prune_mode,
                             stats,
@@ -14602,39 +15693,80 @@ fn access_plan(
                 .filter(|idx| !index_ignored(from, idx.name.o()))
                 .is_some()
             {
-                // TiDB access-path selection sizes every index starting with the
-                // range column; the covering one wins because it avoids the
-                // table probe (`select a, b ... where a < 3` reads IDX_ab).
-                // Among covering candidates the narrower key is cheaper, so a
-                // single-column index beats a PRIMARY KEY that merely shares
-                // its leading column (`where col_3 >= …` reads `idx_1(col_3)`).
-                let covered = info
-                    .indices
-                    .iter()
-                    .filter(|idx| {
-                        // A clustered PRIMARY KEY has no separate index path; its
-                        // range is a table range scan.
-                        !(idx.primary && info.pk_is_clustered())
-                            && !index_ignored(from, idx.name.o())
-                            && idx
-                                .columns
-                                .first()
-                                .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&column))
-                    })
-                    .filter(|idx| index_covers_needed(idx, select, &join_keys, info, from))
-                    .min_by(|a, b| {
-                        a.columns
-                            .len()
-                            .cmp(&b.columns.len())
-                            .then(a.primary.cmp(&b.primary))
+                // A non-covering range lookup adds a table probe per row, so
+                // TiDB's cost model weighs it against the full table scan
+                // (`select * from t where name > 'a'` still reads the index).
+                let candidates = info.indices.iter().filter(|idx| {
+                    !(idx.primary && info.pk_is_clustered())
+                        && !index_ignored(from, idx.name.o())
+                        && idx
+                            .columns
+                            .first()
+                            .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&column))
+                });
+                let (db, table) = from.qualified(current_db);
+                let table_stats = stats.and_then(|handle| handle.table(&db, &table));
+                let total = table_row_count(stats, from, current_db);
+                let conjuncts = select
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.split_cnf())
+                    .unwrap_or_default();
+                // A covering index answers the range from the index alone, so
+                // it outranks a same-prefix non-covering index even when the
+                // ranges match (`select a, b … where a < 3` reads `IDX_ab`,
+                // not a double read on `IDX_a`).
+                let mut best_covering: Option<(&sealdb_meta::IndexInfo, f64)> = None;
+                let mut best_lookup: Option<(&sealdb_meta::IndexInfo, f64)> = None;
+                // A TIMESTAMP index key holds UTC wall clock, so a session-local
+                // bound cannot be seeked; TiDB still reads the index and keeps
+                // the predicate as a cop Selection, sizing the scan from the
+                // column estimate (`types/time` USE_INDEX ranges).
+                let ts_range = has_timestamp_bound(&column, info, &conjuncts);
+                for index in candidates {
+                    let rows = match super::access_range::index_access_range(
+                        info,
+                        index,
+                        &conjuncts,
+                        total,
+                        table_stats.as_ref(),
+                    ) {
+                        Some(access) => access.range.filter_rows.max(1.0),
+                        None if ts_range => {
+                            sealdb_statistics::pseudo::filter_rows(&conjuncts, total).max(1.0)
+                        }
+                        None => continue,
+                    };
+                    let slot = if index_covers_needed(index, select, &join_keys, info, from) {
+                        &mut best_covering
+                    } else {
+                        &mut best_lookup
+                    };
+                    // Equal ranges prefer the narrower index: TiDB reads
+                    // `idx_1(col_3)` rather than the wider `PRIMARY` (or
+                    // `IDX_a` over `IDX_ab`) when both answer the same range.
+                    let better = slot.is_none_or(|(best_index, best_rows)| {
+                        rows < best_rows
+                            || (rows == best_rows
+                                && index.columns.len() < best_index.columns.len())
                     });
-                // A non-covering range lookup adds a table probe per row; TiDB's
-                // cost model keeps the full table scan for this shape (a
-                // clustered PK range still applies below).
-                let Some(index) = covered else {
-                    break;
+                    if better {
+                        *slot = Some((index, rows));
+                    }
+                }
+                let Some((index, rows)) = best_covering.or(best_lookup) else {
+                    continue;
                 };
-                return index_plan(select, from, info, index, prune_mode, &join_keys);
+                let covered = best_covering.is_some();
+                let index_cost = if covered {
+                    rows
+                } else {
+                    index_lookup_cost(rows)
+                };
+                if index_cost < table_scan_cost(total) {
+                    return index_plan(select, from, info, index, prune_mode, &join_keys);
+                }
+                continue;
             }
         }
         // OR of equalities on one indexed leading column → a single index
@@ -14649,7 +15781,7 @@ fn access_plan(
         if info.common_handle
             && let Some(selection) = select.selection.as_ref()
             && let Some(pk_col) = info.clustered_prefix_column()
-            && let Some(range) = handle_scan_range(selection, pk_col.name.o())
+            && let Some(range) = handle_scan_range(selection, pk_col)
         {
             let mut plan = partitioned_table_reader(
                 from,
@@ -14693,7 +15825,7 @@ fn access_plan(
             return index_plan(select, from, info, index, prune_mode, &join_keys);
         }
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
-        if let Some(plan) = index_merge_plan(select, from, info, prune_mode) {
+        if let Some(plan) = index_merge_plan(select, from, info, prune_mode, stats, current_db) {
             return plan;
         }
         // A covering index scan replaces the table scan when a filter cannot
@@ -14729,7 +15861,7 @@ fn access_plan(
         }
         return partitioned_table_reader(
             from,
-            info,
+            estimate_info,
             select.selection.as_ref(),
             prune_mode,
             stats,
@@ -14762,7 +15894,11 @@ fn range_filter_columns(selection: Option<&ExprNode>) -> Vec<String> {
 
 /// TiDB `TableRangeScan` text for a clustered PK range: every CNF conjunct is
 /// a comparison (or BETWEEN) on the handle column and `<>` splits in two.
-fn handle_scan_range(selection: &ExprNode, handle: &str) -> Option<String> {
+fn handle_scan_range(
+    selection: &ExprNode,
+    column: &sealdb_meta::ColumnInfo,
+) -> Option<String> {
+    let handle = column.name.o();
     let mut ranges: Vec<sealdb_statistics::pseudo::Bounds> = Vec::new();
     for item in selection.split_cnf() {
         let (name, sets) = sealdb_statistics::pseudo::conjunct_bound_sets(&item)?;
@@ -14781,7 +15917,45 @@ fn handle_scan_range(selection: &ExprNode, handle: &str) -> Option<String> {
     if ranges.is_empty() {
         return None;
     }
+    // A range spanning the handle's whole type domain filters nothing, so
+    // TiDB keeps a bare TableFullScan (`col BETWEEN T::MIN AND T::MAX`).
+    if ranges.len() == 1 && handle_range_covers_domain(&ranges[0], column) {
+        return None;
+    }
     Some(sealdb_statistics::pseudo::ranges_text(&ranges))
+}
+
+/// True when `range` covers every value of the integer handle's type domain.
+fn handle_range_covers_domain(
+    range: &sealdb_statistics::pseudo::Bounds,
+    column: &sealdb_meta::ColumnInfo,
+) -> bool {
+    let Some((lo, hi)) = super::rule_predicate_push_down::int_bounds(&column.field_type) else {
+        return false;
+    };
+    let to_i128 = |value: &sealdb_types::Datum| -> Option<i128> {
+        match value {
+            sealdb_types::Datum::I64(v) => Some(*v as i128),
+            sealdb_types::Datum::U64(v) => Some(*v as i128),
+            sealdb_types::Datum::F64(v) if v.fract() == 0.0 => Some(*v as i128),
+            sealdb_types::Datum::Decimal(d) => d.to_string().parse().ok(),
+            sealdb_types::Datum::Bytes(b) => std::str::from_utf8(b).ok()?.trim().parse().ok(),
+            _ => None,
+        }
+    };
+    match (&range.0, &range.1) {
+        (None, None) => true,
+        (Some((low, true)), Some((high, true))) => {
+            let Some(low) = to_i128(low) else {
+                return false;
+            };
+            let Some(high) = to_i128(high) else {
+                return false;
+            };
+            low <= lo && high >= hi
+        }
+        _ => false,
+    }
 }
 
 /// `ORDER BY` a secondary index key prefix: TiDB reads the index in key order
@@ -14889,8 +16063,31 @@ fn select_spans_multiple_partitions(
 
 /// The plan already yields its rows in `ORDER BY` order (a full index read
 /// whose key prefix matches the sort), so no `Sort` is needed.
-fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {    if select.order_by.is_empty() {
+fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
+    if select.order_by.is_empty() {
         return false;
+    }
+    // IndexMerge union arms that read their index in key order already provide
+    // the query's ORDER BY (`keep order:true`). A dirty read keeps the merge
+    // below a `UnionScan`, which passes the order through.
+    let plan = match plan {
+        PhysicalPlan::UnionScan { child, .. } => child.as_ref(),
+        other => other,
+    };
+    if let PhysicalPlan::IndexMerge {
+        keep_order: true,
+        order_column: Some(column),
+        order_desc,
+        ..
+    } = plan
+    {
+        return match select.order_by.as_slice() {
+            [item] => {
+                matches!(&item.expr, ExprNode::Column(col) if col.name.eq_ignore_ascii_case(column))
+                    && item.desc == *order_desc
+            }
+            _ => false,
+        };
     }
     // Only a full index scan keeps key order; a decided range carries its own
     // `keep order` flag (and `Sort` semantics) in EXPLAIN. A multi-partition

@@ -46,6 +46,12 @@ pub(crate) fn build_table_cop_tasks(
 }
 
 /// Run CopTasks as local KV scans (MemStorage and TiKV txn buffer path).
+///
+/// `filter` is the coprocessor selection pushed into this scan. TiDB acquires
+/// `FOR UPDATE` / `FOR SHARE` locks in `SelectLockExec`, i.e. *above* the
+/// Selection, so only rows that pass the filter may be locked — a range scan
+/// must not lock rows the query never returns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_cop_tasks_locally(
     txn: &mut dyn Transaction,
     info: &TableInfo,
@@ -53,7 +59,41 @@ pub(crate) fn execute_cop_tasks_locally(
     tasks: &[CopTask],
     lock: RowLock,
     wait: LockWait,
+    filter: Option<&sealdb_parser::ast::ExprNode>,
 ) -> Result<Vec<ScannedRow>> {
+    if lock != RowLock::None
+        && let Some(filter) = filter
+    {
+        let schema: Vec<String> = info
+            .columns
+            .iter()
+            .map(|c| {
+                if c.hidden {
+                    format!("\u{1}{}", c.name.o())
+                } else {
+                    c.name.o().to_string()
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for task in tasks {
+            for range in &task.ranges {
+                let pairs = txn.scan(&range.start, &range.end)?;
+                let decoded = decode_scanned_rows(pairs.clone(), info, physical_id)?;
+                for (idx, row) in decoded.into_iter().enumerate() {
+                    if !sealdb_expression::eval_filter(filter, &schema, &row.values)? {
+                        continue;
+                    }
+                    // Lock after the Selection; `SkipLocked` / `Nowait` decide
+                    // whether a conflicting row is dropped or errors.
+                    if txn.get_locked(&pairs[idx].0, lock, wait)?.is_some() {
+                        out.push(row);
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
     let mut rows = Vec::new();
     for task in tasks {
         for range in &task.ranges {

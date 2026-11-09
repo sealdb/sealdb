@@ -455,15 +455,14 @@ impl ExprNode {
         let ExprNode::Binary(bin) = self else {
             return None;
         };
+        // A signed literal parses as `-(1)`, so fold the constant side rather
+        // than only accepting a bare `Value` (`c1 < -1` drives a range in TiDB).
         match (bin.left.as_ref(), bin.right.as_ref()) {
-            (ExprNode::Column(col), ExprNode::Value(v))
-                if matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) =>
-            {
-                Some((col.name.clone(), bin.op, v.datum.clone()))
+            (ExprNode::Column(col), right) if matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
+                right.const_datum().map(|value| (col.name.clone(), bin.op, value))
             }
-            (ExprNode::Value(v), ExprNode::Column(col)) => {
-                flip_cmp(bin.op).map(|op| (col.name.clone(), op, v.datum.clone()))
-            }
+            (left, ExprNode::Column(col)) => flip_cmp(bin.op)
+                .and_then(|op| left.const_datum().map(|value| (col.name.clone(), op, value))),
             _ => None,
         }
     }
@@ -477,9 +476,11 @@ impl ExprNode {
             return None;
         }
         match (bin.left.as_ref(), bin.right.as_ref()) {
-            (ExprNode::Column(col), ExprNode::Value(v))
-            | (ExprNode::Value(v), ExprNode::Column(col)) => {
-                Some((col.name.clone(), v.datum.clone()))
+            (ExprNode::Column(col), right) => {
+                right.const_datum().map(|value| (col.name.clone(), value))
+            }
+            (left, ExprNode::Column(col)) => {
+                left.const_datum().map(|value| (col.name.clone(), value))
             }
             _ => None,
         }
@@ -495,11 +496,9 @@ impl ExprNode {
         let ExprNode::Column(col) = b.expr.as_ref() else {
             return None;
         };
-        let (ExprNode::Value(low), ExprNode::Value(high)) = (b.low.as_ref(), b.high.as_ref())
-        else {
-            return None;
-        };
-        Some((col.name.clone(), low.datum.clone(), high.datum.clone()))
+        let low = b.low.const_datum()?;
+        let high = b.high.const_datum()?;
+        Some((col.name.clone(), low, high))
     }
 
     pub fn column_ranges(&self) -> Vec<ColumnRange> {

@@ -1883,6 +1883,30 @@
 - **下一步**:
   - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
 
+### 2026-11-08（`explain_easy` 波：访问路径成本 + 执行器形态）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - Planner（成本）：`index_lookup_cost` 按 TiDB 的探针实际成本定价。v2 把每个索引行折算成一次表探针 + double-read 请求批次（`tidb_index_lookup_size` 20000 → 每批 32 task × `tidb_request_factor` 6e6 ÷ double-read 并发 5），约等于 100 行顺序扫描；v1 用 `doubleReadFactor`，边界约 16% 选择率。以本机 TiDB 8.5 实测校准（9999 行表）：v2 49 行仍选 `IndexLookUp`、99 行转 `TableReader`；v1 1599 行仍选索引
+  - Planner：`tidb_cost_model_version` 会话变量（全局 thread-local `COST_MODEL_VERSION` + plan cache key），`IndexLookUp` 在 v1 下按双读计费
+  - Planner：TIMESTAMP 索引键存 UTC 墙钟，会话时区的时间范围不能直接 seek；有界时仍规划 `IndexReader` + cop `Selection`，DST gap 告警按 TiDB 次数产生（`types/time`）
+  - Planner：`explain` 的伪统计估行只为“非整数常量的单列比较”套 1/3 范围选择率（`datum_range_est`），聚合派生列（`Column#…`）与整数上界仍走 `selectionFactor` 0.8，避免 `agg_predicate_pushdown` / `jointest/join` 估行回退
+  - Planner：索引可见性统一走 `index_visible`（`IGNORED`/`INVISIBLE` 都不是访问路径，除非 hint）；`IndexInfo` 增加 `invisible`/`global` 选项并透传 DDL
+  - Planner：`IndexMerge` 按 planner 给出的 partial path 执行（含聚簇主键 arm、`keep order`、`limit embedded`），不再从 WHERE 反推 arm
+  - Planner：查询级 `ORDER BY`/`LIMIT` 挂在 `Window` 之上（`apply_window_outer_order`），窗口自身的 Sort 只负责分区/peers 顺序
+  - Executor：`MemTableScan` 接收下推的等值 ranges（同列 OR、跨列 AND，按 memtable 大小写不敏感比较过滤）；`InformationSchema` 节点携带 ranges
+  - Executor：`SELECT` 在 FOR UPDATE/FOR SHARE 下先做 cop `Selection` 再上锁，只锁真正返回的行
+  - Session/Store：RC 的 `refresh_snapshot` 推进读时间戳（`read_ts`，写入冲突仍用 `start_ts`）；`Transaction::dirty_keys` 贯通 Mem/TiKV，给 `UnionScan` 脏读合并用
+  - 测试基线：`sealdb-itest` 支持 `SEALDB_ITEST_LENIENT_ERRORS`（缺错误码时仍输出文本，便于逐条 triage）
+- **验证**:
+  - `executor/union_scan`：Mem `PASS`。虚拟生成列索引上的 `select * … where c > 3` 在脏事务里按 TiDB 选 `TableReader`（1/3 伪统计选择率下非覆盖索引不再胜出），行序回到 handle 合并顺序
+  - `run-tests.sh -s memory` → `PASS: memory=44`
+  - `run-tests.sh -s tikv` → `PASS: tikv=43`
+- **阻塞/风险**:
+  - 本机 `go` 是 1.26，TiDB 的 `hack` 包只认 1.25：用 `GOTOOLCHAIN=go1.25.12` 构建 `tidb-server` 作为对照 oracle（unistore），后续成本/形状对齐都以它为准
+- **下一步**:
+  - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
+
 ### 2026-10-19
 
 **决策落地**

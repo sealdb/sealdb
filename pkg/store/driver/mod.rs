@@ -258,6 +258,10 @@ impl TikvTransaction {
 }
 
 impl Transaction for TikvTransaction {
+    fn dirty_keys(&self) -> Vec<Vec<u8>> {
+        self.writes.keys().cloned().collect()
+    }
+
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(overlay) = self.overlay_get(key) {
             return Ok(overlay);

@@ -126,6 +126,19 @@ fn push_into(
                 .map(|c| push_into(c, conjuncts.clone(), is, current_db))
                 .collect(),
         },
+        // TiDB builds `PhysicalUnionScan` after predicate pushdown, so the
+        // table's conjuncts still reach the access path below it (the merge's
+        // probe `Selection`); the UnionScan keeps re-applying them to the
+        // uncommitted rows it merges in.
+        PhysicalPlan::UnionScan { info, child, .. } => {
+            let child = push_into(*child, conjuncts, is, current_db);
+            let est_rows = super::explain::est_rows(&child);
+            PhysicalPlan::UnionScan {
+                info,
+                est_rows,
+                child: Box::new(child),
+            }
+        }
         PhysicalPlan::IndexLookUpReader {
             table,
             index,
@@ -364,6 +377,15 @@ fn push_into(
             indexes,
             partitions,
             pushed,
+            intersection,
+            paths,
+            est_rows,
+            probe_est,
+            probe_selection,
+            limit,
+            keep_order,
+            order_column,
+            order_desc,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
@@ -386,6 +408,15 @@ fn push_into(
                     indexes,
                     partitions,
                     pushed: and_opt(pushed, ExprNode::compose_cnf(pushable)),
+                    intersection,
+                    paths,
+                    est_rows,
+                    probe_est,
+                    probe_selection,
+                    limit,
+                    keep_order,
+                    order_column,
+                    order_desc,
                 },
                 residual,
             )
@@ -712,15 +743,26 @@ fn push_into(
         // TiDB pushes equality ranges into the infoschema memory table and
         // prints them on the scan (`table_name:["t1"]`); the 10000-row
         // estimate stays, and answered conjuncts leave no `Selection`.
-        PhysicalPlan::InfoSchema { table, pushed } => {
-            let mut ranges: Vec<(String, String)> = Vec::new();
+        PhysicalPlan::InfoSchema {
+            table,
+            pushed,
+            ranges: already,
+        } => {
+            // A range can only answer a predicate on a column the memory table
+            // actually exposes; anything else stays above as a `Selection`.
+            let columns = sealdb_infoschema::tables::virtual_columns(&table);
+            let mut ranges: Vec<(String, String)> = already;
             let mut residual = Vec::new();
             for conjunct in conjuncts {
                 match mem_table_range(&conjunct) {
-                    Some((column, values)) => {
+                    Some((column, values))
+                        if columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&column)) =>
+                    {
                         ranges.extend(values.into_iter().map(|v| (column.clone(), v)));
                     }
-                    None => residual.push(conjunct),
+                    _ => residual.push(conjunct),
                 }
             }
             ranges.sort();
@@ -754,6 +796,7 @@ fn push_into(
                 PhysicalPlan::InfoSchema {
                     table,
                     pushed: (!text.is_empty()).then_some(text),
+                    ranges,
                 },
                 residual,
             )
@@ -931,7 +974,8 @@ fn mem_table_value(value: Datum) -> Option<String> {
     Some(text.to_lowercase())
 }
 
-fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {    let Some(filter) = ExprNode::compose_cnf(residual) else {
+fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
+    let Some(filter) = ExprNode::compose_cnf(residual) else {
         return plan;
     };
     if filter.has_subquery() {
@@ -1134,7 +1178,7 @@ fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> 
 }
 
 /// Integer type bounds `(min, max)` for the column's field type.
-fn int_bounds(ft: &sealdb_types::field_type::FieldType) -> Option<(i128, i128)> {
+pub(crate) fn int_bounds(ft: &sealdb_types::field_type::FieldType) -> Option<(i128, i128)> {
     use sealdb_types::field_type::*;
     let (lo, hi) = if ft.is_unsigned() {
         match ft.tp {
@@ -1217,7 +1261,7 @@ fn full_domain_conjunct(info: &sealdb_meta::TableInfo, expr: &ExprNode) -> bool 
     }
 }
 
-fn const_i128(expr: &ExprNode) -> Option<i128> {
+pub(crate) fn const_i128(expr: &ExprNode) -> Option<i128> {
     match expr {
         ExprNode::Value(v) => match &v.datum {
             Datum::I64(v) => Some(*v as i128),

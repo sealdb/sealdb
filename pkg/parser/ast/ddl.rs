@@ -239,6 +239,9 @@ pub struct IndexDef {
     /// TiDB `PRIMARY KEY (...) CLUSTERED`: the PK is the row handle even when
     /// `tidb_enable_clustered_index` would otherwise keep it secondary.
     pub clustered: bool,
+    /// TiDB `INVISIBLE` index option: the optimizer ignores the index unless a
+    /// `USE INDEX` / `FORCE INDEX` hint names it.
+    pub invisible: bool,
 }
 
 /// `FOREIGN KEY (a, b) REFERENCES t (c, d) ON UPDATE … ON DELETE …`.
@@ -668,6 +671,8 @@ pub struct CreateIndexStmt {
     pub name: String,
     pub columns: Vec<IndexPart>,
     pub unique: bool,
+    /// TiDB `INVISIBLE`: the optimizer ignores the new index.
+    pub invisible: bool,
 }
 
 impl CreateIndexStmt {

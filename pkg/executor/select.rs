@@ -69,6 +69,44 @@ impl MemTableExec {
             emitted: false,
         }
     }
+
+    /// TiDB `MemTableScan` ranges: equality ranges on a column OR together,
+    /// ranges on different columns AND together. Values compare under the
+    /// memory table's case-insensitive collation.
+    pub fn filter_ranges(&mut self, ranges: &[(String, String)]) {
+        if ranges.is_empty() {
+            return;
+        }
+        let mut columns: Vec<(usize, Vec<&str>)> = Vec::new();
+        for (column, value) in ranges {
+            let Some(idx) = self
+                .schema
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(column))
+            else {
+                continue;
+            };
+            match columns.iter_mut().find(|(seen, _)| *seen == idx) {
+                Some((_, values)) => values.push(value),
+                None => columns.push((idx, vec![value])),
+            }
+        }
+        self.rows.retain(|row| {
+            columns.iter().all(|(idx, values)| {
+                row.get(*idx).is_some_and(|datum| {
+                    let text = match datum {
+                        sealdb_types::Datum::Bytes(bytes) => {
+                            String::from_utf8_lossy(bytes).into_owned()
+                        }
+                        sealdb_types::Datum::I64(v) => v.to_string(),
+                        sealdb_types::Datum::U64(v) => v.to_string(),
+                        _ => return false,
+                    };
+                    values.iter().any(|value| text.eq_ignore_ascii_case(value))
+                })
+            })
+        });
+    }
 }
 
 impl Executor for MemTableExec {

@@ -189,6 +189,14 @@ impl TxnManager {
         Ok(handle)
     }
 
+    /// Keys written by the current transaction (empty when there is none).
+    pub fn dirty_keys(&self) -> Vec<Vec<u8>> {
+        let Some(handle) = &self.handle else {
+            return Vec::new();
+        };
+        handle.with_txn(|txn| Ok(txn.dirty_keys())).unwrap_or_default()
+    }
+
     pub fn refresh_snapshot(&self) -> Result<()> {
         if let Some(handle) = &self.handle {
             handle.with_txn(|txn| txn.refresh_snapshot())?;

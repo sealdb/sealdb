@@ -16,6 +16,8 @@ pub struct IndexAccessRange {
     pub range: IndexScanRange,
     /// Conjuncts fully encoded by the range (they leave the cop Selection).
     pub consumed: Vec<ExprNode>,
+    /// Coerced seek bounds of every range in the set.
+    pub ranges: Vec<pseudo::Bounds>,
 }
 
 /// Statistics snapshot of a table, as TIckDB's DataSource carries it.
@@ -153,6 +155,7 @@ pub fn index_access_range(
             partial: partial_columns,
         },
         consumed,
+        ranges,
     })
 }
 

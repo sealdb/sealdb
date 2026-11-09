@@ -1846,8 +1846,15 @@ fn emit_cop_children(
             }
             // RANGE: `RANGE_SEL|<sel>|<decided by …>` → index/table range probed
             // per outer row: a cop Selection above a decided range scan.
-            if let Some((sel, range_info)) = range_sel_pushed(pushed.as_ref()) {
-                let sel_est = keep_order_est(*row_count, &sel);
+            if let Some((sel, range_info, scan_rows)) = range_sel_pushed(pushed.as_ref()) {
+                // A marker carrying the scan estimate keeps the cop Selection at
+                // the reader's row count (TiDB already scaled it by the filters)
+                // and prints that estimate on the scan itself.
+                let sel_est = match scan_rows {
+                    Some(_) => *row_count,
+                    None => keep_order_est(*row_count, &sel),
+                };
+                let scan_est = scan_rows.unwrap_or(sel_est);
                 let mut keep = format!("range: {range_info}, keep order:false");
                 if *stats_pseudo {
                     keep.push_str(", stats:pseudo");
@@ -1877,7 +1884,7 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "TableRangeScan",
-                        est: sel_est,
+                        est: scan_est,
                         task: scan_task,
                         access: scan_access,
                         info: keep,
@@ -2050,7 +2057,7 @@ fn emit_cop_children(
                 return true;
             }
             // IndexJoin probe: index-side Selection above the decided range.
-            if let Some((sel, range_info)) = range_sel_pushed(pushed.as_ref()) {
+            if let Some((sel, range_info, _)) = range_sel_pushed(pushed.as_ref()) {
                 let pseudo = *row_count >= 9_000.0;
                 let sel_est = keep_order_est(*row_count, &sel);
                 let mut keep = format!("range: {range_info}, keep order:false");
@@ -2844,46 +2851,202 @@ fn emit_cop_children(
             indexes,
             partitions,
             pushed,
+            paths,
+            probe_selection,
+            probe_est,
+            est_rows: root_est,
+            ..
         } => {
-            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
-            if let Some(filter) = pushed.as_ref() {
-                info = format!("pushed:{}", filter.restore_string());
+            let task = "cop[tikv]";
+            if paths.is_empty() {
+                // Legacy union shape: arms are derived from the selection at
+                // execution time, so EXPLAIN can only list the named indexes.
+                let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
+                if let Some(filter) = pushed.as_ref() {
+                    info = format!("pushed:{}", filter.restore_string());
+                }
+                let n = indexes.len();
+                for (i, index) in indexes.iter().enumerate() {
+                    let last_idx = i + 1 == n;
+                    push_explain_row(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: scan_est,
+                            task: "cop",
+                            access: index_access(table, index, partitions),
+                            info: if last_idx {
+                                info.clone()
+                            } else {
+                                "keep order:false".to_string()
+                            },
+                        },
+                    );
+                }
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRowIDScan",
+                        est: scan_est,
+                        task: "cop",
+                        access: table_access(table, &[]),
+                        info: "keep order:false".to_string(),
+                    },
+                );
+                return true;
             }
-            let n = indexes.len();
-            for (i, index) in indexes.iter().enumerate() {
-                let last_idx = i + 1 == n;
-                // TableRowIDScan always follows as the final sibling.
+            for path in paths {
+                let arm_est = path.range.as_ref().map_or(1.0, |range| range.rows);
+                let access = if path.table_range {
+                    table_access(table, &[])
+                } else {
+                    index_access_cols(table, &path.index, &path.index_columns, partitions)
+                };
+                let mut info = match &path.range {
+                    Some(range) => format!(
+                        "range:{}, keep order:{}{}",
+                        range.text,
+                        if path.keep_order { "true" } else { "false" },
+                        if path.keep_order && path.desc {
+                            ", desc"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => format!(
+                        "keep order:{}",
+                        if path.keep_order { "true" } else { "false" }
+                    ),
+                };
+                if path.range.as_ref().is_some_and(|range| range.pseudo) {
+                    info.push_str(", stats:pseudo");
+                }
+                let scan = if path.table_range {
+                    "TableRangeScan"
+                } else {
+                    "IndexRangeScan"
+                };
+                let Some((offset, count)) = path.limit else {
+                    push_explain_row(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: scan,
+                            est: arm_est,
+                            task,
+                            access,
+                            info,
+                        },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    continue;
+                };
                 push_explain_row(
                     rows,
                     depth,
                     false,
                     next_id,
                     CopRow {
-                        name: "IndexRangeScan",
-                        est: scan_est,
-                        task: "cop",
-                        access: index_access(table, index, partitions),
-                        info: if last_idx {
-                            info.clone()
-                        } else {
-                            "keep order:false".to_string()
-                        },
+                        name: "Limit",
+                        est: arm_est.min((offset + count) as f64),
+                        task,
+                        access: String::new(),
+                        info: format!("offset:{offset}, count:{count}"),
                     },
                 );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Build)");
+                }
+                // The arm has a later sibling (the probe row), so its child
+                // keeps the continuation bar.
+                let mut spine = vec![false; depth];
+                if depth > 0 {
+                    spine[depth - 1] = true;
+                }
+                push_explain_row_spine(
+                    rows,
+                    depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: scan,
+                        est: arm_est,
+                        task,
+                        access,
+                        info,
+                    },
+                    &spine,
+                );
             }
-            push_explain_row(
-                rows,
-                depth,
-                true,
-                next_id,
-                CopRow {
-                    name: "TableRowIDScan",
-                    est: scan_est,
-                    task: "cop",
-                    access: table_access(table, &[]),
-                    info: "keep order:false".to_string(),
-                },
-            );
+            let rowid_info = if paths
+                .iter()
+                .any(|path| path.range.as_ref().is_some_and(|range| range.pseudo))
+            {
+                "keep order:false, stats:pseudo".to_string()
+            } else {
+                "keep order:false".to_string()
+            };
+            if let Some(selection) = probe_selection {
+                // The probe Selection is the merge root's last child; the
+                // TableRowIDScan it filters hangs below it, so it must not keep
+                // a sibling continuation bar.
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: root_est.as_ref().copied().unwrap_or(*probe_est),
+                        task,
+                        access: String::new(),
+                        info: explain_pushed_filter(table, selection),
+                    },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
+                push_explain_row(
+                    rows,
+                    depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRowIDScan",
+                        est: *probe_est,
+                        task,
+                        access: table_access(table, &[]),
+                        info: rowid_info,
+                    },
+                );
+            } else {
+                push_explain_row(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "TableRowIDScan",
+                        est: *probe_est,
+                        task,
+                        access: table_access(table, &[]),
+                        info: rowid_info,
+                    },
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
+                }
+            }
             true
         }
         _ => false,
@@ -3254,11 +3417,19 @@ fn keep_order_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Optio
         .map(|s| s.to_string())
 }
 
-/// `RANGE_SEL|<sel info>|<range>`: index Selection above a decided range.
-fn range_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(String, String)> {
+/// `RANGE_SEL|<sel info>|<range>[|<scan rows>]`: index Selection above a
+/// decided range. The optional scan estimate separates the range's own
+/// cardinality (scaled by the join keys' null-rejects) from the Selection.
+fn range_sel_pushed(
+    pushed: Option<&sealdb_parser::ast::ExprNode>,
+) -> Option<(String, String, Option<f64>)> {
     let rest = bytes_marker(pushed)?.strip_prefix("RANGE_SEL|")?;
-    let (sel, range) = rest.split_once('|')?;
-    Some((sel.to_string(), range.to_string()))
+    let (sel, rest) = rest.split_once('|')?;
+    let (range, scan_rows) = match rest.rsplit_once('|') {
+        Some((range, rows)) => (range, rows.parse::<f64>().ok()),
+        None => (rest, None),
+    };
+    Some((sel.to_string(), range.to_string(), scan_rows))
 }
 
 /// `PARTIAL_SEL|<missing cols>|<sel info>`: TableReader whose pushed Selection
@@ -3278,7 +3449,7 @@ fn tid_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<Strin
 
 /// TiDB keeps `not(isnull(..))` selectivity on real stats; pseudo stats scale
 /// each rejected-null predicate by 0.999.
-fn keep_order_est(row_count: f64, sel_info: &str) -> f64 {
+pub(crate) fn keep_order_est(row_count: f64, sel_info: &str) -> f64 {
     if row_count >= 9_000.0 {
         let n = sel_info.matches("not(isnull(").count() as i32;
         row_count * 0.999_f64.powi(n)
@@ -3288,9 +3459,9 @@ fn keep_order_est(row_count: f64, sel_info: &str) -> f64 {
 }
 
 /// Selection info carried by `KEEP_ORDER_SEL` / `RANGE_SEL` markers.
-fn marker_sel_info(filter: &sealdb_parser::ast::ExprNode) -> Option<String> {
+pub(crate) fn marker_sel_info(filter: &sealdb_parser::ast::ExprNode) -> Option<String> {
     keep_order_sel_pushed(Some(filter))
-        .or_else(|| range_sel_pushed(Some(filter)).map(|(sel, _)| sel))
+        .or_else(|| range_sel_pushed(Some(filter)).map(|(sel, _, _)| sel))
         .or_else(|| partial_sel_pushed(Some(filter)).map(|(_, sel)| sel))
 }
 
@@ -3651,6 +3822,7 @@ fn collect_dot_cop_children(
             indexes,
             partitions,
             pushed,
+            ..
         } => {
             let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
             if let Some(filter) = pushed.as_ref() {
@@ -3868,7 +4040,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
 
         // TiDB `MemTableScan`: the infoschema table's canonical (upper-case)
         // name, not the identifier the statement used.
-        PhysicalPlan::InfoSchema { table, pushed } => (
+        PhysicalPlan::InfoSchema { table, pushed, .. } => (
             "MemTableScan".to_string(),
             format!("table:{}", table.to_uppercase()),
             pushed.clone().unwrap_or_default(),
@@ -4029,18 +4201,22 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 "index:IndexFullScan".to_string()
             },
         ),
-        PhysicalPlan::IndexMerge { indexes, .. } => (
-            "IndexMerge".to_string(),
-            String::new(),
-            format!(
-                "data:{}, TableRowIDScan",
-                indexes
-                    .iter()
-                    .map(|_| "IndexRangeScan")
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ),
+        PhysicalPlan::IndexMerge {
+            intersection,
+            limit,
+            ..
+        } => {
+            let kind = if *intersection {
+                "intersection"
+            } else {
+                "union"
+            };
+            let mut info = format!("type: {kind}");
+            if let Some((offset, count)) = limit {
+                info.push_str(&format!(", limit embedded(offset:{offset}, count:{count})"));
+            }
+            ("IndexMerge".to_string(), String::new(), info)
+        }
         PhysicalPlan::Selection { child, filter, .. } => (
             "Selection".to_string(),
             String::new(),
@@ -4389,6 +4565,31 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
     }
 }
 
+/// TiDB pseudo column-range rate for a single `column <op> const` whose
+/// constant is not an integer (strings, temporal, decimal) — `pseudo_range_est`
+/// only carries integer bounds, so those predicates would otherwise fall back
+/// to the generic 0.8 `selectionFactor` (`name > 'a'` → 3333.33, not 8000).
+fn datum_range_est(
+    conjuncts: &[sealdb_parser::ast::ExprNode],
+    row_count: f64,
+) -> Option<f64> {
+    let [conjunct] = conjuncts else {
+        return None;
+    };
+    // Derived outputs (`Column#5` from an aggregate) carry no column stats.
+    let (column, _, value) = conjunct.column_cmp_const()?;
+    if column.starts_with("Column#") {
+        return None;
+    }
+    if matches!(
+        value,
+        sealdb_types::Datum::I64(_) | sealdb_types::Datum::U64(_)
+    ) {
+        return None;
+    }
+    sealdb_statistics::pseudo::selectivity(conjuncts, row_count, None)
+}
+
 /// Sum per-column range counts, then combine columns independently (TiDB
 /// multiplies the per-column selectivities).
 fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
@@ -4584,6 +4785,12 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 }
             } else if let Some(est) = pseudo_range_est(&filter.split_cnf(), est_rows(child)) {
                 est
+            } else if let Some(est) =
+                datum_range_est(&filter.split_cnf(), est_rows(child))
+            {
+                // Non-integer bounds (strings, temporal, decimal) keep TiDB's
+                // pseudo `1/3` column-range rate instead of the generic 0.8.
+                est.clamp(0.0, est_rows(child))
             } else {
                 est_rows(child) * 0.8
             }
@@ -4679,6 +4886,13 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if let Some(est) = pseudo_range_est(&filter.split_cnf(), *row_count) => est,
+        // Non-integer range bound: TiDB's pseudo column-range rate (1/3), not
+        // the generic `selectionFactor` (`name > 'a'` over 10000 → 3333.33).
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if let Some(est) = datum_range_est(&filter.split_cnf(), *row_count) => est,
         PhysicalPlan::TableReader {
             pushed: Some(_),
             row_count,
@@ -4758,8 +4972,14 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(_), ..
         }
         | PhysicalPlan::IndexMerge {
-            pushed: Some(_), ..
+            pushed: Some(_),
+            est_rows: None,
+            ..
         } => 8_000.0,
+        PhysicalPlan::IndexMerge {
+            est_rows: Some(est),
+            ..
+        } => *est,
         PhysicalPlan::Limit { child, count, .. } => {
             if *count > 0 {
                 est_rows(child).min(*count as f64)
@@ -4899,7 +5119,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             *e
         }
         PhysicalPlan::IndexJoin { est_rows: e, .. } => *e,
-        PhysicalPlan::UnionScan { est_rows: e, .. } => *e,
+        // TiDB `PhysicalUnionScan` reuses its child's stats: the dirty rows it
+        // merges in do not change the estimated cardinality (`1841.86` merge
+        // under `UnionScan` in `index_merge_reader`).
+        PhysicalPlan::UnionScan { child, .. } => est_rows(child),
         PhysicalPlan::Apply {
             child,
             probe: Some(_probe),

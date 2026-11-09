@@ -103,7 +103,14 @@ impl Executor for TableReaderExec {
         } else {
             info.physical_ids()
         };
-        let scanned = scan_table(&self.txn, &info, self.lock, self.wait, &physical)?;
+        let scanned = scan_table_filtered(
+            &self.txn,
+            &info,
+            self.lock,
+            self.wait,
+            &physical,
+            self.pushed.as_ref(),
+        )?;
         // Heap tables expose the row handle as `_tidb_rowid` when referenced.
         let expose_rowid = self.with_rowid && !info.pk_is_handle;
         self.rows = filter_rows(
@@ -165,6 +172,20 @@ pub(crate) fn scan_table(
     wait: LockWait,
     physical_ids: &[i64],
 ) -> Result<Vec<ScannedRow>> {
+    scan_table_filtered(handle, info, lock, wait, physical_ids, None)
+}
+
+/// Like [`scan_table`], with the coprocessor selection fed into the scan so
+/// row locking only covers rows the query actually returns (TiDB
+/// `SelectLockExec` sits above the `Selection`).
+pub(crate) fn scan_table_filtered(
+    handle: &TxnHandle,
+    info: &TableInfo,
+    lock: RowLock,
+    wait: LockWait,
+    physical_ids: &[i64],
+    filter: Option<&ExprNode>,
+) -> Result<Vec<ScannedRow>> {
     handle.with_txn(|txn| {
         let mut rows = Vec::new();
         let start_ts = 0;
@@ -184,6 +205,7 @@ pub(crate) fn scan_table(
                     &tasks,
                     lock,
                     wait,
+                    filter,
                 )?);
             }
         }

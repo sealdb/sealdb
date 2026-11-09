@@ -230,10 +230,14 @@ impl ExecutorBuilder {
                     select,
                 )))
             }
-            PhysicalPlan::InfoSchema { table, .. } => {
+            PhysicalPlan::InfoSchema {
+                table, ranges: pushed_ranges, ..
+            } => {
                 let (columns, rows) =
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
-                Ok(Box::new(MemTableExec::new(columns, rows)))
+                let mut exec = MemTableExec::new(columns, rows);
+                exec.filter_ranges(&pushed_ranges);
+                Ok(Box::new(exec))
             }
             PhysicalPlan::Update { .. } => {
                 let update = match stmt {
@@ -300,7 +304,14 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::IndexMerge {
-                partitions, pushed, ..
+                partitions,
+                pushed,
+                paths,
+                keep_order,
+                order_column,
+                order_desc,
+                limit,
+                ..
             } => {
                 let select = stmt
                     .as_select()
@@ -319,6 +330,11 @@ impl ExecutorBuilder {
                     partitions.clone(),
                     pushed.clone(),
                     select.selection.clone(),
+                    paths.clone(),
+                    *keep_order,
+                    order_column.clone(),
+                    *order_desc,
+                    *limit,
                 )))
             }
             PhysicalPlan::PointGet {
@@ -622,9 +638,15 @@ impl ExecutorBuilder {
                     .as_select()
                     .ok_or_else(|| Error::unsupported("window without select"))?
                     .clone();
+                // `SELECT row_number() over ()` plans a placeholder Projection
+                // (`ROW_NUMBER() OVER ()->Column#1`) over TableDual. The Window
+                // executor evaluates the window functions itself, so that
+                // projection must not try to evaluate them.
+                let child_plan = strip_dual_window_projection(child)
+                    .unwrap_or_else(|| (**child).clone());
                 Ok(Box::new(WindowExec::new(
                     select,
-                    Self::build(child, stmt, domain, current_db, txn)?,
+                    Self::build(&child_plan, stmt, domain, current_db, txn)?,
                 )))
             }
             // TiDB `buildDistinct` HashAgg: EXPLAIN shape for a distinct UNION
@@ -1554,11 +1576,23 @@ fn is_star_expr(expr: &ExprNode) -> bool {
 fn is_window_plan(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::Window { .. } => true,
-        PhysicalPlan::Shuffle { child, .. } | PhysicalPlan::ShuffleReceiver { child } => {
-            is_window_plan(child)
-        }
+        // The query-level ORDER BY / LIMIT is planned on top of the Window.
+        PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Shuffle { child, .. }
+        | PhysicalPlan::ShuffleReceiver { child } => is_window_plan(child),
         _ => false,
     }
+}
+
+/// Window input placeholder: a Projection over TableDual (no FROM) that only
+/// exists for EXPLAIN shape; `WindowExec` evaluates the select list itself.
+fn strip_dual_window_projection(plan: &PhysicalPlan) -> Option<PhysicalPlan> {
+    let PhysicalPlan::Projection { child, .. } = plan else {
+        return None;
+    };
+    matches!(**child, PhysicalPlan::TableDual { .. }).then(|| (**child).clone())
 }
 
 /// True when the plan's top executor is an aggregation (optionally under

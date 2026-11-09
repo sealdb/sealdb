@@ -84,6 +84,11 @@ pub fn build_window_plan(
     } else {
         window
     };
+    // TiDB plans the query-level ORDER BY / LIMIT above the Window operator; the
+    // window's own Sort only establishes partition / peer order below it. Without
+    // this, `... OVER (PARTITION BY name ORDER BY id) ... ORDER BY id` returned
+    // rows in window order (4 before 3).
+    let body = apply_window_outer_order(body, select, win, &schema, table, current_db, stats);
 
     let proj = match outer {
         Some((Op::Minus, rhs)) => {
@@ -197,6 +202,100 @@ fn window_shape(
         prefer_index,
         keep_order: only_a_part,
     }
+}
+
+/// Apply the query-level `ORDER BY` / `LIMIT` on top of the Window plan.
+/// The window's own `Sort` uses `partition by … order by …` keys, so a query
+/// `ORDER BY` that is a prefix of those keys is already satisfied and gets no
+/// extra `Sort` (TiDB `PhysicalWindow` keeps the child order).
+fn apply_window_outer_order(
+    mut plan: PhysicalPlan,
+    select: &SelectStmt,
+    win: Option<&WindowFuncExpr>,
+    schema: &str,
+    table: &str,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> PhysicalPlan {
+    let ordered = !select.order_by.is_empty()
+        && !window_order_covers(win, select, schema, table);
+    let limit = select.limit;
+    let offset = select.offset;
+    if ordered {
+        let by_info = super::planbuilder::topn_by_info(select, current_db);
+        let est_rows = select
+            .from
+            .as_ref()
+            .map(|from| super::plan_cost::table_row_count(stats, from, current_db))
+            .unwrap_or(1.0);
+        if let Some(lim) = limit
+            && offset.unwrap_or(0) == 0
+            && super::plan_cost::prefer_topn(est_rows, lim)
+        {
+            return PhysicalPlan::TopN {
+                child: Box::new(plan),
+                by_info,
+                offset: 0,
+                count: lim,
+            };
+        }
+        plan = PhysicalPlan::Sort {
+            child: Box::new(plan),
+            by_info,
+        };
+    }
+    if let Some(lim) = limit {
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), lim);
+    } else if offset.is_some() {
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), 0);
+    }
+    plan
+}
+
+/// True when the window's `Sort` keys (`partition by` then `order by`) already
+/// provide the query-level `ORDER BY` order as a prefix.
+fn window_order_covers(
+    win: Option<&WindowFuncExpr>,
+    select: &SelectStmt,
+    schema: &str,
+    table: &str,
+) -> bool {
+    let Some(win) = win else {
+        return false;
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for expr in win
+        .spec
+        .partition_by
+        .iter()
+        .chain(win.spec.order_by.iter().map(|item| &item.expr))
+    {
+        let ExprNode::Column(c) = expr else {
+            return false;
+        };
+        let label = format!("{schema}.{table}.{}", c.name);
+        if !keys.iter().any(|k| k == &label) {
+            keys.push(label);
+        }
+    }
+    if keys.is_empty() {
+        return false;
+    }
+    let mut idx = 0;
+    for item in &select.order_by {
+        if item.desc {
+            return false;
+        }
+        let ExprNode::Column(c) = &item.expr else {
+            return false;
+        };
+        let label = format!("{schema}.{table}.{}", c.name);
+        if keys.get(idx) != Some(&label) {
+            return false;
+        }
+        idx += 1;
+    }
+    true
 }
 
 fn format_over(part: &[String], order: &[String], win: &WindowFuncExpr) -> String {

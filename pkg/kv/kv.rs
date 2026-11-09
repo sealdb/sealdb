@@ -63,6 +63,12 @@ pub trait Transaction: Send {
         }
         Ok(out)
     }
+    /// Keys this transaction has written or deleted (TiDB `MemBuffer`), i.e.
+    /// what a `UnionScan` must merge over the snapshot. The key layout is the
+    /// caller's: `kv` only reports the raw bytes.
+    fn dirty_keys(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// Batch pessimistic lock+get. Default loops `get_for_update`.

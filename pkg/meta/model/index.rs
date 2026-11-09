@@ -82,4 +82,10 @@ impl IndexInfo {
         self.global = global;
         self
     }
+
+    /// TiDB `INDEX … INVISIBLE` option.
+    pub fn with_invisible(mut self, invisible: bool) -> Self {
+        self.invisible = invisible;
+        self
+    }
 }

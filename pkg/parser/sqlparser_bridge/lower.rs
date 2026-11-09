@@ -2292,12 +2292,24 @@ fn rewrite_mysql_version_comments(sql: &str) -> String {
 /// `GLOBAL` index (sqlparser has no GLOBAL index option).
 const GLOBAL_INDEX_MARKER: &str = "sealdb_global_index";
 
+const INVISIBLE_INDEX_MARKER: &str = "sealdb_invisible_index";
+
 /// True when the index options carry [`GLOBAL_INDEX_MARKER`].
 fn index_def_global(options: &[sqlparser::ast::IndexOption]) -> bool {
     options.iter().any(|option| {
         matches!(
             option,
             sqlparser::ast::IndexOption::Comment(comment) if comment == GLOBAL_INDEX_MARKER
+        )
+    })
+}
+
+/// True when the index options carry [`INVISIBLE_INDEX_MARKER`].
+fn index_def_invisible(options: &[sqlparser::ast::IndexOption]) -> bool {
+    options.iter().any(|option| {
+        matches!(
+            option,
+            sqlparser::ast::IndexOption::Comment(comment) if comment == INVISIBLE_INDEX_MARKER
         )
     })
 }
@@ -2312,7 +2324,14 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
         // `ALTER TABLE … ADD [UNIQUE] INDEX (c) GLOBAL` carries the same options.
         None => match lower.find("alter table") {
             Some(pos) => pos,
-            None => return sql.to_string(),
+            // `CREATE [UNIQUE] INDEX i ON t (c) INVISIBLE` shares the marker.
+            None => match lower.find("create index") {
+                Some(pos) => pos,
+                None => match lower.find("create unique index") {
+                    Some(pos) => pos,
+                    None => return sql.to_string(),
+                },
+            },
         },
     };
     const GLOBAL: [&str; 2] = ["nonclustered", "clustered"];
@@ -2403,9 +2422,16 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                     continue;
                 }
                 // `UNIQUE KEY uk (c) /*!80000 INVISIBLE */` — MySQL index
-                // visibility. Meta has no visibility flag yet, so the option is
-                // dropped (the index is simply visible).
-                if word == "invisible" || word == "visible" {
+                // visibility. sqlparser has no VISIBLE option, so the flag
+                // rides along as a COMMENT marker recovered in
+                // `index_def_invisible`; `VISIBLE` is the default and drops.
+                if word == "invisible" {
+                    out.push_str(" COMMENT '");
+                    out.push_str(INVISIBLE_INDEX_MARKER);
+                    out.push('\'');
+                    continue;
+                }
+                if word == "visible" {
                     out.push(' ');
                     continue;
                 }
@@ -8803,7 +8829,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 primary: false,
                 global: false,
                 nonclustered: false,
-            clustered: false,
+                clustered: false,
+                invisible: false,
             });
         }
     }
@@ -8819,7 +8846,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     primary: true,
                     global: false,
                     nonclustered: false,
-            clustered: false,
+                    clustered: false,
+                    invisible: false,
                 },
             );
         }
@@ -9923,6 +9951,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<Statement>
         name,
         columns,
         unique: create.unique,
+        invisible: index_def_invisible(&create.index_options),
     }))
 }
 
@@ -10092,7 +10121,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     primary: false,
                     global: index_def_global(&idx.index_options),
                     nonclustered: false,
-            clustered: false,
+                    clustered: false,
+                    invisible: index_def_invisible(&idx.index_options),
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -10136,7 +10166,8 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     primary: false,
                     global: index_def_global(&idx.index_options),
                     nonclustered: false,
-            clustered: false,
+                    clustered: false,
+                    invisible: index_def_invisible(&idx.index_options),
                 });
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
@@ -10182,7 +10213,8 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         primary: false,
         global: index_def_global(&idx.index_options),
         nonclustered: false,
-            clustered: false,
+        clustered: false,
+        invisible: index_def_invisible(&idx.index_options),
     })
 }
 
@@ -10233,6 +10265,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         global: index_def_global(&idx.index_options),
         nonclustered,
         clustered,
+        invisible: index_def_invisible(&idx.index_options),
     })
 }
 

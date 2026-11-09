@@ -28,6 +28,15 @@ pub fn encode_table_prefix(table_id: i64) -> Key {
     Key::from_raw(buf)
 }
 
+/// Table id of a `t<id>_r…` / `t<id>_i…` key, `None` for other keys.
+pub fn decode_table_id(key: &[u8]) -> Option<i64> {
+    if key.len() < 1 + 8 || key[0] != TABLE_PREFIX[0] {
+        return None;
+    }
+    let (_, table_id) = decode_int(&key[1..]).ok()?;
+    Some(table_id)
+}
+
 pub fn encode_row_key(table_id: i64, encoded_handle: &[u8]) -> Key {
     let mut buf = Vec::with_capacity(PREFIX_LEN + encoded_handle.len());
     append_table_record_prefix(&mut buf, table_id);
