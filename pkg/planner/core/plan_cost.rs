@@ -57,8 +57,23 @@ pub fn table_scan_cost(rows: f64) -> f64 {
     rows * SCAN_FACTOR
 }
 
+/// TiDB `PhysicalIndexLookUpReader` price, in table-scan-row units.
+///
+/// Every index row costs one table probe, and that probe is a random seek plus
+/// a double-read request batch: TiDB spreads `tidb_index_lookup_size` (20000)
+/// rows into 32 tasks per batch and charges each `tidb_request_factor` (6e6),
+/// divided by the double-read concurrency (5). One probed row therefore costs
+/// what ~100 sequentially scanned rows cost, so an un-hinted index lookup only
+/// wins for very selective ranges. Measured on TiDB 8.5 (9999-row table, index
+/// on the range column): v2 keeps `IndexLookUp` at 49 rows and switches to
+/// `TableReader` at 99; v1 replaces the request cost with `doubleReadFactor`,
+/// keeping the index up to ~16% selectivity (1599 rows).
 pub fn index_lookup_cost(rows: f64) -> f64 {
-    rows * (SCAN_FACTOR + NET_FACTOR)
+    if super::planbuilder::cost_model_version() <= 1 {
+        rows * 6.0
+    } else {
+        rows * 100.0
+    }
 }
 
 pub fn point_get_cost() -> f64 {
