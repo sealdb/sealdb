@@ -10097,13 +10097,6 @@ fn agg_int_decimal_cast(
 /// pseudo (unanalyzed) statistics TiDB keeps the streaming aggregate.
 fn scalar_agg_prefers_hash(plan: &PhysicalPlan) -> bool {
     const HASH_AGG_CROSSOVER_ROWS: f64 = 234.0;
-    // Cost model v1 has no hash-aggregate CPU amortisation to pay for: a root
-    // `HashAgg` divides its CPU cost by `min(partial, final)` concurrency
-    // (`PhysicalHashAgg.cpuCostDivisor`), so it only costs more than a
-    // `StreamAgg` when `tidb_hashagg_{partial,final}_concurrency` are both 1.
-    if cost_model_version() <= 1 {
-        return hashagg_cpu_amortized();
-    }
     match agg_input_cardinality(plan) {
         Some((rows, false)) => rows > HASH_AGG_CROSSOVER_ROWS,
         _ => false,

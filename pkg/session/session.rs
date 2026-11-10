@@ -2728,12 +2728,16 @@ fn apply_set(
             // `HashAgg`'s CPU cost by `min(partial, final)`; both 1 makes a
             // `StreamAgg` strictly cheaper.
             "tidb_hashagg_partial_concurrency" | "tidb_hashagg_final_concurrency" => {
-                let n: u64 = value.parse().map_err(|_| {
+                let n: u64 = if value.eq_ignore_ascii_case("DEFAULT") {
+                    5
+                } else {
+                    value.parse().map_err(|_| {
                     sealdb_errno::Error::new(
                         sealdb_errno::ERR_WRONG_ARGUMENTS,
                         format!("Variable '{name}' can't be set to the value of '{value}'"),
                     )
-                })?;
+                    })?
+                };
                 if n == 0 {
                     return Err(sealdb_errno::Error::new(
                         sealdb_errno::ERR_WRONG_ARGUMENTS,
