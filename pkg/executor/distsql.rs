@@ -21,11 +21,14 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub enum IndexAccess {
-    Equal(Datum),
+    /// Point range over the pinned key prefix (`idx = 1`).
+    Equal(Vec<Datum>),
+    /// Composite range: `low` / `high` are the pinned key parts (empty means
+    /// unbounded), so `(c2 = 1, c1 > 1)` seeks `low [1 1]` .. `high [1]`.
     Range {
-        low: Option<Datum>,
+        low: Vec<Datum>,
         low_inclusive: bool,
-        high: Option<Datum>,
+        high: Vec<Datum>,
         high_inclusive: bool,
     },
 }
@@ -34,7 +37,7 @@ pub struct IndexLookUpExecutor {
     domain: Arc<Domain>,
     table: TableName,
     index: String,
-    access: IndexAccess,
+    access: Vec<IndexAccess>,
     current_db: String,
     txn: Arc<TxnHandle>,
     lock: RowLock,
@@ -55,7 +58,7 @@ impl IndexLookUpExecutor {
         domain: Arc<Domain>,
         table: TableName,
         index: String,
-        access: IndexAccess,
+        access: Vec<IndexAccess>,
         current_db: impl Into<String>,
         txn: Arc<TxnHandle>,
         lock: RowLock,
@@ -120,41 +123,44 @@ impl Executor for IndexLookUpExecutor {
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
             for physical_id in physical {
-                let (start, end) = scan_bounds(physical_id, index.id, &self.access);
-                if start.as_bytes() >= end.as_slice() {
-                    continue;
-                }
-                for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
-                    let pairs = txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
-                    for (key, value) in pairs {
-                        let handle = index_handle(&index, &key, &value)?;
-                        if self.covering {
-                            let mut row = covering_row(&info, &index, &key, handle)?;
-                            if expose_rowid {
-                                row.push(Datum::I64(handle));
+                for access in &self.access {
+                    let (start, end) = scan_bounds(physical_id, index.id, access);
+                    if start.as_bytes() >= end.as_slice() {
+                        continue;
+                    }
+                    for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
+                        let pairs =
+                            txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
+                        for (key, value) in pairs {
+                            let handle = index_handle(&index, &key, &value)?;
+                            if self.covering {
+                                let mut row = covering_row(&info, &index, &key, handle)?;
+                                if expose_rowid {
+                                    row.push(Datum::I64(handle));
+                                }
+                                rows.push(row);
+                                continue;
                             }
-                            rows.push(row);
-                            continue;
-                        }
-                        let row_key = encode_row_key_with_handle(physical_id, handle);
-                        let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
-                        if let Some(raw) = raw {
-                            let decoded = decode_row(&raw, &info.col_field_types());
-                            let mut row: Vec<Datum> = info
-                                .columns
-                                .iter()
-                                .map(|col| {
-                                    decoded
-                                        .iter()
-                                        .find(|(id, _)| *id == col.id)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or(Datum::Null)
-                                })
-                                .collect();
-                            if expose_rowid {
-                                row.push(Datum::I64(handle));
+                            let row_key = encode_row_key_with_handle(physical_id, handle);
+                            let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                            if let Some(raw) = raw {
+                                let decoded = decode_row(&raw, &info.col_field_types());
+                                let mut row: Vec<Datum> = info
+                                    .columns
+                                    .iter()
+                                    .map(|col| {
+                                        decoded
+                                            .iter()
+                                            .find(|(id, _)| *id == col.id)
+                                            .map(|(_, v)| v.clone())
+                                            .unwrap_or(Datum::Null)
+                                    })
+                                    .collect();
+                                if expose_rowid {
+                                    row.push(Datum::I64(handle));
+                                }
+                                rows.push(row);
                             }
-                            rows.push(row);
                         }
                     }
                 }
@@ -341,9 +347,15 @@ impl Executor for IndexMergeExecutor {
                             .ranges
                             .iter()
                             .map(|(low, high)| IndexAccess::Range {
-                                low: low.as_ref().map(|(value, _)| value.clone()),
+                                low: low
+                                    .as_ref()
+                                    .map(|(value, _)| vec![value.clone()])
+                                    .unwrap_or_default(),
                                 low_inclusive: low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
-                                high: high.as_ref().map(|(value, _)| value.clone()),
+                                high: high
+                                    .as_ref()
+                                    .map(|(value, _)| vec![value.clone()])
+                                    .unwrap_or_default(),
                                 high_inclusive: high
                                     .as_ref()
                                     .is_none_or(|(_, inclusive)| *inclusive),
@@ -470,16 +482,15 @@ fn merge_access_arms(
             .find_index_covering(&column)
             .cloned()
             .ok_or_else(|| Error::unsupported(format!("index merge missing index on {column}")))?;
-        arms.push((index, IndexAccess::Equal(value)));
+        arms.push((index, IndexAccess::Equal(vec![value])));
     }
     Ok(arms)
 }
 
 fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, Vec<u8>) {
     match access {
-        IndexAccess::Equal(value) => {
-            let start =
-                encode_index_seek_prefix(physical_id, index_id, std::slice::from_ref(value));
+        IndexAccess::Equal(values) => {
+            let start = encode_index_seek_prefix(physical_id, index_id, values);
             let end = next_prefix(start.as_bytes());
             (start, end)
         }
@@ -489,34 +500,24 @@ fn scan_bounds(physical_id: i64, index_id: i64, access: &IndexAccess) -> (Key, V
             high,
             high_inclusive,
         } => {
-            let start = match low {
-                None => encode_index_seek_key(physical_id, index_id, &[]),
-                Some(value) => {
-                    let prefix = encode_index_seek_prefix(
-                        physical_id,
-                        index_id,
-                        std::slice::from_ref(value),
-                    );
-                    if *low_inclusive {
-                        prefix
-                    } else {
-                        Key::from_raw(next_prefix(prefix.as_bytes()))
-                    }
+            let start = if low.is_empty() {
+                encode_index_seek_key(physical_id, index_id, &[])
+            } else {
+                let prefix = encode_index_seek_prefix(physical_id, index_id, low);
+                if *low_inclusive {
+                    prefix
+                } else {
+                    Key::from_raw(next_prefix(prefix.as_bytes()))
                 }
             };
-            let end = match high {
-                None => next_prefix(encode_index_seek_key(physical_id, index_id, &[]).as_bytes()),
-                Some(value) => {
-                    let prefix = encode_index_seek_prefix(
-                        physical_id,
-                        index_id,
-                        std::slice::from_ref(value),
-                    );
-                    if *high_inclusive {
-                        next_prefix(prefix.as_bytes())
-                    } else {
-                        prefix.as_bytes().to_vec()
-                    }
+            let end = if high.is_empty() {
+                next_prefix(encode_index_seek_key(physical_id, index_id, &[]).as_bytes())
+            } else {
+                let prefix = encode_index_seek_prefix(physical_id, index_id, high);
+                if *high_inclusive {
+                    next_prefix(prefix.as_bytes())
+                } else {
+                    prefix.as_bytes().to_vec()
                 }
             };
             (start, end)

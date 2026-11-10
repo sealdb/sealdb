@@ -1449,7 +1449,7 @@ fn index_access(
     table: &sealdb_parser::ast::TableName,
     index_name: &str,
     selection: Option<&ExprNode>,
-) -> Option<IndexAccess> {
+) -> Option<Vec<IndexAccess>> {
     let (schema, name) = table.qualified(current_db);
     let is = domain.infoschema();
     let info = is.table_by_name(&schema, &name)?;
@@ -1457,48 +1457,41 @@ fn index_access(
         .indices
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
-    let column = index.columns.first()?.name.o().to_string();
-    // TIMESTAMP index keys are UTC; session-local string ranges (esp. DST gap)
-    // cannot be pushed as byte seeks — full scan + Selection filter.
-    let ts_index = index.columns.first().is_some_and(|c| {
-        info.columns
-            .get(c.offset as usize)
-            .is_some_and(|col| col.field_type.tp == sealdb_types::TYPE_TIMESTAMP)
-    });
-    if !ts_index {
-        if let Some(value) = selection.and_then(|expr| expr.eq_const_on(&column)) {
-            return Some(IndexAccess::Equal(value));
-        }
-        if let Some(range) = selection.and_then(|expr| {
-            expr.column_ranges()
-                .into_iter()
-                .find(|range| range.column.eq_ignore_ascii_case(&column))
-        }) {
-            if range.low.is_some() || range.high.is_some() {
-                return Some(IndexAccess::Range {
-                    low: range.low.as_ref().map(|(value, _)| value.clone()),
-                    low_inclusive: range
-                        .low
-                        .as_ref()
-                        .map(|(_, inclusive)| *inclusive)
-                        .unwrap_or(true),
-                    high: range.high.as_ref().map(|(value, _)| value.clone()),
-                    high_inclusive: range
+    let conjuncts = selection
+        .map(|selection| selection.split_cnf())
+        .unwrap_or_default();
+    // Ranger shares the planner's key ranges, so the executor seeks exactly the
+    // range EXPLAIN prints: an equality prefix pins every key part it covers
+    // (`c2 = 1 and c1 > 1` → `(1 1,1 +inf]` on `index c2(c2)`).
+    if let Some(access) =
+        sealdb_planner::core::access_range::index_key_ranges(info, index, &conjuncts)
+    {
+        return Some(
+            access
+                .ranges
+                .iter()
+                .map(|range| IndexAccess::Range {
+                    low: range.low.iter().map(|(value, _)| value.clone()).collect(),
+                    low_inclusive: range.low_open
+                        || range.low.last().is_none_or(|(_, inclusive)| *inclusive),
+                    high: range
                         .high
-                        .as_ref()
-                        .map(|(_, inclusive)| *inclusive)
-                        .unwrap_or(true),
-                });
-            }
-        }
+                        .iter()
+                        .map(|(value, _)| value.clone())
+                        .collect(),
+                    high_inclusive: range.high_open
+                        || range.high.last().is_none_or(|(_, inclusive)| *inclusive),
+                })
+                .collect(),
+        );
     }
     // USE INDEX / covering IndexReader with no predicate → IndexFullScan.
-    Some(IndexAccess::Range {
-        low: None,
+    Some(vec![IndexAccess::Range {
+        low: Vec::new(),
         low_inclusive: true,
-        high: None,
+        high: Vec::new(),
         high_inclusive: true,
-    })
+    }])
 }
 
 fn select_row_lock(select: &SelectStmt) -> RowLock {

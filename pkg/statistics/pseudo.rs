@@ -21,6 +21,171 @@ pub const SELECTION_FACTOR: f64 = 0.8;
 /// (lower) or `MaxValue` (upper) — the `-inf` / `+inf` sentinels.
 pub type Bounds = (Option<(Datum, bool)>, Option<(Datum, bool)>);
 
+/// One range of a composite index key (TiDB `ranger.Range` with vector
+/// `LowVal` / `HighVal`).
+///
+/// A side only carries the key parts the predicate pins: an empty `low` is
+/// `-inf`, a `high` shorter than the key is `+inf` from there on. `low_open` /
+/// `high_open` mark the sentinel TiDB pads with `MinValue` / `MaxValue` after a
+/// pinned prefix (`[1 -inf,1 5)`, `(1 1,1 +inf]`); the flags are also what the
+/// executor needs to build the seek key, since a pinned prefix seeks as a
+/// prefix scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyRange {
+    pub low: Vec<(Datum, bool)>,
+    pub high: Vec<(Datum, bool)>,
+    pub low_open: bool,
+    pub high_open: bool,
+}
+
+impl KeyRange {
+    /// A point range over the pinned prefix (`[1,1]` for `a = 1`).
+    pub fn point(values: Vec<Datum>) -> Self {
+        let bounds: Vec<(Datum, bool)> = values.into_iter().map(|v| (v, true)).collect();
+        Self {
+            low: bounds.clone(),
+            high: bounds,
+            low_open: false,
+            high_open: false,
+        }
+    }
+
+    /// `ranger.Range.IsPoint`: both sides pin the same inclusive values.
+    pub fn is_point(&self) -> bool {
+        !self.low_open
+            && !self.high_open
+            && self.low.len() == self.high.len()
+            && self
+                .low
+                .iter()
+                .zip(&self.high)
+                .all(|((a, a_inc), (b, b_inc))| *a_inc && *b_inc && a.compare(b) == Ordering::Equal)
+    }
+
+    fn low_exclusive(&self) -> bool {
+        !self.low_open && self.low.last().is_some_and(|(_, inc)| !*inc)
+    }
+
+    fn high_exclusive(&self) -> bool {
+        !self.high_open && self.high.last().is_some_and(|(_, inc)| !*inc)
+    }
+
+    /// `ranger.Range.PrefixEqualLen`: leading key parts both sides pin to the
+    /// same inclusive value.
+    pub fn prefix_equal_len(&self, key_len: usize) -> usize {
+        let mut len = 0;
+        while len < key_len {
+            let (Some((low, low_inc)), Some((high, high_inc))) =
+                (self.low.get(len), self.high.get(len))
+            else {
+                break;
+            };
+            if !*low_inc || !*high_inc || low.compare(high) != Ordering::Equal {
+                break;
+            }
+            len += 1;
+        }
+        len
+    }
+}
+
+/// TiDB `ranger.Range.String()` for a composite key range: `[1 1,1 5)`,
+/// `(1 1,1 +inf]`, `[1 -inf,1 5)`.
+pub fn key_range_text(range: &KeyRange) -> String {
+    let (low_text, low_bracket) = if range.low.is_empty() {
+        ("-inf".to_string(), "[")
+    } else {
+        let mut text = range
+            .low
+            .iter()
+            .map(|(value, _)| format_datum(value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if range.low_open {
+            text.push_str(" -inf");
+        }
+        let bracket = if range.low_exclusive() { "(" } else { "[" };
+        (text, bracket)
+    };
+    let (high_text, high_bracket) = if range.high.is_empty() {
+        ("+inf".to_string(), "]")
+    } else {
+        let mut text = range
+            .high
+            .iter()
+            .map(|(value, _)| format_datum(value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if range.high_open {
+            text.push_str(" +inf");
+        }
+        let bracket = if range.high_exclusive() { ")" } else { "]" };
+        (text, bracket)
+    };
+    format!("{low_bracket}{low_text},{high_text}{high_bracket}")
+}
+
+/// `ranger.Range.String()` joined for a composite key range set.
+pub fn key_ranges_text(ranges: &[KeyRange]) -> String {
+    ranges
+        .iter()
+        .map(key_range_text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Sum of TiDB `getPseudoRowCountByIndexRanges` over a composite range set.
+///
+/// The range only narrows at the first key part beyond the equal prefix; the
+/// prefix itself keeps the `1/100` per-column shrink (`1/1000` on the last
+/// equality part).
+pub fn index_key_ranges_rows(
+    table_rows: f64,
+    ranges: &[KeyRange],
+    key_len: usize,
+    unique: bool,
+) -> f64 {
+    let mut rows: f64 = 0.0;
+    for range in ranges {
+        if table_rows == 0.0 {
+            continue;
+        }
+        let prefix = range.prefix_equal_len(key_len);
+        // A range over every key part is one row on a unique index.
+        if unique && prefix >= key_len && !range.low_exclusive() && !range.high_exclusive() {
+            rows += 1.0;
+            continue;
+        }
+        // The estimate comes from the first part the range does not pin, or —
+        // for a range that only pins equality parts — from the last pinned one.
+        let extends = range.low.len() > prefix || range.high.len() > prefix;
+        let (offset, low, high) = if extends {
+            (prefix, range.low.get(prefix), range.high.get(prefix))
+        } else {
+            let last = prefix.saturating_sub(1);
+            (last, range.low.get(last), range.high.get(last))
+        };
+        let mut count = column_range_rows(table_rows, low, high);
+        if !unique {
+            // One `1/100` per pinned part before the estimated one; a range
+            // that stops at the equality prefix keeps the `1/1000` rate only.
+            let divisions = if extends {
+                offset
+            } else {
+                offset.saturating_sub(1)
+            };
+            for _ in 0..divisions.min(key_len.saturating_sub(1)) {
+                count /= 100.0;
+            }
+        }
+        if count > table_rows {
+            count = table_rows / PSEUDO_LESS_RATE;
+        }
+        rows += count;
+    }
+    rows.min(table_rows)
+}
+
 /// TiDB `getPseudoRowCountByColumnRanges` for a single column range.
 pub fn column_range_rows(table_rows: f64, low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> f64 {
     let mut rows = match (low, high) {

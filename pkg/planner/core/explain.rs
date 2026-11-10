@@ -2431,16 +2431,30 @@ fn emit_cop_children(
             // the table probe filters the rest.
             if let Some(range) = range_scan {
                 let task = "cop[tikv]";
-                let keep = if range.pseudo {
+                let mut keep = if range.pseudo {
                     format!("range:{}, keep order:false, stats:pseudo", range.text)
                 } else {
                     format!("range:{}, keep order:false", range.text)
                 };
-                let rowid_info = if range.pseudo {
+                // The index histogram covers a key column the table statistics
+                // do not carry, so both sides of the lookup read partial stats.
+                let partial = range.partial.as_ref().map(|missing| {
+                    format!(
+                        ", stats:partial[{}:missing]",
+                        missing.replace(',', ":missing, ")
+                    )
+                });
+                if let Some(partial) = &partial {
+                    keep.push_str(partial);
+                }
+                let mut rowid_info = if range.pseudo {
                     "keep order:false, stats:pseudo".to_string()
                 } else {
                     "keep order:false".to_string()
                 };
+                if let Some(partial) = &partial {
+                    rowid_info.push_str(partial);
+                }
                 let probe_row_est = if *probe_est > 0.0 {
                     *probe_est
                 } else {
@@ -4968,6 +4982,15 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if range_pushed(Some(filter)).is_some() => *row_count,
+        // Planner-built access range: `row_count` already holds the range ×
+        // index-side residual estimate. The probe-side `Selection` (table
+        // columns the index cannot encode) does not re-shrink the build side,
+        // so a `pushed` marker cannot fall through to the pseudo 8000.
+        PhysicalPlan::IndexLookUpReader {
+            row_count,
+            range_scan: Some(_),
+            ..
+        } => *row_count,
         PhysicalPlan::IndexLookUpReader {
             probe_est,
             probe_selection_info: Some(_),
