@@ -499,13 +499,17 @@ impl PlanBuilder {
                 fk_children: Vec::new(),
             }),
             Statement::Update(update) => Ok(PhysicalPlan::Update {
-                child: self.dml_update_child(update, is, current_db, stats, prune_mode)?,
+                child: apply_dml_lock(
+                    self.dml_update_child(update, is, current_db, stats, prune_mode)?,
+                ),
                 fk_children: is
                     .map(|is| super::foreign_key::update_fk_children(update, is, current_db))
                     .unwrap_or_default(),
             }),
             Statement::Delete(delete) => Ok(PhysicalPlan::Delete {
-                child: self.dml_delete_child(delete, is, current_db, stats, prune_mode)?,
+                child: apply_dml_lock(
+                    self.dml_delete_child(delete, is, current_db, stats, prune_mode)?,
+                ),
                 fk_children: is
                     .map(|is| super::foreign_key::delete_fk_children(delete, is, current_db))
                     .unwrap_or_default(),
@@ -10923,7 +10927,87 @@ fn partial_agg_column_id(select: &SelectStmt) -> usize {
 /// `SELECT … FOR UPDATE/FOR SHARE`: a handle point get or a batch point get
 /// locks its own keys (`…, lock`); everything else gets a `SelectLock` node.
 fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
-    let info = match select.lock {
+    apply_lock(plan, select.lock)
+}
+
+/// Lock the rows a DML statement reads inside an explicit transaction, exactly
+/// like `SELECT … FOR UPDATE` (TiDB's `UPDATE`/`DELETE` children carry the same
+/// `SelectLock`, and a handle point get reports `, lock`).
+fn apply_dml_lock(plan: Option<Box<PhysicalPlan>>) -> Option<Box<PhysicalPlan>> {
+    let plan = plan?;
+    if !in_explicit_txn() {
+        return Some(plan);
+    }
+    // A `DELETE` repeatedly projects the handle (`Projection(col0) → Point_Get`)
+    // before the row-id shape is folded away; the point get still owns the lock,
+    // so mark it beneath the projection chain instead of wrapping the chain in a
+    // `SelectLock` node (TiDB: `Delete → Point_Get handle:1, lock`).
+    if let Some(locked) = lock_point_get(plan.clone()) {
+        return Some(Box::new(locked));
+    }
+    Some(Box::new(apply_lock(*plan, SelectLock::ForUpdate)))
+}
+
+/// Mark a handle/unique point get reached through passthrough projections as
+/// locking its keys. Returns `None` when the chain does not end in a point get.
+fn lock_point_get(plan: Box<PhysicalPlan>) -> Option<PhysicalPlan> {
+    match *plan {
+        PhysicalPlan::PointGet {
+            table,
+            handle: Some(handle),
+            index: None,
+            index_columns,
+            partition_names,
+            ..
+        } => Some(PhysicalPlan::PointGet {
+            table,
+            handle: Some(handle),
+            index: None,
+            index_columns,
+            partition_names,
+            global_index: false,
+            lock: true,
+        }),
+        PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            handles,
+            index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
+            keep_order,
+            desc,
+            ..
+        } => Some(PhysicalPlan::BatchPointGet {
+            table,
+            column,
+            index,
+            n_keys,
+            handles,
+            index_columns,
+            tuple_columns,
+            partition_names,
+            global_index,
+            lock: true,
+            keep_order,
+            desc,
+        }),
+        PhysicalPlan::Projection { exprs, child } => {
+            let child = lock_point_get(child)?;
+            Some(PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(child),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn apply_lock(plan: PhysicalPlan, lock: SelectLock) -> PhysicalPlan {
+    let info = match lock {
         SelectLock::None => return plan,
         SelectLock::ForUpdate => "for update 0",
         SelectLock::ForShare => "for share 0",
