@@ -1799,6 +1799,23 @@
   - `explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` 用已落地的表达式索引继续推
   - R3 其余 `in_progress`：`explain_join_stats`、`topn_push_down`、`index_merge`
 
+### 2026-11-08（`explain_easy` 波：残余选择率 + anti semi join）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - Planner（点查残余选择率）：`Selection` 盖在 `Point_Get` 上时按 TiDB `cardinality.Selectivity` 放大点查的 1 行。无统计信息时走伪统计列范围率（`gt(c2, 1)` → 1/3 → `0.33`），有列/索引统计时仍走直方图；等式（点查已消费）保持 1 行
+  - Planner（表达式过滤选择率）：`is_equality_filter` 只对“裸列 = 常量”套 1/1000 等值率；`cast(col AS double) = 1` 这类不透明表达式保留 0.8 默认选择率（10000 → 8000）
+  - Planner（谓词化简）：同列冲突等值（`a = 1 AND a = 2`）在 `PredicateSimplification` 阶段折成 `0`，直接规划零行 `TableDual`（索引/主键/普通列三条路径一致）
+  - Planner（EXPLAIN 文本）：`Anti` 连接打印 TiDB 的 `anti semi join`；连接键列按 `OrigTblName` 渲染（`from t t2` 仍打印 `t.b`）
+  - Planner（NOT NULL 重写）：`ifnull(not_null_col, const)` → `cast(...)`、`isnull(not_null_col)` → `0`（保留 outer join 空值侧的例外）
+- **验证**:
+  - `run-tests.sh -s memory --status green` → PASS（全部 green 套件，含 `select`、`explain-non-select-stmt`）
+  - `explain_easy`：17 处 diff → 15 处
+- **阻塞/风险**:
+  - 剩余 diff 集中在：索引覆盖 vs 全表扫描的成本比较（TiDB v1 用行宽估算 `GetAvgRowSize` 决定 `IndexReader`/`TableReader`，当前 codebase 无行宽模型）、limit hint 的期望行数缩放（`limit * 3^k`）、聚合下推到 join 内、Apply 去关联、`EXPLAIN FORMAT='dot'`、`_tidb_rowid` 访问路径、`mysql.opt_rule_blacklist` + `ADMIN RELOAD`
+- **下一步**:
+  - 先补 v1 扫描成本的行宽模型（`GetAvgRowSize`），再按 hunk 顺序推 `explain_easy`
+
 ### 2026-11-08（SQL 文本保真 + 测试基线修正波）
 
 - **Phase**: 跨波次基础修正
