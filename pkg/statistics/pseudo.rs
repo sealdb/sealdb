@@ -447,6 +447,40 @@ fn handle_range_rows(
     rows.min(table_rows)
 }
 
+/// TiDB `cardinality.Selectivity` of the residual predicates over a one-row
+/// point get on an unanalyzed table.
+///
+/// TiDB derives the `Selection`'s cardinality from the table's pseudo column
+/// statistics, so a range predicate keeps its pseudo range rate of the single
+/// row (`gt(c2, 1)` → `1/3`). Equalities are already satisfied by the point
+/// get itself (the access path consumed the handle / unique key), so they keep
+/// the pinned row count.
+pub fn point_get_range_selectivity(conjuncts: &[ExprNode], handle: Option<&str>) -> Option<f64> {
+    let table_rows = 10_000.0;
+    let mut sel = 1.0;
+    let mut consumed = false;
+    for conjunct in conjuncts {
+        let Some((column, range)) = conjunct_column_range(conjunct) else {
+            continue;
+        };
+        let low = range.low.as_ref();
+        let high = range.high.as_ref();
+        if let (Some((low, _)), Some((high, _))) = (low, high)
+            && low.compare(high) == Ordering::Equal
+        {
+            continue;
+        }
+        let rows = if handle.is_some_and(|name| name.eq_ignore_ascii_case(&column)) {
+            handle_range_rows(table_rows, low, high)
+        } else {
+            column_range_rows(table_rows, low, high)
+        };
+        sel *= rows / table_rows;
+        consumed = true;
+    }
+    consumed.then_some(sel)
+}
+
 /// `IS NULL` / `NOT IS NULL` conjuncts carry no `ColumnRange`; the leading
 /// index column can still only consume comparisons, so they stay residual.
 pub fn is_null_predicate(expr: &ExprNode) -> bool {

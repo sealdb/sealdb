@@ -162,6 +162,19 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // TiDB rewrites `ifnull(not_null_col, const)` to a cast and
+                // folds `isnull(not_null_col)` before planning (`ifnull(nb, 0)`
+                // → `cast(nb, bigint BINARY)`).
+                let not_null_folded_select;
+                let select = match is.and_then(|is| {
+                    super::rule_not_null_fold::fold_not_null(select, is, current_db)
+                }) {
+                    Some(folded) => {
+                        not_null_folded_select = folded;
+                        &not_null_folded_select
+                    }
+                    None => select,
+                };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
                 // to `0` and plans a zero-row TableDual.
                 if let Some(ExprNode::Value(ValueExpr {
@@ -11967,9 +11980,23 @@ fn point_get_residual_est(
         Some((db, name)) => (db.to_string(), name.to_string()),
         None => (current_db.to_string(), table.clone()),
     };
+    let info = is?.table_by_name(&db, &table_name)?;
+    let handle_column = info
+        .pk_is_handle
+        .then(|| info.handle_column().map(|c| c.name.o().to_string()))
+        .flatten();
     let table_stats = stats
         .and_then(|handle| handle.table(&db, &table_name))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(|t| super::plan_cost::has_real_stats(t));
+    let Some(table_stats) = table_stats else {
+        // Unanalyzed table: TiDB still scales the point get's single row by the
+        // pseudo column ranges (`gt(c2, 1)` keeps 1/3 → 0.33).
+        let sel = sealdb_statistics::pseudo::point_get_range_selectivity(
+            &filter.split_cnf(),
+            handle_column.as_deref(),
+        )?;
+        return Some(super::explain::est_rows(child) * sel);
+    };
     // TiDB `Selectivity` short-circuits to 1.0 for an empty table.
     let realtime = table_stats.count as f64;
     if realtime <= 0.0 {
@@ -11978,9 +12005,12 @@ fn point_get_residual_est(
     // `coll.ColNum() == 0 && coll.IdxNum() == 0` → `pseudoSelectivity`; the
     // EXPLAIN pseudo heuristics already cover that path.
     if table_stats.columns.is_empty() && table_stats.indices.is_empty() {
-        return None;
+        let sel = sealdb_statistics::pseudo::point_get_range_selectivity(
+            &filter.split_cnf(),
+            handle_column.as_deref(),
+        )?;
+        return Some(super::explain::est_rows(child) * sel);
     }
-    let info = is?.table_by_name(&db, &table_name)?;
     let field_type = |column: &str| {
         info.columns
             .iter()

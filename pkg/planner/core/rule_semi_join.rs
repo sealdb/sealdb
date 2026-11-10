@@ -743,6 +743,11 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
         if let Some((on, inner_filter)) = split_semi_pred(selection, &inner.name) {
+            // TiDB's ExplainInfo renders a join key's `OrigTblName`, so a
+            // subquery alias (`from t t2`) still prints the base table
+            // (`equal:[eq(explain_easy.t.b, explain_easy.t.b)]`).
+            let physical = inner.physical.as_deref().unwrap_or(&inner.name);
+            let on = rewrite_relation_alias(&on, &inner.name, physical);
             return Some(build_spec(
                 if not { JoinType::Anti } else { JoinType::Semi },
                 inner.name.clone(),
@@ -1531,6 +1536,30 @@ fn qualify_table(expr: ExprNode, table: &str) -> ExprNode {
         ExprNode::Column(mut col) if col.table.is_none() => {
             col.table = Some(table.to_string());
             ExprNode::Column(col)
+        }
+        other => other,
+    }
+}
+
+/// Rename every column qualified with `alias` to `physical`: TiDB's
+/// ExplainInfo prints a join key's `OrigTblName`, not the query alias.
+fn rewrite_relation_alias(expr: &ExprNode, alias: &str, physical: &str) -> ExprNode {
+    if alias.eq_ignore_ascii_case(physical) {
+        return expr.clone();
+    }
+    match expr.clone() {
+        ExprNode::Column(mut col) if col.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(alias)) => {
+            col.table = Some(physical.to_string());
+            ExprNode::Column(col)
+        }
+        ExprNode::Binary(mut bin) => {
+            bin.left = Box::new(rewrite_relation_alias(&bin.left, alias, physical));
+            bin.right = Box::new(rewrite_relation_alias(&bin.right, alias, physical));
+            ExprNode::Binary(bin)
+        }
+        ExprNode::Unary(mut unary) => {
+            unary.expr = Box::new(rewrite_relation_alias(&unary.expr, alias, physical));
+            ExprNode::Unary(unary)
         }
         other => other,
     }

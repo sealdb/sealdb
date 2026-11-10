@@ -293,6 +293,22 @@ fn try_eval(expr: &ExprNode) -> Option<ExprNode> {
     eval_expr(expr).ok().map(value)
 }
 
+/// `true` when two constant equalities on the same column disagree
+/// (`a = 1 AND a = 2`), which no row can satisfy.
+fn has_conflicting_equalities(expr: &ExprNode) -> bool {
+    let equalities: Vec<(String, Datum)> = expr
+        .split_cnf()
+        .into_iter()
+        .filter_map(|conjunct| conjunct.eq_column_const())
+        .collect();
+    equalities.iter().enumerate().any(|(i, (column, value))| {
+        equalities[i + 1..].iter().any(|(other, other_value)| {
+            column.eq_ignore_ascii_case(other)
+                && value.compare(other_value) != std::cmp::Ordering::Equal
+        })
+    })
+}
+
 /// Fold a select statement's select list and filters. Returns `None` when the
 /// statement is unchanged.
 pub fn fold_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
@@ -330,6 +346,18 @@ pub fn fold_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
         None => None,
     };
     let selection = fold_filter(&select.selection, &mut changed);
+    // TiDB `PredicateSimplification`: conflicting constant equalities on one
+    // column (`a = 1 AND a = 2`) are unsatisfiable, so the WHERE folds to
+    // `0` and the plan is a zero-row `TableDual`.
+    let selection = match selection {
+        Some(expr) if has_conflicting_equalities(&expr) => {
+            changed = true;
+            Some(ExprNode::Value(ValueExpr {
+                datum: Datum::I64(0),
+            }))
+        }
+        other => other,
+    };
     let having = fold_filter(&select.having, &mut changed);
 
     if !changed {

@@ -4377,7 +4377,14 @@ fn column_eq_is_cross_table(filter: &sealdb_parser::ast::ExprNode) -> bool {
 fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
-    matches!(filter, ExprNode::Binary(bin) if bin.op == Op::Eq)
+    // TiDB's `pseudoEqualRate` (1/1000 → 10 rows) only applies when ranger can
+    // pin a bare column to a constant. An expression comparison such as
+    // `cast(col AS double) = 1` is an opaque filter and keeps the default
+    // selection factor (10000 → 8000).
+    match filter {
+        ExprNode::Binary(bin) if bin.op == Op::Eq => filter.eq_column_const().is_some(),
+        _ => false,
+    }
 }
 
 fn filter_has_like(filter: &sealdb_parser::ast::ExprNode) -> bool {
@@ -5353,7 +5360,8 @@ fn hash_join_explain_info(
         JoinType::Inner => "inner join",
         JoinType::Cross => "CARTESIAN inner join",
         JoinType::Semi => "semi join",
-        JoinType::Anti => "anti join",
+        // TiDB labels an anti semi join explicitly (`anti semi join`).
+        JoinType::Anti => "anti semi join",
     };
     // Pure CARTESIAN Cross with stub ON — no left-cond decoration.
     if matches!(tp, JoinType::Cross) && matches!(on, ExprNode::Value(_)) {

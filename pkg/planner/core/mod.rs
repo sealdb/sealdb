@@ -16,6 +16,7 @@ pub mod planbuilder;
 pub mod rule_constant_fold;
 pub mod rule_having_push_down;
 pub mod rule_inject_extra_projection;
+pub mod rule_not_null_fold;
 pub mod rule_join_reorder;
 pub mod rule_join_reorder_dp;
 pub mod rule_partition_processor;
