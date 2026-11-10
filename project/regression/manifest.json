@@ -14,9 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "in_progress": 27,
-      "green": 27,
+      "green": 37,
       "pending": 190,
+      "in_progress": 17,
       "deferred": 2,
       "local": 8
     },
@@ -776,7 +776,7 @@
     {
       "name": "executor/index_merge_reader",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/index_merge_reader.test",
       "result": "r/executor/index_merge_reader.result",
       "has_result": true,
