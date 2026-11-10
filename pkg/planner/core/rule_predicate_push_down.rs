@@ -97,6 +97,7 @@ fn push_into(
                     partition_names,
                     global_index: false,
                     lock: false,
+                    common_handle: false,
                 };
             }
             wrap_residual(
@@ -429,6 +430,7 @@ fn push_into(
             partition_names,
             global_index,
             lock,
+            common_handle,
         } => {
             // Only the equality on the handle column itself is consumed by a
             // handle point get (`a = 1 AND b = 1` keeps `b = 1` as a filter).
@@ -498,6 +500,7 @@ fn push_into(
                     partition_names,
                     global_index,
                     lock,
+                    common_handle,
                 },
                 residual,
             )
@@ -515,6 +518,7 @@ fn push_into(
             lock,
             keep_order,
             desc,
+            common_handle,
         } => {
             let key_columns = point_get_key_columns(
                 is,
@@ -557,6 +561,7 @@ fn push_into(
                     lock,
                     keep_order,
                     desc,
+                    common_handle,
                 },
                 residual,
             )

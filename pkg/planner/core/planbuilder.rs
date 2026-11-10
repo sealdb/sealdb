@@ -3899,6 +3899,7 @@ fn set_batch_point_order(plan: PhysicalPlan, desc: bool) -> PhysicalPlan {
             partition_names,
             global_index,
             lock,
+            common_handle,
             ..
         } => PhysicalPlan::BatchPointGet {
             table,
@@ -3913,6 +3914,7 @@ fn set_batch_point_order(plan: PhysicalPlan, desc: bool) -> PhysicalPlan {
             lock,
             keep_order: true,
             desc,
+            common_handle,
         },
         other => other,
     }
@@ -4033,6 +4035,18 @@ fn apply_order_limit(
         } = &plan
         && Some(*count) == limit
         && offset.unwrap_or(0) == 0
+    {
+        return plan;
+    }
+    // TiDB folds `LIMIT 0` into an empty plan (`TableDual rows:0`).
+    if limit == Some(0) && offset.unwrap_or(0) == 0 {
+        return PhysicalPlan::TableDual { row_count: 0 };
+    }
+    // A point get returns at most one row, so TiDB's point-get path drops a
+    // plain `LIMIT n` (n >= 1) instead of keeping a Limit node above it.
+    if offset.unwrap_or(0) == 0
+        && limit.is_some_and(|lim| lim >= 1)
+        && matches!(plan, PhysicalPlan::PointGet { .. })
     {
         return plan;
     }
@@ -6958,6 +6972,12 @@ fn index_visible(from: &TableName, index: &sealdb_meta::model::IndexInfo) -> boo
             .any(|hinted| hinted.eq_ignore_ascii_case(index.name.o()))
 }
 
+/// `clustered index:PRIMARY(..)` vs `index:PRIMARY(..)`: TiDB renders the
+/// clustered form only when the PRIMARY KEY is a common handle.
+fn point_index_is_common_handle(info: &sealdb_meta::TableInfo, index: &str) -> bool {
+    info.common_handle && index.eq_ignore_ascii_case("PRIMARY")
+}
+
 /// `a = 1 AND b = 2 …` fully constrains a multi-column unique key → PointGet.
 fn unique_index_eq_point(
     from: &TableName,
@@ -7019,6 +7039,7 @@ fn unique_index_eq_point(
         partition_names,
         global_index: index.global,
         lock: false,
+        common_handle: point_index_is_common_handle(info, index.name.o()),
     })
 }
 
@@ -7347,6 +7368,7 @@ fn tuples_point_plan(
             partition_names,
             global_index: index.global,
             lock: false,
+            common_handle: point_index_is_common_handle(info, index.name.o()),
         };
     }
     batch_point_plan(
@@ -7394,6 +7416,7 @@ fn batch_point_plan(
         lock: false,
         keep_order: false,
         desc: false,
+        common_handle: point_index_is_common_handle(info, index.name.o()),
     }
 }
 
@@ -7517,6 +7540,10 @@ fn point_or_batch(
             (None, Datum::I64(handle)) => Some(*handle),
             _ => None,
         };
+        let common_handle = match &index {
+            Some(name) => point_index_is_common_handle(info, name),
+            None => false,
+        };
         return PhysicalPlan::PointGet {
             table: from.name.clone(),
             handle,
@@ -7525,6 +7552,7 @@ fn point_or_batch(
             partition_names,
             global_index: index_global,
             lock: false,
+            common_handle,
         };
     }
     let mut handles: Vec<i64> = values
@@ -7537,6 +7565,10 @@ fn point_or_batch(
         .collect();
     handles.sort_unstable();
     handles.dedup();
+    let common_handle = match &index {
+        Some(name) => point_index_is_common_handle(info, name),
+        None => false,
+    };
     PhysicalPlan::BatchPointGet {
         table: from.name.clone(),
         column,
@@ -7550,6 +7582,7 @@ fn point_or_batch(
         lock: false,
         keep_order: false,
         desc: false,
+        common_handle,
     }
 }
 
@@ -11028,6 +11061,8 @@ fn lock_point_get(plan: Box<PhysicalPlan>) -> Option<PhysicalPlan> {
             partition_names,
             global_index: false,
             lock: true,
+            // The integer row handle is never an index access object.
+            common_handle: false,
         }),
         PhysicalPlan::BatchPointGet {
             table,
@@ -11041,6 +11076,7 @@ fn lock_point_get(plan: Box<PhysicalPlan>) -> Option<PhysicalPlan> {
             global_index,
             keep_order,
             desc,
+            common_handle,
             ..
         } => Some(PhysicalPlan::BatchPointGet {
             table,
@@ -11055,6 +11091,7 @@ fn lock_point_get(plan: Box<PhysicalPlan>) -> Option<PhysicalPlan> {
             lock: true,
             keep_order,
             desc,
+            common_handle,
         }),
         PhysicalPlan::Projection { exprs, child } => {
             let child = lock_point_get(child)?;
@@ -11089,6 +11126,7 @@ fn apply_lock(plan: PhysicalPlan, lock: SelectLock) -> PhysicalPlan {
             partition_names,
             global_index: false,
             lock: in_explicit_txn(),
+            common_handle: false,
         },
         PhysicalPlan::BatchPointGet {
             table,
@@ -11102,6 +11140,7 @@ fn apply_lock(plan: PhysicalPlan, lock: SelectLock) -> PhysicalPlan {
             global_index,
             keep_order,
             desc,
+            common_handle,
             ..
         } => PhysicalPlan::BatchPointGet {
             table,
@@ -11116,6 +11155,7 @@ fn apply_lock(plan: PhysicalPlan, lock: SelectLock) -> PhysicalPlan {
             lock: true,
             keep_order,
             desc,
+            common_handle,
         },
         other => PhysicalPlan::SelectLock {
             child: Box::new(other),
@@ -15897,6 +15937,7 @@ fn access_plan_inner(
                 ),
                 global_index: false,
                 lock: false,
+                common_handle: false,
             };
         }
         if let Some(plan) = unique_index_eq_point(from, info, &eqs, None) {
@@ -15982,6 +16023,7 @@ fn access_plan_inner(
                         ),
                         global_index: index.global,
                         lock: false,
+                        common_handle: index.primary && info.common_handle,
                     };
                 }
                 // unanalyzed tables keep the index path.

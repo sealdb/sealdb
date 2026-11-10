@@ -193,6 +193,11 @@ pub enum PhysicalPlan {
         /// `FOR UPDATE` handled by the point get itself (`handle:1, lock`).
         #[serde(default)]
         lock: bool,
+        /// The serving index is a common-handle PRIMARY KEY: EXPLAIN prints
+        /// `clustered index:PRIMARY(a, b)` instead of `index:PRIMARY(a, b)`
+        /// (TiDB `IndexInfo.Primary && TblInfo.IsCommonHandle`).
+        #[serde(default)]
+        common_handle: bool,
     },
     BatchPointGet {
         table: String,
@@ -225,6 +230,9 @@ pub enum PhysicalPlan {
         /// Key order is descending (`keep order:true, desc:true`).
         #[serde(default)]
         desc: bool,
+        /// See [`PhysicalPlan::PointGet::common_handle`].
+        #[serde(default)]
+        common_handle: bool,
     },
     /// Row lock above a scan (`SELECT … FOR UPDATE`).
     SelectLock {

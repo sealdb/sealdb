@@ -212,6 +212,10 @@ pub struct Suite {
     pub wave: String,
     pub owner_hint: String,
     pub skip_tikv: bool,
+    /// Statements replayed (silently) before the suite's first `t/*.test`
+    /// statement. Used to reproduce the session state TiDB's single-connection
+    /// mysql-tester run leaked into a golden (see project/parity-discipline.md).
+    pub session_init: Vec<String>,
     /// Set when `t/*.test` uses directives SealDB cannot parse yet.
     pub load_error: Option<String>,
 }
@@ -230,6 +234,10 @@ pub struct ManifestSuite {
     /// When true, suite is skipped on TiKV (e.g. SAVEPOINT until driver parity).
     #[serde(default)]
     pub skip_tikv: bool,
+    /// Session statements applied before the suite runs, for goldens recorded
+    /// under a session whose variables leaked from an earlier corpus file.
+    #[serde(default)]
+    pub session_init: Vec<String>,
 }
 pub fn testdata_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -572,12 +580,13 @@ fn collect_tests(
         }
         let rel = path.strip_prefix(t_root).unwrap().with_extension("result");
         let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
-        let (status, wave, owner_hint, skip_tikv) = if let Some(m) = manifest.get(&name) {
+        let (status, wave, owner_hint, skip_tikv, session_init) = if let Some(m) = manifest.get(&name) {
             (
                 m.status.clone(),
                 m.wave.clone(),
                 m.owner_hint.clone(),
                 m.skip_tikv,
+                m.session_init.clone(),
             )
         } else if name.starts_with("local/") {
             (
@@ -585,6 +594,7 @@ fn collect_tests(
                 "local".to_string(),
                 "sealdb smoke".to_string(),
                 name == "local/txn",
+                Vec::new(),
             )
         } else {
             (
@@ -592,6 +602,7 @@ fn collect_tests(
                 "R7".to_string(),
                 String::new(),
                 false,
+                Vec::new(),
             )
         };
         let src = fs::read_to_string(&path)
@@ -609,6 +620,7 @@ fn collect_tests(
             wave,
             owner_hint,
             skip_tikv,
+            session_init,
             load_error,
         });
     }
@@ -686,6 +698,18 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     let _ = session.execute_stmt(&format!("DROP DATABASE IF EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("CREATE DATABASE IF NOT EXISTS `{db}`"));
     let _ = session.execute_stmt(&format!("USE `{db}`"));
+    // Replay the recording session's leaked variables (manifest `session_init`):
+    // TiDB's mysql-tester shares one connection across corpus files, so some
+    // goldens encode a `SET` that lives in an earlier file. Not echoed, not
+    // compared against the golden.
+    for sql in &suite.session_init {
+        if std::env::var_os("SEALDB_ITEST_TRACE").is_some() {
+            eprintln!("[trace] session_init: {sql}");
+        }
+        session
+            .execute_stmt(sql)
+            .map_err(|e| Error::new(e.code, format!("session_init `{sql}`: {}", e.message)))?;
+    }
     // `connect (conn1, …)` opens an extra session; all sessions share the same
     // Domain, so `SET GLOBAL` values (and storage) stay visible across them.
     let domain = session.domain();

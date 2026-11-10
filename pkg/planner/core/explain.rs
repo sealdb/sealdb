@@ -3118,12 +3118,15 @@ fn point_get_index_access(
     index: &str,
     columns: &[String],
     partitions: &[String],
+    common_handle: bool,
 ) -> String {
     let (kind, index) = if columns.is_empty() {
         ("index", index.to_string())
     } else {
-        // A composite PRIMARY KEY is the clustered common handle in TiDB.
-        let kind = if index.eq_ignore_ascii_case("PRIMARY") && columns.len() > 1 {
+        // TiDB prints `clustered index:PRIMARY(..)` only when the serving
+        // PRIMARY KEY is a common handle (`TblInfo.IsCommonHandle`); an
+        // `INT_ONLY` session keeps it a secondary unique index.
+        let kind = if index.eq_ignore_ascii_case("PRIMARY") && common_handle {
             "clustered index"
         } else {
             "index"
@@ -4096,6 +4099,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             index_columns,
             partition_names,
             global_index,
+            common_handle,
             ..
         } => (
             "Point_Get".to_string(),
@@ -4104,6 +4108,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 index,
                 index_columns,
                 if *global_index { &[] } else { partition_names },
+                *common_handle,
             ),
             String::new(),
         ),
@@ -4121,6 +4126,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             lock,
             keep_order,
             desc,
+            common_handle,
             ..
         } => (
             "Batch_Point_Get".to_string(),
@@ -4129,6 +4135,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                 index,
                 index_columns,
                 if *global_index { &[] } else { partition_names },
+                *common_handle,
             ),
             format!("keep order:{keep_order}, desc:{desc}{}", lock_suffix(*lock)),
         ),

@@ -24,6 +24,7 @@ SealDB = Rust 复刻 **TiDB v8.5.8 计算层**。每个子功能交付时必须�
 | 完备对照 | 移植前对比 TiDB 同文件的调用链与测试覆盖；缺分支必须补齐或在 progress 记缺口与退出条件 |
 | 禁止 | 改权威 `r/*.result`；另起平行实现“凑绿”；无 suite 证据把 parity 标 `ported` |
 | 暂缓 | TiFlash / MPP / TiSpark → manifest `deferred`（不丢弃） |
+| 录制环境 | TiDB 的 mysql-tester **所有 case 共用一条连接**，某些 `SET` 会泄漏到后续文件并写进金样。此类套件在 manifest 用 `session_init`（`SET` 列表）声明泄漏变量，runner 在套件首条语句前静默执行；不得改 `t/*.test` 或金样。 |
 
 `parity_check.py` / 包级 `core-ported` **只做覆盖雷达**，不能替代 suite green。
 

@@ -1151,6 +1151,9 @@
       "result": "r/explain_easy_stats.result",
       "has_result": true,
       "skip_tikv": false,
+      "session_init": [
+        "set @@session.tidb_enable_clustered_index = 'int_only'"
+      ],
       "owner_hint": "planner/core,distsql,store/copr"
     },
     {
