@@ -1168,25 +1168,29 @@ impl PlanBuilder {
         prune_mode: PartitionPruneMode,
     ) -> Result<Option<Box<PhysicalPlan>>> {
         if let Some(set) = insert.select_set.as_deref() {
-            let plan = self.build_with_schema(
-                &Statement::SetOpr(set.clone()),
-                is,
-                current_db,
-                stats,
-                prune_mode,
-            )?;
+            let plan = with_dml_source(|| {
+                self.build_with_schema(
+                    &Statement::SetOpr(set.clone()),
+                    is,
+                    current_db,
+                    stats,
+                    prune_mode,
+                )
+            })?;
             return Ok(Some(Box::new(plan)));
         }
         let Some(select) = insert.select.as_deref() else {
             return Ok(None);
         };
-        let plan = self.build_with_schema(
-            &Statement::Select(select.clone()),
-            is,
-            current_db,
-            stats,
-            prune_mode,
-        )?;
+        let plan = with_dml_source(|| {
+            self.build_with_schema(
+                &Statement::Select(select.clone()),
+                is,
+                current_db,
+                stats,
+                prune_mode,
+            )
+        })?;
         Ok(Some(Box::new(plan)))
     }
 
@@ -4644,6 +4648,9 @@ thread_local! {
     /// Whether the current statement runs inside an explicit transaction, where
     /// `SELECT … FOR UPDATE` point gets report `lock` in EXPLAIN.
     static EXPLICIT_TXN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the plan build in progress plans the source SELECT of an
+    /// `INSERT`/`REPLACE` (TiDB allocates the insert target columns first).
+    static DML_SOURCE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Table ids the current transaction has written (TiDB dirty `MemBuffer`):
     /// their reads become `UnionScan` over snapshot ∪ pending writes.
     static DIRTY_TABLES: std::cell::RefCell<Vec<i64>> =
@@ -4718,6 +4725,25 @@ pub fn with_explicit_txn<T>(explicit: bool, f: impl FnOnce() -> T) -> T {
 
 fn in_explicit_txn() -> bool {
     EXPLICIT_TXN.with(|c| c.get())
+}
+
+/// Run `f` as the source SELECT of an `INSERT`/`REPLACE` statement.
+fn with_dml_source<T>(f: impl FnOnce() -> T) -> T {
+    DML_SOURCE_DEPTH.with(|d| d.set(d.get() + 1));
+    let out = f();
+    DML_SOURCE_DEPTH.with(|d| d.set(d.get() - 1));
+    out
+}
+
+fn in_dml_source() -> bool {
+    DML_SOURCE_DEPTH.with(|d| d.get() > 0)
+}
+
+/// Is the select being planned the statement's outermost one? The table-scope
+/// stack gets one entry per planned select, plus one for the `EXPLAIN` wrapper,
+/// so at most two entries means top level.
+fn select_is_top_level() -> bool {
+    TABLE_DB_MAP.with(|stack| stack.borrow().len() <= 2)
 }
 
 /// Run `f` as part of an `EXPLAIN` plan build (`DESC`/`EXPLAIN` shape builders
@@ -5413,7 +5439,15 @@ fn wrap_output_projection(
         .fields
         .iter()
         .any(|f| !matches!(&f.expr, ExprNode::Column(_)));
-    let col_base = projection_column_base(&plan);
+    // TiDB numbers the source SELECT of an INSERT/REPLACE after the insert
+    // target schema, and a nested select (derived table, subquery, CTE body or
+    // an inlined view body) after every column the enclosing statements already
+    // allocated — both keep the legacy base.
+    let col_base = if in_dml_source() || !select_is_top_level() {
+        projection_column_base(&plan, None)
+    } else {
+        projection_column_base(&plan, from_table_info(select, is, current_db))
+    };
     let mut next_col = col_base;
     let exprs = select
         .fields
@@ -6254,19 +6288,46 @@ fn seed_is_union_of_dual(plan: &PhysicalPlan) -> bool {
     }
 }
 
-fn projection_column_base(plan: &PhysicalPlan) -> usize {
+fn projection_column_base(
+    plan: &PhysicalPlan,
+    table: Option<&sealdb_meta::model::table::TableInfo>,
+) -> usize {
     match plan {
         PhysicalPlan::CTE {
             seed, inline: true, ..
-        } => projection_column_base(seed),
+        } => projection_column_base(seed, table),
         PhysicalPlan::Projection { exprs, .. } => exprs.len() + 1,
         PhysicalPlan::TableDual { .. } => 1,
-        // TiDB unique-id base after a 1-col table + view/derived intermediates.
+        // TiDB allocates one plan column id per DataSource schema column (hidden
+        // columns included) plus `_tidb_rowid` when the handle is not a
+        // clustered index; the first derived expression column follows.
         PhysicalPlan::TableReader { .. }
         | PhysicalPlan::Selection { .. }
-        | PhysicalPlan::IndexReader { .. } => 6,
+        | PhysicalPlan::IndexReader { .. } => table.map(table_column_base).unwrap_or(6),
         _ => 1,
     }
+}
+
+/// TiDB plan column-id base after a fresh single-table `DataSource`.
+fn table_column_base(info: &sealdb_meta::model::table::TableInfo) -> usize {
+    let rowid = usize::from(!info.pk_is_handle && !info.common_handle);
+    info.columns.len() + rowid + 1
+}
+
+/// Metadata of the single base table in `FROM`, when there is exactly one.
+/// Views are excluded: TiDB numbers their inlined SELECT after the statements
+/// that reference them.
+fn from_table_info<'a>(
+    select: &SelectStmt,
+    is: Option<&'a InfoSchema>,
+    current_db: &str,
+) -> Option<&'a sealdb_meta::model::table::TableInfo> {
+    if !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    is?.table_by_name(&db, &table).filter(|info| info.view.is_none())
 }
 
 /// `BIT(n)` storage width in bytes.
