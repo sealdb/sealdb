@@ -89,7 +89,8 @@ impl FieldType {
         let base = match self.tp {
             TYPE_TINY => "tinyint",
             TYPE_SHORT => "smallint",
-            TYPE_LONG | TYPE_INT24 => "int",
+            TYPE_LONG => "int",
+            TYPE_INT24 => "mediumint",
             TYPE_LONG_LONG => "bigint",
             TYPE_FLOAT => "float",
             TYPE_DOUBLE => "double",

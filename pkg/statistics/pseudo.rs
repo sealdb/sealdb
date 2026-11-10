@@ -110,6 +110,11 @@ pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     if let Some(sets) = dnf_eq_bound_sets(expr) {
         return Some(sets);
     }
+    // `a IN (1, 2)` is a DNF of equalities: TiDB ranger expands it into one
+    // point range per value, so two IN lists on the same column intersect.
+    if let Some(sets) = in_list_bound_sets(expr) {
+        return Some(sets);
+    }
     if let Some((column, value)) = expr.eq_key_const() {
         let point = (Some((value.clone(), true)), Some((value, true)));
         return Some((column, vec![point]));
@@ -159,6 +164,33 @@ fn dnf_eq_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
         ranges.push((Some((value.clone(), true)), Some((value, true))));
     }
     Some((column?, ranges))
+}
+
+/// `a IN (1, 2, …)` over one bare column with literal values: TiDB's ranger
+/// detaches it into one point range per value (`["1","1"], ["2","2"]`), which
+/// lets a second IN list on the same column intersect down to a subrange.
+/// `NOT IN` and non-literal lists stay opaque expression filters.
+fn in_list_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    let ExprNode::InList(in_list) = expr else {
+        return None;
+    };
+    if in_list.not || in_list.list.is_empty() {
+        return None;
+    }
+    let ExprNode::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    let mut ranges = Vec::with_capacity(in_list.list.len());
+    for item in &in_list.list {
+        let ExprNode::Value(value) = item else {
+            return None;
+        };
+        ranges.push((
+            Some((value.datum.clone(), true)),
+            Some((value.datum.clone(), true)),
+        ));
+    }
+    Some((column.name.clone(), ranges))
 }
 
 /// Intersect two range sets over the same column (empty ranges drop out).
@@ -318,27 +350,31 @@ fn tighter_high(current: Option<(Datum, bool)>, other: Option<(Datum, bool)>) ->
 }
 
 /// TiDB `selectivity` over a CNF list with pseudo stats: each column's merged
-/// range keeps `range_rows / table_rows`, unrecognized predicates `0.8`.
+/// range set keeps `range_rows / table_rows`, unrecognized predicates `0.8`.
+/// Conjuncts that describe the same column intersect (TiDB `MergeDNF`), so
+/// `a IN (1,2) AND a IN (1,3)` estimates as the single remaining point range.
 pub fn filter_rows(conjuncts: &[ExprNode], table_rows: f64) -> f64 {
-    let mut per_column: Vec<(String, Bounds)> = Vec::new();
+    let mut per_column: Vec<(String, Vec<Bounds>)> = Vec::new();
     let mut total = 1.0f64;
     for conjunct in conjuncts {
-        let Some((column, range)) = conjunct_column_range(conjunct) else {
+        let Some((column, ranges)) = conjunct_bound_sets(conjunct) else {
             total *= SELECTION_FACTOR;
             continue;
         };
-        let bounds = (range.low.clone(), range.high.clone());
         match per_column
             .iter_mut()
             .find(|(name, _)| name.eq_ignore_ascii_case(&column))
         {
-            Some((_, current)) => merge_bounds(current, &bounds),
-            None => per_column.push((column, bounds)),
+            Some((_, current)) => intersect_sets(current, &ranges),
+            None => per_column.push((column, ranges)),
         }
     }
-    for (_, bounds) in &per_column {
-        let rows = column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref());
-        total *= rows / table_rows;
+    for (_, ranges) in &per_column {
+        let rows: f64 = ranges
+            .iter()
+            .map(|bounds| column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref()))
+            .sum();
+        total *= rows.min(table_rows) / table_rows;
     }
     (table_rows * total).clamp(0.0, table_rows)
 }
@@ -355,15 +391,15 @@ pub fn selectivity(conjuncts: &[ExprNode], table_rows: f64, handle: Option<&str>
     if table_rows <= 0.0 {
         return Some(1.0);
     }
-    let mut per_column: Vec<(String, Bounds)> = Vec::new();
+    let mut per_column: Vec<(String, Vec<Bounds>)> = Vec::new();
     let mut dnf: Vec<ExprNode> = Vec::new();
     let mut total = 1.0f64;
     for conjunct in conjuncts {
         let (column, bounds) = if let Some(column) = not_isnull_column(conjunct) {
             // `not(isnull(col))` seeks `(MinNotNull, MaxValue)` on the column.
-            (column, (None, None))
-        } else if let Some((column, range)) = conjunct_column_range(conjunct) {
-            (column, (range.low.clone(), range.high.clone()))
+            (column, vec![(None, None)])
+        } else if let Some((column, ranges)) = conjunct_bound_sets(conjunct) {
+            (column, ranges)
         } else if matches!(conjunct, ExprNode::Binary(bin) if bin.op == Op::LogicOr) {
             dnf.push(conjunct.clone());
             continue;
@@ -375,17 +411,23 @@ pub fn selectivity(conjuncts: &[ExprNode], table_rows: f64, handle: Option<&str>
             .iter_mut()
             .find(|(name, _)| name.eq_ignore_ascii_case(&column))
         {
-            Some((_, current)) => merge_bounds(current, &bounds),
+            Some((_, current)) => intersect_sets(current, &bounds),
             None => per_column.push((column, bounds)),
         }
     }
-    for (column, bounds) in &per_column {
-        let rows = if handle.is_some_and(|name| name.eq_ignore_ascii_case(column)) {
-            handle_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
-        } else {
-            column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
-        };
-        total *= rows / table_rows;
+    for (column, ranges) in &per_column {
+        let is_handle = handle.is_some_and(|name| name.eq_ignore_ascii_case(column));
+        let rows: f64 = ranges
+            .iter()
+            .map(|bounds| {
+                if is_handle {
+                    handle_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
+                } else {
+                    column_range_rows(table_rows, bounds.0.as_ref(), bounds.1.as_ref())
+                }
+            })
+            .sum();
+        total *= rows.min(table_rows) / table_rows;
     }
     for cond in &dnf {
         let items = cond.split_dnf();

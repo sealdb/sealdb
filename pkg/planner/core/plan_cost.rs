@@ -57,6 +57,25 @@ pub fn table_scan_cost(rows: f64) -> f64 {
     rows * SCAN_FACTOR
 }
 
+/// TiDB `cardinality.GetAvgRowSize` under pseudo statistics: every column is
+/// charged `pseudoColSize` (8) bytes plus one flag byte, so a row of `n`
+/// columns is `9n` bytes. `RecordRowKeyLen` (19) is the table-prefix +
+/// table-id + row-id + record-prefix key overhead; TiKV scans subtract the
+/// 8-byte row id (it is the key, not the row body).
+pub fn table_avg_row_size(column_count: usize) -> f64 {
+    9.0 * column_count as f64 + RECORD_ROW_KEY_LEN - 8.0
+}
+
+/// TiDB `cardinality.GetIndexAvgRowSize`: the index key body plus the same
+/// table/index prefix overhead, and one more byte for the `_` suffix that a
+/// non-unique index key carries.
+pub fn index_avg_row_size(scan_column_count: usize, unique: bool) -> f64 {
+    9.0 * scan_column_count as f64 + RECORD_ROW_KEY_LEN + if unique { 0.0 } else { 1.0 }
+}
+
+/// TiDB `tablecodec.RecordRowKeyLen`.
+const RECORD_ROW_KEY_LEN: f64 = 19.0;
+
 /// TiDB `PhysicalIndexLookUpReader` price, in table-scan-row units.
 ///
 /// Every index row costs one table probe, and that probe is a random seek plus

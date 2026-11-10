@@ -4497,6 +4497,20 @@ fn pseudo_ranges_of_predicate(
             let high = expr_to_i128_const(&b.high)?;
             Some((key, vec![(PRangeLow::Val(low), PRangeHigh::Val(high))]))
         }
+        ExprNode::InList(in_list) if !in_list.not => {
+            // `a IN (1, 2)` is a DNF of point ranges, so two IN lists on the
+            // same column intersect (`in (1,2) AND in (1,3)` → `[1,1]`).
+            let key = col_key(&in_list.expr)?;
+            if in_list.list.is_empty() {
+                return None;
+            }
+            let mut ranges = Vec::with_capacity(in_list.list.len());
+            for item in &in_list.list {
+                let value = expr_to_i128_const(item)?;
+                ranges.push((PRangeLow::Val(value), PRangeHigh::Val(value)));
+            }
+            Some((key, ranges))
+        }
         ExprNode::Binary(bin) => {
             let (col, val, op, flipped) = match (bin.left.as_ref(), bin.right.as_ref()) {
                 (ExprNode::Column(_), right) => {

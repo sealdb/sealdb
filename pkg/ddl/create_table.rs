@@ -10,7 +10,7 @@ use sealdb_types::Datum;
 use std::collections::HashMap;
 use sealdb_types::field_type::{
     FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
-    TYPE_ENUM, TYPE_FLOAT, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG, TYPE_MEDIUM_BLOB,
+    TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG, TYPE_MEDIUM_BLOB,
     TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
     TYPE_VAR_STRING, TYPE_YEAR,
 };
@@ -425,7 +425,12 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: 6,
             ..numeric_ft()
         },
-        "INT" | "INTEGER" | "MEDIUMINT" => FieldType {
+        "MEDIUMINT" => FieldType {
+            tp: TYPE_INT24,
+            flen: 9,
+            ..numeric_ft()
+        },
+        "INT" | "INTEGER" => FieldType {
             tp: TYPE_LONG,
             flen: 11,
             ..numeric_ft()

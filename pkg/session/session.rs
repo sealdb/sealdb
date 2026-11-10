@@ -62,6 +62,10 @@ pub struct Session {
     autocommit: Mutex<bool>,
     /// TiDB `tidb_cost_model_version` (default 2 in 8.x; 1 is the legacy model).
     cost_model_version: Mutex<i32>,
+    /// TiDB `tidb_hashagg_partial_concurrency` (default 5).
+    hashagg_partial_concurrency: Mutex<u64>,
+    /// TiDB `tidb_hashagg_final_concurrency` (default 5).
+    hashagg_final_concurrency: Mutex<u64>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
 }
@@ -111,6 +115,8 @@ impl Session {
             window_concurrency: Mutex::new(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY),
             autocommit: Mutex::new(true),
             cost_model_version: Mutex::new(2),
+            hashagg_partial_concurrency: Mutex::new(5),
+            hashagg_final_concurrency: Mutex::new(5),
             last_warnings: Mutex::new(Vec::new()),
         }
     }
@@ -743,6 +749,14 @@ impl Session {
             .cost_model_version
             .lock()
             .expect("session cost model version lock");
+        let hashagg_partial_concurrency = *self
+            .hashagg_partial_concurrency
+            .lock()
+            .expect("session hashagg partial concurrency lock");
+        let hashagg_final_concurrency = *self
+            .hashagg_final_concurrency
+            .lock()
+            .expect("session hashagg final concurrency lock");
         // Cost model version changes the chosen access path; keep it in the
         // Domain-shared plan-cache key so sessions cannot cross-read plans.
         let cache_key = if cost_model_version == 2 {
@@ -752,6 +766,10 @@ impl Session {
         };
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
             sealdb_planner::with_cost_model_version(cost_model_version, || {
+            sealdb_planner::with_hashagg_concurrency(
+                hashagg_partial_concurrency,
+                hashagg_final_concurrency,
+                || {
             sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
             sealdb_planner::with_explicit_txn(explicit_txn, || {
             sealdb_planner::with_dirty_tables(dirty_tables, || {
@@ -783,6 +801,7 @@ impl Session {
                     prune_mode,
                 )
             }
+            })
             })
             })
             })
@@ -2705,6 +2724,34 @@ fn apply_set(
                     .lock()
                     .expect("session cost model version lock") = version;
             }
+            // TiDB hash-aggregate concurrency: the cost model amortises a root
+            // `HashAgg`'s CPU cost by `min(partial, final)`; both 1 makes a
+            // `StreamAgg` strictly cheaper.
+            "tidb_hashagg_partial_concurrency" | "tidb_hashagg_final_concurrency" => {
+                let n: u64 = value.parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!("Variable '{name}' can't be set to the value of '{value}'"),
+                    )
+                })?;
+                if n == 0 {
+                    return Err(sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!("Variable '{name}' can't be set to the value of '{value}'"),
+                    ));
+                }
+                if name == "tidb_hashagg_partial_concurrency" {
+                    *session
+                        .hashagg_partial_concurrency
+                        .lock()
+                        .expect("session hashagg partial concurrency lock") = n;
+                } else {
+                    *session
+                        .hashagg_final_concurrency
+                        .lock()
+                        .expect("session hashagg final concurrency lock") = n;
+                }
+            }
             "autocommit" => {                let on = if value.eq_ignore_ascii_case("DEFAULT") {
                     true
                 } else {
@@ -3062,6 +3109,16 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .cost_model_version
             .lock()
             .expect("session cost model version lock")
+            .to_string(),
+        "tidb_hashagg_partial_concurrency" => session
+            .hashagg_partial_concurrency
+            .lock()
+            .expect("session hashagg partial concurrency lock")
+            .to_string(),
+        "tidb_hashagg_final_concurrency" => session
+            .hashagg_final_concurrency
+            .lock()
+            .expect("session hashagg final concurrency lock")
             .to_string(),
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "tidb_window_concurrency" => session

@@ -358,13 +358,15 @@ impl PlanBuilder {
                     // `ORDER BY` the row handle reads the table in handle order:
                     // TiDB drops the Sort and marks the scan `keep order:true`.
                     // A backwards handle order with `LIMIT` becomes a cop Limit.
-                    let handle_order_desc = matches!(
+                    // A multi-partition read returns rows partition by partition,
+                    // so its output is not globally handle-ordered.
+                    let handle_order_desc = (matches!(
                         plan,
                         PhysicalPlan::TableReader {
                             range_scan: None,
                             ..
                         }
-                    )
+                    ) && !select_spans_multiple_partitions(select, is, current_db))
                     .then(|| order_by_handle(select, is, current_db))
                     .flatten();
                     let handle_order = handle_order_desc
@@ -4648,6 +4650,25 @@ thread_local! {
     /// TiDB `tidb_cost_model_version`: 1 keeps the legacy double-read charge for
     /// an `IndexLookUp`, 2 (the 8.x default) prices the probe as one scan.
     static COST_MODEL_VERSION: std::cell::Cell<i32> = const { std::cell::Cell::new(2) };
+    /// `(partial, final)` of TiDB `tidb_hashagg_{partial,final}_concurrency`.
+    /// The cost model amortises a root `HashAgg`'s CPU cost by
+    /// `min(partial, final)`; when both are 1 the divisor is 0 and the hash
+    /// aggregate prices exactly like a `StreamAgg` plus its memory cost.
+    static HASHAGG_CONCURRENCY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((5, 5)) };
+}
+
+/// Run `f` with the session's hash-aggregate concurrency visible to cost models.
+pub fn with_hashagg_concurrency<T>(partial: u64, fin: u64, f: impl FnOnce() -> T) -> T {
+    let prev = HASHAGG_CONCURRENCY.with(|c| c.replace((partial, fin)));
+    let out = f();
+    HASHAGG_CONCURRENCY.with(|c| c.set(prev));
+    out
+}
+
+/// Whether TiDB amortises a root `HashAgg`'s CPU cost over goroutines
+/// (`PhysicalHashAgg.cpuCostDivisor` returns 0 with partial=final=1).
+pub fn hashagg_cpu_amortized() -> bool {
+    HASHAGG_CONCURRENCY.with(|c| c.get()) != (1, 1)
 }
 
 /// Run `f` with the session's `tidb_cost_model_version` visible to cost models.
@@ -10007,6 +10028,68 @@ fn join_datasource_out_column(
     Some(total + 1)
 }
 
+/// TiDB `AggFuncDesc.WrapCastForAggArgs`: a `sum`/`avg` over an integer column
+/// aggregates `cast(arg, decimal(p, 0))` so a partial aggregation cannot
+/// overflow. Returns the cast target type and whether the argument is unsigned.
+fn agg_int_decimal_cast(
+    fn_name: &str,
+    arg_expr: Option<&sealdb_parser::ast::expressions::ExprNode>,
+    select: &SelectStmt,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+) -> Option<(String, bool)> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    if !matches!(fn_name, "sum" | "avg") {
+        return None;
+    }
+    let ExprNode::Column(col) = arg_expr? else {
+        return None;
+    };
+    let is = is?;
+    let qualifier = col.table.as_deref().unwrap_or("");
+    let mut tables: Vec<&sealdb_parser::ast::ddl::TableName> = Vec::new();
+    if let Some(from) = &select.from {
+        tables.push(from);
+    }
+    for join in &select.joins {
+        tables.push(&join.left);
+        tables.push(&join.right);
+    }
+    let mut found: Vec<&sealdb_meta::ColumnInfo> = Vec::new();
+    for table in tables {
+        let name_matches = qualifier.is_empty()
+            || table.name.eq_ignore_ascii_case(qualifier)
+            || table.resolve_name().eq_ignore_ascii_case(qualifier);
+        if !name_matches {
+            continue;
+        }
+        let (db, name) = table.qualified(current_db);
+        let Some(info) = is.table_by_name(&db, &name) else {
+            continue;
+        };
+        if let Some(column) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        {
+            found.push(column);
+        }
+    }
+    // The AST often drops the column's table qualifier; aliases of the same
+    // physical table resolve to identical types, so the first match is enough.
+    let column = *found.first()?;
+    let flen = match column.field_type.tp {
+        sealdb_types::TYPE_TINY => 3,
+        sealdb_types::TYPE_SHORT => 5,
+        sealdb_types::TYPE_INT24 => 8,
+        sealdb_types::TYPE_LONG => 10,
+        sealdb_types::TYPE_LONG_LONG => 20,
+        sealdb_types::TYPE_YEAR => 4,
+        _ => return None,
+    };
+    Some((format!("decimal({flen},0)"), column.field_type.unsigned))
+}
+
 /// TiDB cost model v2 picks the physical aggregate for a scalar aggregation by
 /// cost: a 2-phase `HashAgg` amortises the cop partial aggregation over
 /// `tidb_executor_concurrency` while `StreamAgg` pays the full per-row CPU, so
@@ -10014,6 +10097,13 @@ fn join_datasource_out_column(
 /// pseudo (unanalyzed) statistics TiDB keeps the streaming aggregate.
 fn scalar_agg_prefers_hash(plan: &PhysicalPlan) -> bool {
     const HASH_AGG_CROSSOVER_ROWS: f64 = 234.0;
+    // Cost model v1 has no hash-aggregate CPU amortisation to pay for: a root
+    // `HashAgg` divides its CPU cost by `min(partial, final)` concurrency
+    // (`PhysicalHashAgg.cpuCostDivisor`), so it only costs more than a
+    // `StreamAgg` when `tidb_hashagg_{partial,final}_concurrency` are both 1.
+    if cost_model_version() <= 1 {
+        return hashagg_cpu_amortized();
+    }
     match agg_input_cardinality(plan) {
         Some((rows, false)) => rows > HASH_AGG_CROSSOVER_ROWS,
         _ => false,
@@ -10265,8 +10355,40 @@ fn build_agg_plan(
                 | PhysicalPlan::Apply { .. }
         ) {
             let out_col = join_datasource_out_column(select, current_db, is).unwrap_or(out_col);
+            // TiDB `AggFuncDesc.WrapCastForAggArgs`: `sum`/`avg` over an integer
+            // argument aggregate `cast(arg, decimal(p, 0))`, so the projection
+            // below the aggregate carries the cast and the aggregate consumes
+            // that column.
+            if let Some((cast_type, unsigned)) =
+                agg_int_decimal_cast(&fn_name, arg_expr, select, current_db, is)
+            {
+                let cast_col = out_col + 1;
+                let unsigned_txt = if unsigned { " UNSIGNED" } else { "" };
+                let proj = PhysicalPlan::Projection {
+                    exprs: vec![format!(
+                        "cast({arg}, {cast_type}{unsigned_txt} BINARY)->Column#{cast_col}"
+                    )],
+                    child: Box::new(plan),
+                };
+                let info = format!("funcs:{fn_name}(Column#{cast_col})->Column#{out_col}");
+                return (
+                    if hashagg_cpu_amortized() {
+                        PhysicalPlan::hash_agg(proj, info, est)
+                    } else {
+                        PhysicalPlan::stream_agg(proj, info, String::new(), est)
+                    },
+                    false,
+                );
+            }
             let info = format!("funcs:{fn_name}({arg})->Column#{out_col}");
-            return (PhysicalPlan::hash_agg(plan, info, est), false);
+            return (
+                if hashagg_cpu_amortized() {
+                    PhysicalPlan::hash_agg(plan, info, est)
+                } else {
+                    PhysicalPlan::stream_agg(plan, info, String::new(), est)
+                },
+                false,
+            );
         }
         // Cop partial agg column. The 2-phase HashAgg allocates one id right
         // after the aggregate output; StreamAgg reserves its partial state over
@@ -14843,6 +14965,47 @@ fn index_covers_needed(
         && info.index_covers(index, join_keys)
 }
 
+/// TiDB `find_best_task` price comparison between a covering `IndexReader` and
+/// a `TableReader` full scan.
+///
+/// Both plans read the same number of rows, so the cheaper one is decided by
+/// the average row size each charges (`cardinality.GetIndexAvgRowSize` versus
+/// `cardinality.GetTableAvgRowSize`, TiKV store):
+///
+/// * the table scan is charged for **every** table column (`ts.tblCols`) —
+///   column pruning does not shrink it;
+/// * the index scan is charged for its own scan columns, which are the needed
+///   columns plus the row handle — the handle is counted twice when the pruned
+///   project list *is* the index column list, and is added unconditionally when
+///   the project list does not line up with the index.
+///
+/// A tie keeps the table scan (TiDB only replaces the cheapest task when the
+/// candidate is strictly cheaper).
+fn covering_index_beats_scan(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    needed: &[String],
+) -> bool {
+    let handle = info
+        .pk_is_handle
+        .then(|| info.handle_column().map(|c| c.name.o().to_string()))
+        .flatten();
+    let handle_needed = handle
+        .as_deref()
+        .is_some_and(|name| needed.iter().any(|col| col.eq_ignore_ascii_case(name)));
+    let mut scan_columns = needed.len();
+    if needed.len() == index.columns.len() {
+        if handle_needed {
+            scan_columns += 1;
+        }
+    } else {
+        scan_columns += 1;
+    }
+    let index_size = super::plan_cost::index_avg_row_size(scan_columns, index.unique);
+    let table_size = super::plan_cost::table_avg_row_size(info.columns.len());
+    index_size < table_size
+}
+
 /// TiDB constant propagation over an inner-join equality key: `t1.a = '4'` plus
 /// `t1.a = t2.a` implies `t2.a = '4'`, which lets both sides use a point get on
 /// the key column. Returns the predicates to add to each side.
@@ -15844,15 +16007,23 @@ fn access_plan_inner(
             return plan;
         }
         // Plain column projection fully covered by a secondary index →
-        // IndexReader (TiDB prefers the covering index over a table full scan).
-        if is_plain_projection(select)
-            && let Some(index) = info
+        // IndexReader when TiDB's row-size cost model prefers it. A covering
+        // index only pays off once it is narrower than the row it replaces:
+        // both sides read the same rows, so the plan costs differ only in the
+        // average row size TiDB charges them.
+        if is_plain_projection(select) {
+            let needed = select_needed_columns(select, Some(&from.name));
+            if let Some(index) = info
                 .indices
                 .iter()
                 .filter(|idx| !idx.primary && !index_ignored(from, idx.name.o()))
-                .find(|idx| index_covers_needed(idx, select, &join_keys, info, from))
-        {
-            return index_plan(select, from, info, index, prune_mode, &join_keys);
+                .find(|idx| {
+                    index_covers_needed(idx, select, &join_keys, info, from)
+                        && covering_index_beats_scan(info, idx, &needed)
+                })
+            {
+                return index_plan(select, from, info, index, prune_mode, &join_keys);
+            }
         }
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode, stats, current_db) {

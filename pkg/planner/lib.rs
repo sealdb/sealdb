@@ -13,4 +13,5 @@ pub use core::{
     normalize_enum_constants, normalize_comparison_literals,
     with_dirty_tables, with_explicit_txn, normalize_prep_cache_key, stmt_has_natural_join,
     with_foreign_key_checks, with_cost_model_version, cost_model_version,
+    with_hashagg_concurrency, hashagg_cpu_amortized,
 };

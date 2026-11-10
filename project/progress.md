@@ -1777,6 +1777,22 @@
 - **下一步**:
   - F02 `CREATE/DROP TABLE` 写兼容 meta key
 
+### 2026-11-08（`explain_easy` 波：覆盖索引行宽成本）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - Planner（行宽模型）：新增 `plan_cost::table_avg_row_size` / `index_avg_row_size`，一比一对应 TiDB `cardinality.GetTableAvgRowSize` / `GetIndexAvgRowSize`（伪统计下每列 8 字节 + 1 标志字节，表扫描 `+RecordRowKeyLen(19) - 8` 行 id，非唯一索引 `+1` 的 `_` 后缀）
+  - Planner（覆盖索引判定）：`covering_index_beats_scan` 只在覆盖索引的平均行宽**严格小于**全表扫描时选 `IndexReader`；表扫描按**全表所有列**计宽（`ts.tblCols`，裁剪不缩表），索引侧按“投影列 + 句柄”，投影列恰好等于索引列时句柄重复计一次，否则无条件补句柄。以本机 TiDB 8.5 oracle 校准 30+ 组合（2–6 列表、单列/复合索引、唯一索引、`varchar` 宽列）后逐条吻合
+  - Planner（分区 + `ORDER BY` 句柄）：多分区读取按分区拼接，不保证全局句柄序，`handle_order` 与 `index_order` 一样排除多分区计划，避免误删 `Sort`
+- **验证**:
+  - `explain_easy`：首个 diff 从第 1 段推进到第 66 行（`ifnull(null,c1)` / `if(10,c1,c2)` 两段已对齐）
+  - `run-tests.sh -s memory --status green` → PASS
+  - `run-tests.sh -s tikv --status green` → `PASS: tikv=36`
+- **阻塞/风险**:
+  - 无列 `TotColSize`（真实统计下 TiDB 用 `TotColSize/count`），当前统一按伪统计 9 字节/列估算；仅影响真实统计下的边界选择
+- **下一步**:
+  - 按 hunk 顺序继续 `explain_easy`：join 估行（`a.c1 = b.c2` → `9990`）、聚合下推 join/union、`IN` 子查询转 join、`LIMIT` 期望行数缩放、相关标量子查询去关联、`EXPLAIN FORMAT='dot'`
+
 ### 2026-11-08（表达式索引 + `tidb_shard` 波）
 
 - **Phase**: R3 explain 波（表达式索引解锁）
