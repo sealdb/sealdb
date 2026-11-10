@@ -743,11 +743,11 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
         if let Some((on, inner_filter)) = split_semi_pred(selection, &inner.name) {
-            // TiDB's ExplainInfo renders a join key's `OrigTblName`, so a
-            // subquery alias (`from t t2`) still prints the base table
-            // (`equal:[eq(explain_easy.t.b, explain_easy.t.b)]`).
-            let physical = inner.physical.as_deref().unwrap_or(&inner.name);
-            let on = rewrite_relation_alias(&on, &inner.name, physical);
+            // Keep the ON key on the query aliases. `ExplainInfo` maps a join
+            // key to its `OrigTblName` when rendering (`from t t2` still prints
+            // `equal:[eq(explain_easy.t.b, explain_easy.t.b)]`); rewriting the
+            // stored predicate instead would mix the physical table name into
+            // the executor's alias-keyed ON and break its side resolution.
             return Some(build_spec(
                 if not { JoinType::Anti } else { JoinType::Semi },
                 inner.name.clone(),

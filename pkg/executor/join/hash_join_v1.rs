@@ -818,7 +818,10 @@ fn side_in_schema(
         if schema_has_table(left_schema, table) {
             return Some(true);
         }
-        return None;
+        // A derived table / CTE alias (`SELECT * FROM cte dt … ON dt.c = …`)
+        // never appears in the child schemas, which only carry the base table
+        // qualifiers. Fall through to the output column name, which is what the
+        // user-visible alias refers to.
     }
     // Unqualified `ON b1 = a1`: resolve by which side owns the name.
     let in_left = schema_has_column(left_schema, &col.name);
