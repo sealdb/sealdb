@@ -14,7 +14,26 @@ pub fn order_by_all_constant(select: &SelectStmt) -> bool {
         && select
             .order_by
             .iter()
-            .all(|item| is_const_order_expr(&item.expr))
+            .all(|item| is_const_order_expr(&item.expr) || aliases_constant_expr(select, &item.expr))
+}
+
+/// TiDB resolves `ORDER BY <alias>` to the select-list expression before it
+/// drops a constant sort: `select 1 as a from dual order by a limit 1` sorts by
+/// `1`, so it keeps `Projection → TableDual` only.
+fn aliases_constant_expr(select: &SelectStmt, expr: &ExprNode) -> bool {
+    let ExprNode::Column(col) = expr else {
+        return false;
+    };
+    select
+        .fields
+        .iter()
+        .find(|field| {
+            field
+                .as_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&col.name))
+        })
+        .is_some_and(|field| is_const_expr(&field.expr))
 }
 
 /// True when any ORDER BY item is a scalar function (not a bare column or
