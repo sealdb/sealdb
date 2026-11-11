@@ -858,6 +858,14 @@ impl PhysicalPlan {
     }
 
     pub fn limit(child: PhysicalPlan, offset: u64, count: u64) -> Self {
+        // TiDB folds the `Limit` away when the child's row count already fits:
+        // a `TableDual` yields an exact row count, so `… FROM dual LIMIT 1`
+        // keeps only `Projection -> TableDual`.
+        if matches!(child, PhysicalPlan::TableDual { .. })
+            && (offset + count) as f64 >= crate::core::explain::est_rows(&child)
+        {
+            return child;
+        }
         PhysicalPlan::Limit {
             child: Box::new(child),
             offset,

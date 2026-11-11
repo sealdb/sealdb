@@ -4223,6 +4223,15 @@ fn order_by_covered_by_merge_join(select: &SelectStmt, plan: &PhysicalPlan) -> b
     })
 }
 
+/// Exact row count of a `dual` source, looking through output projections.
+fn dual_row_count(plan: &PhysicalPlan) -> Option<f64> {
+    match plan {
+        PhysicalPlan::TableDual { row_count } => Some(*row_count as f64),
+        PhysicalPlan::Projection { child, .. } => dual_row_count(child),
+        _ => None,
+    }
+}
+
 fn apply_order_limit(
     mut plan: PhysicalPlan,
     ordered: bool,
@@ -4252,6 +4261,15 @@ fn apply_order_limit(
     if offset.unwrap_or(0) == 0
         && limit.is_some_and(|lim| lim >= 1)
         && matches!(plan, PhysicalPlan::PointGet { .. })
+    {
+        return plan;
+    }
+    // `dual` has an exact row count, so a limit that cannot drop rows is a
+    // no-op: TiDB keeps `Projection -> TableDual`.
+    if offset.unwrap_or(0) == 0
+        && let Some(lim) = limit
+        && let Some(rows) = dual_row_count(&plan)
+        && (lim as f64) >= rows
     {
         return plan;
     }
