@@ -337,6 +337,23 @@
 | 跨表等值类型安全 | 类型不同的等值（`int = bit`）不能当 hash key，必须留在 `Selection` 走隐式转换 | `qualify_cross_equality` 校验表归属；`same_join_key_type` 校验声明类型 | `executor/jointest/join` 无回归 |
 | suite green | Gate A+B | manifest `green` | `explain_foreign_key` Mem=1 / TiKV=1 PASS；green 33→34 |
 
+### 2.0v R3 统计驱动的 IndexMerge（2026-11-12）
+
+`explain_indexmerge_stats` 加载完整直方图后仍退回 `TableFullScan`（`a < 50 or b < 50` 估计
+1,666,669 行），因为 merge 的两侧都没有吃真实统计。逐项对齐后该套件 diff 131 → 36 行：
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 聚簇 handle arm | `GetRowCountByIntColumnRanges`：`a < 50` 的 `TableRangeScan` 用 PK 列直方图，49 行且不带 `stats:pseudo` | `apply_index_merge_handle_stats` 用 `column_range_estimate`（回退 primary 索引直方图）改写 arm 的 `rows`/`filter_rows`/`pseudo` | `IndexMerge 98.00` + `TableRangeScan(Build) 49.00` |
+| 残差选择率 | probe 端 `f > 100` / `(a<10 or d<10)` 走列直方图，DNF 用 `1 - Π(1 - selᵢ)` | `index_merge_residual_rows` + `conjunct_selectivity`；`dnf_stats_selectivity` 供表扫 Selection 复用 | `Selection(Probe) 98.00`（原 32.67）、混合 OR 折叠为 `0.00` |
+| OR 组选择 | `indexMergeOR` 选代价最低的 DNF 组：`(b<10000 or c<10000) and (a<10 or d<10)` 用 a/d 两臂（18 行）而非 b/c（19,978 行） | `index_merge_plan` 遍历所有 OR conjunct，按 `index_merge_union_rows` 取最小 | 臂换为 `TableRangeScan(a)` + `td(d)` |
+| 表扫 OR 基数 | `or(a < 50, b < 5000000)` 的 Selection 用直方图 union，而非 `0.8` 默认 | `stats_cnf_filter_rows` 的 DNF 分支 | 4,000,000 → 4,999,999 |
+| 提示 | `no_index_merge()` 禁用；hinted arm 优先“覆盖全部有界列”的索引 | `IndexMergeHint.disabled`、`hint_names_table`；`index_merge_arm_index` 先找 covering 候选 | `aid = 2 and c2 = 'bbb'` 走 `aid_c2` 而非 `aid_c1` 加残差 |
+| `test` 库 | TiDB bootstrap 建 `test` schema | `bootstrap_system_tables` 独立创建 `TEST_SCHEMA` | `use test` 不再 1049 |
+
+剩余 36 行：`x < 5000000` 的 ±1 行估计、`IndexMerge` 节点编号、以及 issue 61093 的
+`TopN` 下推到 probe + 同索引多区间合并（需 fix control 52869）。Gate：memory=46 / tikv=45 PASS。
+
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。
 
