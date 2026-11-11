@@ -116,22 +116,8 @@ pub fn pinned_tuple(
     Some(tuple)
 }
 
-/// Add `tidb_shard(col) = <bucket>` next to every equality on the shard source
-/// column: TiDB's shard rewrite (`a = 100` → `tidb_shard(a) = 8 AND a = 100`).
-///
-/// TiDB `utilfuncp.AddPrefix4ShardIndexes` runs over a condition list:
-///
-/// * a single `OR` condition goes through the DNF path, where each arm is
-///   rewritten on its own (`a = 1 OR a = 10` → `(shard(a)=214 AND a=1) OR
-///   (shard(a)=142 AND a=10)`), and
-/// * anything else uses the CNF path, which needs *every* non-shard key part
-///   pinned by an equality in the list before the prefix is added.
-///
-/// The bucket comes from evaluating the stored `tidb_shard` expression over the
-/// pinned value, and an arm that already carries the shard predicate is left
-/// alone.
-pub fn shard_index_rewrite(select: &SelectStmt, info: &TableInfo) -> Option<SelectStmt> {
-    select.selection.as_ref()?;
+/// Every shard index of `info` (`UNIQUE KEY ((tidb_shard(col)), …)`).
+fn shard_index_shapes(info: &TableInfo) -> Vec<ShardIndex> {
     let mut shard_indices: Vec<ShardIndex> = Vec::new();
     for index in &info.indices {
         // TiDB only marks unique secondary indexes with more than one column.
@@ -180,6 +166,35 @@ pub fn shard_index_rewrite(select: &SelectStmt, info: &TableInfo) -> Option<Sele
             keys,
         });
     }
+    shard_indices
+}
+
+/// Does the table declare a shard index?
+///
+/// TiDB's shard rewrite may add a `tidb_shard(col)` prefix at any point, so the
+/// DataSource of such a table carries the hidden generated column even when the
+/// chosen access path is a table scan (`explain_shard_index` `a = b`).
+pub fn has_shard_index(info: &TableInfo) -> bool {
+    !shard_index_shapes(info).is_empty()
+}
+
+/// Add `tidb_shard(col) = <bucket>` next to every equality on the shard source
+/// column: TiDB's shard rewrite (`a = 100` → `tidb_shard(a) = 8 AND a = 100`).
+///
+/// TiDB `utilfuncp.AddPrefix4ShardIndexes` runs over a condition list:
+///
+/// * a single `OR` condition goes through the DNF path, where each arm is
+///   rewritten on its own (`a = 1 OR a = 10` → `(shard(a)=214 AND a=1) OR
+///   (shard(a)=142 AND a=10)`), and
+/// * anything else uses the CNF path, which needs *every* non-shard key part
+///   pinned by an equality in the list before the prefix is added.
+///
+/// The bucket comes from evaluating the stored `tidb_shard` expression over the
+/// pinned value, and an arm that already carries the shard predicate is left
+/// alone.
+pub fn shard_index_rewrite(select: &SelectStmt, info: &TableInfo) -> Option<SelectStmt> {
+    select.selection.as_ref()?;
+    let shard_indices = shard_index_shapes(info);
     if shard_indices.is_empty() {
         return None;
     }

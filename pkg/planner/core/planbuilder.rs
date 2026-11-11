@@ -6190,11 +6190,17 @@ fn wrap_output_projection(
 ) -> PhysicalPlan {
     // A table with an expression index carries a hidden generated column in
     // its DataSource schema, so `SELECT *` must project the user columns back
-    // out (`Projection` at the root, or a cop `Projection` when TiDB pushes it
-    // into the scan) whichever access path the table is read through.
+    // out. TiDB only adds that column when the expression index takes part in
+    // the plan: the access path reads it, or the index is a shard index whose
+    // `tidb_shard(col)` prefix the rewrite may inject (`explain_shard_index`).
+    // A plain expression index that the plan never touches leaves the
+    // DataSource at the user columns and needs no projection (`explain_easy`
+    // `t4`, which has a non-shard `expr_idx((a+b+1))`).
     let star_hidden = is_star_select(select)
         && select.joins.is_empty()
-        && hidden_table_info(select, is, current_db).is_some();
+        && hidden_table_info(select, is, current_db).is_some_and(|info| {
+            plan_reads_expr_index(&plan, info) || super::expr_index::has_shard_index(info)
+        });
     if (is_star_select(select) && !star_hidden)
         || needs_hash_agg(select)
         || needs_window(select)
