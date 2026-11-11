@@ -104,6 +104,67 @@ pub fn index_key_ranges(
     index: &IndexInfo,
     conjuncts: &[ExprNode],
 ) -> Option<KeyRangeAccess> {
+    let conjunct_access = conjunction_key_ranges(info, index, conjuncts);
+    if conjunct_access.is_some() {
+        return conjunct_access;
+    }
+    // `(c1=1 and c2=2) or (c1=3 and c2=4)` over one index: every arm pins a
+    // common key prefix, so TiDB's ranger seeks the index once with one point
+    // range per arm (`range:[0 1,0 1], [1 3,1 3]`).
+    let [single] = conjuncts else {
+        return None;
+    };
+    let ranges = dnf_point_ranges(info, index, single)?;
+    Some(KeyRangeAccess {
+        ranges,
+        consumed: vec![single.clone()],
+    })
+}
+
+/// One point range per DNF arm when every arm pins the same key prefix.
+fn dnf_point_ranges(
+    info: &TableInfo,
+    index: &IndexInfo,
+    conjunct: &ExprNode,
+) -> Option<Vec<pseudo::KeyRange>> {
+    let arms = conjunct.split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut ranges: Vec<pseudo::KeyRange> = Vec::with_capacity(arms.len());
+    let mut width: Option<usize> = None;
+    for arm in &arms {
+        // Each arm is a conjunction: split it so every equality can pin a key
+        // part (`c1=0 and c2=1` → `[0 1,0 1]`).
+        let arm_access = index_key_ranges(info, index, &arm.split_cnf())?;
+        let [range] = arm_access.ranges.as_slice() else {
+            return None;
+        };
+        // The arm has to pin a fully-inclusive prefix of the key, so the range
+        // is a single key (`[0 1,0 1]`) rather than an open interval.
+        if range.low_open || range.high_open || range.low.len() != range.high.len() {
+            return None;
+        }
+        let is_point = range.low.iter().zip(range.high.iter()).all(|(low, high)| {
+            low.1 && high.1 && low.0.compare(&high.0) == std::cmp::Ordering::Equal
+        });
+        if !is_point {
+            return None;
+        }
+        match width {
+            Some(prev) if prev != range.low.len() => return None,
+            _ => width = Some(range.low.len()),
+        }
+        ranges.push(range.clone());
+    }
+    Some(ranges)
+}
+
+fn conjunction_key_ranges(
+    info: &TableInfo,
+    index: &IndexInfo,
+    conjuncts: &[ExprNode],
+) -> Option<KeyRangeAccess> {
     let parts = index_key_parts(info, index)?;
     let leading = parts.first()?;
     // TIMESTAMP index keys are stored in UTC, so session-local bounds cannot be
@@ -309,6 +370,18 @@ pub fn index_access_range(
             consumed.push(conjunct.clone());
         }
     }
+    // A DNF of point arms pins the leading column once per arm; the histogram
+    // lookup sums those points.
+    if ranges.is_empty() && key_ranges.len() > 1 {
+        ranges = key_ranges
+            .iter()
+            .filter_map(|range| {
+                let low = range.low.first()?.clone();
+                let high = range.high.first()?.clone();
+                Some((Some(low), Some(high)))
+            })
+            .collect();
+    }
     let rows = pseudo::index_key_ranges_rows(table_rows, &key_ranges, key_len, index.unique);
     // TiDB sizes the scan from the index statistics (`IndexStats.lessRowCount`
     // on the encoded keys); `stats:pseudo` disappears once the histogram exists.
@@ -502,5 +575,86 @@ mod tests {
         let (info, index) =
             table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
         assert!(index_access_range(&info, &index, &selection("b < 3"), 10_000.0, None).is_none());
+    }
+
+    /// Table with an integer clustered PRIMARY KEY, like `explain_easy_stats.t1`.
+    fn handle_table(columns: Vec<ColumnInfo>, index_columns: &[&str]) -> (TableInfo, IndexInfo) {
+        let mut info = TableInfo::new(1, "t", columns);
+        info.pk_is_handle = true;
+        let pk_cols: Vec<IndexColumn> = vec![IndexColumn::new("c1", 0)];
+        let mut primary = IndexInfo::new(1, "PRIMARY", "t", pk_cols);
+        primary.primary = true;
+        primary.unique = true;
+        let cols: Vec<IndexColumn> = index_columns
+            .iter()
+            .enumerate()
+            .map(|(offset, name)| IndexColumn::new(*name, offset as i32))
+            .collect();
+        let mut index = IndexInfo::new(2, "c2", "t", cols);
+        index.unique = false;
+        info.indices = vec![primary, index.clone()];
+        (info, index)
+    }
+
+    #[test]
+    fn test_equality_prefix_pins_the_row_handle() {
+        // `c1 > 1 and c2 = 1` on `index c2(c2)`: the index key is `(c2, c1)`,
+        // so the equality pins `c2` and the range continues on the handle.
+        let (info, index) = handle_table(
+            vec![
+                int_column("c1", 0),
+                int_column("c2", 1),
+                int_column("c3", 2),
+            ],
+            &["c2"],
+        );
+        let access =
+            index_access_range(&info, &index, &selection("c1 > 1 and c2 = 1"), 10_000.0, None)
+                .expect("range");
+        assert_eq!(access.range.text, "(1 1,1 +inf]");
+        assert_eq!(access.key_ranges.len(), 1);
+        // Both predicates are encoded by the seek, so neither stays a filter.
+        assert_eq!(access.consumed.len(), 2);
+        assert_eq!(
+            access
+                .ranges
+                .iter()
+                .map(|(low, high)| pseudo::range_text(low.as_ref(), high.as_ref()))
+                .collect::<Vec<_>>(),
+            vec!["[1,1]".to_string()],
+            "the leading-column bounds still drive the histogram lookup"
+        );
+    }
+
+    #[test]
+    fn test_columns_beyond_the_range_stay_filters() {
+        let (info, index) = handle_table(
+            vec![
+                int_column("c1", 0),
+                int_column("c2", 1),
+                int_column("c3", 2),
+            ],
+            &["c2"],
+        );
+        let access = index_access_range(
+            &info,
+            &index,
+            &selection("c1 > 1 and c2 = 1 and c3 < 1"),
+            10_000.0,
+            None,
+        )
+        .expect("range");
+        assert_eq!(access.range.text, "(1 1,1 +inf]");
+        assert_eq!(access.consumed.len(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_in_ranges_merge() {
+        let (info, index) =
+            table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
+        let access =
+            index_access_range(&info, &index, &selection("a in (1, 1)"), 10_000.0, None)
+                .expect("range");
+        assert_eq!(access.range.text, "[1,1]");
     }
 }

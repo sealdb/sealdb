@@ -14,4 +14,6 @@ pub use core::{
     with_dirty_tables, with_explicit_txn, normalize_prep_cache_key, stmt_has_natural_join,
     with_foreign_key_checks, with_cost_model_version, cost_model_version,
     with_hashagg_concurrency, hashagg_cpu_amortized,
+    with_agg_push_down, agg_push_down,
+    with_insubq_to_join_and_agg, insubq_to_join_and_agg,
 };

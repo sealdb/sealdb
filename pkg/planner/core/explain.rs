@@ -585,6 +585,7 @@ fn walk_with_parent(
                         | "IndexJoin"
                         | "UnionScan"
                         | "Limit"
+                        | "TopN"
                         | "CTEFullScan"
                 )
             {
@@ -602,6 +603,7 @@ fn walk_with_parent(
                         | "IndexJoin"
                         | "UnionScan"
                         | "Limit"
+                        | "TopN"
                         | "CTEFullScan"
                 )
             {
@@ -722,8 +724,19 @@ fn walk_with_parent(
         tree_prefix(depth, last)
     };
     // TopN count only overrides DistSQL reader est (pushed TopN), not Union/etc.
+    // A correlated lookup keeps its Apply-scaled cardinality: the limit sits in
+    // the cop `TopN`, not on the reader.
+    let correlated_lookup = matches!(
+        plan,
+        PhysicalPlan::IndexLookUpReader {
+            selection_info: Some(sel),
+            ..
+        } if topn_build_marker(sel).is_some()
+    );
     let row_est = if let Some((_, _, count)) = topn_parent {
-        if matches!(
+        if correlated_lookup {
+            est_rows(plan)
+        } else if matches!(
             plan,
             PhysicalPlan::IndexReader { .. }
                 | PhysicalPlan::TableReader { .. }
@@ -2581,6 +2594,70 @@ fn emit_cop_children(
                 if under_bushy {
                     build_spine.push(true);
                 }
+                // Correlated `ORDER BY … LIMIT` probe: TiDB pushes a `TopN`
+                // into the cop task above the decided-by index range.
+                if let Some((by_info, scan_rows)) =
+                    selection_info.as_deref().and_then(topn_build_marker)
+                {
+                    // The probe runs on TiKV, and the cop `TopN` has a later
+                    // sibling (`TableRowIDScan`), so its child keeps a bar.
+                    let task = "cop[tikv]";
+                    let mut build_spine = cop_spine.to_vec();
+                    while build_spine.len() < depth.saturating_sub(1) {
+                        build_spine.push(false);
+                    }
+                    let mut child_spine = build_spine.clone();
+                    child_spine.push(true);
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "TopN",
+                            est: *row_count,
+                            task,
+                            access: String::new(),
+                            info: format!("{by_info}, offset:0, count:1"),
+                        },
+                        &build_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: scan_rows,
+                            task,
+                            access: idx_access.clone(),
+                            info: range_info_full.clone(),
+                        },
+                        &child_spine,
+                    );
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TableRowIDScan",
+                            est: *row_count,
+                            task,
+                            access: table_access(table, &[]),
+                            info: rowid_info,
+                        },
+                        &build_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                    return true;
+                }
                 if selection_info.is_some() {
                     push_explain_row_spine(
                         rows,
@@ -3389,6 +3466,15 @@ fn pushed_is_bytes_info(filter: &sealdb_parser::ast::ExprNode) -> bool {
 }
 
 /// `RANGE:…` Bytes marker on TableReader/IndexReader pushed filter.
+/// `TOPN|<by_info>|<scan est>` marker on an `IndexLookUpReader`: the decided-by
+/// index range of a correlated `ORDER BY … LIMIT` probe is read under a cop
+/// `TopN` (the scan keeps its un-limited cardinality).
+fn topn_build_marker(selection_info: &str) -> Option<(&str, f64)> {
+    let rest = selection_info.strip_prefix("TOPN|")?;
+    let (by_info, est) = rest.rsplit_once('|')?;
+    Some((by_info, est.parse().ok()?))
+}
+
 fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
@@ -3922,6 +4008,7 @@ fn join_role_label(
             "HashJoin"
                 | "TableReader"
                 | "StreamAgg"
+                | "HashAgg"
                 | "Projection"
                 | "Selection"
                 | "IndexReader"
@@ -4267,11 +4354,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::Limit { offset, count, .. } => (
             "Limit".to_string(),
             String::new(),
-            if *count > 0 {
-                format!("offset:{offset}, count:{count}")
-            } else {
-                String::new()
-            },
+            format!("offset:{offset}, count:{count}"),
         ),
         PhysicalPlan::HashAgg { info, .. } => ("HashAgg".to_string(), String::new(), info.clone()),
         PhysicalPlan::StreamAgg { info, .. } => {
@@ -5031,14 +5114,16 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             est_rows: Some(est),
             ..
         } => *est,
-        PhysicalPlan::Limit { child, count, .. } => {
-            if *count > 0 {
-                est_rows(child).min(*count as f64)
-            } else {
-                est_rows(child).min(1.0)
-            }
-        }
-        PhysicalPlan::TopN { child, count, .. } => est_rows(child).min(*count as f64),
+        PhysicalPlan::Limit { child, count, .. } => est_rows(child).min(*count as f64),
+        // Correlated `ORDER BY … LIMIT` probe: the limit is pushed into the cop
+        // task, so the `TopN` keeps the Apply-scaled cardinality of its lookup.
+        PhysicalPlan::TopN { child, count, .. } => match child.as_ref() {
+            PhysicalPlan::IndexLookUpReader {
+                selection_info: Some(sel),
+                ..
+            } if topn_build_marker(sel).is_some() => est_rows(child),
+            _ => est_rows(child).min(*count as f64),
+        },
         // Planner-computed join cardinality from the key NDVs.
         PhysicalPlan::HashJoin {
             est_rows: Some(est),

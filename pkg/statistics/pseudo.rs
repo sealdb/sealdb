@@ -817,4 +817,45 @@ mod tests {
             10.0
         );
     }
+
+    /// `(c2 = 1, c1 > 1)` on `index c2(c2)` of a handle table: TiDB pads the
+    /// high side with `MaxValue`, so the range prints `(1 1,1 +inf]`.
+    fn prefix_range() -> KeyRange {
+        KeyRange {
+            low: vec![(int(1), true), (int(1), false)],
+            high: vec![(int(1), true)],
+            low_open: false,
+            high_open: true,
+        }
+    }
+
+    #[test]
+    fn test_key_range_text_pads_the_sentinels() {
+        assert_eq!(key_range_text(&prefix_range()), "(1 1,1 +inf]");
+        assert_eq!(
+            key_range_text(&KeyRange {
+                low: vec![(int(1), true)],
+                high: vec![(int(1), true), (int(5), false)],
+                low_open: true,
+                high_open: false,
+            }),
+            "[1 -inf,1 5)"
+        );
+        assert_eq!(key_range_text(&KeyRange::point(vec![int(1)])), "[1,1]");
+    }
+
+    #[test]
+    fn test_key_range_estimate_narrows_past_the_equal_prefix() {
+        // 10000 pseudo rows: `c1 > 1` keeps 1/3 of them, then the pinned
+        // `c2 = 1` shrinks one more 1/100 (TiDB
+        // `getPseudoRowCountByIndexRanges`).
+        let rows = index_key_ranges_rows(10_000.0, &[prefix_range()], 2, false);
+        assert!((rows - 10_000.0 / 3.0 / 100.0).abs() < 1e-6, "{rows}");
+    }
+
+    #[test]
+    fn test_key_range_point_on_unique_index_is_one_row() {
+        let point = KeyRange::point(vec![int(1), int(2)]);
+        assert_eq!(index_key_ranges_rows(10_000.0, &[point], 2, true), 1.0);
+    }
 }

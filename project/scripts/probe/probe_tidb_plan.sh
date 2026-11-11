@@ -53,6 +53,9 @@ trap cleanup EXIT
 
 git -C "$TIDB_ROOT" worktree add --detach --quiet "$WORK" HEAD
 git -C "$WORK" apply "$SCRIPT_DIR/tidb_plan_trace.patch"
+if [[ -n "${TIDB_PLANID_TRACE:-}" ]]; then
+  git -C "$WORK" apply "$SCRIPT_DIR/tidb_planid_trace.patch"
+fi
 mkdir -p "$WORK/zzprobe"
 cp "$SCRIPT_DIR/probe_test.go" "$WORK/zzprobe/probe_test.go"
 
@@ -60,6 +63,6 @@ cd "$WORK"
 # `-tags=intest` is required by testkit's mock store guard; the trace patch also
 # gates the `hack` package's go1.25 ABI assertion so the probe runs on whatever
 # local toolchain is installed. Goldens never come from this path.
-PROBE_FILE="$PROBE_FILE" TIDB_PROBE="$TRACE" TIDB_SKIP_ABI_CHECK="${TIDB_SKIP_ABI_CHECK:-1}" \
+PROBE_FILE="$PROBE_FILE" TIDB_PROBE="$TRACE" TIDB_PLANID_TRACE="${TIDB_PLANID_TRACE:-}" TIDB_SKIP_ABI_CHECK="${TIDB_SKIP_ABI_CHECK:-1}" \
   go test -tags=intest ./zzprobe -run TestProbe -v -count=1 2>&1 \
   | grep -v -E '^(=== RUN|--- PASS|PASS|ok  )' || true

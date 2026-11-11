@@ -1,0 +1,21 @@
+diff --git a/pkg/planner/core/operator/baseimpl/plan.go b/pkg/planner/core/operator/baseimpl/plan.go
+--- a/pkg/planner/core/operator/baseimpl/plan.go
++++ b/pkg/planner/core/operator/baseimpl/plan.go
+@@ -16,6 +16,7 @@ package baseimpl
+ 
+ import (
+ 	"fmt"
++	"os"
+ 	"strconv"
+ 	"unsafe"
+ 
+@@ -40,6 +41,9 @@ type Plan struct {
+ // NewBasePlan creates a new base plan.
+ func NewBasePlan(ctx planctx.PlanContext, tp string, qbBlock int) Plan {
+ 	id := ctx.GetSessionVars().PlanID.Add(1)
++	if os.Getenv("TIDB_PLANID_TRACE") != "" {
++		fmt.Printf("[planid] %d %s\n", id, tp)
++	}
+ 	return Plan{
+ 		tp:      tp,
+ 		id:      int(id),

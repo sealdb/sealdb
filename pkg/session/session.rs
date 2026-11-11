@@ -66,6 +66,13 @@ pub struct Session {
     hashagg_partial_concurrency: Mutex<u64>,
     /// TiDB `tidb_hashagg_final_concurrency` (default 5).
     hashagg_final_concurrency: Mutex<u64>,
+    /// TiDB `tidb_opt_agg_push_down` (default OFF): the `AggregationPushDownSolver`
+    /// may push a decomposable partial aggregation below an inner join.
+    opt_agg_push_down: Mutex<bool>,
+    /// TiDB `tidb_opt_insubq_to_join_and_agg` (default ON): rewrite a
+    /// non-correlated `IN (SELECT …)` into an inner join with a de-duplicating
+    /// aggregation on the subquery side.
+    opt_insubq_to_join_and_agg: Mutex<bool>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
 }
@@ -117,6 +124,8 @@ impl Session {
             cost_model_version: Mutex::new(2),
             hashagg_partial_concurrency: Mutex::new(5),
             hashagg_final_concurrency: Mutex::new(5),
+            opt_agg_push_down: Mutex::new(false),
+            opt_insubq_to_join_and_agg: Mutex::new(true),
             last_warnings: Mutex::new(Vec::new()),
         }
     }
@@ -757,6 +766,14 @@ impl Session {
             .hashagg_final_concurrency
             .lock()
             .expect("session hashagg final concurrency lock");
+        let opt_agg_push_down = *self
+            .opt_agg_push_down
+            .lock()
+            .expect("session agg push down lock");
+        let opt_insubq_to_join_and_agg = *self
+            .opt_insubq_to_join_and_agg
+            .lock()
+            .expect("session insubq lock");
         // Cost model version changes the chosen access path; keep it in the
         // Domain-shared plan-cache key so sessions cannot cross-read plans.
         let cache_key = if cost_model_version == 2 {
@@ -766,6 +783,8 @@ impl Session {
         };
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
             sealdb_planner::with_cost_model_version(cost_model_version, || {
+            sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
+            sealdb_planner::with_insubq_to_join_and_agg(opt_insubq_to_join_and_agg, || {
             sealdb_planner::with_hashagg_concurrency(
                 hashagg_partial_concurrency,
                 hashagg_final_concurrency,
@@ -801,6 +820,8 @@ impl Session {
                     prune_mode,
                 )
             }
+            })
+            })
             })
             })
             })
@@ -2833,6 +2854,31 @@ fn apply_set(
                     .expect("session window_concurrency lock") = n.max(1);
             }
             "tidb_enable_window_function" => {}
+            // `AggregationPushDownSolver` gate (TiDB default OFF).
+            "tidb_opt_agg_push_down" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .opt_agg_push_down
+                    .lock()
+                    .expect("session agg push down lock") = on;
+            }
+            // `IN (SELECT …)` → inner join + de-duplicating aggregation gate
+            // (TiDB default ON).
+            "tidb_opt_insubq_to_join_and_agg" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .opt_insubq_to_join_and_agg
+                    .lock()
+                    .expect("session insubq lock") = on;
+            }
             // Per-query memory quota (TiDB `tidb_mem_quota_query`): `0` = no
             // limit, `DEFAULT` = 1 GiB. Values are byte counts, possibly written
             // as an integer expression (`1 << 18`).
@@ -3124,6 +3170,28 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .lock()
             .expect("session hashagg final concurrency lock")
             .to_string(),
+        "tidb_opt_agg_push_down" => {
+            if *session
+                .opt_agg_push_down
+                .lock()
+                .expect("session agg push down lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_opt_insubq_to_join_and_agg" => {
+            if *session
+                .opt_insubq_to_join_and_agg
+                .lock()
+                .expect("session insubq lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "tidb_window_concurrency" => session
             .window_concurrency

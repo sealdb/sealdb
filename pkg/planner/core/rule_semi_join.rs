@@ -16,7 +16,7 @@ use sealdb_types::Datum;
 /// Recursively replace Apply nodes that carry a decorrelatable EXISTS/IN
 /// predicate with a left-deep HashJoin Semi or Anti.
 pub fn rewrite_semi_join(plan: PhysicalPlan) -> PhysicalPlan {
-    rewrite_semi_join_ctx(plan, None, "")
+    rewrite_semi_join_ctx(plan, None, "", None)
 }
 
 /// InfoSchema-aware variant so `IN (SELECT * …)` can expand the star.
@@ -24,6 +24,7 @@ pub fn rewrite_semi_join_ctx(
     plan: PhysicalPlan,
     is: Option<&sealdb_infoschema::InfoSchema>,
     current_db: &str,
+    stats: Option<&sealdb_statistics::Handle>,
 ) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Apply {
@@ -32,8 +33,8 @@ pub fn rewrite_semi_join_ctx(
             probe,
             info,
         } => {
-            let child = rewrite_semi_join_ctx(*child, is, current_db);
-            let probe = probe.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db)));
+            let child = rewrite_semi_join_ctx(*child, is, current_db, stats);
+            let probe = probe.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db, stats)));
             // Dual-child Apply (count IN IndexJoin) keeps its shape.
             if probe.is_some() || info.is_some() {
                 PhysicalPlan::Apply {
@@ -43,20 +44,20 @@ pub fn rewrite_semi_join_ctx(
                     info,
                 }
             } else {
-                rewrite_apply(child, filter, is, current_db)
+                rewrite_apply(child, filter, is, current_db, stats)
             }
         },
         PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             filter,
             est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             by_info,
         },
         PhysicalPlan::TopN {
@@ -65,7 +66,7 @@ pub fn rewrite_semi_join_ctx(
             offset,
             count,
         } => PhysicalPlan::TopN {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             by_info,
             offset,
             count,
@@ -75,7 +76,7 @@ pub fn rewrite_semi_join_ctx(
             offset,
             count,
         } => PhysicalPlan::Limit {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             offset,
             count,
         },
@@ -85,7 +86,7 @@ pub fn rewrite_semi_join_ctx(
             cop_info,
             est_rows,
         } => PhysicalPlan::HashAgg {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             info,
             cop_info,
             est_rows,
@@ -96,21 +97,21 @@ pub fn rewrite_semi_join_ctx(
             cop_info,
             est_rows,
         } => PhysicalPlan::StreamAgg {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             info,
             cop_info,
             est_rows,
         },
         PhysicalPlan::Window { info, child } => PhysicalPlan::Window {
             info,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::Shuffle { info, child } => PhysicalPlan::Shuffle {
             info,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::HashJoin {
             est_rows,
@@ -123,8 +124,8 @@ pub fn rewrite_semi_join_ctx(
         } => PhysicalPlan::HashJoin {
             est_rows,
             tp,
-            left: Box::new(rewrite_semi_join_ctx(*left, is, current_db)),
-            right: Box::new(rewrite_semi_join_ctx(*right, is, current_db)),
+            left: Box::new(rewrite_semi_join_ctx(*left, is, current_db, stats)),
+            right: Box::new(rewrite_semi_join_ctx(*right, is, current_db, stats)),
             left_table,
             right_table,
             on,
@@ -137,12 +138,12 @@ pub fn rewrite_semi_join_ctx(
         } => PhysicalPlan::IndexJoin {
             info,
             est_rows,
-            outer: Box::new(rewrite_semi_join_ctx(*outer, is, current_db)),
-            inner: Box::new(rewrite_semi_join_ctx(*inner, is, current_db)),
+            outer: Box::new(rewrite_semi_join_ctx(*outer, is, current_db, stats)),
+            inner: Box::new(rewrite_semi_join_ctx(*inner, is, current_db, stats)),
         },
         PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
-            children: children.into_iter().map(|c| Box::new(rewrite_semi_join_ctx(*c, is, current_db))).collect(),
+            children: children.into_iter().map(|c| Box::new(rewrite_semi_join_ctx(*c, is, current_db, stats))).collect(),
         },
         PhysicalPlan::DistinctUnion {
             info,
@@ -151,7 +152,7 @@ pub fn rewrite_semi_join_ctx(
         } => PhysicalPlan::DistinctUnion {
             info,
             est_rows,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::CTE {
             name,
@@ -167,8 +168,8 @@ pub fn rewrite_semi_join_ctx(
             name,
             alias,
             columns,
-            seed: Box::new(rewrite_semi_join_ctx(*seed, is, current_db)),
-            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db))),
+            seed: Box::new(rewrite_semi_join_ctx(*seed, is, current_db, stats)),
+            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db, stats))),
             inline,
             recursive,
             limit,
@@ -183,7 +184,7 @@ pub fn rewrite_semi_join_ctx(
             keys,
             fields,
             names,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         PhysicalPlan::Explain {
             format,
@@ -192,7 +193,7 @@ pub fn rewrite_semi_join_ctx(
         } => PhysicalPlan::Explain {
             format,
             analyze,
-            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db)),
+            child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
         },
         other => other,
     }
@@ -205,6 +206,11 @@ struct SemiSpec {
     on: ExprNode,
     /// Null-reject filters pushed onto the outer (Probe) side.
     outer_filter: Option<ExprNode>,
+    /// The spec came from a non-correlated `IN (SELECT …)` predicate, so TiDB
+    /// may rewrite it into an inner join against a de-duplicated subquery.
+    dedup_in: bool,
+    /// Physical (unaliased) name of the inner table, for statistics lookups.
+    right_physical: String,
 }
 
 fn rewrite_apply(
@@ -212,6 +218,7 @@ fn rewrite_apply(
     filter: ExprNode,
     is: Option<&sealdb_infoschema::InfoSchema>,
     current_db: &str,
+    stats: Option<&sealdb_statistics::Handle>,
 ) -> PhysicalPlan {
     let mut leftover = Vec::new();
     for item in filter.split_cnf() {
@@ -221,11 +228,23 @@ fn rewrite_apply(
                 if let Some(outer_filter) = spec.outer_filter {
                     plan = push_isnull_filter(plan, outer_filter);
                 }
+                // TiDB `RewriteINToJoinAndAgg`: a non-correlated `x IN (SELECT …)`
+                // becomes an inner join against the de-duplicated subquery, so
+                // every join row is a distinct match.
+                let mut tp = spec.tp;
+                let mut right = spec.right;
+                if spec.dedup_in
+                    && super::insubq_to_join_and_agg()
+                    && let Some(key) = join_key_on_table(&spec.on, &spec.right_table)
+                {
+                    right = dedup_in_right(right, &key, &spec.right_table, current_db, stats);
+                    tp = JoinType::Inner;
+                }
                 plan = PhysicalPlan::HashJoin {
                     est_rows: None,
-                    tp: spec.tp,
+                    tp,
                     left: Box::new(plan),
-                    right: Box::new(spec.right),
+                    right: Box::new(right),
                     left_table,
                     right_table: spec.right_table,
                     on: spec.on,
@@ -754,6 +773,7 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
                 inner_filter,
                 on,
                 None,
+                false,
             ));
         }
         // Correlated predicates without a cross-table equality: TiDB
@@ -849,6 +869,8 @@ fn cartesian_exists_spec(
         right,
         on,
         outer_filter: merge_filters(ExprNode::compose_cnf(outer_preds), left_nulls),
+        dedup_in: false,
+        right_physical: inner.name.clone(),
     })
 }
 
@@ -964,6 +986,8 @@ fn from_exists_cte(
         right,
         on,
         outer_filter: left_nulls,
+        dedup_in: false,
+        right_physical: inner.name.clone(),
     })
 }
 
@@ -1114,6 +1138,8 @@ fn from_in(
             right: PhysicalPlan::table_reader(inner.name.clone(), Vec::new()),
             on,
             outer_filter: None,
+            dedup_in: false,
+            right_physical: inner.name.clone(),
         });
     }
     // `name NOT IN (SELECT const FROM exam WHERE exam.stu_id = stu.id)`:
@@ -1159,6 +1185,8 @@ fn from_in(
             right,
             on,
             outer_filter: None,
+            dedup_in: false,
+            right_physical: inner.name.clone(),
         });
     }
     if !matches!(inner_expr, ExprNode::Column(_)) || !matches!(outer_expr, ExprNode::Column(_)) {
@@ -1169,13 +1197,18 @@ fn from_in(
     }
     let equal = eq_expr(outer_expr.clone(), inner_expr.clone());
     if other_conds.is_empty() {
-        return Some(build_spec(
+        let mut spec = build_spec(
             join_tp,
             inner.name.clone(),
             inner_filter,
             equal,
             None,
-        ));
+            // `x IN (SELECT c FROM t)`: TiDB rewrites the semi join into an
+            // inner join against the de-duplicated subquery.
+            !not,
+        );
+        spec.right_physical = inner_physical.to_string();
+        return Some(spec);
     }
     // Correlated IN → semi join with equal + other cond (TiDB decorrelate).
     let outer = outer_table?;
@@ -1208,7 +1241,103 @@ fn from_in(
             datum: Datum::Bytes(info.into_bytes()),
         }),
         outer_filter: left_nulls,
+        dedup_in: false,
+        right_physical: inner.name.clone(),
     })
+}
+
+/// TiDB `buildDistinct` on the `IN` subquery plus `ExtractOnCondition`'s null
+/// rejection: the inner side of the rewritten inner join keeps one row per
+/// distinct key value, so the join can never duplicate an outer row.
+fn dedup_in_right(
+    right: PhysicalPlan,
+    key: &str,
+    right_table: &str,
+    current_db: &str,
+    stats: Option<&sealdb_statistics::Handle>,
+) -> PhysicalPlan {
+    let col = ExprNode::Column(ColumnNameExpr {
+        schema: None,
+        table: Some(right_table.to_string()),
+        name: key.to_string(),
+    });
+    let qualifier = explain_semi_col(&col, None);
+    let right = push_isnull_filter(
+        right,
+        ExprNode::Unary(UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                expr: Box::new(col),
+                not: false,
+            })),
+        }),
+    );
+    // TiDB `buildDistinct` reads the subquery after `ANALYZE`, so the scan
+    // carries the real table count; unanalyzed tables keep the 10000 default.
+    let table_stats = stats
+        .and_then(|h| h.table(current_db, right_table))
+        .filter(super::plan_cost::has_real_stats);
+    let right = with_scan_count(right, table_stats.as_ref().map(|t| t.count as f64));
+    // TiDB `GroupNDV`: the key column's NDV under real statistics, otherwise the
+    // pseudo 0.8 distinct factor over the null-rejected rows.
+    let est = match table_stats.as_ref() {
+        Some(t) => t
+            .column_ndv(key)
+            .map(|ndv| ndv.min(t.count as f64))
+            .unwrap_or_else(|| super::explain::est_rows(&right)),
+        None => super::explain::est_rows(&right) * 0.8,
+    };
+    PhysicalPlan::hash_agg(
+        right,
+        format!("group by:{qualifier}, funcs:firstrow({qualifier})->{qualifier}"),
+        est,
+    )
+}
+
+/// Pin the underlying reader's cardinality (real stats → analyzed estimate,
+/// `None` → keep the pseudo 10000 default).
+fn with_scan_count(plan: PhysicalPlan, count: Option<f64>) -> PhysicalPlan {
+    use PhysicalPlan as P;
+    match plan {
+        P::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            data_limit,
+            filter_est,
+            range_scan,
+            pushed,
+            keep_order,
+        } => P::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count: count.unwrap_or(row_count),
+            stats_pseudo: match count {
+                Some(_) => false,
+                None => stats_pseudo,
+            },
+            data_limit,
+            filter_est,
+            range_scan,
+            pushed,
+            keep_order,
+        },
+        P::Selection {
+            child,
+            filter,
+            est_rows,
+        } => P::Selection {
+            child: Box::new(with_scan_count(*child, count)),
+            filter,
+            est_rows,
+        },
+        other => other,
+    }
 }
 
 fn build_spec(
@@ -1217,6 +1346,7 @@ fn build_spec(
     inner_filter: Option<ExprNode>,
     on: ExprNode,
     outer_filter: Option<ExprNode>,
+    dedup_in: bool,
 ) -> SemiSpec {
     let mut right = PhysicalPlan::table_reader(right_table.clone(), Vec::new());
     if let Some(filter) = inner_filter {
@@ -1228,10 +1358,12 @@ fn build_spec(
     }
     SemiSpec {
         tp,
-        right_table,
+        right_table: right_table.clone(),
         right,
         on,
         outer_filter,
+        dedup_in,
+        right_physical: right_table,
     }
 }
 
@@ -1604,7 +1736,12 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
 /// TiDB SemiJoinRewriter: DISTINCT the Semi inner (right) side on the join
 /// key so the build side is unique. Keep HashJoin Semi so SELECT * still
 /// emits the left schema (TiDB adds a left projection after Inner+Agg).
-pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
+pub fn rewrite_semi_join_agg(
+    plan: PhysicalPlan,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+    stats: Option<&sealdb_statistics::Handle>,
+) -> PhysicalPlan {
     match plan {
         PhysicalPlan::HashJoin {
             est_rows,
@@ -1615,8 +1752,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             right_table,
             on,
         } => {
-            let left = rewrite_semi_join_agg(*left);
-            let right = rewrite_semi_join_agg(*right);
+            let left = rewrite_semi_join_agg(*left, is, current_db, stats);
+            let right = rewrite_semi_join_agg(*right, is, current_db, stats);
             // LogicAnd(Eq, Bytes explain) — used by CTE EXISTS — skips Distinct
             // (join_key_on_table only matches bare Eq); TiDB has no HashAgg here.
             if tp == JoinType::Semi
@@ -1654,22 +1791,22 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             probe,
             info,
         } => PhysicalPlan::Apply {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             filter,
-            probe: probe.map(|p| Box::new(rewrite_semi_join_agg(*p))),
+            probe: probe.map(|p| Box::new(rewrite_semi_join_agg(*p, is, current_db, stats))),
             info,
         },
         PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             filter,
             est_rows,
         },
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             by_info,
         },
         PhysicalPlan::TopN {
@@ -1678,7 +1815,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         } => PhysicalPlan::TopN {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             by_info,
             offset,
             count,
@@ -1688,7 +1825,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             offset,
             count,
         } => PhysicalPlan::Limit {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             offset,
             count,
         },
@@ -1698,7 +1835,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         } => PhysicalPlan::HashAgg {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             info,
             cop_info,
             est_rows,
@@ -1711,8 +1848,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::IndexJoin {
             info,
             est_rows,
-            outer: Box::new(rewrite_semi_join_agg(*outer)),
-            inner: Box::new(rewrite_semi_join_agg(*inner)),
+            outer: Box::new(rewrite_semi_join_agg(*outer, is, current_db, stats)),
+            inner: Box::new(rewrite_semi_join_agg(*inner, is, current_db, stats)),
         },
         PhysicalPlan::StreamAgg {
             child,
@@ -1720,27 +1857,27 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             cop_info,
             est_rows,
         } => PhysicalPlan::StreamAgg {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             info,
             cop_info,
             est_rows,
         },
         PhysicalPlan::Window { info, child } => PhysicalPlan::Window {
             info,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::Shuffle { info, child } => PhysicalPlan::Shuffle {
             info,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::ShuffleReceiver { child } => PhysicalPlan::ShuffleReceiver {
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
             children: children
                 .into_iter()
-                .map(|c| Box::new(rewrite_semi_join_agg(*c)))
+                .map(|c| Box::new(rewrite_semi_join_agg(*c, is, current_db, stats)))
                 .collect(),
         },
         PhysicalPlan::DistinctUnion {
@@ -1750,7 +1887,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::DistinctUnion {
             info,
             est_rows,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::CTE {
             name,
@@ -1766,8 +1903,8 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             name,
             alias,
             columns,
-            seed: Box::new(rewrite_semi_join_agg(*seed)),
-            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_agg(*p))),
+            seed: Box::new(rewrite_semi_join_agg(*seed, is, current_db, stats)),
+            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_agg(*p, is, current_db, stats))),
             inline,
             recursive,
             limit,
@@ -1782,7 +1919,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
             keys,
             fields,
             names,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         PhysicalPlan::Explain {
             format,
@@ -1791,7 +1928,7 @@ pub fn rewrite_semi_join_agg(plan: PhysicalPlan) -> PhysicalPlan {
         } => PhysicalPlan::Explain {
             format,
             analyze,
-            child: Box::new(rewrite_semi_join_agg(*child)),
+            child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
         },
         other => other,
     }

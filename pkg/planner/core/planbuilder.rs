@@ -237,6 +237,14 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // Correlated scalar subquery with `ORDER BY … LIMIT` in the
+                // select list → Apply over the ordered index probe.
+                if let Some(plan) =
+                    scalar_order_limit_apply_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
@@ -316,7 +324,13 @@ impl PlanBuilder {
                     // Predicate pushdown rebuilds join nodes, so their
                     // cardinality (derived from the pushed-down children) has
                     // to be recomputed before any aggregate above them.
-                    plan = fill_join_est_rows(plan, is, current_db, stats);
+                    plan = fill_join_est_rows(
+                        plan,
+                        is,
+                        current_db,
+                        stats,
+                        &query_alias_map(select),
+                    );
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
                 plan = lift_point_get_merge_join(plan, select, is, current_db);
@@ -332,7 +346,7 @@ impl PlanBuilder {
                         .and_then(|is| global_index_agg_plan(select, &plan, is, current_db))
                     {
                         Some(agg) => (agg, false),
-                        None => build_agg_plan(select, plan, current_db, is),
+                        None => build_agg_plan(select, plan, current_db, is, stats),
                     };
                     plan = agg;
                     stream_keep_order = keep_order;
@@ -388,12 +402,16 @@ impl PlanBuilder {
                     // read returns rows partition by partition, so it is not.
                     let index_order = !select_spans_multiple_partitions(select, is, current_db)
                         && plan_provides_order(select, &plan);
+                    // `ORDER BY` a prefix of the point-get key needs no Sort: the
+                    // single-row lookup already returns rows in key order.
+                    let point_prefix_order = point_get_prefix_order(select, &plan);
                     let need_sort = !select.order_by.is_empty()
                         && !order_by_all_constant(select)
                         && !(stream_keep_order && order_prefix_of_group_by(select))
                         && !merge_orders
                         && !handle_order
                         && !index_order
+                        && !point_prefix_order
                         && point_order.is_none();
                     let join_ordinal_sort = need_sort
                         && !select.joins.is_empty()
@@ -417,7 +435,12 @@ impl PlanBuilder {
                         if let Some(lim) = select.limit {
                             plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), lim);
                         } else if select.offset.is_some() {
-                            plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), 0);
+                            // OFFSET without LIMIT: TiDB keeps the unbounded count.
+                            plan = PhysicalPlan::limit(
+                                plan,
+                                select.offset.unwrap_or(0),
+                                u64::MAX,
+                            );
                         }
                     } else if join_ordinal_sort {
                         // Sort by select-list ordinals: project the output first so
@@ -477,7 +500,12 @@ impl PlanBuilder {
                 }
                 // TiDB remapping Projection after StreamAgg+ORDER BY is explain-only
                 // (see explain.rs); executable plan keeps the agg output schema.
-                plan = rewrite_semi_join_agg(rewrite_semi_join_ctx(plan, is, current_db));
+                plan = rewrite_semi_join_agg(
+                    rewrite_semi_join_ctx(plan, is, current_db, stats),
+                    is,
+                    current_db,
+                    stats,
+                );
                 // TiDB wraps quantified ALL Apply in a remapping Projection for
                 // `SELECT *` (cte suite: Projection → Apply → StreamAgg/HashAgg).
                 plan = wrap_quantified_all_projection(plan, select, is, current_db);
@@ -1419,7 +1447,13 @@ impl PlanBuilder {
         let plan = inject_inner_join_null_reject(plan, select, is, current_db);
         // TiDB sizes the join on the pushed-down children (the null-rejecting
         // Selection above each side changes the key NDV).
-        let plan = fill_join_est_rows(plan, is, current_db, stats);
+        let plan = fill_join_est_rows(
+            plan,
+            is,
+            current_db,
+            stats,
+            &query_alias_map(select),
+        );
         let plan = star_join_projection(plan, select, is, current_db);
         Ok(plan)
     }
@@ -3807,6 +3841,39 @@ fn order_by_handle(
     desc
 }
 
+/// `ORDER BY` a prefix of the point-get key: a single-row lookup returns its
+/// row in key order, so TiDB keeps no `Sort` above the point get.
+fn point_get_prefix_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
+    let PhysicalPlan::PointGet {
+        index,
+        index_columns,
+        ..
+    } = plan
+    else {
+        return false;
+    };
+    if index.is_none() || index_columns.is_empty() {
+        return false;
+    }
+    if select.order_by.is_empty() || select.order_by.len() > index_columns.len() {
+        return false;
+    }
+    let mut desc = None;
+    for (item, key) in select.order_by.iter().zip(index_columns.iter()) {
+        let ExprNode::Column(col) = &item.expr else {
+            return false;
+        };
+        if !col.name.eq_ignore_ascii_case(key) {
+            return false;
+        }
+        match desc {
+            Some(prev) if prev != item.desc => return false,
+            _ => desc = Some(item.desc),
+        }
+    }
+    true
+}
+
 /// `ORDER BY` the batch point-get key (index prefix or handle) needs no Sort:
 /// the batch walks its keys in order (`keep order:true, desc:…`).
 /// Returns `Some(descending)` when the sort is satisfied by the key order.
@@ -4077,7 +4144,7 @@ fn apply_order_limit(
     if let Some(lim) = limit {
         plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), lim);
     } else if offset.is_some() {
-        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), 0);
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), u64::MAX);
     }
     plan
 }
@@ -4680,6 +4747,40 @@ thread_local! {
     /// `min(partial, final)`; when both are 1 the divisor is 0 and the hash
     /// aggregate prices exactly like a `StreamAgg` plus its memory cost.
     static HASHAGG_CONCURRENCY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((5, 5)) };
+    /// TiDB `tidb_opt_agg_push_down` (default OFF): `AggregationPushDownSolver`
+    /// may split a decomposable aggregation into a partial one below an inner
+    /// join plus a final aggregation above it.
+    static AGG_PUSH_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// TiDB `tidb_opt_insubq_to_join_and_agg` (default ON): a non-correlated
+    /// `x IN (SELECT …)` becomes an inner join with a de-duplicating aggregate
+    /// on the subquery side instead of a semi join.
+    static INSUBQ_TO_JOIN_AND_AGG: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Run `f` with the session's `tidb_opt_insubq_to_join_and_agg` visible.
+pub fn with_insubq_to_join_and_agg<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let prev = INSUBQ_TO_JOIN_AND_AGG.with(|c| c.replace(on));
+    let out = f();
+    INSUBQ_TO_JOIN_AND_AGG.with(|c| c.set(prev));
+    out
+}
+
+/// Session `tidb_opt_insubq_to_join_and_agg` (TiDB default ON).
+pub fn insubq_to_join_and_agg() -> bool {
+    INSUBQ_TO_JOIN_AND_AGG.with(|c| c.get())
+}
+
+/// Run `f` with the session's `tidb_opt_agg_push_down` visible to the builder.
+pub fn with_agg_push_down<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let prev = AGG_PUSH_DOWN.with(|c| c.replace(on));
+    let out = f();
+    AGG_PUSH_DOWN.with(|c| c.set(prev));
+    out
+}
+
+/// Session `tidb_opt_agg_push_down` (TiDB default OFF).
+pub fn agg_push_down() -> bool {
+    AGG_PUSH_DOWN.with(|c| c.get())
 }
 
 /// Run `f` with the session's hash-aggregate concurrency visible to cost models.
@@ -8936,25 +9037,36 @@ fn dnf_same_index_plan(
     if arms.len() < 2 {
         return None;
     }
-    let mut column: Option<String> = None;
+    // Every arm pins the same set of columns (`c1=0 and c2=1`); a composite
+    // index whose whole key is pinned becomes one point range per arm.
+    let mut pinned: Option<Vec<String>> = None;
     for arm in &arms {
-        let (name, _) = arm.eq_column_const()?;
-        match &column {
-            Some(have) if !have.eq_ignore_ascii_case(&name) => return None,
-            _ => column = Some(name),
+        let mut columns = Vec::new();
+        for conjunct in arm.split_cnf() {
+            let (name, _) = conjunct.eq_column_const()?;
+            columns.push(name);
+        }
+        if columns.is_empty() {
+            return None;
+        }
+        match &pinned {
+            Some(have) if !same_column_set(have, &columns) => return None,
+            Some(_) => {}
+            None => pinned = Some(columns),
         }
     }
-    let column = column?;
+    let pinned = pinned?;
     let index = info
         .indices
         .iter()
         .filter(|idx| {
             !(idx.primary && info.pk_is_clustered())
                 && !index_ignored(from, idx.name.o())
-                && idx
-                    .columns
-                    .first()
-                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&column))
+                && idx.columns.iter().all(|column| {
+                    pinned
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(column.name.o()))
+                })
         })
         .min_by(|a, b| {
             a.columns
@@ -8963,6 +9075,13 @@ fn dnf_same_index_plan(
                 .then(a.primary.cmp(&b.primary))
         })?;
     Some(index_plan(select, from, info, index, prune_mode, join_keys))
+}
+
+/// Same column names regardless of order (`c1, c2` ≡ `c2, c1`).
+fn same_column_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .all(|left| b.iter().any(|right| left.eq_ignore_ascii_case(right)))
 }
 
 /// `USE_INDEX_MERGE(t, idx…)` hint targeting one table factor. An empty index
@@ -10280,6 +10399,7 @@ fn build_agg_plan(
     plan: PhysicalPlan,
     current_db: &str,
     is: Option<&InfoSchema>,
+    stats: Option<&Handle>,
 ) -> (PhysicalPlan, bool) {
     // `use` may leave another schema as the session default while the query
     // names its table explicitly (`select … from with_cluster_index.tbl_0`):
@@ -10520,6 +10640,32 @@ fn build_agg_plan(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // TiDB `eliminateSingleRowAgg`: a point get returns at most one row, so a
+    // plain `GROUP BY` over it yields that row unchanged. An `ORDER BY` keeps a
+    // StreamAgg so the ordered columns stay in the aggregate's output.
+    if matches!(plan, PhysicalPlan::PointGet { .. })
+        && !select.fields.iter().any(|field| is_agg_expr(&field.expr))
+    {
+        if select.order_by.is_empty() {
+            return (plan, false);
+        }
+        if let Some(info) = is.and_then(|is| is.table_by_name(&agg_db, table)) {
+            let funcs: Vec<String> = info
+                .columns
+                .iter()
+                .map(|column| {
+                    let col_ref = format!("{db_qual}{table}.{}", column.name.o());
+                    format!("funcs:firstrow({col_ref})->{col_ref}")
+                })
+                .collect();
+            let info_text = format!("group by:{group_info}, {}", funcs.join(", "));
+            return (
+                PhysicalPlan::stream_agg(plan, info_text, String::new(), 1.0),
+                false,
+            );
+        }
+    }
+
     if select.distinct {
         // TiDB: HashAgg(firstrow distinct cols) → StreamAgg(group by) → IndexReader.
         let field = select
@@ -10540,6 +10686,12 @@ fn build_agg_plan(
     // the synthetic partial `count` when the select list holds only group-by
     // columns (`funcs:firstrow(…)->…` only).
     if !select.joins.is_empty() {
+        // TiDB `AggregationPushDownSolver` runs before the aggregate is built:
+        // with `tidb_opt_agg_push_down` on, part of the aggregation moves into
+        // the build side of an inner join.
+        if let Some(pushed) = join_agg_push_down(select, plan.clone(), current_db, is, stats) {
+            return pushed;
+        }
         return build_join_agg_plan(select, plan, current_db);
     }
 
@@ -10933,6 +11085,360 @@ fn join_agg_col_ref(select: &SelectStmt, current_db: &str, expr: &ExprNode) -> S
         return format!("{schema}.{phys}.{}", c.name);
     }
     expr.restore_string()
+}
+
+/// TiDB `AggregationPushDownSolver` for a two-table inner join.
+///
+/// With `tidb_opt_agg_push_down` on, a decomposable aggregate over an inner
+/// join splits into a partial `HashAgg` on the side that owns its arguments
+/// (TiDB always pushes into the join's build side) and a final aggregate above
+/// the join. The partial aggregation groups by that side's share of the
+/// `GROUP BY` list plus the join keys, so the join can re-merge the groups.
+///
+/// When the `GROUP BY` list pins a unique key of the *other* side every join
+/// row is already its own group: the final aggregation collapses into a plain
+/// `Projection` of the partial results.
+///
+/// Returns the rewritten plan plus the `stream_keep_order` flag.
+fn join_agg_push_down(
+    select: &SelectStmt,
+    plan: PhysicalPlan,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+    stats: Option<&Handle>,
+) -> Option<(PhysicalPlan, bool)> {
+    use super::rule_aggregation_push_down::{
+        AggSide, covers_unique_key, expr_side, is_decomposable,
+    };
+
+    if !super::agg_push_down()
+        || select.joins.len() != 1
+        || select.distinct
+        || !select.having.is_none()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return None;
+    }
+    let PhysicalPlan::HashJoin {
+        tp: JoinType::Inner,
+        left,
+        right,
+        left_table,
+        right_table,
+        est_rows,
+        on,
+    } = plan
+    else {
+        return None;
+    };
+    // TiDB stops at the first join: a spine of joins keeps its aggregation.
+    let is_join = |p: &PhysicalPlan| {
+        matches!(p, PhysicalPlan::HashJoin { .. } | PhysicalPlan::MergeJoin { .. })
+    };
+    if is_join(&left) || is_join(&right) {
+        return None;
+    }
+    // Aliases and physical table names both name a side (predicate pushdown
+    // rewrites the ON columns to physical names).
+    let ast_join = &select.joins[0];
+    let left_names = vec![
+        left_table.to_ascii_lowercase(),
+        ast_join.left.resolve_name().to_ascii_lowercase(),
+    ];
+    let right_names = vec![
+        right_table.to_ascii_lowercase(),
+        ast_join.right.resolve_name().to_ascii_lowercase(),
+    ];
+
+    // Split the aggregate functions by the side that owns their arguments.
+    let mut left_aggs: Vec<&FuncCallExpr> = Vec::new();
+    let mut right_aggs: Vec<&FuncCallExpr> = Vec::new();
+    let mut agg_fields: Vec<&FuncCallExpr> = Vec::new();
+    for field in &select.fields {
+        let ExprNode::Func(func) = &field.expr else {
+            if matches!(field.expr, ExprNode::Column(_)) {
+                continue;
+            }
+            return None;
+        };
+        if !is_agg_expr(&field.expr) {
+            return None;
+        }
+        if !is_decomposable(&func.name, func.distinct, 0) {
+            return None;
+        }
+        agg_fields.push(func);
+        match func.args.first() {
+            // A constant argument (`count(1)`) joins the build side.
+            None => right_aggs.push(func),
+            Some(arg) => match expr_side(arg, &left_names, &right_names) {
+                AggSide::Left => left_aggs.push(func),
+                AggSide::Right | AggSide::Neither => right_aggs.push(func),
+                AggSide::Both => return None,
+            },
+        }
+    }
+    if agg_fields.is_empty() {
+        return None;
+    }
+    // TiDB's `checkAnyCountAndSum` guard: `count`/`sum` on one side forbid
+    // pushing the other side's aggregation through the join (NULL handling).
+    let has_count_sum = |funcs: &[&FuncCallExpr]| {
+        funcs
+            .iter()
+            .any(|f| matches!(f.name.to_ascii_lowercase().as_str(), "count" | "sum"))
+    };
+    if (has_count_sum(&right_aggs) && !left_aggs.is_empty())
+        || (has_count_sum(&left_aggs) && !right_aggs.is_empty())
+    {
+        return None;
+    }
+
+    // Group keys may only be plain columns; split them by side.
+    let mut left_gby: Vec<ExprNode> = Vec::new();
+    let mut right_gby: Vec<ExprNode> = Vec::new();
+    for item in &select.group_by {
+        if !matches!(item, ExprNode::Column(_)) {
+            return None;
+        }
+        match expr_side(item, &left_names, &right_names) {
+            AggSide::Left => push_group_key(&mut left_gby, item),
+            AggSide::Right => push_group_key(&mut right_gby, item),
+            AggSide::Both | AggSide::Neither => return None,
+        }
+    }
+    // The join keys pin the groups of both sides (`addGbyCols`).
+    for (lc, rc) in join_eq_pairs(&on) {
+        let l = ExprNode::Column(lc);
+        let r = ExprNode::Column(rc);
+        let l_side = expr_side(&l, &left_names, &right_names);
+        let r_side = expr_side(&r, &left_names, &right_names);
+        if (l_side == AggSide::Left && r_side == AggSide::Right)
+            || (l_side == AggSide::Right && r_side == AggSide::Left)
+        {
+            push_group_key(&mut left_gby, &l);
+            push_group_key(&mut right_gby, &r);
+        }
+    }
+
+    let push_right = !right_aggs.is_empty();
+    let push_left = !push_right && !left_aggs.is_empty();
+    if !push_right && !push_left {
+        return None;
+    }
+    let (push_gby, push_aggs) = if push_right {
+        (&right_gby, &right_aggs)
+    } else {
+        (&left_gby, &left_aggs)
+    };
+    if push_gby.is_empty() {
+        return None;
+    }
+    // TiDB `tryToEliminateAggregation` on the pushed side: its groups are
+    // single rows already, so nothing is pushed at all.
+    let pushed_table = if push_right { &right_table } else { &left_table };
+    let pushed_physical = join_side_physical(select, pushed_table);
+    let pushed_names: Vec<String> = push_gby
+        .iter()
+        .filter_map(|e| match e {
+            ExprNode::Column(c) => Some(c.name.clone()),
+            _ => None,
+        })
+        .collect();
+    if let Some(info) = is.and_then(|is| is.table_by_name(current_db, &pushed_physical))
+        && covers_unique_key(info, &pushed_names)
+    {
+        return None;
+    }
+
+    // The partial aggregation replaces the pushed side's subtree.
+    let child = if push_right {
+        (*right).clone()
+    } else {
+        (*left).clone()
+    };
+    let pseudo = super::explain::is_pseudo_plan(&child);
+    let child_rows = super::explain::est_rows(&child).max(1.0);
+    let out_col = join_datasource_out_column(select, current_db, is).unwrap_or(5);
+    let aliases = query_alias_map(select);
+    let partial_est = pushed_group_est(push_gby, &child, child_rows, current_db, &aliases, stats);
+
+    let group_info: Vec<String> = push_gby
+        .iter()
+        .map(|e| join_agg_col_ref(select, current_db, e))
+        .collect();
+    let mut root_funcs: Vec<String> = Vec::new();
+    let mut cop_funcs: Vec<String> = Vec::new();
+    // TiDB `makeNewAgg` allocates the final aggregate's output columns first,
+    // then the partial aggregate's own outputs (the cop task's in 2-phase mode).
+    let n = push_aggs.len();
+    let mut partial_next = out_col + n;
+    let mut cop_next = out_col + 2 * n;
+    for func in push_aggs {
+        let name = func.name.to_ascii_lowercase();
+        let arg = func
+            .args
+            .first()
+            .map(|a| join_agg_col_ref(select, current_db, a))
+            .unwrap_or_else(|| "1".to_string());
+        if pseudo {
+            cop_funcs.push(format!("funcs:{name}({arg})->Column#{cop_next}"));
+            root_funcs.push(format!(
+                "funcs:{name}(Column#{cop_next})->Column#{partial_next}"
+            ));
+            cop_next += 1;
+        } else {
+            root_funcs.push(format!("funcs:{name}({arg})->Column#{partial_next}"));
+        }
+        partial_next += 1;
+    }
+    for (expr, text) in push_gby.iter().zip(group_info.iter()) {
+        let _ = expr;
+        root_funcs.push(format!("funcs:firstrow({text})->{text}"));
+    }
+    let partial_info = format!("group by:{}, {}", group_info.join(", "), root_funcs.join(", "));
+    let partial = if pseudo {
+        PhysicalPlan::hash_agg_cop(
+            child,
+            partial_info,
+            format!("group by:{}, {}", group_info.join(", "), cop_funcs.join(", ")),
+            partial_est,
+        )
+    } else {
+        PhysicalPlan::hash_agg(child, partial_info, partial_est)
+    };
+    let join = if push_right {
+        PhysicalPlan::HashJoin {
+            tp: JoinType::Inner,
+            left,
+            right: Box::new(partial),
+            left_table: left_table.clone(),
+            right_table: right_table.clone(),
+            est_rows,
+            on,
+        }
+    } else {
+        PhysicalPlan::HashJoin {
+            tp: JoinType::Inner,
+            left: Box::new(partial),
+            right,
+            left_table: left_table.clone(),
+            right_table: right_table.clone(),
+            est_rows,
+            on,
+        }
+    };
+
+    // The final aggregation disappears when the other side's `GROUP BY`
+    // columns already pin one row per group.
+    let other_table = if push_right { &left_table } else { &right_table };
+    let other_physical = join_side_physical(select, other_table);
+    let outer_names: Vec<String> = select
+        .group_by
+        .iter()
+        .filter_map(|e| match e {
+            ExprNode::Column(c) => Some(c.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let eliminated = is
+        .and_then(|is| is.table_by_name(current_db, &other_physical))
+        .is_some_and(|info| covers_unique_key(info, &outer_names));
+    if eliminated {
+        let exprs: Vec<String> = (0..agg_fields.len())
+            .map(|i| format!("Column#{}", out_col + i))
+            .collect();
+        return Some((
+            PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(join),
+            },
+            false,
+        ));
+    }
+
+    // Final aggregation above the join: it consumes the partial columns.
+    let mut final_funcs: Vec<String> = Vec::new();
+    let mut col = out_col + agg_fields.len();
+    for (index, func) in agg_fields.iter().enumerate() {
+        let name = func.name.to_ascii_lowercase();
+        final_funcs.push(format!(
+            "funcs:{name}(Column#{col})->Column#{}",
+            out_col + index
+        ));
+        col += 1;
+    }
+    for item in &select.group_by {
+        let text = join_agg_col_ref(select, current_db, item);
+        final_funcs.push(format!("funcs:firstrow({text})->{text}"));
+    }
+    let final_info = if select.group_by.is_empty() {
+        final_funcs.join(", ")
+    } else {
+        format!(
+            "group by:{}, {}",
+            select
+                .group_by
+                .iter()
+                .map(|e| join_agg_col_ref(select, current_db, e))
+                .collect::<Vec<_>>()
+                .join(", "),
+            final_funcs.join(", ")
+        )
+    };
+    Some((
+        PhysicalPlan::hash_agg(join, final_info, partial_est),
+        false,
+    ))
+}
+
+/// Append a `GROUP BY` column unless the list already holds it.
+fn push_group_key(keys: &mut Vec<ExprNode>, item: &ExprNode) {
+    let ExprNode::Column(col) = item else {
+        return;
+    };
+    let dup = keys.iter().any(|k| match k {
+        ExprNode::Column(k) => k.name.eq_ignore_ascii_case(&col.name),
+        _ => false,
+    });
+    if !dup {
+        keys.push(item.clone());
+    }
+}
+
+/// TiDB's partial-aggregation cardinality: the group-key NDV product, capped by
+/// the input row count. Pseudo statistics fall back to `0.8` per key.
+fn pushed_group_est(
+    keys: &[ExprNode],
+    child: &PhysicalPlan,
+    rows: f64,
+    current_db: &str,
+    aliases: &[(String, String)],
+    stats: Option<&Handle>,
+) -> f64 {
+    if super::explain::is_pseudo_plan(child) {
+        return (rows * 0.8_f64.powi(keys.len() as i32)).max(1.0);
+    }
+    let mut est = 1.0;
+    for item in keys {
+        let ExprNode::Column(col) = item else {
+            continue;
+        };
+        let table = col.table.as_deref().unwrap_or("");
+        let db = col.schema.as_deref().unwrap_or(current_db);
+        let physical = aliases
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(table))
+            .map(|(_, phys)| phys.as_str())
+            .unwrap_or(table);
+        let ndv = stats
+            .and_then(|h| h.table(db, physical))
+            .filter(|t| has_real_stats(t))
+            .and_then(|t| t.column_ndv(&col.name));
+        est *= ndv.unwrap_or(rows);
+    }
+    est.min(rows).max(1.0)
 }
 
 /// HashAgg over a join: TiDB `ExplainInfo` uses OrigTblName operands and omits
@@ -12386,11 +12892,30 @@ fn point_get_residual_est(
     Some((super::explain::est_rows(child) * sel).clamp(0.0, realtime))
 }
 
+/// `(alias-or-name, physical table name)` for every table the query reads.
+///
+/// Join predicates keep the alias (`b.c2`) while table statistics are keyed by
+/// the physical `OrigTblName` (`t2`), so every statistics lookup goes through
+/// this map first.
+fn query_alias_map(select: &SelectStmt) -> Vec<(String, String)> {
+    select
+        .join_tables()
+        .iter()
+        .map(|t| {
+            (
+                t.name.to_ascii_lowercase(),
+                t.resolve_name().to_ascii_lowercase(),
+            )
+        })
+        .collect()
+}
+
 fn fill_join_est_rows(
     plan: PhysicalPlan,
     is: Option<&InfoSchema>,
     current_db: &str,
     stats: Option<&Handle>,
+    aliases: &[(String, String)],
 ) -> PhysicalPlan {
     match plan {
         PhysicalPlan::HashJoin {
@@ -12402,10 +12927,10 @@ fn fill_join_est_rows(
             right_table,
             on,
         } => {
-            let left = fill_join_est_rows(*left, is, current_db, stats);
-            let right = fill_join_est_rows(*right, is, current_db, stats);
+            let left = fill_join_est_rows(*left, is, current_db, stats, aliases);
+            let right = fill_join_est_rows(*right, is, current_db, stats, aliases);
             let est_rows = est_rows.or_else(|| {
-                join_est_by_ndv(&left, &right, tp, &on, is, current_db, stats)
+                join_est_by_ndv(&left, &right, tp, &on, is, current_db, stats, aliases)
             });
             PhysicalPlan::HashJoin {
                 est_rows,
@@ -12419,14 +12944,14 @@ fn fill_join_est_rows(
         }
         PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
             exprs,
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
         },
         PhysicalPlan::Selection {
             child,
             filter,
             est_rows,
         } => {
-            let child = fill_join_est_rows(*child, is, current_db, stats);
+            let child = fill_join_est_rows(*child, is, current_db, stats, aliases);
             // TiDB derives a residual Selection's cardinality from the table
             // statistics (`cardinality.Selectivity`): a point get pins one row
             // and the residual predicates scale it by their column / index
@@ -12441,7 +12966,7 @@ fn fill_join_est_rows(
             }
         }
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
             by_info,
         },
         PhysicalPlan::TopN {
@@ -12450,7 +12975,7 @@ fn fill_join_est_rows(
             offset,
             count,
         } => PhysicalPlan::TopN {
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
             by_info,
             offset,
             count,
@@ -12460,7 +12985,7 @@ fn fill_join_est_rows(
             offset,
             count,
         } => PhysicalPlan::Limit {
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
             offset,
             count,
         },
@@ -12471,7 +12996,7 @@ fn fill_join_est_rows(
         } => PhysicalPlan::UnionScan {
             info,
             est_rows,
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
         },
         PhysicalPlan::CTE {
             name,
@@ -12487,9 +13012,9 @@ fn fill_join_est_rows(
             name,
             alias,
             columns,
-            seed: Box::new(fill_join_est_rows(*seed, is, current_db, stats)),
+            seed: Box::new(fill_join_est_rows(*seed, is, current_db, stats, aliases)),
             recursive_plan: recursive_plan
-                .map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats))),
+                .map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats, aliases))),
             inline,
             recursive,
             limit,
@@ -12501,9 +13026,9 @@ fn fill_join_est_rows(
             probe,
             info,
         } => PhysicalPlan::Apply {
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
             filter,
-            probe: probe.map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats))),
+            probe: probe.map(|p| Box::new(fill_join_est_rows(*p, is, current_db, stats, aliases))),
             info,
         },
         PhysicalPlan::RowProjection {
@@ -12515,12 +13040,12 @@ fn fill_join_est_rows(
             info,
             exprs,
             names,
-            child: Box::new(fill_join_est_rows(*child, is, current_db, stats)),
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
         },
         PhysicalPlan::PartitionUnion { children } => PhysicalPlan::PartitionUnion {
             children: children
                 .into_iter()
-                .map(|p| fill_join_est_rows(p, is, current_db, stats))
+                .map(|p| fill_join_est_rows(p, is, current_db, stats, aliases))
                 .collect(),
         },
         PhysicalPlan::IndexJoin {
@@ -12531,8 +13056,8 @@ fn fill_join_est_rows(
         } => PhysicalPlan::IndexJoin {
             info,
             est_rows,
-            outer: Box::new(fill_join_est_rows(*outer, is, current_db, stats)),
-            inner: Box::new(fill_join_est_rows(*inner, is, current_db, stats)),
+            outer: Box::new(fill_join_est_rows(*outer, is, current_db, stats, aliases)),
+            inner: Box::new(fill_join_est_rows(*inner, is, current_db, stats, aliases)),
         },
         other => other,
     }
@@ -12633,12 +13158,19 @@ fn column_usable_ndv(
     stats: Option<&Handle>,
     is: Option<&InfoSchema>,
     current_db: &str,
+    aliases: &[(String, String)],
     plan: &PhysicalPlan,
     col: &sealdb_parser::ast::expressions::ColumnNameExpr,
     side_rows: f64,
 ) -> Option<f64> {
     let table = col.table.as_deref()?;
     let db = col.schema.as_deref().unwrap_or(current_db);
+    // Statistics are keyed by the physical table name, the predicate by alias.
+    let physical = aliases
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(table))
+        .map(|(_, phys)| phys.as_str())
+        .unwrap_or(table);
     let side = {
         let mut names = Vec::new();
         plan_table_names(plan, &mut names);
@@ -12646,7 +13178,7 @@ fn column_usable_ndv(
     };
     let owned = side.iter().any(|n| n.eq_ignore_ascii_case(table))
         || is
-            .and_then(|is| is.table_by_name(db, table))
+            .and_then(|is| is.table_by_name(db, physical))
             .is_some_and(|info| {
                 side.iter()
                     .any(|n| n.eq_ignore_ascii_case(info.name.o()))
@@ -12654,9 +13186,9 @@ fn column_usable_ndv(
     if !owned {
         return None;
     }
-    let table_stats = stats.and_then(|h| h.table(db, table)).filter(|t| {
-        super::plan_cost::has_real_stats(t)
-    });
+    let table_stats = stats
+        .and_then(|h| h.table(db, physical))
+        .filter(|t| super::plan_cost::has_real_stats(t));
     if let Some(t) = table_stats
         && let Some(ndv) = t.column_ndv(&col.name)
     {
@@ -12671,9 +13203,11 @@ fn column_usable_ndv(
     }
     // TiDB's `pseudo` join-key NDV: the statistics do not carry this column,
     // so the estimate degrades to `pseudoLessRate × rows`. The rows come from
-    // the column's own scan subtree (filters above it included), not from the
+    // the column's own scan subtree (filters above them included), not from the
     // whole join side: a 2.50-row inner-join spine still sees `t4.a` as 7992,
     // so `t4 ⟕ …` matches on the key NDV instead of the spine cardinality.
+    // TiDB `EstimateColumnNDV` has no unique-key special case: a key column
+    // without histogram statistics keeps the distinct factor.
     let rows = pseudo_column_rows(plan, table).unwrap_or_else(|| side_rows.max(1.0));
     Some(rows * 0.8)
 }
@@ -12707,6 +13241,7 @@ fn join_est_by_ndv(
     is: Option<&InfoSchema>,
     current_db: &str,
     stats: Option<&Handle>,
+    aliases: &[(String, String)],
 ) -> Option<f64> {
     let l = super::explain::est_rows(left);
     let r = super::explain::est_rows(right);
@@ -12722,17 +13257,17 @@ fn join_est_by_ndv(
     let mut seen_l = false;
     let mut seen_r = false;
     for (lc, rc) in &pairs {
-        if let Some(ndv) = column_usable_ndv(stats, is, current_db, left, lc, l) {
+        if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, left, lc, l) {
             ndv_l = ndv_l.max(ndv);
             seen_l = true;
-        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, right, lc, r) {
+        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, right, lc, r) {
             ndv_r = ndv_r.max(ndv);
             seen_r = true;
         }
-        if let Some(ndv) = column_usable_ndv(stats, is, current_db, right, rc, r) {
+        if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, right, rc, r) {
             ndv_r = ndv_r.max(ndv);
             seen_r = true;
-        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, left, rc, l) {
+        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, left, rc, l) {
             ndv_l = ndv_l.max(ndv);
             seen_l = true;
         }
@@ -13087,6 +13622,163 @@ fn exists_having_agg_semi_plan(
         on: ExprNode::Value(ValueExpr {
             datum: Datum::Bytes(b"semi join, equal:[eq(Column#13, Column#11)]".to_vec()),
         }),
+    })
+}
+
+/// Correlated scalar subquery with an ordered limit in the select list:
+/// `select c2 = (select c2 from t2 where t1.c1 = t2.c1 order by c1 limit 1) from t1`.
+///
+/// TiDB keeps the correlation as an `Apply` (CARTESIAN left outer join): the
+/// outer scan builds, and the probe is a `TopN` over the inner index range whose
+/// bounds the outer key decides. The Apply cardinality follows the outer side,
+/// and the correlated index scan is scaled by the outer row count.
+///
+/// Only the analyzed shape is modeled here; under pseudo statistics TiDB sinks
+/// the limit into the `IndexLookUp` and drops the `TopN` (`explain_easy`).
+fn scalar_order_limit_apply_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if select.fields.len() != 1
+        || !select.joins.is_empty()
+        || select.from_item.is_some()
+        || select.selection.is_some()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+    {
+        return None;
+    }
+    let outer = select.from.as_ref()?;
+    if outer.name.eq_ignore_ascii_case("dual") {
+        return None;
+    }
+    let ExprNode::Binary(cmp) = &select.fields[0].expr else {
+        return None;
+    };
+    if cmp.op != Op::Eq {
+        return None;
+    }
+    let (outer_col, sub) = match (cmp.left.as_ref(), cmp.right.as_ref()) {
+        (ExprNode::Column(col), ExprNode::ScalarSubquery(sub)) => (col, sub),
+        (ExprNode::ScalarSubquery(sub), ExprNode::Column(col)) => (col, sub),
+        _ => return None,
+    };
+    let ResultSetNode::Select(inner) = sub.query.as_ref() else {
+        return None;
+    };
+    if inner.fields.len() != 1
+        || !inner.joins.is_empty()
+        || inner.from_item.is_some()
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || inner.distinct
+        || inner.limit != Some(1)
+        || inner.offset.unwrap_or(0) != 0
+        || inner.order_by.len() != 1
+        || inner.order_by[0].desc
+    {
+        return None;
+    }
+    let inner_from = inner.from.as_ref()?;
+    let ExprNode::Column(order_col) = &inner.order_by[0].expr else {
+        return None;
+    };
+    let ExprNode::Column(inner_field) = &inner.fields[0].expr else {
+        return None;
+    };
+    // The correlation compares a column of the inner table with the outer.
+    let ExprNode::Binary(corr) = inner.selection.as_ref()? else {
+        return None;
+    };
+    if corr.op != Op::Eq {
+        return None;
+    }
+    let (l, r) = match (corr.left.as_ref(), corr.right.as_ref()) {
+        (ExprNode::Column(a), ExprNode::Column(b)) => (a, b),
+        _ => return None,
+    };
+    let outer_name = outer.resolve_name().to_string();
+    let inner_name = inner_from.resolve_name().to_string();
+    let (outer_ref, inner_ref) = match (l.table.as_deref(), r.table.as_deref()) {
+        (Some(lt), Some(rt))
+            if lt.eq_ignore_ascii_case(&outer_name) && rt.eq_ignore_ascii_case(&inner_name) =>
+        {
+            (l, r)
+        }
+        (Some(lt), Some(rt))
+            if lt.eq_ignore_ascii_case(&inner_name) && rt.eq_ignore_ascii_case(&outer_name) =>
+        {
+            (r, l)
+        }
+        _ => return None,
+    };
+    if !inner_ref.name.eq_ignore_ascii_case(&order_col.name) {
+        return None;
+    }
+    // Analyzed fixture only: the pseudo shape embeds the limit in the lookup.
+    let (inner_db, inner_table) = inner_from.qualified(current_db);
+    stats
+        .and_then(|handle| handle.table(&inner_db, &inner_table))
+        .filter(|t| has_real_stats(t))?;
+    let info = is?.table_by_name(&inner_db, &inner_table)?;
+    let index = info.indices.iter().find(|idx| {
+        !(idx.primary && info.pk_is_clustered())
+            && !index_ignored(inner_from, idx.name.o())
+            && index_key_column_names(info, idx)
+                .first()
+                .is_some_and(|key| key.eq_ignore_ascii_case(&order_col.name))
+    })?;
+    let outer_rows = table_row_count(stats, outer, current_db);
+    let inner_rows = table_row_count(stats, inner_from, current_db);
+    // TiDB cross-estimates `outer.k = inner.k` at the pseudo 1/1000 equality
+    // rate and `AdjustRowCountForIndexScanByLimit` widens it by 1.25 for the
+    // `LIMIT 1`; the Apply then scales the probe by the outer row count.
+    let scan_rows = inner_rows / 1000.0 * 1.25 * outer_rows;
+    let schema = schema_prefix(current_db);
+    let by_info = format!("{schema}.{inner_name}.{}", order_col.name);
+    let range = format!(
+        "decided by [eq({schema}.{outer_name}.{}, {schema}.{inner_name}.{})]",
+        outer_ref.name, inner_ref.name
+    );
+    let lookup = PhysicalPlan::IndexLookUpReader {
+        table: inner_from.name.clone(),
+        index: index.name.o().to_string(),
+        index_columns: index_key_column_names(&info, index),
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: outer_rows,
+        // Marker: the decided-by range sits under a cop `TopN(Build)`.
+        selection_info: Some(format!("TOPN|{by_info}|{scan_rows}")),
+        probe_selection_info: None,
+        probe_est: 0.0,
+        range_scan: None,
+        pushed: Some(range_push(&range)),
+    };
+    let probe = PhysicalPlan::TopN {
+        child: Box::new(lookup),
+        by_info,
+        offset: 0,
+        count: 1,
+    };
+    let build = access_plan(select, outer, is, current_db, stats, prune_mode);
+    let apply = PhysicalPlan::Apply {
+        child: Box::new(build),
+        filter: ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b"apply".to_vec()),
+        }),
+        probe: Some(Box::new(probe)),
+        info: Some("CARTESIAN left outer join".to_string()),
+    };
+    Some(PhysicalPlan::Projection {
+        exprs: vec![format!(
+            "eq({schema}.{outer_name}.{}, {schema}.{inner_name}.{})->Column#11",
+            outer_col.name, inner_field.name
+        )],
+        child: Box::new(apply),
     })
 }
 

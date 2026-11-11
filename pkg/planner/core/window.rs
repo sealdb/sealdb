@@ -247,7 +247,7 @@ fn apply_window_outer_order(
     if let Some(lim) = limit {
         plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), lim);
     } else if offset.is_some() {
-        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), 0);
+        plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), u64::MAX);
     }
     plan
 }

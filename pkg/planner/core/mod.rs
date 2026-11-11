@@ -13,6 +13,7 @@ pub mod plan_cache_param;
 pub mod plan_cost;
 pub mod plan_cost_ver2;
 pub mod planbuilder;
+pub mod rule_aggregation_push_down;
 pub mod rule_constant_fold;
 pub mod rule_having_push_down;
 pub mod rule_inject_extra_projection;
@@ -37,6 +38,7 @@ pub use planbuilder::{
     normalize_enum_constants, normalize_comparison_literals,
     using_dropped_columns, with_dirty_tables, with_explicit_txn, PlanBuilder,
     with_cost_model_version, cost_model_version, with_hashagg_concurrency,
-    hashagg_cpu_amortized,
+    hashagg_cpu_amortized, with_agg_push_down, agg_push_down,
+    with_insubq_to_join_and_agg, insubq_to_join_and_agg,
 };
 pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};
