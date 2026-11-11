@@ -242,22 +242,35 @@ fn push_into(
             }
             // The index scan feeds the build side, so its output cardinality is
             // what remains after the *index-side* residual only; probe-side
-            // predicates must not shrink it.
-            if let Some(range) = access_range.as_mut()
-                && selection_info.is_some()
-            {
-                range.filter_rows = row_count;
+            // predicates must not shrink it. `IndexScanRange::filter_rows` was
+            // filled by the ranger from every unused predicate, so drop the
+            // probe share it folded in.
+            if let Some(range) = access_range.as_mut() {
+                range.filter_rows = if selection_info.is_some() {
+                    row_count
+                } else {
+                    range.rows
+                };
             }
             let probe_filter = if probe_side.is_empty() {
                 None
             } else {
                 ExprNode::compose_cnf(probe_side.clone())
             };
+            let probe_base = access_range.as_ref().map_or(row_count, |range| range.rows);
             let probe_est = probe_filter.as_ref().map_or(0.0, |filter| {
                 table_info
                     .as_ref()
                     .and_then(|info| unique_eq_rows(info, filter))
-                    .unwrap_or(row_count)
+                    .unwrap_or_else(|| {
+                        // TiDB sizes the `TableRowIDScan`'s filter from the
+                        // table's column statistics (`cardinality.Selectivity`),
+                        // so `c3 < 1` keeps its pseudo range rate over the rows
+                        // the index range produced.
+                        let sel = sealdb_statistics::pseudo::selectivity(&probe_side, 10_000.0, None)
+                            .unwrap_or(1.0);
+                        probe_base * sel
+                    })
             });
             let probe_selection_info = probe_filter
                 .as_ref()

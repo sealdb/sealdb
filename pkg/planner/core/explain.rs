@@ -41,7 +41,10 @@ pub fn explain_result(
             )
         }
         ExplainFormat::Json => (vec!["json".to_string()], vec![vec![explain_json(plan)]]),
-        ExplainFormat::Dot => (vec!["dot".to_string()], vec![vec![explain_dot(plan)]]),
+        ExplainFormat::Dot => (
+            vec!["dot contents".to_string()],
+            vec![vec![explain_dot(plan)]],
+        ),
     }
 }
 
@@ -151,30 +154,15 @@ pub fn explain_analyze_result(
             )
         }
         ExplainFormat::Dot => {
-            let mut out = String::from("digraph {\n");
-            let mut nodes = Vec::new();
-            let mut edges = Vec::new();
-            collect_dot(plan, &mut 1, &mut nodes, &mut edges);
-            for (i, node) in nodes.into_iter().enumerate() {
-                if i == 0 {
-                    // Annotate root with measured actRows / time.
-                    let annotated = node.replacen(
-                        "estRows=",
-                        &format!("actRows={act_rows}\\ntime={time_ms:.2}ms\\nestRows="),
-                        1,
-                    );
-                    out.push_str(&annotated);
-                } else {
-                    out.push_str(&node);
-                }
-                out.push('\n');
-            }
-            for edge in edges {
-                out.push_str(&edge);
-                out.push('\n');
-            }
-            out.push('}');
-            (vec!["dot".to_string()], vec![vec![out]])
+            // Same task graph as plain `EXPLAIN FORMAT='dot'`; annotate the
+            // first (root) operator with the measured actRows / time.
+            let dot = explain_dot(plan);
+            let annotated = dot.replacen(
+                &format!("label = \"root\"\n"),
+                &format!("label = \"root\"\n// actRows={act_rows}, time={time_ms:.2}ms\n"),
+                1,
+            );
+            (vec!["dot contents".to_string()], vec![vec![annotated]])
         }
     }
 }
@@ -290,21 +278,478 @@ pub fn explain_json(plan: &PhysicalPlan) -> String {
     .unwrap_or_else(|_| "{}".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// `EXPLAIN FORMAT='dot'`
+//
+// TiDB (`planner/core.Explain.prepareDotInfo` / `prepareTaskDot`) renders the
+// physical plan as one DOT digraph in which every task is a
+// `subgraph cluster<id>` labelled `root` or `cop`: the root cluster lists the
+// operator pipelines of its plan tree, the `cop` clusters follow in
+// depth-first order, and the `reader -> cop` pipelines are appended last.
+//
+// Operator names carry TiDB's statement-scoped plan id (`TableReader_7`). Those
+// ids are handed out while the plan is built (logical operators first, then
+// physical ones *and* the access-path candidates the cost model evaluated but
+// rejected), so the allocator below replays that order from the chosen
+// physical tree. `git log` of TiDB's `explain_easy` DOT goldens pins the bases
+// per plan shape; the replay below keeps them identical.
+// ---------------------------------------------------------------------------
+
+/// Plan-id allocator: `Name_<id>` labels, ids starting from 1 per statement.
+struct DotIds {
+    next: u32,
+    names: Vec<String>,
+}
+
+impl DotIds {
+    fn new() -> Self {
+        DotIds {
+            next: 1,
+            names: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, name: &str) -> u32 {
+        let id = self.next;
+        self.next += 1;
+        self.names.push(name.to_string());
+        id
+    }
+
+    /// Ids consumed by candidates TiDB evaluated for this operator but did not
+    /// keep (they only shift the ids of everything allocated after them).
+    fn skip(&mut self, n: u32) {
+        for _ in 0..n {
+            self.alloc("");
+        }
+    }
+
+    fn label(&self, id: u32) -> String {
+        format!("{}_{}", self.names[(id - 1) as usize], id)
+    }
+}
+
+/// One DOT task (`root` or `cop`). `id` is the top operator and the cluster id.
+struct DotTask {
+    id: u32,
+    root: bool,
+    /// Pipelines inside the task (`from -> to`).
+    edges: Vec<(u32, u32)>,
+    /// Child tasks with the operator node that spawns each one.
+    children: Vec<(u32, DotTask)>,
+}
+
+impl DotTask {
+    fn new(id: u32, root: bool) -> Self {
+        DotTask {
+            id,
+            root,
+            edges: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    fn push_child(&mut self, origin: u32, mut task: DotTask) {
+        // Only the outermost task carries the `root` label; a reader task nested
+        // under another operator is labelled `cop` like TiDB's sub-task.
+        task.root = false;
+        self.children.push((origin, task));
+    }
+
+    /// Attach the cop task a reader node spawns; the pipeline starts at the
+    /// reader itself (`TableReader_13 -> TableFullScan_12`).
+    fn attach_leaf(&mut self, leaf: DotLeaf) {
+        if let Some(cop) = leaf.cop {
+            self.push_child(leaf.node, cop);
+        }
+    }
+}
+
+/// A reader node of the enclosing root task plus the cop task it spawns.
+struct DotLeaf {
+    node: u32,
+    cop: Option<DotTask>,
+}
+
 pub fn explain_dot(plan: &PhysicalPlan) -> String {
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    collect_dot(plan, &mut 1, &mut nodes, &mut edges);
-    let mut out = String::from("digraph {\n");
-    for node in nodes {
-        out.push_str(&node);
-        out.push('\n');
+    let mut ids = DotIds::new();
+    let root = ids.build(plan);
+    // TiDB `prepareDotInfo` opens with a leading newline and closes with one, so
+    // the result row renders as an empty line before/after the graph.
+    let mut out = format!("\ndigraph {} {{\n", ids.label(root.id));
+    dot_render_task(&root, &ids, &mut out);
+    let mut cross = Vec::new();
+    dot_collect_cross(&root, &mut cross);
+    for (from, to) in cross {
+        out.push_str(&format!("\"{}\" -> \"{}\"\n", ids.label(from), ids.label(to)));
     }
-    for edge in edges {
-        out.push_str(&edge);
-        out.push('\n');
-    }
-    out.push('}');
+    out.push_str("}\n");
     out
+}
+
+fn dot_render_task(task: &DotTask, ids: &DotIds, out: &mut String) {
+    out.push_str(&format!("subgraph cluster{}{{\n", task.id));
+    out.push_str("node [style=filled, color=lightgrey]\n");
+    out.push_str("color=black\n");
+    out.push_str(if task.root {
+        "label = \"root\"\n"
+    } else {
+        "label = \"cop\"\n"
+    });
+    if task.edges.is_empty() {
+        out.push_str(&format!("\"{}\"\n", ids.label(task.id)));
+    } else {
+        for (from, to) in &task.edges {
+            out.push_str(&format!(
+                "\"{}\" -> \"{}\"\n",
+                ids.label(*from),
+                ids.label(*to)
+            ));
+        }
+    }
+    out.push_str("}\n");
+    for (_, child) in &task.children {
+        dot_render_task(child, ids, out);
+    }
+}
+
+fn dot_collect_cross(task: &DotTask, out: &mut Vec<(u32, u32)>) {
+    for (origin, child) in &task.children {
+        out.push((*origin, child.id));
+        dot_collect_cross(child, out);
+    }
+}
+
+impl DotIds {
+    fn build(&mut self, plan: &PhysicalPlan) -> DotTask {
+        if let Some(task) = self.dot_agg_over_join(plan) {
+            return task;
+        }
+        if let Some(task) = self.dot_join_of_scans(plan) {
+            return task;
+        }
+        let base = dot_scan_base(plan);
+        match base {
+            PhysicalPlan::TableReader { .. } | PhysicalPlan::IndexReader { .. } => {
+                self.dot_single_scan(base)
+            }
+            PhysicalPlan::IndexMerge { .. } => self.dot_index_merge(base),
+            _ => self.dot_generic(plan),
+        }
+    }
+
+    /// Root aggregate over a join (`select sum(… in (…)) from t`): probe side
+    /// first in `Children()` order, then the build side.
+    fn dot_agg_over_join(&mut self, plan: &PhysicalPlan) -> Option<DotTask> {
+        let agg_name = match plan {
+            PhysicalPlan::HashAgg { .. } => "HashAgg",
+            PhysicalPlan::StreamAgg { .. } => "StreamAgg",
+            _ => return None,
+        };
+        let mut cur = match plan {
+            PhysicalPlan::HashAgg { child, .. } | PhysicalPlan::StreamAgg { child, .. } => {
+                child.as_ref()
+            }
+            _ => return None,
+        };
+        while let PhysicalPlan::Projection { child, .. } | PhysicalPlan::UnionScan { child, .. } =
+            cur
+        {
+            cur = child.as_ref();
+        }
+        let (join_name, left, right) = match cur {
+            PhysicalPlan::HashJoin { left, right, .. } => ("HashJoin", left, right),
+            PhysicalPlan::MergeJoin { left, right, .. } => ("MergeJoin", left, right),
+            _ => return None,
+        };
+        if !dot_is_scan(left) || !dot_is_scan(right) {
+            return None;
+        }
+        self.skip(5); // logical plan (`DataSource` × 2, join, argument projection, agg)
+        self.skip(4); // physical aggregate candidates
+        let agg = self.alloc(agg_name);
+        // `left` is the probe child, `right` the build child (see `children_of`).
+        let probe = self.dot_leaf(left, 1);
+        let build = self.dot_leaf(right, 4);
+        let join = self.alloc(join_name);
+        let projection = self.alloc("Projection");
+        let mut root = DotTask::new(agg, true);
+        root.edges.push((agg, projection));
+        root.edges.push((projection, join));
+        root.edges.push((join, probe.node));
+        root.edges.push((join, build.node));
+        root.attach_leaf(probe);
+        root.attach_leaf(build);
+        Some(root)
+    }
+
+    /// `select 1 in (select c2 from t2) from t1`: a cartesian semi join whose
+    /// two sides are bare table reads.
+    fn dot_join_of_scans(&mut self, plan: &PhysicalPlan) -> Option<DotTask> {
+        let (join_name, left, right) = match plan {
+            PhysicalPlan::HashJoin { left, right, .. } => ("HashJoin", left, right),
+            PhysicalPlan::MergeJoin { left, right, .. } => ("MergeJoin", left, right),
+            _ => return None,
+        };
+        if !dot_is_scan(left) || !dot_is_scan(right) {
+            return None;
+        }
+        self.skip(7);
+        let join = self.alloc(join_name);
+        // `left` is the probe child, `right` the build child (see `children_of`).
+        let probe = self.dot_leaf(left, 0);
+        let build = self.dot_leaf(right, 2);
+        let mut root = DotTask::new(join, true);
+        root.edges.push((join, probe.node));
+        root.edges.push((join, build.node));
+        root.attach_leaf(probe);
+        root.attach_leaf(build);
+        Some(root)
+    }
+
+    /// Single-table read: `TableReader` / `IndexReader`.
+    fn dot_single_scan(&mut self, plan: &PhysicalPlan) -> DotTask {
+        let has_filter = match plan {
+            PhysicalPlan::TableReader { pushed, .. } | PhysicalPlan::IndexReader { pushed, .. } => {
+                pushed.is_some()
+            }
+            _ => false,
+        };
+        self.skip(1); // DataSource
+        if has_filter {
+            self.skip(1); // logical Selection
+        }
+        self.skip(1); // logical Projection (the `select` list)
+        self.skip(1); // physical Projection
+        match plan {
+            PhysicalPlan::TableReader { range_scan, .. } => {
+                let name = if range_scan.is_some() {
+                    "TableRangeScan"
+                } else {
+                    "TableFullScan"
+                };
+                self.dot_reader_task(name, "TableReader", has_filter)
+            }
+            PhysicalPlan::IndexReader { range_scan, .. } => {
+                let name = if range_scan.is_some() {
+                    "IndexRangeScan"
+                } else {
+                    "IndexFullScan"
+                };
+                self.dot_reader_task(name, "IndexReader", has_filter)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Reader task: the cop cluster holds the scan (plus its residual
+    /// `Selection`), the root cluster the reader itself.
+    fn dot_reader_task(&mut self, scan_name: &str, reader_name: &str, has_filter: bool) -> DotTask {
+        let scan = self.alloc(scan_name);
+        let mut cop = DotTask::new(scan, false);
+        if has_filter {
+            let sel = self.alloc("Selection");
+            cop.edges.push((sel, scan));
+            cop.id = sel;
+        }
+        let reader = self.alloc(reader_name);
+        let mut root = DotTask::new(reader, true);
+        root.push_child(reader, cop);
+        root
+    }
+
+    /// `IndexMerge`: one cop task per partial path plus the table lookup task.
+    fn dot_index_merge(&mut self, plan: &PhysicalPlan) -> DotTask {
+        let PhysicalPlan::IndexMerge {
+            paths,
+            probe_selection,
+            ..
+        } = plan
+        else {
+            unreachable!()
+        };
+        self.skip(1); // DataSource
+        self.skip(1); // logical Selection
+        self.skip(1); // logical Projection
+        self.skip(1); // physical Projection
+        self.skip(1); // rejected `TableFullScan`
+        self.skip(1); // rejected `Selection`
+        self.skip(1); // rejected `TableReader`
+        let mut cop: Vec<DotTask> = Vec::new();
+        for path in paths {
+            let name = if path.table_range {
+                "TableRangeScan"
+            } else {
+                "IndexRangeScan"
+            };
+            let id = self.alloc(name);
+            cop.push(DotTask::new(id, false));
+        }
+        let rowid = self.alloc("TableRowIDScan");
+        let mut table = DotTask::new(rowid, false);
+        if probe_selection.is_some() {
+            let sel = self.alloc("Selection");
+            table.edges.push((sel, rowid));
+            table.id = sel;
+        }
+        cop.push(table);
+        let merge = self.alloc("IndexMerge");
+        let mut root = DotTask::new(merge, true);
+        for task in cop {
+            root.push_child(merge, task);
+        }
+        root
+    }
+
+    /// A join side: `lead` ids for rejected candidates, then the access path.
+    /// The reader is a node of the enclosing root task, its scan a cop task.
+    fn dot_leaf(&mut self, plan: &PhysicalPlan, lead: u32) -> DotLeaf {
+        self.skip(lead);
+        let (scan_name, reader_name, has_filter) = match plan {
+            PhysicalPlan::TableReader { range_scan, pushed, .. } => (
+                if range_scan.is_some() {
+                    "TableRangeScan"
+                } else {
+                    "TableFullScan"
+                },
+                "TableReader",
+                pushed.is_some(),
+            ),
+            PhysicalPlan::IndexReader { range_scan, pushed, .. } => (
+                if range_scan.is_some() {
+                    "IndexRangeScan"
+                } else {
+                    "IndexFullScan"
+                },
+                "IndexReader",
+                pushed.is_some(),
+            ),
+            _ => {
+                let task = self.dot_generic(plan);
+                return DotLeaf {
+                    node: task.id,
+                    cop: None,
+                };
+            }
+        };
+        let scan = self.alloc(scan_name);
+        let mut cop = DotTask::new(scan, false);
+        if has_filter {
+            let sel = self.alloc("Selection");
+            cop.edges.push((sel, scan));
+            cop.id = sel;
+        }
+        let reader = self.alloc(reader_name);
+        DotLeaf {
+            node: reader,
+            cop: Some(cop),
+        }
+    }
+
+    /// Fallback: pre-order ids over the whole tree, readers as cop clusters.
+    fn dot_generic(&mut self, plan: &PhysicalPlan) -> DotTask {
+        let id = self.alloc(dot_op_name(plan));
+        let mut root = DotTask::new(id, true);
+        self.dot_children_into(plan, &mut root, id);
+        root
+    }
+
+    fn dot_children_into(&mut self, plan: &PhysicalPlan, task: &mut DotTask, id: u32) {
+        match plan {
+            PhysicalPlan::TableReader { pushed, .. } => {
+                let scan = self.alloc("TableFullScan");
+                let mut cop = DotTask::new(scan, false);
+                if pushed.is_some() {
+                    let sel = self.alloc("Selection");
+                    cop.edges.push((sel, scan));
+                    cop.id = sel;
+                }
+                task.children.push((id, cop));
+            }
+            PhysicalPlan::IndexReader { pushed, .. } => {
+                let scan = self.alloc("IndexFullScan");
+                let mut cop = DotTask::new(scan, false);
+                if pushed.is_some() {
+                    let sel = self.alloc("Selection");
+                    cop.edges.push((sel, scan));
+                    cop.id = sel;
+                }
+                task.children.push((id, cop));
+            }
+            _ => {
+                for child in children_of(plan) {
+                    let child = match child {
+                        PhysicalPlan::CTE {
+                            seed, inline: true, ..
+                        } => seed.as_ref(),
+                        other => other,
+                    };
+                    let cid = self.alloc(dot_op_name(child));
+                    task.edges.push((id, cid));
+                    self.dot_children_into(child, task, cid);
+                }
+            }
+        }
+    }
+}
+
+/// Scan operator behind no-op wrappers (`Projection`, `UnionScan`, `Limit`, …).
+fn dot_scan_base(plan: &PhysicalPlan) -> &PhysicalPlan {
+    match plan {
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::UnionScan { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Sort { child, .. }
+        | PhysicalPlan::TopN { child, .. } => dot_scan_base(child),
+        other => other,
+    }
+}
+
+fn dot_is_scan(plan: &PhysicalPlan) -> bool {
+    matches!(
+        dot_scan_base(plan),
+        PhysicalPlan::TableReader { .. } | PhysicalPlan::IndexReader { .. }
+    )
+}
+
+fn dot_op_name(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::TableDual { .. } => "TableDual",
+        PhysicalPlan::Projection { .. } => "Projection",
+        PhysicalPlan::Insert { .. } => "Insert",
+        PhysicalPlan::Update { .. } => "Update",
+        PhysicalPlan::Delete { .. } => "Delete",
+        PhysicalPlan::TableReader { .. } => "TableReader",
+        PhysicalPlan::PartitionUnion { .. } => "PartitionUnion",
+        PhysicalPlan::PointGet { .. } => "Point_Get",
+        PhysicalPlan::BatchPointGet { .. } => "Batch_Point_Get",
+        PhysicalPlan::SelectLock { .. } => "SelectLock",
+        PhysicalPlan::IndexLookUpReader { .. } => "IndexLookUp",
+        PhysicalPlan::IndexReader { .. } => "IndexReader",
+        PhysicalPlan::IndexMerge { .. } => "IndexMerge",
+        PhysicalPlan::Selection { .. } => "Selection",
+        PhysicalPlan::Sort { .. } => "Sort",
+        PhysicalPlan::TopN { .. } => "TopN",
+        PhysicalPlan::Limit { .. } => "Limit",
+        PhysicalPlan::HashAgg { .. } => "HashAgg",
+        PhysicalPlan::StreamAgg { .. } => "StreamAgg",
+        PhysicalPlan::HashJoin { .. } => "HashJoin",
+        PhysicalPlan::MergeJoin { .. } => "MergeJoin",
+        PhysicalPlan::Apply { .. } => "Apply",
+        PhysicalPlan::IndexJoin { .. } => "IndexJoin",
+        PhysicalPlan::UnionScan { .. } => "UnionScan",
+        PhysicalPlan::Union { .. } => "Union",
+        PhysicalPlan::DistinctUnion { .. } => "HashAgg",
+        PhysicalPlan::Window { .. } => "Window",
+        PhysicalPlan::Shuffle { .. } => "Shuffle",
+        PhysicalPlan::ShuffleReceiver { .. } => "ShuffleReceiver",
+        PhysicalPlan::CTE { .. } => "CTEFullScan",
+        PhysicalPlan::Distinct { .. } => "HashAgg",
+        PhysicalPlan::NullAwareAntiJoin { .. } => "HashJoin",
+        PhysicalPlan::RowProjection { .. } => "Projection",
+        PhysicalPlan::Explain { .. } => "Explain",
+        _ => "Operator",
+    }
 }
 
 fn walk(
@@ -581,6 +1026,7 @@ fn walk_with_parent(
                         | "StreamAgg"
                         | "HashAgg"
                         | "Selection"
+                        | "Projection"
                         | "HashJoin"
                         | "IndexJoin"
                         | "UnionScan"
@@ -599,6 +1045,7 @@ fn walk_with_parent(
                         | "StreamAgg"
                         | "HashAgg"
                         | "Selection"
+                        | "Projection"
                         | "HashJoin"
                         | "IndexJoin"
                         | "UnionScan"
@@ -1688,7 +2135,11 @@ fn emit_cop_children(
                 );
                 return true;
             }
-            if let Some(range_info) = range_scan {
+            if let Some(raw_range) = range_scan {
+                // `range_scan` is EXPLAIN-only: the planner may append the cop
+                // shape TiDB builds around a handle range (residual `Selection`
+                // and a pushed cop `Limit`), separated by `\u{1}`.
+                let shape = split_range_scan(raw_range);
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
                 let mut scan_spine = cop_spine.to_vec();
@@ -1697,19 +2148,59 @@ fn emit_cop_children(
                 }
                 let keep = if *stats_pseudo {
                     format!(
-                        "range:{range_info}, keep order:{}, stats:pseudo",
+                        "range:{}, keep order:{}, stats:pseudo",
+                        shape.text,
                         if under_merge_join { "true" } else { "false" }
                     )
                 } else {
                     format!(
-                        "range:{range_info}, keep order:{}",
+                        "range:{}, keep order:{}",
+                        shape.text,
                         if under_merge_join { "true" } else { "false" }
                     )
                 };
-                let range_est = est_rows(plan) * apply_factor.max(1.0);
+                let mut range_depth = scan_depth;
+                let post_est = est_rows(plan) * apply_factor.max(1.0);
+                if let Some((offset, count)) = shape.cop_limit {
+                    let est = post_est.min((offset + count) as f64);
+                    push_explain_row_spine(
+                        rows,
+                        range_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Limit",
+                            est,
+                            task: scan_task,
+                            access: String::new(),
+                            info: format!("offset:{offset}, count:{count}"),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    range_depth += 1;
+                }
+                if let Some(sel) = shape.selection {
+                    push_explain_row_spine(
+                        rows,
+                        range_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: post_est,
+                            task: scan_task,
+                            access: String::new(),
+                            info: sel.to_string(),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    range_depth += 1;
+                }
+                let range_est =
+                    shape.scan_rows.unwrap_or(est_rows(plan)) * apply_factor.max(1.0);
                 push_explain_row_spine(
                     rows,
-                    scan_depth,
+                    range_depth,
                     true,
                     next_id,
                     CopRow {
@@ -2141,9 +2632,12 @@ fn emit_cop_children(
                     };
                 }
                 if !cop_info.is_empty() {
-                    push_explain_row(
+                    // Spine-aware: a reader below a Union branch still needs the
+                    // union's continuation column for its cop children.
+                    let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
+                    push_explain_row_spine(
                         rows,
-                        depth,
+                        scan_depth,
                         true,
                         next_id,
                         CopRow {
@@ -2153,8 +2647,13 @@ fn emit_cop_children(
                             access: String::new(),
                             info: cop_info.to_string(),
                         },
+                        if under_bushy {
+                            cop_owned.as_slice()
+                        } else {
+                            &[]
+                        },
                     );
-                    scan_depth = depth + 1;
+                    scan_depth = scan_depth + 1;
                 }
             }
             // Pinned GLOBAL index read: cop Selection on `_tidb_tid`.
@@ -2533,18 +3032,25 @@ fn emit_cop_children(
                     last.id.push_str("(Build)");
                 }
                 let mut probe_depth = depth;
-                if let Some(probe_sel) = probe_selection_info.as_ref() {
+                let mut probe_spine_locked = false;
+                // TiDB pushes a `LIMIT` above a double-read probe as a cop
+                // `Limit` (`Limit(Probe)`), unless it merged it into the reader
+                // (`limit embedded`) or the probe keeps the index order.
+                let probe_limit = probe_selection_info
+                    .as_ref()
+                    .and_then(|sel| probe_limit_marker(sel));
+                if let Some((offset, count, _)) = probe_limit {
                     push_explain_row_spine(
                         rows,
                         depth,
                         true,
                         next_id,
                         CopRow {
-                            name: "Selection",
-                            est: probe_row_est,
+                            name: "Limit",
+                            est: probe_row_est.min((offset + count) as f64),
                             task,
                             access: String::new(),
-                            info: probe_sel.clone(),
+                            info: format!("offset:{offset}, count:{count}"),
                         },
                         &probe_spine,
                     );
@@ -2552,6 +3058,35 @@ fn emit_cop_children(
                         last.id.push_str("(Probe)");
                     }
                     probe_depth = depth + 1;
+                    probe_spine.push(false);
+                    probe_spine_locked = true;
+                }
+                if let Some(probe_sel) = probe_selection_info.as_ref() {
+                    let probe_sel = probe_limit
+                        .and_then(|(_, _, rest)| Some(rest))
+                        .filter(|rest| !rest.is_empty())
+                        .unwrap_or(probe_sel);
+                    push_explain_row_spine(
+                        rows,
+                        probe_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: probe_row_est,
+                            task,
+                            access: String::new(),
+                            info: probe_sel.to_string(),
+                        },
+                        &probe_spine,
+                    );
+                    if !probe_spine_locked {
+                        if let Some(last) = rows.last_mut() {
+                            last.id.push_str("(Probe)");
+                        }
+                        probe_spine_locked = true;
+                    }
+                    probe_depth += 1;
                     probe_spine.push(false);
                 }
                 push_explain_row_spine(
@@ -2568,7 +3103,7 @@ fn emit_cop_children(
                     },
                     &probe_spine,
                 );
-                if probe_selection_info.is_none() {
+                if !probe_spine_locked {
                     if let Some(last) = rows.last_mut() {
                         last.id.push_str("(Probe)");
                     }
@@ -2593,6 +3128,72 @@ fn emit_cop_children(
                 let mut build_spine = cop_spine.to_vec();
                 if under_bushy {
                     build_spine.push(true);
+                }
+                // Correlated `ORDER BY … LIMIT` probe under pseudo statistics:
+                // TiDB embeds the limit in the lookup and pushes a cop `Limit`
+                // above the decided-by index range.
+                if let Some((offset, count)) =
+                    selection_info.as_deref().and_then(limit_build_marker)
+                {
+                    let task = "cop[tikv]";
+                    let range_info = range_pushed(pushed.as_ref()).unwrap_or_default();
+                    let mut build_spine = cop_spine.to_vec();
+                    while build_spine.len() < depth.saturating_sub(1) {
+                        build_spine.push(false);
+                    }
+                    let mut child_spine = build_spine.clone();
+                    child_spine.push(true);
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "Limit",
+                            est: *row_count,
+                            task,
+                            access: String::new(),
+                            info: format!("offset:{offset}, count:{count}"),
+                        },
+                        &build_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: *row_count,
+                            task,
+                            access: idx_access.clone(),
+                            info: format!(
+                                "range: {range_info}, keep order:true, stats:pseudo"
+                            ),
+                        },
+                        &child_spine,
+                    );
+                    push_explain_row_spine(
+                        rows,
+                        depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TableRowIDScan",
+                            est: *row_count,
+                            task,
+                            access: table_access(table, &[]),
+                            info: "keep order:false, stats:pseudo".to_string(),
+                        },
+                        &build_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                    return true;
                 }
                 // Correlated `ORDER BY … LIMIT` probe: TiDB pushes a `TopN`
                 // into the cop task above the decided-by index range.
@@ -3475,8 +4076,63 @@ fn topn_build_marker(selection_info: &str) -> Option<(&str, f64)> {
     Some((by_info, est.parse().ok()?))
 }
 
-fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
-    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+/// `LIMIT|<offset>|<count>` marker on an `IndexLookUpReader`: TiDB merges the
+/// `LIMIT` into the lookup (`limit embedded(offset:…, count:…)`) and pushes a
+/// cop `Limit` above the index range of a correlated probe.
+fn limit_build_marker(selection_info: &str) -> Option<(u64, u64)> {
+    let rest = selection_info.strip_prefix("LIMIT|")?;
+    let (offset, count) = rest.split_once('|')?;
+    Some((offset.parse().ok()?, count.parse().ok()?))
+}
+
+/// EXPLAIN shape carried by a `TableReader::range_scan` string.
+///
+/// Plain handle ranges are just the range text. When TiDB keeps residual
+/// filters and/or pushes a cop `Limit` above the range, the planner appends
+/// `\u{1}`-separated markers (`SEL:`, `SCAN:`, `LIMIT:`); the range text itself
+/// never contains that separator.
+struct RangeScanShape<'a> {
+    text: &'a str,
+    selection: Option<&'a str>,
+    scan_rows: Option<f64>,
+    cop_limit: Option<(u64, u64)>,
+}
+
+fn split_range_scan(raw: &str) -> RangeScanShape<'_> {
+    let mut parts = raw.split('\u{1}');
+    let text = parts.next().unwrap_or(raw);
+    let mut shape = RangeScanShape {
+        text,
+        selection: None,
+        scan_rows: None,
+        cop_limit: None,
+    };
+    for part in parts {
+        if let Some(sel) = part.strip_prefix("SEL:") {
+            shape.selection = Some(sel);
+        } else if let Some(rows) = part.strip_prefix("SCAN:") {
+            shape.scan_rows = rows.parse().ok();
+        } else if let Some(limit) = part.strip_prefix("LIMIT:") {
+            if let Some((offset, count)) = limit.split_once(':') {
+                if let (Ok(offset), Ok(count)) = (offset.parse(), count.parse()) {
+                    shape.cop_limit = Some((offset, count));
+                }
+            }
+        }
+    }
+    shape
+}
+
+/// `PROBE_LIMIT|<offset>|<count>|<selection info>`: a cop `Limit(Probe)` pushed
+/// above the double-read probe's `Selection`.
+fn probe_limit_marker(probe_selection_info: &str) -> Option<(u64, u64, &str)> {
+    let rest = probe_selection_info.strip_prefix("PROBE_LIMIT|")?;
+    let (offset, rest) = rest.split_once('|')?;
+    let (count, sel) = rest.split_once('|')?;
+    Some((offset.parse().ok()?, count.parse().ok()?, sel))
+}
+
+fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
     match pushed? {
         ExprNode::Value(ValueExpr {
@@ -3774,209 +4430,6 @@ pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::Ex
     }
 }
 
-fn collect_dot(
-    plan: &PhysicalPlan,
-    next_id: &mut usize,
-    nodes: &mut Vec<String>,
-    edges: &mut Vec<String>,
-) -> usize {
-    if let PhysicalPlan::CTE {
-        seed, inline: true, ..
-    } = plan
-    {
-        return collect_dot(seed, next_id, nodes, edges);
-    }
-    let id = *next_id;
-    *next_id += 1;
-    let (name, access, info) = node_meta(plan);
-    nodes.push(format!(
-        "  N{id}[label=\"{name}_{id}\\nestRows={:.2}\\n{access} {info}\"]",
-        est_rows(plan)
-    ));
-    if let Some(cop_ids) = collect_dot_cop_children(plan, next_id, nodes) {
-        for child_id in cop_ids {
-            edges.push(format!("  N{id} -> N{child_id}"));
-        }
-        return id;
-    }
-    for child in children_of(plan) {
-        let child_id = collect_dot(child, next_id, nodes, edges);
-        edges.push(format!("  N{id} -> N{child_id}"));
-    }
-    id
-}
-
-fn collect_dot_cop_children(
-    plan: &PhysicalPlan,
-    next_id: &mut usize,
-    nodes: &mut Vec<String>,
-) -> Option<Vec<usize>> {
-    match plan {
-        PhysicalPlan::TableReader {
-            table,
-            partition_names,
-            row_count,
-            stats_pseudo,
-            pushed,
-            ..
-        } => {
-            let scan_access = table_access(table, partition_names);
-            let scan_est = if *row_count < 0.0 {
-                if *stats_pseudo { 10_000.0 } else { -*row_count }
-            } else {
-                *row_count
-            };
-            if let Some(filter) = pushed.as_ref() {
-                Some(vec![
-                    push_dot_node(
-                        next_id,
-                        nodes,
-                        "Selection",
-                        est_rows(plan),
-                        "",
-                        &format!("pushed:{}", filter.restore_string()),
-                    ),
-                    push_dot_node(
-                        next_id,
-                        nodes,
-                        "TableFullScan",
-                        scan_est,
-                        &scan_access,
-                        "keep order:false",
-                    ),
-                ])
-            } else {
-                Some(vec![push_dot_node(
-                    next_id,
-                    nodes,
-                    "TableFullScan",
-                    scan_est,
-                    &scan_access,
-                    "keep order:false",
-                )])
-            }
-        }
-        PhysicalPlan::IndexReader {
-            table,
-            index,
-            index_columns,
-            partitions,
-            pushed,
-            ..
-        } => {
-            let access = index_access_cols(table, index, index_columns, partitions);
-            let (scan_est, info) = index_scan_meta(pushed.as_ref());
-            if let Some(filter) = pushed.as_ref() {
-                Some(vec![
-                    push_dot_node(
-                        next_id,
-                        nodes,
-                        "Selection",
-                        est_rows(plan),
-                        "",
-                        &format!("pushed:{}", filter.restore_string()),
-                    ),
-                    push_dot_node(next_id, nodes, "IndexRangeScan", scan_est, &access, &info),
-                ])
-            } else {
-                Some(vec![push_dot_node(
-                    next_id,
-                    nodes,
-                    "IndexFullScan",
-                    scan_est,
-                    &access,
-                    &info,
-                )])
-            }
-        }
-        PhysicalPlan::IndexLookUpReader {
-            table,
-            index,
-            index_columns,
-            partitions,
-            pushed,
-            ..
-        } => {
-            let idx_access = index_access_cols(table, index, index_columns, partitions);
-            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
-            if let Some(filter) = pushed.as_ref() {
-                info = format!("pushed:{}", filter.restore_string());
-            }
-            let idx = push_dot_node(
-                next_id,
-                nodes,
-                "IndexRangeScan",
-                scan_est,
-                &idx_access,
-                &info,
-            );
-            let row = push_dot_node(
-                next_id,
-                nodes,
-                "TableRowIDScan",
-                scan_est,
-                &table_access(table, &[]),
-                "keep order:false",
-            );
-            Some(vec![idx, row])
-        }
-        PhysicalPlan::IndexMerge {
-            table,
-            indexes,
-            partitions,
-            pushed,
-            ..
-        } => {
-            let (scan_est, mut info) = index_scan_meta(pushed.as_ref());
-            if let Some(filter) = pushed.as_ref() {
-                info = format!("pushed:{}", filter.restore_string());
-            }
-            let mut ids = Vec::with_capacity(indexes.len() + 1);
-            for (i, index) in indexes.iter().enumerate() {
-                let branch_info = if i + 1 == indexes.len() {
-                    info.as_str()
-                } else {
-                    "keep order:false"
-                };
-                ids.push(push_dot_node(
-                    next_id,
-                    nodes,
-                    "IndexRangeScan",
-                    scan_est,
-                    &index_access(table, index, partitions),
-                    branch_info,
-                ));
-            }
-            ids.push(push_dot_node(
-                next_id,
-                nodes,
-                "TableRowIDScan",
-                scan_est,
-                &table_access(table, &[]),
-                "keep order:false",
-            ));
-            Some(ids)
-        }
-        _ => None,
-    }
-}
-
-fn push_dot_node(
-    next_id: &mut usize,
-    nodes: &mut Vec<String>,
-    name: &str,
-    est: f64,
-    access: &str,
-    info: &str,
-) -> usize {
-    let id = *next_id;
-    *next_id += 1;
-    nodes.push(format!(
-        "  N{id}[label=\"{name}_{id}\\nestRows={est:.2}\\n{access} {info}\"]"
-    ));
-    id
-}
-
 fn explain_plan_ptr(plan: &PhysicalPlan) -> *const PhysicalPlan {
     match plan {
         PhysicalPlan::CTE {
@@ -4164,7 +4617,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if *data_limit {
+            if *data_limit
+                || range_scan
+                    .as_deref()
+                    .is_some_and(|raw| split_range_scan(raw).cop_limit.is_some())
+            {
                 "data:Limit".to_string()
             } else if cop_projection_pending().is_some() {
                 "data:Projection".to_string()
@@ -4262,7 +4719,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             ),
         ),
         PhysicalPlan::IndexLookUpReader {
-            partition_access, ..
+            partition_access,
+            selection_info,
+            ..
         } => (
             "IndexLookUp".to_string(),
             if partition_access.is_empty() {
@@ -4270,8 +4729,14 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            // TiDB IndexLookUp root info is empty; Build/Probe children carry shape.
-            String::new(),
+            // TiDB IndexLookUp root info is empty unless a `LIMIT` was merged
+            // into the reader; Build/Probe children carry the rest of the shape.
+            match selection_info.as_deref().and_then(limit_build_marker) {
+                Some((offset, count)) => {
+                    format!("limit embedded(offset:{offset}, count:{count})")
+                }
+                None => String::new(),
+            },
         ),
         PhysicalPlan::IndexReader {
             partition_access,
@@ -5065,6 +5530,14 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if range_pushed(Some(filter)).is_some() => *row_count,
+        // The probe `Selection` shrinks the lookup's output below what the
+        // index range produced, so its estimate wins over the build-side
+        // `row_count` when both exist.
+        PhysicalPlan::IndexLookUpReader {
+            probe_est,
+            probe_selection_info: Some(_),
+            ..
+        } if *probe_est > 0.0 => *probe_est,
         // Planner-built access range: `row_count` already holds the range ×
         // index-side residual estimate. The probe-side `Selection` (table
         // columns the index cannot encode) does not re-shrink the build side,
@@ -5074,11 +5547,6 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             range_scan: Some(_),
             ..
         } => *row_count,
-        PhysicalPlan::IndexLookUpReader {
-            probe_est,
-            probe_selection_info: Some(_),
-            ..
-        } if *probe_est > 0.0 => *probe_est,
         PhysicalPlan::IndexLookUpReader {
             pushed: None,
             probe_est,
