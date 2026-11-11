@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-08 13:20 (+08:00)
+> 生成时间：2026-11-11 22:40 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **34 个** 做到 1:1 金样对齐并在**双引擎**上全绿（本轮复验 `PASS: memory=34` / `PASS: tikv=34`）；R1 已收口，R2 完成 15/22，R3 完成 15/48 并正在主攻分区与 EXPLAIN 形状；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **37 个** 登记为 `green`（R1 4 / R2 15 / R3 18），本轮复验的 33 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 15/22，R3 完成 18/48，当前主攻 EXPLAIN 形状（`explain_easy*` 的相关标量子查询 `Apply` 已对齐，`FORMAT='dot'` 输出器待做）；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
 
 ---
 
@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **34 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 34 | 13.4% |
-| `in_progress` | 20 | 7.9% |
+| `green` | 37 | 14.6% |
+| `in_progress` | 17 | 6.7% |
 | `pending` | 190 | 74.8% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -34,7 +34,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **34 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 15 | 6 | 1 | 主波完成 ~68% |
-| R3（point_get / index / partition / explain*） | 15 | 14 | 19 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 18 | 11 | 19 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 0 | 0 | 12 | 未开工 |
 | R6 | 0 | 0 | 35 | 未开工 |

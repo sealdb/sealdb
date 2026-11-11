@@ -1940,6 +1940,43 @@
 - **下一步**:
   - 继续 R3 `in_progress`：`explain_easy` / `explain_easy_stats` / `explain_generate_column_substitute` / `topn_push_down` / `explain_complex_stats`
 
+### 2026-11-11（`explain_easy_stats` 波：标量子查询 Apply + DOT 观测）
+
+- **Phase**: R3 explain 波
+- **完成**:
+  - Planner：select 列表里的相关标量子查询
+    `select c2 = (select c2 from t2 where t1.c1 = t2.c1 order by c1 limit 1) from t1`
+    按 TiDB 的 `Apply`（CARTESIAN left outer join）建计划：Build 侧外层全表扫，Probe 侧
+    `TopN(offset:0, count:1) → IndexLookUp`，被外层键决定的范围下推到 cop
+    `TopN(Build) → IndexRangeScan(decided by [eq(…)], TableRowIDScan(Probe)`
+  - Planner：相关内层索引扫描基数按 TiDB `AdjustRowCountForIndexScanByLimit` 计算
+    （伪统计等值 1/1000 × `LIMIT 1` 的 1.25 调整，再乘外层行数 → `1985 × 1.25 = 2481.25`，
+    `× 1999` 外层 = `4960.02`）；Apply 根估行跟随外层
+  - Planner：`tidb_opt_agg_push_down` / `tidb_opt_insubq_to_join_and_agg` 会话变量接入
+    （`AggregationPushDownSolver` 形状的 partial/final 聚合拆分、`IN` 子查询转 join+去重聚合）
+  - 工具：`project/scripts/probe/tidb_planid_trace.patch` + `TIDB_PLANID_TRACE=1`
+    在一次性 `git worktree` 里记录 TiDB 每次 `NewBasePlan` 的 `PlanID` 分配序列；
+    参考仓保持零改动
+- **验证**:
+  - `explain_easy_stats`（Mem）：第 105–113 行的 Apply 计划与 golden 逐字一致；仅剩
+    `EXPLAIN FORMAT='dot'` 一处（我们仍是通用 `digraph {…}`，TiDB 是
+    `digraph <根>` + 每个 task 一个 `subgraph cluster<id>` + 末尾 pipeline 边）
+  - `subquery` / `index_join` / `topn_pushdown`（Mem）`PASS`
+- **TiDB 侧观测（只读）**:
+  - Plan ID 每个语句归零（`buildLogicalPlan` → `PlanID.Store(0)`），随后每次
+    `NewBasePlan` 自增；逻辑阶段先分配（`DataSource`/`Selection`/`Projection`），
+    物理阶段自顶向下分配（父先于子），每个 DataSource 的候选路径各自占号（未选中的也占），
+    cop 计划先于对应 reader。故 `select * from t` → `TableFullScan_4`/`TableReader_5`，
+    `select * from t where a < 2` → `…_5/_6/_7`
+- **阻塞/风险**:
+  - DOT/row 格式的节点编号必须复刻 TiDB 的候选路径枚举顺序，才能与 golden 对齐；
+    这是后续 DOT 波的核心工作
+  - `explain_easy` 剩余差异：join 估行 `9990.00`（我们 `12487.50 = 9990×1.25`）与
+    `IndexLookUp` 探针侧 `11.08`/`33.33` 互换
+- **下一步**:
+  - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
+  - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
+
 ### 2026-10-19
 
 **决策落地**
