@@ -41,14 +41,14 @@ impl Columns<'_> {
         let mut nullable = Vec::new();
         for join in &select.joins {
             match join.tp {
-                JoinType::LeftOuter => nullable.push(join.right.resolve_name().to_string()),
+                JoinType::LeftOuter => nullable.push(join.right.name.clone()),
                 JoinType::RightOuter => {
-                    nullable.push(join.left.resolve_name().to_string());
+                    nullable.push(join.left.name.clone());
                     for earlier in &select.joins {
                         if earlier.right.name.eq_ignore_ascii_case(&join.right.name) {
                             break;
                         }
-                        nullable.push(earlier.right.resolve_name().to_string());
+                        nullable.push(earlier.right.name.clone());
                     }
                 }
                 _ => {}
