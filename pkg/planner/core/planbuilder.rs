@@ -9503,7 +9503,8 @@ fn stats_cnf_filter_rows(
     table_stats: &super::access_range::TableStats,
     info: &sealdb_meta::TableInfo,
     selection: &ExprNode,
-) -> Option<f64> {    let count = table_stats.count as f64;
+) -> Option<f64> {
+    let count = table_stats.count as f64;
     if count <= 0.0 {
         return Some(0.0);
     }
@@ -9521,6 +9522,7 @@ fn stats_cnf_filter_rows(
     };
     let mut sel = 1.0;
     let mut estimated: Vec<String> = Vec::new();
+    let mut estimated_any = false;
     for (column, bounds) in sealdb_statistics::pseudo::column_bound_sets(selection) {
         let ft = field_type(&column)?;
         let rows = table_stats.column_range_estimate(
@@ -9530,45 +9532,101 @@ fn stats_cnf_filter_rows(
         )?;
         sel *= rows / count;
         estimated.push(column);
+        estimated_any = true;
     }
     // `not(isnull(col))` is the `(MinNotNull, MaxValue)` column range.
     let not_null = to_stats(vec![(None, None)]);
     let mut leftover = false;
     for conjunct in &selection.split_cnf() {
-        let covered = if let Some((column, _)) =
-            sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
-        {
-            estimated.iter().any(|e| e.eq_ignore_ascii_case(&column))
-        } else if let Some(column) = not_isnull_column(conjunct) {
-            if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
-                true
-            } else {
-                let Some(ft) = field_type(&column) else {
-                    return None;
-                };
-                let rows = table_stats.column_range_estimate(
-                    &column,
-                    sealdb_statistics::kind_of(ft),
-                    &not_null,
-                )?;
-                sel *= rows / count;
-                estimated.push(column);
-                true
+        // An OR group unions its items' own range selectivities instead of
+        // falling back to the `0.8` factor.
+        if conjunct.split_dnf().len() > 1 {
+            match dnf_stats_selectivity(table_stats, info, conjunct) {
+                Some(dnf) => {
+                    sel *= dnf.clamp(0.0, 1.0);
+                    estimated_any = true;
+                    continue;
+                }
+                None => {
+                    leftover = true;
+                    continue;
+                }
             }
-        } else {
-            false
-        };
+        }
+        let covered =
+            if let Some((column, _)) = sealdb_statistics::pseudo::conjunct_bound_sets(conjunct) {
+                estimated.iter().any(|e| e.eq_ignore_ascii_case(&column))
+            } else if let Some(column) = not_isnull_column(conjunct) {
+                if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
+                    true
+                } else {
+                    let Some(ft) = field_type(&column) else {
+                        return None;
+                    };
+                    let rows = table_stats.column_range_estimate(
+                        &column,
+                        sealdb_statistics::kind_of(ft),
+                        &not_null,
+                    )?;
+                    sel *= rows / count;
+                    estimated.push(column);
+                    estimated_any = true;
+                    true
+                }
+            } else {
+                false
+            };
         if !covered {
             leftover = true;
         }
     }
-    if estimated.is_empty() {
+    if !estimated_any {
         return None;
     }
     if leftover {
         sel *= sealdb_statistics::pseudo::SELECTION_FACTOR;
     }
     Some((count * sel).clamp(0.0, count))
+}
+
+/// TiDB `cardinality.Selectivity` of a DNF group: each item multiplies its
+/// bound ranges, then the items union as `1 - Π(1 - selᵢ)`. `None` when an item
+/// has a predicate no column histogram can bound.
+fn dnf_stats_selectivity(
+    table_stats: &super::access_range::TableStats,
+    info: &sealdb_meta::TableInfo,
+    conjunct: &ExprNode,
+) -> Option<f64> {
+    let count = table_stats.count as f64;
+    if count <= 0.0 {
+        return Some(0.0);
+    }
+    let field_type = |column: &str| {
+        info.columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            .map(|c| &c.field_type)
+    };
+    let mut union = 0.0;
+    for item in conjunct.split_dnf() {
+        let mut item_sel = 1.0;
+        for cond in item.split_cnf() {
+            let (column, bounds) = sealdb_statistics::pseudo::conjunct_bound_sets(&cond)?;
+            let ft = field_type(&column)?;
+            let ranges: Vec<_> = bounds
+                .into_iter()
+                .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
+                .collect();
+            let rows = table_stats.column_range_estimate(
+                &column,
+                sealdb_statistics::kind_of(ft),
+                &ranges,
+            )?;
+            item_sel *= rows / count;
+        }
+        union = union + item_sel - union * item_sel;
+    }
+    Some(union.clamp(0.0, 1.0))
 }
 
 /// TiDB `GetRowCountByIndexRanges` on the clustered PRIMARY index for a
@@ -10048,12 +10106,22 @@ fn same_column_set(a: &[String], b: &[String]) -> bool {
 #[derive(Clone)]
 struct IndexMergeHint {
     indexes: Vec<String>,
+    /// `no_index_merge()` forbids the merge for this table even when the
+    /// optimizer would otherwise build one.
+    disabled: bool,
 }
 
 /// TiDB `use_index_merge(<table>, <index>, …)`: the first argument names the
-/// table factor (alias), the rest the indexes the hint allows.
+/// table factor (alias), the rest the indexes the hint allows. A matching
+/// `no_index_merge()` / `no_index_merge(<table>)` disables the merge.
 fn index_merge_hint(text: &str, target: &str) -> Option<IndexMergeHint> {
     let lower = text.to_ascii_lowercase();
+    if hint_names_table(&lower, "no_index_merge(", target) {
+        return Some(IndexMergeHint {
+            indexes: Vec::new(),
+            disabled: true,
+        });
+    }
     let name = "use_index_merge(";
     let mut base = 0usize;
     while let Some(found) = lower[base..].find(name) {
@@ -10069,11 +10137,35 @@ fn index_merge_hint(text: &str, target: &str) -> Option<IndexMergeHint> {
                 .map(|part| part.trim().trim_matches('`').to_ascii_lowercase())
                 .filter(|part| !part.is_empty())
                 .collect();
-            return Some(IndexMergeHint { indexes });
+            return Some(IndexMergeHint {
+                indexes,
+                disabled: false,
+            });
         }
         base = open + close_rel + 1;
     }
     None
+}
+
+/// Whether `hint` appears with no table argument (`hint` is `"foo("`) or with
+/// one matching `target`.
+fn hint_names_table(lower_sql: &str, hint: &str, target: &str) -> bool {
+    let mut base = 0usize;
+    while let Some(found) = lower_sql[base..].find(hint) {
+        let open = base + found + hint.len();
+        let Some(close_rel) = lower_sql[open..].find(')') else {
+            return false;
+        };
+        let inside = lower_sql[open..open + close_rel]
+            .trim()
+            .trim_matches('`')
+            .trim();
+        if inside.is_empty() || inside.eq_ignore_ascii_case(target) {
+            return true;
+        }
+        base = open + close_rel + 1;
+    }
+    false
 }
 
 /// Hint name → index, with TiDB's `PRIMARY` alias for the clustered key.
@@ -10240,14 +10332,30 @@ fn index_merge_arm_index<'a>(
             .filter_map(|name| hint_index(info, name))
             .collect()
     };
-    candidates.into_iter().find(|idx| {
+    let usable = |idx: &&sealdb_meta::IndexInfo| {
         !(idx.primary && info.pk_is_handle)
             && !idx.invisible
             && idx.columns.first().is_some_and(|col| {
                 let key = super::expr_index::part_key(info, col);
                 columns.iter().any(|name| name.eq_ignore_ascii_case(&key))
             })
-    })
+    };
+    // TiDB prefers the hinted index that pins *every* bounded column of the
+    // item: `(aid = 1 and c1 = 'aaa') or (aid = 2 and c2 = 'bbb')` seeks
+    // `aid_c2` for the second arm, not `aid_c1` again with a residual filter.
+    let covering = |idx: &&sealdb_meta::IndexInfo| {
+        usable(idx)
+            && columns.iter().all(|name| {
+                idx.columns
+                    .iter()
+                    .any(|col| super::expr_index::part_key(info, col).eq_ignore_ascii_case(name))
+            })
+    };
+    candidates
+        .iter()
+        .find(|idx| covering(idx))
+        .or_else(|| candidates.iter().find(|idx| usable(idx)))
+        .copied()
 }
 
 /// Build one union arm for a DNF item; the handle wins when the item pins it.
@@ -10414,10 +10522,76 @@ fn index_merge_union_arm_selectivity(
     (rows / table_rows).clamp(0.0, 1.0)
 }
 
+/// TiDB `GetRowCountByIntColumnRanges`: a clustered handle arm seeks the PK
+/// column, so its `TableRangeScan` is charged the column histogram instead of
+/// the `1/3` pseudo estimate the arm builder starts from.
+fn apply_index_merge_handle_stats(
+    info: &sealdb_meta::TableInfo,
+    paths: &mut [IndexMergePath],
+    table: Option<&super::access_range::TableStats>,
+) {
+    let Some(table) = table else {
+        return;
+    };
+    let Some(column) = info.clustered_prefix_column() else {
+        return;
+    };
+    let primary = info.indices.iter().find(|idx| idx.primary);
+    for path in paths.iter_mut().filter(|path| path.table_range) {
+        let stat_ranges: Vec<_> = path
+            .ranges
+            .iter()
+            .map(|(low, high)| sealdb_statistics::range_est::StatsRange {
+                low: low.clone(),
+                high: high.clone(),
+            })
+            .collect();
+        let estimate = table
+            .column_range_estimate(
+                column.name.o(),
+                sealdb_statistics::kind_of(&column.field_type),
+                &stat_ranges,
+            )
+            .or_else(|| {
+                primary.and_then(|pk| {
+                    table.index_range_estimate(pk.name.o(), &column.field_type, &stat_ranges)
+                })
+            });
+        if let Some(rows) = estimate
+            && let Some(range) = path.range.as_mut()
+        {
+            range.rows = rows;
+            range.filter_rows = rows;
+            range.pseudo = false;
+        }
+    }
+}
+
+/// TiDB `indexMergeOR` union cardinality: `1 - Π(1 - selᵢ)`.
+fn index_merge_union_rows(
+    info: &sealdb_meta::TableInfo,
+    paths: &[IndexMergePath],
+    table_rows: f64,
+    real_stats: bool,
+) -> f64 {
+    let mut selectivity = 0.0;
+    for path in paths {
+        let arm = index_merge_union_arm_selectivity(info, path, table_rows, real_stats);
+        selectivity = selectivity + arm - selectivity * arm;
+    }
+    table_rows * selectivity
+}
+
 /// TiDB probe-side selectivity for a residual filter. A DNF filter that was
 /// only partially covered comes back whole (`or(eq(c,10), and(...))`), and its
-/// pseudo selectivity is the OR of its items, not the `0.8` default.
-fn index_merge_residual_rows(residual: &[ExprNode], rows: f64) -> f64 {
+/// selectivity is the OR of its items, not the `0.8` default. Each conjunct
+/// leans on its column histogram when the statistics carry one.
+fn index_merge_residual_rows(
+    residual: &[ExprNode],
+    rows: f64,
+    info: &sealdb_meta::TableInfo,
+    table: Option<&super::access_range::TableStats>,
+) -> f64 {
     if let [only] = residual
         && only.split_dnf().len() > 1
     {
@@ -10425,26 +10599,55 @@ fn index_merge_residual_rows(residual: &[ExprNode], rows: f64) -> f64 {
         for item in only.split_dnf() {
             let mut item_sel = 1.0;
             for cond in item.split_cnf() {
-                let per = match sealdb_statistics::pseudo::conjunct_bound_sets(&cond) {
-                    Some((_, sets)) => sets
-                        .iter()
-                        .map(|(low, high)| {
-                            sealdb_statistics::pseudo::column_range_rows(
-                                1.0,
-                                low.as_ref(),
-                                high.as_ref(),
-                            )
-                        })
-                        .sum::<f64>(),
-                    None => sealdb_statistics::pseudo::SELECTION_FACTOR,
-                };
-                item_sel *= per;
+                item_sel *= conjunct_selectivity(&cond, info, table);
             }
             selectivity = selectivity + item_sel - selectivity * item_sel;
         }
         return (rows * selectivity).clamp(0.0, rows);
     }
-    sealdb_statistics::pseudo::filter_rows(residual, rows)
+    let mut selectivity = 1.0;
+    for conjunct in residual.iter().flat_map(|conjunct| conjunct.split_cnf()) {
+        selectivity *= conjunct_selectivity(&conjunct, info, table);
+    }
+    (rows * selectivity).clamp(0.0, rows)
+}
+
+/// Selectivity of one conjunct: TiDB `GetRowCountByIntColumnRanges` over the
+/// column histogram when it exists, else the pseudo range estimate.
+fn conjunct_selectivity(
+    cond: &ExprNode,
+    info: &sealdb_meta::TableInfo,
+    table: Option<&super::access_range::TableStats>,
+) -> f64 {
+    let Some((name, sets)) = sealdb_statistics::pseudo::conjunct_bound_sets(cond) else {
+        return sealdb_statistics::pseudo::SELECTION_FACTOR;
+    };
+    if let Some(table) = table
+        && let Some(column) = info
+            .columns
+            .iter()
+            .find(|column| column.name.o().eq_ignore_ascii_case(&name))
+    {
+        let stat_ranges: Vec<_> = sets
+            .iter()
+            .map(|(low, high)| sealdb_statistics::range_est::StatsRange {
+                low: low.clone(),
+                high: high.clone(),
+            })
+            .collect();
+        if let Some(rows) = table.column_range_estimate(
+            column.name.o(),
+            sealdb_statistics::kind_of(&column.field_type),
+            &stat_ranges,
+        ) {
+            return (rows / table.count.max(1) as f64).clamp(0.0, 1.0);
+        }
+    }
+    sets.iter()
+        .map(|(low, high)| {
+            sealdb_statistics::pseudo::column_range_rows(1.0, low.as_ref(), high.as_ref())
+        })
+        .sum()
 }
 
 /// TiDB index-merge access path: a union of DNF arms (OR) or an intersection of
@@ -10469,7 +10672,11 @@ fn index_merge_plan(
     // explicit `USE_INDEX_MERGE` hint.
     let hint = hinted.clone().unwrap_or(IndexMergeHint {
         indexes: Vec::new(),
+        disabled: false,
     });
+    if hint.disabled {
+        return None;
+    }
     let selection = select.selection.as_ref()?;
     let table_rows = table_row_count(stats, from, current_db).max(1.0);
     let table_stats = stats
@@ -10491,9 +10698,35 @@ fn index_merge_plan(
         );
     }
     let (mut paths, residual, intersection) = match or_pos {
-        Some(pos) => {
-            let (paths, residual) =
-                index_merge_union_paths(&cnf, pos, &hint, info, table_rows, table_stats.as_ref())?;
+        Some(_) => {
+            let mut best: Option<(f64, Vec<IndexMergePath>, Vec<ExprNode>)> = None;
+            for pos in 0..cnf.len() {
+                if cnf[pos].split_dnf().len() < 2 {
+                    continue;
+                }
+                let Some((mut paths, residual)) = index_merge_union_paths(
+                    &cnf,
+                    pos,
+                    &hint,
+                    info,
+                    table_rows,
+                    table_stats.as_ref(),
+                ) else {
+                    continue;
+                };
+                apply_index_merge_handle_stats(info, &mut paths, table_stats.as_ref());
+                // TiDB `indexMergeOR` keeps the DNF group whose union reads the
+                // fewest rows: `(b<10000 or c<10000) and (a<10 or d<10)` merges
+                // the a/d arms rather than the wider b/c ones.
+                let rows = index_merge_union_rows(info, &paths, table_rows, table_stats.is_some());
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_rows, _, _)| rows < *best_rows)
+                {
+                    best = Some((rows, paths, residual));
+                }
+            }
+            let (_, paths, residual) = best?;
             (paths, residual, false)
         }
         None => {
@@ -10508,13 +10741,30 @@ fn index_merge_plan(
             (paths, residual, true)
         }
     };
+    if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+        eprintln!(
+            "IM paths={:?} real_stats={}",
+            paths
+                .iter()
+                .map(|path| (
+                    path.index.clone(),
+                    path.table_range,
+                    path.range.as_ref().map(|range| range.rows)
+                ))
+                .collect::<Vec<_>>(),
+            table_stats.is_some()
+        );
+    }
     if hinted.is_none() {
-        // An automatic union needs one distinct secondary index per arm; a
-        // handle arm or two arms on the same index stay a table scan.
+        // An automatic union needs one distinct secondary index per arm; two
+        // arms on the same index stay a table scan. A handle arm is allowed
+        // while it is a *range* scan (`a < 50` on the clustered PK is a
+        // `TableRangeScan(Build)` partial path); a full table scan arm would
+        // just read everything, so it keeps the TableFullScan + Selection.
         let mut seen = std::collections::HashSet::new();
         if paths
             .iter()
-            .any(|path| path.table_range || path.index.is_empty())
+            .any(|path| path.table_range && path.range.is_none())
             || !paths
                 .iter()
                 .all(|path| seen.insert(path.index.to_ascii_lowercase()))
@@ -10531,13 +10781,7 @@ fn index_merge_plan(
             .fold(1.0, |acc, path| acc * path_rows(path) / table_rows);
         table_rows * selectivity
     } else {
-        let mut selectivity = 0.0;
-        for path in &paths {
-            let arm =
-                index_merge_union_arm_selectivity(info, path, table_rows, table_stats.is_some());
-            selectivity = selectivity + arm - selectivity * arm;
-        }
-        table_rows * selectivity
+        index_merge_union_rows(info, &paths, table_rows, table_stats.is_some())
     };
     if hinted.is_none()
         && super::plan_cost::index_lookup_cost(rowid_est)
@@ -10545,6 +10789,13 @@ fn index_merge_plan(
     {
         // Union (index ranges + row lookups) costs more than scanning the
         // table once: TiDB keeps the TableFullScan + Selection.
+        if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+            eprintln!(
+                "IM reject cost rowid_est={rowid_est} lookup={} scan={}",
+                super::plan_cost::index_lookup_cost(rowid_est),
+                super::plan_cost::table_scan_cost(table_rows)
+            );
+        }
         return None;
     }
     // ORDER BY a suffix key column of every arm → the merge reads in that order
@@ -10598,7 +10849,7 @@ fn index_merge_plan(
     let probe_est = if residual.is_empty() {
         rowid_est
     } else {
-        index_merge_residual_rows(&residual, rowid_est)
+        index_merge_residual_rows(&residual, rowid_est, info, table_stats.as_ref())
     };
     let embedded = select
         .limit
@@ -19298,8 +19549,7 @@ fn rowid_access_plan(
     // TiDB keeps the rowid comparison as a cop filter, so the operators above
     // the range report the selection factor (0.8) of that filter.
     let post_rows = access_rows * sealdb_statistics::pseudo::SELECTION_FACTOR;
-    let residual_filter =
-        sealdb_parser::ast::expressions::ExprNode::compose_cnf(residual.clone());
+    let residual_filter = sealdb_parser::ast::expressions::ExprNode::compose_cnf(residual.clone());
     let mut plan = partitioned_table_reader(
         from,
         info,
@@ -19399,10 +19649,7 @@ fn rowid_cop_projection(
         }
         // Table column order, as the cop projection lists the pruned schema.
         for col in info.columns.iter().filter(|c| !c.hidden) {
-            if wanted
-                .iter()
-                .any(|w| w.eq_ignore_ascii_case(col.name.o()))
-            {
+            if wanted.iter().any(|w| w.eq_ignore_ascii_case(col.name.o())) {
                 columns.push(format!("{schema}.{table}.{}", col.name.o()));
             }
         }
