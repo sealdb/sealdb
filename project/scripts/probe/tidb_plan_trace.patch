@@ -1,0 +1,328 @@
+diff --git a/pkg/planner/cardinality/cross_estimation.go b/pkg/planner/cardinality/cross_estimation.go
+index 9b67e601fe..0285debc91 100644
+--- a/pkg/planner/cardinality/cross_estimation.go
++++ b/pkg/planner/cardinality/cross_estimation.go
+@@ -15,7 +15,9 @@
+ package cardinality
+ 
+ import (
++	"fmt"
+ 	"math"
++	"os"
+ 
+ 	"github.com/pingcap/tidb/pkg/expression"
+ 	"github.com/pingcap/tidb/pkg/planner/planctx"
+@@ -84,6 +86,9 @@ func AdjustRowCountForIndexScanByLimit(sctx planctx.PlanContext,
+ 	dsStatsInfo, dsTableStats *property.StatsInfo, dsStatisticTable *statistics.Table,
+ 	path *util.AccessPath, expectedCnt float64, desc bool) float64 {
+ 	rowCount := path.CountAfterAccess
++	if os.Getenv("TIDB_PROBE") != "" {
++		fmt.Fprintf(os.Stderr, "ADJIDX path.count=%v expectedCnt=%v dsRows=%v dsPseudo=%v\n", path.CountAfterAccess, expectedCnt, dsStatsInfo.RowCount, dsStatisticTable.Pseudo)
++	}
+ 	count, ok, corr := crossEstimateIndexRowCount(sctx,
+ 		dsStatsInfo, dsTableStats, dsStatisticTable, path, expectedCnt, desc)
+ 	if ok {
+diff --git a/pkg/planner/cardinality/join.go b/pkg/planner/cardinality/join.go
+index 06a8e3a3fe..7b712c9e9a 100644
+--- a/pkg/planner/cardinality/join.go
++++ b/pkg/planner/cardinality/join.go
+@@ -15,7 +15,9 @@
+ package cardinality
+ 
+ import (
++	"fmt"
+ 	"math"
++	"os"
+ 
+ 	"github.com/pingcap/tidb/pkg/expression"
+ 	"github.com/pingcap/tidb/pkg/planner/planctx"
+@@ -42,6 +44,9 @@ func EstimateFullJoinRowCount(sctx planctx.PlanContext,
+ 		rightKeyNDV, rightColCnt = EstimateColsNDVWithMatchedLen(rightNAJoinKeys, rightSchema, rightProfile)
+ 	}
+ 	count := leftProfile.RowCount * rightProfile.RowCount / max(leftKeyNDV, rightKeyNDV)
++	if os.Getenv("TIDB_PROBE") != "" {
++		fmt.Fprintf(os.Stderr, "JOINEST cart=%v left=%v right=%v lNDV=%v rNDV=%v lCnt=%v rCnt=%v keys=%v count=%v thresh=%v\n", isCartesian, leftProfile.RowCount, rightProfile.RowCount, leftKeyNDV, rightKeyNDV, leftColCnt, rightColCnt, len(leftJoinKeys), count, sctx.GetSessionVars().TiDBOptJoinReorderThreshold)
++	}
+ 	if sctx.GetSessionVars().TiDBOptJoinReorderThreshold <= 0 {
+ 		return count
+ 	}
+diff --git a/pkg/planner/cardinality/row_count_column.go b/pkg/planner/cardinality/row_count_column.go
+index 96d4fe5b11..0db0a38906 100644
+--- a/pkg/planner/cardinality/row_count_column.go
++++ b/pkg/planner/cardinality/row_count_column.go
+@@ -15,6 +15,9 @@
+ package cardinality
+ 
+ import (
++	"fmt"
++	"os"
++
+ 	"github.com/pingcap/errors"
+ 	"github.com/pingcap/tidb/pkg/planner/core/cost"
+ 	"github.com/pingcap/tidb/pkg/planner/planctx"
+@@ -101,6 +104,11 @@ func GetRowCountByIntColumnRanges(sctx planctx.PlanContext, coll *statistics.His
+ 		if len(intRanges) == 0 {
+ 			return 0, nil
+ 		}
++		if os.Getenv("TIDB_PROBE") != "" {
++			for _, r := range intRanges {
++				fmt.Fprintf(os.Stderr, "INTCOLRANGE col=%v low=%v(%v) high=%v(%v) realtime=%v\n", colUniqueID, r.LowVal[0].GetValue(), r.LowVal[0].Kind(), r.HighVal[0].GetValue(), r.HighVal[0].Kind(), coll.RealtimeCount)
++			}
++		}
+ 		if intRanges[0].LowVal[0].Kind() == types.KindInt64 {
+ 			result = getPseudoRowCountBySignedIntRanges(intRanges, float64(coll.RealtimeCount))
+ 		} else {
+diff --git a/pkg/planner/cardinality/selectivity.go b/pkg/planner/cardinality/selectivity.go
+index aeb7df9148..47ff9b9ba2 100644
+--- a/pkg/planner/cardinality/selectivity.go
++++ b/pkg/planner/cardinality/selectivity.go
+@@ -16,7 +16,9 @@ package cardinality
+ 
+ import (
+ 	"cmp"
++	"fmt"
+ 	"math"
++	"os"
+ 	"math/bits"
+ 	"slices"
+ 
+@@ -224,6 +226,12 @@ func Selectivity(
+ 			})
+ 		}
+ 	}
++	if os.Getenv("TIDB_PROBE") != "" {
++		fmt.Fprintf(os.Stderr, "SELPROBE exprs=%v ret=%v realtime=%v\n", exprs, ret, coll.RealtimeCount)
++		for _, n := range nodes {
++			fmt.Fprintf(os.Stderr, "SELPROBE  node tp=%v id=%v mask=%v sel=%v partCover=%v ranges=%v\n", n.Tp, n.ID, n.mask, n.Selectivity, n.partCover, n.Ranges)
++		}
++	}
+ 	usedSets := GetUsableSetsByGreedy(nodes)
+ 	// Initialize the mask with the full set.
+ 	mask := (int64(1) << uint(len(remainedExprs))) - 1
+@@ -282,6 +290,9 @@ func Selectivity(
+ 				switch x.FuncName.L {
+ 				case ast.LogicOr:
+ 					notCoveredDNF[i] = x
++					if os.Getenv("TIDB_PROBE") != "" {
++						fmt.Fprintf(os.Stderr, "SELPROBE dnf=%v\n", x.StringWithCtx(ctx.GetExprCtx().GetEvalCtx(), errors.RedactLogDisable))
++					}
+ 					continue
+ 				case ast.Like, ast.Ilike, ast.Regexp, ast.RegexpLike:
+ 					notCoveredStrMatch[i] = x
+diff --git a/pkg/planner/core/exhaust_physical_plans.go b/pkg/planner/core/exhaust_physical_plans.go
+index ab31ff1adf..6f48a5374a 100644
+--- a/pkg/planner/core/exhaust_physical_plans.go
++++ b/pkg/planner/core/exhaust_physical_plans.go
+@@ -17,6 +17,7 @@ package core
+ import (
+ 	"fmt"
+ 	"math"
++	"os"
+ 	"slices"
+ 	"strings"
+ 
+@@ -596,6 +597,16 @@ func constructIndexJoin(
+ 		// Only count candidates that keep the original Apply outer/inner order.
+ 		FromDecorrelatedApply: p.FromDecorrelatedApply && outerIdx == 0,
+ 	}.Init(p.SCtx(), p.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), p.QueryBlockOffset(), chReqProps...)
++	if os.Getenv("TIDB_PROBE") != "" {
++		uids := func(s *expression.Schema) []int64 {
++			out := make([]int64, 0, s.Len())
++			for _, c := range s.Columns {
++				out = append(out, c.UniqueID)
++			}
++			return out
++		}
++		fmt.Fprintf(os.Stderr, "IJOIN outerIdx=%d c0=%v c1=%v c0uids=%v c1uids=%v schemauids=%v innerChildIdx=%d\n", outerIdx, p.Children()[0].TP(), p.Children()[1].TP(), uids(p.Children()[0].Schema()), uids(p.Children()[1].Schema()), uids(p.Schema()), join.InnerChildIdx)
++	}
+ 	if path != nil {
+ 		join.IdxColLens = path.IdxColLens
+ 	}
+@@ -1106,6 +1117,13 @@ func constructInnerTableScanTask(
+ 		// i.e, rowCount equals to `countAfterAccess * selectivity`.
+ 		countAfterAccess = rowCount / selectivity
+ 	}
++	if os.Getenv("TIDB_PROBE") != "" {
++		fcs := make([]string, 0, len(ts.filterCondition))
++		for _, fc := range ts.filterCondition {
++			fcs = append(fcs, fc.ExplainInfo(p.SCtx().GetExprCtx().GetEvalCtx()))
++		}
++		fmt.Fprintf(os.Stderr, "INNERTSCAN table=%v rowCount=%v sel=%v countAfterAccess=%v filters=%v cond=%v\n", ts.TableAsName.L, rowCount, selectivity, countAfterAccess, len(ts.filterCondition), fcs)
++	}
+ 	ts.SetStats(&property.StatsInfo{
+ 		// TableScan as inner child of IndexJoin can return at most 1 tuple for each outer row.
+ 		RowCount:     math.Min(1.0, countAfterAccess),
+diff --git a/pkg/planner/core/find_best_task.go b/pkg/planner/core/find_best_task.go
+index 5392bcdf85..b0665169e6 100644
+--- a/pkg/planner/core/find_best_task.go
++++ b/pkg/planner/core/find_best_task.go
+@@ -15,6 +15,7 @@
+ package core
+ 
+ import (
++	"os"
+ 	"bytes"
+ 	"cmp"
+ 	"fmt"
+@@ -2159,6 +2160,9 @@ func convertToIndexMergeScan(ds *logicalop.DataSource, prop *property.PhysicalPr
+ 		scans = append(scans, scan)
+ 	}
+ 	totalRowCount := path.CountAfterAccess
++	if os.Getenv("TIDB_PROBE") != "" {
++		fmt.Fprintf(os.Stderr, "IMMERGE countAfter=%v expectedCnt=%v dsRows=%v\n", path.CountAfterAccess, prop.ExpectedCnt, ds.StatsInfo().RowCount)
++	}
+ 	// Add an arbitrary tolerance factor to account for comparison with floating point
+ 	if (prop.ExpectedCnt + cost.ToleranceFactor) < ds.StatsInfo().RowCount {
+ 		totalRowCount *= prop.ExpectedCnt / ds.StatsInfo().RowCount
+diff --git a/pkg/planner/core/indexmerge_path.go b/pkg/planner/core/indexmerge_path.go
+index 9aceebda53..8873fcb6d0 100644
+--- a/pkg/planner/core/indexmerge_path.go
++++ b/pkg/planner/core/indexmerge_path.go
+@@ -16,7 +16,9 @@ package core
+ 
+ import (
+ 	"cmp"
++	"fmt"
+ 	"math"
++	"os"
+ 	"slices"
+ 	"strings"
+ 
+@@ -289,6 +291,15 @@ func generateIndexMergeOrPaths(ds *logicalop.DataSource, filters []expression.Ex
+ 		if possiblePath == nil {
+ 			return nil
+ 		}
++		if os.Getenv("TIDB_PROBE") != "" {
++			fmt.Fprintf(os.Stderr, "IMPROBE rows=%v sel=%v dnf=%v\n", ds.TableStats.RowCount, sel, accessDNF.StringWithCtx(ds.SCtx().GetExprCtx().GetEvalCtx(), errors.RedactLogDisable))
++			for i, set := range partialAlternativePaths {
++				for _, p := range set {
++					fmt.Fprintf(os.Stderr, "IMPROBE  alt[%d] idx=%v table=%v count=%v ranges=%v conds=%v filters=%v\n",
++						i, p.Index, p.IsTablePath(), p.CountAfterAccess, p.Ranges, p.AccessConds, p.IndexFilters)
++				}
++			}
++		}
+ 		possiblePath.CountAfterAccess = sel * ds.TableStats.RowCount
+ 		// only after all partial path is determined, can the countAfterAccess be done, delay it to converging.
+ 		ds.PossibleAccessPaths = append(ds.PossibleAccessPaths, possiblePath)
+diff --git a/pkg/planner/core/operator/logicalop/logical_join.go b/pkg/planner/core/operator/logicalop/logical_join.go
+index 4405953697..5d430204ed 100644
+--- a/pkg/planner/core/operator/logicalop/logical_join.go
++++ b/pkg/planner/core/operator/logicalop/logical_join.go
+@@ -19,6 +19,8 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"math/bits"
++	"os"
++	"strings"
+ 
+ 	"github.com/pingcap/errors"
+ 	"github.com/pingcap/tidb/pkg/expression"
+@@ -1376,6 +1378,24 @@ func (p *LogicalJoin) ExtractOnCondition(
+ 			otherCond = append(otherCond, expr)
+ 		}
+ 	}
++	if os.Getenv("TIDB_PROBE") != "" {
++		strs := func(es []expression.Expression) []string {
++			out := make([]string, 0, len(es))
++			for _, e := range es {
++				out = append(out, e.StringWithCtx(ctx.GetExprCtx().GetEvalCtx(), errors.RedactLogDisable))
++			}
++			return out
++		}
++		fmt.Fprintf(os.Stderr, "EXTRACT type=%v conds=%v\n  left=%v\n  right=%v\n  other=%v eqn=%v\n", p.JoinType, strs(conditions), strs(leftCond), strs(rightCond), strs(otherCond), len(eqCond))
++		for _, e := range conditions {
++			if strings.Contains(e.StringWithCtx(ctx.GetExprCtx().GetEvalCtx(), errors.RedactLogDisable), "or(") {
++				fmt.Fprintf(os.Stderr, "EQPROBE cond=%v -> eq=%v left=%v right=%v other=%v\n", e.StringWithCtx(ctx.GetExprCtx().GetEvalCtx(), errors.RedactLogDisable), len(eqCond), len(leftCond), len(rightCond), len(otherCond))
++				for _, c := range expression.ExtractColumns(e) {
++					fmt.Fprintf(os.Stderr, "EQPROBE  col=%v uid=%v inL=%v inR=%v\n", c.StringWithCtx(ctx.GetExprCtx().GetEvalCtx(), errors.RedactLogDisable), c.UniqueID, leftSchema.Contains(c), rightSchema.Contains(c))
++				}
++			}
++		}
++	}
+ 	return
+ }
+ 
+diff --git a/pkg/planner/core/operator/physicalop/base_physical_plan.go b/pkg/planner/core/operator/physicalop/base_physical_plan.go
+index 4370cfdeec..4dfd81274f 100644
+--- a/pkg/planner/core/operator/physicalop/base_physical_plan.go
++++ b/pkg/planner/core/operator/physicalop/base_physical_plan.go
+@@ -15,6 +15,9 @@
+ package physicalop
+ 
+ import (
++	"fmt"
++	"os"
++
+ 	"github.com/pingcap/errors"
+ 	"github.com/pingcap/tidb/pkg/expression"
+ 	"github.com/pingcap/tidb/pkg/kv"
+@@ -241,6 +244,17 @@ func (p *BasePhysicalPlan) GetEstRowCountForDisplay() float64 {
+ 	if p == nil {
+ 		return 0
+ 	}
++	if os.Getenv("TIDB_PROBE") != "" {
++		pc := utilfuncp.GetEstimatedProbeCntFromProbeParents(p.probeParents)
++		fmt.Fprintf(os.Stderr, "ESTNODE id=%v rowcount=%v probeparents=%d proberows=%v\n", p.ID(), p.StatsInfo().RowCount, len(p.probeParents), pc)
++		for _, pp := range p.probeParents {
++			if j, ok := pp.(interface{ getInnerChildIdx() int }); ok {
++				fmt.Fprintf(os.Stderr, "  PROBEPARENT tp=%v outerRows=%v innerIdx=%v\n", pp.TP(), pp.Children()[1-j.getInnerChildIdx()].StatsInfo().RowCount, j.getInnerChildIdx())
++			} else {
++				fmt.Fprintf(os.Stderr, "  PROBEPARENT tp=%v (noparent)\n", pp.TP())
++			}
++		}
++	}
+ 	return p.StatsInfo().RowCount * utilfuncp.GetEstimatedProbeCntFromProbeParents(p.probeParents)
+ }
+ 
+diff --git a/pkg/planner/core/rule_eliminate_projection.go b/pkg/planner/core/rule_eliminate_projection.go
+index d1e98d5ca9..bfac48eb13 100644
+--- a/pkg/planner/core/rule_eliminate_projection.go
++++ b/pkg/planner/core/rule_eliminate_projection.go
+@@ -18,6 +18,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"fmt"
++	"os"
+ 
+ 	perrors "github.com/pingcap/errors"
+ 	"github.com/pingcap/failpoint"
+@@ -108,6 +109,18 @@ func doPhysicalProjectionElimination(p base.PhysicalPlan) base.PhysicalPlan {
+ 	}
+ 
+ 	proj, isProj := p.(*PhysicalProjection)
++	if os.Getenv("TIDB_PROBE") != "" && isProj {
++		child := p.Children()[0]
++		fmt.Fprintf(os.Stderr, "PROJELIM keep?=%v projLen=%d childTP=%v childLen=%d\n", !canProjectionBeEliminatedStrict(proj), p.Schema().Len(), child.TP(), child.Schema().Len())
++		for i := range proj.Exprs {
++			col, ok := proj.Exprs[i].(*expression.Column)
++			if !ok || i >= child.Schema().Len() {
++				fmt.Fprintf(os.Stderr, "  expr[%d]=%v col=%v ok=%v\n", i, proj.Exprs[i], col, ok)
++				continue
++			}
++			fmt.Fprintf(os.Stderr, "  expr[%d]=%v uid=%d childUID=%d eq=%v\n", i, proj.Exprs[i], col.UniqueID, child.Schema().Columns[i].UniqueID, col.EqualColumn(child.Schema().Columns[i]))
++		}
++	}
+ 	if !isProj || !canProjectionBeEliminatedStrict(proj) {
+ 		return p
+ 	}
+diff --git a/pkg/util/hack/map_abi.go b/pkg/util/hack/map_abi.go
+index a4946da2fb..c52dbcbc8f 100644
+--- a/pkg/util/hack/map_abi.go
++++ b/pkg/util/hack/map_abi.go
+@@ -15,6 +15,7 @@
+ package hack
+ 
+ import (
++	"os"
+ 	"runtime"
+ 	"strings"
+ 	"unsafe"
+@@ -411,7 +412,7 @@ func (m *MemAwareMap[K, V]) RealBytes() uint64 {
+ }
+ 
+ func checkMapABI() {
+-	if !strings.Contains(runtime.Version(), `go1.25`) {
++	if !strings.Contains(runtime.Version(), `go1.25`) && os.Getenv("TIDB_SKIP_ABI_CHECK") == "" {
+ 		panic("The hack package only supports go1.25, please confirm the correctness of the ABI before upgrading")
+ 	}
+ }
