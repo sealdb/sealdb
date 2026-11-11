@@ -577,6 +577,7 @@ fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Res
     let idx = found.ok_or_else(|| {
         if std::env::var("SEALDB_DEBUG_COL").is_ok() {
             eprintln!("DEBUG unbound column {:?} schema={schema:?}", col);
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
         }
         Error::new(
             ERR_BAD_FIELD,
@@ -604,10 +605,15 @@ fn column_matches(col: &ColumnNameExpr, schema_name: &str) -> bool {
         name.eq_ignore_ascii_case(&col.name) || schema_name.eq_ignore_ascii_case(&col.name);
     match col.table.as_deref() {
         Some(wanted) => {
+            // Schema-qualified labels (`dbg.m2.b`) must still bind `m2.b`;
+            // the database prefix only labels the column.
+            let qualified = format!("{wanted}.{}", col.name);
+            let suffix = format!(".{qualified}").to_ascii_lowercase();
             name_ok
                 && (table.is_none()
                     || table.is_some_and(|t| t.eq_ignore_ascii_case(wanted))
-                    || schema_name.eq_ignore_ascii_case(&format!("{wanted}.{}", col.name)))
+                    || schema_name.eq_ignore_ascii_case(&qualified)
+                    || schema_name.to_ascii_lowercase().ends_with(&suffix))
         }
         None => name_ok,
     }

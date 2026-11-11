@@ -545,7 +545,7 @@ impl ExecutorBuilder {
                 }
                 Ok(Box::new(TableDualExec::new(*row_count as usize, schema)))
             }
-            PhysicalPlan::HashAgg { child, .. } => {
+            PhysicalPlan::HashAgg { child, info, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("hash agg without select"))?;
@@ -556,6 +556,21 @@ impl ExecutorBuilder {
                     current_db,
                     Arc::clone(&txn),
                 )?;
+                // `RewriteINToJoinAndAgg` puts a `HashAgg(firstrow)` over the
+                // subquery as the build side of an inner join. That aggregate
+                // belongs to the *subquery*, so the outer statement carries no
+                // aggregation of its own: execute it from the plan's group keys
+                // (`group by:dbg.m2.b, funcs:firstrow(…)`) instead.
+                if let Some(dedup) = dedup_from_agg_info(info)
+                    && !stmt_owns_agg_info(select, &dedup)
+                {
+                    return Ok(Box::new(DistinctExec::new(
+                        dedup.keys,
+                        dedup.fields,
+                        dedup.names,
+                        built,
+                    )));
+                }
                 // Outer DISTINCT HashAgg over StreamAgg: dedup projected columns.
                 if matches!(
                     child.as_ref(),
@@ -964,10 +979,25 @@ impl ExecutorBuilder {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        // `RewriteINToJoinAndAgg` (`tidb_opt_insubq_to_join_and_agg`) turns
+        // `x IN (SELECT y …)` into an inner join against the de-duplicated
+        // subquery. The subquery columns are not visible to the outer query
+        // (TiDB prunes them), and the de-dup keeps at most one build row per
+        // key, so the join behaves exactly like the semi join it replaced.
+        let in_rewrite = matches!(tp, JoinType::Inner)
+            && matches!(
+                right,
+                PhysicalPlan::HashAgg { info, .. } if dedup_from_agg_info(info).is_some()
+            );
+        let exec_tp = if in_rewrite {
+            JoinType::Semi
+        } else {
+            tp
+        };
         let join = sealdb_parser::ast::Join {
             left: sealdb_parser::ast::TableName::new(None, left_table.to_string()),
             right: sealdb_parser::ast::TableName::new(None, right_table.to_string()),
-            tp: ast_join_type(tp),
+            tp: ast_join_type(exec_tp),
             on: on.clone(),
             using_cols: using_cols.clone(),
             natural: false,
@@ -2028,6 +2058,88 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
         other if other.has_subquery() => other.restore_string(),
         other => other.restore_string(),
     }
+}
+
+/// Whether the plan's aggregate keys are exactly the statement's `GROUP BY`
+/// list, i.e. the `HashAgg` is the statement's own aggregate rather than a
+/// rewritten subquery de-duplication.
+fn stmt_owns_agg_info(select: &SelectStmt, dedup: &DedupAgg) -> bool {
+    select.group_by.len() == dedup.keys.len()
+        && select.group_by.iter().zip(&dedup.keys).all(|(item, key)| {
+            let text = item
+                .restore_string()
+                .to_ascii_lowercase()
+                .replace('`', "");
+            let key = key.to_ascii_lowercase();
+            text == key
+                || key.ends_with(&format!(".{text}"))
+                || text.ends_with(&format!(".{key}"))
+        })
+}
+
+/// A subquery de-duplication aggregate executed directly from the physical
+/// plan's ExplainInfo (`group by:a, b, funcs:firstrow(a)->a, funcs:firstrow(b)->b`).
+struct DedupAgg {
+    keys: Vec<String>,
+    fields: Vec<ExprNode>,
+    names: Vec<String>,
+}
+
+/// Parse TiDB's `HashAgg` ExplainInfo into a row-dedup on its group keys.
+///
+/// Only the `buildDistinct` shape (`RewriteINToJoinAndAgg`) qualifies: every
+/// function is `firstrow(<key>)` returning that key, so the aggregate output
+/// is exactly the distinct group keys. Anything else (real aggregates such as
+/// `max`) returns `None` and the statement-driven path keeps handling it.
+fn dedup_from_agg_info(info: &str) -> Option<DedupAgg> {
+    let rest = info.strip_prefix("group by:")?;
+    let (group_part, func_part) = rest.split_once(", funcs:")?;
+    if group_part.is_empty() {
+        return None;
+    }
+    let keys: Vec<&str> = group_part.split(", ").collect();
+    let mut names = Vec::with_capacity(keys.len());
+    for func in func_part.split(", funcs:") {
+        let inner = func.strip_prefix("firstrow(")?;
+        let (arg, out) = inner.split_once(")->")?;
+        let key = keys
+            .iter()
+            .find(|k| k.eq_ignore_ascii_case(arg))
+            .copied()?;
+        names.push((key, out));
+    }
+    if names.len() != keys.len() {
+        return None;
+    }
+    let fields = keys
+        .iter()
+        .map(|key| parse_qualified_column(key).map(ExprNode::Column))
+        .collect::<Option<Vec<_>>>()?;
+    let names = names.into_iter().map(|(_, out)| out.to_string()).collect();
+    Some(DedupAgg {
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+        fields,
+        names,
+    })
+}
+
+/// `dbg.m2.b` → `ColumnNameExpr { table: Some("m2"), name: "b" }` (the schema
+/// prefix only labels the column; resolution is by table + column name).
+fn parse_qualified_column(
+    text: &str,
+) -> Option<sealdb_parser::ast::expressions::ColumnNameExpr> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.rsplit('.');
+    let name = parts.next()?.to_string();
+    let table = parts.next().map(|t| t.to_string());
+    Some(sealdb_parser::ast::expressions::ColumnNameExpr {
+        schema: None,
+        table,
+        name,
+    })
 }
 
 /// `Apply`-style context for scalar subqueries in SELECT list / GROUP BY /
