@@ -16,6 +16,8 @@ use sealdb_parser::parser::Parser;
 
 /// System schema name (lowercase, like TiDB's `mysql.SchemaName`).
 pub const MYSQL_SCHEMA: &str = "mysql";
+/// TiDB's default scratch schema.
+pub const TEST_SCHEMA: &str = "test";
 
 /// TiDB grant tables that `EXPLAIN` / privilege checks see. Each entry is one
 /// `CREATE TABLE` with its `i_user` index inline; TiDB adds that index with a
@@ -157,14 +159,25 @@ const SYSTEM_TABLES: &[&str] = &[
 /// `mysql` database yet (TiDB `bootstrap()`). Existing storage keeps its
 /// schemas untouched, so this is a one-shot bootstrap.
 ///
+/// TiDB also ships an empty `test` schema (`CREATE DATABASE IF NOT EXISTS
+/// test`), which suites `use` before creating their tables.
+///
 /// Returns whether anything was created, so the caller can persist the meta.
 pub fn bootstrap_system_tables(meta: &mut Mutator) -> Result<bool> {
+    let mut created = false;
     let dbs = meta.list_databases()?;
-    if dbs
-        .iter()
-        .any(|db| db.name.l().eq_ignore_ascii_case(MYSQL_SCHEMA))
-    {
-        return Ok(false);
+    let has = |name: &str| dbs.iter().any(|db| db.name.l().eq_ignore_ascii_case(name));
+    if !has(TEST_SCHEMA) {
+        let db_id = meta.gen_global_id()?;
+        let db = DBInfo::new(db_id, TEST_SCHEMA);
+        meta.create_database(&db)?;
+        created = true;
+    }
+    if has(MYSQL_SCHEMA) {
+        if created {
+            meta.gen_schema_version()?;
+        }
+        return Ok(created);
     }
     let db_id = meta.gen_global_id()?;
     let db = DBInfo::new(db_id, MYSQL_SCHEMA);
