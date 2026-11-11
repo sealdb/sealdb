@@ -191,11 +191,7 @@ impl Session {
 
     /// Execute every statement in `sql` and return each result ( multi-resultset).
     pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
-        let mode = self
-            .sql_mode
-            .lock()
-            .expect("session sql_mode lock")
-            .clone();
+        let mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
         reject_create_table_func_call(sql, &mode)?;
         // sqlparser always applies MySQL backslash escapes. Under
         // NO_BACKSLASH_ESCAPES, double `\` inside quotes so the unescaped
@@ -728,11 +724,7 @@ impl Session {
             .lock()
             .expect("session partition prune mode lock");
         // EXPLAIN / semi-join strings use `current_db_name()` (suite schema).
-        let explicit_txn = self
-            .txn
-            .lock()
-            .expect("session txn lock")
-            .is_explicit()
+        let explicit_txn = self.txn.lock().expect("session txn lock").is_explicit()
             || !*self.autocommit.lock().expect("session autocommit lock");
         // TiDB `MemBuffer.DirtyTableExists`: tables with pending writes in this
         // transaction read through a `UnionScan`.
@@ -783,49 +775,51 @@ impl Session {
         };
         let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
             sealdb_planner::with_cost_model_version(cost_model_version, || {
-            sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
-            sealdb_planner::with_insubq_to_join_and_agg(opt_insubq_to_join_and_agg, || {
-            sealdb_planner::with_hashagg_concurrency(
-                hashagg_partial_concurrency,
-                hashagg_final_concurrency,
-                || {
-            sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
-            sealdb_planner::with_explicit_txn(explicit_txn, || {
-            sealdb_planner::with_dirty_tables(dirty_tables, || {
-            if use_cache {
-                let cache = self.domain.plan_cache();
-                // Re-optimize every EXECUTE: the cached plan was built from the
-                // first bound SQL, so literal values baked into ranges, pushed
-                // cop filters, or pruned partitions would answer a later USING
-                // list incorrectly. The cache still accounts a hit so shared
-                // plan-cache statistics match TiDB.
-                let cached = cache.get(&cache_key, schema_ver).is_some();
-                let plan = self.planner.build_with_schema(
-                    stmt,
-                    Some(&is),
-                    &current_db,
-                    Some(stats.as_ref()),
-                    prune_mode,
-                )?;
-                if !cached {
-                    cache.put(cache_key, schema_ver, plan.clone());
-                }
-                Ok(plan)
-            } else {
-                self.planner.build_with_schema(
-                    stmt,
-                    Some(&is),
-                    &current_db,
-                    Some(stats.as_ref()),
-                    prune_mode,
-                )
-            }
-            })
-            })
-            })
-            })
-            })
-            })
+                sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
+                    sealdb_planner::with_insubq_to_join_and_agg(opt_insubq_to_join_and_agg, || {
+                        sealdb_planner::with_hashagg_concurrency(
+                            hashagg_partial_concurrency,
+                            hashagg_final_concurrency,
+                            || {
+                                sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
+                                    sealdb_planner::with_explicit_txn(explicit_txn, || {
+                                        sealdb_planner::with_dirty_tables(dirty_tables, || {
+                                            if use_cache {
+                                                let cache = self.domain.plan_cache();
+                                                // Re-optimize every EXECUTE: the cached plan was built from the
+                                                // first bound SQL, so literal values baked into ranges, pushed
+                                                // cop filters, or pruned partitions would answer a later USING
+                                                // list incorrectly. The cache still accounts a hit so shared
+                                                // plan-cache statistics match TiDB.
+                                                let cached =
+                                                    cache.get(&cache_key, schema_ver).is_some();
+                                                let plan = self.planner.build_with_schema(
+                                                    stmt,
+                                                    Some(&is),
+                                                    &current_db,
+                                                    Some(stats.as_ref()),
+                                                    prune_mode,
+                                                )?;
+                                                if !cached {
+                                                    cache.put(cache_key, schema_ver, plan.clone());
+                                                }
+                                                Ok(plan)
+                                            } else {
+                                                self.planner.build_with_schema(
+                                                    stmt,
+                                                    Some(&is),
+                                                    &current_db,
+                                                    Some(stats.as_ref()),
+                                                    prune_mode,
+                                                )
+                                            }
+                                        })
+                                    })
+                                })
+                            },
+                        )
+                    })
+                })
             })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
@@ -851,11 +845,7 @@ impl Session {
             .lock()
             .expect("session collation lock")
             .clone();
-        let sql_mode = self
-            .sql_mode
-            .lock()
-            .expect("session sql_mode lock")
-            .clone();
+        let sql_mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
         let time_zone = self
             .time_zone
             .lock()
@@ -919,10 +909,7 @@ impl Session {
         // MySQL: a session holding `LOCK TABLES … READ` cannot write the table.
         if is_write_stmt(stmt) {
             for key in &keys {
-                if self
-                    .domain
-                    .session_read_locks_table(self.session_id, key)
-                {
+                if self.domain.session_read_locks_table(self.session_id, key) {
                     let table = key.rsplit('.').next().unwrap_or(key);
                     return Err(sealdb_errno::Error::new(
                         sealdb_errno::ERR_TABLE_NOT_LOCKED_FOR_WRITE,
@@ -1370,12 +1357,8 @@ impl Session {
                     format!("LOAD STATS: file not found: {path}"),
                 )
             })?;
-        let raw = std::fs::read_to_string(file).map_err(|e| {
-            Error::new(
-                sealdb_errno::ERR_UNKNOWN_ERROR,
-                format!("LOAD STATS: {e}"),
-            )
-        })?;
+        let raw = std::fs::read_to_string(file)
+            .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, format!("LOAD STATS: {e}")))?;
         let (database, table, stats) = sealdb_statistics::table_from_tidb_json(&raw)?;
         if database.is_empty() || table.is_empty() {
             return Err(Error::new(
@@ -1750,9 +1733,23 @@ fn is_create_table_func_name(name: &str) -> bool {
     // TiDB treats built-in function identifiers specially for CREATE TABLE.
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "COUNT" | "BIT_AND" | "BIT_OR" | "BIT_XOR" | "NOW" | "SUM" | "AVG" | "MAX" | "MIN"
-            | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME"
-            | "LOCALTIMESTAMP" | "UTC_DATE" | "UTC_TIME" | "UTC_TIMESTAMP"
+        "COUNT"
+            | "BIT_AND"
+            | "BIT_OR"
+            | "BIT_XOR"
+            | "NOW"
+            | "SUM"
+            | "AVG"
+            | "MAX"
+            | "MIN"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_DATE"
+            | "CURRENT_TIME"
+            | "LOCALTIME"
+            | "LOCALTIMESTAMP"
+            | "UTC_DATE"
+            | "UTC_TIME"
+            | "UTC_TIMESTAMP"
     ) || sealdb_expression::lookup(name).is_some()
 }
 
@@ -1764,8 +1761,7 @@ fn keyword_at_ci(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
         return false;
     }
     let end = i + kw.len();
-    end == bytes.len()
-        || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+    end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
 }
 
 fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
@@ -2047,6 +2043,7 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
             table: sealdb_parser::ast::TableName::new(Some(schema), name),
             tables: Vec::new(),
             indexes: Vec::new(),
+            bucket_count: None,
         });
         session.execute_one(&analyze)?;
     }
@@ -2331,7 +2328,8 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
     )))
 }
 
-fn parse_set_literal(value: &str) -> sealdb_types::Datum {    let v = value.trim();
+fn parse_set_literal(value: &str) -> sealdb_types::Datum {
+    let v = value.trim();
     if v.eq_ignore_ascii_case("null") {
         return sealdb_types::Datum::Null;
     }
@@ -2374,11 +2372,7 @@ fn needs_user_var_subst(stmt: &Statement) -> bool {
 }
 
 fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> bool {
-    col.name.starts_with("@@")
-        || col
-            .table
-            .as_deref()
-            .is_some_and(|t| t.starts_with('@'))
+    col.name.starts_with("@@") || col.table.as_deref().is_some_and(|t| t.starts_with('@'))
 }
 
 /// TiDB-style select-list name for expressions that mention session vars.
@@ -2575,10 +2569,7 @@ fn div_by_zero_mode(
     }
 }
 
-fn apply_set(
-    session: &Session,
-    stmt: &sealdb_parser::ast::SetStmt,
-) -> Result<Vec<(i32, String)>> {
+fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Vec<(i32, String)>> {
     let mut warnings = Vec::new();
     for a in &stmt.assignments {
         if is_user_var_name(&a.name) {
@@ -2753,10 +2744,10 @@ fn apply_set(
                     5
                 } else {
                     value.parse().map_err(|_| {
-                    sealdb_errno::Error::new(
-                        sealdb_errno::ERR_WRONG_ARGUMENTS,
-                        format!("Variable '{name}' can't be set to the value of '{value}'"),
-                    )
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!("Variable '{name}' can't be set to the value of '{value}'"),
+                        )
                     })?
                 };
                 if n == 0 {
@@ -2777,13 +2768,11 @@ fn apply_set(
                         .expect("session hashagg final concurrency lock") = n;
                 }
             }
-            "autocommit" => {                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+            "autocommit" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
                     true
                 } else {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "1" | "on" | "true"
-                    )
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
                 };
                 *session.autocommit.lock().expect("session autocommit lock") = on;
             }
@@ -2792,10 +2781,7 @@ fn apply_set(
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
                     true
                 } else {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "1" | "on" | "true"
-                    )
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
                 };
                 *session
                     .foreign_key_checks
@@ -2821,10 +2807,7 @@ fn apply_set(
             // Session time zone (DST / TIMESTAMP display). Value stored for later
             // conversion; offset literals like '+00:00' / named zones accepted.
             "time_zone" => {
-                *session
-                    .time_zone
-                    .lock()
-                    .expect("session time_zone lock") = value;
+                *session.time_zone.lock().expect("session time_zone lock") = value;
             }
             // `tx_isolation` / `transaction_isolation`: TiDB's alias pair for
             // `SET TRANSACTION ISOLATION LEVEL`. READ-UNCOMMITTED is accepted
@@ -2838,16 +2821,16 @@ fn apply_set(
                     _ => {
                         return Err(sealdb_errno::Error::new(
                             sealdb_errno::ERR_WRONG_ARGUMENTS,
-                            format!(
-                                "Variable '{name}' can't be set to the value of '{value}'"
-                            ),
+                            format!("Variable '{name}' can't be set to the value of '{value}'"),
                         ));
                     }
                 };
                 *session.isolation.lock().expect("session isolation lock") = level;
             }
             "tidb_window_concurrency" => {
-                let n: u64 = value.parse().unwrap_or(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY);
+                let n: u64 = value
+                    .parse()
+                    .unwrap_or(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY);
                 *session
                     .window_concurrency
                     .lock()
@@ -3585,7 +3568,12 @@ struct ViewPrivCtx<'a> {
 }
 
 impl ViewPrivCtx<'_> {
-    fn require(&self, db: &str, name: &str, privs: sealdb_parser::ast::PrivilegeType) -> Result<()> {
+    fn require(
+        &self,
+        db: &str,
+        name: &str,
+        privs: sealdb_parser::ast::PrivilegeType,
+    ) -> Result<()> {
         if self
             .mgr
             .request_verification_with_roles(&self.user, &self.roles, db, name, privs)
@@ -3810,7 +3798,10 @@ fn inject_view_cte(
     let view_col_names: Vec<String> = if !explicit_cols.is_empty() {
         explicit_cols
     } else if !body_is_star && info.columns.len() == view_select.fields.len() {
-        info.columns.iter().map(|c| c.name.o().to_string()).collect()
+        info.columns
+            .iter()
+            .map(|c| c.name.o().to_string())
+            .collect()
     } else {
         Vec::new()
     };
@@ -3953,7 +3944,9 @@ fn qualify_tables_in_expr(
 ) {
     use sealdb_parser::ast::expressions::ExprNode;
     match expr {
-        ExprNode::ScalarSubquery(s) => qualify_tables_in_result_set(&mut s.query, schema, cte_names),
+        ExprNode::ScalarSubquery(s) => {
+            qualify_tables_in_result_set(&mut s.query, schema, cte_names)
+        }
         ExprNode::Exists(e) => qualify_tables_in_result_set(&mut e.query, schema, cte_names),
         ExprNode::InSubquery(s) => {
             qualify_tables_in_expr(&mut s.expr, schema, cte_names);
@@ -4196,9 +4189,7 @@ fn rewrite_merged_view_cols(
                 .table
                 .as_deref()
                 .is_none_or(|t| t.eq_ignore_ascii_case(view_name));
-            if from_view
-                && let Some(mapped) = mapping.get(&c.name.to_ascii_lowercase())
-            {
+            if from_view && let Some(mapped) = mapping.get(&c.name.to_ascii_lowercase()) {
                 *expr = mapped.clone();
             }
         }
@@ -4547,7 +4538,11 @@ mod tests {
         let ok = session
             .execute_stmt("SELECT TIMESTAMP '2024-01-01 14:00:00'")
             .unwrap();
-        assert_eq!(ok.columns[0], "TIMESTAMP '2024-01-01 14:00:00'", "{:?}", ok.columns);
+        assert_eq!(
+            ok.columns[0], "TIMESTAMP '2024-01-01 14:00:00'",
+            "{:?}",
+            ok.columns
+        );
         assert_eq!(ok.rows[0][0].display(), "2024-01-01 14:00:00");
     }
 
@@ -4559,7 +4554,9 @@ mod tests {
         let ok = session.execute_stmt("SELECT '孵', '孵化投入'").unwrap();
         assert_eq!(ok.rows[0][0].display(), "孵", "literal");
         assert_eq!(ok.rows[0][1].display(), "孵化投入", "literal2");
-        session.execute_stmt("CREATE DATABASE IF NOT EXISTS utf8probe").unwrap();
+        session
+            .execute_stmt("CREATE DATABASE IF NOT EXISTS utf8probe")
+            .unwrap();
         session.execute_stmt("USE utf8probe").unwrap();
         session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
         session
@@ -4596,7 +4593,9 @@ mod tests {
     #[test]
     fn test_date_add_timestampadd_strings() {
         let session = Session::new();
-        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        session
+            .execute_stmt("SET time_zone='Europe/Paris'")
+            .unwrap();
         let ok = session
             .execute_stmt("SELECT DATE_ADD('2025-03-30 02:30:00', INTERVAL 1 HOUR)")
             .unwrap();
@@ -4606,7 +4605,9 @@ mod tests {
             .unwrap();
         assert_eq!(ok.rows[0][0].display(), "2025-03-30 03:30:00");
         let ok = session
-            .execute_stmt("SELECT TIMESTAMPDIFF(HOUR, '2025-03-30 01:59:59', '2025-03-30 02:30:00')")
+            .execute_stmt(
+                "SELECT TIMESTAMPDIFF(HOUR, '2025-03-30 01:59:59', '2025-03-30 02:30:00')",
+            )
             .unwrap();
         assert_eq!(ok.rows, vec![vec![Datum::I64(0)]]);
     }
@@ -4614,13 +4615,21 @@ mod tests {
     #[test]
     fn test_timestampadd_column_dst_8179() {
         let session = Session::new();
-        session.execute_stmt("CREATE DATABASE IF NOT EXISTS dst").unwrap();
+        session
+            .execute_stmt("CREATE DATABASE IF NOT EXISTS dst")
+            .unwrap();
         session.execute_stmt("USE dst").unwrap();
         session.execute_stmt("SET time_zone='UTC'").unwrap();
         session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
-        session.execute_stmt("CREATE TABLE t (id int primary key, ts TIMESTAMP)").unwrap();
-        session.execute_stmt("INSERT INTO t VALUES (1, '2025-03-30 00:59:59')").unwrap();
-        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        session
+            .execute_stmt("CREATE TABLE t (id int primary key, ts TIMESTAMP)")
+            .unwrap();
+        session
+            .execute_stmt("INSERT INTO t VALUES (1, '2025-03-30 00:59:59')")
+            .unwrap();
+        session
+            .execute_stmt("SET time_zone='Europe/Paris'")
+            .unwrap();
         let err = session
             .execute_stmt("SELECT TIMESTAMPADD(HOUR, 1, ts) FROM t")
             .expect_err("dst");
@@ -4630,7 +4639,9 @@ mod tests {
     #[test]
     fn test_timestamp_index_nullsafe_dst_warnings() {
         let session = Session::new();
-        session.execute_stmt("CREATE DATABASE IF NOT EXISTS tzidx").unwrap();
+        session
+            .execute_stmt("CREATE DATABASE IF NOT EXISTS tzidx")
+            .unwrap();
         session.execute_stmt("USE tzidx").unwrap();
         session.execute_stmt("SET time_zone='UTC'").unwrap();
         session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
@@ -4643,8 +4654,12 @@ mod tests {
         session
             .execute_stmt("INSERT INTO t VALUES (2, '2025-03-30 01:00:00')")
             .unwrap();
-        session.execute_stmt("ALTER TABLE t ADD INDEX idx_ts (ts)").unwrap();
-        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        session
+            .execute_stmt("ALTER TABLE t ADD INDEX idx_ts (ts)")
+            .unwrap();
+        session
+            .execute_stmt("SET time_zone='Europe/Paris'")
+            .unwrap();
         let eq = session
             .execute_stmt(
                 "SELECT /*+ USE_INDEX(t, idx_ts) */ * FROM t WHERE ts = '2025-03-30 02:00:00'",
@@ -4674,7 +4689,9 @@ mod tests {
     #[test]
     fn test_timestamp_column_tz_display() {
         let session = Session::new();
-        session.execute_stmt("CREATE DATABASE IF NOT EXISTS tz").unwrap();
+        session
+            .execute_stmt("CREATE DATABASE IF NOT EXISTS tz")
+            .unwrap();
         session.execute_stmt("USE tz").unwrap();
         session.execute_stmt("SET time_zone='UTC'").unwrap();
         session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
@@ -4687,7 +4704,9 @@ mod tests {
         session
             .execute_stmt("INSERT INTO t VALUES (2, '2025-03-30 01:00:00')")
             .unwrap();
-        session.execute_stmt("SET time_zone='Europe/Paris'").unwrap();
+        session
+            .execute_stmt("SET time_zone='Europe/Paris'")
+            .unwrap();
         let ok = session
             .execute_stmt("SELECT *, UNIX_TIMESTAMP(ts) FROM t")
             .unwrap();
@@ -4722,9 +4741,7 @@ mod tests {
             .unwrap();
         assert_eq!(ok.rows, vec![vec![Datum::I64(-1)]]);
         let err = session
-            .execute_stmt(
-                "SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)",
-            )
+            .execute_stmt("SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)")
             .unwrap_err();
         assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
         assert!(
@@ -4779,7 +4796,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_exists_with_recursive_cte_correlated() {
         let session = Session::new();
@@ -4801,7 +4817,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("EXISTS recursive CTE failed: {e}"));
         assert_eq!(rows.display_rows(), vec![vec!["1".to_string()]]);
     }
-
 
     #[test]
     fn test_unnamed_key_index_name_and_cte_binding() {
@@ -4939,7 +4954,10 @@ mod tests {
         assert!(text.contains("Sort(Build)"), "{text}");
         assert!(text.contains("Sort(Probe)"), "{text}");
         assert!(text.contains("not(isnull(cte.t1.c1))"), "{text}");
-        assert!(!text.lines().next().unwrap_or("").starts_with("Sort|"), "{text}");
+        assert!(
+            !text.lines().next().unwrap_or("").starts_with("Sort|"),
+            "{text}"
+        );
         let rows = session
             .execute_stmt(
                 "WITH cte1 AS (SELECT c1 FROM t1) \
@@ -8410,7 +8428,9 @@ mod tests {
             .execute_stmt("SELECT COUNT(*) FROM db1.t WHERE id = 4")
             .unwrap();
         assert_eq!(deleted.display_rows(), vec![vec!["0".to_string()]]);
-        session.execute_stmt("DROP TABLE IF EXISTS db1.tbl_0").unwrap();
+        session
+            .execute_stmt("DROP TABLE IF EXISTS db1.tbl_0")
+            .unwrap();
         session
             .execute_stmt("CREATE TABLE db1.tbl_0(a int)")
             .unwrap();
@@ -8425,7 +8445,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_VIEW_WRONG_LIST);
     }
-
 
     #[test]
     fn test_derived_table() {
@@ -9081,7 +9100,11 @@ mod tests {
             "{}",
             before.explain()
         );
-        assert!(!before.explain().contains("TableReader"), "{}", before.explain());
+        assert!(
+            !before.explain().contains("TableReader"),
+            "{}",
+            before.explain()
+        );
         session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
         let stats = session.stats().table("db1", "t").unwrap();
         assert_eq!(stats.count, 3);
@@ -9206,10 +9229,7 @@ mod tests {
             .map(|r| r.join("|"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            before_text.contains("IndexLookUp"),
-            "{before_text}"
-        );
+        assert!(before_text.contains("IndexLookUp"), "{before_text}");
         // `SELECT *` needs the table lookup: the index is not covering.
         assert!(!before_text.contains("TableReader"), "{before_text}");
         session.execute_stmt("ANALYZE TABLE db1.t").unwrap();
@@ -9483,7 +9503,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("Point_Get") || text.contains("TableReader") || text.contains("Selection"),
+            text.contains("Point_Get")
+                || text.contains("TableReader")
+                || text.contains("Selection"),
             "{text}"
         );
         assert!(
@@ -9749,9 +9771,7 @@ mod expression_index_tests {
             .unwrap();
         assert_eq!(rows.rows.len(), 2);
         // The value must be readable back through the expression index itself.
-        let hit = session
-            .execute_stmt("select b from t where a = 2")
-            .unwrap();
+        let hit = session.execute_stmt("select b from t where a = 2").unwrap();
         assert_eq!(hit.display_rows(), vec![vec!["20".to_string()]]);
     }
 
@@ -9795,4 +9815,3 @@ mod expression_index_tests {
         assert_eq!(err.code, 3758, "{err}");
     }
 }
-

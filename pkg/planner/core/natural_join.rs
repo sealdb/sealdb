@@ -9,10 +9,10 @@
 use sealdb_errno::{ERR_AMBIGUOUS_COLUMN, Error, Result};
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::dml::{CommonTableExpression, Join, SelectStmt};
+use sealdb_parser::ast::expressions::ValueExpr;
 use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode};
 use sealdb_parser::ast::{FromItem, Statement};
 use sealdb_parser::opcode::Op;
-use sealdb_parser::ast::expressions::ValueExpr;
 use sealdb_types::Datum;
 
 use sealdb_infoschema::InfoSchema;
@@ -78,11 +78,7 @@ pub fn expand_natural_joins(
     }
 }
 
-fn expand_select(
-    select: &mut SelectStmt,
-    is: Option<&InfoSchema>,
-    current_db: &str,
-) -> Result<()> {
+fn expand_select(select: &mut SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> Result<()> {
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
             expand_select(&mut cte.query, is, current_db)?;
@@ -254,12 +250,15 @@ fn table_side_columns(
     current_db: &str,
 ) -> Option<SideColumns> {
     let name = table.resolve_name();
-    if let Some(cte) = ctes
-        .iter()
-        .find(|cte| cte.name.eq_ignore_ascii_case(name) || cte.name.eq_ignore_ascii_case(&table.name))
-    {
+    if let Some(cte) = ctes.iter().find(|cte| {
+        cte.name.eq_ignore_ascii_case(name) || cte.name.eq_ignore_ascii_case(&table.name)
+    }) {
         let cols = cte_columns(cte);
-        return Some(cols.into_iter().map(|col| (col, table.name.clone())).collect());
+        return Some(
+            cols.into_iter()
+                .map(|col| (col, table.name.clone()))
+                .collect(),
+        );
     }
     let is = is?;
     let schema = table
@@ -380,8 +379,11 @@ mod tests {
 
     #[test]
     fn natural_common_columns_in_left_order() {
-        let (cols, _) = resolve_natural(side(&[("c", "t1"), ("b", "t1")]), side(&[("b", "t2"), ("a", "t2")]))
-            .unwrap();
+        let (cols, _) = resolve_natural(
+            side(&[("c", "t1"), ("b", "t1")]),
+            side(&[("b", "t2"), ("a", "t2")]),
+        )
+        .unwrap();
         assert_eq!(cols, vec!["b".to_string()]);
     }
 
@@ -399,7 +401,8 @@ mod tests {
     #[test]
     fn natural_from_item_owner_resolution() {
         let left = side(&[("c", "t1"), ("b", "t1"), ("a", "t2"), ("b", "t2")]);
-        let err = resolve_natural(left, side(&[("b", "t3"), ("c", "t3"), ("y", "t4")])).unwrap_err();
+        let err =
+            resolve_natural(left, side(&[("b", "t3"), ("c", "t3"), ("y", "t4")])).unwrap_err();
         assert_eq!(err.message, "Column 'b' in from clause is ambiguous");
     }
 }

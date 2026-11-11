@@ -30,7 +30,12 @@ pub enum OomAction {
 
 impl OomAction {
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_uppercase().as_str() {
+        match raw
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_ascii_uppercase()
+            .as_str()
+        {
             "CANCEL" | "DEFAULT" | "" => Some(Self::Cancel),
             "LOG" => Some(Self::Log),
             "NONE" => Some(Self::None),

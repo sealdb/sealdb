@@ -173,11 +173,8 @@ fn push_into(
             // still become the index access range: the ranger detaches it from
             // the filter and the scan seeks.
             let mut residual = residual;
-            let range_candidates: Vec<ExprNode> = pushable
-                .iter()
-                .chain(residual.iter())
-                .cloned()
-                .collect();
+            let range_candidates: Vec<ExprNode> =
+                pushable.iter().chain(residual.iter()).cloned().collect();
             // TiDB ranger: predicates on the index prefix become the access
             // range of the Build side, so `IndexLookUp` seeks instead of
             // scanning the whole index. The range keeps its own estRows while
@@ -267,8 +264,9 @@ fn push_into(
                         // table's column statistics (`cardinality.Selectivity`),
                         // so `c3 < 1` keeps its pseudo range rate over the rows
                         // the index range produced.
-                        let sel = sealdb_statistics::pseudo::selectivity(&probe_side, 10_000.0, None)
-                            .unwrap_or(1.0);
+                        let sel =
+                            sealdb_statistics::pseudo::selectivity(&probe_side, 10_000.0, None)
+                                .unwrap_or(1.0);
                         probe_base * sel
                     })
             });
@@ -338,11 +336,8 @@ fn push_into(
                     .indices
                     .iter()
                     .find(|idx| idx.name.o().eq_ignore_ascii_case(&index));
-                let range_candidates: Vec<ExprNode> = pushable
-                    .iter()
-                    .chain(residual.iter())
-                    .cloned()
-                    .collect();
+                let range_candidates: Vec<ExprNode> =
+                    pushable.iter().chain(residual.iter()).cloned().collect();
                 if let Some(index_info) = index_info
                     && let Some(access) = super::access_range::index_access_range(
                         info,
@@ -533,13 +528,7 @@ fn push_into(
             desc,
             common_handle,
         } => {
-            let key_columns = point_get_key_columns(
-                is,
-                current_db,
-                &table,
-                index.as_deref(),
-                None,
-            );
+            let key_columns = point_get_key_columns(is, current_db, &table, index.as_deref(), None);
             let mut residual: Vec<ExprNode> = conjuncts
                 .into_iter()
                 .filter_map(|expr| {
@@ -774,9 +763,7 @@ fn push_into(
             for conjunct in conjuncts {
                 match mem_table_range(&conjunct) {
                     Some((column, values))
-                        if columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&column)) =>
+                        if columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) =>
                     {
                         ranges.extend(values.into_iter().map(|v| (column.clone(), v)));
                     }
@@ -869,8 +856,7 @@ fn pk_eq_handle(
 fn cop_pushable(expr: &ExprNode) -> bool {
     match expr {
         ExprNode::Func(func) => {
-            !func.name.eq_ignore_ascii_case("tidb_shard")
-                && func.args.iter().all(cop_pushable)
+            !func.name.eq_ignore_ascii_case("tidb_shard") && func.args.iter().all(cop_pushable)
         }
         ExprNode::Binary(bin) => cop_pushable(&bin.left) && cop_pushable(&bin.right),
         ExprNode::Unary(unary) => cop_pushable(&unary.expr),
@@ -912,7 +898,9 @@ fn point_get_key_columns(
                 Some(super::expr_index::part_keys(info, idx))
             })
             .unwrap_or_default(),
-        None => handle_column.map(|c| vec![c.to_string()]).unwrap_or_default(),
+        None => handle_column
+            .map(|c| vec![c.to_string()])
+            .unwrap_or_default(),
     }
 }
 
@@ -929,7 +917,13 @@ fn is_point_get_key(expr: &ExprNode, key_columns: &[String]) -> bool {
 /// every arm is fully answered by the lookup (the filter is redundant).
 fn reduce_pinned_dnf(expr: &ExprNode, key_columns: &[String]) -> Option<Option<ExprNode>> {
     let arms = expr.split_dnf();
-    if arms.len() < 2 || !arms.iter().all(|arm| arm.split_cnf_all().iter().any(|c| is_point_get_key(c, key_columns))) {
+    if arms.len() < 2
+        || !arms.iter().all(|arm| {
+            arm.split_cnf_all()
+                .iter()
+                .any(|c| is_point_get_key(c, key_columns))
+        })
+    {
         return None;
     }
     let mut leftovers: Vec<ExprNode> = Vec::with_capacity(arms.len());
@@ -976,10 +970,7 @@ fn mem_table_range(expr: &ExprNode) -> Option<(String, Vec<String>)> {
         return Some((col.name.to_ascii_lowercase(), values));
     }
     let (column, value) = expr.eq_column_const()?;
-    Some((
-        column.to_ascii_lowercase(),
-        vec![mem_table_value(value)?],
-    ))
+    Some((column.to_ascii_lowercase(), vec![mem_table_value(value)?]))
 }
 
 fn mem_table_value(value: Datum) -> Option<String> {

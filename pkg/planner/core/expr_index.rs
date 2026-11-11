@@ -63,12 +63,12 @@ pub fn has_expression_part(info: &TableInfo, index: &IndexInfo) -> bool {
 ///
 /// Returns `None` when the expression reads a column the predicate does not
 /// pin (`a + b` under `a = 1` alone) or when the value folds to `NULL`.
-pub fn eval_part(
-    info: &TableInfo,
-    expr: &ExprNode,
-    known: &[(String, Datum)],
-) -> Option<Datum> {
-    let schema: Vec<String> = info.columns.iter().map(|c| c.name.o().to_string()).collect();
+pub fn eval_part(info: &TableInfo, expr: &ExprNode, known: &[(String, Datum)]) -> Option<Datum> {
+    let schema: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
     let mut row = vec![Datum::Null; info.columns.len()];
     for (name, value) in known {
         if let Some(pos) = info

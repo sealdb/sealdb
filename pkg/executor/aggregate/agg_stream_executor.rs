@@ -1,8 +1,8 @@
 // StreamAgg for scalar aggregations (no GROUP BY).
 // Completeness wave: sorted GROUP BY StreamAgg, pipelined partial aggs.
 use super::HashAggExec;
-use crate::join::apply::SubqueryEvalCtx;
 use crate::internal::exec::Executor;
+use crate::join::apply::SubqueryEvalCtx;
 use sealdb_errno::Result;
 use sealdb_parser::ast::SelectStmt;
 use sealdb_util::chunk::Chunk;

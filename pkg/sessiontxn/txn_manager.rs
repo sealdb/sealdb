@@ -194,7 +194,9 @@ impl TxnManager {
         let Some(handle) = &self.handle else {
             return Vec::new();
         };
-        handle.with_txn(|txn| Ok(txn.dirty_keys())).unwrap_or_default()
+        handle
+            .with_txn(|txn| Ok(txn.dirty_keys()))
+            .unwrap_or_default()
     }
 
     pub fn refresh_snapshot(&self) -> Result<()> {

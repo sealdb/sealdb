@@ -28,7 +28,11 @@ pub enum ClusteredIndexMode {
 impl ClusteredIndexMode {
     /// TiDB `GetClusteredIndexMode`-style parse of the variable literal.
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim_matches(|c| c == '\'' || c == '"').to_ascii_uppercase().as_str() {
+        match value
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_ascii_uppercase()
+            .as_str()
+        {
             "ON" | "1" | "TRUE" | "DEFAULT" => Some(Self::On),
             "INT_ONLY" => Some(Self::IntOnly),
             "OFF" | "0" | "FALSE" => Some(Self::Off),

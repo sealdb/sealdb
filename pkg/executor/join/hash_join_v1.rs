@@ -637,12 +637,8 @@ fn bare_col(name: &str) -> &str {
 
 fn validate_using_cols(using: &[String], left: &[String], right: &[String]) -> Result<()> {
     for col in using {
-        let in_left = left
-            .iter()
-            .any(|c| bare_col(c).eq_ignore_ascii_case(col));
-        let in_right = right
-            .iter()
-            .any(|c| bare_col(c).eq_ignore_ascii_case(col));
+        let in_left = left.iter().any(|c| bare_col(c).eq_ignore_ascii_case(col));
+        let in_right = right.iter().any(|c| bare_col(c).eq_ignore_ascii_case(col));
         if !in_left || !in_right {
             return Err(Error::new(
                 ERR_BAD_FIELD,
@@ -654,10 +650,8 @@ fn validate_using_cols(using: &[String], left: &[String], right: &[String]) -> R
 }
 
 fn coalesce_using_schema(left: &[String], right: &[String], using: &[String]) -> Vec<String> {
-    let drop_right: std::collections::HashSet<String> = using
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let drop_right: std::collections::HashSet<String> =
+        using.iter().map(|c| c.to_ascii_lowercase()).collect();
     left.iter()
         .cloned()
         .chain(
@@ -673,10 +667,8 @@ fn coalesce_using_schema(left: &[String], right: &[String], using: &[String]) ->
 /// so its columns come first and the left duplicates are dropped
 /// (`t1(a,c) RIGHT JOIN t2(a,d) USING(a)` → `t2.a, t2.d, t1.c`).
 fn coalesce_using_schema_right(left: &[String], right: &[String], using: &[String]) -> Vec<String> {
-    let drop_left: std::collections::HashSet<String> = using
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let drop_left: std::collections::HashSet<String> =
+        using.iter().map(|c| c.to_ascii_lowercase()).collect();
     right
         .iter()
         .cloned()
@@ -695,10 +687,8 @@ fn project_using_rows(
     using: &[String],
     hidden: &[usize],
 ) -> Vec<Vec<Datum>> {
-    let drop_right: std::collections::HashSet<String> = using
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let drop_right: std::collections::HashSet<String> =
+        using.iter().map(|c| c.to_ascii_lowercase()).collect();
     let keep: Vec<usize> = (0..left_width)
         .chain((0..right.len()).filter_map(|i| {
             if drop_right.contains(&bare_col(&right[i]).to_ascii_lowercase()) {
@@ -714,7 +704,11 @@ fn project_using_rows(
                 .iter()
                 .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null))
                 .collect();
-            out.extend(hidden.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)));
+            out.extend(
+                hidden
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)),
+            );
             out
         })
         .collect()
@@ -728,15 +722,14 @@ fn project_using_rows_right(
     using: &[String],
     hidden: &[usize],
 ) -> Vec<Vec<Datum>> {
-    let drop_left: std::collections::HashSet<String> = using
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let drop_left: std::collections::HashSet<String> =
+        using.iter().map(|c| c.to_ascii_lowercase()).collect();
     let keep: Vec<usize> = (0..right.len())
         .map(|i| left.len() + i)
-        .chain((0..left.len()).filter(|&i| {
-            !drop_left.contains(&bare_col(&left[i]).to_ascii_lowercase())
-        }))
+        .chain(
+            (0..left.len())
+                .filter(|&i| !drop_left.contains(&bare_col(&left[i]).to_ascii_lowercase())),
+        )
         .collect();
     rows.into_iter()
         .map(|row| {
@@ -744,7 +737,11 @@ fn project_using_rows_right(
                 .iter()
                 .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null))
                 .collect();
-            out.extend(hidden.iter().map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)));
+            out.extend(
+                hidden
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or(Datum::Null)),
+            );
             out
         })
         .collect()
@@ -783,9 +780,7 @@ fn split_on_conditions<'a>(
         if key.is_none() {
             // A parenthesized table group on either side exposes several table
             // qualifiers, so classify by the child schemas first.
-            if let Ok(keys) =
-                split_join_eq_by_schema(conjunct, left_schema, right_schema)
-            {
+            if let Ok(keys) = split_join_eq_by_schema(conjunct, left_schema, right_schema) {
                 key = Some(keys);
                 continue;
             }
@@ -796,9 +791,8 @@ fn split_on_conditions<'a>(
         }
         residual.push(conjunct);
     }
-    let (left_key, right_key) = key.ok_or_else(|| {
-        Error::unsupported("JOIN ON must compare columns from both tables")
-    })?;
+    let (left_key, right_key) =
+        key.ok_or_else(|| Error::unsupported("JOIN ON must compare columns from both tables"))?;
     Ok((left_key, right_key, residual))
 }
 

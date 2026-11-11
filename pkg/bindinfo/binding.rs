@@ -73,7 +73,10 @@ fn strip_index_hints(sql: &str) -> String {
             };
             let mut j = skip_ws(bytes, i + kw_len);
             if keyword_at(bytes, j, b"INDEX") || keyword_at(bytes, j, b"KEY") {
-                j = skip_ws(bytes, j + if keyword_at(bytes, j, b"INDEX") { 5 } else { 3 });
+                j = skip_ws(
+                    bytes,
+                    j + if keyword_at(bytes, j, b"INDEX") { 5 } else { 3 },
+                );
                 if j < bytes.len() && bytes[j] == b'(' {
                     j = skip_balanced_paren(bytes, j);
                     i = j;

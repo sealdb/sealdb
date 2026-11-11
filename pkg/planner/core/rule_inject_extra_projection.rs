@@ -10,15 +10,20 @@ use sealdb_parser::opcode::Op;
 
 /// True when every ORDER BY item folds to a constant (no columns / non-deterministic funcs).
 pub fn order_by_all_constant(select: &SelectStmt) -> bool {
-    !select.order_by.is_empty() && select.order_by.iter().all(|item| is_const_order_expr(&item.expr))
+    !select.order_by.is_empty()
+        && select
+            .order_by
+            .iter()
+            .all(|item| is_const_order_expr(&item.expr))
 }
 
 /// True when any ORDER BY item is a scalar function (not a bare column or
 /// select-list ordinal — ordinals sort by output position in SortExec).
 pub fn order_by_has_scalar_func(select: &SelectStmt) -> bool {
-    select.order_by.iter().any(|item| {
-        !matches!(item.expr, ExprNode::Column(_)) && !is_order_by_ordinal(&item.expr)
-    })
+    select
+        .order_by
+        .iter()
+        .any(|item| !matches!(item.expr, ExprNode::Column(_)) && !is_order_by_ordinal(&item.expr))
 }
 
 /// InjectProjBelowSort: Projection(select cols) → Sort(Column#N) →
@@ -71,11 +76,7 @@ pub fn inject_proj_below_sort(
     }
 }
 
-fn next_order_column_id(
-    select: &SelectStmt,
-    is: Option<&InfoSchema>,
-    current_db: &str,
-) -> usize {
+fn next_order_column_id(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> usize {
     // TiDB AllocPlanColumnID after table cols + handle: t(a,b) → Column#4.
     if let Some(from) = &select.from {
         if let Some(n) = table_column_count(from, is, current_db) {
@@ -85,7 +86,11 @@ fn next_order_column_id(
     4
 }
 
-fn table_column_count(from: &TableName, is: Option<&InfoSchema>, current_db: &str) -> Option<usize> {
+fn table_column_count(
+    from: &TableName,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<usize> {
     let schema = from
         .schema
         .as_deref()

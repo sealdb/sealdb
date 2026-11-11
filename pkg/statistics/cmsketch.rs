@@ -28,7 +28,9 @@ impl CmSketch {
         if depth == 0 || width == 0 {
             return None;
         }
-        let count = rows.last().map(|row| row.iter().map(|c| u64::from(*c)).sum())?;
+        let count = rows
+            .last()
+            .map(|row| row.iter().map(|c| u64::from(*c)).sum())?;
         Some(Self {
             depth,
             width,
@@ -178,8 +180,8 @@ pub fn murmur3_sum128(data: &[u8]) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sealdb_types::field_type::TYPE_LONG;
     use sealdb_types::FieldType;
+    use sealdb_types::field_type::TYPE_LONG;
 
     fn load(path: &str) -> crate::table::Table {
         let raw = std::fs::read_to_string(format!(
@@ -211,11 +213,8 @@ mod tests {
         let table = load("s/explain_easy_stats_t1.json");
         let idx = table.index("c2").expect("index stats");
         let sketch = idx.cm_sketch.as_ref().expect("cm sketch");
-        let key = crate::range_est::encode_index_key(
-            &FieldType::new_longlong(),
-            &Datum::I64(1),
-        )
-        .expect("key");
+        let key = crate::range_est::encode_index_key(&FieldType::new_longlong(), &Datum::I64(1))
+            .expect("key");
         assert_eq!(sketch.query_bytes(&key), 0);
         let _ = TYPE_LONG;
     }

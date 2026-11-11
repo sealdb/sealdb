@@ -1,12 +1,12 @@
 use super::table::TableInfo;
 use crate::model::job::{STATE_PUBLIC, SchemaState};
 use sealdb_errno::{ERR_NO_PARTITION_FOR_GIVEN_VALUE, Error, Result};
-use std::cmp::Ordering;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
 use sealdb_parser::model::CIStr;
 use sealdb_parser::opcode::Op;
 use sealdb_types::Datum;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 /// TiDB `model.PartitionType` core cases for .
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -173,7 +173,8 @@ impl PartitionInfo {
         };
         let n = self.definitions.len() as i64;
         let idx = (v % n).unsigned_abs();
-        Ok(self.definitions[idx as usize].id)    }
+        Ok(self.definitions[idx as usize].id)
+    }
 
     /// TiDB `KEY` partitioning: MD5 of the key value, first 8 digest bytes as
     /// a big-endian `u64`, then `% partitions`. Distinct from HASH (modulo of
@@ -495,9 +496,7 @@ fn compare_bound(value: &Datum, bound: &str) -> Option<Ordering> {
             (v as f64).partial_cmp(&b)
         }
         Datum::Bit(b) => {
-            let v = b
-                .iter()
-                .fold(0u128, |acc, x| (acc << 8) | u128::from(*x));
+            let v = b.iter().fold(0u128, |acc, x| (acc << 8) | u128::from(*x));
             if let Ok(bound_i) = bound.parse::<u128>() {
                 return Some(v.cmp(&bound_i));
             }

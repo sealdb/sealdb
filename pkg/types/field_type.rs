@@ -25,11 +25,7 @@ pub struct FieldType {
     #[serde(rename = "Collate")]
     pub collate: String,
     /// `ENUM`/`SET` members in declaration order (TiDB `FieldType.Elems`).
-    #[serde(
-        rename = "Elems",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "Elems", default, skip_serializing_if = "Option::is_none")]
     pub elems: Option<Vec<String>>,
     #[serde(skip)]
     pub unsigned: bool,

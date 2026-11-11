@@ -55,9 +55,9 @@ pub fn expr_side(expr: &ExprNode, left: &[String], right: &[String]) -> AggSide 
     let mut seen_right = false;
     for (qualifier, _name) in expr.referenced_columns() {
         let matches = |names: &[String]| {
-            qualifier.as_deref().is_some_and(|q| {
-                names.iter().any(|n| n.eq_ignore_ascii_case(q))
-            })
+            qualifier
+                .as_deref()
+                .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q)))
         };
         if matches(left) {
             seen_left = true;
@@ -82,10 +82,11 @@ pub fn covers_unique_key(info: &TableInfo, columns: &[String]) -> bool {
     info.indices.iter().any(|idx| {
         idx.unique
             && !idx.columns.is_empty()
-            && idx
-                .columns
-                .iter()
-                .all(|c| columns.iter().any(|col| col.eq_ignore_ascii_case(c.name.o())))
+            && idx.columns.iter().all(|c| {
+                columns
+                    .iter()
+                    .any(|col| col.eq_ignore_ascii_case(c.name.o()))
+            })
     })
 }
 
@@ -94,7 +95,10 @@ pub fn covers_unique_key(info: &TableInfo, columns: &[String]) -> bool {
 /// TiDB keeps the original function name in both phases; the partial column is
 /// the argument of the final call.
 pub fn final_func(func: &str, partial_col: usize, out_col: usize) -> String {
-    format!("{}(Column#{partial_col})->Column#{out_col}", func.to_ascii_lowercase())
+    format!(
+        "{}(Column#{partial_col})->Column#{out_col}",
+        func.to_ascii_lowercase()
+    )
 }
 
 #[cfg(test)]

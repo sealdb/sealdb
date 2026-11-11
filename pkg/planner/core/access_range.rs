@@ -431,6 +431,7 @@ pub fn index_access_range(
             filter_rows,
             pseudo: pseudo_scan,
             partial: partial_columns,
+            keep_order: false,
         },
         consumed,
         ranges,
@@ -457,9 +458,11 @@ fn coerce_bound(
             sealdb_types::Datum::F64(v) => {
                 sealdb_types::Datum::Decimal(sealdb_types::MyDecimal::parse(&format!("{v}")).ok()?)
             }
-            sealdb_types::Datum::Bytes(b) | sealdb_types::Datum::Bit(b) => sealdb_types::Datum::Decimal(
-                sealdb_types::MyDecimal::parse(std::str::from_utf8(b).ok()?.trim()).ok()?,
-            ),
+            sealdb_types::Datum::Bytes(b) | sealdb_types::Datum::Bit(b) => {
+                sealdb_types::Datum::Decimal(
+                    sealdb_types::MyDecimal::parse(std::str::from_utf8(b).ok()?.trim()).ok()?,
+                )
+            }
             // NULL bound on a NOT NULL column: keep the datum as-is.
             _ => value,
         },
@@ -502,16 +505,11 @@ fn bounds_fit_column(
 mod tests {
     use super::*;
     use sealdb_meta::{ColumnInfo, IndexColumn};
-    use sealdb_types::FieldType;
     use sealdb_parser::Parser;
+    use sealdb_types::FieldType;
 
     fn int_column(name: &str, offset: i32) -> ColumnInfo {
-        ColumnInfo::new(
-            offset as i64 + 1,
-            offset,
-            name,
-            FieldType::new_longlong(),
-        )
+        ColumnInfo::new(offset as i64 + 1, offset, name, FieldType::new_longlong())
     }
 
     fn table_info(
@@ -538,16 +536,12 @@ mod tests {
         let sealdb_parser::ast::Statement::Select(select) = stmt else {
             panic!("not a select");
         };
-        select
-            .selection
-            .expect("selection")
-            .split_cnf()
+        select.selection.expect("selection").split_cnf()
     }
 
     #[test]
     fn test_less_than_becomes_range() {
-        let (info, index) =
-            table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
+        let (info, index) = table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
         let access =
             index_access_range(&info, &index, &selection("a < 3"), 10_000.0, None).expect("range");
         assert_eq!(access.range.text, "[-inf,3)");
@@ -572,8 +566,7 @@ mod tests {
 
     #[test]
     fn test_unrelated_column_has_no_range() {
-        let (info, index) =
-            table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
+        let (info, index) = table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
         assert!(index_access_range(&info, &index, &selection("b < 3"), 10_000.0, None).is_none());
     }
 
@@ -608,9 +601,14 @@ mod tests {
             ],
             &["c2"],
         );
-        let access =
-            index_access_range(&info, &index, &selection("c1 > 1 and c2 = 1"), 10_000.0, None)
-                .expect("range");
+        let access = index_access_range(
+            &info,
+            &index,
+            &selection("c1 > 1 and c2 = 1"),
+            10_000.0,
+            None,
+        )
+        .expect("range");
         assert_eq!(access.range.text, "(1 1,1 +inf]");
         assert_eq!(access.key_ranges.len(), 1);
         // Both predicates are encoded by the seek, so neither stays a filter.
@@ -650,11 +648,9 @@ mod tests {
 
     #[test]
     fn test_duplicate_in_ranges_merge() {
-        let (info, index) =
-            table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
-        let access =
-            index_access_range(&info, &index, &selection("a in (1, 1)"), 10_000.0, None)
-                .expect("range");
+        let (info, index) = table_info(vec![int_column("a", 0), int_column("b", 1)], &["a"], false);
+        let access = index_access_range(&info, &index, &selection("a in (1, 1)"), 10_000.0, None)
+            .expect("range");
         assert_eq!(access.range.text, "[1,1]");
     }
 }

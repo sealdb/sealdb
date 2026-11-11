@@ -60,6 +60,10 @@ pub struct IndexScanRange {
     /// `stats:partial[col:missing]` on the scan.
     #[serde(default)]
     pub partial: Option<String>,
+    /// Equality-constrained key prefix makes the scan already ordered by the
+    /// remaining keys (`a = 1 ORDER BY b` on `idx(a, b)` keeps key order).
+    #[serde(default)]
+    pub keep_order: bool,
 }
 
 /// Inclusive/exclusive bounds of one index range, `None` meaning the
@@ -675,18 +679,22 @@ impl PhysicalPlan {
                 by_info,
                 offset,
                 count,
-            } => format!("TopN({by_info},offset:{offset},count:{count}) -> {}", child.explain()),
+            } => format!(
+                "TopN({by_info},offset:{offset},count:{count}) -> {}",
+                child.explain()
+            ),
             PhysicalPlan::Limit {
                 child,
                 offset,
                 count,
-            } => format!("Limit(offset:{offset},count:{count}) -> {}", child.explain()),
+            } => format!(
+                "Limit(offset:{offset},count:{count}) -> {}",
+                child.explain()
+            ),
             PhysicalPlan::HashAgg { child, info, .. } => {
                 format!("HashAgg({info}) -> {}", child.explain())
             }
-            PhysicalPlan::StreamAgg {
-                child, info, ..
-            } => {
+            PhysicalPlan::StreamAgg { child, info, .. } => {
                 format!("StreamAgg({info}) -> {}", child.explain())
             }
             PhysicalPlan::HashJoin {
@@ -711,7 +719,11 @@ impl PhysicalPlan {
             },
             PhysicalPlan::IndexJoin {
                 outer, inner, info, ..
-            } => format!("IndexJoin({info}, {}, {})", outer.explain(), inner.explain()),
+            } => format!(
+                "IndexJoin({info}, {}, {})",
+                outer.explain(),
+                inner.explain()
+            ),
             PhysicalPlan::UnionScan { child, info, .. } => {
                 format!("UnionScan({info}) -> {}", child.explain())
             }
@@ -754,8 +766,14 @@ impl PhysicalPlan {
             } => {
                 format!("Distinct({}) -> {}", keys.join(","), child.explain())
             }
-            PhysicalPlan::NullAwareAntiJoin { info, probe, build, .. } => {
-                format!("NullAwareAntiJoin({info}, {}, {})", probe.explain(), build.explain())
+            PhysicalPlan::NullAwareAntiJoin {
+                info, probe, build, ..
+            } => {
+                format!(
+                    "NullAwareAntiJoin({info}, {}, {})",
+                    probe.explain(),
+                    build.explain()
+                )
             }
             PhysicalPlan::RowProjection { info, child, .. } => {
                 format!("RowProjection({info}) -> {}", child.explain())

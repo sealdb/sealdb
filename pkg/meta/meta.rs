@@ -131,8 +131,7 @@ impl Mutator {
     }
 
     pub fn reset_auto_id(&mut self, table_id: i64) {
-        let key =
-            encode_string_data_key(format!("NextAutoID:{table_id}").as_bytes()).into_bytes();
+        let key = encode_string_data_key(format!("NextAutoID:{table_id}").as_bytes()).into_bytes();
         self.remove_key(key);
     }
 

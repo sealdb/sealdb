@@ -226,7 +226,8 @@ fn column_default_datum(col: &ColumnInfo) -> Result<Option<sealdb_types::Datum>>
 
 /// `ALTER TABLE … ADD COLUMN … DEFAULT x` fills existing rows with `x`
 /// (TiDB/MySQL expose the default for rows written before the column existed).
-fn backfill_added_column(    storage: &dyn Storage,
+fn backfill_added_column(
+    storage: &dyn Storage,
     info: &TableInfo,
     types: &[(i64, sealdb_types::FieldType)],
     col_id: i64,
@@ -311,8 +312,7 @@ pub(crate) fn backfill_generated_columns(
                 }
             }
             let mut col_ids: Vec<i64> = decoded.iter().map(|(id, _)| *id).collect();
-            let mut out: Vec<sealdb_types::Datum> =
-                decoded.into_iter().map(|(_, v)| v).collect();
+            let mut out: Vec<sealdb_types::Datum> = decoded.into_iter().map(|(_, v)| v).collect();
             for (id, col, expr) in &pending {
                 if col_ids.contains(id) {
                     continue;
@@ -663,7 +663,8 @@ fn alter_index_visibility(
     Ok(())
 }
 
-fn column_insert_index(info: &TableInfo, position: &ColumnPosition) -> Result<usize> {    match position {
+fn column_insert_index(info: &TableInfo, position: &ColumnPosition) -> Result<usize> {
+    match position {
         ColumnPosition::None => Ok(info.columns.len()),
         ColumnPosition::First => Ok(0),
         ColumnPosition::After(name) => {

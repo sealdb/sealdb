@@ -64,7 +64,8 @@ impl MyDecimal {
         out
     }
 
-    pub fn to_i64(&self) -> Result<i64> {        let int_part = self.digits.split('.').next().unwrap_or("0");
+    pub fn to_i64(&self) -> Result<i64> {
+        let int_part = self.digits.split('.').next().unwrap_or("0");
         let v: i64 = int_part
             .parse()
             .map_err(|_| Error::new(ERR_TRUNCATED_WRONG_VALUE, "decimal overflow"))?;
@@ -94,7 +95,11 @@ impl MyDecimal {
         } else if frac.len() >= scale {
             format!("{int_part}.{}", &frac[..scale])
         } else {
-            format!("{int_part}.{frac}{:0>width$}", "", width = scale - frac.len())
+            format!(
+                "{int_part}.{frac}{:0>width$}",
+                "",
+                width = scale - frac.len()
+            )
         };
         Self {
             negative: self.negative,

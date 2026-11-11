@@ -8,12 +8,9 @@ use sealdb_errno::{
     ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_DUP_FIELDNAME, ERR_UNSUPPORTED,
     ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
-use std::sync::atomic::{AtomicI64, Ordering};
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::expressions::{
-    ColumnNameExpr, ExprNode, InListExpr, ValueExpr,
-};
+use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, InListExpr, ValueExpr};
 use sealdb_parser::ast::{
     ResultSetNode, SelectField, SelectLock, SelectLockWait, SelectStmt, SetOprType, Statement,
     WithClause,
@@ -24,6 +21,7 @@ use sealdb_util::chunk::Chunk;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// TiDB session var `cte_max_recursion_depth` (default 1000). Stored process-wide
 /// like `tidb_window_concurrency`; the itest runner executes suites serially.
@@ -36,7 +34,6 @@ pub fn set_cte_max_recursion_depth(depth: i64) {
 pub fn cte_max_recursion_depth() -> i64 {
     CTE_MAX_RECURSION_DEPTH.load(Ordering::Relaxed)
 }
-
 
 type CteWorking = (Vec<String>, Vec<Vec<Datum>>);
 
@@ -395,9 +392,7 @@ fn iterate_recursive(
     }
     // TiDB/MySQL: a recursive arm that never reads this CTE runs once (the
     // planner turns it into a regular child and no depth limit applies).
-    let self_ref = arms
-        .iter()
-        .any(|(_, rec)| select_refs_table(rec, name));
+    let self_ref = arms.iter().any(|(_, rec)| select_refs_table(rec, name));
     // TiDB counts the seed as iteration 1 (`computeSeedPart` sets curIter=1) and
     // rejects starting an iteration whose number exceeds @@cte_max_recursion_depth.
     // The depth check runs before `limitDone` (`computeRecursivePart`).
@@ -532,13 +527,8 @@ fn run_statement(
         Some(stats.as_ref()),
         sealdb_planner::PartitionPruneMode::Dynamic,
     )?;
-    let exec = ExecutorBuilder::build(
-        &plan,
-        stmt,
-        Arc::clone(domain),
-        current_db,
-        Arc::clone(txn),
-    )?;
+    let exec =
+        ExecutorBuilder::build(&plan, stmt, Arc::clone(domain), current_db, Arc::clone(txn))?;
     ExecutorBuilder::run(exec)
 }
 
@@ -643,9 +633,7 @@ pub fn pre_evaluate_dml_predicate(
             b.expr = Box::new(pre_evaluate_dml_predicate(
                 &b.expr, domain, current_db, txn,
             )?);
-            b.low = Box::new(pre_evaluate_dml_predicate(
-                &b.low, domain, current_db, txn,
-            )?);
+            b.low = Box::new(pre_evaluate_dml_predicate(&b.low, domain, current_db, txn)?);
             b.high = Box::new(pre_evaluate_dml_predicate(
                 &b.high, domain, current_db, txn,
             )?);
@@ -745,9 +733,7 @@ fn unknown_outer_col_in_recursive(
         if found.is_some() {
             return;
         }
-        let is_outer = outer_cols
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&col.name));
+        let is_outer = outer_cols.iter().any(|c| c.eq_ignore_ascii_case(&col.name));
         if !is_outer {
             return;
         }

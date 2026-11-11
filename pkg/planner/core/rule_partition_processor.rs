@@ -2,9 +2,7 @@
 /// Static prunes at plan time; dynamic defers to execute using the pushed filter.
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::ExprNode;
-use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, InListExpr, ValueExpr,
-};
+use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, InListExpr, ValueExpr};
 
 /// TiDB `variable.PartitionPruneMode` (legacy *-only aliases normalize here).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,11 +71,7 @@ pub fn resolve_partitions(
         .filter(|d| pruned.contains(&d.id))
         .collect();
     if !named.is_empty() {
-        defs.retain(|d| {
-            named
-                .iter()
-                .any(|n| d.name.o().eq_ignore_ascii_case(n))
-        });
+        defs.retain(|d| named.iter().any(|n| d.name.o().eq_ignore_ascii_case(n)));
         // Keep definition order (TiDB EXPLAIN `p1,p2` for `PARTITION (p2,p1)`).
         let mut ordered = Vec::new();
         for d in &part.definitions {
@@ -228,10 +222,8 @@ fn rewrite_prune_selection(
     use sealdb_parser::opcode::Op;
     match expr {
         ExprNode::Binary(bin) => {
-            if matches!(
-                bin.op,
-                Op::Eq | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Ne
-            ) && (monotonic || bin.op == Op::Eq)
+            if matches!(bin.op, Op::Eq | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Ne)
+                && (monotonic || bin.op == Op::Eq)
             {
                 let lhs_key = key_column_of(&bin.left, key_columns);
                 let rhs_key = key_column_of(&bin.right, key_columns);
@@ -335,9 +327,7 @@ fn const_datum(expr: &ExprNode) -> Option<sealdb_types::Datum> {
     match expr {
         ExprNode::Value(ValueExpr { datum }) if !datum.is_null() => Some(datum.clone()),
         // Negative literals parse as `UnaryMinus(Value)`.
-        ExprNode::Unary(u)
-            if u.op == sealdb_parser::opcode::Op::UnaryMinus =>
-        {
+        ExprNode::Unary(u) if u.op == sealdb_parser::opcode::Op::UnaryMinus => {
             match u.expr.as_ref() {
                 ExprNode::Value(ValueExpr {
                     datum: sealdb_types::Datum::I64(v),
@@ -361,7 +351,11 @@ fn eval_key_expr(
     column: &str,
     value: &sealdb_types::Datum,
 ) -> Option<sealdb_types::Datum> {
-    let schema: Vec<String> = info.columns.iter().map(|c| c.name.o().to_string()).collect();
+    let schema: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
     let idx = schema.iter().position(|c| c.eq_ignore_ascii_case(column))?;
     let mut row = vec![sealdb_types::Datum::Null; schema.len()];
     row[idx] = value.clone();

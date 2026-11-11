@@ -415,6 +415,8 @@ pub struct AnalyzeTableStmt {
     pub tables: Vec<TableName>,
     /// Optional index names for `ANALYZE TABLE t INDEX idx1, idx2`.
     pub indexes: Vec<String>,
+    /// `WITH n BUCKETS`: histogram bucket count (TiDB default 256).
+    pub bucket_count: Option<u64>,
 }
 
 impl AnalyzeTableStmt {
@@ -446,6 +448,9 @@ impl AnalyzeTableStmt {
                 }
                 ctx.write_name(name);
             }
+        }
+        if let Some(buckets) = self.bucket_count {
+            ctx.write_str(&format!(" WITH {buckets} BUCKETS"));
         }
         Ok(())
     }

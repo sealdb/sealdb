@@ -5,8 +5,8 @@
 use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
-    ERR_BAD_DB, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME,
-    ERR_NO_SUCH_TABLE, Error, Result,
+    ERR_BAD_DB, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE,
+    Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;

@@ -3,8 +3,8 @@ use crate::ast::ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
     CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
-    GeneratedColumn, ForeignKeyDef, IndexDef, IndexPart, PartitionDef, PartitionOption, PartitionType,
-    SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
+    ForeignKeyDef, GeneratedColumn, IndexDef, IndexPart, PartitionDef, PartitionOption,
+    PartitionType, SequenceOptionSet, TableName, TruncateTableStmt, TtlInfo,
 };
 use crate::ast::dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, InsertStmt, Join,
@@ -12,10 +12,10 @@ use crate::ast::dml::{
     SetOprStmt, SetOprType, UpdateStmt, WithClause,
 };
 use crate::ast::expressions::{
-    BinaryOpExpr, CaseExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr,
-    InListExpr, InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr,
-    ScalarSubqueryExpr, UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec,
-    WindowFrameUnits, WindowFuncExpr, WindowSpec,
+    BinaryOpExpr, CaseExpr, ExistsExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
+    InSubqueryExpr, IsNullExpr, PatternLikeExpr, QuantifiedCmpExpr, ScalarSubqueryExpr,
+    UnaryOpExpr, ValueExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFuncExpr,
+    WindowSpec,
 };
 use crate::ast::misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
@@ -38,26 +38,22 @@ use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
     ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_UNSUPPORTED, Error, Result,
 };
-use sealdb_types::{
-    parse_date_literal, parse_time_literal, parse_timestamp_literal, Datum,
-};
+use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
     Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
     BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
     CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
-    Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable,
-    Function, FunctionArg,
+    Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
     LockTableType as SqlLockTableType, LockType, MySQLColumnPosition, NamedWindowDefinition,
     NamedWindowExpr, NonBlock, NullTreatment, ObjectName, ObjectType, OnInsert, OrderByExpr,
-    OrderByKind,
-    OrderBySort, Privileges, Query, RenameTable as SqlRenameTable, RenameTableNameKind, Revoke,
-    SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier, ShowCreateObject,
-    ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions,
+    OrderByKind, OrderBySort, Privileges, Query, RenameTable as SqlRenameTable,
+    RenameTableNameKind, Revoke, SchemaName, SelectItem, Set, SetExpr, SetOperator, SetQuantifier,
+    ShowCreateObject, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions,
     Statement as SqlStatement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, TypedString,
-    UnaryOperator, Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
+    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, TypedString, UnaryOperator,
+    Update, Use, Value, Values, WindowFrameBound as SqlWindowFrameBound,
     WindowFrameUnits as SqlWindowFrameUnits, WindowType, With,
 };
 use sqlparser::parser::Parser;
@@ -206,8 +202,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             prepare.sql = sql;
         }
         if let Statement::AnalyzeTable(analyze) = &mut lowered {
-            if let Some((indexes, tables)) = analyze_extras.next().flatten() {
+            if let Some((indexes, tables, buckets)) = analyze_extras.next().flatten() {
                 analyze.indexes = indexes;
+                analyze.bucket_count = buckets;
                 if tables.len() > 1 {
                     analyze.tables = tables
                         .into_iter()
@@ -450,9 +447,7 @@ fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
         if i + 1 < bytes.len()
             && bytes[i] == b'-'
             && bytes[i + 1] == b'-'
-            && (i + 2 >= bytes.len()
-                || bytes[i + 2].is_ascii_whitespace()
-                || bytes[i + 2] == b'\n')
+            && (i + 2 >= bytes.len() || bytes[i + 2].is_ascii_whitespace() || bytes[i + 2] == b'\n')
         {
             i += 2;
             while i < bytes.len() && bytes[i] != b'\n' {
@@ -754,17 +749,15 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             column: None,
         })),
         SqlStatement::ShowDatabases { show_options, .. }
-        | SqlStatement::ShowSchemas { show_options, .. } => {
-            Ok(Statement::Show(ShowStmt {
-                kind: ShowStmtKind::Databases,
-                db_name: None,
-                table: None,
-                user: None,
-                full: false,
-                pattern: show_like_pattern(show_options),
-                column: None,
-            }))
-        }
+        | SqlStatement::ShowSchemas { show_options, .. } => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::Databases,
+            db_name: None,
+            table: None,
+            user: None,
+            full: false,
+            pattern: show_like_pattern(show_options),
+            column: None,
+        })),
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Tables,
             db_name: show_options
@@ -863,7 +856,12 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                             None,
                             Some(Box::new(lower_set_opr(query)?)),
                         ),
-                        _ => (columns, Vec::new(), Some(Box::new(lower_query(query)?)), None),
+                        _ => (
+                            columns,
+                            Vec::new(),
+                            Some(Box::new(lower_query(query)?)),
+                            None,
+                        ),
                     },
                     None => return Err(Error::unsupported("INSERT without VALUES")),
                 }
@@ -1114,14 +1112,13 @@ fn rewrite_primary_key_nonclustered(sql: &str) -> String {
                 let after_key = skip_ws(bytes, after_pk + "KEY".len());
                 // TiDB allows an index name between `KEY` and the column list
                 // (`PRIMARY KEY idx_0 (a, b) NONCLUSTERED`).
-                let after_key = if after_key < bytes.len()
-                    && bytes[after_key] != b'('
-                {
+                let after_key = if after_key < bytes.len() && bytes[after_key] != b'(' {
                     skip_index_name(bytes, after_key)
                 } else {
                     after_key
                 };
-                if after_key < bytes.len() && bytes[after_key] == b'('
+                if after_key < bytes.len()
+                    && bytes[after_key] == b'('
                     && let Some(close) = matching_paren(bytes, after_key)
                 {
                     let after_close = skip_ws(bytes, close + 1);
@@ -1614,12 +1611,53 @@ const DESC_COL_MARKER: &str = "__sealdb_desc_col__";
 /// Keywords that begin a statement, so `EXPLAIN <kw>` is never a table name.
 fn starts_statement(word: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "SELECT", "INSERT", "REPLACE", "UPDATE", "DELETE", "WITH", "ANALYZE", "TABLE", "VALUES",
-        "SET", "CREATE", "DROP", "ALTER", "TRUNCATE", "SHOW", "EXPLAIN", "DESC", "DESCRIBE",
-        "USE", "BEGIN", "COMMIT", "ROLLBACK", "LOAD", "DO", "EXECUTE", "PREPARE", "GRANT",
-        "REVOKE", "FLUSH", "SHUTDOWN", "KILL", "CALL", "CHECK", "RENAME", "ADMIN", "SPLIT",
-        "TRACE", "BACKUP", "RESTORE", "LOCK", "UNLOCK", "START", "SAVEPOINT", "RELEASE",
-        "PURGE", "CHANGE", "IMPORT",
+        "SELECT",
+        "INSERT",
+        "REPLACE",
+        "UPDATE",
+        "DELETE",
+        "WITH",
+        "ANALYZE",
+        "TABLE",
+        "VALUES",
+        "SET",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "TRUNCATE",
+        "SHOW",
+        "EXPLAIN",
+        "DESC",
+        "DESCRIBE",
+        "USE",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "LOAD",
+        "DO",
+        "EXECUTE",
+        "PREPARE",
+        "GRANT",
+        "REVOKE",
+        "FLUSH",
+        "SHUTDOWN",
+        "KILL",
+        "CALL",
+        "CHECK",
+        "RENAME",
+        "ADMIN",
+        "SPLIT",
+        "TRACE",
+        "BACKUP",
+        "RESTORE",
+        "LOCK",
+        "UNLOCK",
+        "START",
+        "SAVEPOINT",
+        "RELEASE",
+        "PURGE",
+        "CHANGE",
+        "IMPORT",
     ];
     KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word))
 }
@@ -1647,8 +1685,7 @@ fn rewrite_describe_column(sql: &str) -> String {
                 None
             };
             if let Some(kw_len) = kw_len
-                && let Some((table, column, end)) =
-                    describe_column_tokens(bytes, i + kw_len)
+                && let Some((table, column, end)) = describe_column_tokens(bytes, i + kw_len)
             {
                 out.push_str("SHOW COLUMNS FROM `");
                 out.push_str(DESC_COL_MARKER);
@@ -1912,6 +1949,7 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
         table: object_table_name(table)?,
         tables: Vec::new(),
         indexes: Vec::new(),
+        bucket_count: None,
     }))
 }
 
@@ -2423,9 +2461,7 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
             }
             _ if c.is_ascii_alphanumeric() || c == b'_' => {
                 let word_start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let word = lower[word_start..i].to_string();
@@ -2491,7 +2527,8 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
 }
 
 /// Skips `!=`, strings, backticks, and MySQL version comments `/*! ... */`.
-fn rewrite_mysql_bang(sql: &str) -> String {    let mut out = String::with_capacity(sql.len() + 16);
+fn rewrite_mysql_bang(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut in_sq = false;
@@ -2779,7 +2816,11 @@ fn try_unwrap_union_derived(sql: &str, bytes: &[u8], start: usize) -> Option<(St
         return None;
     }
     let arm1 = inner[pos + 1..arm1_close - 1].trim();
-    if !keyword_at(arm1.as_bytes(), skip_ws_and_comments(arm1.as_bytes(), 0), "SELECT") {
+    if !keyword_at(
+        arm1.as_bytes(),
+        skip_ws_and_comments(arm1.as_bytes(), 0),
+        "SELECT",
+    ) {
         return None;
     }
     pos = skip_ws_and_comments(ib, arm1_close);
@@ -2803,7 +2844,11 @@ fn try_unwrap_union_derived(sql: &str, bytes: &[u8], start: usize) -> Option<(St
         return None;
     }
     let arm2 = inner[after_all + 1..arm2_close - 1].trim();
-    if !keyword_at(arm2.as_bytes(), skip_ws_and_comments(arm2.as_bytes(), 0), "SELECT") {
+    if !keyword_at(
+        arm2.as_bytes(),
+        skip_ws_and_comments(arm2.as_bytes(), 0),
+        "SELECT",
+    ) {
         return None;
     }
     // Only rewrite when the rest of the inner is trailing whitespace (binary UNION).
@@ -2813,11 +2858,7 @@ fn try_unwrap_union_derived(sql: &str, bytes: &[u8], start: usize) -> Option<(St
     }
     let mut rewritten = String::from("(");
     rewritten.push_str(arm1);
-    rewritten.push_str(if all_kw {
-        " union all "
-    } else {
-        " union "
-    });
+    rewritten.push_str(if all_kw { " union all " } else { " union " });
     rewritten.push_str(arm2);
     rewritten.push(')');
     Some((rewritten, close))
@@ -2926,7 +2967,11 @@ fn scan_as_of_expr_end(bytes: &[u8], start: usize) -> usize {
     }
     match bytes[i] {
         b'\'' | b'"' | b'`' => return scan_quoted_end(bytes, i),
-        b'(' => return matching_paren(bytes, i).map(|p| p + 1).unwrap_or(bytes.len()),
+        b'(' => {
+            return matching_paren(bytes, i)
+                .map(|p| p + 1)
+                .unwrap_or(bytes.len());
+        }
         _ => {}
     }
     while i < bytes.len() {
@@ -3111,9 +3156,18 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
 /// True when the next token after a parenthesized table group starts a JOIN.
 fn follows_join_keyword(bytes: &[u8], close: usize) -> bool {
     let after = skip_ws_and_comments(bytes, close);
-    ["JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "NATURAL", "STRAIGHT_JOIN"]
-        .iter()
-        .any(|kw| keyword_at(bytes, after, kw))
+    [
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "CROSS",
+        "NATURAL",
+        "STRAIGHT_JOIN",
+    ]
+    .iter()
+    .any(|kw| keyword_at(bytes, after, kw))
 }
 
 /// Rewrite a top-level comma table list into explicit CROSS JOINs so it can be
@@ -3263,10 +3317,7 @@ fn rewrite_update_comma_join(sql: &str) -> Result<String> {
     Ok(out)
 }
 
-fn rewrite_one_update_comma_join(
-    sql: &str,
-    start: usize,
-) -> Result<Option<(String, usize)>> {
+fn rewrite_one_update_comma_join(sql: &str, start: usize) -> Result<Option<(String, usize)>> {
     let bytes = sql.as_bytes();
     let mut j = start + "UPDATE".len();
     let mut depth = 0i32;
@@ -3445,9 +3496,30 @@ fn push_sql_char(out: &mut String, sql: &str, i: usize) -> usize {
 /// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]` and
 /// `ANALYZE TABLE t1, t2 ALL COLUMNS`. Strip INDEX / ALL COLUMNS / extra
 /// tables and re-attach after lower. Returns `(indexes, table_names)`.
+/// TiDB `WITH <n> BUCKETS` analyze option: returns the position after the
+/// option and the requested histogram bucket count.
+fn read_analyze_buckets(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64>) {
+    let k = skip_ws(bytes, k);
+    if !keyword_at(bytes, k, "WITH") {
+        return (k, None);
+    }
+    let mut p = skip_ws(bytes, k + "WITH".len());
+    let start = p;
+    while p < bytes.len() && bytes[p].is_ascii_digit() {
+        p += 1;
+    }
+    let digits = &sql[start..p];
+    let after = skip_ws(bytes, p);
+    if digits.is_empty() || !keyword_at(bytes, after, "BUCKETS") {
+        return (k, None);
+    }
+    let count = digits.parse().ok();
+    (skip_ws(bytes, after + "BUCKETS".len()), count)
+}
+
 fn extract_analyze_index(
     sql: &str,
-) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>)>>)> {
+) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>, Option<u64>)>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut extras = Vec::new();
@@ -3511,7 +3583,8 @@ fn extract_analyze_index(
                         break;
                     }
                     out.push_str(&sql[i..first_end]);
-                    extras.push(Some((names, table_names)));
+                    let (k, buckets) = read_analyze_buckets(bytes, sql, k);
+                    extras.push(Some((names, table_names, buckets)));
                     i = k;
                     continue;
                 }
@@ -3520,14 +3593,20 @@ fn extract_analyze_index(
                     let after_all = skip_ws(bytes, j + "ALL".len());
                     if keyword_at(bytes, after_all, "COLUMNS") {
                         out.push_str(&sql[i..first_end]);
-                        extras.push(Some((Vec::new(), table_names)));
-                        i = skip_ws(bytes, after_all + "COLUMNS".len());
+                        let (k, buckets) = read_analyze_buckets(
+                            bytes,
+                            sql,
+                            skip_ws(bytes, after_all + "COLUMNS".len()),
+                        );
+                        extras.push(Some((Vec::new(), table_names, buckets)));
+                        i = k;
                         continue;
                     }
                 }
                 out.push_str(&sql[i..first_end]);
-                extras.push(Some((Vec::new(), table_names)));
-                i = j;
+                let (k, buckets) = read_analyze_buckets(bytes, sql, j);
+                extras.push(Some((Vec::new(), table_names, buckets)));
+                i = k;
                 continue;
             }
         }
@@ -5001,7 +5080,8 @@ fn parse_table_priv_level(bytes: &[u8], mut i: usize) -> Result<Option<(GrantLev
     )))
 }
 
-fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {    let mut privs = Vec::new();
+fn parse_dynamic_priv_list(bytes: &[u8], mut i: usize) -> Result<(Vec<String>, usize)> {
+    let mut privs = Vec::new();
     loop {
         i = skip_ws(bytes, i);
         let (name, next) = read_quoted_or_ident(bytes, i);
@@ -5810,8 +5890,14 @@ fn normalize_ttl_expr(raw: &str) -> String {
     let mut parts = Vec::new();
     for tok in raw.split_whitespace() {
         let upper = tok.to_ascii_uppercase();
-        if upper == "INTERVAL" || upper == "HOUR" || upper == "DAY" || upper == "MINUTE"
-            || upper == "SECOND" || upper == "WEEK" || upper == "MONTH" || upper == "YEAR"
+        if upper == "INTERVAL"
+            || upper == "HOUR"
+            || upper == "DAY"
+            || upper == "MINUTE"
+            || upper == "SECOND"
+            || upper == "WEEK"
+            || upper == "MONTH"
+            || upper == "YEAR"
             || upper == "+"
         {
             parts.push(upper);
@@ -6094,7 +6180,8 @@ fn insert_partition_names(exprs: Option<&Vec<Expr>>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {    // SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
+fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, usize)> {
+    // SUBPARTITION BY is accepted under RANGE/LIST (TiDB strips it) and
     // rejected under HASH/KEY with ErrSubpartition.
     let tp = if keyword_at(bytes, i, "RANGE") {
         i = skip_ws(bytes, i + "RANGE".len());
@@ -6111,8 +6198,8 @@ fn parse_partition_by(bytes: &[u8], mut i: usize) -> Result<(PartitionOption, us
     } else {
         return Err(Error::unsupported("partition type"));
     };
-    let range_columns = matches!(tp, PartitionType::Range | PartitionType::List)
-        && keyword_at(bytes, i, "COLUMNS");
+    let range_columns =
+        matches!(tp, PartitionType::Range | PartitionType::List) && keyword_at(bytes, i, "COLUMNS");
     if range_columns {
         i = skip_ws(bytes, i + "COLUMNS".len());
     }
@@ -6277,10 +6364,12 @@ fn parse_partition_key(
 
 fn is_partition_expr(inner: &str) -> bool {
     let bytes = inner.as_bytes();
-    if bytes
-        .iter()
-        .any(|b| matches!(b, b'(' | b'+' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!'))
-    {
+    if bytes.iter().any(|b| {
+        matches!(
+            b,
+            b'(' | b'+' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!'
+        )
+    }) {
         return true;
     }
     // `id DIV 2` / `id MOD 2` / `id << 1` but not a bare identifier list.
@@ -6734,8 +6823,10 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
     // Strip WITH before lowering the body so lower_query does not re-attach it.
     let mut query_ast = cte.query.clone();
     query_ast.with = None;
-    let (mut query, recursive_arm, recursive_rest, set_rest, limit, offset) =
-        match query_ast.body.as_ref() {
+    let (mut query, recursive_arm, recursive_rest, set_rest, limit, offset) = match query_ast
+        .body
+        .as_ref()
+    {
         SetExpr::Select(_) => {
             let mut q = lower_query(&query_ast)?;
             // The body LIMIT/OFFSET belongs to the CTE (applied once by
@@ -6777,9 +6868,7 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
                     set_rest: rest.collect(),
                     materialize: match cte.materialized {
                         Some(CteAsMaterialized::Materialized) => CteMaterialize::Materialized,
-                        Some(CteAsMaterialized::NotMaterialized) => {
-                            CteMaterialize::NotMaterialized
-                        }
+                        Some(CteAsMaterialized::NotMaterialized) => CteMaterialize::NotMaterialized,
                         None => CteMaterialize::Default,
                     },
                     limit: set.limit,
@@ -7222,7 +7311,9 @@ fn lower_from(
 }
 
 fn from_has_nested_join(from: &[TableWithJoins]) -> bool {
-    from.iter().any(|twj| factor_has_nested(&twj.relation) || twj.joins.iter().any(|j| factor_has_nested(&j.relation)))
+    from.iter().any(|twj| {
+        factor_has_nested(&twj.relation) || twj.joins.iter().any(|j| factor_has_nested(&j.relation))
+    })
 }
 
 fn factor_has_nested(factor: &TableFactor) -> bool {
@@ -7468,13 +7559,21 @@ fn lower_table_with_joins(
                 (JoinType::Inner, lower_expr(expr)?, Vec::new(), true, false)
             }
             JoinOperator::Left(JoinConstraint::On(expr))
-            | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
-                (JoinType::LeftOuter, lower_expr(expr)?, Vec::new(), false, false)
-            }
+            | JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (
+                JoinType::LeftOuter,
+                lower_expr(expr)?,
+                Vec::new(),
+                false,
+                false,
+            ),
             JoinOperator::Right(JoinConstraint::On(expr))
-            | JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
-                (JoinType::RightOuter, lower_expr(expr)?, Vec::new(), false, false)
-            }
+            | JoinOperator::RightOuter(JoinConstraint::On(expr)) => (
+                JoinType::RightOuter,
+                lower_expr(expr)?,
+                Vec::new(),
+                false,
+                false,
+            ),
             // MySQL `JOIN` / `INNER JOIN` without ON/USING ≡ CROSS JOIN.
             JoinOperator::CrossJoin(JoinConstraint::None)
             | JoinOperator::Join(JoinConstraint::None)
@@ -7833,10 +7932,7 @@ fn table_factor(
 }
 
 /// Rewrite `alias.col` → `physical.col` so HashJoin key split sees real table names.
-fn rewrite_join_on_aliases(
-    expr: ExprNode,
-    aliases: &[(String, String)],
-) -> ExprNode {
+fn rewrite_join_on_aliases(expr: ExprNode, aliases: &[(String, String)]) -> ExprNode {
     match expr {
         ExprNode::Column(mut col) => {
             if let Some(table) = col.table.as_deref() {
@@ -8716,9 +8812,7 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
     }))
 }
 
-fn lower_column_default(
-    options: &[sqlparser::ast::ColumnOptionDef],
-) -> Option<String> {
+fn lower_column_default(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
     options.iter().find_map(|opt| match &opt.option {
         sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
         _ => None,
@@ -9151,8 +9245,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         }
         Expr::Function(func) => lower_function(func),
         // sqlparser lowers `FLOOR(x)` / `CEIL(x)` to dedicated variants.
-        Expr::Floor { expr: inner, field }
-        | Expr::Ceil { expr: inner, field } => {
+        Expr::Floor { expr: inner, field } | Expr::Ceil { expr: inner, field } => {
             let name = if matches!(expr, Expr::Floor { .. }) {
                 "floor"
             } else {
@@ -9221,10 +9314,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             negated,
         } => {
             let left = Box::new(lower_expr(expr)?);
-            let list = list
-                .iter()
-                .map(lower_expr)
-                .collect::<Result<Vec<_>>>()?;
+            let list = list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?;
             // TiDB `inToExpression`: a one-element IN list is not kept as IN,
             // it becomes an equality (`a IN (x)` → `a = x`), which also lets
             // partition pruning and range scans see the constant.
@@ -9300,12 +9390,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 .transpose()?,
             when_then: conditions
                 .iter()
-                .map(|when| {
-                    Ok((
-                        lower_expr(&when.condition)?,
-                        lower_expr(&when.result)?,
-                    ))
-                })
+                .map(|when| Ok((lower_expr(&when.condition)?, lower_expr(&when.result)?)))
                 .collect::<Result<Vec<_>>>()?,
             else_expr: else_result
                 .as_ref()
@@ -9417,9 +9502,7 @@ fn lower_typed_string(ts: &TypedString) -> Result<ExprNode> {
         DataType::Date => parse_date_literal(&raw)?,
         DataType::Time(_, _) => parse_time_literal(&raw)?,
         other => {
-            return Err(Error::unsupported(format!(
-                "typed string type {other}"
-            )));
+            return Err(Error::unsupported(format!("typed string type {other}")));
         }
     };
     Ok(ExprNode::Value(ValueExpr {
@@ -9809,7 +9892,10 @@ fn bit_literal_bytes(bits: &str) -> Result<Vec<u8>> {
     let value = u64::from_str_radix(digits, 2)
         .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid bit literal b'{bits}'")))?;
     let bytes = value.to_be_bytes();
-    let first = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len() - 1);
+    let first = bytes
+        .iter()
+        .position(|b| *b != 0)
+        .unwrap_or(bytes.len() - 1);
     Ok(bytes[first..].to_vec())
 }
 
@@ -10085,9 +10171,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             } else if let Some(name) = old_column_name.value.strip_prefix(ALTER_INDEX_MARKER) {
                 Ok(AlterTableSpec::AlterIndexVisibility {
                     name: name.to_string(),
-                    invisible: new_column_name
-                        .value
-                        .eq_ignore_ascii_case("INVISIBLE"),
+                    invisible: new_column_name.value.eq_ignore_ascii_case("INVISIBLE"),
                 })
             } else {
                 Ok(AlterTableSpec::RenameColumn {
@@ -10253,7 +10337,8 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     }
     let strip_marker = |part: &IndexPart, marker: &str| -> Option<IndexPart> {
         let name = part.column_name()?;
-        name.strip_prefix(marker).map(|rest| IndexPart::column(rest))
+        name.strip_prefix(marker)
+            .map(|rest| IndexPart::column(rest))
     };
     let nonclustered = match strip_marker(&columns[0], NONCLUSTERED_MARKER) {
         Some(rest) => {
@@ -10326,12 +10411,7 @@ fn index_part(col: &sqlparser::ast::IndexColumn) -> Result<IndexPart> {
             if !is_prefix {
                 return Ok(IndexPart::expression(index_expr_text(expr)?));
             }
-            let raw = f
-                .name
-                .0
-                .last()
-                .map(|p| p.to_string())
-                .unwrap_or_default();
+            let raw = f.name.0.last().map(|p| p.to_string()).unwrap_or_default();
             // ObjectName Display may keep MySQL backticks (`col`).
             let name = raw.trim_matches('`').trim_matches('"').to_string();
             if name.is_empty() {
@@ -10478,8 +10558,7 @@ mod paren_from_tests {
 
     #[test]
     fn unwraps_union_derived_arm_parens() {
-        let sql =
-            "select * from ((select 4 as a) union all (select 33 as a)) tmp order by a desc limit 1";
+        let sql = "select * from ((select 4 as a) union all (select 33 as a)) tmp order by a desc limit 1";
         let rewritten = rewrite_mysql_union_derived_parens(sql);
         assert!(
             rewritten.contains("select 4 as a union all select 33 as a"),
@@ -10505,4 +10584,3 @@ mod paren_from_tests {
         }
     }
 }
-

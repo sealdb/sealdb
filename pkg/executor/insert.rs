@@ -1,21 +1,21 @@
 use crate::index::write_index_keys;
-use crate::join::apply::SubqueryEvalCtx;
 use crate::internal::exec::Executor;
+use crate::join::apply::SubqueryEvalCtx;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_NO_DB,
     ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION,
-    ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED,
+    ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
 use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
-use sealdb_types::field_type::{FieldType, TYPE_ENUM, TYPE_SET};
 use sealdb_types::EnumValue;
+use sealdb_types::field_type::{FieldType, TYPE_ENUM, TYPE_SET};
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ impl InsertExec {
             done: false,
         }
     }
-        /// `REPLACE`: every row conflicting on any unique key is deleted, then the
+    /// `REPLACE`: every row conflicting on any unique key is deleted, then the
     /// new row is written. TiDB counts a rewritten-verbatim row as one affected
     /// row and a changed replacement as delete + insert (two).
     fn replace_rows(
@@ -79,8 +79,7 @@ impl InsertExec {
                     continue;
                 }
                 duplicates += 1;
-                let unchanged =
-                    conflicts.len() == 1 && existing[conflicts[0]].values == values;
+                let unchanged = conflicts.len() == 1 && existing[conflicts[0]].values == values;
                 if unchanged {
                     affected += 1;
                     continue;
@@ -167,15 +166,12 @@ impl Executor for InsertExec {
             fill_auto_increment(&self.domain, info, values)?;
         }
         if !self.stmt.partitions.is_empty() {
-            pending = filter_target_partitions(
-                info,
-                &self.stmt.partitions,
-                pending,
-                self.stmt.ignore,
-            )?;
+            pending =
+                filter_target_partitions(info, &self.stmt.partitions, pending, self.stmt.ignore)?;
         }
-        let batched =
-            self.stmt.rows.len() > 1 || self.stmt.select.is_some() || self.stmt.select_set.is_some();
+        let batched = self.stmt.rows.len() > 1
+            || self.stmt.select.is_some()
+            || self.stmt.select_set.is_some();
         if self.stmt.replace {
             return self.replace_rows(info, pending, batched);
         }
@@ -255,17 +251,11 @@ impl Executor for InsertExec {
                         {
                             return Err(duplicate_error(info, dup_idx, &merged));
                         }
-                        crate::update::apply_row_update(
-                            txn,
-                            info,
-                            &existing[idx],
-                            merged.clone(),
-                        )?;
+                        crate::update::apply_row_update(txn, info, &existing[idx], merged.clone())?;
                         existing[idx].values = merged;
                     }
                     None => {
-                        let (handle, physical_id) =
-                            write_row(txn, &self.domain, info, &values)?;
+                        let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
                         existing.push(crate::table_reader::ScannedRow {
                             handle,
                             physical_id,
@@ -545,11 +535,18 @@ pub(crate) fn bump_auto_increment(
 /// Evaluate `GENERATED ALWAYS AS (expr)` columns in ascending offset order so a
 /// generated column may reference earlier generated ones. Values are stored
 /// physically (VIRTUAL columns included) until a lazy-read path lands.
-pub(crate) fn fill_generated_columns(info: &sealdb_meta::TableInfo, values: &mut [Datum]) -> Result<()> {
+pub(crate) fn fill_generated_columns(
+    info: &sealdb_meta::TableInfo,
+    values: &mut [Datum],
+) -> Result<()> {
     if info.columns.iter().all(|c| c.generated_expr.is_none()) {
         return Ok(());
     }
-    let schema: Vec<String> = info.columns.iter().map(|c| c.name.o().to_string()).collect();
+    let schema: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
     let mut exprs = Vec::new();
     for col in &info.columns {
         let Some(text) = col.generated_expr.as_deref() else {
@@ -569,10 +566,7 @@ pub(crate) fn fill_generated_columns(info: &sealdb_meta::TableInfo, values: &mut
 }
 
 fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
-    if matches!(
-        col.field_type.tp,
-        TYPE_ENUM | TYPE_SET
-    ) {
+    if matches!(col.field_type.tp, TYPE_ENUM | TYPE_SET) {
         return cast_enum_set(v, &col.field_type, col.name.o());
     }
     let mut out = v.cast(&col.field_type)?;
@@ -768,7 +762,10 @@ fn write_row(
             .unwrap_or_default();
         return Err(Error::new(
             ERR_DUP_ENTRY,
-            format!("Duplicate entry '{value}' for key '{}.PRIMARY'", info.name.o()),
+            format!(
+                "Duplicate entry '{value}' for key '{}.PRIMARY'",
+                info.name.o()
+            ),
         ));
     }
     txn.set(key.as_bytes(), &encode_row(&col_ids, values))?;
@@ -820,7 +817,11 @@ fn find_conflict(
     })
 }
 
-pub(crate) fn duplicate_error(info: &sealdb_meta::TableInfo, index_idx: usize, values: &[Datum]) -> Error {
+pub(crate) fn duplicate_error(
+    info: &sealdb_meta::TableInfo,
+    index_idx: usize,
+    values: &[Datum],
+) -> Error {
     let index = &info.indices[index_idx];
     let value = index
         .columns

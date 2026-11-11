@@ -20,16 +20,12 @@ pub use memquota::{
 
 pub use evaluator::{
     DEFAULT_WINDOW_CONCURRENCY, DivByZeroMode, clear_warnings, collation_ci, collation_mode,
-    current_db_name, datum_sql_eq,
-    eval_expr,
-    eval_expr_with_row, eval_filter, format_timestamp_display, locate_partition_for_row,
-    note_warning, session_local_to_utc, set_window_concurrency, sql_mode_flag, take_warnings,
-    time_to_unix_millis,
-    warnings_len,
-    truthy,
-    utc_to_session_local, validate_string_cmp_literals, validate_string_cmp_literals_on, window_concurrency, with_collation,
-    with_collation_ci, with_current_db, with_div_by_zero_mode, with_index_dst_double,
-    with_sql_mode, with_time_zone,
+    current_db_name, datum_sql_eq, eval_expr, eval_expr_with_row, eval_filter,
+    format_timestamp_display, locate_partition_for_row, note_warning, session_local_to_utc,
+    set_window_concurrency, sql_mode_flag, take_warnings, time_to_unix_millis, truthy,
+    utc_to_session_local, validate_string_cmp_literals, validate_string_cmp_literals_on,
+    warnings_len, window_concurrency, with_collation, with_collation_ci, with_current_db,
+    with_div_by_zero_mode, with_index_dst_double, with_sql_mode, with_time_zone,
 };
 pub use funcs::{FuncCategory, FuncMeta, builtin_list, implemented_names, lookup};
 pub use sealdb_util::collate::CollateMode;

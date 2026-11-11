@@ -9,17 +9,17 @@
 
 use crate::create_table::field_type_from_name;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_BLOB,
-    ERR_FUNCTIONAL_INDEX_ON_FIELD, ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
+    ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
     ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, Error, Result,
 };
 use sealdb_meta::{ColumnInfo, IndexColumn, TableInfo};
 use sealdb_parser::ast::ExprNode;
-use sealdb_parser::opcode::Op;
 use sealdb_parser::ast::IndexPart;
+use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::lower::parse_expr;
-use sealdb_types::field_type::FieldType;
 use sealdb_types::Datum;
+use sealdb_types::field_type::FieldType;
 
 /// TiDB `buildIndexInfo`: hidden column name for the `pos`-th expression part.
 pub(crate) fn hidden_column_name(index_name: &str, pos: usize) -> String {
@@ -101,14 +101,12 @@ fn column_field_type<'a>(info: &'a TableInfo, name: &str) -> Option<&'a FieldTyp
 
 fn infer(expr: &ExprNode, info: &TableInfo, index_name: &str, text: &str) -> Result<FieldType> {
     match expr {
-        ExprNode::Column(c) => column_field_type(info, &c.name)
-            .cloned()
-            .ok_or_else(|| {
-                Error::new(
-                    ERR_BAD_FIELD,
-                    format!("Unknown column '{}' in index '{}'", c.name, index_name),
-                )
-            }),
+        ExprNode::Column(c) => column_field_type(info, &c.name).cloned().ok_or_else(|| {
+            Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{}' in index '{}'", c.name, index_name),
+            )
+        }),
         ExprNode::Value(v) => literal_field_type(&v.datum),
         ExprNode::Unary(u) => infer(&u.expr, info, index_name, text),
         ExprNode::Binary(b) => {
@@ -221,16 +219,19 @@ fn function_field_type(
     let ty = match lower.as_str() {
         // TiDB `tidb_shard` hashes into a 64-bit signed integer.
         "tidb_shard" => FieldType::new_longlong(),
-        "upper" | "ucase" | "lower" | "lcase" | "concat" | "concat_ws" | "substring"
-        | "substr" | "trim" | "ltrim" | "rtrim" | "replace" | "left" | "right" | "repeat"
-        | "reverse" | "insert" | "format" | "hex" | "to_base64" | "from_base64" => {
+        "upper" | "ucase" | "lower" | "lcase" | "concat" | "concat_ws" | "substring" | "substr"
+        | "trim" | "ltrim" | "rtrim" | "replace" | "left" | "right" | "repeat" | "reverse"
+        | "insert" | "format" | "hex" | "to_base64" | "from_base64" => {
             let mut ty = FieldType::new_string();
             // `upper(name)` keeps the operand's declared length when known.
             if let Some(arg) = f.args.first()
-                && let Some(src) = column_field_type(info, match arg {
-                    ExprNode::Column(c) => &c.name,
-                    _ => "",
-                })
+                && let Some(src) = column_field_type(
+                    info,
+                    match arg {
+                        ExprNode::Column(c) => &c.name,
+                        _ => "",
+                    },
+                )
                 && src.flen > 0
             {
                 ty.flen = src.flen;

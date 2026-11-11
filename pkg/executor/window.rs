@@ -565,13 +565,11 @@ fn bound_index(
         }),
         (
             WindowFrameUnits::Groups,
-            WindowFrameBound::IntervalPreceding { .. }
-            | WindowFrameBound::IntervalFollowing { .. },
+            WindowFrameBound::IntervalPreceding { .. } | WindowFrameBound::IntervalFollowing { .. },
         ) => Err(Error::unsupported("GROUPS interval frame")),
         (
             WindowFrameUnits::Rows,
-            WindowFrameBound::IntervalPreceding { .. }
-            | WindowFrameBound::IntervalFollowing { .. },
+            WindowFrameBound::IntervalPreceding { .. } | WindowFrameBound::IntervalFollowing { .. },
         ) => Err(Error::unsupported("ROWS interval frame")),
     }
 }

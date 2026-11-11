@@ -9,9 +9,9 @@ use sealdb_parser::ast::expressions::{
 };
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
-use sealdb_types::field_type::FieldType;
-use sealdb_types::time::{parse_timestamp_literal, Time, TimeType};
 use sealdb_types::Datum;
+use sealdb_types::field_type::FieldType;
+use sealdb_types::time::{Time, TimeType, parse_timestamp_literal};
 use sealdb_util::collate::{CollateMode, compare_bytes};
 use std::cell::{Cell, RefCell};
 
@@ -321,11 +321,7 @@ fn note_dst_gap_warning(t: &Time, mode: DstWarnMode) {
     }
 }
 
-fn compare_datums_for_op(
-    left: &Datum,
-    right: &Datum,
-    op: Op,
-) -> Result<std::cmp::Ordering> {
+fn compare_datums_for_op(left: &Datum, right: &Datum, op: Op) -> Result<std::cmp::Ordering> {
     let mode = match op {
         Op::Eq | Op::NullSafeEq | Op::Ne => DstWarnMode::PerEval,
         _ => DstWarnMode::Once,
@@ -462,10 +458,7 @@ pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {
 /// Same, with the scanned table's column types: a binary-charset column
 /// (`BIT`, `BINARY`, `BLOB`) compares raw bytes, so a hex/bit literal needs no
 /// charset conversion there.
-pub fn validate_string_cmp_literals_on(
-    expr: &ExprNode,
-    info: Option<&TableInfo>,
-) -> Result<()> {
+pub fn validate_string_cmp_literals_on(expr: &ExprNode, info: Option<&TableInfo>) -> Result<()> {
     let walk = |child: &ExprNode| validate_string_cmp_literals_on(child, info);
     match expr {
         ExprNode::Binary(b)
@@ -698,12 +691,7 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             if is_zero_divisor(&right)? {
                 return div_by_zero();
             }
-            num_bin(
-                &left,
-                &right,
-                |a, b| Ok(a / b),
-                |a, b| Ok(a / b),
-            )
+            num_bin(&left, &right, |a, b| Ok(a / b), |a, b| Ok(a / b))
         }
         Op::IntDiv => {
             // MySQL `DIV`: integer division truncating toward zero; both
@@ -719,12 +707,7 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             if is_zero_divisor(&right)? {
                 return div_by_zero();
             }
-            num_bin(
-                &left,
-                &right,
-                |a, b| Ok(a % b),
-                |a, b| Ok(a % b),
-            )
+            num_bin(&left, &right, |a, b| Ok(a % b), |a, b| Ok(a % b))
         }
         Op::Eq => Ok(bool_datum(
             compare_datums_for_op(&left, &right, Op::Eq)?.is_eq(),
@@ -1292,7 +1275,8 @@ fn eval_substring(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Resu
     Ok(Datum::Bytes(out.into_bytes()))
 }
 
-fn datum_as_time(d: &Datum) -> Result<Time> {    match d {
+fn datum_as_time(d: &Datum) -> Result<Time> {
+    match d {
         Datum::Time(t) => Ok(*t),
         Datum::Bytes(b) => {
             let s = String::from_utf8_lossy(b);
@@ -1328,51 +1312,51 @@ fn time_from_yyyymmdd(n: i64) -> Option<Time> {
     let digits = n.to_string();
     let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
         match digits.len() {
-        14 => (
-            digits[0..4].parse().ok()?,
-            digits[4..6].parse().ok()?,
-            digits[6..8].parse().ok()?,
-            digits[8..10].parse().ok()?,
-            digits[10..12].parse().ok()?,
-            digits[12..14].parse().ok()?,
-        ),
-        12 => (
-            digits[0..4].parse().ok()?,
-            digits[4..6].parse().ok()?,
-            digits[6..8].parse().ok()?,
-            digits[8..10].parse().ok()?,
-            digits[10..12].parse().ok()?,
-            0,
-        ),
-        8 => (
-            digits[0..4].parse().ok()?,
-            digits[4..6].parse().ok()?,
-            digits[6..8].parse().ok()?,
-            0,
-            0,
-            0,
-        ),
-        6 => {
-            let yy: i64 = digits[0..2].parse().ok()?;
-            (
-                if yy < 70 { 2000 + yy } else { 1900 + yy },
-                digits[2..4].parse().ok()?,
+            14 => (
+                digits[0..4].parse().ok()?,
                 digits[4..6].parse().ok()?,
+                digits[6..8].parse().ok()?,
+                digits[8..10].parse().ok()?,
+                digits[10..12].parse().ok()?,
+                digits[12..14].parse().ok()?,
+            ),
+            12 => (
+                digits[0..4].parse().ok()?,
+                digits[4..6].parse().ok()?,
+                digits[6..8].parse().ok()?,
+                digits[8..10].parse().ok()?,
+                digits[10..12].parse().ok()?,
+                0,
+            ),
+            8 => (
+                digits[0..4].parse().ok()?,
+                digits[4..6].parse().ok()?,
+                digits[6..8].parse().ok()?,
                 0,
                 0,
                 0,
-            )
-        }
-        l if l > 14 => (
-            digits[0..4].parse().ok()?,
-            digits[4..6].parse().ok()?,
-            digits[6..8].parse().ok()?,
-            digits[8..10].parse().ok()?,
-            digits[10..12].parse().ok()?,
-            digits[12..14].parse().ok()?,
-        ),
-        _ => return None,
-    };
+            ),
+            6 => {
+                let yy: i64 = digits[0..2].parse().ok()?;
+                (
+                    if yy < 70 { 2000 + yy } else { 1900 + yy },
+                    digits[2..4].parse().ok()?,
+                    digits[4..6].parse().ok()?,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            l if l > 14 => (
+                digits[0..4].parse().ok()?,
+                digits[4..6].parse().ok()?,
+                digits[6..8].parse().ok()?,
+                digits[8..10].parse().ok()?,
+                digits[10..12].parse().ok()?,
+                digits[12..14].parse().ok()?,
+            ),
+            _ => return None,
+        };
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
@@ -1587,11 +1571,7 @@ fn eval_date_add_sub(
     Ok(Datum::Time(t))
 }
 
-fn eval_timestamp_add(
-    func: &FuncCallExpr,
-    schema: &[String],
-    row: &[Datum],
-) -> Result<Datum> {
+fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.len() != 3 {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
@@ -1722,11 +1702,7 @@ fn shift_minutes(t: &mut Time, minutes: i64) -> Result<()> {
     Ok(())
 }
 
-fn eval_timestamp_diff(
-    func: &FuncCallExpr,
-    schema: &[String],
-    row: &[Datum],
-) -> Result<Datum> {
+fn eval_timestamp_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.len() != 3 {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
@@ -1751,10 +1727,7 @@ fn eval_timestamp_diff(
     let secs = |t: &Time| -> i64 {
         // Approximate absolute seconds from a fixed epoch (no TZ).
         let days = i64::from(t.year) * 366 + i64::from(t.month) * 31 + i64::from(t.day);
-        days * 86400
-            + i64::from(t.hour) * 3600
-            + i64::from(t.minute) * 60
-            + i64::from(t.second)
+        days * 86400 + i64::from(t.hour) * 3600 + i64::from(t.minute) * 60 + i64::from(t.second)
     };
     let diff = secs(&tb) - secs(&ta);
     let out = match unit.as_str() {
@@ -1769,11 +1742,7 @@ fn eval_timestamp_diff(
     Ok(Datum::I64(out))
 }
 
-fn eval_unix_timestamp(
-    func: &FuncCallExpr,
-    schema: &[String],
-    row: &[Datum],
-) -> Result<Datum> {
+fn eval_unix_timestamp(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.is_empty() {
         return Err(Error::unsupported("UNIX_TIMESTAMP()"));
     }
@@ -1857,11 +1826,7 @@ fn wall_secs(t: &Time) -> i64 {
         + i64::from(t.second)
 }
 
-fn eval_from_unixtime(
-    func: &FuncCallExpr,
-    schema: &[String],
-    row: &[Datum],
-) -> Result<Datum> {
+fn eval_from_unixtime(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     if func.args.len() != 1 {
         return Err(Error::new(
             sealdb_errno::ERR_WRONG_ARGUMENTS,
@@ -2009,8 +1974,7 @@ fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<
     if value.is_null() || low.is_null() || high.is_null() {
         return Ok(Datum::Null);
     }
-    let inside =
-        compare_datums(&value, &low)?.is_ge() && compare_datums(&value, &high)?.is_le();
+    let inside = compare_datums(&value, &low)?.is_ge() && compare_datums(&value, &high)?.is_le();
     Ok(bool_datum(if expr.not { !inside } else { inside }))
 }
 
@@ -2304,14 +2268,18 @@ mod hex_cmp_tests {
         });
         let err = eval_expr_with_row(&expr, &schema, &row).unwrap_err();
         assert_eq!(err.code, ERR_UNKNOWN_ERROR);
-        assert!(err.message.contains("Cannot convert string"), "{}", err.message);
+        assert!(
+            err.message.contains("Cannot convert string"),
+            "{}",
+            err.message
+        );
     }
 }
 #[cfg(test)]
 mod unsigned_sub_tests {
     use super::*;
-    use sealdb_parser::ast::*;
     use sealdb_parser::Parser;
+    use sealdb_parser::ast::*;
 
     fn select_expr(sql: &str) -> ExprNode {
         let stmt = Parser::new().parse_one_stmt(sql).unwrap();
@@ -2327,25 +2295,17 @@ mod unsigned_sub_tests {
         with_sql_mode("", || {
             let err = eval_expr_with_row(&expr, &[], &[]).unwrap_err();
             assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
-            assert!(
-                err.message.contains("BIGINT UNSIGNED"),
-                "{}",
-                err.message
-            );
+            assert!(err.message.contains("BIGINT UNSIGNED"), "{}", err.message);
         });
         with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
-            assert_eq!(
-                eval_expr_with_row(&expr, &[], &[]).unwrap(),
-                Datum::I64(-3)
-            );
+            assert_eq!(eval_expr_with_row(&expr, &[], &[]).unwrap(), Datum::I64(-3));
         });
     }
 
     #[test]
     fn minus_no_unsigned_subtraction_overflow() {
-        let expr = select_expr(
-            "SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)",
-        );
+        let expr =
+            select_expr("SELECT CAST(-1 as UNSIGNED) - cast(9223372036854775807 as unsigned)");
         with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
             let err = eval_expr_with_row(&expr, &[], &[]).unwrap_err();
             assert_eq!(err.code, ERR_DATA_OUT_OF_RANGE, "{err}");
@@ -2364,9 +2324,8 @@ mod unsigned_sub_tests {
 
     #[test]
     fn minus_no_unsigned_subtraction_ok() {
-        let expr = select_expr(
-            "SELECT CAST(-1 as UNSIGNED) - cast(-9223372036854775808 as unsigned)",
-        );
+        let expr =
+            select_expr("SELECT CAST(-1 as UNSIGNED) - cast(-9223372036854775808 as unsigned)");
         with_sql_mode("NO_UNSIGNED_SUBTRACTION", || {
             assert_eq!(
                 eval_expr_with_row(&expr, &[], &[]).unwrap(),
@@ -2398,4 +2357,3 @@ mod high_not_tests {
         });
     }
 }
-

@@ -365,9 +365,8 @@ fn materialize(
                     for (when, then) in &case.when_then {
                         let when = materialize(when, ctx, cache)?;
                         let when = eval_expr_with_row(&when, &ctx.outer_schema, &ctx.outer_row)?;
-                        let matched = !operand.is_null()
-                            && !when.is_null()
-                            && operand.compare(&when).is_eq();
+                        let matched =
+                            !operand.is_null() && !when.is_null() && operand.compare(&when).is_eq();
                         if matched {
                             taken = Some(then);
                             break;
@@ -390,9 +389,7 @@ fn materialize(
             };
             match taken.or(case.else_expr.as_deref()) {
                 Some(branch) => materialize(branch, ctx, cache),
-                None => Ok(ExprNode::Value(ValueExpr {
-                    datum: Datum::Null,
-                })),
+                None => Ok(ExprNode::Value(ValueExpr { datum: Datum::Null })),
             }
         }
         other => Ok(other.clone()),
@@ -618,10 +615,7 @@ fn bind_select_with_cte_schemas(
     // Attach outer WITH when the subquery references those CTEs (no_decorrelate
     // EXISTS over a WITH recursive cte1 defined on the outer SELECT).
     out.with = match (&select.with, &ctx.outer_with) {
-        (Some(inner), Some(outer)) => Some(bind_with(
-            &merge_with_clauses(outer, inner),
-            ctx,
-        )?),
+        (Some(inner), Some(outer)) => Some(bind_with(&merge_with_clauses(outer, inner), ctx)?),
         (Some(inner), None) => Some(bind_with(inner, ctx)?),
         (None, Some(outer)) => Some(bind_with(outer, ctx)?),
         (None, None) => None,
@@ -662,10 +656,7 @@ fn bind_select_with_cte_schemas(
 fn merge_with_clauses(outer: &WithClause, inner: &WithClause) -> WithClause {
     let mut ctes = outer.ctes.clone();
     for cte in &inner.ctes {
-        if !ctes
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(&cte.name))
-        {
+        if !ctes.iter().any(|c| c.name.eq_ignore_ascii_case(&cte.name)) {
             ctes.push(cte.clone());
         }
     }

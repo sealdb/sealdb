@@ -57,10 +57,7 @@ pub fn mysql_numeric_prefix(text: &str) -> f64 {
             end = probe;
         }
     }
-    if seen_digit
-        && end < bytes.len()
-        && (bytes[end] == b'e' || bytes[end] == b'E')
-    {
+    if seen_digit && end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
         let mut probe = end + 1;
         if probe < bytes.len() && (bytes[probe] == b'+' || bytes[probe] == b'-') {
             probe += 1;
@@ -208,20 +205,16 @@ impl Datum {
             (Datum::Enum(a), Datum::Enum(b)) => a.label.cmp(&b.label),
             (Datum::Enum(a), Datum::Bytes(b)) => a.label.cmp(b),
             (Datum::Bytes(a), Datum::Enum(b)) => a.cmp(&b.label),
-            (Datum::Enum(a), Datum::I64(b)) => {
-                i128::from(a.number).cmp(&i128::from(*b))
-            }
-            (Datum::I64(a), Datum::Enum(b)) => {
-                i128::from(*a).cmp(&i128::from(b.number))
-            }
+            (Datum::Enum(a), Datum::I64(b)) => i128::from(a.number).cmp(&i128::from(*b)),
+            (Datum::I64(a), Datum::Enum(b)) => i128::from(*a).cmp(&i128::from(b.number)),
             (Datum::Enum(a), Datum::U64(b)) => u128::from(a.number).cmp(&u128::from(*b)),
             (Datum::U64(a), Datum::Enum(b)) => u128::from(*a).cmp(&u128::from(b.number)),
-            (Datum::Enum(a), Datum::F64(b)) => (a.number as f64)
-                .partial_cmp(b)
-                .unwrap_or(Ordering::Equal),
-            (Datum::F64(a), Datum::Enum(b)) => a
-                .partial_cmp(&(b.number as f64))
-                .unwrap_or(Ordering::Equal),
+            (Datum::Enum(a), Datum::F64(b)) => {
+                (a.number as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+            (Datum::F64(a), Datum::Enum(b)) => {
+                a.partial_cmp(&(b.number as f64)).unwrap_or(Ordering::Equal)
+            }
             (Datum::Enum(a), Datum::Decimal(b)) => (a.number as f64)
                 .partial_cmp(&b.to_f64().unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
@@ -278,26 +271,18 @@ impl Datum {
                         Datum::Decimal(d) => {
                             let s = d.to_string();
                             if s.starts_with('-') {
-                                return Err(Error::new(
-                                    ERR_DATA_OUT_OF_RANGE,
-                                    "UNSIGNED overflow",
-                                ));
+                                return Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"));
                             }
                             let int_part = s.split('.').next().unwrap_or("0");
                             int_part
                                 .parse::<u64>()
                                 .map(Datum::U64)
-                                .map_err(|_| {
-                                    Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow")
-                                })
+                                .map_err(|_| Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"))
                         }
                         other => {
                             let v = other.as_i64()?;
                             if v < 0 {
-                                return Err(Error::new(
-                                    ERR_DATA_OUT_OF_RANGE,
-                                    "UNSIGNED overflow",
-                                ));
+                                return Err(Error::new(ERR_DATA_OUT_OF_RANGE, "UNSIGNED overflow"));
                             }
                             Ok(Datum::U64(v as u64))
                         }
@@ -426,9 +411,7 @@ fn parse_f64(b: &[u8]) -> Result<f64> {
 /// TiDB/MySQL REAL text form: scientific for large/small magnitudes (`1e23`),
 /// otherwise decimal; whole values keep a single fractional digit (`2.0`).
 fn bit_as_u64(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
 }
 
 fn bit_as_u128(bytes: &[u8]) -> u128 {

@@ -170,14 +170,17 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             for (seq, col) in idx.columns.iter().enumerate() {
                 // An expression key part reports COLUMN_NAME NULL and its
                 // generating expression instead (MySQL 8 / TiDB `Expression`).
-                let (column_name, expression) =
-                    match table.columns.iter().find(|c| c.hidden && c.name.o().eq_ignore_ascii_case(col.name.o())) {
-                        Some(hidden) => (
-                            Datum::Null,
-                            bytes(hidden.generated_expr.as_deref().unwrap_or_default()),
-                        ),
-                        None => (bytes(col.name.o()), Datum::Null),
-                    };
+                let (column_name, expression) = match table
+                    .columns
+                    .iter()
+                    .find(|c| c.hidden && c.name.o().eq_ignore_ascii_case(col.name.o()))
+                {
+                    Some(hidden) => (
+                        Datum::Null,
+                        bytes(hidden.generated_expr.as_deref().unwrap_or_default()),
+                    ),
+                    None => (bytes(col.name.o()), Datum::Null),
+                };
                 rows.push(vec![
                     bytes("def"),
                     bytes(db),
@@ -203,7 +206,6 @@ fn statistics(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     });
     (schema, rows)
 }
-
 
 /// TiDB `information_schema.tidb_indexes`: `statistics` plus the index id,
 /// visibility, clustered flag and (for expression key parts) the generating

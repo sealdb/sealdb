@@ -6,8 +6,8 @@
 use super::physical_plans::PhysicalPlan;
 use super::rule_predicate_push_down::predicate_push_down;
 use sealdb_infoschema::InfoSchema;
-use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode};
 use sealdb_parser::ast::SelectStmt;
+use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode};
 use sealdb_parser::opcode::Op;
 
 /// Split HAVING, push predicates, inject Projections, scale estRows.
@@ -37,8 +37,7 @@ pub fn apply_having_push_down(
     // The injected cast/Projection below the aggregate only exists when an
     // aggregate function is actually computed above it. A plain
     // `GROUP BY … HAVING <group col> …` shape keeps the group-by/firstrow plan.
-    let has_agg = expr_has_agg(having)
-        || select.fields.iter().any(|f| expr_has_agg(&f.expr));
+    let has_agg = expr_has_agg(having) || select.fields.iter().any(|f| expr_has_agg(&f.expr));
     let mut plan = if has_agg {
         inject_avg_group_projection(plan, select, current_db, agg_est)
     } else {
@@ -59,9 +58,7 @@ pub fn apply_having_push_down(
     // HAVING itself and no such output column exists.
     let residual_supported = residual_aggs_projected(&residual, select);
     let has_residual = !residual.is_empty();
-    if residual_supported
-        && let Some(filter) = compose_cnf_right(residual)
-    {
+    if residual_supported && let Some(filter) = compose_cnf_right(residual) {
         plan = PhysicalPlan::Selection {
             filter: rewrite_having_agg_refs(normalize_or_right(filter), select),
             child: Box::new(plan),
@@ -146,9 +143,7 @@ fn filter_selectivity(expr: &ExprNode) -> f64 {
 
 fn cmp_column_name(b: &BinaryOpExpr) -> Option<String> {
     match (b.left.as_ref(), b.right.as_ref()) {
-        (ExprNode::Column(c), _) | (_, ExprNode::Column(c)) => {
-            Some(c.name.to_ascii_lowercase())
-        }
+        (ExprNode::Column(c), _) | (_, ExprNode::Column(c)) => Some(c.name.to_ascii_lowercase()),
         _ => None,
     }
 }
@@ -365,11 +360,7 @@ fn inject_avg_group_projection(
     current_db: &str,
     agg_est: f64,
 ) -> PhysicalPlan {
-    let table = select
-        .from
-        .as_ref()
-        .map(|t| t.name.as_str())
-        .unwrap_or("t");
+    let table = select.from.as_ref().map(|t| t.name.as_str()).unwrap_or("t");
     let qual = |col: &str| {
         if current_db.is_empty() {
             format!("select.{table}.{col}")
@@ -438,14 +429,11 @@ fn inject_avg_group_projection(
             continue;
         }
         if let ExprNode::Column(col) = &field.expr {
-            if let Some((idx, _)) = select.group_by.iter().enumerate().find(|(_, g)| {
-                matches!(g, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&col.name))
-            }) {
+            if let Some((idx, _)) = select.group_by.iter().enumerate().find(
+                |(_, g)| matches!(g, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&col.name)),
+            ) {
                 let id = group_ids[idx];
-                funcs.push(format!(
-                    "funcs:firstrow(Column#{id})->{}",
-                    qual(&col.name)
-                ));
+                funcs.push(format!("funcs:firstrow(Column#{id})->{}", qual(&col.name)));
             }
         }
     }
@@ -463,11 +451,7 @@ fn wrap_having_output_projection(
     select: &SelectStmt,
     current_db: &str,
 ) -> PhysicalPlan {
-    let table = select
-        .from
-        .as_ref()
-        .map(|t| t.name.as_str())
-        .unwrap_or("t");
+    let table = select.from.as_ref().map(|t| t.name.as_str()).unwrap_or("t");
     let qual = |col: &str| {
         if current_db.is_empty() {
             format!("select.{table}.{col}")
@@ -520,7 +504,11 @@ fn push_through_agg(
             est_rows,
             child: Box::new(predicate_push_down(*child, filter, is, current_db)),
         },
-        PhysicalPlan::Selection { filter: outer, child, est_rows } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection {
+            filter: outer,
+            child,
+            est_rows,
+        } => PhysicalPlan::Selection {
             filter: outer,
             child: Box::new(push_through_agg(*child, filter, is, current_db)),
             est_rows,
@@ -582,7 +570,11 @@ fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
             est_rows: est,
             child,
         },
-        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection {
+            filter,
+            child,
+            est_rows,
+        } => PhysicalPlan::Selection {
             filter,
             child: Box::new(set_agg_est(*child, est)),
             est_rows,
@@ -614,7 +606,11 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             exprs,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
         },
-        PhysicalPlan::Selection { filter, child, est_rows } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection {
+            filter,
+            child,
+            est_rows,
+        } => PhysicalPlan::Selection {
             filter,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
             est_rows,
@@ -658,11 +654,8 @@ fn residual_aggs_projected(residual: &[ExprNode], select: &SelectStmt) -> bool {
     residual.iter().all(|expr| {
         let mut aggs = Vec::new();
         collect_agg_texts(expr, &mut aggs);
-        aggs.iter().all(|text| {
-            projected
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(text))
-        })
+        aggs.iter()
+            .all(|text| projected.iter().any(|p| p.eq_ignore_ascii_case(text)))
     })
 }
 

@@ -302,7 +302,10 @@ impl ExprNode {
             if value.is_null() {
                 continue;
             }
-            if !values.iter().any(|have: &Datum| have.compare(&value).is_eq()) {
+            if !values
+                .iter()
+                .any(|have: &Datum| have.compare(&value).is_eq())
+            {
                 values.push(value);
             }
         }
@@ -458,11 +461,17 @@ impl ExprNode {
         // A signed literal parses as `-(1)`, so fold the constant side rather
         // than only accepting a bare `Value` (`c1 < -1` drives a range in TiDB).
         match (bin.left.as_ref(), bin.right.as_ref()) {
-            (ExprNode::Column(col), right) if matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
-                right.const_datum().map(|value| (col.name.clone(), bin.op, value))
+            (ExprNode::Column(col), right)
+                if matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) =>
+            {
+                right
+                    .const_datum()
+                    .map(|value| (col.name.clone(), bin.op, value))
             }
-            (left, ExprNode::Column(col)) => flip_cmp(bin.op)
-                .and_then(|op| left.const_datum().map(|value| (col.name.clone(), op, value))),
+            (left, ExprNode::Column(col)) => flip_cmp(bin.op).and_then(|op| {
+                left.const_datum()
+                    .map(|value| (col.name.clone(), op, value))
+            }),
             _ => None,
         }
     }
@@ -1101,8 +1110,14 @@ pub enum WindowFrameBound {
     Following(u64),
     UnboundedFollowing,
     /// `INTERVAL '2:30' MINUTE_SECOND PRECEDING` (TiDB window RANGE).
-    IntervalPreceding { value: String, unit: String },
-    IntervalFollowing { value: String, unit: String },
+    IntervalPreceding {
+        value: String,
+        unit: String,
+    },
+    IntervalFollowing {
+        value: String,
+        unit: String,
+    },
 }
 
 impl WindowFrameBound {

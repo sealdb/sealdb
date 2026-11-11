@@ -13,9 +13,8 @@ pub fn md5(bytes: &[u8]) -> [u8; 16] {
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
         15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
-    let k: [u32; 64] = std::array::from_fn(|i| {
-        ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32
-    });
+    let k: [u32; 64] =
+        std::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32);
 
     let mut msg = bytes.to_vec();
     let bit_len = (bytes.len() as u64).wrapping_mul(8);
@@ -25,11 +24,20 @@ pub fn md5(bytes: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
-    let (mut a0, mut b0, mut c0, mut d0) =
-        (0x6745_2301u32, 0xefcd_ab89u32, 0x98ba_dcfeu32, 0x1032_5476u32);
+    let (mut a0, mut b0, mut c0, mut d0) = (
+        0x6745_2301u32,
+        0xefcd_ab89u32,
+        0x98ba_dcfeu32,
+        0x1032_5476u32,
+    );
     for chunk in msg.chunks(64) {
         let m: [u32; 16] = std::array::from_fn(|i| {
-            u32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]])
+            u32::from_le_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ])
         });
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
         for i in 0..64 {
@@ -42,10 +50,7 @@ pub fn md5(bytes: &[u8]) -> [u8; 16] {
             let tmp = d;
             d = c;
             c = b;
-            let sum = a
-                .wrapping_add(f)
-                .wrapping_add(k[i])
-                .wrapping_add(m[g]);
+            let sum = a.wrapping_add(f).wrapping_add(k[i]).wrapping_add(m[g]);
             b = b.wrapping_add(sum.rotate_left(S[i]));
             a = tmp;
         }

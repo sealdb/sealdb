@@ -172,8 +172,12 @@ fn bound_text(item: &Value, field: &str) -> Result<String> {
 
 fn bound_bytes(item: &Value, field: &str) -> Result<Vec<u8>> {
     let encoded = item.get(field).and_then(Value::as_str).unwrap_or_default();
-    decode_base64(encoded)
-        .ok_or_else(|| Error::new(ERR_UNKNOWN_ERROR, format!("load stats: bad base64 in {field}")))
+    decode_base64(encoded).ok_or_else(|| {
+        Error::new(
+            ERR_UNKNOWN_ERROR,
+            format!("load stats: bad base64 in {field}"),
+        )
+    })
 }
 
 /// Standard-alphabet base64 with optional padding (TiDB JSON uses `base64.StdEncoding`).

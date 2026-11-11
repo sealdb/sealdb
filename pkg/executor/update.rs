@@ -141,7 +141,13 @@ impl Executor for UpdateExec {
         let validation_snapshot = if info.indices.iter().any(|idx| idx.unique)
             && physical.len() < info.physical_ids().len()
         {
-            scan_table(&self.txn, &info, lock, LockWait::Block, &info.physical_ids())?
+            scan_table(
+                &self.txn,
+                &info,
+                lock,
+                LockWait::Block,
+                &info.physical_ids(),
+            )?
         } else {
             snapshot.clone()
         };
@@ -149,8 +155,7 @@ impl Executor for UpdateExec {
             validate_update_uniqueness(&info, &validation_snapshot, &plans, self.stmt.ignore)?;
         for (i, (_, new_values)) in plans.iter().enumerate() {
             if keep[i] {
-                keep[i] =
-                    check_partition_target(&info, new_values, &targets, self.stmt.ignore)?;
+                keep[i] = check_partition_target(&info, new_values, &targets, self.stmt.ignore)?;
             }
         }
         let mut changed = 0u64;
@@ -458,9 +463,7 @@ fn column_matches(schema_name: &str, table: Option<&str>, column: &str) -> bool 
 /// `NOT NULL` columns reject an explicit NULL assignment (`1048`).
 fn reject_null_not_null(info: &sealdb_meta::TableInfo, values: &[Datum]) -> Result<()> {
     for (col, value) in info.columns.iter().zip(values.iter()) {
-        if value.is_null()
-            && col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
-        {
+        if value.is_null() && col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0 {
             return Err(Error::new(
                 ERR_BAD_NULL,
                 format!("Column '{}' cannot be null", col.name.o()),
@@ -471,17 +474,18 @@ fn reject_null_not_null(info: &sealdb_meta::TableInfo, values: &[Datum]) -> Resu
 }
 
 /// Resolve `tbl PARTITION (p1, p2)` names to physical ids (empty = all).
-pub(crate) fn resolve_partition_ids(
-    info: &TableInfo,
-    names: &[String],
-) -> Result<Vec<i64>> {
+pub(crate) fn resolve_partition_ids(info: &TableInfo, names: &[String]) -> Result<Vec<i64>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
     let Some(part) = info.partition.as_ref() else {
         return Err(Error::new(
             ERR_UNKNOWN_PARTITION,
-            format!("Unknown partition '{}' in table '{}'", names[0], info.name.o()),
+            format!(
+                "Unknown partition '{}' in table '{}'",
+                names[0],
+                info.name.o()
+            ),
         ));
     };
     let mut ids = Vec::with_capacity(names.len());
@@ -570,9 +574,9 @@ fn validate_update_uniqueness(
         for existing in snapshot {
             let same_row = existing.handle == plans[i].0.handle
                 && existing.physical_id == plans[i].0.physical_id;
-            let also_updated = plans.iter().any(|(p, _)| {
-                p.handle == existing.handle && p.physical_id == existing.physical_id
-            });
+            let also_updated = plans
+                .iter()
+                .any(|(p, _)| p.handle == existing.handle && p.physical_id == existing.physical_id);
             if same_row || also_updated {
                 continue;
             }
@@ -778,13 +782,7 @@ fn bind_outer_assignments(
             out.push(item.clone());
             continue;
         }
-        let bound = bind_outer_refs(
-            &item.expr,
-            &info.name.o(),
-            col_names,
-            values,
-            &[],
-        );
+        let bound = bind_outer_refs(&item.expr, &info.name.o(), col_names, values, &[]);
         let expr = pre_evaluate_dml_predicate(&bound, domain, current_db, txn)?;
         out.push(Assignment {
             table: item.table.clone(),
@@ -816,15 +814,17 @@ fn bind_outer_refs(
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case(outer_table));
             let bare_outer = c.table.is_none() && !inside;
-            let shadowed = c.table.as_deref().is_some_and(|t| {
-                inner_tables.iter().any(|i| i.eq_ignore_ascii_case(t))
-            });
+            let shadowed = c
+                .table
+                .as_deref()
+                .is_some_and(|t| inner_tables.iter().any(|i| i.eq_ignore_ascii_case(t)));
             if !shadowed && (qualified_outer || bare_outer) {
                 let name = c.name.as_str();
-                if let Some(i) = col_names
-                    .iter()
-                    .position(|n| n.rsplit('.').next().is_some_and(|b| b.eq_ignore_ascii_case(name)))
-                {
+                if let Some(i) = col_names.iter().position(|n| {
+                    n.rsplit('.')
+                        .next()
+                        .is_some_and(|b| b.eq_ignore_ascii_case(name))
+                }) {
                     return ExprNode::Value(ValueExpr {
                         datum: values[i].clone(),
                     });
@@ -834,14 +834,31 @@ fn bind_outer_refs(
         }
         ExprNode::Binary(b) => {
             let mut b = b.clone();
-            b.left = Box::new(bind_outer_refs(&b.left, outer_table, col_names, values, inner_tables));
-            b.right =
-                Box::new(bind_outer_refs(&b.right, outer_table, col_names, values, inner_tables));
+            b.left = Box::new(bind_outer_refs(
+                &b.left,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
+            b.right = Box::new(bind_outer_refs(
+                &b.right,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::Binary(b)
         }
         ExprNode::Unary(u) => {
             let mut u = u.clone();
-            u.expr = Box::new(bind_outer_refs(&u.expr, outer_table, col_names, values, inner_tables));
+            u.expr = Box::new(bind_outer_refs(
+                &u.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::Unary(u)
         }
         ExprNode::Func(f) => {
@@ -855,12 +872,24 @@ fn bind_outer_refs(
         }
         ExprNode::Cast(c) => {
             let mut c = c.clone();
-            c.expr = Box::new(bind_outer_refs(&c.expr, outer_table, col_names, values, inner_tables));
+            c.expr = Box::new(bind_outer_refs(
+                &c.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::Cast(c)
         }
         ExprNode::InList(l) => {
             let mut l = l.clone();
-            l.expr = Box::new(bind_outer_refs(&l.expr, outer_table, col_names, values, inner_tables));
+            l.expr = Box::new(bind_outer_refs(
+                &l.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             l.list = l
                 .list
                 .iter()
@@ -870,22 +899,56 @@ fn bind_outer_refs(
         }
         ExprNode::Between(b) => {
             let mut b = b.clone();
-            b.expr = Box::new(bind_outer_refs(&b.expr, outer_table, col_names, values, inner_tables));
-            b.low = Box::new(bind_outer_refs(&b.low, outer_table, col_names, values, inner_tables));
-            b.high =
-                Box::new(bind_outer_refs(&b.high, outer_table, col_names, values, inner_tables));
+            b.expr = Box::new(bind_outer_refs(
+                &b.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
+            b.low = Box::new(bind_outer_refs(
+                &b.low,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
+            b.high = Box::new(bind_outer_refs(
+                &b.high,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::Between(b)
         }
         ExprNode::Like(l) => {
             let mut l = l.clone();
-            l.expr = Box::new(bind_outer_refs(&l.expr, outer_table, col_names, values, inner_tables));
-            l.pattern =
-                Box::new(bind_outer_refs(&l.pattern, outer_table, col_names, values, inner_tables));
+            l.expr = Box::new(bind_outer_refs(
+                &l.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
+            l.pattern = Box::new(bind_outer_refs(
+                &l.pattern,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::Like(l)
         }
         ExprNode::IsNull(i) => {
             let mut i = i.clone();
-            i.expr = Box::new(bind_outer_refs(&i.expr, outer_table, col_names, values, inner_tables));
+            i.expr = Box::new(bind_outer_refs(
+                &i.expr,
+                outer_table,
+                col_names,
+                values,
+                inner_tables,
+            ));
             ExprNode::IsNull(i)
         }
         ExprNode::Case(c) => {
@@ -923,9 +986,13 @@ fn bind_outer_refs(
         ExprNode::ScalarSubquery(s) => {
             let mut s = s.clone();
             if let sealdb_parser::ast::ResultSetNode::Select(query) = s.query.as_ref() {
-                s.query = Box::new(sealdb_parser::ast::ResultSetNode::Select(
-                    bind_outer_query(query, outer_table, col_names, values, inner_tables),
-                ));
+                s.query = Box::new(sealdb_parser::ast::ResultSetNode::Select(bind_outer_query(
+                    query,
+                    outer_table,
+                    col_names,
+                    values,
+                    inner_tables,
+                )));
             }
             ExprNode::ScalarSubquery(s)
         }
@@ -952,10 +1019,22 @@ fn bind_outer_query(
         field.expr = bind_outer_refs(&field.expr, outer_table, col_names, values, &inner);
     }
     if let Some(selection) = &q.selection {
-        q.selection = Some(bind_outer_refs(selection, outer_table, col_names, values, &inner));
+        q.selection = Some(bind_outer_refs(
+            selection,
+            outer_table,
+            col_names,
+            values,
+            &inner,
+        ));
     }
     if let Some(having) = &q.having {
-        q.having = Some(bind_outer_refs(having, outer_table, col_names, values, &inner));
+        q.having = Some(bind_outer_refs(
+            having,
+            outer_table,
+            col_names,
+            values,
+            &inner,
+        ));
     }
     q.group_by = q
         .group_by

@@ -210,12 +210,7 @@ impl ColumnStats {
     pub fn exact_point_count(&self, value: &Datum) -> Option<u64> {
         let key = datum_key(value);
         let raw = self.value_counts.as_ref()?;
-        Some(
-            raw.iter()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, c)| *c)
-                .sum(),
-        )
+        Some(raw.iter().filter(|(k, _)| *k == key).map(|(_, c)| *c).sum())
     }
 
     /// Exact rows whose value lies inside `[lower, upper]` with the given
@@ -255,7 +250,11 @@ impl ColumnStats {
         let mut total = 0u64;
         for value in values {
             let key = datum_key(value);
-            total += raw.iter().filter(|(k, _)| *k == key).map(|(_, c)| *c).sum::<u64>();
+            total += raw
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, c)| *c)
+                .sum::<u64>();
         }
         Some(total)
     }
@@ -416,4 +415,3 @@ mod histogram_tests {
         assert_eq!(topn.lookup("b"), None);
     }
 }
-

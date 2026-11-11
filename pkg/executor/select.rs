@@ -326,7 +326,9 @@ impl Executor for DistinctExec {
                 let out = if project {
                     self.fields
                         .iter()
-                        .map(|expr| sealdb_expression::eval_expr_with_row(expr, &child_schema, &row))
+                        .map(|expr| {
+                            sealdb_expression::eval_expr_with_row(expr, &child_schema, &row)
+                        })
                         .collect::<Result<Vec<_>>>()?
                 } else {
                     row.clone()

@@ -12,7 +12,8 @@ fn main() {
         .with_store_name(Some("memory"))
         .expect("store config");
     let storage = sealdb_store::open(&cfg).expect("open store");
-    let domain = Arc::new(Domain::with_storage_and_grant_table_id_base(storage, 0).expect("domain"));
+    let domain =
+        Arc::new(Domain::with_storage_and_grant_table_id_base(storage, 0).expect("domain"));
     let session = Session::with_domain(domain);
     for sql in std::env::args().skip(1) {
         println!("-- {sql}");

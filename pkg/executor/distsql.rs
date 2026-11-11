@@ -296,105 +296,96 @@ impl Executor for IndexMergeExecutor {
         // A clustered-PK arm scans the table rows themselves, so the whole
         // table is the row-ID superset; the WHERE filter below prunes it to the
         // merge's exact result.
-        let mut rows: Vec<Vec<Datum>> =
-            if self.paths.iter().any(|path| path.table_range) {
-                crate::table_reader::scan_table(
-                    &self.txn,
-                    &info,
-                    self.lock,
-                    self.wait,
-                    &physical,
-                )?
+        let mut rows: Vec<Vec<Datum>> = if self.paths.iter().any(|path| path.table_range) {
+            crate::table_reader::scan_table(&self.txn, &info, self.lock, self.wait, &physical)?
                 .into_iter()
                 .map(|row| row.values)
                 .collect()
+        } else {
+            let arms = if self.paths.is_empty() {
+                merge_access_arms(self.selection.as_ref().or(self.pushed.as_ref()), &info)?
             } else {
-                let arms = if self.paths.is_empty() {
-                    merge_access_arms(self.selection.as_ref().or(self.pushed.as_ref()), &info)?
-                } else {
-                    Vec::new()
-                };
-                if arms.is_empty() && self.paths.is_empty() {
-                    return Err(Error::unsupported("index merge without access path"));
-                }
-                self.txn.with_txn(|txn| {
-                    let mut seen = HashSet::new();
-                    let mut handles: Vec<(i64, i64)> = Vec::new();
-                    for (index, access) in &arms {
-                        collect_bounds(
-                            txn,
-                            (*index).clone(),
-                            std::slice::from_ref(access),
-                            &physical,
-                            self.lock,
-                            self.wait,
-                            &mut seen,
-                            &mut handles,
-                        )?;
-                    }
-                    for path in &self.paths {
-                        if path.table_range {
-                            continue;
-                        }
-                        let Some(index) = info
-                            .indices
-                            .iter()
-                            .find(|index| index.name.o().eq_ignore_ascii_case(&path.index))
-                        else {
-                            continue;
-                        };
-                        let bounds: Vec<IndexAccess> = path
-                            .ranges
-                            .iter()
-                            .map(|(low, high)| IndexAccess::Range {
-                                low: low
-                                    .as_ref()
-                                    .map(|(value, _)| vec![value.clone()])
-                                    .unwrap_or_default(),
-                                low_inclusive: low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
-                                high: high
-                                    .as_ref()
-                                    .map(|(value, _)| vec![value.clone()])
-                                    .unwrap_or_default(),
-                                high_inclusive: high
-                                    .as_ref()
-                                    .is_none_or(|(_, inclusive)| *inclusive),
-                            })
-                            .collect();
-                        collect_bounds(
-                            txn,
-                            index.clone(),
-                            &bounds,
-                            &physical,
-                            self.lock,
-                            self.wait,
-                            &mut seen,
-                            &mut handles,
-                        )?;
-                    }
-                    let mut rows = Vec::with_capacity(handles.len());
-                    for (physical_id, handle) in handles {
-                        let row_key = encode_row_key_with_handle(physical_id, handle);
-                        let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
-                        if let Some(raw) = raw {
-                            let decoded = decode_row(&raw, &info.col_field_types());
-                            rows.push(
-                                info.columns
-                                    .iter()
-                                    .map(|col| {
-                                        decoded
-                                            .iter()
-                                            .find(|(id, _)| *id == col.id)
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or(Datum::Null)
-                                    })
-                                    .collect(),
-                            );
-                        }
-                    }
-                    Ok(rows)
-                })?
+                Vec::new()
             };
+            if arms.is_empty() && self.paths.is_empty() {
+                return Err(Error::unsupported("index merge without access path"));
+            }
+            self.txn.with_txn(|txn| {
+                let mut seen = HashSet::new();
+                let mut handles: Vec<(i64, i64)> = Vec::new();
+                for (index, access) in &arms {
+                    collect_bounds(
+                        txn,
+                        (*index).clone(),
+                        std::slice::from_ref(access),
+                        &physical,
+                        self.lock,
+                        self.wait,
+                        &mut seen,
+                        &mut handles,
+                    )?;
+                }
+                for path in &self.paths {
+                    if path.table_range {
+                        continue;
+                    }
+                    let Some(index) = info
+                        .indices
+                        .iter()
+                        .find(|index| index.name.o().eq_ignore_ascii_case(&path.index))
+                    else {
+                        continue;
+                    };
+                    let bounds: Vec<IndexAccess> = path
+                        .ranges
+                        .iter()
+                        .map(|(low, high)| IndexAccess::Range {
+                            low: low
+                                .as_ref()
+                                .map(|(value, _)| vec![value.clone()])
+                                .unwrap_or_default(),
+                            low_inclusive: low.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                            high: high
+                                .as_ref()
+                                .map(|(value, _)| vec![value.clone()])
+                                .unwrap_or_default(),
+                            high_inclusive: high.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                        })
+                        .collect();
+                    collect_bounds(
+                        txn,
+                        index.clone(),
+                        &bounds,
+                        &physical,
+                        self.lock,
+                        self.wait,
+                        &mut seen,
+                        &mut handles,
+                    )?;
+                }
+                let mut rows = Vec::with_capacity(handles.len());
+                for (physical_id, handle) in handles {
+                    let row_key = encode_row_key_with_handle(physical_id, handle);
+                    let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                    if let Some(raw) = raw {
+                        let decoded = decode_row(&raw, &info.col_field_types());
+                        rows.push(
+                            info.columns
+                                .iter()
+                                .map(|col| {
+                                    decoded
+                                        .iter()
+                                        .find(|(id, _)| *id == col.id)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or(Datum::Null)
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                Ok(rows)
+            })?
+        };
         self.rows = filter_rows(
             std::mem::take(&mut rows),
             &self.schema,
@@ -405,7 +396,10 @@ impl Executor for IndexMergeExecutor {
         // a DESC order sorts the merged result backwards.
         if self.keep_order
             && let Some(column) = self.order_column.as_deref()
-            && let Some(pos) = self.schema.iter().position(|name| name.eq_ignore_ascii_case(column))
+            && let Some(pos) = self
+                .schema
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(column))
         {
             self.rows.sort_by(|left, right| {
                 let ordering = left[pos].compare(&right[pos]);
@@ -591,11 +585,7 @@ fn covering_row(
     Ok(row)
 }
 
-fn rehydrate_index_datum(
-    info: &TableInfo,
-    offset: usize,
-    value: Datum,
-) -> Result<Datum> {
+fn rehydrate_index_datum(info: &TableInfo, offset: usize, value: Datum) -> Result<Datum> {
     let Some(col) = info.columns.get(offset) else {
         return Ok(value);
     };

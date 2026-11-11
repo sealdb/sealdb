@@ -82,7 +82,8 @@ impl Executor for DeleteExec {
         // Prune on the pre-evaluated predicate: a raw scalar subquery cannot be
         // reasoned about and would prune every partition away.
         let mut physical = sealdb_planner::core::prune_partitions(&info, filter.as_ref());
-        let targets = crate::update::resolve_partition_ids(&info, &self.stmt.table.partition_names)?;
+        let targets =
+            crate::update::resolve_partition_ids(&info, &self.stmt.table.partition_names)?;
         if !targets.is_empty() {
             physical.retain(|id| targets.contains(id));
         }

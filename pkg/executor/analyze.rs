@@ -42,13 +42,10 @@ impl Executor for AnalyzeExec {
             return Ok(());
         };
         let indexes = analyze.indexes.clone();
-        let tables: Vec<_> = analyze
-            .all_tables()
-            .into_iter()
-            .cloned()
-            .collect();
+        let buckets = analyze.bucket_count;
+        let tables: Vec<_> = analyze.all_tables().into_iter().cloned().collect();
         for table in &tables {
-            self.analyze_one(table, &indexes)?;
+            self.analyze_one(table, &indexes, buckets)?;
         }
         Ok(())
     }
@@ -71,6 +68,7 @@ impl AnalyzeExec {
         &self,
         table: &sealdb_parser::ast::TableName,
         indexes: &[String],
+        buckets: Option<u64>,
     ) -> Result<()> {
         let (schema, name) = table.qualified(&self.current_db);
         if schema.is_empty() {
@@ -91,7 +89,7 @@ impl AnalyzeExec {
             &info.physical_ids(),
         )?;
         let index_cols = resolve_index_columns(&info, indexes)?;
-        let columns = collect_column_stats(&info, &rows, index_cols.as_ref());
+        let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets);
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
             if index_cols.is_some() {
                 prev.count = rows.len() as u64;
@@ -159,6 +157,7 @@ fn collect_column_stats(
     info: &TableInfo,
     rows: &[crate::table_reader::ScannedRow],
     index_cols: Option<&HashSet<String>>,
+    buckets: Option<u64>,
 ) -> Vec<(String, ColumnStats)> {
     let mut columns = Vec::new();
     for (idx, col) in info.columns.iter().enumerate() {
@@ -183,7 +182,10 @@ fn collect_column_stats(
             }
         }
         values.sort();
-        let histogram = Some(Histogram::from_sorted(&values, Table::DEFAULT_HIST_BUCKETS));
+        let max_buckets = buckets
+            .map(|n| n as usize)
+            .unwrap_or(Table::DEFAULT_HIST_BUCKETS);
+        let histogram = Some(Histogram::from_sorted(&values, max_buckets));
         let counts: Vec<(String, u64)> = freq.into_iter().collect();
         let topn = Some(TopN::from_counts(&counts, Table::DEFAULT_TOPN));
         // Planner selectivity for partition pruning needs exact counts; keep

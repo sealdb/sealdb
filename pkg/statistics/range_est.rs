@@ -251,11 +251,9 @@ impl Histogram {
     fn calc_fraction(lower: &Bound, upper: &Bound, value: &Bound) -> f64 {
         let (l, u, v) = match (lower, upper, value) {
             (Bound::Num(l), Bound::Num(u), Bound::Num(v)) => (*l, *u, *v),
-            (Bound::Int(l), Bound::Int(u), Bound::Int(v)) => (
-                (*l as f64),
-                (*u as f64),
-                (*v as f64),
-            ),
+            (Bound::Int(l), Bound::Int(u), Bound::Int(v)) => {
+                ((*l as f64), (*u as f64), (*v as f64))
+            }
             // Strings interpolate on the base-256 value of the common suffix.
             (Bound::Bytes(l), Bound::Bytes(u), Bound::Bytes(v)) => {
                 let prefix = common_prefix(l, u);
@@ -690,9 +688,7 @@ impl Table {
                         // the CM sketch before the histogram: a value the sketch
                         // puts at zero estimates no rows even inside a bucket.
                         None => match &idx.cm_sketch {
-                            Some(sketch) if idx.stats_ver < 2 => {
-                                sketch.query_bytes(&key) as f64
-                            }
+                            Some(sketch) if idx.stats_ver < 2 => sketch.query_bytes(&key) as f64,
                             _ => idx.equal_row_count(&key),
                         },
                     }

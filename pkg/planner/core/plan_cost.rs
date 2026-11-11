@@ -227,10 +227,12 @@ fn const_i64(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<i64> {
 
 fn const_datum(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<sealdb_types::Datum> {
     use sealdb_parser::ast::expressions::ExprNode;
-    const_i64(expr).map(sealdb_types::Datum::I64).or_else(|| match expr {
-        ExprNode::Value(v) => Some(v.datum.clone()),
-        _ => None,
-    })
+    const_i64(expr)
+        .map(sealdb_types::Datum::I64)
+        .or_else(|| match expr {
+            ExprNode::Value(v) => Some(v.datum.clone()),
+            _ => None,
+        })
 }
 
 fn as_column(expr: &sealdb_parser::ast::expressions::ExprNode) -> Option<&str> {
@@ -270,27 +272,23 @@ fn comparison_rows(
     match op {
         Op::Eq => point(),
         Op::Ne => Some(rows - point()? - stats.null_count as f64),
-        Op::Lt => Some(
-            (stats.exact_range_count(None, Some((&datum, false)))? as f64)
-                .clamp(1.0, rows),
-        ),
-        Op::Le => Some(
-            (stats.exact_range_count(None, Some((&datum, true)))? as f64).clamp(1.0, rows),
-        ),
-        Op::Gt => Some(
-            (stats.exact_range_count(Some((&datum, false)), None)? as f64).clamp(1.0, rows),
-        ),
-        Op::Ge => Some(
-            (stats.exact_range_count(Some((&datum, true)), None)? as f64).clamp(1.0, rows),
-        ),
+        Op::Lt => {
+            Some((stats.exact_range_count(None, Some((&datum, false)))? as f64).clamp(1.0, rows))
+        }
+        Op::Le => {
+            Some((stats.exact_range_count(None, Some((&datum, true)))? as f64).clamp(1.0, rows))
+        }
+        Op::Gt => {
+            Some((stats.exact_range_count(Some((&datum, false)), None)? as f64).clamp(1.0, rows))
+        }
+        Op::Ge => {
+            Some((stats.exact_range_count(Some((&datum, true)), None)? as f64).clamp(1.0, rows))
+        }
         _ => None,
     }
 }
 
-fn in_list_rows(
-    table: &Table,
-    list: &sealdb_parser::ast::expressions::InListExpr,
-) -> Option<f64> {
+fn in_list_rows(table: &Table, list: &sealdb_parser::ast::expressions::InListExpr) -> Option<f64> {
     let col = as_column(&list.expr)?;
     let stats = table.column(col)?;
     stats.value_counts.as_ref()?;
@@ -310,10 +308,7 @@ fn in_list_rows(
 }
 
 /// Conjunction: intersect ranges on one column and subtract excluded values.
-fn cnf_rows(
-    table: &Table,
-    filter: &sealdb_parser::ast::expressions::ExprNode,
-) -> Option<f64> {
+fn cnf_rows(table: &Table, filter: &sealdb_parser::ast::expressions::ExprNode) -> Option<f64> {
     use sealdb_parser::ast::expressions::ExprNode;
     let mut column: Option<String> = None;
     let mut lo: Option<(sealdb_types::Datum, bool)> = None;

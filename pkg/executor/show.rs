@@ -38,11 +38,8 @@ impl Executor for ShowExec {
                 // Non-privileged users only see databases they hold a grant on
                 // (TiDB `ShowDatabasesExec`); `INFORMATION_SCHEMA` is always
                 // visible and listed first.
-                let visible = sealdb_privilege::thread_user().and_then(|user| {
-                    self.domain
-                        .privilege()
-                        .visible_databases(&user, &[])
-                });
+                let visible = sealdb_privilege::thread_user()
+                    .and_then(|user| self.domain.privilege().visible_databases(&user, &[]));
                 let mut names: Vec<String> = is
                     .all_schemas()
                     .into_iter()
@@ -417,16 +414,9 @@ fn column_row(info: &TableInfo, col: &ColumnInfo, full: bool) -> Vec<Datum> {
     };
     // `PRI` for a PRIMARY KEY member, else `UNI` / `MUL` for the first column
     // of a unique / non-unique secondary index (MySQL `Field::Key`).
-    let in_index = |idx: &sealdb_meta::IndexInfo| {
-        idx.columns
-            .first()
-            .is_some_and(|c| c.offset == col.offset)
-    };
-    let key = if info
-        .indices
-        .iter()
-        .any(|idx| idx.primary && in_index(idx))
-    {
+    let in_index =
+        |idx: &sealdb_meta::IndexInfo| idx.columns.first().is_some_and(|c| c.offset == col.offset);
+    let key = if info.indices.iter().any(|idx| idx.primary && in_index(idx)) {
         "PRI"
     } else if info.indices.iter().any(|idx| idx.unique && in_index(idx)) {
         "UNI"
@@ -490,11 +480,17 @@ fn render_create_table(info: &TableInfo) -> String {
         let parts = idx
             .columns
             .iter()
-            .map(|c| match info.columns.iter().find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o())) {
-                // Expression key part: TiDB prints the generating expression
-                // wrapped in an extra paren pair.
-                Some(col) => format!("({})", col.generated_expr.clone().unwrap_or_default()),
-                None => format!("`{}`", c.name.o()),
+            .map(|c| {
+                match info
+                    .columns
+                    .iter()
+                    .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o()))
+                {
+                    // Expression key part: TiDB prints the generating expression
+                    // wrapped in an extra paren pair.
+                    Some(col) => format!("({})", col.generated_expr.clone().unwrap_or_default()),
+                    None => format!("`{}`", c.name.o()),
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");

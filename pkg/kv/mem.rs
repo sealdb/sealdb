@@ -671,7 +671,10 @@ mod tests {
         let mut stale = storage.begin_stale_read(before_update).unwrap();
         assert_eq!(stale.get(b"k").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(stale.get(b"new").unwrap(), None);
-        assert_eq!(stale.scan(b"", b"z").unwrap(), vec![(b"k".to_vec(), b"v1".to_vec())]);
+        assert_eq!(
+            stale.scan(b"", b"z").unwrap(),
+            vec![(b"k".to_vec(), b"v1".to_vec())]
+        );
         stale.commit().unwrap();
 
         // The latest snapshot sees the update.

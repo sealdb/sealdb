@@ -580,31 +580,32 @@ fn collect_tests(
         }
         let rel = path.strip_prefix(t_root).unwrap().with_extension("result");
         let name = rel.with_extension("").to_string_lossy().replace('\\', "/");
-        let (status, wave, owner_hint, skip_tikv, session_init) = if let Some(m) = manifest.get(&name) {
-            (
-                m.status.clone(),
-                m.wave.clone(),
-                m.owner_hint.clone(),
-                m.skip_tikv,
-                m.session_init.clone(),
-            )
-        } else if name.starts_with("local/") {
-            (
-                "local".to_string(),
-                "local".to_string(),
-                "sealdb smoke".to_string(),
-                name == "local/txn",
-                Vec::new(),
-            )
-        } else {
-            (
-                "pending".to_string(),
-                "R7".to_string(),
-                String::new(),
-                false,
-                Vec::new(),
-            )
-        };
+        let (status, wave, owner_hint, skip_tikv, session_init) =
+            if let Some(m) = manifest.get(&name) {
+                (
+                    m.status.clone(),
+                    m.wave.clone(),
+                    m.owner_hint.clone(),
+                    m.skip_tikv,
+                    m.session_init.clone(),
+                )
+            } else if name.starts_with("local/") {
+                (
+                    "local".to_string(),
+                    "local".to_string(),
+                    "sealdb smoke".to_string(),
+                    name == "local/txn",
+                    Vec::new(),
+                )
+            } else {
+                (
+                    "pending".to_string(),
+                    "R7".to_string(),
+                    String::new(),
+                    false,
+                    Vec::new(),
+                )
+            };
         let src = fs::read_to_string(&path)
             .map_err(|e| Error::new(sealdb_errno::ERR_UNKNOWN_ERROR, e.to_string()))?;
         let (steps, load_error) = match parse_test(&src) {
@@ -1115,9 +1116,8 @@ fn normalize_partition_ids(rest: &str) -> String {
 /// the empty catalog a fresh TiDB instance would have.
 fn reset_tikv_schemas(storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
     let session = new_session(storage);
-    let listed = session.execute_stmt(
-        "SELECT SCHEMA_NAME FROM information_schema.schemata ORDER BY SCHEMA_NAME",
-    )?;
+    let listed = session
+        .execute_stmt("SELECT SCHEMA_NAME FROM information_schema.schemata ORDER BY SCHEMA_NAME")?;
     for row in listed.rows {
         let Some(name) = row.first().map(|d| d.display()) else {
             continue;
@@ -1133,7 +1133,8 @@ fn reset_tikv_schemas(storage: Arc<dyn sealdb_kv::Storage>) -> Result<()> {
     Ok(())
 }
 
-fn run_backend(    suites: &[Suite],
+fn run_backend(
+    suites: &[Suite],
     backend: StoreBackend,
     opts: &RunOptions,
     record: bool,

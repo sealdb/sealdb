@@ -17,12 +17,14 @@
 
 use sealdb_meta::model::ColumnInfo;
 use sealdb_parser::ast::dml::{JoinType, SelectStmt};
-use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, ValueExpr};
+use sealdb_parser::ast::expressions::{
+    BinaryOpExpr, ExprNode, FuncCallExpr, FuncCastExpr, ValueExpr,
+};
+use sealdb_types::Datum;
 use sealdb_types::field_type::{
     NOT_NULL_FLAG, TYPE_DECIMAL, TYPE_DOUBLE, TYPE_FLOAT, TYPE_INT24, TYPE_LONG, TYPE_LONG_LONG,
     TYPE_NEW_DECIMAL, TYPE_SHORT, TYPE_TINY,
 };
-use sealdb_types::Datum;
 
 /// Column lookup used by the rewrites below.
 struct Columns<'a> {
@@ -56,11 +58,8 @@ impl Columns<'_> {
     }
 
     fn column(&self, col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> Option<&ColumnInfo> {
-        let is_table_nullable = |name: &str| {
-            self.nullable
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
-        };
+        let is_table_nullable =
+            |name: &str| self.nullable.iter().any(|n| n.eq_ignore_ascii_case(name));
         for table in self.select.join_tables() {
             if let Some(tbl) = col.table.as_deref()
                 && !table.name.eq_ignore_ascii_case(tbl)
@@ -76,9 +75,7 @@ impl Columns<'_> {
             let Some(info) = self.is.table_by_name(schema, table.resolve_name()) else {
                 continue;
             };
-            if is_table_nullable(table.name.as_str())
-                || is_table_nullable(table.resolve_name())
-            {
+            if is_table_nullable(table.name.as_str()) || is_table_nullable(table.resolve_name()) {
                 return None;
             }
             return info
@@ -98,7 +95,11 @@ fn is_integer_type(tp: u8) -> bool {
 }
 
 fn is_number_type(tp: u8) -> bool {
-    is_integer_type(tp) || matches!(tp, TYPE_DOUBLE | TYPE_FLOAT | TYPE_DECIMAL | TYPE_NEW_DECIMAL)
+    is_integer_type(tp)
+        || matches!(
+            tp,
+            TYPE_DOUBLE | TYPE_FLOAT | TYPE_DECIMAL | TYPE_NEW_DECIMAL
+        )
 }
 
 /// TiDB cast target text for the merged `ifnull` type. Only the numeric mixes
@@ -146,7 +147,10 @@ fn rewrite_ifnull(func: &FuncCallExpr, cols: &Columns<'_>) -> Option<ExprNode> {
 }
 
 /// `isnull(<not null col>)` → `0`.
-fn rewrite_isnull(expr: &sealdb_parser::ast::expressions::IsNullExpr, cols: &Columns<'_>) -> Option<ExprNode> {
+fn rewrite_isnull(
+    expr: &sealdb_parser::ast::expressions::IsNullExpr,
+    cols: &Columns<'_>,
+) -> Option<ExprNode> {
     if expr.not {
         return None;
     }
@@ -217,18 +221,19 @@ fn rewrite(expr: &ExprNode, cols: &Columns<'_>, changed: &mut bool) -> ExprNode 
             ci: l.ci,
         }),
         ExprNode::Case(c) => ExprNode::Case(sealdb_parser::ast::expressions::CaseExpr {
-            operand: c.operand.as_ref().map(|e| Box::new(rewrite(e, cols, changed))),
+            operand: c
+                .operand
+                .as_ref()
+                .map(|e| Box::new(rewrite(e, cols, changed))),
             when_then: c
                 .when_then
                 .iter()
-                .map(|(w, t)| {
-                    (
-                        rewrite(w, cols, changed),
-                        rewrite(t, cols, changed),
-                    )
-                })
+                .map(|(w, t)| (rewrite(w, cols, changed), rewrite(t, cols, changed)))
                 .collect(),
-            else_expr: c.else_expr.as_ref().map(|e| Box::new(rewrite(e, cols, changed))),
+            else_expr: c
+                .else_expr
+                .as_ref()
+                .map(|e| Box::new(rewrite(e, cols, changed))),
         }),
         other => other.clone(),
     };

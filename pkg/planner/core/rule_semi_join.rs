@@ -6,8 +6,8 @@
 /// as HashJoin Anti. NOT IN stays Apply.
 use super::physical_plans::{JoinType, PhysicalPlan};
 use sealdb_parser::ast::expressions::{
-    BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, IsNullExpr, QuantifiedCmpExpr,
-    UnaryOpExpr, ValueExpr,
+    BinaryOpExpr, ColumnNameExpr, ExistsExpr, ExprNode, IsNullExpr, QuantifiedCmpExpr, UnaryOpExpr,
+    ValueExpr,
 };
 use sealdb_parser::ast::{SelectStmt, TableName};
 use sealdb_parser::opcode::Op;
@@ -46,8 +46,12 @@ pub fn rewrite_semi_join_ctx(
             } else {
                 rewrite_apply(child, filter, is, current_db, stats)
             }
-        },
-        PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
+        }
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
             filter,
             est_rows,
@@ -143,7 +147,10 @@ pub fn rewrite_semi_join_ctx(
         },
         PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
             op,
-            children: children.into_iter().map(|c| Box::new(rewrite_semi_join_ctx(*c, is, current_db, stats))).collect(),
+            children: children
+                .into_iter()
+                .map(|c| Box::new(rewrite_semi_join_ctx(*c, is, current_db, stats)))
+                .collect(),
         },
         PhysicalPlan::DistinctUnion {
             info,
@@ -169,7 +176,8 @@ pub fn rewrite_semi_join_ctx(
             alias,
             columns,
             seed: Box::new(rewrite_semi_join_ctx(*seed, is, current_db, stats)),
-            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db, stats))),
+            recursive_plan: recursive_plan
+                .map(|p| Box::new(rewrite_semi_join_ctx(*p, is, current_db, stats))),
             inline,
             recursive,
             limit,
@@ -301,7 +309,9 @@ fn try_shaped_apply(outer: &PhysicalPlan, filter: &ExprNode) -> Option<PhysicalP
         ExprNode::QuantifiedCmp(q) if q.all && matches!(q.op, Op::Gt) => {
             quantified_gt_all_apply(outer.clone(), filter.clone(), q)
         }
-        ExprNode::Exists(e) if !e.not => recursive_exists_cte_apply(outer.clone(), filter.clone(), e),
+        ExprNode::Exists(e) if !e.not => {
+            recursive_exists_cte_apply(outer.clone(), filter.clone(), e)
+        }
         _ => None,
     }
 }
@@ -402,7 +412,9 @@ fn build_nonrecursive_all_probe(
         "funcs:max({schema}.{}.{inner_col})->Column#19, funcs:sum(isnull({schema}.{}.{inner_col}))->Column#20, funcs:count(1)->Column#21",
         inner.name, inner.name
     );
-    Some(PhysicalPlan::stream_agg(reader, root_info, cop_info, 10_000.0))
+    Some(PhysicalPlan::stream_agg(
+        reader, root_info, cop_info, 10_000.0,
+    ))
 }
 
 fn build_recursive_all_probe(
@@ -447,9 +459,7 @@ fn build_recursive_all_probe(
         offset: cte.offset,
     };
     // Column ids: correlated-in-recursive uses #23/#24 → #18/#19/#20; else #19/#20 → #14..
-    let (src, max_out, sum_out, cnt_out) = if seed.selection.is_none()
-        && rec.selection.is_some()
-    {
+    let (src, max_out, sum_out, cnt_out) = if seed.selection.is_none() && rec.selection.is_some() {
         (23, 18, 19, 20)
     } else {
         (19, 14, 15, 16)
@@ -515,14 +525,14 @@ fn build_recursive_arm_plan(
             .unwrap_or_else(|| text.clone());
         exprs.push(format!(
             "cast({}, int)->{schema}.{orig_tbl}.{col}",
-            explain_semi_pred(&field.expr).replace(
-                &format!("{cte_name}."),
-                &format!("{schema}.{orig_tbl}."),
-            )
+            explain_semi_pred(&field.expr)
+                .replace(&format!("{cte_name}."), &format!("{schema}.{orig_tbl}."),)
         ));
     }
     if exprs.is_empty() {
-        exprs.push(format!("cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1"));
+        exprs.push(format!(
+            "cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1"
+        ));
     }
     let scan = PhysicalPlan::TableReader {
         table: format!("CTE_0"),
@@ -651,7 +661,9 @@ fn recursive_exists_cte_apply(
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
     let rec_plan = match &cte.recursive {
-        Some((_, rec)) => build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema),
+        Some((_, rec)) => {
+            build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema)
+        }
         None => PhysicalPlan::table_reader("CTE_0", Vec::new()),
     };
     let cte_plan = PhysicalPlan::CTE {
@@ -727,11 +739,7 @@ fn semi_join_explain_info(
         {
             return None;
         }
-        rendered.push(explain_semi_pred_inner(
-            part,
-            inner_alias,
-            inner_physical,
-        ));
+        rendered.push(explain_semi_pred_inner(part, inner_alias, inner_physical));
     }
     if rendered.is_empty() {
         return None;
@@ -820,15 +828,17 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
             // `equal:[eq(explain_easy.t.b, explain_easy.t.b)]`); rewriting the
             // stored predicate instead would mix the physical table name into
             // the executor's alias-keyed ON and break its side resolution.
-            return Some(build_spec(
-                if not { JoinType::Anti } else { JoinType::Semi },
-                inner.name.clone(),
-                inner_filter,
-                on,
-                None,
-                false,
-            )
-            .with_physical(inner.physical.as_deref().unwrap_or(&inner.name)));
+            return Some(
+                build_spec(
+                    if not { JoinType::Anti } else { JoinType::Semi },
+                    inner.name.clone(),
+                    inner_filter,
+                    on,
+                    None,
+                    false,
+                )
+                .with_physical(inner.physical.as_deref().unwrap_or(&inner.name)),
+            );
         }
         // Correlated predicates without a cross-table equality: TiDB
         // decorrelates to a CARTESIAN semi/anti join with `other cond`.
@@ -961,14 +971,10 @@ fn derive_comparison_null_rejects(
         let ExprNode::Binary(bin) = cond else {
             continue;
         };
-        if !matches!(
-            bin.op,
-            Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne
-        ) {
+        if !matches!(bin.op, Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne) {
             continue;
         }
-        let (ExprNode::Column(l), ExprNode::Column(r)) =
-            (bin.left.as_ref(), bin.right.as_ref())
+        let (ExprNode::Column(l), ExprNode::Column(r)) = (bin.left.as_ref(), bin.right.as_ref())
         else {
             continue;
         };
@@ -986,11 +992,7 @@ fn derive_comparison_null_rejects(
     (ExprNode::compose_cnf(inner), ExprNode::compose_cnf(outer))
 }
 
-fn from_exists_cte(
-    not: bool,
-    query: &SelectStmt,
-    outer_table: Option<&str>,
-) -> Option<SemiSpec> {
+fn from_exists_cte(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Option<SemiSpec> {
     let with = query.with.as_ref()?;
     if with.ctes.len() != 1 || with.is_recursive {
         return None;
@@ -1000,9 +1002,7 @@ fn from_exists_cte(
         return None;
     }
     let from = query.from.as_ref()?;
-    if !from
-        .resolve_name()
-        .eq_ignore_ascii_case(&cte.name)
+    if !from.resolve_name().eq_ignore_ascii_case(&cte.name)
         || !query.joins.is_empty()
         || query.selection.is_some()
         || !query.group_by.is_empty()
@@ -1065,7 +1065,9 @@ fn not_isnull_for_eq(on: &ExprNode, table: &str) -> Option<ExprNode> {
     }
     for side in [&bin.left, &bin.right] {
         if let ExprNode::Column(c) = side.as_ref()
-            && c.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(table))
+            && c.table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(table))
         {
             return Some(ExprNode::Unary(UnaryOpExpr {
                 op: Op::Not,
@@ -1504,16 +1506,12 @@ fn not_isnull_cols(exprs: &[ExprNode], table: &str) -> Option<ExprNode> {
     let mut filters = Vec::new();
     for expr in exprs {
         for (t, name) in expr.referenced_columns() {
-            if !t
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(table))
-            {
+            if !t.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(table)) {
                 continue;
             }
-            if seen
-                .iter()
-                .any(|(tn, cn): &(String, String)| tn.eq_ignore_ascii_case(table) && cn.eq_ignore_ascii_case(&name))
-            {
+            if seen.iter().any(|(tn, cn): &(String, String)| {
+                tn.eq_ignore_ascii_case(table) && cn.eq_ignore_ascii_case(&name)
+            }) {
                 continue;
             }
             seen.push((table.to_string(), name.clone()));
@@ -1546,12 +1544,11 @@ fn explain_semi_eq_outer_first(eq: &ExprNode, inner: &str) -> String {
     let ExprNode::Binary(bin) = eq else {
         return explain_semi_pred(eq);
     };
-    let (outer, inn) =
-        if col_table(&bin.left).is_some_and(|t| t.eq_ignore_ascii_case(inner)) {
-            (bin.right.as_ref(), bin.left.as_ref())
-        } else {
-            (bin.left.as_ref(), bin.right.as_ref())
-        };
+    let (outer, inn) = if col_table(&bin.left).is_some_and(|t| t.eq_ignore_ascii_case(inner)) {
+        (bin.right.as_ref(), bin.left.as_ref())
+    } else {
+        (bin.left.as_ref(), bin.right.as_ref())
+    };
     explain_semi_eq(outer, inn, None)
 }
 
@@ -1595,11 +1592,7 @@ fn explain_semi_pred_with(expr: &ExprNode, inner: Option<(&str, &str)>) -> Strin
         // TiDB renders an IN list as `in(col, e1, e2)`.
         ExprNode::InList(list) => {
             let mut parts = vec![explain_semi_pred_with(&list.expr, inner)];
-            parts.extend(
-                list.list
-                    .iter()
-                    .map(|e| explain_semi_pred_with(e, inner)),
-            );
+            parts.extend(list.list.iter().map(|e| explain_semi_pred_with(e, inner)));
             format!(
                 "{}({})",
                 if list.not { "not in" } else { "in" },
@@ -1616,9 +1609,7 @@ fn explain_semi_col(expr: &ExprNode, inner: Option<(&str, &str)>) -> String {
             let alias = c.table.as_deref().unwrap_or("t");
             // TiDB `OrigTblName`: aliases print as the physical table.
             let table = match inner {
-                Some((inner_alias, inner_physical))
-                    if alias.eq_ignore_ascii_case(inner_alias) =>
-                {
+                Some((inner_alias, inner_physical)) if alias.eq_ignore_ascii_case(inner_alias) => {
                     inner_physical.to_string()
                 }
                 _ => crate::core::planbuilder::explain_physical_table(alias)
@@ -1641,9 +1632,7 @@ fn explain_semi_col(expr: &ExprNode, inner: Option<(&str, &str)>) -> String {
         ExprNode::Value(ValueExpr {
             datum: Datum::U64(v),
         }) => v.to_string(),
-        ExprNode::Value(ValueExpr {
-            datum: Datum::Null,
-        }) => "NULL".into(),
+        ExprNode::Value(ValueExpr { datum: Datum::Null }) => "NULL".into(),
         other => other.restore_string(),
     }
 }
@@ -1836,7 +1825,11 @@ pub fn rewrite_semi_join_agg(
             probe: probe.map(|p| Box::new(rewrite_semi_join_agg(*p, is, current_db, stats))),
             info,
         },
-        PhysicalPlan::Selection { child, filter, est_rows } => PhysicalPlan::Selection {
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
             child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
             filter,
             est_rows,
@@ -1944,7 +1937,8 @@ pub fn rewrite_semi_join_agg(
             alias,
             columns,
             seed: Box::new(rewrite_semi_join_agg(*seed, is, current_db, stats)),
-            recursive_plan: recursive_plan.map(|p| Box::new(rewrite_semi_join_agg(*p, is, current_db, stats))),
+            recursive_plan: recursive_plan
+                .map(|p| Box::new(rewrite_semi_join_agg(*p, is, current_db, stats))),
             inline,
             recursive,
             limit,

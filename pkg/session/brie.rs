@@ -398,9 +398,7 @@ fn datum_to_json(d: &Datum) -> serde_json::Value {
         }
         Datum::Decimal(v) => serde_json::Value::String(v.to_string()),
         Datum::Time(v) => serde_json::Value::String(format!("{v:?}")),
-        Datum::Enum(v) => {
-            serde_json::Value::String(String::from_utf8_lossy(&v.label).into_owned())
-        }
+        Datum::Enum(v) => serde_json::Value::String(String::from_utf8_lossy(&v.label).into_owned()),
     }
 }
 

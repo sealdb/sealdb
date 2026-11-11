@@ -231,7 +231,9 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::InfoSchema {
-                table, ranges: pushed_ranges, ..
+                table,
+                ranges: pushed_ranges,
+                ..
             } => {
                 let (columns, rows) =
                     sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
@@ -461,11 +463,8 @@ impl ExecutorBuilder {
                     tuples
                         .into_iter()
                         .map(|tuple| {
-                            let known: Vec<(String, sealdb_types::Datum)> = names
-                                .iter()
-                                .cloned()
-                                .zip(tuple.iter().cloned())
-                                .collect();
+                            let known: Vec<(String, sealdb_types::Datum)> =
+                                names.iter().cloned().zip(tuple.iter().cloned()).collect();
                             key_values(&known)
                         })
                         .collect::<Option<Vec<_>>>()
@@ -657,8 +656,8 @@ impl ExecutorBuilder {
                 // (`ROW_NUMBER() OVER ()->Column#1`) over TableDual. The Window
                 // executor evaluates the window functions itself, so that
                 // projection must not try to evaluate them.
-                let child_plan = strip_dual_window_projection(child)
-                    .unwrap_or_else(|| (**child).clone());
+                let child_plan =
+                    strip_dual_window_projection(child).unwrap_or_else(|| (**child).clone());
                 Ok(Box::new(WindowExec::new(
                     select,
                     Self::build(&child_plan, stmt, domain, current_db, txn)?,
@@ -989,11 +988,7 @@ impl ExecutorBuilder {
                 right,
                 PhysicalPlan::HashAgg { info, .. } if dedup_from_agg_info(info).is_some()
             );
-        let exec_tp = if in_rewrite {
-            JoinType::Semi
-        } else {
-            tp
-        };
+        let exec_tp = if in_rewrite { JoinType::Semi } else { tp };
         let join = sealdb_parser::ast::Join {
             left: sealdb_parser::ast::TableName::new(None, left_table.to_string()),
             right: sealdb_parser::ast::TableName::new(None, right_table.to_string()),
@@ -1395,7 +1390,10 @@ fn index_lookup_values(
     // listed value, like TiDB's `detachCondAndBuildRangeForIndex`.
     for part in &index.columns {
         let key = sealdb_planner::core::expr_index::part_key(&info, part);
-        if known.iter().any(|(name, _)| name.eq_ignore_ascii_case(&key)) {
+        if known
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&key))
+        {
             continue;
         }
         if let Some(value) = selection
@@ -1504,11 +1502,7 @@ fn index_access(
                     low: range.low.iter().map(|(value, _)| value.clone()).collect(),
                     low_inclusive: range.low_open
                         || range.low.last().is_none_or(|(_, inclusive)| *inclusive),
-                    high: range
-                        .high
-                        .iter()
-                        .map(|(value, _)| value.clone())
-                        .collect(),
+                    high: range.high.iter().map(|(value, _)| value.clone()).collect(),
                     high_inclusive: range.high_open
                         || range.high.last().is_none_or(|(_, inclusive)| *inclusive),
                 })
@@ -2066,14 +2060,9 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
 fn stmt_owns_agg_info(select: &SelectStmt, dedup: &DedupAgg) -> bool {
     select.group_by.len() == dedup.keys.len()
         && select.group_by.iter().zip(&dedup.keys).all(|(item, key)| {
-            let text = item
-                .restore_string()
-                .to_ascii_lowercase()
-                .replace('`', "");
+            let text = item.restore_string().to_ascii_lowercase().replace('`', "");
             let key = key.to_ascii_lowercase();
-            text == key
-                || key.ends_with(&format!(".{text}"))
-                || text.ends_with(&format!(".{key}"))
+            text == key || key.ends_with(&format!(".{text}")) || text.ends_with(&format!(".{key}"))
         })
 }
 
@@ -2102,10 +2091,7 @@ fn dedup_from_agg_info(info: &str) -> Option<DedupAgg> {
     for func in func_part.split(", funcs:") {
         let inner = func.strip_prefix("firstrow(")?;
         let (arg, out) = inner.split_once(")->")?;
-        let key = keys
-            .iter()
-            .find(|k| k.eq_ignore_ascii_case(arg))
-            .copied()?;
+        let key = keys.iter().find(|k| k.eq_ignore_ascii_case(arg)).copied()?;
         names.push((key, out));
     }
     if names.len() != keys.len() {
@@ -2125,9 +2111,7 @@ fn dedup_from_agg_info(info: &str) -> Option<DedupAgg> {
 
 /// `dbg.m2.b` → `ColumnNameExpr { table: Some("m2"), name: "b" }` (the schema
 /// prefix only labels the column; resolution is by table + column name).
-fn parse_qualified_column(
-    text: &str,
-) -> Option<sealdb_parser::ast::expressions::ColumnNameExpr> {
+fn parse_qualified_column(text: &str) -> Option<sealdb_parser::ast::expressions::ColumnNameExpr> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;

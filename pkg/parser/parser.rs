@@ -751,7 +751,10 @@ mod tests {
         }
         // `EXPLAIN <statement>` must stay an EXPLAIN, not `DESC tbl col`.
         assert_eq!(
-            parser.parse_one_stmt("explain select 1").unwrap().stmt_type(),
+            parser
+                .parse_one_stmt("explain select 1")
+                .unwrap()
+                .stmt_type(),
             "ExplainStmt"
         );
         match parser.parse_one_stmt("SHOW CREATE TABLE db1.t").unwrap() {
@@ -1615,7 +1618,11 @@ mod tests {
             .as_ref()
             .unwrap()
             .1;
-        assert_eq!(lim_rec.limit, Some(10), "paren LIMIT must survive set-op lower");
+        assert_eq!(
+            lim_rec.limit,
+            Some(10),
+            "paren LIMIT must survive set-op lower"
+        );
         let exists = parser
             .parse_one_stmt(
                 "SELECT * FROM t dt WHERE EXISTS (WITH RECURSIVE qn AS (SELECT 1 AS b UNION ALL SELECT b+1 FROM qn WHERE b=0) SELECT * FROM qn WHERE b=1)",
@@ -1702,10 +1709,7 @@ mod tests {
         let joined_sel = joined.as_select().unwrap();
         assert_eq!(joined_sel.joins.len(), 1);
         assert_eq!(joined_sel.joins[0].right.name, "d");
-        assert_eq!(
-            joined_sel.with.as_ref().unwrap().ctes[0].name,
-            "d"
-        );
+        assert_eq!(joined_sel.with.as_ref().unwrap().ctes[0].name, "d");
     }
 
     #[test]
@@ -2131,7 +2135,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod timestamp_lit_parse {
     use super::*;
@@ -2193,8 +2196,12 @@ mod orig_text_timestamp {
             .unwrap();
         let f = &stmt.as_select().unwrap().fields[0];
         eprintln!("orig={:?}", f.orig_text);
-        assert!(f.orig_text.as_ref().unwrap().to_ascii_lowercase().contains("timestamp"));
+        assert!(
+            f.orig_text
+                .as_ref()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("timestamp")
+        );
     }
 }
-
-

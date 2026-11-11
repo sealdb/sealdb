@@ -53,7 +53,11 @@ pub(crate) fn insert_fk_children(
         return Vec::new();
     };
     let provided: Vec<String> = if insert.columns.is_empty() {
-        target.columns.iter().map(|c| c.name.o().to_string()).collect()
+        target
+            .columns
+            .iter()
+            .map(|c| c.name.o().to_string())
+            .collect()
     } else {
         insert.columns.clone()
     };
@@ -63,7 +67,12 @@ pub(crate) fn insert_fk_children(
             continue;
         }
         if let Some(node) = check_exist_node(is, current_db, target, fk) {
-            checks.push((fk.ref_table.clone(), target.name.o().to_string(), order, node));
+            checks.push((
+                fk.ref_table.clone(),
+                target.name.o().to_string(),
+                order,
+                node,
+            ));
         }
     }
     // `ON DUPLICATE KEY UPDATE` rewrites columns of an existing row: the same
@@ -79,7 +88,12 @@ pub(crate) fn insert_fk_children(
                 continue;
             }
             if let Some(node) = check_exist_node(is, current_db, target, fk) {
-                checks.push((fk.ref_table.clone(), target.name.o().to_string(), order, node));
+                checks.push((
+                    fk.ref_table.clone(),
+                    target.name.o().to_string(),
+                    order,
+                    node,
+                ));
             }
         }
     }
@@ -116,7 +130,12 @@ pub(crate) fn update_fk_children(
                 continue;
             }
             if let Some(node) = check_exist_node(is, current_db, table, fk) {
-                checks.push((fk.ref_table.clone(), table.name.o().to_string(), order, node));
+                checks.push((
+                    fk.ref_table.clone(),
+                    table.name.o().to_string(),
+                    order,
+                    node,
+                ));
             }
         }
         collect_child_fks_update(is, current_db, table, &updated, &mut checks, &mut cascades);
@@ -145,13 +164,8 @@ pub(crate) fn delete_fk_children(
     };
     for table in targets {
         // Every referenced key row disappears, so every child FK is affected.
-        let (child_checks, child_cascades) = split_by_action(collect_child_fks(
-            is,
-            current_db,
-            table,
-            &[],
-            false,
-        ));
+        let (child_checks, child_cascades) =
+            split_by_action(collect_child_fks(is, current_db, table, &[], false));
         checks.extend(child_checks);
         cascades.extend(child_cascades);
     }

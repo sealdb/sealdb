@@ -381,7 +381,11 @@ pub fn explain_dot(plan: &PhysicalPlan) -> String {
     let mut cross = Vec::new();
     dot_collect_cross(&root, &mut cross);
     for (from, to) in cross {
-        out.push_str(&format!("\"{}\" -> \"{}\"\n", ids.label(from), ids.label(to)));
+        out.push_str(&format!(
+            "\"{}\" -> \"{}\"\n",
+            ids.label(from),
+            ids.label(to)
+        ));
     }
     out.push_str("}\n");
     out
@@ -606,7 +610,9 @@ impl DotIds {
     fn dot_leaf(&mut self, plan: &PhysicalPlan, lead: u32) -> DotLeaf {
         self.skip(lead);
         let (scan_name, reader_name, has_filter) = match plan {
-            PhysicalPlan::TableReader { range_scan, pushed, .. } => (
+            PhysicalPlan::TableReader {
+                range_scan, pushed, ..
+            } => (
                 if range_scan.is_some() {
                     "TableRangeScan"
                 } else {
@@ -615,7 +621,9 @@ impl DotIds {
                 "TableReader",
                 pushed.is_some(),
             ),
-            PhysicalPlan::IndexReader { range_scan, pushed, .. } => (
+            PhysicalPlan::IndexReader {
+                range_scan, pushed, ..
+            } => (
                 if range_scan.is_some() {
                     "IndexRangeScan"
                 } else {
@@ -959,7 +967,11 @@ fn walk_with_parent(
         // HashJoin / MergeJoin: children_of lists right(Build) then left(Probe).
         // A RIGHT JOIN is executed with the left, null-supplying side as build.
         Some(PhysicalPlan::HashJoin {
-            left, right, tp, on, ..
+            left,
+            right,
+            tp,
+            on,
+            ..
         }) => {
             // Build is the hashed input. A LEFT JOIN normally hashes the right
             // (null-supplying) side; when that side is an unanalyzed pseudo
@@ -2196,8 +2208,7 @@ fn emit_cop_children(
                     );
                     range_depth += 1;
                 }
-                let range_est =
-                    shape.scan_rows.unwrap_or(est_rows(plan)) * apply_factor.max(1.0);
+                let range_est = shape.scan_rows.unwrap_or(est_rows(plan)) * apply_factor.max(1.0);
                 push_explain_row_spine(
                     rows,
                     range_depth,
@@ -2704,10 +2715,11 @@ fn emit_cop_children(
             // Planner-built access range: predicates on the index prefix became
             // `range:…`; leftovers stay a cop Selection above the scan.
             if let Some(range) = range_scan {
+                let order = if range.keep_order { "true" } else { "false" };
                 let mut keep = if range.pseudo {
-                    format!("range:{}, keep order:false, stats:pseudo", range.text)
+                    format!("range:{}, keep order:{order}, stats:pseudo", range.text)
                 } else {
-                    format!("range:{}, keep order:false", range.text)
+                    format!("range:{}, keep order:{order}", range.text)
                 };
                 if let Some(missing) = &range.partial {
                     keep.push_str(", stats:partial[");
@@ -2721,6 +2733,14 @@ fn emit_cop_children(
                     scan_spine.push(false);
                 }
                 if let Some(filter) = pushed.as_ref() {
+                    // The reader's own cardinality is what the range plus its
+                    // residual cop Selection keeps; the scan below reports the
+                    // range's cardinality (`filter_rows` falls back to it).
+                    let sel_est = if range.filter_rows > 0.0 {
+                        range.filter_rows
+                    } else {
+                        *row_count
+                    };
                     push_explain_row_spine(
                         rows,
                         scan_depth,
@@ -2728,7 +2748,7 @@ fn emit_cop_children(
                         next_id,
                         CopRow {
                             name: "Selection",
-                            est: *row_count,
+                            est: sel_est,
                             task: "cop[tikv]",
                             access: String::new(),
                             info: explain_pushed_filter(table, filter),
@@ -2943,10 +2963,11 @@ fn emit_cop_children(
             // the table probe filters the rest.
             if let Some(range) = range_scan {
                 let task = "cop[tikv]";
+                let order = if range.keep_order { "true" } else { "false" };
                 let mut keep = if range.pseudo {
-                    format!("range:{}, keep order:false, stats:pseudo", range.text)
+                    format!("range:{}, keep order:{order}, stats:pseudo", range.text)
                 } else {
-                    format!("range:{}, keep order:false", range.text)
+                    format!("range:{}, keep order:{order}", range.text)
                 };
                 // The index histogram covers a key column the table statistics
                 // do not carry, so both sides of the lookup read partial stats.
@@ -3170,9 +3191,7 @@ fn emit_cop_children(
                             est: *row_count,
                             task,
                             access: idx_access.clone(),
-                            info: format!(
-                                "range: {range_info}, keep order:true, stats:pseudo"
-                            ),
+                            info: format!("range: {range_info}, keep order:true, stats:pseudo"),
                         },
                         &child_spine,
                     );
@@ -4132,7 +4151,8 @@ fn probe_limit_marker(probe_selection_info: &str) -> Option<(u64, u64, &str)> {
     Some((offset.parse().ok()?, count.parse().ok()?, sel))
 }
 
-fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
+fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String> {
+    use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
     match pushed? {
         ExprNode::Value(ValueExpr {
@@ -4534,7 +4554,11 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         // smaller — the preserved 4-row spine over a 9990-row pseudo probe, or
         // a 2-row build subtree over a 4-row preserved side.
         PhysicalPlan::HashJoin {
-            left, right, tp, on, ..
+            left,
+            right,
+            tp,
+            on,
+            ..
         } => {
             if matches!(tp, JoinType::RightOuter) {
                 if est_rows(right) < est_rows(left) {
@@ -5018,6 +5042,10 @@ fn prange_min_high(a: PRangeHigh, b: PRangeHigh) -> PRangeHigh {
 fn prange_empty(r: &PRange) -> bool {
     match (r.0, r.1) {
         (PRangeLow::Val(a), PRangeHigh::Val(b)) => a > b,
+        // A `NULL` upper bound sits below every non-NULL lower bound, so
+        // `isnull(c) AND not(isnull(c))` intersects to an empty range.
+        (PRangeLow::MinNotNull, PRangeHigh::Null) => true,
+        (PRangeLow::Val(_), PRangeHigh::Null) => true,
         _ => false,
     }
 }
@@ -5147,6 +5175,9 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
     let null_count = row_count / 1000.0;
     match (r.0, r.1) {
         (PRangeLow::Null, PRangeHigh::MaxValue) => row_count,
+        // `c IS NULL` is a point range on the single NULL value: TiDB's
+        // `getPseudoRowCountByColumnRanges` charges the `1/1000` equal rate.
+        (PRangeLow::Null, PRangeHigh::Null) => null_count,
         (PRangeLow::MinNotNull, PRangeHigh::MaxValue) => row_count - null_count,
         (PRangeLow::MinNotNull, PRangeHigh::Val(_)) => (row_count / 3.0 - null_count).max(0.0),
         (_, PRangeHigh::MaxValue) => row_count / 3.0,
@@ -5159,10 +5190,7 @@ fn prange_count(row_count: f64, r: &PRange) -> f64 {
 /// constant is not an integer (strings, temporal, decimal) — `pseudo_range_est`
 /// only carries integer bounds, so those predicates would otherwise fall back
 /// to the generic 0.8 `selectionFactor` (`name > 'a'` → 3333.33, not 8000).
-fn datum_range_est(
-    conjuncts: &[sealdb_parser::ast::ExprNode],
-    row_count: f64,
-) -> Option<f64> {
+fn datum_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
     let [conjunct] = conjuncts else {
         return None;
     };
@@ -5320,18 +5348,15 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             // TiDB sizes the residual Selection of a handle point get from the
             // point get's one row (unanalyzed tables: `RealtimeCount == 0`
             // short-circuits selectivity to 1.0).
-            if matches!(
-                child.as_ref(),
-                PhysicalPlan::PointGet { index: None, .. }
-            ) {
+            if matches!(child.as_ref(), PhysicalPlan::PointGet { index: None, .. }) {
                 return est_rows(child);
             }
             // Memory tables expose no statistics, so TiDB applies the default
             // 0.8 `selectionFactor` (`isnull(digest)` over 10000 → 8000).
             if matches!(child.as_ref(), PhysicalPlan::InfoSchema { .. })
-                && filter.split_cnf().iter().any(|c| {
-                    matches!(c, sealdb_parser::ast::expressions::ExprNode::IsNull(i) if !i.not)
-                })
+                && filter.split_cnf().iter().any(
+                    |c| matches!(c, sealdb_parser::ast::expressions::ExprNode::IsNull(i) if !i.not),
+                )
             {
                 return est_rows(child) * 0.8;
             }
@@ -5375,9 +5400,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 }
             } else if let Some(est) = pseudo_range_est(&filter.split_cnf(), est_rows(child)) {
                 est
-            } else if let Some(est) =
-                datum_range_est(&filter.split_cnf(), est_rows(child))
-            {
+            } else if let Some(est) = datum_range_est(&filter.split_cnf(), est_rows(child)) {
                 // Non-integer bounds (strings, temporal, decimal) keep TiDB's
                 // pseudo `1/3` column-range rate instead of the generic 0.8.
                 est.clamp(0.0, est_rows(child))

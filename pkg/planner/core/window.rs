@@ -5,10 +5,10 @@
 use super::physical_plans::PhysicalPlan;
 use sealdb_expression::window_concurrency;
 use sealdb_infoschema::InfoSchema;
+use sealdb_parser::ast::SelectStmt;
 use sealdb_parser::ast::expressions::{
     ExprNode, WindowFrameBound, WindowFrameUnits, WindowFuncExpr,
 };
-use sealdb_parser::ast::SelectStmt;
 use sealdb_parser::opcode::Op;
 use sealdb_statistics::Handle;
 
@@ -20,11 +20,7 @@ pub fn build_window_plan(
     current_db: &str,
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
-    let table = select
-        .from
-        .as_ref()
-        .map(|t| t.name.as_str())
-        .unwrap_or("t");
+    let table = select.from.as_ref().map(|t| t.name.as_str()).unwrap_or("t");
     let schema = if current_db.is_empty() {
         "select".to_string()
     } else {
@@ -76,9 +72,7 @@ pub fn build_window_plan(
 
     let body = if needs_sort && use_shuffle {
         PhysicalPlan::Shuffle {
-            info: format!(
-                "execution info: concurrency:{concurrency}, data sources:[TableReader]"
-            ),
+            info: format!("execution info: concurrency:{concurrency}, data sources:[TableReader]"),
             child: Box::new(window),
         }
     } else {
@@ -217,8 +211,7 @@ fn apply_window_outer_order(
     current_db: &str,
     stats: Option<&Handle>,
 ) -> PhysicalPlan {
-    let ordered = !select.order_by.is_empty()
-        && !window_order_covers(win, select, schema, table);
+    let ordered = !select.order_by.is_empty() && !window_order_covers(win, select, schema, table);
     let limit = select.limit;
     let offset = select.offset;
     if ordered {
@@ -368,9 +361,7 @@ fn maybe_index_for_window(
     current_db: &str,
 ) -> PhysicalPlan {
     let PhysicalPlan::TableReader {
-        table,
-        partitions,
-        ..
+        table, partitions, ..
     } = &child
     else {
         return child;
@@ -440,7 +431,11 @@ fn index_reader(
     partitions: &Vec<i64>,
     index: &sealdb_meta::model::IndexInfo,
 ) -> PhysicalPlan {
-    let index_columns: Vec<String> = index.columns.iter().map(|c| c.name.o().to_string()).collect();
+    let index_columns: Vec<String> = index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
     PhysicalPlan::IndexReader {
         table: table.to_string(),
         index: index.name.o().to_string(),
@@ -515,9 +510,7 @@ fn partition_ndv(
     ndv.min(table.count.max(1))
 }
 
-fn extract_window_outer(
-    expr: &ExprNode,
-) -> (Option<&WindowFuncExpr>, Option<(Op, &ExprNode)>) {
+fn extract_window_outer(expr: &ExprNode) -> (Option<&WindowFuncExpr>, Option<(Op, &ExprNode)>) {
     match expr {
         ExprNode::Window(w) => (Some(w), None),
         ExprNode::Binary(bin) => {

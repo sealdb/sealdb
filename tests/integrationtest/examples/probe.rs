@@ -9,9 +9,7 @@ use sealdb_session::Session;
 fn main() {
     let cfg = Config::default().with_store_name(Some("memory")).unwrap();
     let storage = sealdb_store::open(&cfg).unwrap();
-    let domain = Arc::new(
-        Domain::with_storage_id_base(storage, 12345).expect("domain meta load"),
-    );
+    let domain = Arc::new(Domain::with_storage_id_base(storage, 12345).expect("domain meta load"));
     let session = Session::with_domain(domain);
     let _ = session.execute_stmt("DROP DATABASE IF EXISTS `probe`");
     let _ = session.execute_stmt("CREATE DATABASE IF NOT EXISTS `probe`");

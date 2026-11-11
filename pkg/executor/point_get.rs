@@ -116,13 +116,7 @@ impl Executor for PointGetExec {
                 .ok_or_else(|| Error::unsupported("index point get without lookup"))?;
             self.txn.with_txn(|txn| {
                 for physical_id in scan_ids.iter().copied() {
-                    let key = encode_index_key(
-                        physical_id,
-                        index.id,
-                        &lookup,
-                        0,
-                        true,
-                    );
+                    let key = encode_index_key(physical_id, index.id, &lookup, 0, true);
                     let raw = txn.get_locked(key.as_bytes(), self.lock, self.wait)?;
                     if let Some(raw) = raw {
                         return decode_handle_from_row_key(&raw).map(Some);

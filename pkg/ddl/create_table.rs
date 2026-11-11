@@ -7,13 +7,13 @@ use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
 use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
-use std::collections::HashMap;
 use sealdb_types::field_type::{
     FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
-    TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG, TYPE_MEDIUM_BLOB,
-    TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP, TYPE_TINY, TYPE_TINY_BLOB,
-    TYPE_VAR_STRING, TYPE_YEAR,
+    TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG,
+    TYPE_MEDIUM_BLOB, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_STRING, TYPE_TIMESTAMP,
+    TYPE_TINY, TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_YEAR,
 };
+use std::collections::HashMap;
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
     if stmt.cols.is_empty() {
@@ -244,7 +244,12 @@ fn columns_from_select_scoped(
         }
         let name = field_column_name(field, i);
         let type_name = type_name_from_expr(&field.expr, &sources)?;
-        push_select_column(&mut cols, &name, type_name, expr_is_not_null_constant(&field.expr))?;
+        push_select_column(
+            &mut cols,
+            &name,
+            type_name,
+            expr_is_not_null_constant(&field.expr),
+        )?;
     }
     if cols.is_empty() {
         return Err(Error::unsupported("CREATE TABLE AS SELECT without columns"));
@@ -264,9 +269,7 @@ fn expr_is_not_null_constant(expr: &ExprNode) -> bool {
         ExprNode::Binary(b) => {
             expr_is_not_null_constant(&b.left) && expr_is_not_null_constant(&b.right)
         }
-        ExprNode::Func(f) => {
-            !f.args.is_empty() && f.args.iter().all(expr_is_not_null_constant)
-        }
+        ExprNode::Func(f) => !f.args.is_empty() && f.args.iter().all(expr_is_not_null_constant),
         _ => false,
     }
 }

@@ -145,49 +145,48 @@ pub fn index_key_ranges_rows(
     key_len: usize,
     unique: bool,
 ) -> f64 {
-    let mut rows: f64 = 0.0;
-    for range in ranges {
-        if table_rows == 0.0 {
-            continue;
-        }
-        let prefix = range.prefix_equal_len(key_len);
-        // A range over every key part is one row on a unique index.
-        if unique && prefix >= key_len && !range.low_exclusive() && !range.high_exclusive() {
-            rows += 1.0;
-            continue;
-        }
-        // The estimate comes from the first part the range does not pin, or —
-        // for a range that only pins equality parts — from the last pinned one.
-        let extends = range.low.len() > prefix || range.high.len() > prefix;
-        let (offset, low, high) = if extends {
-            (prefix, range.low.get(prefix), range.high.get(prefix))
-        } else {
-            let last = prefix.saturating_sub(1);
-            (last, range.low.get(last), range.high.get(last))
-        };
-        let mut count = column_range_rows(table_rows, low, high);
-        if !unique {
-            // One `1/100` per pinned part before the estimated one; a range
-            // that stops at the equality prefix keeps the `1/1000` rate only.
-            let divisions = if extends {
-                offset
-            } else {
-                offset.saturating_sub(1)
-            };
-            for _ in 0..divisions.min(key_len.saturating_sub(1)) {
-                count /= 100.0;
-            }
-        }
-        if count > table_rows {
-            count = table_rows / PSEUDO_LESS_RATE;
-        }
-        rows += count;
+    if table_rows == 0.0 {
+        return 0.0;
     }
-    rows.min(table_rows)
+    // TiDB passes `colsLen = -1` for non-unique indexes, so a point range on a
+    // non-unique index still narrows by its equal prefix (`1/1000` for the last
+    // pinned part plus `1/100` for every part before it).
+    let cols_len: isize = if unique { key_len as isize } else { -1 };
+    let mut total: f64 = 0.0;
+    for range in ranges {
+        let mut i = range.prefix_equal_len(key_len) as isize;
+        if i == cols_len && !range.low_exclusive() && !range.high_exclusive() {
+            total += 1.0;
+            continue;
+        }
+        // The estimate comes from the first part the range does not pin, or
+        // from the last part when the range only consists of pinned parts.
+        if i >= range.low.len() as isize {
+            i = range.low.len() as isize - 1;
+        }
+        let index = i.max(0) as usize;
+        let mut count = column_range_rows(table_rows, range.low.get(index), range.high.get(index));
+        if count > table_rows {
+            count = table_rows;
+        }
+        // One `1/100` per pinned part before the estimated one.
+        for _ in 0..i.max(0) {
+            count /= 100.0;
+        }
+        total += count;
+    }
+    if total > table_rows {
+        total = table_rows / PSEUDO_LESS_RATE;
+    }
+    total
 }
 
 /// TiDB `getPseudoRowCountByColumnRanges` for a single column range.
-pub fn column_range_rows(table_rows: f64, low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> f64 {
+pub fn column_range_rows(
+    table_rows: f64,
+    low: Option<&(Datum, bool)>,
+    high: Option<&(Datum, bool)>,
+) -> f64 {
     let mut rows = match (low, high) {
         // `(MinNotNull, MaxValue)` — every non-NULL row.
         (None, None) => table_rows - table_rows / PSEUDO_EQUAL_RATE,
@@ -427,17 +426,11 @@ pub fn index_ranges_rows(
 /// `[1,1]`, `(3,+inf]`.
 pub fn range_text(low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> String {
     let (low_text, low_bracket) = match low {
-        Some((value, inclusive)) => (
-            format_datum(value),
-            if *inclusive { "[" } else { "(" },
-        ),
+        Some((value, inclusive)) => (format_datum(value), if *inclusive { "[" } else { "(" }),
         None => ("-inf".to_string(), "["),
     };
     let (high_text, high_bracket) = match high {
-        Some((value, inclusive)) => (
-            format_datum(value),
-            if *inclusive { "]" } else { ")" },
-        ),
+        Some((value, inclusive)) => (format_datum(value), if *inclusive { "]" } else { ")" }),
         None => ("+inf".to_string(), "]"),
     };
     format!("{low_bracket}{low_text},{high_text}{high_bracket}")
@@ -447,8 +440,87 @@ pub fn range_text(low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> 
 /// temporal values in their canonical text form.
 pub fn format_datum(value: &Datum) -> String {
     match value {
-        Datum::Bytes(bytes) => format!("\"{}\"", String::from_utf8_lossy(bytes)),
+        Datum::Bytes(bytes) | Datum::Bit(bytes) => quote_go_string(bytes),
         other => other.display(),
+    }
+}
+
+/// Quote a byte string the way TiDB does when printing range bounds.
+///
+/// TiDB renders datum bounds with Go's `strconv.Quote`: printable ASCII and
+/// printable UTF-8 characters are kept verbatim, common control characters use
+/// their short escape (`\t`, `\n`, ...), and any byte that is not part of a
+/// valid printable UTF-8 sequence is emitted as a `\xNN` hex escape.
+fn quote_go_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'"' => {
+                out.push_str("\\\"");
+                index += 1;
+            }
+            b'\\' => {
+                out.push_str("\\\\");
+                index += 1;
+            }
+            b'\t' => {
+                out.push_str("\\t");
+                index += 1;
+            }
+            b'\n' => {
+                out.push_str("\\n");
+                index += 1;
+            }
+            b'\r' => {
+                out.push_str("\\r");
+                index += 1;
+            }
+            0x20..=0x7e => {
+                out.push(byte as char);
+                index += 1;
+            }
+            _ => match leading_utf8_char(&bytes[index..]) {
+                Some((ch, len)) if ch.is_control() && (ch as u32) < 0x80 => {
+                    // Go's `strconv.Quote` keeps ASCII control bytes in the
+                    // `\xNN` form and only switches to `\u` above U+007F.
+                    out.push_str(&format!("\\x{:02x}", ch as u32));
+                    index += len;
+                }
+                Some((ch, len)) if ch.is_control() => {
+                    out.push_str(&format!("\\u{:04x}", ch as u32));
+                    index += len;
+                }
+                Some((ch, len)) => {
+                    out.push(ch);
+                    index += len;
+                }
+                None => {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                    index += 1;
+                }
+            },
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Decode the first UTF-8 character of `bytes` without scanning past it.
+fn leading_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let window = &bytes[..bytes.len().min(4)];
+    match std::str::from_utf8(window) {
+        Ok(text) => text.chars().next().map(|ch| (ch, ch.len_utf8())),
+        Err(err) => {
+            let valid = &window[..err.valid_up_to()];
+            if valid.is_empty() {
+                return None;
+            }
+            let ch = std::str::from_utf8(valid).ok()?.chars().next()?;
+            Some((ch, ch.len_utf8()))
+        }
     }
 }
 
@@ -490,7 +562,10 @@ pub fn merge_bounds(target: &mut Bounds, other: &Bounds) {
     target.1 = tighter_high(target.1.take(), other.1.clone());
 }
 
-fn tighter_low(current: Option<(Datum, bool)>, other: Option<(Datum, bool)>) -> Option<(Datum, bool)> {
+fn tighter_low(
+    current: Option<(Datum, bool)>,
+    other: Option<(Datum, bool)>,
+) -> Option<(Datum, bool)> {
     match (current, other) {
         (None, other) => other,
         (current, None) => current,
@@ -502,7 +577,10 @@ fn tighter_low(current: Option<(Datum, bool)>, other: Option<(Datum, bool)>) -> 
     }
 }
 
-fn tighter_high(current: Option<(Datum, bool)>, other: Option<(Datum, bool)>) -> Option<(Datum, bool)> {
+fn tighter_high(
+    current: Option<(Datum, bool)>,
+    other: Option<(Datum, bool)>,
+) -> Option<(Datum, bool)> {
     match (current, other) {
         (None, other) => other,
         (current, None) => current,
@@ -741,19 +819,17 @@ mod tests {
         ];
         let sel = selectivity(&conds, 10_000.0, Some("a")).expect("modeled");
         // TiDB reports 10.988001 rows for this filter list.
-        assert!((sel * 10_000.0 - 10.988_001).abs() < 1e-5, "{}", sel * 10_000.0);
+        assert!(
+            (sel * 10_000.0 - 10.988_001).abs() < 1e-5,
+            "{}",
+            sel * 10_000.0
+        );
     }
 
     #[test]
     fn test_index_range_text() {
-        assert_eq!(
-            range_text(None, Some(&(int(3), false))),
-            "[-inf,3)"
-        );
-        assert_eq!(
-            range_text(Some(&(int(3), false)), None),
-            "(3,+inf]"
-        );
+        assert_eq!(range_text(None, Some(&(int(3), false))), "[-inf,3)");
+        assert_eq!(range_text(Some(&(int(3), false)), None), "(3,+inf]");
         assert_eq!(
             range_text(Some(&(int(1), true)), Some(&(int(1), true))),
             "[1,1]"
