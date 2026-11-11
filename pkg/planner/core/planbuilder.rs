@@ -9499,6 +9499,55 @@ pub(crate) fn stats_filter_selectivity(
 /// TiDB `cardinality.Selectivity` for a table-scan cop filter over analyzed
 /// statistics: each column contributes `range_rows / count` and every
 /// predicate the ranger cannot bound keeps the `selectionFactor` (0.8).
+/// Rows a bounded predicate reads on one column.
+///
+/// TiDB derives the access ranges from an index path when the predicate's
+/// column is covered by a full-column leading index, and reads the row count
+/// from *that* index's histogram. The two histograms can disagree by a row at
+/// the top of the range (a column histogram counts the last value's repeats,
+/// the index histogram ends one key earlier), so the index estimate wins when
+/// it applies.
+fn column_rows_estimate(
+    table_stats: &super::access_range::TableStats,
+    info: &sealdb_meta::TableInfo,
+    column: &str,
+    bounds: &[sealdb_statistics::pseudo::Bounds],
+) -> Option<f64> {
+    let column_info = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(column))?;
+    let ranges: Vec<_> = bounds
+        .iter()
+        .map(|(low, high)| sealdb_statistics::range_est::StatsRange {
+            low: low.clone(),
+            high: high.clone(),
+        })
+        .collect();
+    let index_rows = info
+        .indices
+        .iter()
+        .filter(|index| !index.invisible)
+        .find(|index| {
+            index.columns.len() == 1
+                && index.columns[0].length < 0
+                && index.columns[0]
+                    .name
+                    .o()
+                    .eq_ignore_ascii_case(column_info.name.o())
+        })
+        .and_then(|index| {
+            table_stats.index_range_estimate(index.name.o(), &column_info.field_type, &ranges)
+        });
+    index_rows.or_else(|| {
+        table_stats.column_range_estimate(
+            column_info.name.o(),
+            sealdb_statistics::kind_of(&column_info.field_type),
+            &ranges,
+        )
+    })
+}
+
 fn stats_cnf_filter_rows(
     table_stats: &super::access_range::TableStats,
     info: &sealdb_meta::TableInfo,
@@ -9514,28 +9563,17 @@ fn stats_cnf_filter_rows(
             .find(|c| c.name.o().eq_ignore_ascii_case(column))
             .map(|c| &c.field_type)
     };
-    let to_stats = |bounds: Vec<sealdb_statistics::pseudo::Bounds>| {
-        bounds
-            .into_iter()
-            .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
-            .collect::<Vec<_>>()
-    };
     let mut sel = 1.0;
     let mut estimated: Vec<String> = Vec::new();
     let mut estimated_any = false;
     for (column, bounds) in sealdb_statistics::pseudo::column_bound_sets(selection) {
-        let ft = field_type(&column)?;
-        let rows = table_stats.column_range_estimate(
-            &column,
-            sealdb_statistics::kind_of(ft),
-            &to_stats(bounds),
-        )?;
+        let rows = column_rows_estimate(table_stats, info, &column, &bounds)?;
         sel *= rows / count;
         estimated.push(column);
         estimated_any = true;
     }
     // `not(isnull(col))` is the `(MinNotNull, MaxValue)` column range.
-    let not_null = to_stats(vec![(None, None)]);
+    let not_null: Vec<sealdb_statistics::pseudo::Bounds> = vec![(None, None)];
     let mut leftover = false;
     for conjunct in &selection.split_cnf() {
         // An OR group unions its items' own range selectivities instead of
@@ -9560,14 +9598,10 @@ fn stats_cnf_filter_rows(
                 if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
                     true
                 } else {
-                    let Some(ft) = field_type(&column) else {
+                    let Some(_) = field_type(&column) else {
                         return None;
                     };
-                    let rows = table_stats.column_range_estimate(
-                        &column,
-                        sealdb_statistics::kind_of(ft),
-                        &not_null,
-                    )?;
+                    let rows = column_rows_estimate(table_stats, info, &column, &not_null)?;
                     sel *= rows / count;
                     estimated.push(column);
                     estimated_any = true;
@@ -9601,27 +9635,12 @@ fn dnf_stats_selectivity(
     if count <= 0.0 {
         return Some(0.0);
     }
-    let field_type = |column: &str| {
-        info.columns
-            .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(column))
-            .map(|c| &c.field_type)
-    };
     let mut union = 0.0;
     for item in conjunct.split_dnf() {
         let mut item_sel = 1.0;
         for cond in item.split_cnf() {
             let (column, bounds) = sealdb_statistics::pseudo::conjunct_bound_sets(&cond)?;
-            let ft = field_type(&column)?;
-            let ranges: Vec<_> = bounds
-                .into_iter()
-                .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
-                .collect();
-            let rows = table_stats.column_range_estimate(
-                &column,
-                sealdb_statistics::kind_of(ft),
-                &ranges,
-            )?;
+            let rows = column_rows_estimate(table_stats, info, &column, &bounds)?;
             item_sel *= rows / count;
         }
         union = union + item_sel - union * item_sel;
@@ -10612,8 +10631,15 @@ fn index_merge_residual_rows(
     (rows * selectivity).clamp(0.0, rows)
 }
 
-/// Selectivity of one conjunct: TiDB `GetRowCountByIntColumnRanges` over the
-/// column histogram when it exists, else the pseudo range estimate.
+/// Selectivity of one conjunct: TiDB `GetRowCountByIntColumnRanges` /
+/// `GetRowCountByIndexRanges` when real statistics exist, else the pseudo
+/// range estimate.
+///
+/// TiDB derives the access ranges from an index path when the predicate's
+/// columns are covered by one, and reads the row count from *that* index's
+/// histogram. The two histograms can disagree by a row at the top of the
+/// range (`b < max` on a column whose index histogram ends one row earlier),
+/// so the index estimate has to win when it applies.
 fn conjunct_selectivity(
     cond: &ExprNode,
     info: &sealdb_meta::TableInfo,
@@ -10627,21 +10653,9 @@ fn conjunct_selectivity(
             .columns
             .iter()
             .find(|column| column.name.o().eq_ignore_ascii_case(&name))
+        && let Some(rows) = column_rows_estimate(table, info, column.name.o(), &sets)
     {
-        let stat_ranges: Vec<_> = sets
-            .iter()
-            .map(|(low, high)| sealdb_statistics::range_est::StatsRange {
-                low: low.clone(),
-                high: high.clone(),
-            })
-            .collect();
-        if let Some(rows) = table.column_range_estimate(
-            column.name.o(),
-            sealdb_statistics::kind_of(&column.field_type),
-            &stat_ranges,
-        ) {
-            return (rows / table.count.max(1) as f64).clamp(0.0, 1.0);
-        }
+        return (rows / table.count.max(1) as f64).clamp(0.0, 1.0);
     }
     sets.iter()
         .map(|(low, high)| {
