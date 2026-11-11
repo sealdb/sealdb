@@ -1222,6 +1222,18 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                     continue;
                 }
             }
+            if keyword_at(bytes, after_admin, "RELOAD") {
+                // `ADMIN RELOAD [OPT_RULE_BLACKLIST|EXPR_PUSHDOWN_BLACKLIST|BINDINGS]`:
+                // SealDB reads the blacklist tables at planning time, so the
+                // reload itself is a no-op.
+                let mut j = after_admin + "RELOAD".len();
+                while j < bytes.len() && bytes[j] != b';' {
+                    j += 1;
+                }
+                out.push_str("DO 0");
+                i = j;
+                continue;
+            }
             if keyword_at(bytes, after_admin, "SHOW") {
                 let after_show = skip_ws(bytes, after_admin + "SHOW".len());
                 if keyword_at(bytes, after_show, "DDL") {

@@ -141,6 +141,16 @@ const SYSTEM_TABLES: &[&str] = &[
         PRIMARY KEY (Host, DB, User, Table_name, Column_name),\n\
         KEY i_user (User)\n\
     )",
+    // TiDB `mysql.expr_pushdown_blacklist`: expressions kept out of coprocessors.
+    "CREATE TABLE expr_pushdown_blacklist (\n\
+        name CHAR(100) NOT NULL,\n\
+        store_type CHAR(100) NOT NULL DEFAULT 'tikv,tiflash,tidb',\n\
+        reason VARCHAR(200)\n\
+    )",
+    // TiDB `mysql.opt_rule_blacklist`: disabled optimizer rules.
+    "CREATE TABLE opt_rule_blacklist (\n\
+        name CHAR(100) NOT NULL\n\
+    )",
 ];
 
 /// Create the `mysql` schema and its system tables when the cluster has no
