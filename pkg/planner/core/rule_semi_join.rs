@@ -240,6 +240,22 @@ fn rewrite_apply(
                     right = dedup_in_right(right, &key, &spec.right_table, current_db, stats);
                     tp = JoinType::Inner;
                 }
+                // TiDB `ExplainInfo` labels an equal-key semi/anti join with the
+                // tables' OrigTblName (`FROM t t1` prints `t`, not `t1`). The
+                // alias→physical scope is only alive while planning, so freeze
+                // the rendered text in a Bytes marker next to the executable ON.
+                let mut on = spec.on;
+                if matches!(tp, JoinType::Semi | JoinType::Anti)
+                    && let Some(info) =
+                        semi_join_explain_info(tp, &on, &spec.right_table, &spec.right_physical)
+                {
+                    on = and_expr(
+                        on,
+                        ExprNode::Value(ValueExpr {
+                            datum: Datum::Bytes(info.into_bytes()),
+                        }),
+                    );
+                }
                 plan = PhysicalPlan::HashJoin {
                     est_rows: None,
                     tp,
@@ -247,7 +263,7 @@ fn rewrite_apply(
                     right: Box::new(right),
                     left_table,
                     right_table: spec.right_table,
-                    on: spec.on,
+                    on,
                 };
             }
             None => leftover.push(item),
@@ -690,6 +706,43 @@ fn and_expr(left: ExprNode, right: ExprNode) -> ExprNode {
     })
 }
 
+/// ExplainInfo of an equal-key semi/anti join, rendered while the
+/// alias→physical table scope is still open. `None` when the ON carries
+/// non-equality conjuncts (their rendering is left to the default path).
+fn semi_join_explain_info(
+    tp: JoinType,
+    on: &ExprNode,
+    inner_alias: &str,
+    inner_physical: &str,
+) -> Option<String> {
+    let parts = on.split_cnf();
+    let mut rendered = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let ExprNode::Binary(bin) = part else {
+            return None;
+        };
+        if bin.op != Op::Eq
+            || !matches!(bin.left.as_ref(), ExprNode::Column(_))
+            || !matches!(bin.right.as_ref(), ExprNode::Column(_))
+        {
+            return None;
+        }
+        rendered.push(explain_semi_pred_inner(
+            part,
+            inner_alias,
+            inner_physical,
+        ));
+    }
+    if rendered.is_empty() {
+        return None;
+    }
+    let label = match tp {
+        JoinType::Anti => "anti semi join",
+        _ => "semi join",
+    };
+    Some(format!("{label}, equal:[{}]", rendered.join(" ")))
+}
+
 fn try_semi_spec(
     outer: &PhysicalPlan,
     expr: &ExprNode,
@@ -774,7 +827,8 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
                 on,
                 None,
                 false,
-            ));
+            )
+            .with_physical(inner.physical.as_deref().unwrap_or(&inner.name)));
         }
         // Correlated predicates without a cross-table equality: TiDB
         // decorrelates to a CARTESIAN semi/anti join with `other cond`.
@@ -870,7 +924,7 @@ fn cartesian_exists_spec(
         on,
         outer_filter: merge_filters(ExprNode::compose_cnf(outer_preds), left_nulls),
         dedup_in: false,
-        right_physical: inner.name.clone(),
+        right_physical: inner_physical.to_string(),
     })
 }
 
@@ -959,12 +1013,13 @@ fn from_exists_cte(
     }
     let seed = cte.query.as_ref();
     let inner = simple_inner(seed)?;
+    let inner_physical = inner.physical.clone().unwrap_or_else(|| inner.name.clone());
     let selection = seed.selection.as_ref()?;
     let (eq, inner_only) = split_semi_pred(selection, &inner.name)?;
     let outer_tbl = outer_table.unwrap_or("t1");
     // TiDB: null-reject both sides; EXPLAIN equal lists outer col first; no Distinct.
     let join_label = if not { "anti semi join" } else { "semi join" };
-    let equal = explain_semi_eq_outer_first(&eq, &inner.name);
+    let equal = explain_semi_eq_outer_first(&eq, &inner_physical);
     let info = format!("{join_label}, equal:[{equal}]");
     let on = ExprNode::Binary(BinaryOpExpr {
         op: Op::LogicAnd,
@@ -987,7 +1042,7 @@ fn from_exists_cte(
         on,
         outer_filter: left_nulls,
         dedup_in: false,
-        right_physical: inner.name.clone(),
+        right_physical: inner_physical.to_string(),
     })
 }
 
@@ -1139,7 +1194,7 @@ fn from_in(
             on,
             outer_filter: None,
             dedup_in: false,
-            right_physical: inner.name.clone(),
+            right_physical: inner_physical.to_string(),
         });
     }
     // `name NOT IN (SELECT const FROM exam WHERE exam.stu_id = stu.id)`:
@@ -1186,7 +1241,7 @@ fn from_in(
             on,
             outer_filter: None,
             dedup_in: false,
-            right_physical: inner.name.clone(),
+            right_physical: inner_physical.to_string(),
         });
     }
     if !matches!(inner_expr, ExprNode::Column(_)) || !matches!(outer_expr, ExprNode::Column(_)) {
@@ -1242,7 +1297,7 @@ fn from_in(
         }),
         outer_filter: left_nulls,
         dedup_in: false,
-        right_physical: inner.name.clone(),
+        right_physical: inner_physical.to_string(),
     })
 }
 
@@ -1337,6 +1392,15 @@ fn with_scan_count(plan: PhysicalPlan, count: Option<f64>) -> PhysicalPlan {
             est_rows,
         },
         other => other,
+    }
+}
+
+/// `SemiSpec` builder that records the inner table's physical (OrigTblName)
+/// name so EXPLAIN can render join keys the way TiDB does.
+impl SemiSpec {
+    fn with_physical(mut self, physical: &str) -> Self {
+        self.right_physical = physical.to_string();
+        self
     }
 }
 
@@ -1668,30 +1732,6 @@ fn qualify_table(expr: ExprNode, table: &str) -> ExprNode {
         ExprNode::Column(mut col) if col.table.is_none() => {
             col.table = Some(table.to_string());
             ExprNode::Column(col)
-        }
-        other => other,
-    }
-}
-
-/// Rename every column qualified with `alias` to `physical`: TiDB's
-/// ExplainInfo prints a join key's `OrigTblName`, not the query alias.
-fn rewrite_relation_alias(expr: &ExprNode, alias: &str, physical: &str) -> ExprNode {
-    if alias.eq_ignore_ascii_case(physical) {
-        return expr.clone();
-    }
-    match expr.clone() {
-        ExprNode::Column(mut col) if col.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(alias)) => {
-            col.table = Some(physical.to_string());
-            ExprNode::Column(col)
-        }
-        ExprNode::Binary(mut bin) => {
-            bin.left = Box::new(rewrite_relation_alias(&bin.left, alias, physical));
-            bin.right = Box::new(rewrite_relation_alias(&bin.right, alias, physical));
-            ExprNode::Binary(bin)
-        }
-        ExprNode::Unary(mut unary) => {
-            unary.expr = Box::new(rewrite_relation_alias(&unary.expr, alias, physical));
-            ExprNode::Unary(unary)
         }
         other => other,
     }

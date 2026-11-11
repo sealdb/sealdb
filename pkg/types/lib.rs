@@ -15,8 +15,8 @@ pub use field_type::{
 };
 pub use mydecimal::MyDecimal;
 pub use time::{
-    Time, TimeType, parse_date_literal, parse_datetime_literal, parse_time_literal,
-    parse_timestamp_literal,
+    Time, TimeType, parse_date_literal, parse_datetime_literal, parse_duration_string,
+    parse_time_literal, parse_timestamp_literal,
 };
 
 #[cfg(test)]

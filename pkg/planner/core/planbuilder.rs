@@ -1377,6 +1377,18 @@ impl PlanBuilder {
                 child: Box::new(seed),
             };
         }
+        // `SELECT <scalar agg|const> FROM (SELECT <aggs> FROM base …) d`: TiDB
+        // prunes the derived aggregate's outputs and seeds a `count(1)`, which
+        // also renumbers the derived / cop plan columns (see `derived_agg_ids`).
+        if select
+            .from
+            .as_ref()
+            .is_some_and(|f| f.resolve_name().eq_ignore_ascii_case(&from.name))
+            && with.set_rest(&from.name)?.is_empty()
+            && let Some((ids, _)) = derived_agg_ids(select, is, current_db)
+        {
+            seed = rewrite_derived_agg(seed, ids);
+        }
         let set_rest = with.set_rest(&from.name)?;
         let mut set_op_ids = SetOpColumnIds::default();
         if !set_rest.is_empty() {
@@ -4261,7 +4273,7 @@ fn scale_reader_by_limit(
     plan: PhysicalPlan,
     selection: &ExprNode,
     info: &sealdb_meta::TableInfo,
-    from: &TableName,
+    _from: &TableName,
     conjuncts: &[ExprNode],
     total: f64,
     filtered: f64,
@@ -6128,6 +6140,10 @@ fn wrap_output_projection(
     // allocated — both keep the legacy base.
     let col_base = if in_dml_source() || !select_is_top_level() {
         projection_column_base(&plan, None)
+    } else if let Some((ids, true)) = derived_agg_ids(select, is, current_db) {
+        // `SELECT 1, 'a' FROM (SELECT <aggs> …) d`: the pruned seed keeps a
+        // projection whose items follow the derived aggregate's outputs.
+        ids.outer
     } else {
         projection_column_base(&plan, from_table_info(select, is, current_db))
     };
@@ -7440,17 +7456,35 @@ fn coerce_comparison_literals(
     if select.from_item.is_some() || !select.joins.is_empty() {
         return None;
     }
-    let selection = select.selection.as_ref()?;
     let from = select.from.as_ref()?;
     let (db, table) = from.qualified(current_db);
     let info = is?.table_by_name(&db, &table)?;
-    let coerced = expand_casted_in_lists(&coerce_numeric_literals(selection, info));
-    if coerced.restore_string() == selection.restore_string() {
-        return None;
-    }
     let mut out = select.clone();
-    out.selection = Some(coerced);
-    Some(out)
+    let mut changed = false;
+    if let Some(selection) = select.selection.as_ref() {
+        let coerced = expand_casted_in_lists(&coerce_numeric_literals(selection, info));
+        // `Time` datums restore back to the quoted literal, so compare the
+        // expression trees too or the coercion would be dropped as a no-op.
+        if coerced.restore_string() != selection.restore_string()
+            || format!("{coerced:?}") != format!("{selection:?}")
+        {
+            out.selection = Some(coerced);
+            changed = true;
+        }
+    }
+    // TiDB folds SELECT-list comparisons with the same type rules
+    // (`select a = '123455' from t` prints the numeric constant), so the
+    // projection must carry the coerced datum too.
+    for (i, field) in select.fields.iter().enumerate() {
+        let coerced = coerce_numeric_literals(&field.expr, info);
+        if coerced.restore_string() != field.expr.restore_string()
+            || format!("{coerced:?}") != format!("{field:?}")
+        {
+            out.fields[i].expr = coerced;
+            changed = true;
+        }
+    }
+    changed.then_some(out)
 }
 
 /// `in(cast(col, double BINARY), 0, 1)` → `or(eq(cast(…), 0), eq(cast(…), 1))`:
@@ -8715,16 +8749,25 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                 }
                 // `datetime_col = '1981-09-15'`: TiDB converts the constant to
                 // the column type, so the range/Selection carry a `Time` datum.
-                if column_class(&left, info) == Some(ColumnClass::Temporal)
-                    && let Some(ft) = column_field_type(&left, info)
-                    && let Some(datum) = temporal_literal(&right, ft)
+                // A DATE column compares as DATETIME, a TIME column folds a
+                // numeric constant into a duration (`a = 1` → `00:00:01`).
+                if let Some(ft) = column_field_type(&left, info)
+                    && let Some(datum) = comparison_temporal_literal(&right, ft)
                 {
                     right = value_expr(datum);
-                } else if column_class(&right, info) == Some(ColumnClass::Temporal)
-                    && let Some(ft) = column_field_type(&right, info)
-                    && let Some(datum) = temporal_literal(&left, ft)
+                } else if let Some(ft) = column_field_type(&right, info)
+                    && let Some(datum) = comparison_temporal_literal(&left, ft)
                 {
                     left = value_expr(datum);
+                }
+                // `int_col = <constant>` folds to constant false when the
+                // constant overflows the column's integer type.
+                if bin.op == Op::Eq {
+                    if let Some(folded) = int_eq_out_of_range(&left, &right, info)
+                        .or_else(|| int_eq_out_of_range(&right, &left, info))
+                    {
+                        return folded;
+                    }
                 }
             }
             // Arithmetic on a string column evaluates as `double` on both sides.
@@ -8926,6 +8969,113 @@ fn bytes_number(expr: &ExprNode) -> Option<Datum> {
     } else {
         Some(Datum::F64(value))
     }
+}
+
+/// Constant compared with a temporal column, converted to the datum TiDB folds
+/// the comparison with.
+///
+/// * `DATE` promotes the constant to `DATETIME` (zero time part);
+/// * `DATETIME`/`TIMESTAMP` parse the constant at microsecond precision;
+/// * `TIME` parses a duration text (`'11:11:11'`) or reads a number as seconds
+///   (`a = 1` → `00:00:01.000000`).
+fn comparison_temporal_literal(
+    expr: &ExprNode,
+    ft: &sealdb_types::FieldType,
+) -> Option<Datum> {
+    match ft.tp {
+        sealdb_types::TYPE_DATE => {
+            let mut time = match expr {
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(bytes),
+                }) => {
+                    let text = std::str::from_utf8(bytes).ok()?;
+                    sealdb_types::parse_date_literal(text)
+                        .or_else(|_| sealdb_types::parse_datetime_literal(text))
+                        .ok()?
+                }
+                _ => return None,
+            };
+            time.tp = sealdb_types::TimeType::Datetime;
+            time.fsp = 6;
+            Some(Datum::Time(time))
+        }
+        sealdb_types::TYPE_DATETIME | sealdb_types::TYPE_TIMESTAMP => temporal_literal(expr, ft),
+        sealdb_types::TYPE_DURATION => {
+            let time = match expr {
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(bytes),
+                }) => {
+                    let text = std::str::from_utf8(bytes).ok()?;
+                    sealdb_types::parse_duration_string(text)?
+                }
+                ExprNode::Value(ValueExpr { datum }) => {
+                    let secs = match datum {
+                        Datum::I64(v) => *v,
+                        Datum::U64(v) => *v as i64,
+                        Datum::F64(v) => *v as i64,
+                        Datum::Decimal(d) => d.to_i64().ok()?,
+                        _ => return None,
+                    };
+                    if !(0..=838 * 3600 + 59 * 60 + 59).contains(&secs) {
+                        return None;
+                    }
+                    let secs = secs as u32;
+                    sealdb_types::Time {
+                        year: 0,
+                        month: 0,
+                        day: 0,
+                        hour: (secs / 3600) as u8,
+                        minute: ((secs % 3600) / 60) as u8,
+                        second: (secs % 60) as u8,
+                        micro: 0,
+                        fsp: 6,
+                        tp: sealdb_types::TimeType::Time,
+                    }
+                }
+                _ => return None,
+            };
+            Some(Datum::Time(time))
+        }
+        _ => None,
+    }
+}
+
+/// TiDB folds `int_col = <constant>` against the column's integer type: a
+/// constant the type cannot hold makes the equality a constant false (`0`),
+/// e.g. `a int unsigned` compared with a 32-digit decimal.
+fn int_eq_out_of_range(
+    column: &ExprNode,
+    value: &ExprNode,
+    info: &sealdb_meta::TableInfo,
+) -> Option<ExprNode> {
+    let ft = column_field_type(column, info)?;
+    let (min, max): (f64, f64) = match ft.tp {
+        sealdb_types::TYPE_TINY if ft.is_unsigned() => (0.0, 255.0),
+        sealdb_types::TYPE_TINY => (-128.0, 127.0),
+        sealdb_types::TYPE_SHORT if ft.is_unsigned() => (0.0, 65_535.0),
+        sealdb_types::TYPE_SHORT => (-32_768.0, 32_767.0),
+        sealdb_types::TYPE_INT24 if ft.is_unsigned() => (0.0, 16_777_215.0),
+        sealdb_types::TYPE_INT24 => (-8_388_608.0, 8_388_607.0),
+        sealdb_types::TYPE_LONG if ft.is_unsigned() => (0.0, 4_294_967_295.0),
+        sealdb_types::TYPE_LONG => (-2_147_483_648.0, 2_147_483_647.0),
+        sealdb_types::TYPE_LONG_LONG if ft.is_unsigned() => (0.0, 18_446_744_073_709_551_615.0),
+        sealdb_types::TYPE_LONG_LONG => (-9_223_372_036_854_775_808.0, 9_223_372_036_854_775_807.0),
+        _ => return None,
+    };
+    let ExprNode::Value(ValueExpr { datum }) = value else {
+        return None;
+    };
+    let parsed = match datum {
+        Datum::Decimal(d) => d.to_f64().ok()?,
+        Datum::I64(v) => *v as f64,
+        Datum::U64(v) => *v as f64,
+        Datum::F64(v) => *v,
+        _ => return None,
+    };
+    if parsed < min || parsed > max {
+        return Some(value_expr(Datum::I64(0)));
+    }
+    None
 }
 
 fn cast_double(expr: ExprNode) -> ExprNode {
@@ -10381,6 +10531,187 @@ fn expr_contains_agg(expr: &ExprNode) -> bool {
     }
 }
 
+/// TiDB plan column ids for a scalar query that reads a *derived aggregate*
+/// (`SELECT <one item> FROM (SELECT <aggs> FROM base …) d`).
+///
+/// TiDB allocates, in order: the base table's DataSource, the derived
+/// aggregate's own outputs (`agg_count` of them), then the outer item. Column
+/// pruning then drops the unused aggregate result, and the seed re-adds a
+/// `count(1)` for the pruned column once per pruning pass, so each pass
+/// allocates two more ids and the last seed's `count(1)` becomes the surviving
+/// derived output. Splitting the cop task afterwards enumerates one partial
+/// aggregate per function of the original aggregation, so the cop column sits
+/// `3*(agg_count-1)+2` ids after the seed's.
+#[derive(Clone, Copy)]
+struct DerivedAggIds {
+    /// Output column of the outer aggregate / projection item.
+    outer: usize,
+    /// Surviving output column of the derived aggregate.
+    seed_out: usize,
+    /// Cop partial-aggregate column of the derived aggregate.
+    seed_partial: usize,
+}
+
+impl DerivedAggIds {
+    fn new(base: usize, agg_count: usize, const_outer: bool) -> Self {
+        let outer = base + agg_count;
+        let seed_out = outer + 2 + usize::from(const_outer);
+        let seed_partial = seed_out + 3 * (agg_count - 1) + 2;
+        Self {
+            outer,
+            seed_out,
+            seed_partial,
+        }
+    }
+}
+
+/// Recognise `SELECT <scalar agg | constant> FROM (SELECT <aggs> FROM base …) d`
+/// where none of the derived aggregate's outputs are used by the outer query.
+/// Returns the ids plus whether the outer item is a bare constant (TiDB keeps a
+/// projection over the pruned seed in that case).
+fn derived_agg_ids(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<(DerivedAggIds, bool)> {
+    if !select.joins.is_empty()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.from_item.is_some()
+    {
+        return None;
+    }
+    let [field] = select.fields.as_slice() else {
+        return None;
+    };
+    let const_outer = match &field.expr {
+        ExprNode::Func(f) if is_agg_expr(&field.expr) => {
+            // The outer aggregate must not read a derived column.
+            if !matches!(f.args.as_slice(), [] | [ExprNode::Value(_)]) {
+                return None;
+            }
+            false
+        }
+        ExprNode::Value(_) => true,
+        _ => return None,
+    };
+    let from = select.from.as_ref()?;
+    let with = select.with.as_ref()?;
+    let cte = with.find(from.resolve_name())?;
+    if !cte.set_rest.is_empty() {
+        return None;
+    }
+    let seed = with.seed_select(&cte.name).ok()?;
+    if !seed.joins.is_empty()
+        || seed.from_item.is_some()
+        || !seed.fields.iter().all(|f| is_agg_expr(&f.expr))
+        || !seed.order_by.is_empty()
+        || seed.limit.is_some()
+        || seed.offset.is_some()
+    {
+        return None;
+    }
+    let agg_count = seed.fields.len();
+    let base = derived_agg_base_next(&seed, is, current_db)?;
+    Some((DerivedAggIds::new(base, agg_count, const_outer), const_outer))
+}
+
+/// Next plan column id after the DataSource of the innermost base table, seen
+/// through any number of `SELECT * FROM <cte>` layers.
+fn derived_agg_base_next(
+    seed: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<usize> {
+    let mut cur = seed.clone();
+    for _ in 0..8 {
+        if !cur.joins.is_empty() || cur.from_item.is_some() {
+            return None;
+        }
+        let from = cur.from.as_ref()?;
+        let name = from.resolve_name();
+        if let Some(with) = cur.with.as_ref()
+            && with.find(name).is_some()
+        {
+            let next = with.seed_select(name).ok()?;
+            if !is_star_select(&next) {
+                return None;
+            }
+            cur = next;
+            continue;
+        }
+        let (db, table) = from.qualified(current_db);
+        let info = is?.table_by_name(&db, &table)?;
+        if info.view.is_some() {
+            return None;
+        }
+        return Some(table_column_base(info));
+    }
+    None
+}
+
+/// Rebuild the pruned derived aggregate as TiDB does: the seed contributes a
+/// `count(1)` over the surviving output column, and the cop partial is split
+/// into `count(1)` as well (all derived outputs were pruned). The aggregate
+/// keeps its kind (StreamAgg for an ordered seed, HashAgg for a group-by scan).
+fn rewrite_derived_agg(plan: PhysicalPlan, ids: DerivedAggIds) -> PhysicalPlan {
+    fn group_prefix(info: &str) -> String {
+        info.split_once(", funcs:")
+            .map(|(g, _)| format!("{g}, "))
+            .unwrap_or_default()
+    }
+    match plan {
+        PhysicalPlan::StreamAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } if !cop_info.is_empty() => {
+            let group = group_prefix(&info);
+            let root = format!(
+                "{group}funcs:count(Column#{})->Column#{}",
+                ids.seed_partial, ids.seed_out
+            );
+            let cop = format!("{group}funcs:count(1)->Column#{}", ids.seed_partial);
+            PhysicalPlan::stream_agg(*child, root, cop, est_rows)
+        }
+        PhysicalPlan::HashAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } if !cop_info.is_empty() => {
+            let group = group_prefix(&info);
+            let root = format!(
+                "{group}funcs:count(Column#{})->Column#{}",
+                ids.seed_partial, ids.seed_out
+            );
+            let cop = format!("{group}funcs:count(1)->Column#{}", ids.seed_partial);
+            PhysicalPlan::hash_agg_cop(*child, root, cop, est_rows)
+        }
+        PhysicalPlan::HashAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } if cop_info.is_empty() => {
+            // Cop aggregation pushdown had not split yet: build both phases.
+            let group = group_prefix(&info);
+            let root = format!(
+                "{group}funcs:count(Column#{})->Column#{}",
+                ids.seed_partial, ids.seed_out
+            );
+            let cop = format!("{group}funcs:count(1)->Column#{}", ids.seed_partial);
+            PhysicalPlan::hash_agg_cop(*child, root, cop, est_rows)
+        }
+        other => other,
+    }
+}
+
 /// Prefer IndexReader when GROUP BY columns are a leading prefix of an index.
 fn group_by_index_plan(
     select: &SelectStmt,
@@ -11015,10 +11346,31 @@ fn build_agg_plan(
         PhysicalPlan::Projection { child, .. } => *child,
         other => other,
     };
+    let est = agg_est_rows(select);
+    // `SELECT count(1) FROM (SELECT <aggs> FROM base …) d`: every derived
+    // aggregate output is pruned, so TiDB's outer scalar aggregate reads the
+    // seed's re-added `count(1)` (see `derived_agg_ids`).
+    if let Some((ids, false)) = derived_agg_ids(select, is, current_db)
+        && matches!(plan, PhysicalPlan::CTE { .. })
+    {
+        let info = select
+            .fields
+            .first()
+            .map(|f| f.expr.restore_string())
+            .unwrap_or_else(|| "count(1)".to_string());
+        return (
+            PhysicalPlan::stream_agg(
+                plan,
+                format!("funcs:{info}->Column#{}", ids.outer),
+                String::new(),
+                est,
+            ),
+            false,
+        );
+    }
     let keep_order =
         matches!(plan, PhysicalPlan::IndexReader { .. }) && !select.group_by.is_empty();
     let stream = select.group_by.is_empty() || keep_order;
-    let est = agg_est_rows(select);
     let partial_col = partial_agg_column_id(select);
 
     if select.distinct && select.group_by.is_empty() {

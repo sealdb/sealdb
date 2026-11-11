@@ -5997,8 +5997,12 @@ pub(crate) fn explain_join_col(col: &sealdb_parser::ast::expressions::ColumnName
     if col.name.starts_with("Column#") {
         return col.name.clone();
     }
-    let table = col.table.as_deref().unwrap_or("t");
-    let schema = column_schema(col, table);
+    let alias = col.table.as_deref().unwrap_or("t");
+    // TiDB `OrigTblName`: an aliased table prints as its physical name, so
+    // `FROM t t1 JOIN t t2` keys read `eq(<db>.t.b, <db>.t.b)`.
+    let table = crate::core::planbuilder::explain_physical_table(alias)
+        .unwrap_or_else(|| alias.to_string());
+    let schema = column_schema(col, &table);
     if schema.is_empty() {
         format!("select.{table}.{}", col.name)
     } else {
