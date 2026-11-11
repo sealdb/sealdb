@@ -274,6 +274,18 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // TiDB `OuterJoinEliminator` runs before access path selection:
+                // a LEFT/RIGHT OUTER JOIN whose inner side is joined on a unique
+                // key collapses to the preserved side, so the remaining query
+                // plans exactly like a single-table select.
+                let eliminated_join_select;
+                let select = match eliminate_outer_join(select, is, current_db) {
+                    Some(eliminated) => {
+                        eliminated_join_select = eliminated;
+                        &eliminated_join_select
+                    }
+                    None => select,
+                };
                 let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
@@ -1332,7 +1344,13 @@ impl PlanBuilder {
         if from.schema.is_some() {
             return Err(Error::unsupported("qualified CTE name"));
         }
-        let seed_select = with.seed_select(&from.name)?;
+        let mut seed_select = with.seed_select(&from.name)?;
+        // TiDB `tidb_remove_orderby_in_subquery` (default ON): an ORDER BY in a
+        // subquery / CTE body is dropped unless the body also has LIMIT/OFFSET,
+        // because a nested query block's order is not observable.
+        if seed_select.limit.is_none() && seed_select.offset.is_none() {
+            seed_select.order_by.clear();
+        }
         let cte = with.find(&from.name);
         // Prefer explicit `WITH cte (a,b) AS`; else seed AS aliases / column names
         // so `cte2 as c1 … WHERE c2.col_2` resolves (TiDB CTE output names).
@@ -2927,6 +2945,17 @@ fn inner_join_null_reject_filters(
 }
 
 /// Push `not(isnull(key))` into a plain base-table scan of an inner join.
+/// Identity of a null-rejection conjunct for duplicate detection: the column a
+/// `not(isnull(col))` targets, otherwise the expression's canonical key. The
+/// predicate can reach the scan either from the ON text (unqualified) or from
+/// the annotated statement (`select.t2.b`), so qualifiers must not matter.
+fn null_reject_key(expr: &ExprNode) -> String {
+    if let Some(column) = not_isnull_column(expr) {
+        return format!("not(isnull({}))", column.to_ascii_lowercase());
+    }
+    expr.expr_key()
+}
+
 fn push_inner_null_reject(
     side: PhysicalPlan,
     on: &ExprNode,
@@ -2950,12 +2979,20 @@ fn push_inner_null_reject(
             filter
                 .split_cnf()
                 .iter()
-                .map(|c| c.restore_string())
+                .map(null_reject_key)
                 .collect()
         })
         .unwrap_or_default();
     let mut filters = inner_join_null_reject_filters(on, table, physical, is, current_db);
-    filters.retain(|filter| !existing.iter().any(|e| *e == filter.restore_string()));
+    let mut seen: Vec<String> = Vec::new();
+    filters.retain(|filter| {
+        let key = null_reject_key(filter);
+        if existing.iter().any(|e| *e == key) || seen.iter().any(|s| *s == key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
     if filters.is_empty() {
         return side;
     }
@@ -6152,15 +6189,12 @@ fn wrap_output_projection(
     current_db: &str,
 ) -> PhysicalPlan {
     // A table with an expression index carries a hidden generated column in
-    // its DataSource schema; `SELECT *` still projects only the user columns,
-    // so the star list goes through the same projection path. TiDB only adds
-    // the hidden column to the DataSource when the expression index is the
-    // chosen access path (the point-get case is [`expr_index_point_projection`]);
-    // a scan of the primary key / an ordinary index never sees it.
+    // its DataSource schema, so `SELECT *` must project the user columns back
+    // out (`Projection` at the root, or a cop `Projection` when TiDB pushes it
+    // into the scan) whichever access path the table is read through.
     let star_hidden = is_star_select(select)
         && select.joins.is_empty()
-        && hidden_table_info(select, is, current_db)
-            .is_some_and(|info| plan_reads_expr_index(&plan, info));
+        && hidden_table_info(select, is, current_db).is_some();
     if (is_star_select(select) && !star_hidden)
         || needs_hash_agg(select)
         || needs_window(select)
@@ -9389,7 +9423,7 @@ pub(crate) fn unique_eq_rows(info: &sealdb_meta::TableInfo, selection: &ExprNode
         .then_some(1.0)
 }
 
-/// Cardinality of a single null-rejecting cop filter over analyzed stats.
+/// Cardinality of a null-rejecting cop filter over analyzed stats.
 ///
 /// TiDB sizes each conjunct from the column statistics and multiplies the
 /// selectivities, so a lone `col <> const` keeps
@@ -9401,27 +9435,134 @@ fn column_stats_filter_rows(
     selection: &ExprNode,
 ) -> Option<f64> {
     let conjuncts = selection.split_cnf();
-    let [conjunct] = conjuncts.as_slice() else {
-        return None;
-    };
     let count = table_stats.count as f64;
-    let rows = if let Some(column) = not_isnull_column(conjunct) {
-        // TiDB `getNotNULLRowCount`: a column the statistics do not carry keeps
-        // the whole table count (the scan is only marked `stats:partial`).
-        match table_stats.column(&column) {
-            Some(col) if col.histogram.is_some() => count - col.null_count as f64,
-            _ => count,
+    if let [conjunct] = conjuncts.as_slice() {
+        if let Some(column) = not_isnull_column(conjunct) {
+            // TiDB `getNotNULLRowCount`: a column the statistics do not carry
+            // keeps the whole table count (the scan is only `stats:partial`).
+            let rows = match table_stats.column(&column) {
+                Some(col) if col.histogram.is_some() => count - col.null_count as f64,
+                _ => count,
+            };
+            return Some(rows.clamp(1.0, count));
         }
-    } else {
-        let (column, value) = ne_column_const(conjunct)?;
-        let field_type = &info
-            .columns
+        if let Some((column, value)) = ne_column_const(conjunct)
+            && let Some(field_type) = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(&column))
+                .map(|c| &c.field_type)
+            && let Some(rows) = table_stats.column_ne_estimate(
+                &column,
+                sealdb_statistics::kind_of(field_type),
+                &value,
+            )
+        {
+            return Some(rows.clamp(1.0, count));
+        }
+    }
+    // General case: TiDB `cardinality.Selectivity` over the CNF list, using the
+    // column histograms / TopN for every column the ranger can bound.
+    stats_cnf_filter_rows(table_stats, info, selection)
+}
+
+/// TiDB `cardinality.Selectivity` of `filter` over `info`'s analyzed column
+/// statistics, as a ratio in `[0, 1]`. `None` when the table has no real
+/// statistics or the filter's columns carry none, so callers keep their
+/// pseudo estimate.
+pub(crate) fn stats_filter_selectivity(
+    info: Option<&sealdb_meta::TableInfo>,
+    table_stats: Option<&super::access_range::TableStats>,
+    filter: &ExprNode,
+) -> Option<f64> {
+    let info = info?;
+    let table_stats = table_stats.filter(|t| super::plan_cost::has_real_stats(t))?;
+    let count = table_stats.count as f64;
+    if count <= 0.0 {
+        return None;
+    }
+    // A predicate with a cast around its column (`cast(c, double) = 0`) is not
+    // bounded by the ranger: TiDB keeps the `selectionFactor` for it instead of
+    // charging the column's own range rate (`point_get_plan` `t4`).
+    if filter.split_cnf().iter().any(|c| c.expr_key().contains("cast(")) {
+        return None;
+    }
+    stats_cnf_filter_rows(table_stats, info, filter).map(|rows| (rows / count).clamp(0.0, 1.0))
+}
+
+/// TiDB `cardinality.Selectivity` for a table-scan cop filter over analyzed
+/// statistics: each column contributes `range_rows / count` and every
+/// predicate the ranger cannot bound keeps the `selectionFactor` (0.8).
+fn stats_cnf_filter_rows(
+    table_stats: &super::access_range::TableStats,
+    info: &sealdb_meta::TableInfo,
+    selection: &ExprNode,
+) -> Option<f64> {    let count = table_stats.count as f64;
+    if count <= 0.0 {
+        return Some(0.0);
+    }
+    let field_type = |column: &str| {
+        info.columns
             .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(&column))?
-            .field_type;
-        table_stats.column_ne_estimate(&column, sealdb_statistics::kind_of(field_type), &value)?
+            .find(|c| c.name.o().eq_ignore_ascii_case(column))
+            .map(|c| &c.field_type)
     };
-    Some(rows.clamp(1.0, count))
+    let to_stats = |bounds: Vec<sealdb_statistics::pseudo::Bounds>| {
+        bounds
+            .into_iter()
+            .map(|(low, high)| sealdb_statistics::range_est::StatsRange { low, high })
+            .collect::<Vec<_>>()
+    };
+    let mut sel = 1.0;
+    let mut estimated: Vec<String> = Vec::new();
+    for (column, bounds) in sealdb_statistics::pseudo::column_bound_sets(selection) {
+        let ft = field_type(&column)?;
+        let rows = table_stats.column_range_estimate(
+            &column,
+            sealdb_statistics::kind_of(ft),
+            &to_stats(bounds),
+        )?;
+        sel *= rows / count;
+        estimated.push(column);
+    }
+    // `not(isnull(col))` is the `(MinNotNull, MaxValue)` column range.
+    let not_null = to_stats(vec![(None, None)]);
+    let mut leftover = false;
+    for conjunct in &selection.split_cnf() {
+        let covered = if let Some((column, _)) =
+            sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
+        {
+            estimated.iter().any(|e| e.eq_ignore_ascii_case(&column))
+        } else if let Some(column) = not_isnull_column(conjunct) {
+            if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
+                true
+            } else {
+                let Some(ft) = field_type(&column) else {
+                    return None;
+                };
+                let rows = table_stats.column_range_estimate(
+                    &column,
+                    sealdb_statistics::kind_of(ft),
+                    &not_null,
+                )?;
+                sel *= rows / count;
+                estimated.push(column);
+                true
+            }
+        } else {
+            false
+        };
+        if !covered {
+            leftover = true;
+        }
+    }
+    if estimated.is_empty() {
+        return None;
+    }
+    if leftover {
+        sel *= sealdb_statistics::pseudo::SELECTION_FACTOR;
+    }
+    Some((count * sel).clamp(0.0, count))
 }
 
 /// TiDB `GetRowCountByIndexRanges` on the clustered PRIMARY index for a
@@ -9545,14 +9686,18 @@ fn clustered_range_rows(
 
 /// Column of a `not(isnull(col))` conjunct (TiDB null-rejection predicate).
 fn not_isnull_column(expr: &ExprNode) -> Option<String> {
-    match expr {
+    let is_null = match expr {
         ExprNode::Unary(u) if u.op == Op::Not => match u.expr.as_ref() {
-            ExprNode::IsNull(isnull) if !isnull.not => match isnull.expr.as_ref() {
-                ExprNode::Column(col) => Some(col.name.clone()),
-                _ => None,
-            },
-            _ => None,
+            ExprNode::IsNull(isnull) if !isnull.not => isnull,
+            _ => return None,
         },
+        // TiDB folds `NOT (x IS NULL)` into `x IS NOT NULL`, which the
+        // explain text prints as `not(isnull(x))`.
+        ExprNode::IsNull(isnull) if isnull.not => isnull,
+        _ => return None,
+    };
+    match is_null.expr.as_ref() {
+        ExprNode::Column(col) => Some(col.name.clone()),
         _ => None,
     }
 }
@@ -10487,14 +10632,15 @@ fn index_merge_plan(
     })
 }
 
-/// True for `SELECT <plain columns> FROM t` with no filtering, grouping, or
-/// de-duplication — the shape where a covering secondary index may replace the
-/// table scan.
+/// True for `SELECT <plain columns> FROM t` with no filtering or grouping —
+/// the shape where a covering secondary index may replace the table scan.
+/// `DISTINCT` does not block the index: TiDB picks the access path inside the
+/// data source, and the de-duplication (when it survives elimination) sits
+/// above it.
 fn is_plain_projection(select: &SelectStmt) -> bool {
     select.selection.is_none()
         && select.group_by.is_empty()
         && select.having.is_none()
-        && !select.distinct
         && select
             .fields
             .iter()
@@ -10816,6 +10962,114 @@ fn group_by_index_plan(
         }
     }
     None
+}
+
+/// TiDB `OuterJoinEliminator` (`rule_join_elimination.go`).
+///
+/// A `LEFT`/`RIGHT OUTER JOIN` is dropped when
+///   1. nothing above the join reads a column of the null-supplying side
+///      (`parentCols` all belong to the preserved side), and
+///   2. the inner side is joined on one of its unique keys (`PRIMARY`, a
+///      unique index, or the integer handle), so every preserved row matches
+///      at most one inner row.
+///
+/// The inner columns are unused, so the preserved side's rows are the join
+/// result: `select t1.a, t1.b from t1 left join t2 on t1.a = t2.a` becomes
+/// `select t1.a, t1.b from t1` (`rule_join_elimination.go:tryToEliminateOuterJoin`).
+/// Extra `ON` conjuncts only decide whether an inner row matches; with the
+/// inner side unused they cannot filter preserved rows, so they go with it.
+fn eliminate_outer_join(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    let is = is?;
+    // `select *` reads the inner side too; a bushy FROM item plans separately.
+    if select.from_item.is_some() || select.joins.len() != 1 || is_star_select(select) {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let join = &select.joins[0];
+    let (outer, inner) = match map_join_type(join.tp) {
+        JoinType::LeftOuter => (from, &join.right),
+        JoinType::RightOuter => (&join.right, from),
+        _ => return None,
+    };
+    let (inner_db, inner_table) = inner.qualified(current_db);
+    let inner_info = is.table_by_name(&inner_db, &inner_table)?;
+    // `parentCols`: every expression above the join. An unqualified name the
+    // inner side also defines may resolve there, so it blocks elimination.
+    let mut parent_exprs: Vec<&ExprNode> = select.fields.iter().map(|f| &f.expr).collect();
+    parent_exprs.extend(select.group_by.iter());
+    parent_exprs.extend(select.having.iter());
+    parent_exprs.extend(select.order_by.iter().map(|item| &item.expr));
+    parent_exprs.extend(select.selection.iter());
+    let references_inner = |expr: &ExprNode| {
+        expr.referenced_columns()
+            .iter()
+            .any(|(qualifier, name)| match qualifier {
+                Some(qualifier) => {
+                    qualifier.eq_ignore_ascii_case(&inner.name)
+                        || qualifier.eq_ignore_ascii_case(inner.resolve_name())
+                }
+                None => inner_info
+                    .columns
+                    .iter()
+                    .any(|column| column.name.o().eq_ignore_ascii_case(name)),
+            })
+    };
+    if parent_exprs.iter().any(|expr| references_inner(expr)) {
+        return None;
+    }
+    // Inner join keys: equality conjuncts pairing an inner column with an outer
+    // one (`extractInnerJoinKeys`).
+    let belongs_to = |column: &ColumnNameExpr, table: &TableName| {
+        column.table.as_deref().is_some_and(|qualifier| {
+            qualifier.eq_ignore_ascii_case(&table.name)
+                || qualifier.eq_ignore_ascii_case(table.resolve_name())
+        })
+    };
+    let mut inner_keys: Vec<String> = Vec::new();
+    for conjunct in join.on.split_cnf_all() {
+        let ExprNode::Binary(binary) = conjunct else {
+            continue;
+        };
+        if binary.op != Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(left), ExprNode::Column(right)) = (&*binary.left, &*binary.right)
+        else {
+            continue;
+        };
+        if belongs_to(left, inner) && belongs_to(right, outer) {
+            inner_keys.push(left.name.to_ascii_lowercase());
+        } else if belongs_to(right, inner) && belongs_to(left, outer) {
+            inner_keys.push(right.name.to_ascii_lowercase());
+        }
+    }
+    // `isInnerJoinKeysContainUniqueKey`: the inner side must be unique on the
+    // joined columns.
+    let unique_on_keys = inner_info.indices.iter().any(|index| {
+        (index.primary || index.unique)
+            && !index.columns.is_empty()
+            && index.columns.iter().all(|column| {
+                inner_keys
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(column.name.o()))
+            })
+    }) || (inner_info.pk_is_handle
+        && inner_info.handle_column().is_some_and(|column| {
+            inner_keys
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case(column.name.o()))
+        }));
+    if !unique_on_keys {
+        return None;
+    }
+    let mut rewritten = select.clone();
+    rewritten.from = Some(outer.clone());
+    rewritten.joins = Vec::new();
+    Some(rewritten)
 }
 
 /// `count(*)` over `LEFT JOIN` whose inner side is joined on its complete
@@ -11450,6 +11704,12 @@ fn build_agg_plan(
     let partial_col = partial_agg_column_id(select);
 
     if select.distinct && select.group_by.is_empty() {
+        // TiDB `AggregationEliminator`: `DISTINCT` over columns that contain a
+        // unique key is a no-op (`tryToEliminateAggregation`), so the HashAgg
+        // disappears and the unique index reader below is the whole plan.
+        if distinct_by_unique_key(select, &plan, is, current_db) {
+            return (plan, false);
+        }
         // SELECT DISTINCT without GROUP BY — dedup projected columns.
         let keys = select
             .fields
@@ -12538,6 +12798,66 @@ fn build_join_agg_plan(
     (PhysicalPlan::hash_agg(plan, info, est), false)
 }
 
+/// True when the columns of `SELECT DISTINCT` contain a unique key of the
+/// source, so the de-duplication cannot remove anything.
+///
+/// TiDB builds `DISTINCT` as a `LogicalAggregation` whose group-by columns are
+/// the select list, then `tryToEliminateAggregation` drops it when the child's
+/// schema keys cover those columns
+/// (`rule_aggregation_elimination.go:tryToEliminateAggregation`). Column
+/// pruning then leaves the scan (a covering unique index reader) alone.
+fn distinct_by_unique_key(
+    select: &SelectStmt,
+    plan: &PhysicalPlan,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    let Some(is) = is else {
+        return false;
+    };
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.table_by_name(&db, &table) else {
+        return false;
+    };
+    // The distinct columns themselves: only plain columns can be checked.
+    let mut distinct_cols: Vec<String> = Vec::with_capacity(select.fields.len());
+    for field in &select.fields {
+        let ExprNode::Column(column) = &field.expr else {
+            return false;
+        };
+        distinct_cols.push(column.name.to_ascii_lowercase());
+    }
+    let contains = |name: &str| {
+        distinct_cols
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    };
+    // The access path must be the unique key itself, not a table scan: TiDB
+    // reads the child's schema keys, which the index reader exposes.
+    let index_name = match plan {
+        PhysicalPlan::IndexReader { index, .. } => index,
+        _ => return false,
+    };
+    let Some(index) = info
+        .indices
+        .iter()
+        .find(|index| index.name.o().eq_ignore_ascii_case(index_name))
+    else {
+        return false;
+    };
+    if !(index.unique || index.primary) || index.columns.is_empty() {
+        return false;
+    }
+    // Prefix key parts cannot prove uniqueness of the whole column.
+    index
+        .columns
+        .iter()
+        .all(|column| column.length == -1 && contains(column.name.o()))
+}
+
 fn agg_est_rows(select: &SelectStmt) -> f64 {
     if select.group_by.is_empty() {
         return 1.0;
@@ -12649,6 +12969,20 @@ fn lock_point_get(plan: Box<PhysicalPlan>) -> Option<PhysicalPlan> {
             Some(PhysicalPlan::Projection {
                 exprs,
                 child: Box::new(child),
+            })
+        }
+        // A residual filter over the point get (`update t set j=-j where i=1
+        // and j=1` → `Selection → Point_Get`) stays above the locking lookup.
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => {
+            let child = lock_point_get(child)?;
+            Some(PhysicalPlan::Selection {
+                child: Box::new(child),
+                filter,
+                est_rows,
             })
         }
         _ => None,
@@ -17849,6 +18183,15 @@ fn self_join_star_projection(
         && bare_access(left_child, &left_table)
         && bare_access(right_child, &right_table);
     if probe_matches {
+        // TiDB's join reorder starts from the smallest table. When the build
+        // (FROM-second) side is strictly cheaper the reordered join schema no
+        // longer matches the `select *` order, so the Projection survives:
+        // `t1.b = t2.b AND t2.b IS NULL` keeps it, an even `t1.v = t2.v` not.
+        let probe_rows = super::explain::est_rows(left_child);
+        let build_rows = super::explain::est_rows(right_child);
+        if build_rows < probe_rows {
+            return wrap_star_join_projection(plan, select, is, current_db);
+        }
         return plan;
     }
     wrap_star_join_projection(plan, select, is, current_db)
@@ -18417,6 +18760,19 @@ fn access_plan_inner(
                 }
             }
         }
+        // `_tidb_rowid` is the row handle of a heap table (no integer PRIMARY
+        // KEY and no common handle). TiDB seeks it like an integer handle:
+        // `Point_Get` for an equality, a `TableRangeScan` for a range, and it
+        // prunes the hidden handle back out in the cop task.
+        if !info.pk_is_handle
+            && !info.common_handle
+            && from.use_indexes.is_empty()
+            && let Some(selection) = select.selection.as_ref()
+            && let Some(plan) =
+                rowid_access_plan(select, from, info, selection, stats, current_db, prune_mode)
+        {
+            return plan;
+        }
         // Only an integer clustered PRIMARY KEY is the row handle; a plain
         // first column (`= const`) is a filter, not a point get.
         let handle_col = if info.pk_is_handle {
@@ -18714,17 +19070,20 @@ fn access_plan_inner(
         if let Some(plan) = group_by_index_plan(select, from, info, prune_mode, &join_keys) {
             return plan;
         }
-        // Plain column projection fully covered by a secondary index →
-        // IndexReader when TiDB's row-size cost model prefers it. A covering
-        // index only pays off once it is narrower than the row it replaces:
-        // both sides read the same rows, so the plan costs differ only in the
-        // average row size TiDB charges them.
+        // Plain column projection fully covered by a secondary index (or by a
+        // non-clustered `PRIMARY`, which is an ordinary unique index on a heap
+        // table) → IndexReader when TiDB's row-size cost model prefers it. A
+        // covering index only pays off once it is narrower than the row it
+        // replaces: both sides read the same rows, so the plan costs differ
+        // only in the average row size TiDB charges them.
         if is_plain_projection(select) {
             let needed = select_needed_columns(select, Some(&from.name));
             if let Some(index) = info
                 .indices
                 .iter()
-                .filter(|idx| !idx.primary && !index_ignored(from, idx.name.o()))
+                .filter(|idx| {
+                    !(idx.primary && info.pk_is_clustered()) && !index_ignored(from, idx.name.o())
+                })
                 .find(|idx| {
                     index_covers_needed(idx, select, &join_keys, info, from)
                         && covering_index_beats_scan(info, idx, &needed)
@@ -18835,6 +19194,217 @@ fn handle_scan_range_residual(
         return None;
     }
     Some((sealdb_statistics::pseudo::ranges_text(&ranges), residual))
+}
+
+/// Access path for `_tidb_rowid`, the row handle of a heap table (TiDB
+/// `TableScan` on a non-clustered handle).
+///
+/// - `_tidb_rowid = 0` → `Point_Get` (`handle:0`).
+/// - `_tidb_rowid > 0` → `TableRangeScan`; the hidden handle is pruned in the
+///   cop task (`data:Projection`), and TiDB keeps the rowid comparison as a
+///   cop filter (0.8) on top of the range estimate.
+///
+/// The range estimate follows TiDB's `GetRowCountByTableRanges`: a range that
+/// covers the whole rowid domain (`rowid > 0`, rowids start at 1) keeps the
+/// table count; other conjuncts multiply their pseudo selectivity into the
+/// access cardinality and stay a cop `Selection`.
+fn rowid_access_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    selection: &ExprNode,
+    stats: Option<&Handle>,
+    current_db: &str,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let mut ranges: Vec<sealdb_statistics::pseudo::Bounds> = Vec::new();
+    let mut rowid_conjuncts: Vec<ExprNode> = Vec::new();
+    let mut residual: Vec<ExprNode> = Vec::new();
+    for item in selection.split_cnf() {
+        // `not(isnull(_tidb_rowid))` is implied by the handle itself.
+        if not_isnull_column(&item).is_some_and(|c| c.eq_ignore_ascii_case("_tidb_rowid")) {
+            continue;
+        }
+        match sealdb_statistics::pseudo::conjunct_bound_sets(&item) {
+            Some((name, sets)) if name.eq_ignore_ascii_case("_tidb_rowid") => {
+                if ranges.is_empty() {
+                    ranges = sets;
+                } else {
+                    sealdb_statistics::pseudo::intersect_sets(&mut ranges, &sets);
+                }
+                if ranges.is_empty() {
+                    return None;
+                }
+                rowid_conjuncts.push(item);
+            }
+            _ => residual.push(item),
+        }
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    let point = match ranges.as_slice() {
+        [(Some((low, _)), Some((high, _)))] if low.compare(high) == std::cmp::Ordering::Equal => {
+            datum_as_handle(low)
+        }
+        _ => None,
+    };
+    // A lone rowid equality is a point get; a residual predicate would need a
+    // Selection above it, which this path does not model.
+    if let Some(handle) = point {
+        if residual.is_empty() {
+            return Some(PhysicalPlan::PointGet {
+                table: from.resolve_name().to_string(),
+                handle: Some(handle),
+                index: None,
+                index_columns: Vec::new(),
+                partition_names: Vec::new(),
+                global_index: false,
+                lock: false,
+                common_handle: false,
+            });
+        }
+        return None;
+    }
+    if ranges
+        .iter()
+        .all(|(low, high)| low.is_none() && high.is_none())
+    {
+        // `_tidb_rowid` unbounded on both sides filters nothing.
+        return None;
+    }
+    // A keyed access path for a residual predicate wins over the rowid range.
+    if !residual.is_empty() && residual_has_index_path(info, from, &residual) {
+        return None;
+    }
+    let total = table_row_count(stats, from, current_db);
+    let range_rows = if ranges.len() == 1 && rowid_range_covers_handle(&ranges[0]) {
+        total
+    } else {
+        sealdb_statistics::pseudo::filter_rows(&rowid_conjuncts, total)
+    };
+    let residual_ratio = if residual.is_empty() {
+        1.0
+    } else {
+        sealdb_statistics::pseudo::filter_rows(&residual, total) / total
+    };
+    let access_rows = (range_rows * residual_ratio).clamp(0.0, total);
+    // TiDB keeps the rowid comparison as a cop filter, so the operators above
+    // the range report the selection factor (0.8) of that filter.
+    let post_rows = access_rows * sealdb_statistics::pseudo::SELECTION_FACTOR;
+    let residual_filter =
+        sealdb_parser::ast::expressions::ExprNode::compose_cnf(residual.clone());
+    let mut plan = partitioned_table_reader(
+        from,
+        info,
+        // The range covers the rowid; only the residual conjuncts stay a cop
+        // Selection (the EXPLAIN shape is carried by `range_scan`).
+        residual_filter.as_ref(),
+        prune_mode,
+        stats,
+        current_db,
+    );
+    if let PhysicalPlan::TableReader {
+        row_count,
+        filter_est,
+        range_scan,
+        ..
+    } = &mut plan
+    {
+        *row_count = access_rows;
+        *filter_est = Some(post_rows);
+        let mut shape = sealdb_statistics::pseudo::ranges_text(&ranges);
+        if let Some(proj) = rowid_cop_projection(select, from, info, current_db) {
+            shape.push('\u{1}');
+            shape.push_str("PROJ:");
+            shape.push_str(&proj);
+        }
+        if let Some(filter) = residual_filter {
+            shape.push('\u{1}');
+            shape.push_str("SEL:");
+            shape.push_str(&super::explain::explain_pushed_filter(&from.name, &filter));
+        }
+        shape.push('\u{1}');
+        shape.push_str(&format!("SCAN:{access_rows}"));
+        *range_scan = Some(shape);
+    }
+    Some(plan)
+}
+
+/// A rowid range that starts at (or below) the first row handle and has no
+/// upper bound covers every row: rowids are allocated from 1 upwards.
+fn rowid_range_covers_handle(range: &sealdb_statistics::pseudo::Bounds) -> bool {
+    let (low, high) = range;
+    if high.is_some() {
+        return false;
+    }
+    match low {
+        None => true,
+        Some((value, _)) => match value {
+            Datum::I64(v) => *v <= 0,
+            Datum::U64(v) => *v == 0,
+            Datum::F64(v) => *v <= 0.0,
+            _ => false,
+        },
+    }
+}
+
+/// Cop `Projection` that prunes the hidden `_tidb_rowid` handle
+/// (`db.table.col, …`), or `None` when the statement selects the rowid itself.
+fn rowid_cop_projection(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    current_db: &str,
+) -> Option<String> {
+    let fields_mention_rowid = select.fields.iter().any(|field| {
+        field
+            .expr
+            .referenced_columns()
+            .iter()
+            .any(|(_, name)| name.eq_ignore_ascii_case("_tidb_rowid"))
+    });
+    if fields_mention_rowid {
+        return None;
+    }
+    let schema = schema_prefix(current_db);
+    let table = from.resolve_name();
+    let mut columns: Vec<String> = Vec::new();
+    if is_star_select(select) {
+        columns = info
+            .columns
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| format!("{schema}.{table}.{}", c.name.o()))
+            .collect();
+    } else {
+        let mut wanted: Vec<String> = Vec::new();
+        for field in &select.fields {
+            for (_, name) in field.expr.referenced_columns() {
+                if info
+                    .columns
+                    .iter()
+                    .any(|c| c.name.o().eq_ignore_ascii_case(&name))
+                    && !wanted.iter().any(|w| w.eq_ignore_ascii_case(&name))
+                {
+                    wanted.push(name);
+                }
+            }
+        }
+        // Table column order, as the cop projection lists the pruned schema.
+        for col in info.columns.iter().filter(|c| !c.hidden) {
+            if wanted
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(col.name.o()))
+            {
+                columns.push(format!("{schema}.{table}.{}", col.name.o()));
+            }
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(columns.join(", "))
 }
 
 /// CNF conjuncts that bound the handle column (the access range of a clustered

@@ -262,11 +262,19 @@ fn push_into(
                     .unwrap_or_else(|| {
                         // TiDB sizes the `TableRowIDScan`'s filter from the
                         // table's column statistics (`cardinality.Selectivity`),
-                        // so `c3 < 1` keeps its pseudo range rate over the rows
-                        // the index range produced.
-                        let sel =
+                        // so `c3 < 1` keeps its range rate over the rows the
+                        // index range produced. Analyzed statistics win over the
+                        // pseudo rates (`not(isnull(not_null_col))` is 1.0, not
+                        // the `9990/10000` MinNotNull pseudo estimate).
+                        let sel = super::planbuilder::stats_filter_selectivity(
+                            table_info.as_deref(),
+                            super::planbuilder::statement_stats(&table).as_ref(),
+                            filter,
+                        )
+                        .or_else(|| {
                             sealdb_statistics::pseudo::selectivity(&probe_side, 10_000.0, None)
-                                .unwrap_or(1.0);
+                        })
+                        .unwrap_or(1.0);
                         probe_base * sel
                     })
             });
@@ -442,11 +450,19 @@ fn push_into(
         } => {
             // Only the equality on the handle column itself is consumed by a
             // handle point get (`a = 1 AND b = 1` keeps `b = 1` as a filter).
+            // A heap table's handle is the hidden `_tidb_rowid`; `handle_column()`
+            // returns its first integer column instead, so name the rowid.
             let handle_column = (handle.is_some() && index.is_none())
                 .then(|| {
-                    statement_table_info(is, current_db, &table)
-                        .and_then(|info| info.handle_column())
-                        .map(|c| c.name.o().to_string())
+                    statement_table_info(is, current_db, &table).and_then(|info| {
+                        if info.pk_is_handle {
+                            info.handle_column().map(|c| c.name.o().to_string())
+                        } else if info.common_handle {
+                            None
+                        } else {
+                            Some("_tidb_rowid".to_string())
+                        }
+                    })
                 })
                 .flatten();
             let key_columns = point_get_key_columns(

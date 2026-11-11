@@ -2173,6 +2173,25 @@ fn emit_cop_children(
                 };
                 let mut range_depth = scan_depth;
                 let post_est = est_rows(plan) * apply_factor.max(1.0);
+                // TiDB prunes the hidden `_tidb_rowid` handle of a heap table in
+                // the cop task: `data:Projection → Projection(cop) → scan`.
+                if let Some(proj) = shape.projection {
+                    push_explain_row_spine(
+                        rows,
+                        range_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Projection",
+                            est: post_est,
+                            task: scan_task,
+                            access: String::new(),
+                            info: proj.to_string(),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    range_depth += 1;
+                }
                 if let Some((offset, count)) = shape.cop_limit {
                     let est = post_est.min((offset + count) as f64);
                     push_explain_row_spine(
@@ -4112,6 +4131,9 @@ fn limit_build_marker(selection_info: &str) -> Option<(u64, u64)> {
 /// never contains that separator.
 struct RangeScanShape<'a> {
     text: &'a str,
+    /// Cop `Projection` above the range scan (TiDB prunes the hidden
+    /// `_tidb_rowid` handle of a heap table in the cop task).
+    projection: Option<&'a str>,
     selection: Option<&'a str>,
     scan_rows: Option<f64>,
     cop_limit: Option<(u64, u64)>,
@@ -4122,12 +4144,15 @@ fn split_range_scan(raw: &str) -> RangeScanShape<'_> {
     let text = parts.next().unwrap_or(raw);
     let mut shape = RangeScanShape {
         text,
+        projection: None,
         selection: None,
         scan_rows: None,
         cop_limit: None,
     };
     for part in parts {
-        if let Some(sel) = part.strip_prefix("SEL:") {
+        if let Some(proj) = part.strip_prefix("PROJ:") {
+            shape.projection = Some(proj);
+        } else if let Some(sel) = part.strip_prefix("SEL:") {
             shape.selection = Some(sel);
         } else if let Some(rows) = part.strip_prefix("SCAN:") {
             shape.scan_rows = rows.parse().ok();
@@ -4333,14 +4358,17 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             )
         }
         ExprNode::Cast(c) => {
-            let target = if c.target.to_ascii_uppercase().contains("DOUBLE") {
-                "double BINARY"
-            } else if c.target.to_ascii_uppercase().contains("CHAR")
-                || c.target.to_ascii_uppercase().contains("STRING")
+            let upper = c.target.to_ascii_uppercase();
+            let target = if upper.contains("DOUBLE") || upper == "FLOAT8" {
+                "double BINARY".to_string()
+            } else if upper.contains("CHAR")
+                || upper.contains("STRING")
+                || upper.contains("BINARY")
             {
-                "var_string(370)"
+                "var_string(370)".to_string()
             } else {
-                "binary"
+                // TiDB prints the field type name plus the BINARY flag.
+                format!("{} BINARY", c.target.to_ascii_lowercase())
             };
             format!("cast({}, {target})", explain_scalar_expr(&c.expr, table))
         }
@@ -4647,6 +4675,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
                     .is_some_and(|raw| split_range_scan(raw).cop_limit.is_some())
             {
                 "data:Limit".to_string()
+            } else if range_scan
+                .as_deref()
+                .is_some_and(|raw| split_range_scan(raw).projection.is_some())
+            {
+                "data:Projection".to_string()
             } else if cop_projection_pending().is_some() {
                 "data:Projection".to_string()
             } else if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {

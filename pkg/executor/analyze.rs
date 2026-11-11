@@ -185,8 +185,19 @@ fn collect_column_stats(
         let max_buckets = buckets
             .map(|n| n as usize)
             .unwrap_or(Table::DEFAULT_HIST_BUCKETS);
-        let histogram = Some(Histogram::from_sorted(&values, max_buckets));
         let counts: Vec<(String, u64)> = freq.into_iter().collect();
+        // TiDB `BuildHistAndTopN`: when the TopN already holds every distinct
+        // value (`haveAllNDV`) no bucket is built, so the histogram keeps only
+        // the NDV/null metadata and every estimate comes from the TopN rows
+        // (`analyze table t all columns with 1 buckets` over 4 distinct values).
+        let histogram = Some(if distinct.len() <= Table::DEFAULT_TOPN {
+            Histogram {
+                ndv: distinct.len() as u64,
+                buckets: Vec::new(),
+            }
+        } else {
+            Histogram::from_sorted(&values, max_buckets)
+        });
         let topn = Some(TopN::from_counts(&counts, Table::DEFAULT_TOPN));
         // Planner selectivity for partition pruning needs exact counts; keep
         // them only for narrow columns.

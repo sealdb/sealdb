@@ -258,6 +258,38 @@ impl ColumnStats {
         }
         Some(total)
     }
+
+    /// Rows the TopN records inside `[lower, upper]`.
+    ///
+    /// TiDB `TopN.BetweenCount`: with version-2 statistics the TopN rows are
+    /// held out of the histogram, so a range estimate is exactly the frequent
+    /// values it covers.
+    pub fn topn_range_row_count(
+        &self,
+        lower: Option<(&Datum, bool)>,
+        upper: Option<(&Datum, bool)>,
+    ) -> f64 {
+        let Some(topn) = &self.topn else {
+            return 0.0;
+        };
+        let lo = lower.map(|(d, inc)| (datum_key(d), inc));
+        let hi = upper.map(|(d, inc)| (datum_key(d), inc));
+        let order = key_order(&topn.items, lo.as_ref(), hi.as_ref());
+        topn
+            .items
+            .iter()
+            .filter(|(key, _)| {
+                lo.as_ref().is_none_or(|(lo_key, inc)| {
+                    let ord = compare_keys(order, key, lo_key);
+                    ord == Ordering::Greater || (ord == Ordering::Equal && *inc)
+                }) && hi.as_ref().is_none_or(|(hi_key, inc)| {
+                    let ord = compare_keys(order, key, hi_key);
+                    ord == Ordering::Less || (ord == Ordering::Equal && *inc)
+                })
+            })
+            .map(|(_, count)| *count as f64)
+            .sum()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

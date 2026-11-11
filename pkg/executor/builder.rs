@@ -1125,20 +1125,21 @@ impl ExecutorBuilder {
                 .iter()
                 .map(|&i| {
                     let c = &exec.schema()[i];
-                    let Some((prefix, name)) = c.rsplit_once('.') else {
-                        return c.clone();
-                    };
+                    let parts: Vec<&str> = c.split('.').collect();
                     let simple = |s: &str| {
                         !s.is_empty()
                             && s.chars()
                                 .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')
                     };
-                    let ident_start = prefix
-                        .chars()
-                        .next()
+                    let ident_start = parts
+                        .first()
+                        .and_then(|p| p.chars().next())
                         .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '$');
-                    if ident_start && simple(prefix) && simple(name) {
-                        name.to_string()
+                    // Physical table columns may carry `db.table.col` (a
+                    // partitioned table's OrigTblName keeps the real name);
+                    // MySQL/TiDB result labels are the bare column name.
+                    if parts.len() >= 2 && ident_start && parts.iter().all(|p| simple(p)) {
+                        parts.last().copied().unwrap_or(c).to_string()
                     } else {
                         c.clone()
                     }

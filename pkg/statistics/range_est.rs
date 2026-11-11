@@ -527,7 +527,15 @@ impl ColumnStats {
     ) -> Option<f64> {
         let hist = self.histogram.as_ref()?;
         if hist.buckets.is_empty() {
-            return None;
+            // TopN-only statistics (`BuildHistAndTopN` skips bucket building
+            // when the TopN holds every distinct value): the range estimate is
+            // `TopN.BetweenCount`, clamped like TiDB
+            // (`GetColumnRowCount` keeps at least one row).
+            let count = self.topn_range_row_count(
+                range.low.as_ref().map(|(d, inc)| (d, *inc)),
+                range.high.as_ref().map(|(d, inc)| (d, *inc)),
+            );
+            return Some(count.clamp(1.0, realtime.max(1.0)));
         }
         let notnull = hist.not_null_count();
         let equal = |value: &Datum| -> f64 {

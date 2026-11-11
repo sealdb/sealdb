@@ -642,6 +642,17 @@ pub fn selectivity(conjuncts: &[ExprNode], table_rows: f64, handle: Option<&str>
             // `not(isnull(col))` seeks `(MinNotNull, MaxValue)` on the column.
             (column, vec![(None, None)])
         } else if let Some((column, ranges)) = conjunct_bound_sets(conjunct) {
+            // A key that is not a real column of the predicate — a cast around
+            // the column (`cast(c, double) = 0`) reports its expression text —
+            // has no pseudo range: TiDB keeps the default selection factor.
+            if !conjunct
+                .referenced_columns()
+                .iter()
+                .any(|(_, name)| name.eq_ignore_ascii_case(&column))
+            {
+                total *= SELECTION_FACTOR;
+                continue;
+            }
             (column, ranges)
         } else if matches!(conjunct, ExprNode::Binary(bin) if bin.op == Op::LogicOr) {
             dnf.push(conjunct.clone());

@@ -253,7 +253,11 @@ fn try_compare_as_time(
                     t = utc_to_session_local(t)?;
                     t.tp = TimeType::Datetime;
                 }
-                Ok(Some((t, false, was_ts)))
+                // A folded DATETIME value (`'2025-03-30 02:00:00'` typed from
+                // the compared TIMESTAMP column's type) keeps its wall clock,
+                // so it can still sit in the DST gap.
+                let gap = !was_ts && is_dst_gap_wall(&t);
+                Ok(Some((t, gap, was_ts)))
             }
             Datum::Bytes(b) => {
                 let s = String::from_utf8_lossy(b);
