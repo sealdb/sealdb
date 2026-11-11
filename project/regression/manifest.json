@@ -1141,12 +1141,15 @@
       "result": "r/explain_easy.result",
       "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner/core,distsql,store/copr"
+      "owner_hint": "planner/core,distsql,store/copr",
+      "session_init": [
+        "set @@session.tidb_enable_clustered_index = 'int_only'"
+      ]
     },
     {
       "name": "explain_easy_stats",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_easy_stats.test",
       "result": "r/explain_easy_stats.result",
       "has_result": true,
