@@ -208,7 +208,10 @@ pub enum IndexPart {
     Column(String),
     /// MySQL prefix index part (`KEY idx (b(10))`): only the first `length`
     /// bytes of the column take part in the key (`model.IndexColumn.Length`).
-    Prefix { name: String, length: i32 },
+    Prefix {
+        name: String,
+        length: i32,
+    },
     /// TiDB expression index part. The text is `field.Text()` spelling, which
     /// is what `SHOW CREATE TABLE` / `information_schema.tidb_indexes` render.
     Expression(String),

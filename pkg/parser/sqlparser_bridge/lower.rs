@@ -10606,9 +10606,7 @@ fn index_part(col: &sqlparser::ast::IndexColumn) -> Result<IndexPart> {
         // length so DDL can record it on `model.IndexColumn.Length`.
         Expr::Function(f) => {
             let prefix_length = match &f.args {
-                sqlparser::ast::FunctionArguments::List(list)
-                    if list.args.len() == 1 =>
-                {
+                sqlparser::ast::FunctionArguments::List(list) if list.args.len() == 1 => {
                     match list.args.first() {
                         Some(sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
