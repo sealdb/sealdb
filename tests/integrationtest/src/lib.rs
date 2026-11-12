@@ -679,10 +679,29 @@ fn open_storage(backend: StoreBackend, pd: Option<&str>) -> Result<Arc<dyn seald
 fn new_session(storage: Arc<dyn sealdb_kv::Storage>) -> Session {
     // Privilege tables are live so `connect (...)` sessions run as the named
     // user (EXPLAIN/SHOW VIEW privilege checks). root holds global ALL.
-    Session::with_domain(Arc::new(
+    let session = Session::with_domain(Arc::new(
         Domain::with_storage_and_grant_table_id_base(storage, unique_id_base())
             .expect("domain meta load"),
-    ))
+    ));
+    init_driver_session(&session);
+    session
+}
+
+/// Session state TiDB's `mysql-tester` installs on every connection before it
+/// runs the corpus (`initConn` in mysql-tester/src/main.go). Goldens encode the
+/// resulting state, so a fresh SealDB session has to start out the same way:
+///
+/// - `tidb_enable_clustered_index = 'int_only'`: a non-integer PRIMARY KEY
+///   (`binary(2)`) stays a secondary unique index, so `EXPLAIN` prints
+///   `table:t, index:PRIMARY(a)` instead of `clustered index:PRIMARY(a)`.
+fn init_driver_session(session: &Session) {
+    if let Err(err) = session.execute_stmt("SET @@session.tidb_enable_clustered_index = 'int_only'")
+    {
+        eprintln!(
+            "[warn] session default tidb_enable_clustered_index: {} ({})",
+            err.message, err.code
+        );
+    }
 }
 
 pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<String> {
@@ -724,6 +743,7 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
                 SessionDirective::Connect { name, user, db } => {
                     sessions.entry(name.clone()).or_insert_with(|| {
                         let session = Session::with_domain(Arc::clone(&domain));
+                        init_driver_session(&session);
                         if !user.is_empty() {
                             session.set_current_user(sealdb_parser::ast::UserIdentity::new(
                                 user.clone(),
@@ -846,6 +866,18 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                         }
                     }
                 }
+                // TiDB applies `--replace_regex` to every cell, so a pattern
+                // anchored with `.*` collapses that column only
+                // (`.*num_rpc.*` → `<execution info>` stays in its row).
+                for row in &mut rows {
+                    for cell in row.iter_mut() {
+                        for (re, replacement) in &step.replace_regex {
+                            if re.is_match(cell) {
+                                *cell = re.replace_all(cell, replacement.as_str()).into_owned();
+                            }
+                        }
+                    }
+                }
                 for row in rows {
                     lines.push(row.join("\t"));
                 }
@@ -861,8 +893,12 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
                 lines.push(format!("info: {}", qr.info));
             }
             let mut out = lines.join("\n");
-            for (re, replacement) in &step.replace_regex {
-                out = re.replace_all(&out, replacement.as_str()).into_owned();
+            // The echoed SQL / warnings are not cells: keep TiDB's text pass
+            // for them only.
+            if !step.replace_regex.is_empty() && (step.show_warnings || step.show_info) {
+                for (re, replacement) in &step.replace_regex {
+                    out = re.replace_all(&out, replacement.as_str()).into_owned();
+                }
             }
             Ok(out)
         }

@@ -936,7 +936,7 @@
     {
       "name": "executor/point_get",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/point_get.test",
       "result": "r/executor/point_get.result",
       "has_result": true,

@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-12（green 38 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-12（green 39 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -26,7 +26,7 @@
 | infra | import + record + runner + fail-lock | `done` | `import_tidb_itest.sh` / `record_tidb_itest.sh` / manifest |
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
-| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；10 套件 `in_progress` |
+| R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/point_get` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；9 套件 `in_progress` |
 | R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
