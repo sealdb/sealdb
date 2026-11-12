@@ -95,6 +95,10 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     /// Explicit `NOT NULL` (or PRIMARY KEY implied) column option.
     pub not_null: bool,
+    /// Column `CHARACTER SET <name>` (TiDB `FieldType.Charset`).
+    pub charset: Option<String>,
+    /// Column `COLLATE <name>` (TiDB `FieldType.Collate`).
+    pub collate: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +112,14 @@ impl ColumnDef {
         ctx.write_name(&self.name);
         ctx.write_str(" ");
         ctx.write_str(&self.type_name);
+        if let Some(charset) = &self.charset {
+            ctx.write_str(" CHARACTER SET ");
+            ctx.write_str(charset);
+        }
+        if let Some(collate) = &self.collate {
+            ctx.write_str(" COLLATE ");
+            ctx.write_str(collate);
+        }
         if let Some(default) = &self.default {
             ctx.write_str(" DEFAULT ");
             ctx.write_str(default);
@@ -194,6 +206,9 @@ impl AlterDatabaseStmt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexPart {
     Column(String),
+    /// MySQL prefix index part (`KEY idx (b(10))`): only the first `length`
+    /// bytes of the column take part in the key (`model.IndexColumn.Length`).
+    Prefix { name: String, length: i32 },
     /// TiDB expression index part. The text is `field.Text()` spelling, which
     /// is what `SHOW CREATE TABLE` / `information_schema.tidb_indexes` render.
     Expression(String),
@@ -204,22 +219,37 @@ impl IndexPart {
         Self::Column(name.into())
     }
 
+    pub fn prefix(name: impl Into<String>, length: i32) -> Self {
+        Self::Prefix {
+            name: name.into(),
+            length,
+        }
+    }
+
     pub fn expression(text: impl Into<String>) -> Self {
         Self::Expression(text.into())
     }
 
-    /// Column name for a plain part, `None` for an expression part.
+    /// Column name for a plain (or prefix) part, `None` for an expression part.
     pub fn column_name(&self) -> Option<&str> {
         match self {
-            Self::Column(name) => Some(name),
+            Self::Column(name) | Self::Prefix { name, .. } => Some(name),
             Self::Expression(_) => None,
+        }
+    }
+
+    /// Prefix length of a `col(N)` key part (`-1` for a full-column part).
+    pub fn prefix_length(&self) -> i32 {
+        match self {
+            Self::Prefix { length, .. } => *length,
+            _ => -1,
         }
     }
 
     /// Expression text for an expression part.
     pub fn as_expression(&self) -> Option<&str> {
         match self {
-            Self::Column(_) => None,
+            Self::Column(_) | Self::Prefix { .. } => None,
             Self::Expression(text) => Some(text),
         }
     }
@@ -281,6 +311,12 @@ impl IndexDef {
             }
             match col {
                 IndexPart::Column(name) => ctx.write_name(name),
+                IndexPart::Prefix { name, length } => {
+                    ctx.write_name(name);
+                    ctx.write_str("(");
+                    ctx.write_str(&length.to_string());
+                    ctx.write_str(")");
+                }
                 // TiDB wraps an expression index part in an extra paren pair:
                 // `KEY idx ((`a` + 1))`.
                 IndexPart::Expression(text) => {
@@ -695,6 +731,12 @@ impl CreateIndexStmt {
             }
             match col {
                 IndexPart::Column(name) => ctx.write_name(name),
+                IndexPart::Prefix { name, length } => {
+                    ctx.write_name(name);
+                    ctx.write_str("(");
+                    ctx.write_str(&length.to_string());
+                    ctx.write_str(")");
+                }
                 IndexPart::Expression(text) => {
                     ctx.write_str("(");
                     ctx.write_str(text);

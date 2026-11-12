@@ -40,7 +40,7 @@ pub(crate) fn resolve_index_parts(
     let mut columns = Vec::with_capacity(parts.len());
     for (pos, part) in parts.iter().enumerate() {
         match part {
-            IndexPart::Column(name) => {
+            IndexPart::Column(name) | IndexPart::Prefix { name, .. } => {
                 let col = info
                     .columns
                     .iter()
@@ -51,7 +51,9 @@ pub(crate) fn resolve_index_parts(
                             format!("Unknown column '{name}' in index '{index_name}'"),
                         )
                     })?;
-                columns.push(IndexColumn::new(col.name.o(), col.offset));
+                let mut ic = IndexColumn::new(col.name.o(), col.offset);
+                ic.length = part.prefix_length();
+                columns.push(ic);
             }
             IndexPart::Expression(text) => {
                 let name = hidden_column_name(index_name, pos);

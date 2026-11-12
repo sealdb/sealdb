@@ -64,8 +64,16 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
     let projection_texts = capture_select_projections(sql);
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
+    // comments are expanded (the "T" comment is otherwise an ordinary comment).
+    let rewritten = rewrite_tidb_clustered_comment(&rewritten);
     // Expand MySQL `/*!50100 ... */` version comments so PARTITION/options parse.
     let rewritten = rewrite_mysql_version_comments(&rewritten);
+    // TiDB `int1`…`int4` type aliases: sqlparser only knows the canonical names,
+    // and a Custom type cannot take `UNSIGNED`.
+    let rewritten = rewrite_integer_type_aliases(&rewritten);
+    // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
+    let rewritten = rewrite_mysql_column_charset(&rewritten);
     // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
     // would otherwise drop the trailing visibility keyword.
     let rewritten = rewrite_alter_index_visibility(&rewritten);
@@ -1048,6 +1056,100 @@ const RENAME_INDEX_SEP: char = '\u{1f}';
 /// sqlparser has no `ADMIN SHOW DDL JOBS`; rewrite to SHOW TABLES FROM a marker schema.
 /// sqlparser MySQL dialect has no `ALTER TABLE t RENAME INDEX`. Rewrite to a
 /// marked `RENAME COLUMN` that `lower_alter_spec` turns back into RenameIndex.
+/// TiDB `int1`…`int4` column type aliases → the canonical MySQL names
+/// sqlparser understands (a `DataType::Custom` cannot take `UNSIGNED`).
+fn rewrite_integer_type_aliases(sql: &str) -> String {
+    const ALIASES: [(&str, &str); 4] = [
+        ("int1", "tinyint"),
+        ("int2", "smallint"),
+        ("int3", "mediumint"),
+        ("int4", "int"),
+    ];
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if let Some((alias, canonical)) = ALIASES
+            .iter()
+            .find(|(alias, _)| keyword_at(bytes, i, alias))
+        {
+            out.push_str(canonical);
+            i += alias.len();
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// MySQL column option `a varchar(255) CHARSET gbk` → `CHARACTER SET gbk`
+/// (sqlparser's column option spelling). A table option keeps its `=` form.
+fn rewrite_mysql_column_charset(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "charset") {
+            let after = skip_ws(bytes, i + "charset".len());
+            if after < bytes.len() && bytes[after] != b'=' {
+                out.push_str("CHARACTER SET");
+                i += "charset".len();
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_rename_index(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 24);
@@ -1110,6 +1212,23 @@ fn rewrite_primary_key_nonclustered(sql: &str) -> String {
             let after_pk = skip_ws(bytes, i + "PRIMARY".len());
             if keyword_at(bytes, after_pk, "KEY") {
                 let after_key = skip_ws(bytes, after_pk + "KEY".len());
+                // Column-level `a int PRIMARY KEY CLUSTERED`: no column list, so
+                // the marker rides on a column COMMENT option recovered in
+                // `lower_create_table`.
+                if let Some(marker) = if keyword_at(bytes, after_key, "NONCLUSTERED") {
+                    Some((NONCLUSTERED_MARKER, "NONCLUSTERED".len()))
+                } else if keyword_at(bytes, after_key, "CLUSTERED") {
+                    Some((CLUSTERED_MARKER, "CLUSTERED".len()))
+                } else {
+                    None
+                } {
+                    out.push_str(&sql[i..after_key]);
+                    out.push_str("COMMENT '");
+                    out.push_str(marker.0);
+                    out.push('\'');
+                    i = skip_ws(bytes, after_key + marker.1);
+                    continue;
+                }
                 // TiDB allows an index name between `KEY` and the column list
                 // (`PRIMARY KEY idx_0 (a, b) NONCLUSTERED`).
                 let after_key = if after_key < bytes.len() && bytes[after_key] != b'(' {
@@ -2233,6 +2352,64 @@ const SEALDB_BANG_FN: &str = "__sealdb_bang";
 /// Expand MySQL executable version comments `/*!NNNNN body */` → ` body `.
 /// Conditionally-compiled MySQL options (e.g. `PARTITION BY`) must be real SQL
 /// for sqlparser; SealDB always enables them (TiDB/MySQL ≥ 5.1 behavior).
+/// TiDB stores clustered-index choices for a primary key as a "T" comment
+/// (`/*T![clustered_index] clustered */`) rather than a keyword. Expand it into
+/// the keyword that [`rewrite_primary_key_nonclustered`] recognizes.
+fn rewrite_tidb_clustered_comment(sql: &str) -> String {
+    const PREFIX: &str = "/*T![clustered_index]";
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains(&PREFIX.to_ascii_lowercase()) {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let q = bytes[i];
+            out.push(q as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if q == b'\'' && ch == '\\' {
+                    if let Some(next) = sql[i..].chars().next() {
+                        out.push(next);
+                        i += next.len_utf8();
+                    }
+                    continue;
+                }
+                if ch == q as char {
+                    if i < bytes.len() && bytes[i] == q {
+                        out.push(q as char);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if lower[i..].starts_with(&PREFIX.to_ascii_lowercase())
+            && let Some(end) = lower[i..].find("*/")
+        {
+            let body = &lower[i + PREFIX.len()..i + end];
+            if body.contains("nonclustered") {
+                out.push_str(" NONCLUSTERED ");
+            } else {
+                out.push_str(" CLUSTERED ");
+            }
+            i += end + 2;
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_mysql_version_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -8854,6 +9031,26 @@ fn lower_not_null(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
     })
 }
 
+/// Column `CHARACTER SET <name>` option (TiDB `FieldType.Charset`).
+fn lower_column_charset(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::CharacterSet(name) => Some(object_name_text(name)),
+        _ => None,
+    })
+}
+
+/// Column `COLLATE <name>` option (TiDB `FieldType.Collate`).
+fn lower_column_collate(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::Collation(name) => Some(object_name_text(name)),
+        _ => None,
+    })
+}
+
+fn object_name_text(name: &ObjectName) -> String {
+    name.to_string().trim_matches('`').to_string()
+}
+
 fn lower_auto_increment(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
     options.iter().any(|opt| match &opt.option {
         sqlparser::ast::ColumnOption::DialectSpecific(tokens) => tokens.iter().any(|t| {
@@ -8891,6 +9088,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     }
     let mut cols = Vec::with_capacity(create.columns.len());
     let mut col_primary: Option<String> = None;
+    let mut col_pk_clustered = false;
+    let mut col_pk_nonclustered = false;
     for col in &create.columns {
         cols.push(ColumnDef {
             name: col.name.value.clone(),
@@ -8899,13 +9098,26 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             generated: lower_generated_column(&col.options)?,
             auto_increment: lower_auto_increment(&col.options),
             not_null: lower_not_null(&col.options),
+            charset: lower_column_charset(&col.options),
+            collate: lower_column_collate(&col.options),
         });
         for opt in &col.options {
-            if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)) {
-                if col_primary.is_some() {
-                    return Err(Error::unsupported("multiple column PRIMARY KEY"));
+            match &opt.option {
+                sqlparser::ast::ColumnOption::Comment(comment) if comment == CLUSTERED_MARKER => {
+                    col_pk_clustered = true;
                 }
-                col_primary = Some(col.name.value.clone());
+                sqlparser::ast::ColumnOption::Comment(comment)
+                    if comment == NONCLUSTERED_MARKER =>
+                {
+                    col_pk_nonclustered = true;
+                }
+                sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                    if col_primary.is_some() {
+                        return Err(Error::unsupported("multiple column PRIMARY KEY"));
+                    }
+                    col_primary = Some(col.name.value.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -8951,8 +9163,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     unique: true,
                     primary: true,
                     global: false,
-                    nonclustered: false,
-                    clustered: false,
+                    nonclustered: col_pk_nonclustered,
+                    clustered: col_pk_clustered && !col_pk_nonclustered,
                     invisible: false,
                 },
             );
@@ -10109,6 +10321,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 generated: lower_generated_column(&column_def.options)?,
                 auto_increment: lower_auto_increment(&column_def.options),
                 not_null: lower_not_null(&column_def.options),
+                charset: lower_column_charset(&column_def.options),
+                collate: lower_column_collate(&column_def.options),
             },
             position: lower_column_position(column_position),
         }),
@@ -10370,7 +10584,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
 /// an expression-only index is named `expression_index`.
 fn default_index_name(columns: &[IndexPart]) -> String {
     match &columns[0] {
-        IndexPart::Column(name) => name.clone(),
+        IndexPart::Column(name) | IndexPart::Prefix { name, .. } => name.clone(),
         IndexPart::Expression(_) => "expression_index".to_string(),
     }
 }
@@ -10388,36 +10602,37 @@ fn index_part(col: &sqlparser::ast::IndexColumn) -> Result<IndexPart> {
     };
     match expr {
         Expr::Identifier(ident) => Ok(IndexPart::Column(ident.value.clone())),
-        // MySQL prefix index `col(N)` parses as a function call; keep the name
-        // (prefix length is applied later in DDL / IndexColumn.length).
+        // MySQL prefix index `col(N)` parses as a function call; keep the
+        // length so DDL can record it on `model.IndexColumn.Length`.
         Expr::Function(f) => {
-            let is_prefix = match &f.args {
-                sqlparser::ast::FunctionArguments::List(list) => {
-                    list.args.len() == 1
-                        && matches!(
-                            list.args.first(),
-                            Some(sqlparser::ast::FunctionArg::Unnamed(
-                                sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
-                                    sqlparser::ast::ValueWithSpan {
-                                        value: Value::Number(_, _),
-                                        ..
-                                    }
-                                ))
-                            ))
-                        )
+            let prefix_length = match &f.args {
+                sqlparser::ast::FunctionArguments::List(list)
+                    if list.args.len() == 1 =>
+                {
+                    match list.args.first() {
+                        Some(sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+                                sqlparser::ast::ValueWithSpan {
+                                    value: Value::Number(n, _),
+                                    ..
+                                },
+                            )),
+                        )) => n.parse::<i32>().ok(),
+                        _ => None,
+                    }
                 }
-                _ => false,
+                _ => None,
             };
-            if !is_prefix {
+            let Some(length) = prefix_length else {
                 return Ok(IndexPart::expression(index_expr_text(expr)?));
-            }
+            };
             let raw = f.name.0.last().map(|p| p.to_string()).unwrap_or_default();
             // ObjectName Display may keep MySQL backticks (`col`).
             let name = raw.trim_matches('`').trim_matches('"').to_string();
             if name.is_empty() {
                 return Err(Error::unsupported(format!("INDEX column {f}")));
             }
-            Ok(IndexPart::Column(name))
+            Ok(IndexPart::prefix(name, length))
         }
         other => Ok(IndexPart::expression(index_expr_text(other)?)),
     }
