@@ -1,4 +1,4 @@
-use super::physical_plans::{DdlKind, IndexMergePath, JoinType, PhysicalPlan};
+use super::physical_plans::{DdlKind, IndexMergePath, IndexScanRange, JoinType, PhysicalPlan};
 use super::plan_cost::{
     eq_row_count_value, has_real_stats, index_lookup_cost, partition_filter_rows, point_get_cost,
     prefer_topn, table_row_count, table_scan_cost,
@@ -4362,8 +4362,23 @@ fn apply_limit_scan_scale(
     else {
         return plan;
     };
-    // Single base table only: joins and derived tables have their own readers.
-    if !select.joins.is_empty() || select.from_item.is_some() || !select.group_by.is_empty() {
+    // Join directly under `LIMIT`: TiDB splits the limit over the join's output
+    // (`ExpectedCnt = n / joinRows`) and pushes it into the probe side.
+    if !select.joins.is_empty() {
+        let expected = (offset + count) as f64;
+        let child = if expected > 0.0 {
+            scale_join_children_by_limit(*child, expected)
+        } else {
+            *child
+        };
+        return PhysicalPlan::Limit {
+            offset,
+            count,
+            child: Box::new(child),
+        };
+    }
+    // Single base table only: derived tables and aggregates have their own readers.
+    if select.from_item.is_some() || !select.group_by.is_empty() {
         return PhysicalPlan::Limit {
             offset,
             count,
@@ -4430,6 +4445,244 @@ fn apply_limit_scan_scale(
         count,
         child: Box::new(scaled),
     }
+}
+
+/// TiDB default `OptOrderingIdxSelRatio` (`-1`): `calcChildExpectedCnt` adds
+/// `(joinRows - outerRows) * ratio`, i.e. subtracts the join's growth factor
+/// instead of multiplying it.
+const LIMIT_JOIN_ORDER_RATIO: f64 = -1.0;
+
+/// TiDB `ExpectedCnt` pushdown into a join directly below `LIMIT`.
+///
+/// `LIMIT 5` over an unanalyzed equi-join (`joinRows = 12500`) only needs
+/// `5 / 12500` of the join output, so the probe side scans that fraction of its
+/// rows. For `IndexJoin` the outer side first becomes
+/// `outerRows * f + (joinRows - outerRows) * OptOrderingIdxSelRatio`
+/// (`10000 * 0.0004 - 2500 = 1.5`) and the inner side reuses the outer factor.
+fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPlan {
+    let join_rows = match &plan {
+        PhysicalPlan::HashJoin { est_rows, .. } | PhysicalPlan::MergeJoin { est_rows, .. } => {
+            match est_rows {
+                Some(est) => *est,
+                None => super::explain::est_rows(&plan),
+            }
+        }
+        PhysicalPlan::IndexJoin { est_rows, .. } => *est_rows,
+        _ => 0.0,
+    };
+    if !(join_rows.is_finite() && join_rows > 0.0) || expected >= join_rows {
+        return plan;
+    }
+    let factor = (expected / join_rows).clamp(0.0, 1.0);
+    match plan {
+        PhysicalPlan::HashJoin {
+            tp,
+            left,
+            right,
+            left_table,
+            right_table,
+            est_rows,
+            on,
+        } => PhysicalPlan::HashJoin {
+            tp,
+            // Build (right) keeps its cardinality; the limit stops the probe.
+            left: Box::new(scale_plan_rows(*left, factor)),
+            right,
+            left_table,
+            right_table,
+            est_rows,
+            on,
+        },
+        PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            left_key,
+            right_key,
+            tp,
+            est_rows,
+            info,
+            on,
+        } => PhysicalPlan::MergeJoin {
+            left: Box::new(scale_plan_rows(*left, factor)),
+            right: Box::new(scale_plan_rows(*right, factor)),
+            left_table,
+            right_table,
+            left_key,
+            right_key,
+            tp,
+            est_rows,
+            info,
+            on,
+        },
+        PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer,
+            inner,
+        } => {
+            let outer_rows = super::explain::est_rows(&outer).max(0.0);
+            let outer_factor = if outer_rows > 0.0 {
+                let scaled = outer_rows * factor
+                    + (join_rows - outer_rows).max(0.0) * LIMIT_JOIN_ORDER_RATIO;
+                (scaled.max(0.0) / outer_rows).clamp(0.0, 1.0)
+            } else {
+                factor
+            };
+            PhysicalPlan::IndexJoin {
+                info,
+                est_rows,
+                outer: Box::new(scale_plan_rows(*outer, outer_factor)),
+                inner: Box::new(scale_plan_rows(*inner, outer_factor)),
+            }
+        }
+        // `LIMIT` above a residual `Selection` / `Projection` still scales the
+        // join underneath.
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            child: Box::new(scale_join_children_by_limit(*child, expected)),
+            filter,
+            est_rows,
+        },
+        PhysicalPlan::Projection {
+            exprs,
+            est_rows,
+            child,
+        } => PhysicalPlan::Projection {
+            exprs,
+            est_rows,
+            child: Box::new(scale_join_children_by_limit(*child, expected)),
+        },
+        other => other,
+    }
+}
+
+/// Scale a scan's cardinality by `factor` for TiDB's `LIMIT` expected-count
+/// pushdown. Only the estimates change; the plan shape stays untouched.
+fn scale_plan_rows(plan: PhysicalPlan, factor: f64) -> PhysicalPlan {
+    if !(factor.is_finite() && factor > 0.0 && factor < 1.0) {
+        return plan;
+    }
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            filter_est,
+            range_scan,
+            keep_order,
+            data_limit,
+            pushed,
+        } => PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count: row_count * factor,
+            stats_pseudo,
+            filter_est: filter_est.map(|est| est * factor),
+            range_scan,
+            keep_order,
+            data_limit,
+            pushed,
+        },
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            pushed,
+            range_scan,
+        } => PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count: row_count * factor,
+            pushed,
+            range_scan: range_scan.map(|range| scale_range_rows(range, factor)),
+        },
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            selection_info,
+            probe_selection_info,
+            probe_est,
+            range_scan,
+            pushed,
+        } => PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count: row_count * factor,
+            selection_info,
+            probe_selection_info,
+            probe_est: if probe_est > 0.0 {
+                probe_est * factor
+            } else {
+                probe_est
+            },
+            range_scan: range_scan.map(|range| scale_range_rows(range, factor)),
+            pushed,
+        },
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            child: Box::new(scale_plan_rows(*child, factor)),
+            filter,
+            est_rows: est_rows.map(|est| est * factor),
+        },
+        PhysicalPlan::Projection {
+            exprs,
+            est_rows,
+            child,
+        } => PhysicalPlan::Projection {
+            exprs,
+            est_rows: est_rows.map(|est| est * factor),
+            child: Box::new(scale_plan_rows(*child, factor)),
+        },
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+            child: Box::new(scale_plan_rows(*child, factor)),
+            by_info,
+        },
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
+            child: Box::new(scale_plan_rows(*child, factor)),
+            by_info,
+            offset,
+            count,
+        },
+        other => other,
+    }
+}
+
+/// Scale the rows an index range produces (and the residual filter keeps).
+fn scale_range_rows(mut range: IndexScanRange, factor: f64) -> IndexScanRange {
+    range.rows *= factor;
+    range.filter_rows = (range.filter_rows * factor).min(range.rows);
+    range
 }
 
 /// Scale the single-table reader under a `LIMIT` (see [`apply_limit_scan_scale`]).
@@ -16904,6 +17157,40 @@ fn inl_join_hint_plan(
             outer_rows,
         ));
         let join_est = outer_rows * probe_rows / ndv.max(1.0);
+        // `LIMIT n` scales an IndexJoin's outer side by TiDB's
+        // `calcChildExpectedCnt`: `outerRows * n / joinRows` plus the ordering
+        // ratio term (`OptOrderingIdxSelRatio`, default -1, so the join's
+        // growth `joinRows - outerRows` is added back instead of subtracted).
+        // The inner probe then reads `outerExpected / ndv` of its rows per key.
+        let expected = match select.limit {
+            Some(count) => (count + select.offset.unwrap_or(0)) as f64,
+            None => 0.0,
+        };
+        let limited = expected > 0.0 && expected < join_est;
+        let outer_expected = if limited {
+            let rows_to_meet_first =
+                ((outer_rows - join_est) * LIMIT_JOIN_ORDER_RATIO).max(0.0);
+            outer_rows * (expected / join_est) + rows_to_meet_first
+        } else {
+            outer_rows
+        };
+        // TiDB multiplies the inner side by the probes it receives
+        // (`outerExpected / ndv`): `1.25 * 2504 = 3130`.
+        let probe_scale = outer_expected / ndv.max(1.0);
+        let outer_factor = if outer_rows > 0.0 {
+            outer_expected / outer_rows
+        } else {
+            1.0
+        };
+        let outer_plan = Box::new(scale_plan_rows(outer_plan, outer_factor));
+        // A covering index serves the probe without a `TableRowIDScan`.
+        let covering = index.columns.iter().all(|c| c.length < 0)
+            && inner_info.columns.iter().all(|col| {
+                index
+                    .columns
+                    .iter()
+                    .any(|c| c.name.o().eq_ignore_ascii_case(col.name.o()))
+            });
         // The decided range only encodes the join key: other equality
         // predicates seek their own index and stay probe-side.
         let probe_range = format!(
@@ -16918,40 +17205,54 @@ fn inl_join_hint_plan(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        let inner_plan = PhysicalPlan::IndexLookUpReader {
-            table: inner_tbl.clone(),
-            index: index.name.o().to_string(),
-            index_columns: index_key_column_names(&inner_info, index),
-            partitions: Vec::new(),
-            partition_access,
-            row_count: probe_rows,
-            selection_info: (!build_filters.is_empty()).then(|| build_filters.join(", ")),
-            probe_selection_info: probe_sel,
-            probe_est: probe_rows,
-            range_scan: Some(super::physical_plans::IndexScanRange {
-                text: probe_range,
-                rows: inner_rows,
-                filter_rows: build_rows,
-                pseudo: table_stats.is_none(),
-                partial: None,
-                keep_order: false,
-            }),
-            pushed: None,
+        let scan_range = super::physical_plans::IndexScanRange {
+            text: probe_range,
+            rows: inner_rows * probe_scale,
+            filter_rows: build_rows * probe_scale,
+            pseudo: table_stats.is_none(),
+            partial: None,
+            keep_order: false,
+        };
+        let inner_plan = if covering {
+            PhysicalPlan::IndexReader {
+                table: inner_tbl.clone(),
+                index: index.name.o().to_string(),
+                index_columns: index_key_column_names(&inner_info, index),
+                partitions: Vec::new(),
+                partition_access,
+                row_count: probe_rows * probe_scale,
+                pushed: None,
+                range_scan: Some(scan_range),
+            }
+        } else {
+            PhysicalPlan::IndexLookUpReader {
+                table: inner_tbl.clone(),
+                index: index.name.o().to_string(),
+                index_columns: index_key_column_names(&inner_info, index),
+                partitions: Vec::new(),
+                partition_access,
+                row_count: probe_rows * probe_scale,
+                selection_info: (!build_filters.is_empty()).then(|| build_filters.join(", ")),
+                probe_selection_info: probe_sel,
+                probe_est: probe_rows * probe_scale,
+                range_scan: Some(scan_range),
+                pushed: None,
+            }
         };
         let (outer_keys, inner_keys, equal_cond) = join_keys(&outer_name, &inner_name);
-        return Some(wrap_scalar_count_agg(
-            select,
-            current_db,
-            is,
-            PhysicalPlan::IndexJoin {
-                info: format!(
-                    "inner join, inner:IndexLookUp, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
-                ),
-                est_rows: join_est,
-                outer: Box::new(outer_plan),
-                inner: Box::new(inner_plan),
-            },
-        ));
+        let inner_kind = if covering { "IndexReader" } else { "IndexLookUp" };
+        let mut plan = PhysicalPlan::IndexJoin {
+            info: format!(
+                "inner join, inner:{inner_kind}, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
+            ),
+            est_rows: join_est,
+            outer: outer_plan,
+            inner: Box::new(inner_plan),
+        };
+        if limited {
+            plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), select.limit.unwrap_or(0));
+        }
+        return Some(wrap_scalar_count_agg(select, current_db, is, plan));
     }
     // TiDB `buildIndexJoinInner2TableScan`: the inner side probes the table by
     // the clustered-key prefix the join keys pin, so only those equalities
@@ -17445,7 +17746,10 @@ fn join_key_ndv(
         .and_then(|t| t.column(column).map(|c| c.ndv))
         .filter(|ndv| *ndv > 0)
         .map(|ndv| ndv as f64)
-        .unwrap_or_else(|| rows.max(1.0))
+        // TiDB's pseudo NDV is `RealtimeCount * 0.8`
+        // (`cardinality.EstimateColumnNDV` with `distinctFactor`), so an
+        // unanalyzed join key estimates `10000 * 10000 / 8000 = 12500` rows.
+        .unwrap_or_else(|| rows.max(1.0) * 0.8)
 }
 
 fn index_join_suite_plan(
