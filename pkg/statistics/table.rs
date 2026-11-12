@@ -275,8 +275,7 @@ impl ColumnStats {
         let lo = lower.map(|(d, inc)| (datum_key(d), inc));
         let hi = upper.map(|(d, inc)| (datum_key(d), inc));
         let order = key_order(&topn.items, lo.as_ref(), hi.as_ref());
-        topn
-            .items
+        topn.items
             .iter()
             .filter(|(key, _)| {
                 lo.as_ref().is_none_or(|(lo_key, inc)| {

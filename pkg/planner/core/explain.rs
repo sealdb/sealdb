@@ -99,7 +99,13 @@ pub fn explain_analyze_result(
     elapsed: Duration,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     let time_ms = elapsed.as_secs_f64() * 1000.0;
-    let exec_info = format!("time:{time_ms:.2}ms, loops:1");
+    // TiDB's Point_Get reports one KV RPC in its runtime stats; the test
+    // goldens mask it with `--replace_regex /.*num_rpc.*/…/`.
+    let num_rpc = match plan {
+        PhysicalPlan::PointGet { .. } | PhysicalPlan::BatchPointGet { .. } => ", num_rpc:1",
+        _ => "",
+    };
+    let exec_info = format!("time:{time_ms:.2}ms, loops:1{num_rpc}");
     match format {
         ExplainFormat::Row | ExplainFormat::Brief => {
             let brief = matches!(format, ExplainFormat::Brief);
@@ -113,6 +119,8 @@ pub fn explain_analyze_result(
                     "access object".to_string(),
                     "execution info".to_string(),
                     "operator info".to_string(),
+                    "memory".to_string(),
+                    "disk".to_string(),
                 ],
                 rows.into_iter()
                     .enumerate()
@@ -134,6 +142,9 @@ pub fn explain_analyze_result(
                                 String::new()
                             },
                             r.info,
+                            // Runtime memory/disk accounting is not collected.
+                            "N/A".to_string(),
+                            "N/A".to_string(),
                         ]
                     })
                     .collect(),
@@ -252,22 +263,56 @@ fn cop_projection_pending() -> Option<String> {
 }
 
 /// True when the plan pins a GLOBAL index reader to named partitions.
+///
+/// Only a GLOBAL index pin renders TiDB's `NULL` placeholders. A LOCAL index
+/// under dynamic pruning also labels its reader `partition:pN`, so the access
+/// label alone cannot tell the two apart: a pinned GLOBAL read additionally
+/// filters cop rows on `_tidb_tid` (`Selection(Build) in(_tidb_tid, tidN)`,
+/// carried as a `TID_SEL`/`RANGE_SEL` marker or in `selection_info`).
 fn plan_reads_pinned_global_index(plan: &PhysicalPlan) -> bool {
-    let access = match plan {
+    match plan {
         PhysicalPlan::IndexReader {
-            partition_access, ..
-        }
-        | PhysicalPlan::IndexLookUpReader {
-            partition_access, ..
-        } => partition_access,
-        _ => "",
-    };
-    if !access.is_empty() && access != "all" {
-        return true;
+            partition_access,
+            pushed,
+            ..
+        } => reader_pins_global_partition(partition_access, pushed.as_ref(), None),
+        PhysicalPlan::IndexLookUpReader {
+            partition_access,
+            selection_info,
+            pushed,
+            ..
+        } => reader_pins_global_partition(
+            partition_access,
+            pushed.as_ref(),
+            selection_info.as_deref(),
+        ),
+        _ => children_of(plan)
+            .into_iter()
+            .any(plan_reads_pinned_global_index),
     }
-    children_of(plan)
-        .into_iter()
-        .any(plan_reads_pinned_global_index)
+}
+
+/// A reader label pins named partitions (`partition:p0`, not `all`).
+fn pinned_global_access(partition_access: &str) -> bool {
+    !partition_access.is_empty() && partition_access != "all" && partition_access != "dual"
+}
+
+/// Whether one reader is a GLOBAL index read pinned to named partitions.
+///
+/// The pin rides in the `pushed` marker as `TID_SEL|tidN` (or as the rendered
+/// `in(_tidb_tid, tidN)` in `selection_info`); the literal column name is not
+/// in the marker, so both spellings count.
+fn reader_pins_global_partition(
+    partition_access: &str,
+    pushed: Option<&sealdb_parser::ast::ExprNode>,
+    selection_info: Option<&str>,
+) -> bool {
+    if !pinned_global_access(partition_access) {
+        return false;
+    }
+    selection_info.is_some_and(|info| info.contains("_tidb_tid"))
+        || bytes_marker(pushed)
+            .is_some_and(|marker| marker.contains("_tidb_tid") || marker.starts_with("TID_SEL|"))
 }
 
 pub fn explain_json(plan: &PhysicalPlan) -> String {
@@ -4361,9 +4406,7 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             let upper = c.target.to_ascii_uppercase();
             let target = if upper.contains("DOUBLE") || upper == "FLOAT8" {
                 "double BINARY".to_string()
-            } else if upper.contains("CHAR")
-                || upper.contains("STRING")
-                || upper.contains("BINARY")
+            } else if upper.contains("CHAR") || upper.contains("STRING") || upper.contains("BINARY")
             {
                 "var_string(370)".to_string()
             } else {
@@ -4698,6 +4741,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::PointGet {
             table,
             handle: Some(handle),
+            handle_unsigned,
             index: None,
             partition_names,
             lock,
@@ -4706,7 +4750,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             // TiDB EXPLAIN id is `Point_Get` (underscore before Get).
             "Point_Get".to_string(),
             table_access(table, partition_names),
-            format!("handle:{handle}{}", lock_suffix(*lock)),
+            if *handle_unsigned {
+                format!("handle:{}{}", *handle as u64, lock_suffix(*lock))
+            } else {
+                format!("handle:{handle}{}", lock_suffix(*lock))
+            },
         ),
         PhysicalPlan::PointGet {
             table,
@@ -5792,6 +5840,12 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             // cardinality is not lifted to the Apply root.
             est_rows(child)
         }
+        // A set-op arm projection keeps the arm's logical (pre-point-get)
+        // cardinality: TiDB derives projection stats from the logical child.
+        PhysicalPlan::Projection {
+            est_rows: Some(est),
+            ..
+        } => *est,
         PhysicalPlan::Projection { child, .. }
         | PhysicalPlan::Sort { child, .. }
         | PhysicalPlan::Apply { child, .. }

@@ -9299,7 +9299,9 @@ mod tests {
                 "task",
                 "access object",
                 "execution info",
-                "operator info"
+                "operator info",
+                "memory",
+                "disk"
             ]
         );
         let analyze_text = analyze

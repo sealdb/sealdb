@@ -92,6 +92,7 @@ fn push_into(
                 return PhysicalPlan::PointGet {
                     table,
                     handle: Some(handle),
+                    handle_unsigned: false,
                     index: None,
                     index_columns: Vec::new(),
                     partition_names,
@@ -441,6 +442,7 @@ fn push_into(
         PhysicalPlan::PointGet {
             table,
             handle,
+            handle_unsigned,
             index,
             index_columns,
             partition_names,
@@ -519,6 +521,7 @@ fn push_into(
                 PhysicalPlan::PointGet {
                     table,
                     handle,
+                    handle_unsigned,
                     index,
                     index_columns,
                     partition_names,
@@ -584,9 +587,10 @@ fn push_into(
                 residual,
             )
         }
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(push_into(*child, conjuncts, is, current_db)),
+            est_rows: None,
         },
         PhysicalPlan::Distinct {
             keys,
@@ -837,7 +841,10 @@ fn statement_table_info<'a>(
     let is = is?;
     let db =
         super::planbuilder::statement_table_db(table).unwrap_or_else(|| current_db.to_string());
-    is.table_by_name(&db, table)
+    // The plan keeps the SQL alias (`FROM t tmp` → `table:tmp`), while the
+    // ranger needs the base table definition to build the index seek.
+    let physical = super::planbuilder::explain_physical_table(table);
+    is.table_by_name(&db, physical.as_deref().unwrap_or(table))
 }
 
 fn pk_eq_handle(

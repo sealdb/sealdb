@@ -346,14 +346,22 @@ fn in_list_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     };
     let mut ranges = Vec::with_capacity(in_list.list.len());
     for item in &in_list.list {
-        let ExprNode::Value(value) = item else {
-            return None;
-        };
-        ranges.push((
-            Some((value.datum.clone(), true)),
-            Some((value.datum.clone(), true)),
-        ));
+        // A signed literal (`-30`) arrives as a unary minus node; TiDB's parser
+        // folds it, so the ranger still sees a point.
+        let value = item.const_datum()?;
+        let point = (Some((value.clone(), true)), Some((value, true)));
+        // TiDB's ranger keeps the point set sorted and de-duplicated, so the
+        // EXPLAIN range list follows value order, not the written order.
+        if !ranges.contains(&point) {
+            ranges.push(point);
+        }
     }
+    ranges.sort_by(|a, b| match (a.0.as_ref(), b.0.as_ref()) {
+        (Some((left, _)), Some((right, _))) => left.compare(right),
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+    });
     Some((column.name.clone(), ranges))
 }
 

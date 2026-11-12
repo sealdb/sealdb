@@ -109,6 +109,13 @@ pub enum PhysicalPlan {
     },
     Projection {
         exprs: Vec<String>,
+        /// TiDB sizes a projection from its *logical* child, so a projection
+        /// directly above a point get keeps the arm's selection cardinality
+        /// (`tableRows × selectivity`) instead of the point get's handle count
+        /// (`buildProjection4Union` arm: `Projection 1.67 -> Batch_Point_Get
+        /// 2.00`). `None` reuses the child's physical cardinality.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        est_rows: Option<f64>,
         child: Box<PhysicalPlan>,
     },
     DDL {
@@ -184,6 +191,10 @@ pub enum PhysicalPlan {
     PointGet {
         table: String,
         handle: Option<i64>,
+        /// Handle column is an UNSIGNED integer: EXPLAIN prints the bit pattern
+        /// as `u64` (`handle:18446744073709551615`).
+        #[serde(default)]
+        handle_unsigned: bool,
         index: Option<String>,
         /// Columns of the unique index serving the point get (`index:uidx(c)`).
         #[serde(default)]
@@ -558,7 +569,7 @@ impl PhysicalPlan {
     pub fn explain(&self) -> String {
         match self {
             PhysicalPlan::TableDual { row_count } => format!("TableDual_{row_count}"),
-            PhysicalPlan::Projection { exprs, child } => {
+            PhysicalPlan::Projection { exprs, child, .. } => {
                 format!("Projection({}) -> {}", exprs.join(","), child.explain())
             }
             PhysicalPlan::DDL { kind } => format!("DDL_{kind:?}"),

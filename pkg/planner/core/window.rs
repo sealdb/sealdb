@@ -111,6 +111,7 @@ pub fn build_window_plan(
     PhysicalPlan::Projection {
         exprs: vec![proj],
         child: Box::new(body),
+        est_rows: None,
     }
 }
 

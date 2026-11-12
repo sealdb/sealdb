@@ -442,6 +442,7 @@ fn inject_avg_group_projection(
     let proj = PhysicalPlan::Projection {
         exprs,
         child: Box::new(child),
+        est_rows: None,
     };
     PhysicalPlan::hash_agg(proj, info, agg_est)
 }
@@ -472,6 +473,7 @@ fn wrap_having_output_projection(
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(plan),
+        est_rows: None,
     }
 }
 
@@ -513,9 +515,10 @@ fn push_through_agg(
             child: Box::new(push_through_agg(*child, filter, is, current_db)),
             est_rows,
         },
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(push_through_agg(*child, filter, is, current_db)),
+            est_rows: None,
         },
         other => predicate_push_down(other, filter, is, current_db),
     }
@@ -579,9 +582,10 @@ fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
             child: Box::new(set_agg_est(*child, est)),
             est_rows,
         },
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(set_agg_est(*child, est)),
+            est_rows: None,
         },
         other => other,
     }
@@ -602,9 +606,10 @@ fn set_reader_filtered_est(plan: PhysicalPlan, below_est: f64) -> PhysicalPlan {
             est_rows,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
         },
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(set_reader_filtered_est(*child, below_est)),
+            est_rows: None,
         },
         PhysicalPlan::Selection {
             filter,

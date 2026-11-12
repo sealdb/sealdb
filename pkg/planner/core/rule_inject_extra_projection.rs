@@ -11,10 +11,9 @@ use sealdb_parser::opcode::Op;
 /// True when every ORDER BY item folds to a constant (no columns / non-deterministic funcs).
 pub fn order_by_all_constant(select: &SelectStmt) -> bool {
     !select.order_by.is_empty()
-        && select
-            .order_by
-            .iter()
-            .all(|item| is_const_order_expr(&item.expr) || aliases_constant_expr(select, &item.expr))
+        && select.order_by.iter().all(|item| {
+            is_const_order_expr(&item.expr) || aliases_constant_expr(select, &item.expr)
+        })
 }
 
 /// TiDB resolves `ORDER BY <alias>` to the select-list expression before it
@@ -79,6 +78,7 @@ pub fn inject_proj_below_sort(
     let bottom = PhysicalPlan::Projection {
         exprs: bottom_exprs,
         child: Box::new(child),
+        est_rows: None,
     };
     let sorted = PhysicalPlan::Sort {
         child: Box::new(bottom),
@@ -92,6 +92,7 @@ pub fn inject_proj_below_sort(
     PhysicalPlan::Projection {
         exprs: top_exprs,
         child: Box::new(sorted),
+        est_rows: None,
     }
 }
 

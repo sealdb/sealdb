@@ -56,9 +56,10 @@ pub fn rewrite_semi_join_ctx(
             filter,
             est_rows,
         },
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
+            est_rows: None,
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join_ctx(*child, is, current_db, stats)),
@@ -442,6 +443,7 @@ fn build_recursive_all_probe(
                 filter: sel.clone(),
                 est_rows: None,
             }),
+            est_rows: None,
         }
     } else {
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
@@ -474,6 +476,7 @@ fn build_recursive_all_probe(
             ),
         ],
         child: Box::new(cte_plan),
+        est_rows: None,
     };
     Some(PhysicalPlan::hash_agg(
         proj,
@@ -568,6 +571,7 @@ fn build_recursive_arm_plan(
     PhysicalPlan::Projection {
         exprs,
         child: Box::new(child),
+        est_rows: None,
     }
 }
 
@@ -656,6 +660,7 @@ fn recursive_exists_cte_apply(
                 filter: sel.clone(),
                 est_rows: None,
             }),
+            est_rows: None,
         }
     } else {
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
@@ -1834,9 +1839,10 @@ pub fn rewrite_semi_join_agg(
             filter,
             est_rows,
         },
-        PhysicalPlan::Projection { exprs, child } => PhysicalPlan::Projection {
+        PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
             exprs,
             child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
+            est_rows: None,
         },
         PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
             child: Box::new(rewrite_semi_join_agg(*child, is, current_db, stats)),
