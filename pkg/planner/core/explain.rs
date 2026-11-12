@@ -4342,10 +4342,14 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             if c.name.starts_with("Column#") {
                 c.name.clone()
             } else {
-                let tbl = c.table.as_deref().unwrap_or(table);
+                let alias = c.table.as_deref().unwrap_or(table);
+                // TiDB `OrigTblName`: an aliased table renders with its
+                // physical name (`FROM t ta` → `t.a`, never `ta.a`).
+                let tbl = crate::core::planbuilder::explain_physical_table(alias)
+                    .unwrap_or_else(|| alias.to_string());
                 // TiDB `Column.ExplainInfo` uses the column's own schema
                 // (`other_db.t.a`), falling back to the session schema.
-                let schema = column_schema(c, tbl);
+                let schema = column_schema(c, &tbl);
                 if schema.is_empty() {
                     format!("select.{tbl}.{}", c.name)
                 } else {
@@ -6086,11 +6090,176 @@ fn hash_join_explain_info(
         return format!("{outer}, equal:[{equal}]");
     }
     let mut info = format!("{outer}, equal:[{}]", equal_keys.join(" "));
+    // TiDB keeps the non-equality ON conjuncts as `LeftConditions` /
+    // `RightConditions` when the whole conjunct only reads that side (an outer
+    // join cannot push it into the other child); those print as
+    // `left cond:[…]` / `right cond:[…]` slices.
+    let (left_cond, right_cond, others) = if matches!(
+        tp,
+        JoinType::LeftOuter | JoinType::RightOuter
+    ) {
+        split_outer_join_conditions(tp, on, _left, _right)
+    } else {
+        (Vec::new(), Vec::new(), others)
+    };
+    if !left_cond.is_empty() {
+        info.push_str(&format!(", left cond:[{}]", left_cond.join(" ")));
+    }
+    if !right_cond.is_empty() {
+        info.push_str(&format!(", right cond:[{}]", right_cond.join(" ")));
+    }
     if !others.is_empty() {
         info.push_str(", other cond:");
         info.push_str(&others.join(", "));
     }
     info
+}
+
+/// Classify the non-equality ON predicates of an outer join by the side they
+/// read: `left cond` for left-only, `right cond` for right-only, `other cond`
+/// for predicates touching both sides.
+fn split_outer_join_conditions(
+    tp: super::physical_plans::JoinType,
+    on: &sealdb_parser::ast::ExprNode,
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let mut left_tables = std::collections::HashSet::new();
+    let mut right_tables = std::collections::HashSet::new();
+    collect_plan_tables(left, &mut left_tables);
+    collect_plan_tables(right, &mut right_tables);
+    let (mut left_cond, mut right_cond, mut others) = (Vec::new(), Vec::new(), Vec::new());
+    for conjunct in on.split_cnf() {
+        if let ExprNode::Binary(bin) = &conjunct
+            && bin.op == Op::Eq
+            && matches!(
+                (bin.left.as_ref(), bin.right.as_ref()),
+                (ExprNode::Column(_), ExprNode::Column(_))
+            )
+        {
+            // Join keys are reported through `equal:[…]`.
+            continue;
+        }
+        let tables: Vec<String> = conjunct
+            .referenced_columns()
+            .into_iter()
+            .filter_map(|(table, _)| table)
+            .map(|t| explain_physical_table_or(&t).to_ascii_lowercase())
+            .collect();
+        let all_in = |set: &std::collections::HashSet<String>| {
+            !tables.is_empty() && tables.iter().all(|t| set.contains(t))
+        };
+        if all_in(&left_tables) && all_in(&right_tables) {
+            // The ON carried the physical name (`OrigTblName`), which is the
+            // same for both aliased sides (`FROM t ta JOIN t tb`). A LEFT JOIN
+            // only keeps outer-side conjuncts here (inner ones are pushed into
+            // the build child); for a RIGHT JOIN TiDB pushes the inner (left)
+            // conjunct down, so nothing is reported on the join.
+            match tp {
+                super::physical_plans::JoinType::LeftOuter => {
+                    left_cond.push(explain_scalar_expr(&conjunct, "t"))
+                }
+                super::physical_plans::JoinType::RightOuter => {}
+                _ => others.push(explain_scalar_expr(&conjunct, "t")),
+            }
+        } else if all_in(&left_tables) {
+            left_cond.push(explain_scalar_expr(&conjunct, "t"));
+        } else if all_in(&right_tables) {
+            right_cond.push(explain_scalar_expr(&conjunct, "t"));
+        } else if !tables.is_empty() {
+            // Unknown qualifier (a table name outside both child subtrees, e.g.
+            // a correlated outer column): keep it on the join.
+            match tp {
+                super::physical_plans::JoinType::LeftOuter => {
+                    left_cond.push(explain_scalar_expr(&conjunct, "t"))
+                }
+                super::physical_plans::JoinType::RightOuter => {
+                    right_cond.push(explain_scalar_expr(&conjunct, "t"))
+                }
+                _ => others.push(explain_scalar_expr(&conjunct, "t")),
+            }
+        } else {
+            others.push(explain_scalar_expr(&conjunct, "t"));
+        }
+    }
+    (left_cond, right_cond, others)
+}
+
+fn explain_physical_table_or(alias: &str) -> String {
+    crate::core::planbuilder::explain_physical_table(alias).unwrap_or_else(|| alias.to_string())
+}
+
+/// Table names (aliases and physical names) a plan subtree reads.
+fn collect_plan_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<String>) {
+    use PhysicalPlan as P;
+    let add = |name: &str, out: &mut std::collections::HashSet<String>| {
+        out.insert(name.to_ascii_lowercase());
+        out.insert(explain_physical_table_or(name).to_ascii_lowercase());
+    };
+    match plan {
+        P::TableReader { table, .. }
+        | P::IndexReader { table, .. }
+        | P::IndexLookUpReader { table, .. }
+        | P::IndexMerge { table, .. }
+        | P::PointGet { table, .. }
+        | P::BatchPointGet { table, .. } => add(table, out),
+        P::HashJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        }
+        | P::MergeJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        } => {
+            add(left_table, out);
+            add(right_table, out);
+            collect_plan_tables(left, out);
+            collect_plan_tables(right, out);
+        }
+        P::IndexJoin { outer, inner, .. } => {
+            collect_plan_tables(outer, out);
+            collect_plan_tables(inner, out);
+        }
+        P::Apply { child, probe, .. } => {
+            collect_plan_tables(child, out);
+            if let Some(probe) = probe {
+                collect_plan_tables(probe, out);
+            }
+        }
+        P::Projection { child, .. }
+        | P::RowProjection { child, .. }
+        | P::Selection { child, .. }
+        | P::Sort { child, .. }
+        | P::TopN { child, .. }
+        | P::Limit { child, .. }
+        | P::UnionScan { child, .. }
+        | P::SelectLock { child, .. }
+        | P::HashAgg { child, .. }
+        | P::StreamAgg { child, .. }
+        | P::Window { child, .. }
+        | P::Distinct { child, .. }
+        | P::DistinctUnion { child, .. }
+        | P::CTE { seed: child, .. } => collect_plan_tables(child, out),
+        P::PartitionUnion { children } => {
+            for child in children {
+                collect_plan_tables(child, out);
+            }
+        }
+        P::Union { children, .. } => {
+            for child in children {
+                collect_plan_tables(child, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {

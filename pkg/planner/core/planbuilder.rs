@@ -62,6 +62,17 @@ impl PlanBuilder {
                 self.build_with_schema_inner(stmt, is, current_db, stats, prune_mode)
             })
         });
+        // EXPLAIN renders the finished plan after the scopes drop; snapshot the
+        // alias → physical mapping so column qualifiers keep TiDB's OrigTblName.
+        LAST_TABLE_PHYS.with(|last| {
+            let mut merged = last.borrow_mut();
+            merged.clear();
+            TABLE_PHYS_MAP.with(|stack| {
+                for map in stack.borrow().iter() {
+                    merged.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            });
+        });
         plan
     }
 
@@ -5635,6 +5646,11 @@ thread_local! {
     /// (OrigTblName) always qualifies columns with the physical name.
     static TABLE_PHYS_MAP: std::cell::RefCell<Vec<std::collections::HashMap<String, String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Flattened alias → physical map of the statement(s) built most recently
+    /// on this thread. EXPLAIN renders a finished plan *after* [`TableDbScope`]
+    /// drops, so this snapshot keeps OrigTblName qualification available.
+    static LAST_TABLE_PHYS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// Statistics snapshots of the statement's tables (TiDB hands the
     /// DataSource its `TableStats`), so predicate pushdown can size ranges.
     static STATS_SCOPE: std::cell::RefCell<
@@ -5859,13 +5875,17 @@ pub(crate) fn explain_table_schema(table: &str) -> Option<String> {
 /// Physical (OrigTblName) table behind an alias: `FROM t t1` → `t1` → `t`.
 /// TiDB EXPLAIN qualifies column references with this name.
 pub(crate) fn explain_physical_table(table: &str) -> Option<String> {
-    TABLE_PHYS_MAP.with(|stack| {
+    let key = table.to_ascii_lowercase();
+    if let Some(found) = TABLE_PHYS_MAP.with(|stack| {
         stack
             .borrow()
             .iter()
             .rev()
-            .find_map(|map| map.get(&table.to_ascii_lowercase()).cloned())
-    })
+            .find_map(|map| map.get(&key).cloned())
+    }) {
+        return Some(found);
+    }
+    LAST_TABLE_PHYS.with(|last| last.borrow().get(&key).cloned())
 }
 
 /// Schema of `table` (as named in the plan) for the statement being planned.
