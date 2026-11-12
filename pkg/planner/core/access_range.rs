@@ -91,6 +91,12 @@ fn index_key_parts(info: &TableInfo, index: &IndexInfo) -> Option<Vec<KeyPart>> 
     Some(parts)
 }
 
+/// Number of key parts of `index`, including the appended row handle of a
+/// non-unique index (`index_key_parts` order).
+pub fn index_key_part_count(info: &TableInfo, index: &IndexInfo) -> Option<usize> {
+    index_key_parts(info, index).map(|parts| parts.len())
+}
+
 /// Composite seek ranges of `index` decided by `conjuncts` alone (no
 /// statistics), or `None` when no range can be built.
 pub struct KeyRangeAccess {

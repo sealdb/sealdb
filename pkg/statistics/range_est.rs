@@ -488,6 +488,34 @@ impl IndexStats {
         range_est
     }
 
+    /// TiDB `equalRowCountOnIndex` for a point range.
+    ///
+    /// Stats version 2 only trusts a repeated bucket boundary (TopN is queried
+    /// first); every other value — including one the histogram does not cover —
+    /// falls back to `estimateRowCountWithUniformDistribution`, i.e.
+    /// `NotNullCount / (NDV - |TopN|)`. A value inside a sampled histogram
+    /// bucket lands exactly on that average (`3554536 / 3373199 = 1.05`).
+    pub fn point_row_count(&self, value: &[u8]) -> f64 {
+        let Some(hist) = &self.histogram else {
+            return 0.0;
+        };
+        if self.stats_ver >= 2 {
+            if let Some(bucket) = hist
+                .buckets
+                .iter()
+                .find(|bucket| bucket.upper.as_slice() == value)
+            {
+                return bucket.repeats as f64;
+            }
+            let ndv = hist.ndv as f64 - self.topn.len() as f64;
+            if ndv <= 0.0 {
+                return 0.0;
+            }
+            return hist.not_null_count() / ndv;
+        }
+        self.equal_row_count(value)
+    }
+
     fn equal_row_count(&self, value: &[u8]) -> f64 {
         let Some(hist) = &self.histogram else {
             return 0.0;
@@ -697,7 +725,7 @@ impl Table {
                         // puts at zero estimates no rows even inside a bucket.
                         None => match &idx.cm_sketch {
                             Some(sketch) if idx.stats_ver < 2 => sketch.query_bytes(&key) as f64,
-                            _ => idx.equal_row_count(&key),
+                            _ => idx.point_row_count(&key),
                         },
                     }
                 }

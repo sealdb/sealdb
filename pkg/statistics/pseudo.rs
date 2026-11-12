@@ -605,6 +605,9 @@ fn tighter_high(
 /// Conjuncts that describe the same column intersect (TiDB `MergeDNF`), so
 /// `a IN (1,2) AND a IN (1,3)` estimates as the single remaining point range.
 pub fn filter_rows(conjuncts: &[ExprNode], table_rows: f64) -> f64 {
+    if table_rows <= 0.0 {
+        return 0.0;
+    }
     let mut per_column: Vec<(String, Vec<Bounds>)> = Vec::new();
     let mut total = 1.0f64;
     for conjunct in conjuncts {

@@ -10660,13 +10660,13 @@ fn index_merge_handle_arm(
     ))
 }
 
-/// Index a union arm reads: the hinted index whose leading column the DNF item
-/// constrains, or any visible leading-column index when the hint lists none.
-fn index_merge_arm_index<'a>(
+/// Indexes a union arm may read: the hinted indexes whose leading column the
+/// DNF item constrains, or every visible leading-column index without a hint.
+fn index_merge_arm_candidates<'a>(
     info: &'a sealdb_meta::TableInfo,
     hint: &IndexMergeHint,
     conds: &[ExprNode],
-) -> Option<&'a sealdb_meta::IndexInfo> {
+) -> Vec<&'a sealdb_meta::IndexInfo> {
     let columns: Vec<String> = conds
         .iter()
         .filter_map(|cond| {
@@ -10689,22 +10689,7 @@ fn index_merge_arm_index<'a>(
                 columns.iter().any(|name| name.eq_ignore_ascii_case(&key))
             })
     };
-    // TiDB prefers the hinted index that pins *every* bounded column of the
-    // item: `(aid = 1 and c1 = 'aaa') or (aid = 2 and c2 = 'bbb')` seeks
-    // `aid_c2` for the second arm, not `aid_c1` again with a residual filter.
-    let covering = |idx: &&sealdb_meta::IndexInfo| {
-        usable(idx)
-            && columns.iter().all(|name| {
-                idx.columns
-                    .iter()
-                    .any(|col| super::expr_index::part_key(info, col).eq_ignore_ascii_case(name))
-            })
-    };
-    candidates
-        .iter()
-        .find(|idx| covering(idx))
-        .or_else(|| candidates.iter().find(|idx| usable(idx)))
-        .copied()
+    candidates.into_iter().filter(|idx| usable(&idx)).collect()
 }
 
 /// Build one union arm for a DNF item; the handle wins when the item pins it.
@@ -10737,8 +10722,52 @@ fn index_merge_union_arm(
     }) {
         return index_merge_handle_arm(info, conds, table_rows);
     }
-    let index = index_merge_arm_index(info, hint, conds)?;
-    index_merge_index_arm(info, index, conds, table_rows, table_stats)
+    let candidates = index_merge_arm_candidates(info, hint, conds);
+    let bounded: Vec<String> = conds
+        .iter()
+        .filter_map(|cond| {
+            sealdb_statistics::pseudo::conjunct_bound_sets(cond).map(|(name, _)| name)
+        })
+        .collect();
+    // TiDB `buildIndexMergePartialPath` picks the alternative with the lowest
+    // `CountAfterIndex`. Prefer an index that pins *every* bounded column (no
+    // residual index filter) when one exists: `(aid = 1 and c1 = 'aaa') or
+    // (aid = 2 and c2 = 'bbb')` seeks `aid_c2` for the second arm rather than
+    // `aid_c1` with a residual filter.
+    let covering = candidates.iter().find(|idx| {
+        bounded.iter().all(|name| {
+            idx.columns
+                .iter()
+                .any(|col| super::expr_index::part_key(info, col).eq_ignore_ascii_case(name))
+        })
+    });
+    if let Some(index) = covering {
+        return index_merge_index_arm(info, index, conds, table_rows, table_stats);
+    }
+    // Otherwise take the cheapest seek: the auth lookup reaches
+    // `auth_value = …` (1.05 rows) through `auth_value`, not through the
+    // `auth_type` index (3554 rows) just because that column is bounded too.
+    let mut best: Option<(IndexMergePath, Vec<ExprNode>, f64)> = None;
+    for index in candidates {
+        let Some((path, consumed)) =
+            index_merge_index_arm(info, index, conds, table_rows, table_stats)
+        else {
+            continue;
+        };
+        let rows = path.range.as_ref().map_or(table_rows, |range| range.filter_rows);
+        if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+            eprintln!(
+                "IM arm candidate index={} rows={rows} scan_rows={:?} text={:?}",
+                index.name.o(),
+                path.range.as_ref().map(|range| range.rows),
+                path.range.as_ref().map(|range| range.text.clone()),
+            );
+        }
+        if best.as_ref().is_none_or(|(_, _, best_rows)| rows < *best_rows) {
+            best = Some((path, consumed, rows));
+        }
+    }
+    best.map(|(path, consumed, _)| (path, consumed))
 }
 
 /// TiDB `buildIndexMergeOrPath`: one arm per DNF item over the index it seeks.
@@ -10920,15 +10949,117 @@ fn apply_index_merge_handle_stats(
 fn index_merge_union_rows(
     info: &sealdb_meta::TableInfo,
     paths: &[IndexMergePath],
+    items: &[Vec<ExprNode>],
     table_rows: f64,
     real_stats: bool,
 ) -> f64 {
+    if !real_stats
+        && let Some(rows) = index_merge_union_dnf_index_rows(info, items, table_rows)
+    {
+        return rows;
+    }
     let mut selectivity = 0.0;
     for path in paths {
         let arm = index_merge_union_arm_selectivity(info, path, table_rows, real_stats);
         selectivity = selectivity + arm - selectivity * arm;
     }
     table_rows * selectivity
+}
+
+/// TiDB `cardinality.Selectivity` over a union's access DNF.
+///
+/// When a single index can build a range for *every* DNF item, the estimator
+/// keeps that index's ranges as one partial-cover stats node instead of
+/// multiplying the arm selectivities. The pseudo row count is what makes
+/// `(aid = 1 and c1 = 'aaa') or (aid = 2 and c2 = 'bbb')` read `8.08`: on
+/// `aid_c1` the second arm only pins `aid`, so its prefix range counts ten
+/// rows, the first arm adds `0.1`, and the residual `c2` filter costs one
+/// `0.8` partial-cover factor (`10.1 * 0.8 / 10000 * 10000`).
+fn index_merge_union_dnf_index_rows(
+    info: &sealdb_meta::TableInfo,
+    items: &[Vec<ExprNode>],
+    table_rows: f64,
+) -> Option<f64> {
+    /// One index that can serve the whole DNF (`StatsNode` in TiDB).
+    struct DnfIndexNode {
+        /// Every DNF item is encoded by the index ranges (not `partCover`).
+        full_cover: bool,
+        /// Fewest access conditions any single DNF item contributes.
+        min_access: usize,
+        num_cols: usize,
+        selectivity: f64,
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let mut best: Option<DnfIndexNode> = None;
+    for index in &info.indices {
+        if index.primary && info.pk_is_handle {
+            continue;
+        }
+        let Some(key_len) = super::access_range::index_key_part_count(info, index) else {
+            continue;
+        };
+        let mut ranges = Vec::new();
+        let mut full_cover = true;
+        let mut min_access = usize::MAX;
+        let mut usable = true;
+        for conds in items {
+            let Some(access) = super::access_range::index_key_ranges(info, index, conds) else {
+                usable = false;
+                break;
+            };
+            if access.ranges.is_empty() {
+                usable = false;
+                break;
+            }
+            if access.consumed.len() < conds.len() {
+                full_cover = false;
+            }
+            min_access = min_access.min(access.consumed.len());
+            ranges.extend(access.ranges);
+        }
+        if !usable {
+            continue;
+        }
+        let rows = sealdb_statistics::pseudo::index_key_ranges_rows(
+            table_rows,
+            &ranges,
+            key_len,
+            index.unique,
+        );
+        let mut selectivity = (rows / table_rows).clamp(0.0, 1.0);
+        if !full_cover {
+            selectivity *= sealdb_statistics::pseudo::SELECTION_FACTOR;
+        }
+        let node = DnfIndexNode {
+            full_cover,
+            min_access,
+            num_cols: index.columns.len(),
+            selectivity,
+        };
+        // TiDB `GetUsableSetsByGreedy`: full cover before partial cover, then
+        // more access conditions per DNF item, fewer index columns, and finally
+        // the lower selectivity.
+        let better = match &best {
+            None => true,
+            Some(best) => {
+                if node.full_cover != best.full_cover {
+                    node.full_cover
+                } else if node.min_access != best.min_access {
+                    node.min_access > best.min_access
+                } else if node.num_cols != best.num_cols {
+                    node.num_cols < best.num_cols
+                } else {
+                    node.selectivity < best.selectivity
+                }
+            }
+        };
+        if better {
+            best = Some(node);
+        }
+    }
+    best.map(|node| table_rows * node.selectivity)
 }
 
 /// TiDB probe-side selectivity for a residual filter. A DNF filter that was
@@ -11041,13 +11172,19 @@ fn index_merge_plan(
             or_pos
         );
     }
-    let (mut paths, residual, intersection) = match or_pos {
+    let (mut paths, residual, intersection, union_items) = match or_pos {
         Some(_) => {
-            let mut best: Option<(f64, Vec<IndexMergePath>, Vec<ExprNode>)> = None;
+            let mut best: Option<(f64, Vec<IndexMergePath>, Vec<ExprNode>, Vec<Vec<ExprNode>>)> =
+                None;
             for pos in 0..cnf.len() {
                 if cnf[pos].split_dnf().len() < 2 {
                     continue;
                 }
+                let items: Vec<Vec<ExprNode>> = cnf[pos]
+                    .split_dnf()
+                    .iter()
+                    .map(|item| item.split_cnf())
+                    .collect();
                 let Some((mut paths, residual)) = index_merge_union_paths(
                     &cnf,
                     pos,
@@ -11062,16 +11199,22 @@ fn index_merge_plan(
                 // TiDB `indexMergeOR` keeps the DNF group whose union reads the
                 // fewest rows: `(b<10000 or c<10000) and (a<10 or d<10)` merges
                 // the a/d arms rather than the wider b/c ones.
-                let rows = index_merge_union_rows(info, &paths, table_rows, table_stats.is_some());
+                let rows = index_merge_union_rows(
+                    info,
+                    &paths,
+                    &items,
+                    table_rows,
+                    table_stats.is_some(),
+                );
                 if best
                     .as_ref()
-                    .is_none_or(|(best_rows, _, _)| rows < *best_rows)
+                    .is_none_or(|(best_rows, _, _, _)| rows < *best_rows)
                 {
-                    best = Some((rows, paths, residual));
+                    best = Some((rows, paths, residual, items));
                 }
             }
-            let (_, paths, residual) = best?;
-            (paths, residual, false)
+            let (_, paths, residual, items) = best?;
+            (paths, residual, false, Some(items))
         }
         None => {
             hinted.as_ref()?;
@@ -11082,7 +11225,7 @@ fn index_merge_plan(
                 table_rows,
                 table_stats.as_ref(),
             )?;
-            (paths, residual, true)
+            (paths, residual, true, None)
         }
     };
     if std::env::var("SEALDB_DEBUG_IM").is_ok() {
@@ -11106,12 +11249,17 @@ fn index_merge_plan(
         // `TableRangeScan(Build)` partial path); a full table scan arm would
         // just read everything, so it keeps the TableFullScan + Selection.
         let mut seen = std::collections::HashSet::new();
+        for path in &paths {
+            seen.insert(path.index.to_ascii_lowercase());
+        }
+        // TiDB skips the union only when *every* arm reads the same access
+        // path (`len(indexMap) == 1`); two DNF items may still seek the same
+        // index with different ranges (`auth_value = 'a' or auth_value = 'b'`
+        // alongside a third arm on `user_id`).
         if paths
             .iter()
             .any(|path| path.table_range && path.range.is_none())
-            || !paths
-                .iter()
-                .all(|path| seen.insert(path.index.to_ascii_lowercase()))
+            || seen.len() < 2
         {
             return None;
         }
@@ -11125,7 +11273,13 @@ fn index_merge_plan(
             .fold(1.0, |acc, path| acc * path_rows(path) / table_rows);
         table_rows * selectivity
     } else {
-        index_merge_union_rows(info, &paths, table_rows, table_stats.is_some())
+        index_merge_union_rows(
+            info,
+            &paths,
+            union_items.as_deref().unwrap_or(&[]),
+            table_rows,
+            table_stats.is_some(),
+        )
     };
     if hinted.is_none()
         && super::plan_cost::index_lookup_cost(rowid_est)
@@ -19945,6 +20099,15 @@ fn access_plan_inner(
         }
         // IndexMerge MVB: OR of ≥2 indexed equalities → union handles + lookup.
         if let Some(plan) = index_merge_plan(select, from, info, prune_mode, stats, current_db) {
+            if std::env::var("SEALDB_DEBUG_IM").is_ok() {
+                eprintln!(
+                    "IM return table={} limit={:?} offset={:?} order={}",
+                    from.name,
+                    select.limit,
+                    select.offset,
+                    select.order_by.len()
+                );
+            }
             return plan;
         }
         // A covering index scan replaces the table scan when a filter cannot

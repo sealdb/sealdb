@@ -6078,8 +6078,19 @@ fn hash_join_explain_info(
         let cond = explain_join_cond(on);
         return format!("CARTESIAN {outer}, left cond:[{cond}]");
     }
-    let equal = explain_join_cond(on);
-    format!("{outer}, equal:[{equal}]")
+    let (equal_keys, others) = split_join_conditions(on);
+    if equal_keys.is_empty() {
+        // `split_cnf` can keep an AND as one marked item; keep the legacy
+        // rendering for those hand-shaped plans.
+        let equal = explain_join_cond(on);
+        return format!("{outer}, equal:[{equal}]");
+    }
+    let mut info = format!("{outer}, equal:[{}]", equal_keys.join(" "));
+    if !others.is_empty() {
+        info.push_str(", other cond:");
+        info.push_str(&others.join(", "));
+    }
+    info
 }
 
 fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
@@ -6174,6 +6185,35 @@ fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
             };
             format!("eq({left}, {right})")
         }
-        other => other.restore_string(),
+        // Residual non-equality conjuncts (`other cond:`) print the TiDB
+        // ScalarFunction shape (`gt(select.t.a, 1)`), not the SQL text.
+        other => explain_scalar_expr(other, "t"),
     }
+}
+
+/// TiDB `PhysicalHashJoin`/`PhysicalMergeJoin` ExplainInfo condition split: the
+/// `Column = Column` conjuncts become the space-separated `equal:[…]` key list,
+/// everything else is the comma-separated `other cond:` payload.
+fn split_join_conditions(
+    on: &sealdb_parser::ast::ExprNode,
+) -> (Vec<String>, Vec<String>) {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let mut equal_keys = Vec::new();
+    let mut others = Vec::new();
+    for conjunct in on.split_cnf() {
+        match &conjunct {
+            ExprNode::Binary(bin)
+                if bin.op == Op::Eq
+                    && matches!(
+                        (bin.left.as_ref(), bin.right.as_ref()),
+                        (ExprNode::Column(_), ExprNode::Column(_))
+                    ) =>
+            {
+                equal_keys.push(explain_join_cond(&conjunct));
+            }
+            other => others.push(explain_scalar_expr(other, "t")),
+        }
+    }
+    (equal_keys, others)
 }
