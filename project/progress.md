@@ -1994,6 +1994,35 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（`topn_push_down` 波：LIMIT expected count 下推）
+
+- **Phase**: R2/R3 join × limit
+- **完成**:
+  - Planner：直接从 TiDB `calcChildExpectedCnt` 对齐 `LIMIT` 下推到 join 的规则：
+    `probe` 侧扫描 `n / joinRows`，IndexJoin 外层还会加上
+    `max(0, (outerRows - joinRows) * OptOrderingIdxSelRatio)`（默认 `-1`，即把
+    join 的放大倍数加回去）。`LIMIT 5` 在伪统计 `10000 × 10000` 等值 join 上得到
+    outer `2504`、inner probe `3130`
+  - Planner：`LIMIT` 之上的 `HashJoin` / `MergeJoin` / `IndexJoin` 都按该规则缩放子节点
+    （MergeJoin 两侧同为 `4.00`；HashJoin 只缩放非 build 的 probe 侧）
+  - Planner：`TIDB_INLJ` hint 分支接入同一 expected count：补 `Limit` 包裹、
+    覆盖索引改走 `IndexReader`（`index:IndexRangeScan`）而不是 `IndexLookUp`，
+    并让探针内侧按 `outerExpected / ndv` 显示
+  - Planner：未 analyze 的 join key 按 TiDB `EstimateColumnNDV` 取伪统计 NDV
+    `rowCount * 0.8`（`10000 → 8000`，join 估行 `12500`）
+- **验证**:
+  - `topn_push_down`（Mem）差异从 40 个 hunk 降到 3 个区域：`TIDB_INLJ` 内连接与
+    左外连接形状已逐字一致
+  - `run-tests.sh --status green -s memory` → `PASS: memory=39`
+  - `run-tests.sh --status green -s tikv` → `PASS: tikv=39`
+- **阻塞/风险**:
+  - 剩余三块：多表 outer-join 的 IndexJoin 重排（`tr/te/p`）、
+    `IN (SELECT … LIMIT 1)` 的 Apply + Limit 下推、`TIDB_SMJ` 的
+    `IndexFullScan keep order:true` 两侧扫描
+- **下一步**:
+  - 继续 `topn_push_down`：`TIDB_SMJ` / `TIDB_HJ` 左外连接的 build 侧选择与 index order
+  - 然后 `explain_easy` / `explain_easy_stats` / `explain_complex_stats`
+
 ### 2026-10-19
 
 **决策落地**
