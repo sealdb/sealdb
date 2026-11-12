@@ -353,6 +353,10 @@ fn field_column_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> 
     }
     match &field.expr {
         ExprNode::Column(col) => col.name.clone(),
+        // TiDB names a bare scalar subquery `name_exp_N` (the field's 1-based
+        // position): the subquery text cannot be an identifier
+        // (`CREATE VIEW v AS SELECT (WITH …) FROM t`).
+        ExprNode::ScalarSubquery(_) => format!("name_exp_{}", offset + 1),
         other => {
             let restored = other.restore_string();
             if restored.is_empty() {

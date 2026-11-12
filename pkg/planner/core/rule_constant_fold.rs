@@ -295,17 +295,58 @@ fn try_eval(expr: &ExprNode) -> Option<ExprNode> {
 
 /// `true` when two constant equalities on the same column disagree
 /// (`a = 1 AND a = 2`), which no row can satisfy.
+///
+/// The column's table qualifier is part of the identity: the same CTE read
+/// twice (`FROM q, q q1 WHERE q.a = 1 AND q1.a = 2`) constrains two different
+/// scans, not one column twice.
 fn has_conflicting_equalities(expr: &ExprNode) -> bool {
-    let equalities: Vec<(String, Datum)> = expr
+    let equalities: Vec<(Option<String>, String, Datum)> = expr
         .split_cnf()
         .into_iter()
-        .filter_map(|conjunct| conjunct.eq_column_const())
+        .filter_map(|conjunct| qualified_column_const(&conjunct))
         .collect();
-    equalities.iter().enumerate().any(|(i, (column, value))| {
-        equalities[i + 1..].iter().any(|(other, other_value)| {
-            column.eq_ignore_ascii_case(other)
-                && value.compare(other_value) != std::cmp::Ordering::Equal
+    equalities
+        .iter()
+        .enumerate()
+        .any(|(i, (table, column, value))| {
+            equalities[i + 1..]
+                .iter()
+                .any(|(other_table, other_column, other_value)| {
+                    let same_table = match (table, other_table) {
+                        // An unqualified name resolves to the single table in
+                        // scope; a qualified one to its alias.
+                        (None, None) => true,
+                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                        _ => false,
+                    };
+                    same_table
+                        && column.eq_ignore_ascii_case(other_column)
+                        && value.compare(other_value) != std::cmp::Ordering::Equal
+                })
         })
+}
+
+/// `col = const` keeping the written table qualifier (`None` when unqualified).
+fn qualified_column_const(expr: &ExprNode) -> Option<(Option<String>, String, Datum)> {
+    let ExprNode::Binary(bin) = expr else {
+        return None;
+    };
+    if !matches!(
+        bin.op,
+        sealdb_parser::opcode::Op::Eq | sealdb_parser::opcode::Op::NullSafeEq
+    ) {
+        return None;
+    }
+    let (column, other) = match (bin.left.as_ref(), bin.right.as_ref()) {
+        (ExprNode::Column(column), other) | (other, ExprNode::Column(column)) => (column, other),
+        _ => return None,
+    };
+    other.const_datum().map(|value| {
+        (
+            column.table.clone(),
+            column.name.to_ascii_lowercase(),
+            value,
+        )
     })
 }
 
