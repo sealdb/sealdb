@@ -119,7 +119,7 @@ impl FieldType {
             TYPE_SET => return self.elems_type_name("set"),
             _ => "varchar",
         };
-        if self.unsigned {
+        if self.is_unsigned() {
             format!("{base} unsigned")
         } else {
             base.to_string()

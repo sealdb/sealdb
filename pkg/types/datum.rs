@@ -300,7 +300,20 @@ impl Datum {
                     Ok(Datum::F64(v))
                 }
             }
-            EvalType::String => Ok(Datum::Bytes(self.as_bytes())),
+            EvalType::String => {
+                let mut bytes = self.as_bytes();
+                // `BINARY(N)` (`TypeString` + binary charset) is fixed-length:
+                // MySQL/TiDB zero-pad on write and truncate past N bytes, so
+                // `insert 'a'` stores `'a\0'` and `a = 'a'` no longer matches.
+                if ft.tp == crate::field_type::TYPE_STRING && ft.charset == "binary" && ft.flen > 0
+                {
+                    let len = ft.flen as usize;
+                    if bytes.len() != len {
+                        bytes.resize(len, 0);
+                    }
+                }
+                Ok(Datum::Bytes(bytes))
+            }
             EvalType::Decimal => {
                 let d = MyDecimal::parse(&self.display())?.with_frac(ft.decimal);
                 Ok(Datum::Decimal(d))

@@ -47,7 +47,7 @@ impl ExecutorBuilder {
                 current_db.to_string(),
                 true,
             ))),
-            PhysicalPlan::Projection { exprs, child } => {
+            PhysicalPlan::Projection { exprs, child, .. } => {
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("projection without select"))?;
@@ -366,13 +366,7 @@ impl ExecutorBuilder {
                     })
                 });
                 let lookup = index.as_ref().and_then(|index_name| {
-                    index_lookup_values(
-                        &domain,
-                        current_db,
-                        &from,
-                        index_name,
-                        select.selection.as_ref(),
-                    )
+                    index_lookup_values(&domain, current_db, &from, index_name, select)
                 });
                 Ok(Box::new(PointGetExec::new(
                     domain,
@@ -1369,7 +1363,7 @@ fn index_lookup_values(
     current_db: &str,
     table: &sealdb_parser::ast::TableName,
     index_name: &str,
-    selection: Option<&ExprNode>,
+    select: &sealdb_parser::ast::SelectStmt,
 ) -> Option<Vec<sealdb_types::Datum>> {
     let (schema, name) = table.qualified(current_db);
     let is = domain.infoschema();
@@ -1378,6 +1372,7 @@ fn index_lookup_values(
         .indices
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+    let selection = select.selection.as_ref();
     let mut known: Vec<(String, sealdb_types::Datum)> = selection
         .map(|expr| {
             expr.split_cnf()
@@ -1386,6 +1381,25 @@ fn index_lookup_values(
                 .collect()
         })
         .unwrap_or_default();
+    // An inner-join key constant (`t1.a = 1` + `t1.a = t2.b`) reaches the
+    // join side as a planner-derived predicate, not in this statement's WHERE,
+    // so mirror it here to build the point-get key.
+    for join in &select.joins {
+        let (left, right) = sealdb_planner::core::planbuilder::derive_join_key_constants(
+            select,
+            &join.left,
+            &join.right,
+            &join.on,
+        );
+        for pred in left.into_iter().chain(right) {
+            if !expr_owned_by(&pred, table) {
+                continue;
+            }
+            if let Some(eq) = pred.eq_key_const() {
+                known.push(eq);
+            }
+        }
+    }
     // A single point get also comes from an `IN` list (`(a, b, c) IN ((1, 1,
     // 1), …)` de-duplicated to one key): every part then takes the first
     // listed value, like TiDB's `detachCondAndBuildRangeForIndex`.
@@ -1404,19 +1418,33 @@ fn index_lookup_values(
             known.push((key, value));
         }
     }
-    let mut values = index_key_values(&info, index, &known)?;
-    for (pos, part) in index.columns.iter().enumerate() {
-        let Some(column) = info
-            .columns
-            .iter()
-            .find(|c| c.name.o().eq_ignore_ascii_case(part.name.o()))
-            .filter(|c| c.field_type.tp == sealdb_types::field_type::TYPE_BIT)
-        else {
-            continue;
-        };
-        values[pos] = values[pos].cast(&column.field_type).ok()?;
+    Some(index_key_values(&info, index, &known)?)
+}
+
+/// Decode raw charset bytes to a UTF-8 string (TiDB `Charset.Decode`).
+fn decode_charset_bytes(charset: &str, bytes: &[u8]) -> String {
+    match charset {
+        "gbk" => sealdb_parser::charset::encoding_gbk::decode(bytes),
+        _ => sealdb_parser::charset::encoding_latin1::decode(bytes),
     }
-    Some(values)
+}
+
+/// The predicate names a column of `table` (plain name or alias).
+fn expr_owned_by(expr: &ExprNode, table: &sealdb_parser::ast::TableName) -> bool {
+    let owned = |node: &ExprNode| {
+        matches!(
+            node,
+            ExprNode::Column(col)
+                if col.table.as_deref().is_some_and(|t| {
+                    t.eq_ignore_ascii_case(&table.name)
+                        || t.eq_ignore_ascii_case(table.resolve_name())
+                })
+        )
+    };
+    match expr {
+        ExprNode::Binary(bin) => owned(&bin.left) || owned(&bin.right),
+        _ => false,
+    }
 }
 
 /// Values of every key part for one point lookup: a plain part comes from the
@@ -1440,6 +1468,41 @@ fn index_key_values(
                 values.push(sealdb_planner::core::expr_index::eval_part(
                     info, &expr, known,
                 )?);
+            }
+        }
+    }
+    // The index key encodes the row's stored datum, so the seek value must take
+    // the column type first (`b = 1` on DECIMAL(10,0) stores a Decimal, and a
+    // bare Int datum would encode a different key tag). A binary/hex literal on
+    // a non-UTF-8 column also needs decoding, since storage keeps strings as
+    // UTF-8 (`a = 0xC4E3BAC3` on a gbk column).
+    for (pos, part) in index.columns.iter().enumerate() {
+        let Some(column) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(part.name.o()))
+        else {
+            continue;
+        };
+        if let sealdb_types::Datum::Bytes(bytes) | sealdb_types::Datum::Bit(bytes) = &values[pos]
+            && std::str::from_utf8(bytes).is_err()
+        {
+            values[pos] = sealdb_types::Datum::Bytes(
+                decode_charset_bytes(&column.field_type.charset, bytes).into_bytes(),
+            );
+        }
+        // The index key encodes the row's stored datum, so the seek value must
+        // take the column type when that changes the key encoding: a BIT value,
+        // and the exact Decimal a DECIMAL(10,0) column stores for an Int
+        // literal. String keys keep the literal bytes: TiDB compares
+        // `binary(2)` keys without re-padding (`a = "a"` does not match a
+        // stored `'a\0'`), and an out-of-range numeric literal is a value that
+        // matches no row rather than a cast error.
+        if column.field_type.tp == sealdb_types::field_type::TYPE_BIT
+            || column.field_type.eval_type() == sealdb_types::field_type::EvalType::Decimal
+        {
+            if let Ok(cast) = values[pos].cast(&column.field_type) {
+                values[pos] = cast;
             }
         }
     }

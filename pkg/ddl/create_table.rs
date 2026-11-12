@@ -27,6 +27,18 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             col.name.clone(),
             field_type_from_name(&col.type_name)?,
         );
+        // Column charset/collation (TiDB `FieldType.Charset/Collate`): a charset
+        // option pins its default binary collation unless COLLATE names one.
+        if let Some(charset) = &col.charset {
+            info.field_type.charset = charset.to_ascii_lowercase();
+            info.field_type.collate =
+                sealdb_parser::charset::Collation::default_for_charset(charset).name;
+        }
+        if let Some(collate) = &col.collate {
+            let parsed = sealdb_parser::charset::Collation::parse(collate);
+            info.field_type.charset = parsed.charset;
+            info.field_type.collate = parsed.name;
+        }
         if let Some(generated) = &col.generated {
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
@@ -293,6 +305,8 @@ fn push_select_column(
         generated: None,
         auto_increment: false,
         not_null,
+        charset: None,
+        collate: None,
     });
     Ok(())
 }
@@ -418,27 +432,27 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
     let (base, rest) = split_type(&upper);
     let unsigned = rest.contains("UNSIGNED") || base.ends_with("UNSIGNED");
     let mut ft = match base {
-        "TINYINT" | "BOOL" | "BOOLEAN" => FieldType {
+        "TINYINT" | "INT1" | "BOOL" | "BOOLEAN" => FieldType {
             tp: TYPE_TINY,
             flen: 4,
             ..numeric_ft()
         },
-        "SMALLINT" => FieldType {
+        "SMALLINT" | "INT2" => FieldType {
             tp: TYPE_SHORT,
             flen: 6,
             ..numeric_ft()
         },
-        "MEDIUMINT" => FieldType {
+        "MEDIUMINT" | "INT3" => FieldType {
             tp: TYPE_INT24,
             flen: 9,
             ..numeric_ft()
         },
-        "INT" | "INTEGER" => FieldType {
+        "INT" | "INTEGER" | "INT4" => FieldType {
             tp: TYPE_LONG,
             flen: 11,
             ..numeric_ft()
         },
-        "BIGINT" => FieldType {
+        "BIGINT" | "INT8" => FieldType {
             tp: TYPE_LONG_LONG,
             flen: 20,
             ..numeric_ft()
