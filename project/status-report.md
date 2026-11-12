@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **39 个** 登记为 `green`（R1 4 / R2 15 / R3 20），本轮复验的 39 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 15/22，R3 完成 20/48，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join（`topn_push_down` 差异从 40 处降到 3 处），`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **39 个** 登记为 `green`（R1 4 / R2 15 / R3 20），本轮复验的 39 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 15/22，R3 完成 20/48，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join（`topn_push_down` 差异从 40 处降到 3 处），`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -27,6 +27,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **39 个** �
 | `pending` | 190 | 74.8% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
+
+逐套明细（254 行，含状态/进度/金样/TiKV）见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ### 2.2 按波次
 
@@ -218,3 +220,309 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），39 套件�
 | 集成测试输入 `t/**/*.test` | 254 |
 | 权威金样 `r/**/*.result` | 258 |
 | 包级对齐登记文件 | 178 |
+
+---
+
+## 11. 附：254 套 suite 全量清单
+
+> 口径：`green` = Gate A（结果/错误码/警告）+ Gate B（EXPLAIN 形状/estRows/task/access object）双过，且在 Mem + TiKV 复验；`in_progress` 的进度 = `(首个差异行 − 1) / 金样总行数`，由 `run-tests.sh -s memory --status in_progress -t <suite>` 于 2026-11-13 逐套复跑得出；`pending` 未开工记 0%。金样列 `✓` = 有 TiDB 权威 `r/*.result`，`✗` = 缺金样；TiKV 列 `✓` = 双引擎复验通过，`skip` = manifest 标记跳过。
+
+### R1 — select / show / types（4 套，green 4）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `select` | green | 100% | ✓ | ✓ |
+| 2 | `show` | green | 100% | ✓ | ✓ |
+| 3 | `types/const` | green | 100% | ✓ | ✓ |
+| 4 | `types/time` | green | 100% | ✓ | ✓ |
+
+### R2 — join / subquery / agg / window / cte（22 套，green 15）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `agg_predicate_pushdown` | green | 100% | ✓ | ✓ |
+| 2 | `collation_agg_func` | pending | 0% | ✗ | — |
+| 3 | `cte` | in_progress | 65%（首差 862/1329） | ✓ | — |
+| 4 | `executor/cte` | green | 100% | ✓ | ✓ |
+| 5 | `executor/jointest/hash_join` | green | 100% | ✓ | ✓ |
+| 6 | `executor/jointest/join` | green | 100% | ✓ | ✓ |
+| 7 | `executor/union_scan` | green | 100% | ✓ | ✓ |
+| 8 | `executor/window` | green | 100% | ✓ | ✓ |
+| 9 | `explain_cte` | in_progress | 2%（首差 9/520） | ✓ | — |
+| 10 | `explain_union_scan` | green | 100% | ✓ | ✓ |
+| 11 | `globalindex/aggregate` | green | 100% | ✓ | ✓ |
+| 12 | `globalindex/index_join` | green | 100% | ✓ | ✓ |
+| 13 | `index_join` | green | 100% | ✓ | ✓ |
+| 14 | `naaj` | green | 100% | ✓ | ✓ |
+| 15 | `null_rejected` | green | 100% | ✓ | ✓ |
+| 16 | `planner/core/casetest/rule/rule_derive_topn_from_window` | in_progress | 3%（首差 12/333） | ✓ | — |
+| 17 | `planner/core/join_reorder2` | in_progress | 3%（首差 10/267） | ✓ | — |
+| 18 | `planner/core/join_reorder_through_projection` | in_progress | 1%（首差 18/2354） | ✓ | — |
+| 19 | `subquery` | green | 100% | ✓ | ✓ |
+| 20 | `topn_push_down` | in_progress | 63%（首差 171/271） | ✓ | — |
+| 21 | `topn_pushdown` | green | 100% | ✓ | ✓ |
+| 22 | `window_function` | green | 100% | ✓ | ✓ |
+
+### R3 — point_get / index / partition / explain*（48 套，green 20）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `access_path_selection` | green | 100% | ✓ | ✓ |
+| 2 | `clustered_index` | green | 100% | ✓ | ✓ |
+| 3 | `ddl/db_partition` | pending | 0% | ✓ | — |
+| 4 | `ddl/exchange_partition_global_index` | pending | 0% | ✓ | — |
+| 5 | `ddl/partition` | pending | 0% | ✓ | — |
+| 6 | `ddl/reorg_partition` | pending | 0% | ✓ | — |
+| 7 | `executor/batch_point_get` | green | 100% | ✓ | ✓ |
+| 8 | `executor/explain` | in_progress | 16%（首差 65/402） | ✓ | — |
+| 9 | `executor/explainfor` | pending | 0% | ✓ | — |
+| 10 | `executor/index_lookup_pushdown_partition` | pending | 0% | ✓ | — |
+| 11 | `executor/index_merge_reader` | green | 100% | ✓ | ✓ |
+| 12 | `executor/partition/issues` | green | 100% | ✓ | ✓ |
+| 13 | `executor/partition/partition_boundaries` | green | 100% | ✓ | ✓ |
+| 14 | `executor/partition/partition_with_expression` | green | 100% | ✓ | ✓ |
+| 15 | `executor/partition/table` | green | 100% | ✓ | ✓ |
+| 16 | `executor/partition/write` | green | 100% | ✓ | ✓ |
+| 17 | `executor/point_get` | green | 100% | ✓ | ✓ |
+| 18 | `explain` | green | 100% | ✓ | ✓ |
+| 19 | `explain-non-select-stmt` | green | 100% | ✓ | ✓ |
+| 20 | `explain_complex` | in_progress | 37%（首差 110/293） | ✓ | — |
+| 21 | `explain_complex_stats` | in_progress | 49%（首差 124/253） | ✓ | — |
+| 22 | `explain_easy` | in_progress | 52%（首差 506/978） | ✓ | — |
+| 23 | `explain_easy_stats` | green | 100% | ✓ | ✓ |
+| 24 | `explain_foreign_key` | green | 100% | ✓ | ✓ |
+| 25 | `explain_generate_column_substitute` | in_progress | 2%（首差 12/708） | ✓ | — |
+| 26 | `explain_indexmerge_stats` | in_progress | 96%（首差 196/203） | ✓ | — |
+| 27 | `explain_join_stats` | green | 100% | ✓ | ✓ |
+| 28 | `explain_shard_index` | green | 100% | ✓ | ✓ |
+| 29 | `explain_stats` | green | 100% | ✓ | ✓ |
+| 30 | `expression/explain` | pending | 0% | ✓ | — |
+| 31 | `globalindex/mem_index_merge` | in_progress | 7%（首差 18/254） | ✓ | — |
+| 32 | `globalindex/mem_index_merge_non_unique` | in_progress | 7%（首差 18/254） | ✓ | — |
+| 33 | `globalindex/point_get` | green | 100% | ✓ | ✓ |
+| 34 | `index_merge` | in_progress | 1%（首差 12/969） | ✓ | — |
+| 35 | `partition` | pending | 0% | ✓ | — |
+| 36 | `planner/core/casetest/partition/integration_partition` | pending | 0% | ✓ | — |
+| 37 | `planner/core/casetest/partition/partition_pruner` | pending | 0% | ✓ | — |
+| 38 | `planner/core/casetest/physicalplantest/physical_plan` | pending | 0% | ✓ | — |
+| 39 | `planner/core/casetest/point_get_plan` | green | 100% | ✓ | ✓ |
+| 40 | `planner/core/cbo` | pending | 0% | ✓ | — |
+| 41 | `planner/core/integration_partition` | pending | 0% | ✓ | — |
+| 42 | `planner/core/partition_pruner` | pending | 0% | ✓ | — |
+| 43 | `planner/core/physical_plan` | pending | 0% | ✓ | — |
+| 44 | `planner/core/plan_cost_ver2` | pending | 0% | ✓ | — |
+| 45 | `planner/core/point_get_plan` | green | 100% | ✓ | ✓ |
+| 46 | `session/clustered_index` | pending | 0% | ✓ | — |
+| 47 | `table/partition` | pending | 0% | ✓ | — |
+| 48 | `util/ranger` | pending | 0% | ✓ | — |
+
+### R4 — plan cache / 会话（13 套，green 0）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `collation_check_use_collation` | pending | 0% | ✗ | — |
+| 2 | `collation_misc` | pending | 0% | ✗ | — |
+| 3 | `collation_pointget` | pending | 0% | ✗ | — |
+| 4 | `common_collation` | pending | 0% | ✓ | — |
+| 5 | `executor/prepared` | pending | 0% | ✓ | — |
+| 6 | `expression/charset_and_collation` | pending | 0% | ✓ | — |
+| 7 | `expression/plan_cache` | pending | 0% | ✓ | — |
+| 8 | `new_character_set` | pending | 0% | ✓ | — |
+| 9 | `new_character_set_builtin` | pending | 0% | ✓ | — |
+| 10 | `new_character_set_invalid` | pending | 0% | ✓ | — |
+| 11 | `planner/core/plan_cache` | pending | 0% | ✓ | — |
+| 12 | `planner/core/tests/prepare/issue` | pending | 0% | ✓ | — |
+| 13 | `planner/core/tests/prepare/prepare` | pending | 0% | ✓ | — |
+
+### R5（12 套，green 0）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `db_integration` | pending | 0% | ✓ | — |
+| 2 | `ddl/db_integration` | pending | 0% | ✓ | — |
+| 3 | `privilege/privileges` | pending | 0% | ✓ | — |
+| 4 | `session/bootstrap_upgrade` | pending | 0% | ✓ | — |
+| 5 | `session/common` | pending | 0% | ✓ | — |
+| 6 | `session/nontransactional` | pending | 0% | ✓ | — |
+| 7 | `session/privileges` | pending | 0% | ✓ | — |
+| 8 | `session/session` | pending | 0% | ✓ | — |
+| 9 | `session/temporary_table` | pending | 0% | ✓ | — |
+| 10 | `session/txn` | pending | 0% | ✓ | — |
+| 11 | `session/variable` | pending | 0% | ✓ | — |
+| 12 | `session/vars` | pending | 0% | ✓ | — |
+
+### R6（35 套，green 0）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `ddl/affinity` | pending | 0% | ✓ | — |
+| 2 | `ddl/attributes_sql` | pending | 0% | ✓ | — |
+| 3 | `ddl/bdr_mode` | pending | 0% | ✓ | — |
+| 4 | `ddl/column` | pending | 0% | ✓ | — |
+| 5 | `ddl/column_change` | pending | 0% | ✓ | — |
+| 6 | `ddl/column_modify` | pending | 0% | ✓ | — |
+| 7 | `ddl/column_type_change` | pending | 0% | ✓ | — |
+| 8 | `ddl/constraint` | pending | 0% | ✓ | — |
+| 9 | `ddl/db` | pending | 0% | ✓ | — |
+| 10 | `ddl/db_cache` | pending | 0% | ✓ | — |
+| 11 | `ddl/db_change` | pending | 0% | ✓ | — |
+| 12 | `ddl/db_foreign_key` | pending | 0% | ✓ | — |
+| 13 | `ddl/db_rename` | pending | 0% | ✓ | — |
+| 14 | `ddl/db_table` | pending | 0% | ✓ | — |
+| 15 | `ddl/ddl_error` | pending | 0% | ✓ | — |
+| 16 | `ddl/default_as_expression` | pending | 0% | ✓ | — |
+| 17 | `ddl/fail_db` | pending | 0% | ✓ | — |
+| 18 | `ddl/foreign_key` | pending | 0% | ✓ | — |
+| 19 | `ddl/index_modify` | pending | 0% | ✓ | — |
+| 20 | `ddl/integration` | pending | 0% | ✓ | — |
+| 21 | `ddl/modify_column` | pending | 0% | ✓ | — |
+| 22 | `ddl/multi_schema_change` | pending | 0% | ✓ | — |
+| 23 | `ddl/primary_key_handle` | pending | 0% | ✓ | — |
+| 24 | `ddl/resource_group` | pending | 0% | ✓ | — |
+| 25 | `ddl/sequence` | pending | 0% | ✓ | — |
+| 26 | `ddl/serial` | pending | 0% | ✓ | — |
+| 27 | `ddl/table_modify` | pending | 0% | ✓ | — |
+| 28 | `infoschema/cluster_tables` | pending | 0% | ✓ | — |
+| 29 | `infoschema/infoschema` | pending | 0% | ✓ | — |
+| 30 | `infoschema/tables` | pending | 0% | ✓ | — |
+| 31 | `infoschema/v2` | pending | 0% | ✓ | — |
+| 32 | `statistics/handle` | pending | 0% | ✓ | — |
+| 33 | `statistics/integration` | pending | 0% | ✓ | — |
+| 34 | `statistics/lock_table_stats` | pending | 0% | ✓ | — |
+| 35 | `statistics/overflow_calc` | pending | 0% | ✓ | — |
+
+### R7（110 套，green 0）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `bindinfo/bind` | pending | 0% | ✓ | — |
+| 2 | `bindinfo/session_handle` | pending | 0% | ✓ | — |
+| 3 | `bindinfo/temptable` | pending | 0% | ✓ | — |
+| 4 | `black_list` | pending | 0% | ✓ | — |
+| 5 | `executor/adapter` | pending | 0% | ✓ | — |
+| 6 | `executor/admin` | pending | 0% | ✓ | — |
+| 7 | `executor/aggregate` | pending | 0% | ✓ | — |
+| 8 | `executor/analyze` | pending | 0% | ✓ | — |
+| 9 | `executor/autoid` | pending | 0% | ✓ | — |
+| 10 | `executor/charset` | pending | 0% | ✓ | — |
+| 11 | `executor/chunk_reuse` | pending | 0% | ✓ | — |
+| 12 | `executor/cluster_table` | pending | 0% | ✓ | — |
+| 13 | `executor/compact_table` | pending | 0% | ✓ | — |
+| 14 | `executor/ddl` | pending | 0% | ✓ | — |
+| 15 | `executor/delete` | pending | 0% | ✓ | — |
+| 16 | `executor/distsql` | pending | 0% | ✓ | — |
+| 17 | `executor/executor` | pending | 0% | ✓ | — |
+| 18 | `executor/executor_txn` | pending | 0% | ✓ | — |
+| 19 | `executor/expand` | pending | 0% | ✓ | — |
+| 20 | `executor/foreign_key` | pending | 0% | ✓ | — |
+| 21 | `executor/grant` | pending | 0% | ✓ | — |
+| 22 | `executor/import_into` | pending | 0% | ✓ | — |
+| 23 | `executor/index_advise` | pending | 0% | ✓ | — |
+| 24 | `executor/index_lookup_join` | pending | 0% | ✓ | — |
+| 25 | `executor/index_lookup_merge_join` | pending | 0% | ✓ | — |
+| 26 | `executor/index_lookup_pushdown` | pending | 0% | ✓ | — |
+| 27 | `executor/infoschema_reader` | pending | 0% | ✓ | — |
+| 28 | `executor/insert` | pending | 0% | ✓ | — |
+| 29 | `executor/inspection_common` | pending | 0% | ✓ | — |
+| 30 | `executor/issues` | pending | 0% | ✓ | — |
+| 31 | `executor/kv` | pending | 0% | ✓ | — |
+| 32 | `executor/merge_join` | pending | 0% | ✓ | — |
+| 33 | `executor/parallel_apply` | pending | 0% | ✓ | — |
+| 34 | `executor/password_management` | pending | 0% | ✓ | — |
+| 35 | `executor/revoke` | pending | 0% | ✓ | — |
+| 36 | `executor/rowid` | pending | 0% | ✓ | — |
+| 37 | `executor/sample` | pending | 0% | ✓ | — |
+| 38 | `executor/set` | pending | 0% | ✓ | — |
+| 39 | `executor/show` | pending | 0% | ✓ | — |
+| 40 | `executor/simple` | pending | 0% | ✓ | — |
+| 41 | `executor/split_table` | pending | 0% | ✓ | — |
+| 42 | `executor/stale_txn` | pending | 0% | ✓ | — |
+| 43 | `executor/statement_context` | pending | 0% | ✓ | — |
+| 44 | `executor/update` | pending | 0% | ✓ | — |
+| 45 | `executor/write` | pending | 0% | ✓ | — |
+| 46 | `expression/builtin` | pending | 0% | ✓ | — |
+| 47 | `expression/cast` | pending | 0% | ✓ | — |
+| 48 | `expression/constant_fold` | pending | 0% | ✓ | — |
+| 49 | `expression/enum_set` | pending | 0% | ✓ | — |
+| 50 | `expression/format` | pending | 0% | ✓ | — |
+| 51 | `expression/issues` | pending | 0% | ✓ | — |
+| 52 | `expression/json` | pending | 0% | ✓ | — |
+| 53 | `expression/misc` | pending | 0% | ✓ | — |
+| 54 | `expression/multi_valued_index` | pending | 0% | ✓ | — |
+| 55 | `expression/noop_functions` | pending | 0% | ✓ | — |
+| 56 | `expression/time` | pending | 0% | ✓ | — |
+| 57 | `expression/vitess_hash` | pending | 0% | ✓ | — |
+| 58 | `generated_columns` | pending | 0% | ✓ | — |
+| 59 | `globalindex/analyze` | pending | 0% | ✓ | — |
+| 60 | `globalindex/ddl` | pending | 0% | ✓ | — |
+| 61 | `globalindex/expression_index` | pending | 0% | ✓ | — |
+| 62 | `globalindex/information_schema` | pending | 0% | ✓ | — |
+| 63 | `globalindex/insert` | pending | 0% | ✓ | — |
+| 64 | `globalindex/mem_index_lookup` | pending | 0% | ✓ | — |
+| 65 | `globalindex/mem_index_non_unique` | pending | 0% | ✓ | — |
+| 66 | `globalindex/mem_index_reader` | pending | 0% | ✓ | — |
+| 67 | `globalindex/misc` | pending | 0% | ✓ | — |
+| 68 | `globalindex/multi_valued_index` | pending | 0% | ✓ | — |
+| 69 | `globalindex/update` | pending | 0% | ✓ | — |
+| 70 | `imdbload` | pending | 0% | ✓ | — |
+| 71 | `parser/integration` | pending | 0% | ✓ | — |
+| 72 | `planner/cardinality/selectivity` | pending | 0% | ✓ | — |
+| 73 | `planner/cardinality/trace` | pending | 0% | ✓ | — |
+| 74 | `planner/cascades/integration` | pending | 0% | ✓ | — |
+| 75 | `planner/core/binary_plan` | pending | 0% | ✓ | — |
+| 76 | `planner/core/casetest/expression_rewriter` | pending | 0% | ✓ | — |
+| 77 | `planner/core/casetest/hint/hint` | pending | 0% | ✓ | — |
+| 78 | `planner/core/casetest/index/index` | pending | 0% | ✓ | — |
+| 79 | `planner/core/casetest/index/partialindex` | pending | 0% | ✓ | — |
+| 80 | `planner/core/casetest/integration` | pending | 0% | ✓ | — |
+| 81 | `planner/core/casetest/predicate_simplification` | pending | 0% | ✓ | — |
+| 82 | `planner/core/casetest/pushdown/push_down` | pending | 0% | ✓ | — |
+| 83 | `planner/core/casetest/rule/rule_join_reorder` | pending | 0% | ✓ | — |
+| 84 | `planner/core/casetest/rule/rule_result_reorder` | pending | 0% | ✓ | — |
+| 85 | `planner/core/expression_rewriter` | pending | 0% | ✓ | — |
+| 86 | `planner/core/grouped_ranges_order_by` | pending | 0% | ✓ | — |
+| 87 | `planner/core/indexjoin` | pending | 0% | ✓ | — |
+| 88 | `planner/core/indexmerge_intersection` | pending | 0% | ✓ | — |
+| 89 | `planner/core/indexmerge_path` | pending | 0% | ✓ | — |
+| 90 | `planner/core/integration` | pending | 0% | ✓ | — |
+| 91 | `planner/core/issuetest/planner_issue` | pending | 0% | ✓ | — |
+| 92 | `planner/core/lateral_join` | pending | 0% | ✓ | — |
+| 93 | `planner/core/memtable_predicate_extractor` | pending | 0% | ✓ | — |
+| 94 | `planner/core/partial_order_topn` | pending | 0% | ✓ | — |
+| 95 | `planner/core/plan` | pending | 0% | ✓ | — |
+| 96 | `planner/core/preprocess` | pending | 0% | ✓ | — |
+| 97 | `planner/core/range_scan_for_like` | pending | 0% | ✓ | — |
+| 98 | `planner/core/rule_constant_propagation` | pending | 0% | ✓ | — |
+| 99 | `planner/core/rule_join_reorder` | pending | 0% | ✓ | — |
+| 100 | `planner/core/rule_outer2inner` | pending | 0% | ✓ | — |
+| 101 | `planner/core/rule_result_reorder` | pending | 0% | ✓ | — |
+| 102 | `planner/funcdep/only_full_group_by` | pending | 0% | ✓ | — |
+| 103 | `sessionctx/setvar` | pending | 0% | ✓ | — |
+| 104 | `sessiontxn/externals` | pending | 0% | ✓ | — |
+| 105 | `table/cache` | pending | 0% | ✓ | — |
+| 106 | `table/index` | pending | 0% | ✓ | — |
+| 107 | `table/tables` | pending | 0% | ✓ | — |
+| 108 | `table/temptable` | pending | 0% | ✓ | — |
+| 109 | `tpch` | pending | 0% | ✓ | — |
+| 110 | `util/admin` | pending | 0% | ✓ | — |
+
+### D — TiFlash / MPP（2 套，deferred）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `ddl/ddl_tiflash` | deferred | — | ✓ | — |
+| 2 | `planner/core/enforce_mpp` | deferred | — | ✓ | — |
+
+### local — SealDB 冒烟（8 套）
+
+| # | Suite | 状态 | 进度 | 金样 | TiKV |
+|---:|---|---|---:|:--:|:--:|
+| 1 | `local/agg` | local | — | ✓ | — |
+| 2 | `local/basic` | local | — | ✓ | — |
+| 3 | `local/dml` | local | — | ✓ | — |
+| 4 | `local/errors` | local | — | ✓ | — |
+| 5 | `local/infoschema` | local | — | ✓ | — |
+| 6 | `local/join` | local | — | ✓ | — |
+| 7 | `local/predicate` | local | — | ✓ | — |
+| 8 | `local/txn` | local | — | ✓ | skip |
+
