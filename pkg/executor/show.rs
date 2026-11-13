@@ -484,6 +484,12 @@ fn render_create_table(info: &TableInfo) -> String {
         .filter(|col| !col.hidden)
         .map(|col| {
             let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
+            if col.field_type.flag & NOT_NULL_FLAG != 0 {
+                line.push_str(" NOT NULL");
+            }
+            if col.auto_increment {
+                line.push_str(" AUTO_INCREMENT");
+            }
             if let Some(default) = &col.default_expr {
                 line.push_str(&format!(" DEFAULT {default}"));
             } else if col.field_type.flag & NOT_NULL_FLAG == 0 {
@@ -517,7 +523,18 @@ fn render_create_table(info: &TableInfo) -> String {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        cols.push(format!("  {key} `{}` ({parts})", idx.name.o()));
+        cols.push(if idx.primary {
+            // TiDB prints the PRIMARY KEY without an index name and annotates
+            // how the key is stored (`/*T![clustered_index] … */`).
+            let stored = if info.pk_is_clustered() {
+                "CLUSTERED"
+            } else {
+                "NONCLUSTERED"
+            };
+            format!("  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */")
+        } else {
+            format!("  {key} `{}` ({parts})", idx.name.o())
+        });
     }
     let mut out = format!(
         "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET={} COLLATE={}",

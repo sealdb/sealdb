@@ -206,7 +206,7 @@
     {
       "name": "ddl/column",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/column.test",
       "result": "r/ddl/column.result",
       "has_result": true,

@@ -1,7 +1,8 @@
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
     ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE,
-    ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, Error, Result,
+    ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
+    ERR_VIEW_WRONG_LIST, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -233,6 +234,141 @@ pub(crate) fn validate_default_fsp(
     Ok(())
 }
 
+/// Bounds of an integer column type (`types.TinyInt` … `types.Longlong`),
+/// honouring the UNSIGNED flag.
+fn integer_bounds(field_type: &FieldType) -> Option<(i128, i128)> {
+    let unsigned = field_type.is_unsigned();
+    let (signed_max, unsigned_max) = match field_type.tp {
+        TYPE_TINY => (i128::from(i8::MAX), i128::from(u8::MAX)),
+        TYPE_SHORT => (i128::from(i16::MAX), i128::from(u16::MAX)),
+        TYPE_INT24 => (i128::from(8_388_607i32), i128::from(16_777_215u32)),
+        TYPE_LONG => (i128::from(i32::MAX), i128::from(u32::MAX)),
+        TYPE_LONG_LONG => (i128::from(i64::MAX), i128::from(u64::MAX)),
+        _ => return None,
+    };
+    if unsigned {
+        Some((0, unsigned_max))
+    } else {
+        Some((-signed_max - 1, signed_max))
+    }
+}
+
+/// Digits of a MySQL bit literal (`b'0110'` / `0b0110`).
+fn bit_literal_bits(text: &str) -> Option<&str> {
+    let rest = if text.len() >= 3 && (text.starts_with("b'") || text.starts_with("B'")) {
+        text.get(2..text.len().saturating_sub(1))?
+    } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        rest
+    } else {
+        return None;
+    };
+    if text.starts_with("b'") || text.starts_with("B'") {
+        if !text.ends_with('\'') {
+            return None;
+        }
+    }
+    if rest.is_empty() || !rest.bytes().all(|b| b == b'0' || b == b'1') {
+        return None;
+    }
+    Some(rest)
+}
+
+/// TiDB `types.CheckDisplayWidth`: `BIT(n)` only allows `1 <= n <= 64`.
+pub(crate) fn validate_display_width(name: &str, field_type: &FieldType) -> Result<()> {
+    if field_type.tp == TYPE_BIT && (field_type.flen < 1 || field_type.flen > 64) {
+        return Err(Error::new(
+            ERR_TOO_BIG_DISPLAYWIDTH,
+            format!("Display width out of range for column '{name}' (max = 64)"),
+        ));
+    }
+    Ok(())
+}
+
+/// TiDB `checkDefaultValue` on a quoted literal: the value must convert to the
+/// column type with truncation/overflow errors raised (`GetColDefaultValue`
+/// evaluates with `LevelError`, so this is independent of `sql_mode`).
+pub(crate) fn validate_default_literal(
+    name: &str,
+    field_type: &FieldType,
+    default: Option<&str>,
+) -> Result<()> {
+    let Some(default) = default else {
+        return Ok(());
+    };
+    let trimmed = default.trim();
+    if field_type.tp == TYPE_BIT {
+        // `b'111'` on `BIT(2)`: the bit-string's value must fit the width.
+        if let Some(bits) = bit_literal_bits(trimmed) {
+            let width = field_type.flen.max(1).min(128) as u32;
+            let mut acc: u128 = 0;
+            let mut overflow = false;
+            for b in bits.bytes() {
+                if b != b'1' {
+                    continue;
+                }
+                match acc.checked_mul(2).and_then(|v| v.checked_add(1)) {
+                    Some(next) => acc = next,
+                    None => overflow = true,
+                }
+            }
+            let max = if width >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << width) - 1
+            };
+            if overflow || acc > max {
+                return Err(Error::new(
+                    ERR_INVALID_DEFAULT,
+                    format!("Invalid default value for '{name}'"),
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        return Ok(());
+    };
+    let value = inner.replace("''", "'");
+    let text = value.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let fits = if let Some((low, high)) = integer_bounds(field_type) {
+        let parsed = text
+            .parse::<i128>()
+            .ok()
+            .or_else(|| text.parse::<f64>().ok().map(|v| v.trunc() as i128));
+        parsed.is_some_and(|v| v >= low && v <= high)
+    } else {
+        match field_type.tp {
+            // A `DATE` default may carry a time part (`'2024-10-24 12:20'`),
+            // which is truncated; a bare `'2024-10'` is not a valid date.
+            TYPE_DATE => {
+                sealdb_types::parse_date_literal(text).is_ok()
+                    || sealdb_types::parse_datetime_literal(text).is_ok()
+            }
+            TYPE_DATETIME | TYPE_TIMESTAMP => {
+                sealdb_types::parse_datetime_literal(text).is_ok()
+                    || sealdb_types::parse_datetime_literal(&format!("{text} 00:00:00")).is_ok()
+            }
+            TYPE_DURATION => {
+                normalize_duration_default(text, field_type.decimal.clamp(0, 6)).is_some()
+            }
+            _ => true,
+        }
+    };
+    if !fits {
+        return Err(Error::new(
+            ERR_INVALID_DEFAULT,
+            format!("Invalid default value for '{name}'"),
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize a quoted literal default to the column type, the way TiDB does at
 /// DDL time: temporal defaults are parsed and rounded to the column's
 /// fractional precision (`DEFAULT '12:12:13.4'` on `TIME` becomes `12:12:13`),
@@ -251,13 +387,19 @@ pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String
         TYPE_DURATION => normalize_duration_default(&value, fsp)
             .map(|text| format!("'{text}'"))
             .unwrap_or_else(|| default.to_string()),
-        TYPE_DATETIME | TYPE_TIMESTAMP => match sealdb_types::parse_datetime_literal(&value) {
+        TYPE_DATETIME | TYPE_TIMESTAMP => match sealdb_types::parse_datetime_literal(&value)
+            .or_else(|_| sealdb_types::parse_datetime_literal(&format!("{value} 00:00:00")))
+        {
             Ok(time) => format!("'{}'", round_time(time, fsp).to_string()),
             Err(_) => default.to_string(),
         },
         TYPE_DATE => match sealdb_types::parse_date_literal(&value) {
             Ok(time) => format!("'{time}'"),
-            Err(_) => default.to_string(),
+            // A `DATE` default may carry a time part, which is truncated.
+            Err(_) => match sealdb_types::parse_datetime_literal(&value) {
+                Ok(time) => format!("'{:04}-{:02}-{:02}'", time.year, time.month, time.day),
+                Err(_) => default.to_string(),
+            },
         },
         _ => default.to_string(),
     }
@@ -472,6 +614,12 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             .map(|default| normalize_default(&info.field_type, default));
         info.auto_increment = col.auto_increment;
         info.auto_random = col.auto_random;
+        validate_display_width(info.name.o(), &info.field_type)?;
+        validate_default_literal(
+            info.name.o(),
+            &info.field_type,
+            info.default_expr.as_deref(),
+        )?;
         validate_default_fsp(
             info.name.o(),
             &info.field_type,
@@ -535,6 +683,12 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             if pk_col_offsets.contains(&c.offset) {
                 c.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
             }
+        }
+    }
+    // TiDB `BuildTableInfo`: AUTO_INCREMENT implies NOT NULL.
+    for c in &mut info.columns {
+        if c.auto_increment {
+            c.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
         }
     }
     // TiDB `BuildTableInfo`: a FOREIGN KEY needs a local index whose prefix is
@@ -933,7 +1087,9 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             }
         }
         "DECIMAL" | "NUMERIC" => {
+            // MySQL/TiDB: `decimal(0)` / `decimal(0,0)` means precision 10.
             let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((10, 0));
+            let flen = if flen == 0 { 10 } else { flen };
             FieldType {
                 tp: TYPE_NEW_DECIMAL,
                 flen,

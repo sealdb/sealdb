@@ -108,6 +108,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_warnings(&rewritten);
     // MySQL/TiDB `DROP TABLES …` (plural object keyword).
     let rewritten = rewrite_drop_tables(&rewritten);
+    let rewritten = rewrite_alter_add_columns_paren(&rewritten);
     let rewritten = rewrite_rename_index(&rewritten);
     let (rewritten, explain_formats) = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
@@ -1518,6 +1519,82 @@ fn rewrite_drop_tables(sql: &str) -> String {
         i = push_sql_char(&mut out, sql, i);
     }
     out
+}
+
+/// MySQL `ALTER TABLE t ADD COLUMN (c1 def, c2 def)` (TiDB accepts a
+/// parenthesized column list). sqlparser only knows the single-column form, so
+/// expand it into one `ADD COLUMN` per definition.
+fn rewrite_alter_add_columns_paren(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "ADD") {
+            let after_add = skip_ws(bytes, i + "ADD".len());
+            if keyword_at(bytes, after_add, "COLUMN") {
+                let open = skip_ws(bytes, after_add + "COLUMN".len());
+                if open < bytes.len() && bytes[open] == b'(' {
+                    if let Some(close) = matching_paren(bytes, open) {
+                        let parts = split_top_level_commas(&sql[open + 1..close]);
+                        for (pos, part) in parts.iter().enumerate() {
+                            if pos > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str("ADD COLUMN ");
+                            out.push_str(part.trim());
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+/// Split on commas that are not nested in parens or quotes.
+fn split_top_level_commas(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                current.push_str(&text[start..i]);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        current.push_str(&text[i..i + 1]);
+        i += 1;
+    }
+    parts.push(current);
+    parts
 }
 
 fn rewrite_show_warnings(sql: &str) -> String {

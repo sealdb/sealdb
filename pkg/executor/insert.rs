@@ -393,6 +393,19 @@ fn map_insert_row(
     row: &[Datum],
     row_no: usize,
 ) -> Result<Vec<Datum>> {
+    // `INSERT INTO t VALUES()` / `INSERT INTO t () VALUES ()`: one row built
+    // entirely from column defaults.
+    if columns.is_empty() && row.is_empty() {
+        let mut values = vec![Datum::Null; info.columns.len()];
+        for col in &info.columns {
+            if col.hidden {
+                continue;
+            }
+            values[col.offset as usize] = column_default_value(col)?;
+        }
+        fill_generated_columns(info, &mut values)?;
+        return Ok(values);
+    }
     if columns.is_empty() {
         // Hidden expression-index columns are not part of the user-visible
         // column list, so `INSERT INTO t VALUES (...)` counts only the rest.

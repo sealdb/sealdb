@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-13（green 53 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 54 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2209,6 +2209,35 @@
   - 无；后续按 R7 长尾继续扫底
 - **下一步**:
   - 继续 R3 `explain_easy` / `explain_complex` / `explain_complex_stats` / `explain_join_stats`
+
+### 2026-11-14（`ddl/column` 转正：默认值校验 + 位类型 + 表结构渲染）
+
+- **Phase**: R6 DDL × 默认值
+- **完成**:
+  - DDL 默认值校验对齐 TiDB `checkDefaultValue`：`GetColDefaultValue` 以
+    `LevelError` 求值，因此与 `sql_mode` 无关；整数默认值按类型区间判越界
+    （`tinyint default '11111111'`、`'11abc'` → 1067），日期可带时间部分并截断
+    （`date default '2024-10-24 12:20'` 合法，`'2024-10'` → 1067），
+    `datetime` 允许仅日期并补 `00:00:00`，`TIME` 复用 duration 解析
+  - `BIT(n)`：新增 1439 `Display width out of range for column 'x' (max = 64)`；
+    `b'…'` 默认值按位串数值判断是否超出列宽（`bit(2) default b'111'` → 1067，
+    `bit(3) default b'000111'` 合法）
+  - `ALTER TABLE … ADD COLUMN (c1 def, c2 def)`（括号列清单）在解析前展开为多条
+    `ADD COLUMN`，并接入同一套默认值/位宽校验
+  - `INSERT INTO t VALUES()` 支持整行取默认值
+  - `SHOW CREATE TABLE`：输出 `NOT NULL` 与 `AUTO_INCREMENT`；PRIMARY KEY 不带索引名并
+    追加 `/*T![clustered_index] CLUSTERED|NONCLUSTERED */`；`decimal` 统一渲染
+    `decimal(M,D)`，`decimal(0)`/`decimal(0,0)` 精度归一到 10
+  - `AUTO_INCREMENT` 列按 TiDB 补 `NOT NULL`
+- **验证**:
+  - `run-tests.sh -s memory -t ddl/column --status pending` → PASS
+  - `run-tests.sh -s tikv -t ddl/column --status pending` → PASS
+  - `run-tests.sh -s memory --status green` → `PASS: memory=53`（无回归）
+  - manifest `ddl/column` → `green`，green 53→54
+- **阻塞/风险**:
+  - `explain_easy` 仍差一条查询：外连接聚合下推 + Union 下推 + 列编号重建
+- **下一步**:
+  - 继续 R6：`ddl/default_as_expression` / `ddl/db_table` 等
 
 ### 2026-10-19
 

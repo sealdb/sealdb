@@ -4,8 +4,8 @@
 // multi-schema-state jobs.
 use crate::create_table::{
     field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
-    ttl_column_name, validate_default_fsp, validate_generated_auto_increment,
-    validate_generated_column_refs, validate_generated_expr,
+    ttl_column_name, validate_default_fsp, validate_default_literal, validate_display_width,
+    validate_generated_auto_increment, validate_generated_column_refs, validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{add_partitions, drop_partitions, exchange_partition};
@@ -248,6 +248,7 @@ fn alter_column_default(
     if let Some(default) = default {
         let field_type = info.columns[pos].field_type.clone();
         let default = normalize_default(&field_type, default);
+        validate_default_literal(name, &field_type, Some(&default))?;
         validate_default_fsp(name, &field_type, Some(&default))?;
         info.columns[pos].default_expr = Some(default);
     } else {
@@ -391,6 +392,12 @@ fn add_column(
     if column.not_null {
         new_col.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
     }
+    validate_display_width(&new_col.name.o().to_string(), &new_col.field_type)?;
+    validate_default_literal(
+        &new_col.name.o().to_string(),
+        &new_col.field_type,
+        new_col.default_expr.as_deref(),
+    )?;
     validate_default_fsp(
         &new_col.name.o().to_string(),
         &new_col.field_type,
@@ -726,6 +733,8 @@ fn change_column(
         .map(|default| default.to_string())
         .or_else(|| info.columns[pos].default_expr.clone())
         .map(|default| normalize_default(&new_ft, &default));
+    validate_display_width(new_name, &new_ft)?;
+    validate_default_literal(new_name, &new_ft, effective_default.as_deref())?;
     validate_default_fsp(new_name, &new_ft, effective_default.as_deref())?;
     if let Some(default) = effective_default {
         info.columns[pos].default_expr = Some(default);

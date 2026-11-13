@@ -120,8 +120,9 @@ impl FieldType {
             TYPE_SET => return self.elems_type_name("set"),
             _ => "varchar",
         };
-        if self.is_unsigned() {
-            format!("{base} unsigned")
+        let mut rendered = if matches!(self.tp, TYPE_NEW_DECIMAL | TYPE_DECIMAL) && self.flen > 0 {
+            // TiDB always spells DECIMAL as `decimal(M,D)`.
+            format!("{base}({},{})", self.flen, self.decimal.max(0))
         } else if matches!(self.tp, TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION)
             && self.decimal > 0
         {
@@ -129,7 +130,11 @@ impl FieldType {
             format!("{base}({})", self.decimal)
         } else {
             base.to_string()
+        };
+        if self.is_unsigned() {
+            rendered.push_str(" unsigned");
         }
+        rendered
     }
 
     /// TiDB `FieldType.HandleWrongValue` numbering for an ENUM/SET label:

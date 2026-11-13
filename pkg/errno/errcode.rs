@@ -102,6 +102,9 @@ pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
+/// TiDB `ErrTooBigDisplayWidth`: `BIT(65)` / `INT(0)` — the declared display
+/// width is outside `[1, type max]`.
+pub const ERR_TOO_BIG_DISPLAYWIDTH: i32 = 1439;
 /// TiDB `ErrInvalidDefault`: a column default that is invalid for the column
 /// type/precision (e.g. `TIMESTAMP` default `NOW(1)` for fsp 0).
 pub const ERR_INVALID_DEFAULT: i32 = 1067;
