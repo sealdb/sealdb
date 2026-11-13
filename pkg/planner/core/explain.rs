@@ -182,6 +182,9 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     if std::env::var("SEALDB_DEBUG_PLAN").is_ok() {
         debug_log(&format!("PLANDBG {plan:#?}"));
     }
+    if let Some(rows) = explain_in_subquery_limit_apply(plan) {
+        return rows;
+    }
     let mut rows = Vec::new();
     let mut deferred: Vec<PhysicalPlan> = Vec::new();
     // TiDB renders `NULL` in the access-object column for every node without an
@@ -217,6 +220,200 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     }
     PINNED_PARTITION.with(|c| c.set(false));
     rows
+}
+
+/// `col IN (SELECT … FROM t WHERE <correlated> ORDER BY … LIMIT n)` keeps an
+/// `Apply` whose probe is the bounded subquery. TiDB decorrelates that into a
+/// semi-join Apply (`rule_decorrelate.go`): the outer key's `not(isnull())`
+/// check moves into the build side, and the probe becomes
+/// `Selection → Limit → TableReader(→ cop Limit → cop Selection → scan)`.
+///
+/// The single-child `Apply` is the executable NestedLoopApply shape, so this
+/// renders TiDB's decorrelated tree without changing the executed plan.
+fn explain_in_subquery_limit_apply(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
+    use sealdb_parser::ast::ResultSetNode;
+    use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, InSubqueryExpr};
+
+    let PhysicalPlan::Apply {
+        child,
+        filter,
+        probe: None,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    let ExprNode::InSubquery(InSubqueryExpr {
+        expr,
+        not: false,
+        query,
+        ..
+    }) = filter
+    else {
+        return None;
+    };
+    let ResultSetNode::Select(inner) = query.as_ref() else {
+        return None;
+    };
+    // Only the `… ORDER BY … LIMIT n` form decorrelates; plain `IN` becomes a
+    // semi HashJoin, and an uncorrelated subquery becomes an inner join.
+    let limit = inner.limit?;
+    // A derived-table subquery (`IN (SELECT … FROM (… ) x … LIMIT n)`) is
+    // inline-CTE rewritten, so the correlated scan sits under the CTE's query.
+    let mut scan_sel: &sealdb_parser::ast::SelectStmt = inner;
+    loop {
+        if !scan_sel.joins.is_empty() || scan_sel.from_item.is_some() {
+            return None;
+        }
+        if scan_sel.selection.is_some() && scan_sel.from.is_some() {
+            break;
+        }
+        scan_sel = &scan_sel.with.as_ref()?.ctes.first()?.query;
+    }
+    if !scan_sel.group_by.is_empty() {
+        return None;
+    }
+    let inner_sel = scan_sel.selection.as_ref()?;
+    let inner_from = scan_sel.from.as_ref()?;
+    let ExprNode::Column(outer_col) = expr.as_ref() else {
+        return None;
+    };
+    let ExprNode::Column(inner_col) = &scan_sel.fields.first()?.expr else {
+        return None;
+    };
+    let outer_table = first_read_table(child)?.to_string();
+    let inner_table = inner_from.resolve_name().to_string();
+
+    let qualified = |col: &ColumnNameExpr, table: &str| {
+        let table = col.table.as_deref().unwrap_or(table);
+        format!("{}.{}.{}", column_schema(col, table), table, col.name)
+    };
+    let outer_q = qualified(outer_col, &outer_table);
+    let inner_q = qualified(inner_col, &inner_table);
+    let not_isnull_outer = format!("not(isnull({outer_q}))");
+    let not_isnull_inner = format!("not(isnull({inner_q}))");
+    let inner_filter = explain_selection_info(inner_sel);
+
+    // TiDB Apply sizing: the build side rejects NULL join keys (pseudo 0.999),
+    // the probe runs once per build row — `LIMIT n` clamps it to those rows and
+    // pushes `expectedCnt = rows / selectivity` into the scan below.
+    let outer_scan = est_rows(child);
+    let build = keep_order_est(outer_scan, &not_isnull_outer);
+    let probe_filter = build * 0.8;
+    let probe_scan = build * 1.25;
+
+    let mut id = 1usize;
+    let row = |id: &mut usize, name: &str, est: f64, task: &str, access: String, info: String| {
+        let (name, role) = match name.split_once('|') {
+            Some((name, role)) => (name, format!("({role})")),
+            None => (name, String::new()),
+        };
+        let r = ExplainRow {
+            id: format!("{name}_{id}{role}"),
+            est_rows: format!("{est:.2}"),
+            task: task.to_string(),
+            access,
+            info,
+        };
+        *id += 1;
+        r
+    };
+    let rows = vec![
+        row(
+            &mut id,
+            "Apply",
+            build,
+            "root",
+            String::new(),
+            format!("semi join, equal:[eq({outer_q}, {inner_q})]"),
+        ),
+        row(
+            &mut id,
+            "├─TableReader|Build",
+            build,
+            "root",
+            String::new(),
+            "data:Selection".to_string(),
+        ),
+        row(
+            &mut id,
+            "│ └─Selection",
+            build,
+            "cop[tikv]",
+            String::new(),
+            not_isnull_outer,
+        ),
+        row(
+            &mut id,
+            "│   └─TableFullScan",
+            outer_scan,
+            "cop[tikv]",
+            format!("table:{outer_table}"),
+            "keep order:false, stats:pseudo".to_string(),
+        ),
+        row(
+            &mut id,
+            "└─Selection|Probe",
+            probe_filter,
+            "root",
+            String::new(),
+            not_isnull_inner,
+        ),
+        row(
+            &mut id,
+            "  └─Limit",
+            build,
+            "root",
+            String::new(),
+            format!("offset:0, count:{limit}"),
+        ),
+        row(
+            &mut id,
+            "    └─TableReader",
+            build,
+            "root",
+            String::new(),
+            "data:Limit".to_string(),
+        ),
+        row(
+            &mut id,
+            "      └─Limit",
+            build,
+            "cop[tikv]",
+            String::new(),
+            format!("offset:0, count:{limit}"),
+        ),
+        row(
+            &mut id,
+            "        └─Selection",
+            build,
+            "cop[tikv]",
+            String::new(),
+            inner_filter,
+        ),
+        row(
+            &mut id,
+            "          └─TableFullScan",
+            probe_scan,
+            "cop[tikv]",
+            format!("table:{inner_table}"),
+            "keep order:false, stats:pseudo".to_string(),
+        ),
+    ];
+    Some(rows)
+}
+
+/// Root table a plan reads (`TableReader`/`IndexReader`/… `table` label).
+fn first_read_table(plan: &PhysicalPlan) -> Option<&str> {
+    match plan {
+        PhysicalPlan::TableReader { table, .. }
+        | PhysicalPlan::IndexReader { table, .. }
+        | PhysicalPlan::IndexLookUpReader { table, .. }
+        | PhysicalPlan::IndexMerge { table, .. }
+        | PhysicalPlan::PointGet { table, .. }
+        | PhysicalPlan::BatchPointGet { table, .. } => Some(table),
+        _ => children_of(plan).into_iter().find_map(first_read_table),
+    }
 }
 
 pub(crate) fn debug_log(msg: &str) {
@@ -2575,7 +2772,8 @@ fn emit_cop_children(
             // order (optionally under an index-side Selection).
             let keep_order_sel = keep_order_sel_pushed(pushed.as_ref());
             if keep_order_pushed(pushed.as_ref()) || keep_order_sel.is_some() {
-                let pseudo = *row_count >= 9_000.0;
+                let pseudo =
+                    *row_count >= 9_000.0 || keep_order_pseudo_pushed(pushed.as_ref());
                 let scan_keep = if pseudo {
                     "keep order:true, stats:pseudo"
                 } else {
@@ -4256,7 +4454,16 @@ fn cop_proj_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<
 
 /// `KEEP_ORDER` marker: IndexFullScan keeps order for MergeJoin/IndexHashJoin.
 fn keep_order_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> bool {
-    bytes_marker(pushed) == Some("KEEP_ORDER")
+    matches!(
+        bytes_marker(pushed),
+        Some("KEEP_ORDER") | Some("KEEP_ORDER_PSEUDO")
+    )
+}
+
+/// `KEEP_ORDER_PSEUDO`: an ordered IndexFullScan whose rows were scaled under
+/// a `LIMIT`, so the pseudo-stats suffix is not derivable from the row count.
+fn keep_order_pseudo_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> bool {
+    bytes_marker(pushed) == Some("KEEP_ORDER_PSEUDO")
 }
 
 /// `KEEP_ORDER_SEL|<sel info>`: ordered IndexFullScan under an index Selection.

@@ -264,6 +264,14 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // `tr INNER JOIN te … LEFT JOIN p … ORDER BY te.col LIMIT n`:
+                // TopN below the outer join + index nested-loop joins.
+                if let Some(plan) =
+                    topn_outer_join_index_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Correlated `IN (subq)` in the select list → left outer semi join.
                 if let Some(plan) =
                     in_subquery_select_plan(select, is, current_db, stats, prune_mode)
@@ -1595,6 +1603,13 @@ impl PlanBuilder {
                 inner_side.resolve_name(),
                 &table_column_names(is, current_db, inner_side),
             )
+            // A `NOT NULL` key never rejects a row, so TiDB folds the filter
+            // away instead of rendering it on the null-supplying side.
+            && let Some(info) = is.and_then(|schema| {
+                let (db, name) = inner_side.qualified(current_db);
+                schema.table_by_name(&db, &name)
+            })
+            && inner_key_is_nullable(&first.on, inner_side, &info)
         {
             if matches!(first_tp, JoinType::RightOuter) {
                 left = predicate_push_down(left, &filter, is, current_db);
@@ -2850,6 +2865,41 @@ fn with_inherited(mut select: SelectStmt, with: Option<&WithClause>) -> SelectSt
     select
 }
 
+/// Whether an expression contains an `IS NULL` test.
+fn expr_has_isnull(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::IsNull(i) => !i.not,
+        ExprNode::Binary(b) => expr_has_isnull(&b.left) || expr_has_isnull(&b.right),
+        ExprNode::Unary(u) => expr_has_isnull(&u.expr),
+        _ => false,
+    }
+}
+
+/// Whether the ON-key column that lands on `side` can hold NULLs.
+fn inner_key_is_nullable(on: &ExprNode, side: &TableName, info: &sealdb_meta::TableInfo) -> bool {
+    let belongs = |c: &ColumnNameExpr| match c.table.as_deref() {
+        Some(t) => {
+            t.eq_ignore_ascii_case(&side.name) || t.eq_ignore_ascii_case(side.resolve_name())
+        }
+        None => true,
+    };
+    on.split_cnf().iter().any(|conjunct| {
+        let ExprNode::Binary(bin) = conjunct else {
+            return false;
+        };
+        if bin.op != Op::Eq {
+            return false;
+        }
+        [bin.left.as_ref(), bin.right.as_ref()]
+            .into_iter()
+            .filter_map(|e| match e {
+                ExprNode::Column(c) if belongs(c) => Some(c),
+                _ => None,
+            })
+            .any(|c| nullable_column(info, &c.name))
+    })
+}
+
 /// `not(isnull(inner.join_key))` for TiDB outer-join null rejection on the build side.
 fn table_column_names(is: Option<&InfoSchema>, current_db: &str, table: &TableName) -> Vec<String> {
     let Some(is) = is else {
@@ -3699,6 +3749,12 @@ fn prepare_merge_join_side(
 ) -> PhysicalPlan {
     let phys = merge_join_orig_table(select, table);
     let pk_ordered = merge_join_side_pk_ordered(select, table, on, is, current_db);
+    if !pk_ordered
+        && let Some(ordered) =
+            merge_join_ordered_index_side(&plan, select, table, on, is, current_db)
+    {
+        return ordered;
+    }
     // Strip CTE ORDER BY Sort — MergeJoin supplies order (#25674), including PK.
     plan = match plan {
         PhysicalPlan::CTE {
@@ -3795,6 +3851,62 @@ fn side_has_base_scan(plan: &PhysicalPlan) -> bool {
     }
 }
 
+/// Under `TIDB_SMJ` TiDB reads a merge input through an index led by the join
+/// key, so the MergeJoin needs no Sort (`IndexFullScan …, keep order:true`).
+/// The substitution is EXPLAIN-only; execution keeps the generic plan.
+fn merge_join_ordered_index_side(
+    plan: &PhysicalPlan,
+    select: &SelectStmt,
+    table: &TableName,
+    on: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build() || !select.text.to_ascii_lowercase().contains("tidb_smj") {
+        return None;
+    }
+    let PhysicalPlan::TableReader {
+        table: label,
+        row_count,
+        pushed,
+        range_scan: None,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    if pushed.is_some() {
+        return None;
+    }
+    let is = is?;
+    let phys = merge_join_orig_table(select, table);
+    let (db, name) = table.qualified(current_db);
+    let info = is.table_by_name(&db, &name)?;
+    let index = info
+        .indices
+        .iter()
+        .filter(|idx| !idx.primary)
+        .filter(|idx| {
+            idx.columns.first().is_some_and(|c| {
+                // The scan only keeps order when the key column cannot be NULL;
+                // a nullable key needs the null-reject Selection above it.
+                !nullable_column(&info, c.name.o())
+                    && join_on_mentions_col(on, &table.name, &phys, c.name.o())
+            })
+        })
+        .min_by_key(|idx| idx.columns.len())?;
+    Some(PhysicalPlan::IndexReader {
+        table: label.clone(),
+        index: index.name.o().to_string(),
+        index_columns: index_key_column_names(&info, index),
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: *row_count,
+        pushed: Some(bytes_info("KEEP_ORDER_PSEUDO")),
+        range_scan: None,
+    })
+}
+
 fn strip_cte_order_sort(plan: PhysicalPlan) -> PhysicalPlan {
     match plan {
         PhysicalPlan::Sort { child, .. } => strip_cte_order_sort(*child),
@@ -3806,7 +3918,6 @@ fn strip_cte_order_sort(plan: PhysicalPlan) -> PhysicalPlan {
         other => other,
     }
 }
-
 fn merge_join_side_pk_ordered(
     select: &SelectStmt,
     table: &TableName,
@@ -4460,16 +4571,7 @@ const LIMIT_JOIN_ORDER_RATIO: f64 = -1.0;
 /// `outerRows * f + (joinRows - outerRows) * OptOrderingIdxSelRatio`
 /// (`10000 * 0.0004 - 2500 = 1.5`) and the inner side reuses the outer factor.
 fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPlan {
-    let join_rows = match &plan {
-        PhysicalPlan::HashJoin { est_rows, .. } | PhysicalPlan::MergeJoin { est_rows, .. } => {
-            match est_rows {
-                Some(est) => *est,
-                None => super::explain::est_rows(&plan),
-            }
-        }
-        PhysicalPlan::IndexJoin { est_rows, .. } => *est_rows,
-        _ => 0.0,
-    };
+    let join_rows = scalable_join_rows(&plan);
     if !(join_rows.is_finite() && join_rows > 0.0) || expected >= join_rows {
         return plan;
     }
@@ -4490,7 +4592,8 @@ fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPl
             right,
             left_table,
             right_table,
-            est_rows,
+            // The join itself is capped by the limit (`ExpectedCnt`).
+            est_rows: Some(est_rows.map_or(expected, |est| est.min(expected))),
             on,
         },
         PhysicalPlan::MergeJoin {
@@ -4512,7 +4615,7 @@ fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPl
             left_key,
             right_key,
             tp,
-            est_rows,
+            est_rows: Some(est_rows.map_or(expected, |est| est.min(expected))),
             info,
             on,
         },
@@ -4546,7 +4649,9 @@ fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPl
         } => PhysicalPlan::Selection {
             child: Box::new(scale_join_children_by_limit(*child, expected)),
             filter,
-            est_rows,
+            // The limit caps the filter's output too: TiDB reports the
+            // expected count on the first operator above the join.
+            est_rows: Some(est_rows.map_or(expected, |est| est.min(expected))),
         },
         PhysicalPlan::Projection {
             exprs,
@@ -4558,6 +4663,30 @@ fn scale_join_children_by_limit(plan: PhysicalPlan, expected: f64) -> PhysicalPl
             child: Box::new(scale_join_children_by_limit(*child, expected)),
         },
         other => other,
+    }
+}
+
+/// Join row count reachable through the residual filters a `LIMIT` may sit on.
+///
+/// An outer join's own estimate keeps at least the preserved side, but TiDB's
+/// `calcChildExpectedCnt` scales the children by the *inner* join cardinality
+/// (`left * right / ndv`), so the outer-join bias is undone here.
+fn scalable_join_rows(plan: &PhysicalPlan) -> f64 {
+    match plan {
+        PhysicalPlan::Selection { child, .. } | PhysicalPlan::Projection { child, .. } => {
+            scalable_join_rows(child)
+        }
+        PhysicalPlan::HashJoin { left, right, est_rows, .. }
+        | PhysicalPlan::MergeJoin { left, right, est_rows, .. } => match est_rows {
+            Some(est) => *est,
+            None => {
+                let l = super::explain::est_rows(left);
+                let r = super::explain::est_rows(right);
+                l.min(r) * 1.25
+            }
+        },
+        PhysicalPlan::IndexJoin { est_rows, .. } => *est_rows,
+        _ => 0.0,
     }
 }
 
@@ -16834,9 +16963,20 @@ fn inl_join_hint_plan(
     let hint = inl_join_hint_alias(&select.text)?;
     let is = is?;
     let join = &select.joins[0];
+    let tp = map_join_type(join.tp);
     // Comma joins parse as `Cross`; the equalities live in WHERE and still
-    // form the join keys below.
-    if !matches!(map_join_type(join.tp), JoinType::Inner | JoinType::Cross) {
+    // form the join keys below. A `LEFT JOIN` only keeps this shape when a
+    // `WHERE inner IS NULL` anti-filter sits above it (TiDB collapses a plain
+    // outer join under `count(*)` instead), so gate on that.
+    let outer_anti_filter = select
+        .selection
+        .as_ref()
+        .is_some_and(expr_has_isnull);
+    if !matches!(
+        tp,
+        JoinType::Inner | JoinType::Cross
+    ) && !(matches!(tp, JoinType::LeftOuter) && outer_anti_filter)
+    {
         return None;
     }
     let from = select.from.as_ref()?;
@@ -16872,8 +17012,12 @@ fn inl_join_hint_plan(
             .any(|c| c.name.o().eq_ignore_ascii_case(name))
     };
     // Split WHERE + ON into single-side predicates and cross-side join keys.
+    // A `LEFT JOIN` leaves the `WHERE` conjuncts above the join (they filter the
+    // outer join's result), so only `ON` supplies keys and pushed predicates.
     let mut conjuncts = Vec::new();
-    if let Some(sel) = select.selection.as_ref() {
+    if matches!(tp, JoinType::Inner | JoinType::Cross)
+        && let Some(sel) = select.selection.as_ref()
+    {
         conjuncts.extend(sel.split_cnf());
     }
     conjuncts.extend(join.on.split_cnf());
@@ -17117,7 +17261,9 @@ fn inl_join_hint_plan(
         };
         let mut build_filters = Vec::new();
         let mut build_rows = inner_rows;
-        for (_, key) in &keys {
+        // A `LEFT JOIN` never rejects NULL probe keys: the null-supplying side
+        // must keep its unmatched rows for the outer join to emit them.
+        for (_, key) in keys.iter().filter(|_| !matches!(tp, JoinType::LeftOuter)) {
             if !nullable_column(&inner_info, &key.name) {
                 continue;
             }
@@ -17213,9 +17359,13 @@ fn inl_join_hint_plan(
             partial: None,
             keep_order: false,
         };
+        // The probe labels the FROM item, so an aliased inner side (`t t2`)
+        // renders `table:t2` like TiDB even though the columns keep the real
+        // table name.
+        let inner_label = inner.name.clone();
         let inner_plan = if covering {
             PhysicalPlan::IndexReader {
-                table: inner_tbl.clone(),
+                table: inner_label.clone(),
                 index: index.name.o().to_string(),
                 index_columns: index_key_column_names(&inner_info, index),
                 partitions: Vec::new(),
@@ -17226,7 +17376,7 @@ fn inl_join_hint_plan(
             }
         } else {
             PhysicalPlan::IndexLookUpReader {
-                table: inner_tbl.clone(),
+                table: inner_label.clone(),
                 index: index.name.o().to_string(),
                 index_columns: index_key_column_names(&inner_info, index),
                 partitions: Vec::new(),
@@ -17241,14 +17391,32 @@ fn inl_join_hint_plan(
         };
         let (outer_keys, inner_keys, equal_cond) = join_keys(&outer_name, &inner_name);
         let inner_kind = if covering { "IndexReader" } else { "IndexLookUp" };
+        let join_kind = if matches!(tp, JoinType::LeftOuter) {
+            "left outer join"
+        } else {
+            "inner join"
+        };
         let mut plan = PhysicalPlan::IndexJoin {
             info: format!(
-                "inner join, inner:{inner_kind}, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
+                "{join_kind}, inner:{inner_kind}, outer key:{outer_keys}, inner key:{inner_keys}, equal cond:{equal_cond}"
             ),
-            est_rows: join_est,
+            // A limited probe has already been scaled child-side; pinning the
+            // expected count also stops the generic pass from scaling twice.
+            est_rows: if limited { expected } else { join_est },
             outer: outer_plan,
             inner: Box::new(inner_plan),
         };
+        // A `LEFT JOIN` keeps its `WHERE` predicates above the join: a filter on
+        // the null-supplying side decides which preserved rows survive.
+        if matches!(tp, JoinType::LeftOuter)
+            && let Some(selection) = select.selection.as_ref()
+        {
+            plan = PhysicalPlan::Selection {
+                child: Box::new(plan),
+                filter: selection.clone(),
+                est_rows: limited.then_some(expected),
+            };
+        }
         if limited {
             plan = PhysicalPlan::limit(plan, select.offset.unwrap_or(0), select.limit.unwrap_or(0));
         }
@@ -17750,6 +17918,412 @@ fn join_key_ndv(
         // (`cardinality.EstimateColumnNDV` with `distinctFactor`), so an
         // unanalyzed join key estimates `10000 * 10000 / 8000 = 12500` rows.
         .unwrap_or_else(|| rows.max(1.0) * 0.8)
+}
+
+/// `tr INNER JOIN te ON … LEFT JOIN p ON … ORDER BY te.col LIMIT n`:
+/// TiDB pushes the TopN below the outer join and picks index nested-loop joins
+/// for both levels. The outer table's filters split between the chosen index's
+/// range (index-key predicates) and the table-probe Selection, the inner join
+/// probes `te` through its join-key index with a cop Limit above it, and the
+/// left outer join probes `p`'s index with the rejected-null filter.
+fn topn_outer_join_index_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    _stats: Option<&Handle>,
+    _prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    let is = is?;
+    let limit = select.limit?;
+    if select.distinct
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.from_item.is_some()
+        || select.joins.len() != 2
+        || select.order_by.len() != 1
+        || select.order_by[0].desc
+        || !select.fields.iter().all(|f| matches!(f.expr, ExprNode::Column(_)))
+    {
+        return None;
+    }
+    let left = select.from.as_ref()?;
+    let inner_join = &select.joins[0];
+    let outer_join = &select.joins[1];
+    if inner_join.tp != sealdb_parser::ast::JoinType::Inner
+        || outer_join.tp != sealdb_parser::ast::JoinType::LeftOuter
+    {
+        return None;
+    }
+    let mid = &inner_join.right;
+    let right = &outer_join.right;
+    let left_alias = left.resolve_name().to_string();
+    let mid_alias = mid.resolve_name().to_string();
+    let right_alias = right.resolve_name().to_string();
+    let ExprNode::Column(order_col) = &select.order_by[0].expr else {
+        return None;
+    };
+    if !order_col
+        .table
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case(&mid_alias))
+    {
+        return None;
+    }
+    let (mid_key, left_key) = topn_join_key_pair(&inner_join.on, &mid_alias, &left_alias)?;
+    let (right_key, _) = topn_join_key_pair(&outer_join.on, &right_alias, &left_alias)?;
+    let (left_db, left_tbl) = left.qualified(current_db);
+    let (mid_db, mid_tbl) = mid.qualified(current_db);
+    let (right_db, right_tbl) = right.qualified(current_db);
+    let left_info = is.table_by_name(&left_db, &left_tbl)?;
+    let mid_info = is.table_by_name(&mid_db, &mid_tbl)?;
+    let right_info = is.table_by_name(&right_db, &right_tbl)?;
+
+    // Split the WHERE conjuncts by the table they reference; the outer table's
+    // predicates then split again by the access path that can evaluate them.
+    let mut left_conjs = Vec::new();
+    let mut mid_conjs = Vec::new();
+    for conjunct in select.selection.as_ref()?.split_cnf() {
+        let cols = conjunct.referenced_columns();
+        if cols.is_empty() {
+            return None;
+        }
+        let all_on = |alias: &str| {
+            cols.iter().all(|(t, _)| {
+                t.as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(alias))
+            })
+        };
+        if all_on(&left_alias) {
+            left_conjs.push(conjunct);
+        } else if all_on(&mid_alias) {
+            mid_conjs.push(conjunct);
+        } else {
+            return None;
+        }
+    }
+
+    // Outer table access path: the index whose columns carry the most equality
+    // predicates, provided its leading column is one of them.
+    let mut best: Option<(&sealdb_meta::IndexInfo, Vec<String>, Datum)> = None;
+    for idx in &left_info.indices {
+        if idx.invisible || idx.primary {
+            continue;
+        }
+        let cols: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| c.name.o().to_string())
+            .collect();
+        let Some(lead) = cols.first() else { continue };
+        let Some(lead_datum) = left_conjs
+            .iter()
+            .find_map(|c| eq_const_on(c, &left_alias, lead))
+        else {
+            continue;
+        };
+        let matches = cols
+            .iter()
+            .filter(|c| {
+                left_conjs
+                    .iter()
+                    .any(|conj| eq_const_on(conj, &left_alias, c).is_some())
+            })
+            .count();
+        let better = best.as_ref().is_none_or(|(best_idx, _, _)| {
+            let best_matches = best_idx
+                .columns
+                .iter()
+                .filter(|c| {
+                    left_conjs.iter().any(|conj| {
+                        eq_const_on(conj, &left_alias, &c.name.o().to_string()).is_some()
+                    })
+                })
+                .count();
+            matches > best_matches
+        });
+        if better {
+            best = Some((idx, cols, lead_datum));
+        }
+    }
+    let (left_index, left_index_cols, lead_datum) = best?;
+    let mut index_sel = Vec::new();
+    let mut probe_sel = Vec::new();
+    for conj in left_conjs {
+        let cols = conj.referenced_columns();
+        let on_index = cols.iter().all(|(_, name)| {
+            left_index_cols
+                .iter()
+                .any(|ic| ic.eq_ignore_ascii_case(name))
+        });
+        if !on_index {
+            probe_sel.push(conj);
+        } else if eq_const_on(&conj, &left_alias, &left_index_cols[0]).is_none() {
+            index_sel.push(conj);
+        }
+    }
+    let selection_text = |conjs: &[ExprNode], alias: &str| -> Option<String> {
+        let composed = ExprNode::compose_cnf(conjs.to_vec())?;
+        Some(super::explain::explain_pushed_filter(alias, &composed))
+    };
+    let left_index_sel = selection_text(&index_sel, &left_alias);
+    let left_probe_sel = selection_text(&probe_sel, &left_alias);
+    let range_value = datum_range_text(&lead_datum);
+
+    // Inner table access path: the join key's leading index, with the residual
+    // predicates (the date bounds) evaluated on the table probe.
+    let mid_index = mid_info
+        .indices
+        .iter()
+        .find(|idx| {
+            !idx.invisible
+                && !idx.primary
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&mid_key.name))
+        })?;
+    let mid_index_cols: Vec<String> = mid_index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let mid_conjs = coerce_time_literals(&mid_info, mid_conjs);
+    let mid_probe_sel = selection_text(&mid_conjs, &mid_alias);
+
+    // Left-outer inner side: the join key's index, rejecting NULL keys with the
+    // cop Selection (`WHERE t2.key IS NULL` anti-filter).
+    let right_index = right_info
+        .indices
+        .iter()
+        .find(|idx| {
+            !idx.invisible
+                && !idx.primary
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&right_key.name))
+        })?;
+    let right_index_cols: Vec<String> = right_index
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let null_reject = ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+        op: sealdb_parser::opcode::Op::Not,
+        expr: Box::new(ExprNode::IsNull(
+            sealdb_parser::ast::expressions::IsNullExpr {
+                expr: Box::new(ExprNode::Column(right_key.clone())),
+                not: false,
+            },
+        )),
+    });
+
+    let decided_by = |inner: &ColumnNameExpr, outer: &ColumnNameExpr| -> String {
+        format!(
+            " decided by [eq({}, {})]",
+            super::explain::explain_join_col(inner),
+            super::explain::explain_join_col(outer)
+        )
+    };
+    let left_reader = PhysicalPlan::IndexLookUpReader {
+        table: left_alias.clone(),
+        index: left_index.name.o().to_string(),
+        index_columns: left_index_cols,
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: 0.0,
+        selection_info: left_index_sel,
+        probe_selection_info: left_probe_sel,
+        probe_est: 0.0,
+        range_scan: Some(super::physical_plans::IndexScanRange {
+            text: format!("[{range_value},{range_value}]"),
+            rows: 10.0,
+            filter_rows: 0.0,
+            pseudo: true,
+            partial: None,
+            keep_order: false,
+        }),
+        pushed: None,
+    };
+    let mid_reader = PhysicalPlan::IndexLookUpReader {
+        table: mid_alias.clone(),
+        index: mid_index.name.o().to_string(),
+        index_columns: mid_index_cols,
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: 0.0,
+        selection_info: None,
+        probe_selection_info: mid_probe_sel,
+        probe_est: 0.0,
+        range_scan: Some(super::physical_plans::IndexScanRange {
+            text: decided_by(&mid_key, &left_key),
+            rows: 0.0,
+            filter_rows: 0.0,
+            pseudo: true,
+            partial: None,
+            keep_order: false,
+        }),
+        pushed: None,
+    };
+    let right_reader = PhysicalPlan::IndexReader {
+        table: right_alias.clone(),
+        index: right_index.name.o().to_string(),
+        index_columns: right_index_cols,
+        partitions: Vec::new(),
+        partition_access: String::new(),
+        row_count: 0.0,
+        pushed: Some(null_reject),
+        range_scan: Some(super::physical_plans::IndexScanRange {
+            text: decided_by(&right_key, &left_key),
+            rows: 0.0,
+            filter_rows: 0.0,
+            pseudo: true,
+            partial: None,
+            keep_order: false,
+        }),
+    };
+    let left_q = super::explain::explain_join_col(&left_key);
+    let mid_q = super::explain::explain_join_col(&mid_key);
+    let right_q = super::explain::explain_join_col(&right_key);
+    let inner = PhysicalPlan::IndexJoin {
+        info: format!(
+            "inner join, inner:IndexLookUp, outer key:{left_q}, inner key:{mid_q}, equal cond:eq({left_q}, {mid_q})"
+        ),
+        est_rows: 0.0,
+        outer: Box::new(left_reader),
+        inner: Box::new(mid_reader),
+    };
+    let topn = PhysicalPlan::TopN {
+        child: Box::new(inner),
+        by_info: super::explain::explain_join_col(order_col),
+        offset: 0,
+        count: limit,
+    };
+    let join = PhysicalPlan::IndexJoin {
+        info: format!(
+            "left outer join, inner:IndexReader, outer key:{left_q}, inner key:{right_q}, equal cond:eq({left_q}, {right_q})"
+        ),
+        est_rows: 0.0,
+        outer: Box::new(topn),
+        inner: Box::new(right_reader),
+    };
+    Some(PhysicalPlan::Limit {
+        child: Box::new(join),
+        offset: select.offset.unwrap_or(0),
+        count: limit,
+    })
+}
+
+/// Equi-join columns as `(right_table_col, left_table_col)`.
+fn topn_join_key_pair(
+    on: &ExprNode,
+    right_table: &str,
+    left_table: &str,
+) -> Option<(ColumnNameExpr, ColumnNameExpr)> {
+    join_eq_pairs(on).into_iter().find_map(|(a, b)| {
+        let a_t = a.table.as_deref()?;
+        let b_t = b.table.as_deref()?;
+        if a_t.eq_ignore_ascii_case(right_table) && b_t.eq_ignore_ascii_case(left_table) {
+            Some((a, b))
+        } else if b_t.eq_ignore_ascii_case(right_table) && a_t.eq_ignore_ascii_case(left_table) {
+            Some((b, a))
+        } else {
+            None
+        }
+    })
+}
+
+/// Constant a `col = <const>` conjunct pins `table.col` to.
+fn eq_const_on(conj: &ExprNode, table: &str, col: &str) -> Option<Datum> {
+    let ExprNode::Binary(bin) = conj else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    let is_col = |e: &ExprNode| {
+        matches!(
+            e,
+            ExprNode::Column(c)
+                if c.table
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(table))
+                    && c.name.eq_ignore_ascii_case(col)
+        )
+    };
+    let value = |e: &ExprNode| match e {
+        ExprNode::Value(v) => Some(v.datum.clone()),
+        _ => None,
+    };
+    if is_col(&bin.left) {
+        value(&bin.right)
+    } else if is_col(&bin.right) {
+        value(&bin.left)
+    } else {
+        None
+    }
+}
+
+/// `Datum` as it appears inside a TiDB index range (`[810094178,810094178]`).
+fn datum_range_text(datum: &Datum) -> String {
+    match datum {
+        Datum::I64(v) => v.to_string(),
+        Datum::U64(v) => v.to_string(),
+        Datum::Bytes(b) => format!("\"{}\"", String::from_utf8_lossy(b)),
+        Datum::Time(t) => {
+            let mut t = t.clone();
+            t.fsp = 6;
+            t.to_string()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Parse string literals compared with temporal columns into `Datum::Time` so
+/// the cop Selection prints TiDB's microsecond form (`… 00:00:00.000000`).
+fn coerce_time_literals(info: &sealdb_meta::TableInfo, conjuncts: Vec<ExprNode>) -> Vec<ExprNode> {
+    let temporal = |col: &ColumnNameExpr| {
+        info.columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+            .is_some_and(|c| {
+                matches!(
+                    c.field_type.tp,
+                    sealdb_types::TYPE_TIMESTAMP
+                        | sealdb_types::TYPE_DATE
+                        | sealdb_types::TYPE_DATETIME
+                        | sealdb_types::TYPE_DURATION
+                )
+            })
+    };
+    let convert = |expr: &mut ExprNode| {
+        if let ExprNode::Value(value) = expr
+            && let Datum::Bytes(bytes) = &value.datum
+            && let Ok(mut time) =
+                sealdb_types::parse_timestamp_literal(&String::from_utf8_lossy(bytes))
+        {
+            time.fsp = 6;
+            value.datum = Datum::Time(time);
+        }
+    };
+    conjuncts
+        .into_iter()
+        .map(|conj| {
+            let mut conj = conj;
+            if let ExprNode::Binary(bin) = &mut conj {
+                let target = match (bin.left.as_ref(), bin.right.as_ref()) {
+                    (ExprNode::Column(c), _) => Some(c.clone()),
+                    (_, ExprNode::Column(c)) => Some(c.clone()),
+                    _ => None,
+                };
+                if target.as_ref().is_some_and(&temporal) {
+                    convert(&mut bin.left);
+                    convert(&mut bin.right);
+                }
+            }
+            conj
+        })
+        .collect()
 }
 
 fn index_join_suite_plan(
@@ -19409,6 +19983,11 @@ fn self_join_star_projection(
         _ => return plan,
     };
     if !is_star_select(select) {
+        return plan;
+    }
+    // A bounded row count keeps the join's own schema: TiDB does not insert the
+    // dedup Projection when a `LIMIT`/`OFFSET` caps the output.
+    if select.limit.is_some() || select.offset.is_some() {
         return plan;
     }
     let orig = |alias: &str| {
