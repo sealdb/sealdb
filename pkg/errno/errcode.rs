@@ -102,6 +102,15 @@ pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
+/// TiDB `ErrUnsupportedOnGeneratedColumn`: an ALTER on a column referenced by
+/// a generated column (`MODIFY a bigint` → 3106).
+pub const ERR_UNSUPPORTED_ON_GENERATED_COLUMN: i32 = 3106;
+/// TiDB `ErrDependentByGeneratedColumn`: DROP / CHANGE / RENAME of a column a
+/// generated column depends on.
+pub const ERR_DEPENDENT_BY_GENERATED_COLUMN: i32 = 3108;
+/// TiDB `ErrDependentByPartitionFunctional`: the column is used by the
+/// partitioning expression, so it cannot be dropped or renamed.
+pub const ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL: i32 = 3855;
 /// TiDB `ErrTooBigDisplayWidth`: `BIT(65)` / `INT(0)` — the declared display
 /// width is outside `[1, type max]`.
 pub const ERR_TOO_BIG_DISPLAYWIDTH: i32 = 1439;

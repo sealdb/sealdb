@@ -830,6 +830,8 @@ pub enum AlterTableSpec {
         default: Option<String>,
         /// `GENERATED ALWAYS AS (expr)` given with the new definition.
         generated: Option<GeneratedColumn>,
+        /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
+        not_null: Option<bool>,
         position: ColumnPosition,
     },
     /// `MODIFY [COLUMN] col type` — keep the name, change the type.
@@ -840,6 +842,8 @@ pub enum AlterTableSpec {
         default: Option<String>,
         /// `GENERATED ALWAYS AS (expr)` given with the new definition.
         generated: Option<GeneratedColumn>,
+        /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
+        not_null: Option<bool>,
         position: ColumnPosition,
     },
     /// `RENAME COLUMN old TO new`.
@@ -949,6 +953,7 @@ impl AlterTableSpec {
                 type_name,
                 default,
                 generated,
+                not_null,
                 position,
             } => {
                 ctx.write_str("CHANGE COLUMN ");
@@ -971,6 +976,11 @@ impl AlterTableSpec {
                         "VIRTUAL"
                     });
                 }
+                match not_null {
+                    Some(true) => ctx.write_str(" NOT NULL"),
+                    Some(false) => ctx.write_str(" NULL"),
+                    None => {}
+                }
                 position.restore(ctx)
             }
             AlterTableSpec::ModifyColumn {
@@ -978,6 +988,7 @@ impl AlterTableSpec {
                 type_name,
                 default,
                 generated,
+                not_null,
                 position,
             } => {
                 ctx.write_str("MODIFY COLUMN ");
@@ -997,6 +1008,11 @@ impl AlterTableSpec {
                     } else {
                         "VIRTUAL"
                     });
+                }
+                match not_null {
+                    Some(true) => ctx.write_str(" NOT NULL"),
+                    Some(false) => ctx.write_str(" NULL"),
+                    None => {}
                 }
                 position.restore(ctx)
             }

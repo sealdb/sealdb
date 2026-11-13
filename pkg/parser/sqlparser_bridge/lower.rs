@@ -9559,6 +9559,23 @@ fn lower_not_null(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
     })
 }
 
+/// Column `NOT NULL` / `NULL` option as an explicit tri-state, so CHANGE /
+/// MODIFY can tell "unspecified" from "drop the NOT NULL flag".
+fn lower_not_null_option(options: &[sqlparser::ast::ColumnOption]) -> Option<bool> {
+    if options.iter().any(|opt| {
+        matches!(
+            opt,
+            sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::PrimaryKey(_)
+        )
+    }) {
+        return Some(true);
+    }
+    options
+        .iter()
+        .any(|opt| matches!(opt, sqlparser::ast::ColumnOption::Null))
+        .then_some(false)
+}
+
 /// Column `CHARACTER SET <name>` option (TiDB `FieldType.Charset`).
 fn lower_column_charset(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
     options.iter().find_map(|opt| match &opt.option {
@@ -10883,6 +10900,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             let has_other_options = options.iter().any(|opt| match opt {
                 sqlparser::ast::ColumnOption::Default(_) => false,
                 sqlparser::ast::ColumnOption::Generated { .. } => false,
+                sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
                 sqlparser::ast::ColumnOption::Comment(c)
                     if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
                 {
@@ -10899,6 +10917,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 type_name: data_type.to_string(),
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
+                not_null: lower_not_null_option(options),
                 position: lower_column_position(column_position),
             })
         }
@@ -10913,6 +10932,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             let has_other_options = options.iter().any(|opt| match opt {
                 sqlparser::ast::ColumnOption::Default(_) => false,
                 sqlparser::ast::ColumnOption::Generated { .. } => false,
+                sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
                 sqlparser::ast::ColumnOption::Comment(c)
                     if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
                 {
@@ -10928,6 +10948,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 type_name: data_type.to_string(),
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
+                not_null: lower_not_null_option(options),
                 position: lower_column_position(column_position),
             })
         }

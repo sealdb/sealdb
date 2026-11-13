@@ -4,16 +4,19 @@
 // multi-schema-state jobs.
 use crate::create_table::{
     field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
-    ttl_column_name, validate_default_fsp, validate_default_literal, validate_display_width,
-    validate_generated_auto_increment, validate_generated_column_refs, validate_generated_expr,
+    references_identifier, ttl_column_name, validate_default_fsp, validate_default_literal,
+    validate_display_width, validate_generated_auto_increment, validate_generated_column_refs,
+    validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{add_partitions, drop_partitions, exchange_partition};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
-    ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
-    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, Error, Result,
+    ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
+    ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
+    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
+    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -83,6 +86,7 @@ pub fn alter_table(
                 type_name,
                 default,
                 generated,
+                not_null,
                 position,
             } => change_column(
                 meta,
@@ -93,6 +97,7 @@ pub fn alter_table(
                 Some(type_name),
                 default.as_deref(),
                 generated.as_ref(),
+                *not_null,
                 position,
                 current_db,
                 storage,
@@ -102,6 +107,7 @@ pub fn alter_table(
                 type_name,
                 default,
                 generated,
+                not_null,
                 position,
             } => change_column(
                 meta,
@@ -112,6 +118,7 @@ pub fn alter_table(
                 Some(type_name),
                 default.as_deref(),
                 generated.as_ref(),
+                *not_null,
                 position,
                 current_db,
                 storage,
@@ -122,6 +129,7 @@ pub fn alter_table(
                 stmt,
                 old_name,
                 new_name,
+                None,
                 None,
                 None,
                 None,
@@ -536,6 +544,47 @@ pub(crate) fn backfill_generated_columns(
     txn.commit()
 }
 
+/// Whether the table's partitioning expression uses `name` (TiDB refuses to
+/// drop or rename such a column: 3855).
+fn used_by_partition_function(info: &TableInfo, name: &str) -> bool {
+    let Some(part) = &info.partition else {
+        return false;
+    };
+    if part
+        .columns
+        .iter()
+        .any(|c| c.o().eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    !part.expr.is_empty() && references_identifier(&part.expr, name)
+}
+
+/// Whether a generated column depends on `name`.
+fn has_dependent_generated_column(info: &TableInfo, name: &str) -> bool {
+    info.columns.iter().any(|col| {
+        col.generated_expr
+            .as_deref()
+            .is_some_and(|expr| references_identifier(expr, name))
+    })
+}
+
+fn partition_column_dependency(name: &str) -> Error {
+    Error::new(
+        ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL,
+        format!(
+            "Column '{name}' has a partitioning function dependency and cannot be dropped or renamed"
+        ),
+    )
+}
+
+fn generated_column_dependency(name: &str) -> Error {
+    Error::new(
+        ERR_DEPENDENT_BY_GENERATED_COLUMN,
+        format!("Column '{name}' has a generated column dependency."),
+    )
+}
+
 fn drop_column(
     meta: &mut Mutator,
     is: &InfoSchema,
@@ -567,6 +616,12 @@ fn drop_column(
             format!("Can't DROP '{name}'; check that column/key exists"),
         ));
     };
+    if used_by_partition_function(&info, name) {
+        return Err(partition_column_dependency(name));
+    }
+    if has_dependent_generated_column(&info, name) {
+        return Err(generated_column_dependency(name));
+    }
     if info.pk_is_handle
         && info
             .handle_column()
@@ -659,6 +714,7 @@ fn change_column(
     type_name: Option<&str>,
     default: Option<&str>,
     generated: Option<&GeneratedColumn>,
+    not_null: Option<bool>,
     position: &ColumnPosition,
     current_db: &str,
     storage: &dyn Storage,
@@ -694,10 +750,22 @@ fn change_column(
             format!("Duplicate column name '{new_name}'"),
         ));
     }
-    let new_ft = match type_name {
+    let mut new_ft = match type_name {
         Some(name) => field_type_from_name(name)?,
         None => info.columns[pos].field_type.clone(),
     };
+    match not_null {
+        Some(true) => new_ft.flag |= sealdb_types::field_type::NOT_NULL_FLAG,
+        Some(false) => new_ft.flag &= !sealdb_types::field_type::NOT_NULL_FLAG,
+        None => {}
+    }
+    let renaming = !old_name.eq_ignore_ascii_case(new_name);
+    if renaming && used_by_partition_function(&info, old_name) {
+        return Err(partition_column_dependency(old_name));
+    }
+    if renaming && has_dependent_generated_column(&info, old_name) {
+        return Err(generated_column_dependency(old_name));
+    }
     if info
         .ttl
         .as_ref()
@@ -729,6 +797,16 @@ fn change_column(
         return Err(Error::unsupported("MODIFY handle column type"));
     }
     let changed = field_type_changed(&info.columns[pos].field_type, &new_ft);
+    if changed && has_dependent_generated_column(&info, old_name) {
+        // TiDB runs the MODIFY, hits the 3108 dependency check and reports it
+        // wrapped in 3106 (`[ddl:3108]` keeps the inner error's code).
+        return Err(Error::new(
+            ERR_UNSUPPORTED_ON_GENERATED_COLUMN,
+            format!(
+                "'[ddl:3108]Column '{old_name}' has a generated column dependency.' is not supported for generated columns."
+            ),
+        ));
+    }
     let effective_default = default
         .map(|default| default.to_string())
         .or_else(|| info.columns[pos].default_expr.clone())

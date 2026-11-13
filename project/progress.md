@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 54 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 55 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2209,6 +2209,26 @@
   - 无；后续按 R7 长尾继续扫底
 - **下一步**:
   - 继续 R3 `explain_easy` / `explain_complex` / `explain_complex_stats` / `explain_join_stats`
+
+### 2026-11-14（`ddl/column_change` 转正：生成列 / 分区依赖校验）
+
+- **Phase**: R6 DDL × 列变更
+- **完成**:
+  - 新增 errno：3106 `ErrUnsupportedOnGeneratedColumn`、3108 `ErrDependentByGeneratedColumn`、
+    3855 `ErrDependentByPartitionFunctional`（SQLSTATE 均为 HY000）
+  - `DROP`/`CHANGE`/`RENAME COLUMN`：被生成列引用的列 → 3108
+    `Column 'a' has a generated column dependency.`；被分区函数引用的列 → 3855
+    `Column 'a' has a partitioning function dependency and cannot be dropped or renamed`
+  - `MODIFY COLUMN` 改类型且被生成列引用 → 3106，消息内层保留 TiDB 的
+    `[ddl:3108]` 前缀（`'[ddl:3108]Column 'a' …' is not supported for generated columns.`）
+  - `CHANGE`/`MODIFY` 现在接受 `NOT NULL` / `NULL` 选项（AlterTableSpec 增加
+    `not_null: Option<bool>` 三态，序列化与 restore 同步），不再报 1235
+- **验证**:
+  - `run-tests.sh -t ddl/column_change` → Mem PASS / TiKV PASS
+  - `run-tests.sh -s memory --status green` → `PASS: memory=54`（无回归）
+  - manifest → `green`，green 54→55
+- **下一步**:
+  - 继续 R6：`ddl/column_modify` / `ddl/db_table` / `ddl/index_modify`
 
 ### 2026-11-14（`ddl/column` 转正：默认值校验 + 位类型 + 表结构渲染）
 
