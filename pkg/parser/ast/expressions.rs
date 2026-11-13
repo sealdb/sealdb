@@ -93,6 +93,115 @@ impl ExprNode {
         ctx.into_string()
     }
 
+    /// `*` select-item marker used by the bridge before star expansion.
+    pub fn is_star_marker(&self) -> bool {
+        matches!(
+            self,
+            ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(b)
+            }) if b == b"*"
+        )
+    }
+
+    /// TiDB `ast.ExprNode.Text()`-style rendering used to derive a select
+    /// field's implicit name: identifiers unquoted, functions lowercased,
+    /// binary operators without surrounding spaces.
+    pub fn text(&self) -> String {
+        match self {
+            ExprNode::Column(c) => {
+                let mut out = String::new();
+                if let Some(schema) = &c.schema {
+                    out.push_str(schema);
+                    out.push('.');
+                }
+                if let Some(table) = &c.table {
+                    out.push_str(table);
+                    out.push('.');
+                }
+                out.push_str(&c.name);
+                out
+            }
+            ExprNode::Value(v) => match &v.datum {
+                Datum::Bytes(b) => {
+                    format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''"))
+                }
+                Datum::Bit(b) => format!("'{}'", String::from_utf8_lossy(b)),
+                Datum::Enum(e) => format!("'{}'", String::from_utf8_lossy(&e.label)),
+                Datum::I64(n) => n.to_string(),
+                Datum::U64(n) => n.to_string(),
+                Datum::F64(f) => {
+                    if f.fract() == 0.0 && f.is_finite() {
+                        format!("{f}")
+                    } else {
+                        f.to_string()
+                    }
+                }
+                Datum::Decimal(d) => d.to_string(),
+                Datum::Time(t) => format!("{t}"),
+                Datum::Null => "NULL".to_string(),
+            },
+            ExprNode::Unary(u) => format!("{}{}", u.op.restore(), u.expr.text()),
+            ExprNode::Binary(b) => {
+                if matches!(b.op, Op::LogicAnd | Op::LogicOr | Op::LogicXor | Op::IntDiv) {
+                    format!("{} {} {}", b.left.text(), b.op.restore(), b.right.text())
+                } else {
+                    format!("{}{}{}", b.left.text(), b.op.restore(), b.right.text())
+                }
+            }
+            ExprNode::Func(f) => {
+                let mut out = f.name.to_ascii_lowercase();
+                out.push('(');
+                if f.distinct {
+                    out.push_str("distinct ");
+                }
+                if f.name.eq_ignore_ascii_case("COUNT") && f.args.is_empty() {
+                    out.push('*');
+                } else {
+                    for (i, arg) in f.args.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(&arg.text());
+                    }
+                }
+                out.push(')');
+                out
+            }
+            ExprNode::Cast(c) => format!("cast({} as {})", c.expr.text(), c.target),
+            other => other.restore_string(),
+        }
+    }
+
+    /// TiDB's implicit select-field name (`SelectField` without `AS`). Returns
+    /// an empty string when the expression has no usable name (subqueries), so
+    /// callers can fall back to `name_exp_N`.
+    pub fn name(&self) -> String {
+        match self {
+            ExprNode::Column(c) => c.name.clone(),
+            ExprNode::Value(v) => match &v.datum {
+                Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                Datum::Bit(b) => String::from_utf8_lossy(b).into_owned(),
+                Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
+                Datum::I64(n) => n.to_string(),
+                Datum::U64(n) => n.to_string(),
+                Datum::F64(f) => {
+                    if f.fract() == 0.0 && f.is_finite() {
+                        format!("{f}")
+                    } else {
+                        f.to_string()
+                    }
+                }
+                Datum::Decimal(d) => d.to_string(),
+                Datum::Time(t) => format!("{t}"),
+                Datum::Null => "NULL".to_string(),
+            },
+            ExprNode::Func(_) | ExprNode::Cast(_) | ExprNode::Binary(_) | ExprNode::Unary(_) => {
+                self.text()
+            }
+            _ => String::new(),
+        }
+    }
+
     pub fn split_cnf(&self) -> Vec<ExprNode> {
         match self {
             ExprNode::Binary(bin) if bin.op == Op::LogicAnd && !bin.single_cnf_item => {
@@ -642,6 +751,15 @@ pub struct ValueExpr {
 
 impl ValueExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if ctx.in_view()
+            && matches!(
+                &self.datum,
+                Datum::Bytes(_) | Datum::Bit(_) | Datum::Enum(_)
+            )
+        {
+            // TiDB restores string literals with their charset introducer.
+            ctx.write_str("_UTF8MB4");
+        }
         ctx.write_str(&match &self.datum {
             Datum::Null => "NULL".to_string(),
             Datum::I64(v) => v.to_string(),
@@ -682,9 +800,19 @@ pub struct BinaryOpExpr {
 impl BinaryOpExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         self.left.restore(ctx)?;
-        ctx.write_str(" ");
+        // TiDB view restore writes `a=1` / `a+1` (no spaces) but keeps word
+        // operators spaced (` AND ` / ` OR ` / ` XOR `).
+        let word = matches!(
+            self.op,
+            Op::LogicAnd | Op::LogicOr | Op::LogicXor | Op::IntDiv
+        );
+        if word || !ctx.in_view() {
+            ctx.write_str(" ");
+        }
         ctx.write_str(self.op.restore());
-        ctx.write_str(" ");
+        if word || !ctx.in_view() {
+            ctx.write_str(" ");
+        }
         self.right.restore(ctx)
     }
 }
@@ -747,7 +875,11 @@ impl FuncCallExpr {
             ctx.write_str(suffix);
             return Ok(());
         }
-        ctx.write_str(&self.name);
+        if ctx.in_view() {
+            ctx.write_str(&self.name.to_ascii_uppercase());
+        } else {
+            ctx.write_str(&self.name);
+        }
         ctx.write_str("(");
         if self.distinct {
             ctx.write_str("DISTINCT ");

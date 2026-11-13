@@ -315,7 +315,9 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             continue;
         }
         if let Some(rest) = strip_prefix_ci(trimmed, "--") {
-            let rest = rest.trim();
+            // mysql-tester directives may be written without the usual space and
+            // with a trailing `;` (`--enable_warnings;`).
+            let rest = rest.trim().trim_end_matches(';').trim();
             if let Some(codes) = strip_prefix_ci(rest, "error") {
                 expected_error = parse_error_code(codes.trim())?;
                 continue;
@@ -1190,6 +1192,10 @@ fn run_backend(
     };
     let mut ran = 0;
     let mut skipped = 0;
+    // Triage sweep (`SEALDB_ITEST_KEEP_GOING=1`): compare every suite and report
+    // all mismatches instead of stopping at the first one.
+    let keep_going = std::env::var("SEALDB_ITEST_KEEP_GOING").is_ok();
+    let mut failures: Vec<String> = Vec::new();
     for suite in suites {
         if !suite_allowed(suite, opts) {
             skipped += 1;
@@ -1218,12 +1224,31 @@ fn run_backend(
             if std::env::var("SEALDB_ITEST_PROGRESS").is_ok() {
                 eprintln!("[itest] {} {} start", backend.as_str(), suite.name);
             }
+            if keep_going {
+                if let Err(err) = compare_suite(suite, Arc::clone(&storage)) {
+                    eprintln!("{err}");
+                    failures.push(format!("{}: {}", suite.name, err.message));
+                }
+                ran += 1;
+                continue;
+            }
             compare_suite(suite, Arc::clone(&storage))?;
             if std::env::var("SEALDB_ITEST_PROGRESS").is_ok() {
                 eprintln!("[itest] {} {} ok", backend.as_str(), suite.name);
             }
         }
         ran += 1;
+    }
+    if !failures.is_empty() {
+        return Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!(
+                "{} suite(s) failed on {}:\n{}",
+                failures.len(),
+                backend.as_str(),
+                failures.join("\n")
+            ),
+        ));
     }
     Ok((ran, skipped, false))
 }

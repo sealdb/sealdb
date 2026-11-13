@@ -60,6 +60,10 @@ pub struct Session {
     window_concurrency: Mutex<u64>,
     /// TiDB `autocommit` (default ON).
     autocommit: Mutex<bool>,
+    /// TiDB `allow_auto_random_explicit_insert` (default OFF).
+    allow_auto_random_explicit_insert: Mutex<bool>,
+    /// TiDB `tidb_enable_auto_increment_in_generated` (default OFF).
+    enable_auto_increment_in_generated: Mutex<bool>,
     /// TiDB `tidb_cost_model_version` (default 2 in 8.x; 1 is the legacy model).
     cost_model_version: Mutex<i32>,
     /// TiDB `tidb_hashagg_partial_concurrency` (default 5).
@@ -121,6 +125,8 @@ impl Session {
             auto_analyze_ratio: Mutex::new(0.5),
             window_concurrency: Mutex::new(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY),
             autocommit: Mutex::new(true),
+            allow_auto_random_explicit_insert: Mutex::new(false),
+            enable_auto_increment_in_generated: Mutex::new(false),
             cost_model_version: Mutex::new(2),
             hashagg_partial_concurrency: Mutex::new(5),
             hashagg_final_concurrency: Mutex::new(5),
@@ -902,19 +908,34 @@ impl Session {
             .clustered_index
             .lock()
             .expect("session clustered index lock");
+        let allow_auto_random = *self
+            .allow_auto_random_explicit_insert
+            .lock()
+            .expect("session allow_auto_random lock");
+        let allow_auto_inc_in_generated = *self
+            .enable_auto_increment_in_generated
+            .lock()
+            .expect("session auto increment in generated lock");
         let result = with_clustered_index_mode(clustered_index, || {
             sealdb_expression::with_div_by_zero_mode(div_mode, || {
-                sealdb_expression::with_sql_mode(sql_mode, || {
-                    sealdb_expression::with_time_zone(time_zone, || {
-                        sealdb_expression::with_current_db(current_db.as_str(), || {
-                            sealdb_expression::with_collation(collate_mode, || {
-                                sealdb_expression::clear_warnings();
-                                // TiDB allocates a fresh memory tracker per query.
-                                sealdb_expression::reset_query_mem_usage();
-                                ExecutorBuilder::run(exec)
+                sealdb_expression::with_allow_auto_random_explicit_insert(allow_auto_random, || {
+                    sealdb_expression::with_allow_auto_increment_in_generated(
+                        allow_auto_inc_in_generated,
+                        || {
+                            sealdb_expression::with_sql_mode(sql_mode, || {
+                                sealdb_expression::with_time_zone(time_zone, || {
+                                    sealdb_expression::with_current_db(current_db.as_str(), || {
+                                        sealdb_expression::with_collation(collate_mode, || {
+                                            sealdb_expression::clear_warnings();
+                                            // TiDB allocates a fresh memory tracker per query.
+                                            sealdb_expression::reset_query_mem_usage();
+                                            ExecutorBuilder::run(exec)
+                                        })
+                                    })
+                                })
                             })
-                        })
-                    })
+                        },
+                    )
                 })
             })
         });
@@ -1519,8 +1540,14 @@ fn show_warnings_result(session: &Session) -> QueryResult {
         rows: warnings
             .into_iter()
             .map(|(code, msg)| {
+                // TiDB appends `DROP … IF EXISTS` misses as notes (`AppendNote`).
+                let level: &[u8] = if code == sealdb_errno::ERR_BAD_TABLE {
+                    b"Note"
+                } else {
+                    b"Warning"
+                };
                 vec![
-                    sealdb_types::Datum::Bytes(b"Warning".to_vec()),
+                    sealdb_types::Datum::Bytes(level.to_vec()),
                     sealdb_types::Datum::I64(code as i64),
                     sealdb_types::Datum::Bytes(msg.into_bytes()),
                 ]
@@ -2399,7 +2426,11 @@ fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
         if let Some((name, val)) = value.split_once('=')
             && name.trim().eq_ignore_ascii_case("sql_mode")
         {
-            return Some(val.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+            return Some(
+                val.trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string(),
+            );
         }
         rest = &rest[after + 1..];
     }
@@ -2874,6 +2905,28 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 *session.autocommit.lock().expect("session autocommit lock") = on;
             }
             "unique_checks" => {}
+            "allow_auto_random_explicit_insert" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .allow_auto_random_explicit_insert
+                    .lock()
+                    .expect("session allow_auto_random lock") = on;
+            }
+            "tidb_enable_auto_increment_in_generated" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .enable_auto_increment_in_generated
+                    .lock()
+                    .expect("session auto increment in generated lock") = on;
+            }
             "foreign_key_checks" => {
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
                     true
@@ -3045,6 +3098,11 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
             session.domain.set_global_enable_auto_analyze(on);
         }
+        // Accepted for compatibility; only the session value gates DML.
+        "allow_auto_random_explicit_insert" => {}
+        // FK feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
+        "tidb_enable_foreign_key" => {}
+        "tidb_enable_auto_increment_in_generated" => {}
         "names" | "character_set_client" | "character_set_connection" | "character_set_results" => {
             if !sealdb_parser::charset::is_supported_charset(value) {
                 return Err(sealdb_errno::Error::new(
@@ -3274,6 +3332,28 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "allow_auto_random_explicit_insert" => {
+            if *session
+                .allow_auto_random_explicit_insert
+                .lock()
+                .expect("session allow_auto_random lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_enable_auto_increment_in_generated" => {
+            if *session
+                .enable_auto_increment_in_generated
+                .lock()
+                .expect("session auto increment in generated lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "tidb_window_concurrency" => session
             .window_concurrency
@@ -3304,6 +3384,8 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
         | "character_set_database"
         | "character_set_server" => globals.character_set_connection,
         "tidb_partition_prune_mode" => globals.partition_prune_mode.clone(),
+        "allow_auto_random_explicit_insert" => "0".into(),
+        "tidb_enable_auto_increment_in_generated" => "0".into(),
         _ => return None,
     })
 }
@@ -3694,10 +3776,12 @@ fn expand_views(
     view_priv: &ViewPrivCtx<'_>,
 ) -> Result<()> {
     match stmt {
-        Statement::Select(select) => expand_views_in_select(select, is, current_db, view_priv, 0)?,
+        Statement::Select(select) => {
+            expand_views_in_select(select, is, current_db, view_priv, &mut Vec::new())?
+        }
         Statement::Insert(insert) => {
             if let Some(select) = insert.select.as_mut() {
-                expand_views_in_select(select, is, current_db, view_priv, 0)?;
+                expand_views_in_select(select, is, current_db, view_priv, &mut Vec::new())?;
             }
         }
         Statement::Update(update) => {
@@ -3727,18 +3811,15 @@ fn expand_views(
             }
         }
         Statement::SetOpr(set) => {
-            expand_views_in_select(&mut set.first, is, current_db, view_priv, 0)?;
+            expand_views_in_select(&mut set.first, is, current_db, view_priv, &mut Vec::new())?;
             for (_, select) in &mut set.rest {
-                expand_views_in_select(select, is, current_db, view_priv, 0)?;
+                expand_views_in_select(select, is, current_db, view_priv, &mut Vec::new())?;
             }
         }
         Statement::Explain(explain) => expand_views(&mut explain.stmt, is, current_db, view_priv)?,
-        Statement::CreateView(create) => {
-            expand_views_in_select(&mut create.select, is, current_db, view_priv, 0)?;
-        }
         Statement::CreateTable(create) => {
             if let Some(select) = create.select.as_mut() {
-                expand_views_in_select(select, is, current_db, view_priv, 0)?;
+                expand_views_in_select(select, is, current_db, view_priv, &mut Vec::new())?;
             }
         }
         _ => {}
@@ -3819,22 +3900,22 @@ fn expand_views_in_select(
     is: &InfoSchema,
     current_db: &str,
     view_priv: &ViewPrivCtx<'_>,
-    depth: usize,
+    chain: &mut Vec<String>,
 ) -> Result<()> {
     if let Some(with) = select.with.as_mut() {
         for cte in &mut with.ctes {
-            expand_views_in_select(&mut cte.query, is, current_db, view_priv, depth)?;
+            expand_views_in_select(&mut cte.query, is, current_db, view_priv, chain)?;
             for (_, arm) in &mut cte.set_rest {
-                expand_views_in_select(arm, is, current_db, view_priv, depth)?;
+                expand_views_in_select(arm, is, current_db, view_priv, chain)?;
             }
             if let Some((_, rec)) = cte.recursive.as_mut() {
-                expand_views_in_select(rec, is, current_db, view_priv, depth)?;
+                expand_views_in_select(rec, is, current_db, view_priv, chain)?;
             }
         }
     }
     let refs: Vec<TableName> = select.join_tables().into_iter().cloned().collect();
     for table in refs {
-        inject_view_cte(select, &table, is, current_db, view_priv, depth)?;
+        inject_view_cte(select, &table, is, current_db, view_priv, chain)?;
     }
     Ok(())
 }
@@ -3845,8 +3926,9 @@ fn inject_view_cte(
     is: &InfoSchema,
     current_db: &str,
     view_priv: &ViewPrivCtx<'_>,
-    depth: usize,
+    chain: &mut Vec<String>,
 ) -> Result<()> {
+    let depth = chain.len();
     let (schema, name) = table.qualified(current_db);
     if schema.is_empty() {
         return Ok(());
@@ -3869,15 +3951,43 @@ fn inject_view_cte(
         view_priv.require(&schema, &name, sealdb_parser::ast::PrivilegeType::SHOW_VIEW)?;
     }
     let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
-    let Statement::Select(mut view_select) = parsed else {
-        return Err(sealdb_errno::Error::unsupported(
-            "VIEW definition must be SELECT",
-        ));
+    let (mut view_select, mut view_set_rest, view_limit, view_offset) = match parsed {
+        Statement::Select(select) => (select, Vec::new(), None, None),
+        Statement::SetOpr(set) => (set.first, set.rest, set.limit, set.offset),
+        _ => {
+            return Err(sealdb_errno::Error::unsupported(
+                "VIEW definition must be SELECT",
+            ));
+        }
     };
     // Unqualified base tables in the view body resolve in the view's schema
     // (`USE cte1; SELECT * FROM cte.v1` still reads cte.t2, not cte1.t2).
     qualify_view_body_tables(&mut view_select, &schema);
-    expand_views_in_select(&mut view_select, is, &schema, view_priv, depth + 1)?;
+    for (_, arm) in &mut view_set_rest {
+        qualify_select_tables(arm, &schema, &[]);
+    }
+    // A `SELECT *` view whose base table lost columns is invalid (1356).
+    validate_view_shape(
+        info,
+        &schema,
+        &name,
+        std::iter::once(&view_select).chain(view_set_rest.iter().map(|(_, arm)| arm)),
+        is,
+        &schema,
+    )?;
+    // TiDB rejects a VIEW that (transitively) references itself: the chain
+    // records the views already being expanded, so a repeat is `ErrViewRecursive`.
+    let key = format!("{schema}.{name}");
+    if chain.len() >= 64 || chain.iter().any(|seen| seen.eq_ignore_ascii_case(&key)) {
+        return Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_VIEW_RECURSIVE,
+            format!("`{schema}`.`{name}` contains view recursion"),
+        ));
+    }
+    chain.push(key);
+    let expanded = expand_views_in_select(&mut view_select, is, &schema, view_priv, chain);
+    chain.pop();
+    expanded?;
     // TiDB MERGE / UNDEFINED: inline simple single-table views.
     // The view's exposed column names come from the explicit column list when
     // present, otherwise from the schema built at CREATE VIEW time (which owns
@@ -3904,7 +4014,8 @@ fn inject_view_cte(
     } else {
         Vec::new()
     };
-    if !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
+    if view_set_rest.is_empty()
+        && !view.algorithm.eq_ignore_ascii_case("TEMPTABLE")
         && try_merge_simple_view(select, &name, &view_select, &view_col_names)?
     {
         return Ok(());
@@ -3966,10 +4077,11 @@ fn inject_view_cte(
         col_name_list,
         recursive: None,
         recursive_rest: Vec::new(),
-        set_rest: Vec::new(),
+        set_rest: view_set_rest,
         materialize,
-        limit: None,
-        offset: None,
+        limit: view_limit,
+        offset: view_offset,
+        derived: false,
     });
     select.with = Some(sealdb_parser::ast::WithClause {
         is_recursive: false,
@@ -3978,6 +4090,249 @@ fn inject_view_cte(
     // CTE names are unqualified; strip schema so planner hits the injected CTE.
     strip_table_schema(select, &name);
     Ok(())
+}
+
+/// `SELECT *` field marker used by the bridge for star expansion.
+fn is_star_select_expr(expr: &ExprNode) -> bool {
+    matches!(
+        expr,
+        ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+            datum: sealdb_types::Datum::Bytes(bytes),
+            ..
+        }) if bytes == b"*"
+    )
+}
+
+/// Output width of a view body arm, expanding `*` against current tables.
+/// `None` when a referenced table cannot be resolved (the real 1146 comes from
+/// the planner instead).
+fn select_output_width(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> Option<usize> {
+    let mut width = 0;
+    for field in &select.fields {
+        if is_star_select_expr(&field.expr) {
+            for table in select.join_tables() {
+                let (schema, name) = table.qualified(current_db);
+                if schema.is_empty() {
+                    return None;
+                }
+                let info = is.table_by_name(&schema, &name)?;
+                width += info.columns.len();
+            }
+        } else {
+            width += 1;
+        }
+    }
+    Some(width)
+}
+
+/// TiDB rebuilds a view's schema from its stored column list; if the body's
+/// tables no longer provide those columns (e.g. `ALTER TABLE … DROP COLUMN`),
+/// loading the view fails with 1356.
+fn validate_view_shape<'a>(
+    info: &sealdb_meta::TableInfo,
+    schema: &str,
+    name: &str,
+    arms: impl Iterator<Item = &'a SelectStmt>,
+    is: &InfoSchema,
+    current_db: &str,
+) -> Result<()> {
+    let expected = info.columns.len();
+    for arm in arms {
+        let width_bad =
+            select_output_width(arm, is, current_db).is_some_and(|width| width < expected);
+        if width_bad || view_arm_invalid(arm, is, current_db) {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_VIEW_INVALID_TABLE,
+                format!(
+                    "View '{schema}.{name}' references invalid table(s) or column(s) \
+                     or function(s) or definer/invoker of view lack rights to use them"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One `FROM` source while validating a view body's column references.
+struct ViewCheckSource {
+    names: Vec<String>,
+    columns: Vec<String>,
+}
+
+/// True when the view body references a table or column that no longer exists.
+fn view_arm_invalid(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> bool {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            if view_arm_invalid(&cte.query, is, current_db) {
+                return true;
+            }
+            if cte
+                .set_rest
+                .iter()
+                .any(|(_, arm)| view_arm_invalid(arm, is, current_db))
+            {
+                return true;
+            }
+        }
+    }
+    let mut sources: Vec<ViewCheckSource> = Vec::new();
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            let columns = cte
+                .query
+                .fields
+                .iter()
+                .map(|field| match &field.as_name {
+                    Some(name) if !name.is_empty() => name.clone(),
+                    _ => field.expr.name(),
+                })
+                .collect();
+            sources.push(ViewCheckSource {
+                names: vec![cte.name.clone()],
+                columns,
+            });
+        }
+    }
+    for table in select.join_tables() {
+        if sources.iter().any(|source| {
+            source
+                .names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(table.resolve_name()))
+        }) {
+            continue;
+        }
+        let (schema, name) = table.qualified(current_db);
+        let Some(info) = is.table_by_name(&schema, &name) else {
+            return true;
+        };
+        let mut names = vec![table.name.clone(), name];
+        if let Some(physical) = &table.physical {
+            names.push(physical.clone());
+        }
+        sources.push(ViewCheckSource {
+            names,
+            columns: info
+                .columns
+                .iter()
+                .map(|col| col.name.o().to_string())
+                .collect(),
+        });
+    }
+    let exprs: Vec<&ExprNode> = select
+        .fields
+        .iter()
+        .map(|field| &field.expr)
+        .chain(select.selection.iter())
+        .chain(select.group_by.iter())
+        .chain(select.having.iter())
+        .chain(select.order_by.iter().map(|item| &item.expr))
+        .chain(select.joins.iter().map(|join| &join.on))
+        .collect();
+    for expr in exprs {
+        if !expr_columns_exist(expr, &sources, is, current_db) {
+            return true;
+        }
+    }
+    false
+}
+
+fn expr_columns_exist(
+    expr: &ExprNode,
+    sources: &[ViewCheckSource],
+    is: &InfoSchema,
+    current_db: &str,
+) -> bool {
+    match expr {
+        ExprNode::Column(col) => {
+            if col.name == "*" {
+                return match &col.table {
+                    Some(table) => sources
+                        .iter()
+                        .any(|source| source.names.iter().any(|n| n.eq_ignore_ascii_case(table))),
+                    None => true,
+                };
+            }
+            let table = col.table.as_deref();
+            sources.iter().any(|source| {
+                source
+                    .columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&col.name))
+                    && table.is_none_or(|t| source.names.iter().any(|n| n.eq_ignore_ascii_case(t)))
+            })
+        }
+        ExprNode::Binary(binary) => {
+            expr_columns_exist(&binary.left, sources, is, current_db)
+                && expr_columns_exist(&binary.right, sources, is, current_db)
+        }
+        ExprNode::Unary(unary) => expr_columns_exist(&unary.expr, sources, is, current_db),
+        ExprNode::Func(func) => func
+            .args
+            .iter()
+            .all(|arg| expr_columns_exist(arg, sources, is, current_db)),
+        ExprNode::Cast(cast) => expr_columns_exist(&cast.expr, sources, is, current_db),
+        ExprNode::InList(list) => {
+            expr_columns_exist(&list.expr, sources, is, current_db)
+                && list
+                    .list
+                    .iter()
+                    .all(|item| expr_columns_exist(item, sources, is, current_db))
+        }
+        ExprNode::Between(between) => {
+            expr_columns_exist(&between.expr, sources, is, current_db)
+                && expr_columns_exist(&between.low, sources, is, current_db)
+                && expr_columns_exist(&between.high, sources, is, current_db)
+        }
+        ExprNode::Like(like) => {
+            expr_columns_exist(&like.expr, sources, is, current_db)
+                && expr_columns_exist(&like.pattern, sources, is, current_db)
+        }
+        ExprNode::IsNull(is_null) => expr_columns_exist(&is_null.expr, sources, is, current_db),
+        ExprNode::Case(case) => {
+            case.operand
+                .iter()
+                .all(|e| expr_columns_exist(e, sources, is, current_db))
+                && case.when_then.iter().all(|(when, then)| {
+                    expr_columns_exist(when, sources, is, current_db)
+                        && expr_columns_exist(then, sources, is, current_db)
+                })
+                && case
+                    .else_expr
+                    .iter()
+                    .all(|e| expr_columns_exist(e, sources, is, current_db))
+        }
+        ExprNode::Window(window) => window
+            .args
+            .iter()
+            .all(|arg| expr_columns_exist(arg, sources, is, current_db)),
+        ExprNode::Row(row) => row
+            .exprs
+            .iter()
+            .all(|item| expr_columns_exist(item, sources, is, current_db)),
+        ExprNode::ScalarSubquery(sub) => !result_set_invalid(&sub.query, is, current_db),
+        ExprNode::Exists(exists) => !result_set_invalid(&exists.query, is, current_db),
+        ExprNode::InSubquery(sub) => {
+            expr_columns_exist(&sub.expr, sources, is, current_db)
+                && !result_set_invalid(&sub.query, is, current_db)
+        }
+        ExprNode::QuantifiedCmp(cmp) => {
+            expr_columns_exist(&cmp.expr, sources, is, current_db)
+                && !result_set_invalid(&cmp.query, is, current_db)
+        }
+        ExprNode::Value(_) => true,
+    }
+}
+
+fn result_set_invalid(
+    query: &sealdb_parser::ast::ResultSetNode,
+    is: &InfoSchema,
+    current_db: &str,
+) -> bool {
+    query
+        .selects()
+        .into_iter()
+        .any(|select| view_arm_invalid(select, is, current_db))
 }
 
 /// Attach `schema` to unqualified table refs that are not CTE names in scope.
@@ -4254,7 +4609,25 @@ fn try_merge_simple_view(
     }
 
     for field in &mut select.fields {
+        // TiDB MERGE keeps the view's exposed column name as the output name:
+        // `SELECT name_exp_1 FROM v` must not fall back to the body expression's
+        // derived name (`SELECT 'a' AS '<65 chars>'` → `a`).
+        let view_col = match &field.expr {
+            sealdb_parser::ast::expressions::ExprNode::Column(c)
+                if c.table
+                    .as_deref()
+                    .is_none_or(|t| t.eq_ignore_ascii_case(view_name)) =>
+            {
+                Some(c.name.clone())
+            }
+            _ => None,
+        };
         rewrite_merged_view_cols(&mut field.expr, view_name, &mapping);
+        if field.as_name.is_none()
+            && let Some(name) = view_col
+        {
+            field.as_name = Some(name);
+        }
     }
     if let Some(sel) = select.selection.as_mut() {
         rewrite_merged_view_cols(sel, view_name, &mapping);
@@ -5508,6 +5881,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(bad.code, sealdb_errno::ERR_VIEW_INVALID);
         session.execute_stmt("DROP VIEW db1.v").unwrap();
+    }
+
+    #[test]
+    fn test_view_long_alias_name_exp() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE db1").unwrap();
+        session.execute_stmt("CREATE TABLE db1.t (a INT)").unwrap();
+        let long = "b".repeat(65);
+        session
+            .execute_stmt(&format!(
+                "CREATE VIEW db1.v AS SELECT 'a' AS '{long}' FROM db1.t"
+            ))
+            .unwrap();
+        let rows = session.execute_stmt("SELECT * FROM db1.v").unwrap();
+        assert_eq!(rows.columns, vec!["name_exp_1".to_string()]);
+        let show = session.execute_stmt("SHOW CREATE VIEW db1.v").unwrap();
+        println!("{}", show.display_rows()[0][1]);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_NO_SUCH_TABLE, ERR_VIEW_WRONG_LIST, Error, Result,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
+    ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE,
+    ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -14,6 +16,426 @@ use sealdb_types::field_type::{
     TYPE_TINY, TYPE_TINY_BLOB, TYPE_VAR_STRING, TYPE_YEAR,
 };
 use std::collections::HashMap;
+
+/// Functions TiDB refuses inside a generated-column expression (3102).
+const DISALLOWED_GENERATED_FUNCS: &[&str] = &[
+    "rand",
+    "load_file",
+    "curdate",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "localtime",
+    "localtimestamp",
+    "now",
+    "sysdate",
+    "uuid",
+    "uuid_short",
+    "is_free_lock",
+    "is_used_lock",
+    "release_lock",
+    "get_lock",
+    "database",
+    "schema",
+    "connection_id",
+    "last_insert_id",
+    "found_rows",
+    "row_count",
+    "current_user",
+    "session_user",
+    "system_user",
+    "user",
+    "version",
+];
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Does `expr` (already lowercased) call `name(` as a standalone identifier?
+fn calls_function(expr: &str, name: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut start = 0;
+    while let Some(offset) = expr[start..].find(name) {
+        let i = start + offset;
+        let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+        let mut j = i + name.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if prev_ok && j < bytes.len() && bytes[j] == b'(' {
+            return true;
+        }
+        start = i + name.len();
+    }
+    false
+}
+
+/// TiDB rejects non-deterministic / environment functions in generated columns
+/// (`GENERATED ALWAYS AS (rand())` → 3102).
+pub(crate) fn validate_generated_expr(col_name: &str, expr: &str) -> Result<()> {
+    let lower = expr.to_ascii_lowercase();
+    for func in DISALLOWED_GENERATED_FUNCS {
+        if calls_function(&lower, func) {
+            return Err(Error::new(
+                ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
+                format!(
+                    "Expression of generated column '{col_name}' contains \
+                     a disallowed function."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does `expr` reference `ident` as a column (i.e. not followed by `(`)?
+pub(crate) fn references_identifier(expr: &str, ident: &str) -> bool {
+    let lower = expr.to_ascii_lowercase();
+    let ident = ident.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(offset) = lower[start..].find(&ident) {
+        let i = start + offset;
+        let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+        let end = i + ident.len();
+        let next_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if prev_ok && next_ok {
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                return true;
+            }
+        }
+        start = i + ident.len();
+    }
+    false
+}
+
+/// Every column referenced by a generated-column expression must exist (1054).
+pub(crate) fn validate_generated_column_refs(
+    columns: &[ColumnInfo],
+    changed: Option<&str>,
+) -> Result<()> {
+    let known: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
+    for col in columns {
+        if let Some(changed) = changed
+            && !col.name.o().eq_ignore_ascii_case(changed)
+        {
+            continue;
+        }
+        let Some(text) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        for (_table, name) in expr.referenced_columns() {
+            if !known.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+                return Err(Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Unknown column '{name}' in 'generated column function'"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A generated column may not reference an AUTO_INCREMENT column unless
+/// `@@tidb_enable_auto_increment_in_generated` is enabled (3109).
+pub(crate) fn validate_generated_auto_increment(
+    columns: &[ColumnInfo],
+    changed: Option<&str>,
+) -> Result<()> {
+    if sealdb_expression::allow_auto_increment_in_generated() {
+        return Ok(());
+    }
+    let auto_inc: Vec<String> = columns
+        .iter()
+        .filter(|c| c.auto_increment)
+        .map(|c| c.name.o().to_string())
+        .collect();
+    if auto_inc.is_empty() {
+        return Ok(());
+    }
+    for col in columns {
+        if let Some(changed) = changed
+            && !col.name.o().eq_ignore_ascii_case(changed)
+        {
+            continue;
+        }
+        let Some(expr) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        for ai in &auto_inc {
+            if references_identifier(expr, ai) {
+                return Err(Error::new(
+                    ERR_GENERATED_COLUMN_REF_AUTO_INC,
+                    format!(
+                        "Generated column '{}' cannot refer to auto-increment column.",
+                        col.name.o()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// TiDB `checkDefaultValue` for temporal columns: a `NOW(fsp)` /
+/// `CURRENT_TIMESTAMP(fsp)` default must match the column's fractional-second
+/// precision exactly (`create table t (tt timestamp default now(1))` → 1067).
+pub(crate) fn validate_default_fsp(
+    name: &str,
+    field_type: &FieldType,
+    default: Option<&str>,
+) -> Result<()> {
+    if !matches!(field_type.tp, TYPE_TIMESTAMP | TYPE_DATETIME) {
+        return Ok(());
+    }
+    let Some(default) = default else {
+        return Ok(());
+    };
+    let lower = default.trim().to_ascii_lowercase();
+    // Longest first: `localtime` is a prefix of `localtimestamp`.
+    let Some(func) = ["current_timestamp", "localtimestamp", "localtime", "now"]
+        .iter()
+        .find(|func| lower.starts_with(**func))
+    else {
+        return Ok(());
+    };
+    let rest = lower[func.len()..].trim();
+    let fsp = if rest.is_empty() {
+        0
+    } else if let Some(inner) = rest
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            0
+        } else {
+            match inner.parse::<i32>() {
+                Ok(n) => n,
+                Err(_) => return Ok(()),
+            }
+        }
+    } else {
+        return Ok(());
+    };
+    if fsp != field_type.decimal {
+        return Err(Error::new(
+            ERR_INVALID_DEFAULT,
+            format!("Invalid default value for '{name}'"),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize a quoted literal default to the column type, the way TiDB does at
+/// DDL time: temporal defaults are parsed and rounded to the column's
+/// fractional precision (`DEFAULT '12:12:13.4'` on `TIME` becomes `12:12:13`),
+/// and date/datetime defaults are re-rendered in canonical form.
+pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String {
+    let trimmed = default.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        return default.to_string();
+    };
+    let value = inner.replace("''", "'");
+    let fsp = field_type.decimal.clamp(0, 6);
+    match field_type.tp {
+        TYPE_DURATION => normalize_duration_default(&value, fsp)
+            .map(|text| format!("'{text}'"))
+            .unwrap_or_else(|| default.to_string()),
+        TYPE_DATETIME | TYPE_TIMESTAMP => match sealdb_types::parse_datetime_literal(&value) {
+            Ok(time) => format!("'{}'", round_time(time, fsp).to_string()),
+            Err(_) => default.to_string(),
+        },
+        TYPE_DATE => match sealdb_types::parse_date_literal(&value) {
+            Ok(time) => format!("'{time}'"),
+            Err(_) => default.to_string(),
+        },
+        _ => default.to_string(),
+    }
+}
+
+fn round_time(mut time: sealdb_types::Time, fsp: i32) -> sealdb_types::Time {
+    let fsp = fsp.clamp(0, 6) as u32;
+    let scale = 10u32.pow(6 - fsp);
+    let mut micro = ((time.micro + scale / 2) / scale) * scale;
+    if micro >= 1_000_000 {
+        micro -= 1_000_000;
+        time.second = time.second.saturating_add(1);
+        if time.second >= 60 {
+            time.second -= 60;
+            time.minute = time.minute.saturating_add(1);
+            if time.minute >= 60 {
+                time.minute -= 60;
+                time.hour = time.hour.saturating_add(1);
+            }
+        }
+    }
+    time.micro = micro;
+    time.fsp = fsp as i8;
+    time
+}
+
+/// `'12:12:13.4'` (or `'1 12:12:13.4'`, `'-838:59:59'`) as stored in a `TIME`
+/// default becomes the normalized `12:12:13` literal, rounded to `fsp`.
+fn normalize_duration_default(value: &str, fsp: i32) -> Option<String> {
+    let trimmed = value.trim();
+    let (negative, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    // Drop a leading day part (`D HH:MM:SS`), TiDB stores only the time part.
+    let body = body
+        .split_once(' ')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(body);
+    let (hms, fraction) = match body.split_once('.') {
+        Some((hms, fraction)) => (hms, Some(fraction)),
+        None => (body, None),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hour: i64 = parts[0].trim().parse().ok()?;
+    let minute: i64 = parts[1].trim().parse().ok()?;
+    let mut second: i64 = parts[2].trim().parse().ok()?;
+    if !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    let digits: Vec<char> = fraction
+        .map(|fraction| fraction.chars().take(7).collect())
+        .unwrap_or_default();
+    let micro: i64 = digits
+        .iter()
+        .take(6)
+        .fold(String::new(), |mut acc, ch| {
+            acc.push(*ch);
+            acc
+        })
+        .parse()
+        .map(|micro: i64| micro * 10i64.pow(6 - digits.len().min(6) as u32))
+        .unwrap_or(0);
+    let fsp = fsp.clamp(0, 6) as u32;
+    let scale = 10i64.pow(6 - fsp);
+    let rounded_micro = ((micro + scale / 2) / scale) * scale;
+    if rounded_micro >= 1_000_000 {
+        second += 1;
+    }
+    let total = hour * 3600 + minute * 60 + second;
+    let (hour, minute, second) = (total / 3600, (total % 3600) / 60, total % 60);
+    let mut text = format!(
+        "{}{:02}:{:02}:{:02}",
+        if negative { "-" } else { "" },
+        hour.abs(),
+        minute.abs(),
+        second.abs()
+    );
+    if fsp > 0 {
+        let frac = format!("{:06}", rounded_micro % 1_000_000);
+        text.push('.');
+        text.push_str(&frac[..fsp as usize]);
+    }
+    Some(text)
+}
+
+/// Column referenced by a normalized TTL expression
+/// (`` `col` + INTERVAL 1 DAY ``).
+pub(crate) fn ttl_column_name(expr: &str) -> String {
+    let trimmed = expr.trim();
+    if let Some(rest) = trimmed.strip_prefix('`') {
+        return rest.split('`').next().unwrap_or_default().to_string();
+    }
+    trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub(crate) fn is_temporal_type(tp: u8) -> bool {
+    matches!(tp, TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP)
+}
+
+/// Whether any table (in any schema) has a FOREIGN KEY referencing `table`
+/// (TiDB `ErrTTLFKReferenced` gate 8152).
+pub(crate) fn referenced_by_foreign_key(is: &InfoSchema, table: &str) -> bool {
+    is.all_schemas().iter().any(|db| {
+        let db_name = db.name.o().to_string();
+        is.schema_tables(&db_name).iter().any(|child| {
+            child
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(table))
+        })
+    })
+}
+
+/// TiDB `checkTTLInfo`: the `TTL` column must exist and be `DATETIME`, `DATE`
+/// or `TIMESTAMP` (8148 / 1054).
+/// TiDB rejects TTL on a table whose clustered primary key holds a FLOAT or
+/// DOUBLE column (`ErrTTLUnsupportedPKType`, 8153): the hidden handle cannot be
+/// ordered reliably across TiKV and MySQL, so TTL would be unsound.
+pub(crate) fn validate_ttl_primary_key(info: &TableInfo) -> Result<()> {
+    if !(info.pk_is_handle || info.common_handle) {
+        return Ok(());
+    }
+    let Some(pk) = info.indices.iter().find(|idx| idx.primary) else {
+        return Ok(());
+    };
+    for pk_col in &pk.columns {
+        let Some(col) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(pk_col.name.o()))
+        else {
+            continue;
+        };
+        if matches!(col.field_type.tp, TYPE_FLOAT | TYPE_DOUBLE) {
+            return Err(Error::new(
+                ERR_TTL_UNSUPPORTED_PK_TYPE,
+                "Unsupported clustered primary key type FLOAT/DOUBLE for TTL",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ttl(info: &TableInfo) -> Result<()> {
+    let Some(ttl) = &info.ttl else {
+        return Ok(());
+    };
+    validate_ttl_primary_key(info)?;
+    let column = ttl_column_name(&ttl.expr);
+    let Some(col) = info
+        .columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(&column))
+    else {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column '{column}' in 'TTL config'"),
+        ));
+    };
+    if !is_temporal_type(col.field_type.tp) {
+        return Err(Error::new(
+            ERR_TTL_INVALID_COLUMN,
+            format!(
+                "Field '{column}' is of a not supported type for TTL config, \
+                 expect DATETIME, DATE or TIMESTAMP"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
     if stmt.cols.is_empty() {
@@ -40,16 +462,28 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             info.field_type.collate = parsed.name;
         }
         if let Some(generated) = &col.generated {
+            validate_generated_expr(&col.name, &generated.expr)?;
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
         }
-        info.default_expr = col.default.clone();
+        info.default_expr = col
+            .default
+            .as_deref()
+            .map(|default| normalize_default(&info.field_type, default));
         info.auto_increment = col.auto_increment;
+        info.auto_random = col.auto_random;
+        validate_default_fsp(
+            info.name.o(),
+            &info.field_type,
+            info.default_expr.as_deref(),
+        )?;
         if col.not_null {
             info.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
         }
         columns.push(info);
     }
+    validate_generated_auto_increment(&columns, None)?;
+    validate_generated_column_refs(&columns, None)?;
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
     for index in stmt.indices.iter() {
         let (idx_cols, hidden) =
@@ -254,7 +688,23 @@ fn columns_from_select_scoped(
             }
             continue;
         }
-        let name = field_column_name(field, i);
+        // Qualified star `t.*`: expand only that source's columns.
+        if let ExprNode::Column(col) = &field.expr
+            && col.name == "*"
+        {
+            let hint = col.table.as_deref().unwrap_or_default();
+            let source = sources
+                .iter()
+                .find(|source| source.table.eq_ignore_ascii_case(hint))
+                .ok_or_else(|| {
+                    Error::new(ERR_NO_SUCH_TABLE, format!("Table '{hint}' doesn't exist"))
+                })?;
+            for (name, type_name) in &source.columns {
+                push_select_column(&mut cols, name, type_name.clone(), false)?;
+            }
+            continue;
+        }
+        let name = select_field_name(field, i);
         let type_name = type_name_from_expr(&field.expr, &sources)?;
         push_select_column(
             &mut cols,
@@ -304,6 +754,7 @@ fn push_select_column(
         default: None,
         generated: None,
         auto_increment: false,
+        auto_random: None,
         not_null,
         charset: None,
         collate: None,
@@ -345,27 +796,20 @@ fn select_sources(
     Ok(sources)
 }
 
-fn field_column_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> String {
-    if let Some(name) = &field.as_name
-        && !name.is_empty()
-    {
-        return name.clone();
+/// TiDB's implicit name for a select field: the explicit alias, else the
+/// expression's `Text()` form. Names longer than 64 characters (or with no
+/// derivable name) fall back to `name_exp_<position>`.
+pub(crate) fn select_field_name(field: &sealdb_parser::ast::SelectField, offset: usize) -> String {
+    let name = match &field.as_name {
+        Some(name) if !name.is_empty() => name.clone(),
+        _ => field.expr.name(),
+    };
+    // TiDB falls back to `name_exp_<pos>` when the derived name cannot be a
+    // column identifier (empty or longer than 64 characters).
+    if name.is_empty() || name.len() > 64 {
+        return format!("name_exp_{}", offset + 1);
     }
-    match &field.expr {
-        ExprNode::Column(col) => col.name.clone(),
-        // TiDB names a bare scalar subquery `name_exp_N` (the field's 1-based
-        // position): the subquery text cannot be an identifier
-        // (`CREATE VIEW v AS SELECT (WITH …) FROM t`).
-        ExprNode::ScalarSubquery(_) => format!("name_exp_{}", offset + 1),
-        other => {
-            let restored = other.restore_string();
-            if restored.is_empty() {
-                format!("_{offset}")
-            } else {
-                restored
-            }
-        }
-    }
+    name
 }
 
 fn type_name_from_expr(expr: &ExprNode, sources: &[SelectSource]) -> Result<String> {
@@ -588,21 +1032,39 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: 10,
             ..string_ft()
         },
-        "DATETIME" => FieldType {
-            tp: TYPE_DATETIME,
-            flen: 19,
-            ..string_ft()
-        },
-        "TIMESTAMP" => FieldType {
-            tp: TYPE_TIMESTAMP,
-            flen: 19,
-            ..string_ft()
-        },
-        "TIME" => FieldType {
-            tp: TYPE_DURATION,
-            flen: parse_len(type_name).unwrap_or(10),
-            ..string_ft()
-        },
+        "DATETIME" => {
+            let fsp = parse_flen_decimal(type_name)
+                .map(|(fsp, _)| fsp)
+                .unwrap_or(0);
+            FieldType {
+                tp: TYPE_DATETIME,
+                flen: 19 + if fsp > 0 { 1 + fsp } else { 0 },
+                decimal: fsp,
+                ..string_ft()
+            }
+        }
+        "TIMESTAMP" => {
+            let fsp = parse_flen_decimal(type_name)
+                .map(|(fsp, _)| fsp)
+                .unwrap_or(0);
+            FieldType {
+                tp: TYPE_TIMESTAMP,
+                flen: 19 + if fsp > 0 { 1 + fsp } else { 0 },
+                decimal: fsp,
+                ..string_ft()
+            }
+        }
+        "TIME" => {
+            let fsp = parse_flen_decimal(type_name)
+                .map(|(fsp, _)| fsp)
+                .unwrap_or(0);
+            FieldType {
+                tp: TYPE_DURATION,
+                flen: 10 + if fsp > 0 { 1 + fsp } else { 0 },
+                decimal: fsp,
+                ..string_ft()
+            }
+        }
         "YEAR" => FieldType {
             tp: TYPE_YEAR,
             flen: 4,

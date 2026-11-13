@@ -2,18 +2,25 @@
 // AFTER/FIRST, ALGORITHM/LOCK (accepted, in-place).
 // Completeness wave / not this feature: generated columns, nested subpartition storage,
 // multi-schema-state jobs.
-use crate::create_table::field_type_from_name;
+use crate::create_table::{
+    field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
+    ttl_column_name, validate_default_fsp, validate_generated_auto_increment,
+    validate_generated_column_refs, validate_generated_expr,
+};
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{add_partitions, drop_partitions, exchange_partition};
 use crate::table::resolve_name;
 use sealdb_errno::{
-    ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME,
-    ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, Error, Result,
+    ERR_BAD_DB, ERR_BAD_FIELD, ERR_CANT_DROP_FIELD_OR_KEY, ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
+    ERR_DUP_FIELDNAME, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
+    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
 use sealdb_meta::{ColumnInfo, Mutator, TableInfo};
-use sealdb_parser::ast::{AlterTableSpec, AlterTableStmt, ColumnPosition, TableName};
+use sealdb_parser::ast::{
+    AlterTableSpec, AlterTableStmt, ColumnPosition, GeneratedColumn, TableName,
+};
 use sealdb_parser::model::CIStr;
 use sealdb_tablecodec::{decode_row, encode_row, gen_table_record_prefix, next_prefix};
 use sealdb_types::{EvalType, FieldType};
@@ -42,6 +49,9 @@ pub fn alter_table(
                 current_db,
                 storage,
             )?,
+            AlterTableSpec::AlterColumnDefault { name, default } => {
+                alter_column_default(meta, &snapshot, stmt, name, default.as_deref(), current_db)?
+            }
             AlterTableSpec::DropColumn { if_exists, name } => {
                 drop_column(meta, &snapshot, stmt, name, *if_exists, current_db)?;
             }
@@ -71,6 +81,8 @@ pub fn alter_table(
                 old_name,
                 new_name,
                 type_name,
+                default,
+                generated,
                 position,
             } => change_column(
                 meta,
@@ -79,6 +91,8 @@ pub fn alter_table(
                 old_name,
                 new_name,
                 Some(type_name),
+                default.as_deref(),
+                generated.as_ref(),
                 position,
                 current_db,
                 storage,
@@ -86,6 +100,8 @@ pub fn alter_table(
             AlterTableSpec::ModifyColumn {
                 name,
                 type_name,
+                default,
+                generated,
                 position,
             } => change_column(
                 meta,
@@ -94,6 +110,8 @@ pub fn alter_table(
                 name,
                 name,
                 Some(type_name),
+                default.as_deref(),
+                generated.as_ref(),
                 position,
                 current_db,
                 storage,
@@ -104,6 +122,8 @@ pub fn alter_table(
                 stmt,
                 old_name,
                 new_name,
+                None,
+                None,
                 None,
                 &ColumnPosition::None,
                 current_db,
@@ -150,9 +170,168 @@ pub fn alter_table(
                     storage,
                 )?;
             }
+            AlterTableSpec::SetTtl {
+                expr,
+                enable,
+                job_interval,
+            } => alter_ttl(
+                meta,
+                &snapshot,
+                stmt,
+                expr.as_deref(),
+                *enable,
+                job_interval.as_deref(),
+                current_db,
+            )?,
+            AlterTableSpec::RemoveTtl => {
+                let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                let db = snapshot.schema_by_name(&schema).ok_or_else(|| {
+                    Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
+                })?;
+                let Some(mut info) = snapshot.table_by_name(&schema, &table).cloned() else {
+                    return Err(Error::new(
+                        ERR_NO_SUCH_TABLE,
+                        format!("Table '{schema}.{table}' doesn't exist"),
+                    ));
+                };
+                info.ttl = None;
+                meta.update_table(db.id, &info)?;
+                meta.gen_schema_version()?;
+            }
+            AlterTableSpec::AddForeignKey { ref_table } => {
+                let (schema, table) = resolve_name(&stmt.table, current_db)?;
+                let _ = table;
+                if let Some(parent) = snapshot.table_by_name(&schema, ref_table)
+                    && parent.ttl.is_some()
+                {
+                    return Err(Error::new(
+                        ERR_TTL_FK_REFERENCED,
+                        "Set TTL for a table referenced by foreign key is not allowed",
+                    ));
+                }
+            }
         }
         snapshot = InfoSchema::from_meta(meta)?;
     }
+    Ok(())
+}
+
+/// `ALTER TABLE … ALTER COLUMN col SET DEFAULT …` / `DROP DEFAULT`.
+fn alter_column_default(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    name: &str,
+    default: Option<&str>,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &table).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    let Some(pos) = info
+        .columns
+        .iter()
+        .position(|c| c.name.o().eq_ignore_ascii_case(name))
+    else {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column '{name}' in '{table}'"),
+        ));
+    };
+    if let Some(default) = default {
+        let field_type = info.columns[pos].field_type.clone();
+        let default = normalize_default(&field_type, default);
+        validate_default_fsp(name, &field_type, Some(&default))?;
+        info.columns[pos].default_expr = Some(default);
+    } else {
+        info.columns[pos].default_expr = None;
+    }
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// `ALTER TABLE … TTL = …` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …`.
+fn alter_ttl(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    expr: Option<&str>,
+    enable: Option<bool>,
+    job_interval: Option<&str>,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &table).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    if let Some(expr) = expr {
+        crate::create_table::validate_ttl_primary_key(&info)?;
+        let column = ttl_column_name(expr);
+        let Some(col) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&column))
+        else {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{column}' in 'TTL config'"),
+            ));
+        };
+        if !is_temporal_type(col.field_type.tp) {
+            return Err(Error::new(
+                ERR_TTL_INVALID_COLUMN,
+                format!(
+                    "Field '{column}' is of a not supported type for TTL config, \
+                     expect DATETIME, DATE or TIMESTAMP"
+                ),
+            ));
+        }
+        if referenced_by_foreign_key(is, &table) {
+            return Err(Error::new(
+                ERR_TTL_FK_REFERENCED,
+                "Set TTL for a table referenced by foreign key is not allowed",
+            ));
+        }
+        let ttl = info.ttl.get_or_insert_with(|| sealdb_meta::TtlInfo {
+            expr: expr.to_string(),
+            enable: true,
+            job_interval: "1h".to_string(),
+        });
+        ttl.expr = expr.to_string();
+    }
+    let Some(ttl) = info.ttl.as_mut() else {
+        let name = if enable.is_some() {
+            "TTL_ENABLE"
+        } else {
+            "TTL_JOB_INTERVAL"
+        };
+        return Err(Error::new(
+            ERR_TTL_NO_CONFIG,
+            format!("Cannot set {name} on a table without TTL config"),
+        ));
+    };
+    if let Some(enable) = enable {
+        ttl.enable = enable;
+    }
+    if let Some(interval) = job_interval {
+        ttl.job_interval = interval.to_string();
+    }
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
     Ok(())
 }
 
@@ -197,10 +376,26 @@ fn add_column(
         column.name.clone(),
         field_type_from_name(&column.type_name)?,
     );
-    new_col.default_expr = column.default.clone();
+    // Normalize a literal default to the column type (TiDB rounds temporal
+    // defaults to the column's fractional precision at DDL time).
+    new_col.default_expr = column
+        .default
+        .as_deref()
+        .map(|default| normalize_default(&new_col.field_type, default));
+    new_col.auto_random = column.auto_random;
+    if let Some(generated) = &column.generated {
+        validate_generated_expr(&column.name, &generated.expr)?;
+        new_col.generated_expr = Some(generated.expr.clone());
+        new_col.generated_stored = generated.stored;
+    }
     if column.not_null {
         new_col.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
     }
+    validate_default_fsp(
+        &new_col.name.o().to_string(),
+        &new_col.field_type,
+        new_col.default_expr.as_deref(),
+    )?;
     let new_id = new_col.id;
     let default_value = column_default_datum(&new_col)?;
     // Existing rows were written before this column existed, so decode them
@@ -209,6 +404,8 @@ fn add_column(
     let old_types = info.col_field_types();
     info.columns.insert(insert_at, new_col);
     recompute_column_offsets(&mut info);
+    validate_generated_auto_increment(&info.columns, Some(&column.name))?;
+    validate_generated_column_refs(&info.columns, Some(&column.name))?;
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     if let Some(value) = default_value {
@@ -363,11 +560,20 @@ fn drop_column(
             format!("Can't DROP '{name}'; check that column/key exists"),
         ));
     };
-    if info
-        .handle_column()
-        .is_some_and(|handle| handle.id == info.columns[pos].id)
+    if info.pk_is_handle
+        && info
+            .handle_column()
+            .is_some_and(|handle| handle.id == info.columns[pos].id)
     {
         return Err(Error::unsupported("DROP handle column"));
+    }
+    if info.ttl.as_ref().is_some_and(|ttl| {
+        crate::create_table::ttl_column_name(&ttl.expr).eq_ignore_ascii_case(name)
+    }) {
+        return Err(Error::new(
+            ERR_TTL_DROP_COLUMN,
+            format!("Cannot drop column '{name}': needed in TTL config"),
+        ));
     }
     if info.indices.iter().any(|idx| {
         idx.columns
@@ -389,6 +595,54 @@ fn drop_column(
 /// CHANGE / MODIFY / RENAME COLUMN: update the name and rewrite stored
 /// values when the FieldType actually changes.
 #[allow(clippy::too_many_arguments)]
+/// Moving a column must not place a generated column before a column it
+/// depends on, or leave a dependent generated column before it (3107).
+fn validate_generated_order_after_move(
+    info: &TableInfo,
+    from: usize,
+    position: &ColumnPosition,
+) -> Result<()> {
+    let mut names: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let moved = names.remove(from);
+    let to = match position {
+        ColumnPosition::First => 0,
+        ColumnPosition::After(target) => names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(target))
+            .map(|i| i + 1)
+            .unwrap_or(names.len()),
+        ColumnPosition::None => names.len(),
+    };
+    let to = to.min(names.len());
+    names.insert(to, moved);
+    let position = |name: &str| names.iter().position(|n| n.eq_ignore_ascii_case(name));
+    for col in &info.columns {
+        let Some(text) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        let Some(col_pos) = position(col.name.o()) else {
+            continue;
+        };
+        let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        for (_table, dep) in expr.referenced_columns() {
+            if let Some(dep_pos) = position(&dep)
+                && dep_pos > col_pos
+            {
+                return Err(Error::new(
+                    ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
+                    "Generated column can refer only to generated columns defined prior to it."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn change_column(
     meta: &mut Mutator,
     is: &InfoSchema,
@@ -396,6 +650,8 @@ fn change_column(
     old_name: &str,
     new_name: &str,
     type_name: Option<&str>,
+    default: Option<&str>,
+    generated: Option<&GeneratedColumn>,
     position: &ColumnPosition,
     current_db: &str,
     storage: &dyn Storage,
@@ -436,13 +692,51 @@ fn change_column(
         None => info.columns[pos].field_type.clone(),
     };
     if info
-        .handle_column()
-        .is_some_and(|handle| handle.id == info.columns[pos].id)
+        .ttl
+        .as_ref()
+        .is_some_and(|ttl| ttl_column_name(&ttl.expr).eq_ignore_ascii_case(old_name))
+    {
+        if !is_temporal_type(new_ft.tp) {
+            return Err(Error::new(
+                ERR_TTL_INVALID_COLUMN,
+                format!(
+                    "Field '{new_name}' is of a not supported type for TTL config, \
+                     expect DATETIME, DATE or TIMESTAMP"
+                ),
+            ));
+        }
+        if !old_name.eq_ignore_ascii_case(new_name)
+            && let Some(ttl) = info.ttl.as_mut()
+        {
+            ttl.expr = ttl
+                .expr
+                .replace(&format!("`{old_name}`"), &format!("`{new_name}`"));
+        }
+    }
+    if info.pk_is_handle
+        && info
+            .handle_column()
+            .is_some_and(|handle| handle.id == info.columns[pos].id)
         && new_ft.eval_type() != EvalType::Int
     {
         return Err(Error::unsupported("MODIFY handle column type"));
     }
     let changed = field_type_changed(&info.columns[pos].field_type, &new_ft);
+    let effective_default = default
+        .map(|default| default.to_string())
+        .or_else(|| info.columns[pos].default_expr.clone())
+        .map(|default| normalize_default(&new_ft, &default));
+    validate_default_fsp(new_name, &new_ft, effective_default.as_deref())?;
+    if let Some(default) = effective_default {
+        info.columns[pos].default_expr = Some(default);
+    }
+    if let Some(generated) = generated {
+        validate_generated_expr(new_name, &generated.expr)?;
+        info.columns[pos].generated_expr = Some(generated.expr.clone());
+        info.columns[pos].generated_stored = generated.stored;
+        validate_generated_auto_increment(&info.columns, Some(new_name))?;
+        validate_generated_column_refs(&info.columns, Some(new_name))?;
+    }
     if changed {
         rewrite_column_rows(storage, &info, info.columns[pos].id, &new_ft)?;
     }
@@ -475,6 +769,7 @@ fn change_column(
         }
     }
     if needs_column_move(position, new_name) {
+        validate_generated_order_after_move(&info, pos, position)?;
         let col = info.columns.remove(pos);
         let insert_at = column_insert_index(&info, position)?;
         info.columns.insert(insert_at, col);
@@ -534,7 +829,8 @@ fn rewrite_column_rows(
 /// into `<n> warnings with this error code, first warning: <first>`.
 fn push_reorg_warnings(warnings: &[(i32, String)]) {
     let mut order: Vec<i32> = Vec::new();
-    let mut counts: std::collections::HashMap<i32, (usize, &str)> = std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<i32, (usize, &str)> =
+        std::collections::HashMap::new();
     for (code, message) in warnings {
         let entry = counts.entry(*code).or_insert_with(|| {
             order.push(*code);
@@ -559,7 +855,9 @@ fn integer_bounds(ft: &FieldType) -> Option<(i128, i128)> {
         sealdb_types::field_type::TYPE_TINY => (-128i128, 127i128),
         sealdb_types::field_type::TYPE_SHORT => (-32_768, 32_767),
         sealdb_types::field_type::TYPE_INT24 => (-8_388_608, 8_388_607),
-        sealdb_types::field_type::TYPE_LONG => (i64::from(i32::MIN) as i128, i64::from(i32::MAX) as i128),
+        sealdb_types::field_type::TYPE_LONG => {
+            (i64::from(i32::MIN) as i128, i64::from(i32::MAX) as i128)
+        }
         sealdb_types::field_type::TYPE_LONG_LONG => (i64::MIN as i128, i64::MAX as i128),
         _ => return None,
     };
@@ -635,7 +933,7 @@ fn rename_table(
     if is.table_by_name(&new_schema, &new_table).is_some() {
         return Err(Error::new(
             ERR_TABLE_EXISTS,
-            format!("Table '{new_table}' already exists"),
+            format!("Table '{new_schema}.{new_table}' already exists"),
         ));
     }
     let new_db = is

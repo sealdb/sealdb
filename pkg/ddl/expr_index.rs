@@ -9,7 +9,8 @@
 
 use crate::create_table::field_type_from_name;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
+    ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
     ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
     ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, Error, Result,
 };
@@ -56,6 +57,23 @@ pub(crate) fn resolve_index_parts(
                 columns.push(ic);
             }
             IndexPart::Expression(text) => {
+                if !sealdb_expression::allow_auto_increment_in_generated() {
+                    let expr = parse_expr(text)?;
+                    for (_table, col_name) in expr.referenced_columns() {
+                        if info.columns.iter().any(|c| {
+                            !c.hidden
+                                && c.auto_increment
+                                && c.name.o().eq_ignore_ascii_case(&col_name)
+                        }) {
+                            return Err(Error::new(
+                                ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
+                                format!(
+                                    "Expression index '{index_name}' cannot refer to an auto-increment column"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 let name = hidden_column_name(index_name, pos);
                 // TiDB rejects the index when a user column already owns the
                 // generated hidden-column name.

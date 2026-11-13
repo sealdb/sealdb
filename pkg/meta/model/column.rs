@@ -25,6 +25,10 @@ pub struct ColumnInfo {
     /// `AUTO_INCREMENT` column option (TiDB `ColumnInfo.AutoIncrement`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_increment: bool,
+    /// TiDB `AUTO_RANDOM(n)` shard bits (`ColumnInfo.AutoRandomBits`; `None`
+    /// when the column is not an auto-random column).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_random: Option<u32>,
     /// TiDB `ColumnInfo.Hidden`: an internal column backing an expression index
     /// (`_V$_idx_0`). Hidden columns are stored in the row but never shown to
     /// clients (`SELECT *`, `SHOW CREATE TABLE`, `information_schema`).
@@ -45,6 +49,7 @@ impl ColumnInfo {
             generated_stored: false,
             default_expr: None,
             auto_increment: false,
+            auto_random: None,
             hidden: false,
         }
     }

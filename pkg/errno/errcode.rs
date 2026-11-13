@@ -3,6 +3,11 @@ pub const ERR_DB_DROP_EXISTS: i32 = 1008;
 pub const ERR_NO_DB: i32 = 1046;
 pub const ERR_BAD_DB: i32 = 1049;
 pub const ERR_TABLE_EXISTS: i32 = 1050;
+/// TiDB `ErrTTLUnsupportedPKType`: a clustered primary key containing FLOAT /
+/// DOUBLE columns cannot use TTL (8153).
+pub const ERR_TTL_UNSUPPORTED_PK_TYPE: i32 = 8153;
+/// MySQL `ER_BAD_TABLE_ERROR`: `DROP TABLE` naming a VIEW (1051).
+pub const ERR_BAD_TABLE: i32 = 1051;
 pub const ERR_PARSE_ERROR: i32 = 1064;
 pub const ERR_UNKNOWN_TABLE: i32 = 1109;
 pub const ERR_BAD_FIELD: i32 = 1054;
@@ -70,8 +75,20 @@ pub const ERR_UNKNOWN_CHARACTER_SET: i32 = 1115;
 pub const ERR_UNKNOWN_COLLATION: i32 = 1273;
 pub const ERR_WRONG_OBJECT: i32 = 1347;
 pub const ERR_VIEW_CHECK_FAILED: i32 = 1369;
+/// TiDB `ErrViewSelectVariable`: a VIEW SELECT references a variable or
+/// parameter (1351).
+pub const ERR_VIEW_SELECT_VARIABLE: i32 = 1351;
+/// MySQL `ER_TOO_LONG_IDENT`: identifier longer than 64 characters (1059).
+pub const ERR_IDENTIFIER_TOO_LONG: i32 = 1059;
+/// MySQL `ER_VIEW_INVALID`: a VIEW definition references tables/columns that
+/// no longer exist (1356).
+pub const ERR_VIEW_INVALID_TABLE: i32 = 1356;
+/// TiDB `ErrDefinerTooLong`: VIEW definer user > 32 or host > 255 chars (1470).
+pub const ERR_DEFINER_TOO_LONG: i32 = 1470;
 /// VIEW WITH CHECK OPTION is invalid for ALGORITHM=TEMPTABLE (MySQL 1471).
 pub const ERR_VIEW_INVALID: i32 = 1471;
+/// TiDB `ErrViewRecursive`: a VIEW definition references itself (1462).
+pub const ERR_VIEW_RECURSIVE: i32 = 1462;
 pub const ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION: i32 = 1792;
 /// TiDB `ErrCTEMaxRecursionDepth`: recursive CTE exceeded @@cte_max_recursion_depth.
 pub const ERR_CTE_MAX_RECURSION_DEPTH: i32 = 3636;
@@ -85,3 +102,34 @@ pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
+/// TiDB `ErrInvalidDefault`: a column default that is invalid for the column
+/// type/precision (e.g. `TIMESTAMP` default `NOW(1)` for fsp 0).
+pub const ERR_INVALID_DEFAULT: i32 = 1067;
+/// TiDB `ErrTTLInvalidColumn`: the `TTL` expression column is missing or not
+/// `DATETIME`/`DATE`/`TIMESTAMP`.
+pub const ERR_TTL_INVALID_COLUMN: i32 = 8148;
+/// TiDB `ErrTTLDropColumn`: a column used by the TTL config cannot be dropped.
+pub const ERR_TTL_DROP_COLUMN: i32 = 8149;
+/// TiDB `ErrTTLNoTTLConfig`: `TTL_ENABLE`/`TTL_JOB_INTERVAL` without `TTL`.
+pub const ERR_TTL_NO_CONFIG: i32 = 8150;
+/// TiDB `ErrTTLTemporaryTable`: `TTL` is not allowed on temporary tables.
+pub const ERR_TTL_TEMPORARY_TABLE: i32 = 8151;
+/// TiDB `ErrTTLFKReferenced`: `TTL` is not allowed on a table that is
+/// referenced by a foreign key.
+pub const ERR_TTL_FK_REFERENCED: i32 = 8152;
+/// TiDB `ErrTTLMultiSchemaChange`: TTL change cannot be combined with other
+/// specs in one `ALTER TABLE`.
+pub const ERR_TTL_MULTI_SCHEMA_CHANGE: i32 = 8200;
+/// TiDB `ErrInvalidAutoRandom`: `AUTO_RANDOM` misuse (explicit insert with
+/// `@@allow_auto_random_explicit_insert` off, invalid conversion, …).
+pub const ERR_INVALID_AUTO_RANDOM: i32 = 8216;
+/// TiDB `ErrGeneratedColumnFunctionIsNotAllowed` (3102).
+pub const ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED: i32 = 3102;
+/// TiDB `ErrGeneratedColumnRefAutoInc`: generated column references an
+/// AUTO_INCREMENT column while `tidb_enable_auto_increment_in_generated` is off.
+pub const ERR_GENERATED_COLUMN_REF_AUTO_INC: i32 = 3109;
+/// TiDB `ErrColumnWithGeneratedDependencies`: a generated column's position
+/// would break another generated column's dependency order (3107).
+pub const ERR_COLUMN_WITH_GENERATED_DEPENDENCIES: i32 = 3107;
+/// TiDB `ErrFunctionalIndexOnAutoIncrementColumn` (3754).
+pub const ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT: i32 = 3754;

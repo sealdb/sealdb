@@ -7,6 +7,8 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_NO_DB => "ErrNoDB",
         errcode::ERR_BAD_DB => "ErrBadDB",
         errcode::ERR_TABLE_EXISTS => "ErrTableExists",
+        errcode::ERR_BAD_TABLE => "ErrBadTable",
+        errcode::ERR_TTL_UNSUPPORTED_PK_TYPE => "ErrTTLUnsupportedPKType",
         errcode::ERR_PARSE_ERROR => "ErrParseError",
         errcode::ERR_UNKNOWN_TABLE => "ErrUnknownTable",
         errcode::ERR_NO_SUCH_TABLE => "ErrNoSuchTable",
@@ -56,7 +58,12 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_UNKNOWN_COLLATION => "ErrUnknownCollation",
         errcode::ERR_WRONG_OBJECT => "ErrWrongObject",
         errcode::ERR_VIEW_CHECK_FAILED => "ErrViewCheckFailed",
+        errcode::ERR_VIEW_SELECT_VARIABLE => "ErrViewSelectVariable",
+        errcode::ERR_VIEW_INVALID_TABLE => "ErrViewInvalid",
+        errcode::ERR_DEFINER_TOO_LONG => "ErrDefinerTooLong",
+        errcode::ERR_IDENTIFIER_TOO_LONG => "ErrTooLongIdent",
         errcode::ERR_VIEW_INVALID => "ErrViewInvalid",
+        errcode::ERR_VIEW_RECURSIVE => "ErrViewRecursive",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "ErrCantExecuteInReadOnlyTransaction",
         errcode::ERR_CTE_MAX_RECURSION_DEPTH => "ErrCTEMaxRecursionDepth",
         errcode::ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION => {
@@ -68,6 +75,20 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED => {
             "ErrFunctionalIndexRowValueIsNotAllowed"
         }
+        errcode::ERR_INVALID_AUTO_RANDOM => "ErrInvalidAutoRandom",
+        errcode::ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED => {
+            "ErrGeneratedColumnFunctionIsNotAllowed"
+        }
+        errcode::ERR_GENERATED_COLUMN_REF_AUTO_INC => "ErrGeneratedColumnRefAutoInc",
+        errcode::ERR_COLUMN_WITH_GENERATED_DEPENDENCIES => "ErrColumnWithGeneratedDependencies",
+        errcode::ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT => "ErrFunctionalIndexOnAutoIncrement",
+        errcode::ERR_INVALID_DEFAULT => "ErrInvalidDefault",
+        errcode::ERR_TTL_INVALID_COLUMN => "ErrTTLInvalidColumn",
+        errcode::ERR_TTL_DROP_COLUMN => "ErrTTLDropColumn",
+        errcode::ERR_TTL_NO_CONFIG => "ErrTTLNoTTLConfig",
+        errcode::ERR_TTL_TEMPORARY_TABLE => "ErrTTLTemporaryTable",
+        errcode::ERR_TTL_FK_REFERENCED => "ErrTTLFKReferenced",
+        errcode::ERR_TTL_MULTI_SCHEMA_CHANGE => "ErrTTLMultiSchemaChange",
         errcode::ERR_MEMORY_EXCEEDED => "ErrMemoryExceedForQuery",
         _ => "ErrUnknown",
     }
@@ -82,6 +103,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_NO_DB => "3D000",
         errcode::ERR_BAD_DB => "42000",
         errcode::ERR_TABLE_EXISTS => "42S01",
+        errcode::ERR_BAD_TABLE => "42S02",
         errcode::ERR_DUP_FIELDNAME => "42S21",
         errcode::ERR_FIELD_SPECIFIED_TWICE => "42000",
         errcode::ERR_DUP_KEYNAME => "42000",
@@ -90,6 +112,8 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_NO_SUCH_TABLE => "42S02",
         errcode::ERR_BAD_FIELD => "42S22",
         errcode::ERR_WRONG_FIELD_WITH_GROUP => "42000",
+        errcode::ERR_INVALID_DEFAULT => "42000",
+        errcode::ERR_IDENTIFIER_TOO_LONG => "42000",
         errcode::ERR_AMBIGUOUS_COLUMN => "23000",
         errcode::ERR_DUP_ENTRY => "23000",
         errcode::ERR_BAD_NULL => "23000",

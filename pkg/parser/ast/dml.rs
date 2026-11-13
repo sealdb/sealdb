@@ -158,6 +158,10 @@ pub struct CommonTableExpression {
     /// Outer `LIMIT` / `OFFSET` on a recursive CTE body (`… UNION ALL … LIMIT n`).
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Synthetic CTE produced by flattening a derived table
+    /// (`FROM (SELECT …) AS x`). View restore inlines these as `(…) AS x`
+    /// instead of printing a `WITH` entry.
+    pub derived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -281,7 +285,45 @@ impl WithClause {
         }
         Ok(arms)
     }
+}
 
+impl CommonTableExpression {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_name(&self.name);
+        if !self.col_name_list.is_empty() {
+            ctx.write_str(" (");
+            for (j, col) in self.col_name_list.iter().enumerate() {
+                if j > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        }
+        ctx.write_str(match self.materialize {
+            CteMaterialize::Materialized => " AS MATERIALIZED (",
+            CteMaterialize::NotMaterialized => " AS NOT MATERIALIZED (",
+            CteMaterialize::Default => " AS (",
+        });
+        self.query.restore(ctx)?;
+        for (op, select) in &self.set_rest {
+            ctx.write_str(" ");
+            ctx.write_str(op.restore());
+            ctx.write_str(" ");
+            select.restore(ctx)?;
+        }
+        if let Some((op, rec)) = &self.recursive {
+            ctx.write_str(" ");
+            ctx.write_str(op.restore());
+            ctx.write_str(" ");
+            rec.restore(ctx)?;
+        }
+        ctx.write_str(")");
+        Ok(())
+    }
+}
+
+impl WithClause {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str("WITH ");
         if self.is_recursive {
@@ -291,36 +333,7 @@ impl WithClause {
             if i > 0 {
                 ctx.write_str(", ");
             }
-            ctx.write_name(&cte.name);
-            if !cte.col_name_list.is_empty() {
-                ctx.write_str(" (");
-                for (j, col) in cte.col_name_list.iter().enumerate() {
-                    if j > 0 {
-                        ctx.write_str(", ");
-                    }
-                    ctx.write_name(col);
-                }
-                ctx.write_str(")");
-            }
-            ctx.write_str(match cte.materialize {
-                CteMaterialize::Materialized => " AS MATERIALIZED (",
-                CteMaterialize::NotMaterialized => " AS NOT MATERIALIZED (",
-                CteMaterialize::Default => " AS (",
-            });
-            cte.query.restore(ctx)?;
-            for (op, select) in &cte.set_rest {
-                ctx.write_str(" ");
-                ctx.write_str(op.restore());
-                ctx.write_str(" ");
-                select.restore(ctx)?;
-            }
-            if let Some((op, rec)) = &cte.recursive {
-                ctx.write_str(" ");
-                ctx.write_str(op.restore());
-                ctx.write_str(" ");
-                rec.restore(ctx)?;
-            }
-            ctx.write_str(")");
+            cte.restore(ctx)?;
         }
         ctx.write_str(" ");
         Ok(())
@@ -374,6 +387,9 @@ impl SelectStmt {
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if ctx.in_view() {
+            return self.restore_view(ctx);
+        }
         if let Some(with) = &self.with {
             with.restore(ctx)?;
         }
@@ -456,6 +472,226 @@ impl SelectStmt {
             SelectLockWait::Block => {}
         }
         Ok(())
+    }
+
+    /// TiDB `SHOW CREATE VIEW` rendering of the stored query: schema-qualified
+    /// tables, an explicit `AS` alias on every select field, and derived tables
+    /// (flattened into CTEs by the bridge) inlined back into the `FROM` clause.
+    fn restore_view(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        let ctes: Vec<&CommonTableExpression> = self
+            .with
+            .as_ref()
+            .map(|with| with.ctes.iter().collect())
+            .unwrap_or_default();
+        if let Some(with) = &self.with {
+            let normal: Vec<&CommonTableExpression> =
+                with.ctes.iter().filter(|cte| !cte.derived).collect();
+            if !normal.is_empty() {
+                ctx.write_str("WITH ");
+                if with.is_recursive {
+                    ctx.write_str("RECURSIVE ");
+                }
+                for (i, cte) in normal.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    cte.restore(ctx)?;
+                }
+                ctx.write_str(" ");
+            }
+        }
+        ctx.write_str("SELECT ");
+        if self.distinct {
+            ctx.write_str("DISTINCT ");
+        }
+        for (i, field) in self.fields.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(",");
+            }
+            if field.expr.is_star_marker() {
+                ctx.write_str("*");
+                continue;
+            }
+            field.expr.restore(ctx)?;
+            let alias = field
+                .as_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| field.expr.name());
+            let alias = if alias.is_empty() {
+                format!("_{i}")
+            } else {
+                alias
+            };
+            ctx.write_str(" AS ");
+            ctx.write_name(&alias);
+        }
+        if !self.joins.is_empty() {
+            ctx.write_str(" FROM ");
+            self.restore_view_join(ctx, &ctes, self.joins.len() - 1)?;
+        } else if let Some(from) = &self.from {
+            ctx.write_str(" FROM ");
+            restore_view_table(from, ctx, &ctes)?;
+        } else if let Some(item) = &self.from_item {
+            ctx.write_str(" FROM ");
+            restore_view_from_item(item, ctx, &ctes)?;
+        }
+        if let Some(selection) = &self.selection {
+            ctx.write_str(" WHERE ");
+            selection.restore(ctx)?;
+        }
+        if !self.group_by.is_empty() {
+            ctx.write_str(" GROUP BY ");
+            for (i, expr) in self.group_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                expr.restore(ctx)?;
+            }
+        }
+        if let Some(having) = &self.having {
+            ctx.write_str(" HAVING ");
+            having.restore(ctx)?;
+        }
+        if !self.order_by.is_empty() {
+            ctx.write_str(" ORDER BY ");
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(",");
+                }
+                item.expr.restore(ctx)?;
+                if item.desc {
+                    ctx.write_str(" DESC");
+                }
+            }
+        }
+        if let Some(limit) = self.limit {
+            ctx.write_str(" LIMIT ");
+            if let Some(offset) = self.offset {
+                ctx.write_str(&format!("{offset},"));
+            }
+            ctx.write_str(&limit.to_string());
+        } else if let Some(offset) = self.offset {
+            ctx.write_str(" LIMIT ");
+            ctx.write_str(&offset.to_string());
+            ctx.write_str(",18446744073709551615");
+        }
+        Ok(())
+    }
+
+    /// Left-deep join chain, each nested level parenthesized (TiDB restore of
+    /// `ast.Join` wraps the left operand).
+    fn restore_view_join(
+        &self,
+        ctx: &mut RestoreCtx,
+        ctes: &[&CommonTableExpression],
+        i: usize,
+    ) -> Result<()> {
+        if i > 0 {
+            ctx.write_str("(");
+            self.restore_view_join(ctx, ctes, i - 1)?;
+            ctx.write_str(")");
+        } else {
+            restore_view_table(&self.joins[0].left, ctx, ctes)?;
+        }
+        let join = &self.joins[i];
+        ctx.write_str(" ");
+        if join.natural {
+            ctx.write_str("NATURAL ");
+        }
+        ctx.write_str(join.tp.restore());
+        ctx.write_str(" ");
+        restore_view_table(&join.right, ctx, ctes)?;
+        if !join.using_cols.is_empty() {
+            ctx.write_str(" USING (");
+            for (j, col) in join.using_cols.iter().enumerate() {
+                if j > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(col);
+            }
+            ctx.write_str(")");
+        } else if join.tp.has_on() {
+            ctx.write_str(" ON ");
+            join.on.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// Render one `FROM` / `JOIN` source: a derived table inlined from its
+/// synthetic CTE, a plain CTE reference (unqualified), or a physical table.
+fn restore_view_table(
+    table: &TableName,
+    ctx: &mut RestoreCtx,
+    ctes: &[&CommonTableExpression],
+) -> Result<()> {
+    if let Some(cte) = ctes
+        .iter()
+        .find(|cte| cte.derived && cte.name.eq_ignore_ascii_case(&table.name))
+    {
+        ctx.write_str("(");
+        cte.query.restore(ctx)?;
+        for (op, select) in &cte.set_rest {
+            ctx.write_str(" ");
+            ctx.write_str(op.restore());
+            ctx.write_str(" ");
+            select.restore(ctx)?;
+        }
+        ctx.write_str(") AS ");
+        ctx.write_name(&cte.name);
+        return Ok(());
+    }
+    if ctes
+        .iter()
+        .any(|cte| !cte.derived && cte.name.eq_ignore_ascii_case(&table.name))
+    {
+        ctx.write_name(&table.name);
+        return Ok(());
+    }
+    table.restore(ctx)
+}
+
+fn restore_view_from_item(
+    item: &FromItem,
+    ctx: &mut RestoreCtx,
+    ctes: &[&CommonTableExpression],
+) -> Result<()> {
+    match item {
+        FromItem::Table(table) => restore_view_table(table, ctx, ctes),
+        FromItem::Join {
+            left,
+            right,
+            tp,
+            on,
+            using_cols,
+            natural,
+        } => {
+            ctx.write_str("(");
+            restore_view_from_item(left, ctx, ctes)?;
+            ctx.write_str(" ");
+            if *natural {
+                ctx.write_str("NATURAL ");
+            }
+            ctx.write_str(tp.restore());
+            ctx.write_str(" ");
+            restore_view_from_item(right, ctx, ctes)?;
+            if !using_cols.is_empty() {
+                ctx.write_str(" USING (");
+                for (i, col) in using_cols.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(col);
+                }
+                ctx.write_str(")");
+            } else if tp.has_on() {
+                ctx.write_str(" ON ");
+                on.restore(ctx)?;
+            }
+            ctx.write_str(")");
+            Ok(())
+        }
     }
 }
 

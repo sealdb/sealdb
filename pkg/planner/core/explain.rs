@@ -2772,8 +2772,7 @@ fn emit_cop_children(
             // order (optionally under an index-side Selection).
             let keep_order_sel = keep_order_sel_pushed(pushed.as_ref());
             if keep_order_pushed(pushed.as_ref()) || keep_order_sel.is_some() {
-                let pseudo =
-                    *row_count >= 9_000.0 || keep_order_pseudo_pushed(pushed.as_ref());
+                let pseudo = *row_count >= 9_000.0 || keep_order_pseudo_pushed(pushed.as_ref());
                 let scan_keep = if pseudo {
                     "keep order:true, stats:pseudo"
                 } else {
@@ -6301,14 +6300,12 @@ fn hash_join_explain_info(
     // `RightConditions` when the whole conjunct only reads that side (an outer
     // join cannot push it into the other child); those print as
     // `left cond:[…]` / `right cond:[…]` slices.
-    let (left_cond, right_cond, others) = if matches!(
-        tp,
-        JoinType::LeftOuter | JoinType::RightOuter
-    ) {
-        split_outer_join_conditions(tp, on, _left, _right)
-    } else {
-        (Vec::new(), Vec::new(), others)
-    };
+    let (left_cond, right_cond, others) =
+        if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter) {
+            split_outer_join_conditions(tp, on, _left, _right)
+        } else {
+            (Vec::new(), Vec::new(), others)
+        };
     if !left_cond.is_empty() {
         info.push_str(&format!(", left cond:[{}]", left_cond.join(" ")));
     }
@@ -6570,9 +6567,7 @@ fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
 /// TiDB `PhysicalHashJoin`/`PhysicalMergeJoin` ExplainInfo condition split: the
 /// `Column = Column` conjuncts become the space-separated `equal:[…]` key list,
 /// everything else is the comma-separated `other cond:` payload.
-fn split_join_conditions(
-    on: &sealdb_parser::ast::ExprNode,
-) -> (Vec<String>, Vec<String>) {
+fn split_join_conditions(on: &sealdb_parser::ast::ExprNode) -> (Vec<String>, Vec<String>) {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
     let mut equal_keys = Vec::new();

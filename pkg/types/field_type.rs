@@ -113,6 +113,7 @@ impl FieldType {
             TYPE_DATE => "date",
             TYPE_DATETIME => "datetime",
             TYPE_TIMESTAMP => "timestamp",
+            TYPE_DURATION => "time",
             TYPE_JSON => "json",
             TYPE_BIT => return format!("bit({})", self.flen.max(1)),
             TYPE_ENUM => return self.elems_type_name("enum"),
@@ -121,6 +122,11 @@ impl FieldType {
         };
         if self.is_unsigned() {
             format!("{base} unsigned")
+        } else if matches!(self.tp, TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION)
+            && self.decimal > 0
+        {
+            // `datetime(3)` / `time(3)` — TiDB prints the fsp only when > 0.
+            format!("{base}({})", self.decimal)
         } else {
             base.to_string()
         }

@@ -616,7 +616,7 @@
     {
       "name": "executor/ddl",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/ddl.test",
       "result": "r/executor/ddl.result",
       "has_result": true,

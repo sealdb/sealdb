@@ -25,6 +25,40 @@ thread_local! {
     static DST_GAP_WARNED: RefCell<bool> = const { RefCell::new(false) };
     /// IndexReader/IndexLookUp filter doubles DST warnings (TiDB types/time suite).
     static INDEX_DST_DOUBLE: RefCell<bool> = const { RefCell::new(false) };
+    /// Session `@@allow_auto_random_explicit_insert` (default OFF).
+    static ALLOW_AUTO_RANDOM_EXPLICIT_INSERT: Cell<bool> = const { Cell::new(false) };
+    /// Session `@@tidb_enable_auto_increment_in_generated` (default OFF).
+    static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` under `@@tidb_enable_auto_increment_in_generated` from the session.
+pub fn with_allow_auto_increment_in_generated<T>(allow: bool, f: impl FnOnce() -> T) -> T {
+    ALLOW_AUTO_INCREMENT_IN_GENERATED.with(|cell| {
+        let prev = cell.get();
+        cell.set(allow);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+pub fn allow_auto_increment_in_generated() -> bool {
+    ALLOW_AUTO_INCREMENT_IN_GENERATED.with(Cell::get)
+}
+
+/// Run `f` under `@@allow_auto_random_explicit_insert` from the session.
+pub fn with_allow_auto_random_explicit_insert<T>(allow: bool, f: impl FnOnce() -> T) -> T {
+    ALLOW_AUTO_RANDOM_EXPLICIT_INSERT.with(|cell| {
+        let prev = cell.get();
+        cell.set(allow);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+pub fn allow_auto_random_explicit_insert() -> bool {
+    ALLOW_AUTO_RANDOM_EXPLICIT_INSERT.with(Cell::get)
 }
 
 /// Run `f` with index-path DST warning doubling (types/time indexed selects).
@@ -1324,9 +1358,7 @@ fn json_scalar_datum(value: &serde_json::Value) -> Datum {
             }
         }
         serde_json::Value::String(s) => Datum::Bytes(s.clone().into_bytes()),
-        other => Datum::Bytes(
-            serde_json::to_vec(other).unwrap_or_else(|_| b"null".to_vec()),
-        ),
+        other => Datum::Bytes(serde_json::to_vec(other).unwrap_or_else(|_| b"null".to_vec())),
     }
 }
 
@@ -1836,8 +1868,7 @@ fn eval_timestamp_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
         // Exact absolute microseconds: the day count comes from the calendar so
         // month lengths never leak into the difference.
         let days = days_from_civil(t.year, t.month, t.day);
-        (((days * 24 + i64::from(t.hour)) * 60 + i64::from(t.minute)) * 60
-            + i64::from(t.second))
+        (((days * 24 + i64::from(t.hour)) * 60 + i64::from(t.minute)) * 60 + i64::from(t.second))
             * 1_000_000
             + i64::from(t.micro)
     };

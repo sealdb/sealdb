@@ -12,9 +12,9 @@ pub use ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 pub use ddl::{
     AlterDatabaseStmt, AlterSequenceStmt, AlterTableSpec, AlterTableStmt, ColumnDef,
     ColumnPosition, CreateDatabaseStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
-    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt, IndexDef,
-    IndexPart, PartitionDef, PartitionOption, PartitionType, SequenceOptionSet, TableName,
-    TruncateTableStmt,
+    CreateViewStmt, DropDatabaseStmt, DropIndexStmt, DropSequenceStmt, DropTableStmt,
+    GeneratedColumn, IndexDef, IndexPart, PartitionDef, PartitionOption, PartitionType,
+    SequenceOptionSet, TableName, TruncateTableStmt,
 };
 pub use dml::{
     Assignment, ByItem, CommonTableExpression, CteMaterialize, DeleteStmt, FromItem, InsertStmt,

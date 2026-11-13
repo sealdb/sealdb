@@ -5,8 +5,7 @@
 /// READ COMMITTED `refresh_snapshot` uses a fresh PD TSO snapshot for plain
 /// reads while keeping the underlying txn buffer for writes/locks.
 use sealdb_errno::{
-    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR, Error,
-    Result,
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR, Error, Result,
 };
 use sealdb_kv::{Storage, Transaction};
 use std::collections::HashMap;

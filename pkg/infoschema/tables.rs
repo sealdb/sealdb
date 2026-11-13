@@ -771,19 +771,37 @@ fn views(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         "VIEW_DEFINITION".to_string(),
         "CHECK_OPTION".to_string(),
         "IS_UPDATABLE".to_string(),
+        "DEFINER".to_string(),
+        "SECURITY_TYPE".to_string(),
+        "CHARACTER_SET_CLIENT".to_string(),
+        "COLLATION_CONNECTION".to_string(),
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
         let Some(view) = &table.view else {
             return;
         };
+        // TiDB stores the default `WITH CASCADED CHECK OPTION` for views created
+        // without an explicit clause and prints it verbatim in I_S.VIEWS.
+        let check_option =
+            if view.check_option.is_empty() || view.check_option.eq_ignore_ascii_case("NONE") {
+                "CASCADED"
+            } else {
+                view.check_option.as_str()
+            };
+        // `root@%` (TiDB `UserIdentity.String()`), not the SHOW CREATE rendering.
+        let definer = view.definer.replace('`', "");
         rows.push(vec![
             bytes("def"),
             bytes(db),
             bytes(table.name.o()),
             bytes(&view.select_stmt),
-            bytes(&view.check_option),
+            bytes(check_option),
             bytes("NO"),
+            bytes(&definer),
+            bytes(&view.security),
+            bytes("utf8mb4"),
+            bytes("utf8mb4_general_ci"),
         ]);
     });
     (schema, rows)

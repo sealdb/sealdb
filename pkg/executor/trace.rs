@@ -8,12 +8,12 @@
 //! then one `Table Stats-Expression-CNF` for the whole CNF filter.
 use sealdb_domain::Domain;
 use sealdb_errno::Result;
+use sealdb_parser::Parser;
 use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
 use sealdb_parser::ast::{SelectStmt, Statement};
 use sealdb_parser::format::RestoreCtx;
 use sealdb_parser::opcode::Op;
-use sealdb_parser::Parser;
-use sealdb_statistics::{kind_of, HistValueKind, StatsRange, Table};
+use sealdb_statistics::{HistValueKind, StatsRange, Table, kind_of};
 use sealdb_types::Datum;
 
 const COLUMN_PREFIX: &str = "Column Stats";
@@ -158,12 +158,7 @@ fn clamp_count(value: f64, total: u64) -> u64 {
     (value.round() as u64).clamp(1, total.max(1))
 }
 
-fn column_estimate(
-    coll: &Table,
-    column: &str,
-    kind: HistValueKind,
-    ranges: &[StatsRange],
-) -> u64 {
+fn column_estimate(coll: &Table, column: &str, kind: HistValueKind, ranges: &[StatsRange]) -> u64 {
     coll.column_range_estimate(column, kind, ranges)
         .map(|v| clamp_count(v, coll.count))
         .unwrap_or_else(|| (coll.count / 2).max(1))

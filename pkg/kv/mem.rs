@@ -1,7 +1,6 @@
 use super::kv::{LockWait, RowLock, Storage, Transaction};
 use sealdb_errno::{
-    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, Error,
-    Result,
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
@@ -522,7 +521,10 @@ impl Transaction for MemTransaction {
             if let Some(current) = store.data.get(key).and_then(|versions| versions.last())
                 && current.commit_ts > self.start_ts
             {
-                return Err(super::kv::write_conflict_error(self.start_ts, current.commit_ts));
+                return Err(super::kv::write_conflict_error(
+                    self.start_ts,
+                    current.commit_ts,
+                ));
             }
         }
         store.next_ts += 1;

@@ -141,11 +141,27 @@ impl Executor for ShowExec {
                         format!("Table '{schema}.{name}' doesn't exist"),
                     )
                 })?;
-                self.schema = vec!["Table".to_string(), "Create Table".to_string()];
-                self.rows = vec![vec![
-                    Datum::Bytes(name.as_bytes().to_vec()),
-                    Datum::Bytes(render_create_table(info).into_bytes()),
-                ]];
+                if info.is_view() {
+                    let view = info.view.as_ref().expect("view body");
+                    self.schema = vec![
+                        "Table".to_string(),
+                        "Create Table".to_string(),
+                        "character_set_client".to_string(),
+                        "collation_connection".to_string(),
+                    ];
+                    self.rows = vec![vec![
+                        Datum::Bytes(name.as_bytes().to_vec()),
+                        Datum::Bytes(render_create_view(info, view).into_bytes()),
+                        Datum::Bytes(b"utf8mb4".to_vec()),
+                        Datum::Bytes(b"utf8mb4_general_ci".to_vec()),
+                    ]];
+                } else {
+                    self.schema = vec!["Table".to_string(), "Create Table".to_string()];
+                    self.rows = vec![vec![
+                        Datum::Bytes(name.as_bytes().to_vec()),
+                        Datum::Bytes(render_create_table(info).into_bytes()),
+                    ]];
+                }
             }
             ShowStmtKind::CreateView => {
                 let table = self
@@ -166,10 +182,17 @@ impl Executor for ShowExec {
                         format!("'{schema}.{name}' is not VIEW"),
                     )
                 })?;
-                self.schema = vec!["View".to_string(), "Create View".to_string()];
+                self.schema = vec![
+                    "View".to_string(),
+                    "Create View".to_string(),
+                    "character_set_client".to_string(),
+                    "collation_connection".to_string(),
+                ];
                 self.rows = vec![vec![
                     Datum::Bytes(name.as_bytes().to_vec()),
                     Datum::Bytes(render_create_view(info, view).into_bytes()),
+                    Datum::Bytes(b"utf8mb4".to_vec()),
+                    Datum::Bytes(b"utf8mb4_general_ci".to_vec()),
                 ]];
             }
             ShowStmtKind::Columns => {
@@ -570,15 +593,17 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
 }
 
 fn render_create_view(info: &TableInfo, view: &sealdb_meta::ViewInfo) -> String {
-    let cols = if view.cols.is_empty() {
+    // TiDB always prints the full output column list (explicit rename list or
+    // the names derived from the view body).
+    let cols = if info.columns.is_empty() {
         String::new()
     } else {
-        let list = view
-            .cols
+        let list = info
+            .columns
             .iter()
-            .map(|c| format!("`{}`", c.o()))
+            .map(|c| format!("`{}`", c.name.o()))
             .collect::<Vec<_>>()
-            .join(",");
+            .join(", ");
         format!(" ({list})")
     };
     format!(

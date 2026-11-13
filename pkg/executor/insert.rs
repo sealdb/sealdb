@@ -4,7 +4,7 @@ use crate::join::apply::SubqueryEvalCtx;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_NO_DB,
+    ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_INVALID_AUTO_RANDOM, ERR_NO_DB,
     ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
     ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_PARTITION,
     ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
@@ -15,7 +15,9 @@ use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_types::EnumValue;
-use sealdb_types::field_type::{FieldType, TYPE_DATE, TYPE_DATETIME, TYPE_ENUM, TYPE_SET, TYPE_TIMESTAMP};
+use sealdb_types::field_type::{
+    FieldType, TYPE_DATE, TYPE_DATETIME, TYPE_ENUM, TYPE_SET, TYPE_TIMESTAMP,
+};
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
@@ -164,6 +166,7 @@ impl Executor for InsertExec {
         }
         for values in &mut pending {
             fill_auto_increment(&self.domain, info, values)?;
+            fill_auto_random(&self.domain, info, values)?;
         }
         if !self.stmt.partitions.is_empty() {
             pending =
@@ -506,6 +509,54 @@ fn fill_auto_increment(
             values[idx] = cast_for_column(&Datum::I64(next), col)?;
         } else if let Some(v) = numeric_form(&current) {
             domain.bump_auto_id(info.id, v as i64)?;
+        }
+    }
+    Ok(())
+}
+
+/// Assign `AUTO_RANDOM(n)` values (TiDB `allocAutoRandomID`): `NULL` and `0`
+/// request a new id whose top `n` bits are XOR-shuffled with a pseudo-random
+/// value; any other value is an explicit insert, which needs
+/// `@@allow_auto_random_explicit_insert`.
+fn fill_auto_random(
+    domain: &sealdb_domain::Domain,
+    info: &sealdb_meta::TableInfo,
+    values: &mut [Datum],
+) -> Result<()> {
+    for col in &info.columns {
+        let Some(bits) = col.auto_random else {
+            continue;
+        };
+        let idx = col.offset as usize;
+        let Some(current) = values.get(idx).cloned() else {
+            continue;
+        };
+        let needs_alloc = match &current {
+            Datum::Null => true,
+            other => numeric_form(other).is_none_or(|v| v == 0.0),
+        };
+        if needs_alloc {
+            let id = domain.next_auto_id(info.id)? as u64;
+            let shard_mask = if bits == 0 || bits >= 63 {
+                0
+            } else {
+                ((1u64 << bits) - 1) << (63 - bits)
+            };
+            // Deterministic shuffle: same input id, same stored value.
+            let shard = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) & shard_mask;
+            let value = (shard | (id & !shard_mask)) as i64;
+            values[idx] = cast_for_column(&Datum::I64(value), col)?;
+        } else {
+            if !sealdb_expression::allow_auto_random_explicit_insert() {
+                return Err(Error::new(
+                    ERR_INVALID_AUTO_RANDOM,
+                    "Invalid auto random: Explicit insertion on auto_random column is disabled. \
+                     Try to set @@allow_auto_random_explicit_insert = true.",
+                ));
+            }
+            if let Some(v) = numeric_form(&current) {
+                domain.bump_auto_id(info.id, v as i64)?;
+            }
         }
     }
     Ok(())

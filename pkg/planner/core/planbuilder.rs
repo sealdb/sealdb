@@ -4685,8 +4685,18 @@ fn scalable_join_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::Selection { child, .. } | PhysicalPlan::Projection { child, .. } => {
             scalable_join_rows(child)
         }
-        PhysicalPlan::HashJoin { left, right, est_rows, .. }
-        | PhysicalPlan::MergeJoin { left, right, est_rows, .. } => match est_rows {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            est_rows,
+            ..
+        }
+        | PhysicalPlan::MergeJoin {
+            left,
+            right,
+            est_rows,
+            ..
+        } => match est_rows {
             Some(est) => *est,
             None => {
                 let l = super::explain::est_rows(left);
@@ -11165,7 +11175,10 @@ fn index_merge_union_arm(
         else {
             continue;
         };
-        let rows = path.range.as_ref().map_or(table_rows, |range| range.filter_rows);
+        let rows = path
+            .range
+            .as_ref()
+            .map_or(table_rows, |range| range.filter_rows);
         if std::env::var("SEALDB_DEBUG_IM").is_ok() {
             eprintln!(
                 "IM arm candidate index={} rows={rows} scan_rows={:?} text={:?}",
@@ -11174,7 +11187,10 @@ fn index_merge_union_arm(
                 path.range.as_ref().map(|range| range.text.clone()),
             );
         }
-        if best.as_ref().is_none_or(|(_, _, best_rows)| rows < *best_rows) {
+        if best
+            .as_ref()
+            .is_none_or(|(_, _, best_rows)| rows < *best_rows)
+        {
             best = Some((path, consumed, rows));
         }
     }
@@ -11364,9 +11380,7 @@ fn index_merge_union_rows(
     table_rows: f64,
     real_stats: bool,
 ) -> f64 {
-    if !real_stats
-        && let Some(rows) = index_merge_union_dnf_index_rows(info, items, table_rows)
-    {
+    if !real_stats && let Some(rows) = index_merge_union_dnf_index_rows(info, items, table_rows) {
         return rows;
     }
     let mut selectivity = 0.0;
@@ -11610,13 +11624,8 @@ fn index_merge_plan(
                 // TiDB `indexMergeOR` keeps the DNF group whose union reads the
                 // fewest rows: `(b<10000 or c<10000) and (a<10 or d<10)` merges
                 // the a/d arms rather than the wider b/c ones.
-                let rows = index_merge_union_rows(
-                    info,
-                    &paths,
-                    &items,
-                    table_rows,
-                    table_stats.is_some(),
-                );
+                let rows =
+                    index_merge_union_rows(info, &paths, &items, table_rows, table_stats.is_some());
                 if best
                     .as_ref()
                     .is_none_or(|(best_rows, _, _, _)| rows < *best_rows)
@@ -12844,6 +12853,27 @@ fn build_agg_plan(
         other => other,
     };
     let est = agg_est_rows(select);
+    // A table-less aggregate (`SELECT DISTINCT 'a', max('b')`) aggregates the
+    // single dual row. The projection built for dual must not evaluate the
+    // aggregate functions itself, so the aggregate reads TableDual directly.
+    if let PhysicalPlan::TableDual { .. } = plan
+        && select.fields.iter().any(|field| is_agg_expr(&field.expr))
+    {
+        let out_col = scalar_agg_out_column("dual", &agg_db, is).unwrap_or(1);
+        let funcs = select
+            .fields
+            .iter()
+            .filter(|field| is_agg_expr(&field.expr))
+            .map(|field| {
+                format!(
+                    "funcs:{}->Column#{out_col}",
+                    field.expr.restore_string().to_ascii_lowercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (PhysicalPlan::hash_agg(plan, funcs, est), false);
+    }
     // `SELECT count(1) FROM (SELECT <aggs> FROM base …) d`: every derived
     // aggregate output is pruned, so TiDB's outer scalar aggregate reads the
     // seed's re-added `count(1)` (see `derived_agg_ids`).
@@ -16977,14 +17007,9 @@ fn inl_join_hint_plan(
     // form the join keys below. A `LEFT JOIN` only keeps this shape when a
     // `WHERE inner IS NULL` anti-filter sits above it (TiDB collapses a plain
     // outer join under `count(*)` instead), so gate on that.
-    let outer_anti_filter = select
-        .selection
-        .as_ref()
-        .is_some_and(expr_has_isnull);
-    if !matches!(
-        tp,
-        JoinType::Inner | JoinType::Cross
-    ) && !(matches!(tp, JoinType::LeftOuter) && outer_anti_filter)
+    let outer_anti_filter = select.selection.as_ref().is_some_and(expr_has_isnull);
+    if !matches!(tp, JoinType::Inner | JoinType::Cross)
+        && !(matches!(tp, JoinType::LeftOuter) && outer_anti_filter)
     {
         return None;
     }
@@ -17323,8 +17348,7 @@ fn inl_join_hint_plan(
         };
         let limited = expected > 0.0 && expected < join_est;
         let outer_expected = if limited {
-            let rows_to_meet_first =
-                ((outer_rows - join_est) * LIMIT_JOIN_ORDER_RATIO).max(0.0);
+            let rows_to_meet_first = ((outer_rows - join_est) * LIMIT_JOIN_ORDER_RATIO).max(0.0);
             outer_rows * (expected / join_est) + rows_to_meet_first
         } else {
             outer_rows
@@ -17399,7 +17423,11 @@ fn inl_join_hint_plan(
             }
         };
         let (outer_keys, inner_keys, equal_cond) = join_keys(&outer_name, &inner_name);
-        let inner_kind = if covering { "IndexReader" } else { "IndexLookUp" };
+        let inner_kind = if covering {
+            "IndexReader"
+        } else {
+            "IndexLookUp"
+        };
         let join_kind = if matches!(tp, JoinType::LeftOuter) {
             "left outer join"
         } else {
@@ -17951,7 +17979,10 @@ fn topn_outer_join_index_plan(
         || select.joins.len() != 2
         || select.order_by.len() != 1
         || select.order_by[0].desc
-        || !select.fields.iter().all(|f| matches!(f.expr, ExprNode::Column(_)))
+        || !select
+            .fields
+            .iter()
+            .all(|f| matches!(f.expr, ExprNode::Column(_)))
     {
         return None;
     }
@@ -17997,10 +18028,8 @@ fn topn_outer_join_index_plan(
             return None;
         }
         let all_on = |alias: &str| {
-            cols.iter().all(|(t, _)| {
-                t.as_deref()
-                    .is_some_and(|t| t.eq_ignore_ascii_case(alias))
-            })
+            cols.iter()
+                .all(|(t, _)| t.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(alias)))
         };
         if all_on(&left_alias) {
             left_conjs.push(conjunct);
@@ -18018,11 +18047,7 @@ fn topn_outer_join_index_plan(
         if idx.invisible || idx.primary {
             continue;
         }
-        let cols: Vec<String> = idx
-            .columns
-            .iter()
-            .map(|c| c.name.o().to_string())
-            .collect();
+        let cols: Vec<String> = idx.columns.iter().map(|c| c.name.o().to_string()).collect();
         let Some(lead) = cols.first() else { continue };
         let Some(lead_datum) = left_conjs
             .iter()
@@ -18080,17 +18105,14 @@ fn topn_outer_join_index_plan(
 
     // Inner table access path: the join key's leading index, with the residual
     // predicates (the date bounds) evaluated on the table probe.
-    let mid_index = mid_info
-        .indices
-        .iter()
-        .find(|idx| {
-            !idx.invisible
-                && !idx.primary
-                && idx
-                    .columns
-                    .first()
-                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&mid_key.name))
-        })?;
+    let mid_index = mid_info.indices.iter().find(|idx| {
+        !idx.invisible
+            && !idx.primary
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&mid_key.name))
+    })?;
     let mid_index_cols: Vec<String> = mid_index
         .columns
         .iter()
@@ -18101,17 +18123,14 @@ fn topn_outer_join_index_plan(
 
     // Left-outer inner side: the join key's index, rejecting NULL keys with the
     // cop Selection (`WHERE t2.key IS NULL` anti-filter).
-    let right_index = right_info
-        .indices
-        .iter()
-        .find(|idx| {
-            !idx.invisible
-                && !idx.primary
-                && idx
-                    .columns
-                    .first()
-                    .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&right_key.name))
-        })?;
+    let right_index = right_info.indices.iter().find(|idx| {
+        !idx.invisible
+            && !idx.primary
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.name.o().eq_ignore_ascii_case(&right_key.name))
+    })?;
     let right_index_cols: Vec<String> = right_index
         .columns
         .iter()
@@ -21660,8 +21679,9 @@ fn plan_reads_global_index(
     current_db: &str,
 ) -> bool {
     let index = match plan {
-        PhysicalPlan::IndexLookUpReader { index, .. }
-        | PhysicalPlan::IndexReader { index, .. } => index,
+        PhysicalPlan::IndexLookUpReader { index, .. } | PhysicalPlan::IndexReader { index, .. } => {
+            index
+        }
         _ => return false,
     };
     let Some(from) = select.from.as_ref() else {

@@ -1,4 +1,4 @@
-use super::dml::SelectStmt;
+use super::dml::{SelectStmt, SetOprStmt};
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
 
@@ -37,6 +37,22 @@ impl TableName {
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if let Some(db) = ctx.view_db().map(str::to_string) {
+            // TiDB view restore always qualifies the table and prints the
+            // physical name followed by the user alias.
+            let schema = self.schema.as_deref().unwrap_or(&db);
+            ctx.write_name(schema);
+            ctx.write_str(".");
+            match &self.physical {
+                Some(physical) => {
+                    ctx.write_name(physical);
+                    ctx.write_str(" AS ");
+                    ctx.write_name(&self.name);
+                }
+                None => ctx.write_name(&self.name),
+            }
+            return Ok(());
+        }
         if let Some(schema) = &self.schema {
             ctx.write_name(schema);
             ctx.write_str(".");
@@ -93,6 +109,9 @@ pub struct ColumnDef {
     pub generated: Option<GeneratedColumn>,
     /// `AUTO_INCREMENT` column option (MySQL/TiDB).
     pub auto_increment: bool,
+    /// TiDB `AUTO_RANDOM[(shard_bits[, range_bits])]`: the number of high bits
+    /// XOR-shuffled with a random value (`None` = not an auto-random column).
+    pub auto_random: Option<u32>,
     /// Explicit `NOT NULL` (or PRIMARY KEY implied) column option.
     pub not_null: bool,
     /// Column `CHARACTER SET <name>` (TiDB `FieldType.Charset`).
@@ -134,6 +153,13 @@ impl ColumnDef {
         }
         if self.auto_increment {
             ctx.write_str(" AUTO_INCREMENT");
+        }
+        if let Some(bits) = self.auto_random {
+            // TiDB renders the option inside a `T` version comment so MySQL
+            // clients ignore it.
+            ctx.write_str(" /*T![auto_rand] AUTO_RANDOM(");
+            ctx.write_str(&bits.to_string());
+            ctx.write_str(") */");
         }
         Ok(())
     }
@@ -646,6 +672,9 @@ pub struct CreateViewStmt {
     pub view_name: TableName,
     pub cols: Vec<String>,
     pub select: Box<SelectStmt>,
+    /// Set operation body for `CREATE VIEW ... AS SELECT ... UNION ...`.
+    /// `select` then holds the first arm (view column names / types come from it).
+    pub select_set: Option<Box<SetOprStmt>>,
     pub algorithm: String,
     pub definer: String,
     pub security: String,
@@ -677,7 +706,11 @@ impl CreateViewStmt {
             ctx.write_str(")");
         }
         ctx.write_str(" AS ");
-        self.select.restore(ctx)?;
+        if let Some(set) = &self.select_set {
+            set.restore(ctx)?;
+        } else {
+            self.select.restore(ctx)?;
+        }
         if !self.check_option.is_empty() && !self.check_option.eq_ignore_ascii_case("NONE") {
             ctx.write_str(" WITH ");
             if !self.check_option.eq_ignore_ascii_case("CASCADED") {
@@ -793,12 +826,20 @@ pub enum AlterTableSpec {
         old_name: String,
         new_name: String,
         type_name: String,
+        /// `DEFAULT <expr>` given with the new definition.
+        default: Option<String>,
+        /// `GENERATED ALWAYS AS (expr)` given with the new definition.
+        generated: Option<GeneratedColumn>,
         position: ColumnPosition,
     },
     /// `MODIFY [COLUMN] col type` — keep the name, change the type.
     ModifyColumn {
         name: String,
         type_name: String,
+        /// `DEFAULT <expr>` given with the new definition.
+        default: Option<String>,
+        /// `GENERATED ALWAYS AS (expr)` given with the new definition.
+        generated: Option<GeneratedColumn>,
         position: ColumnPosition,
     },
     /// `RENAME COLUMN old TO new`.
@@ -844,6 +885,27 @@ pub enum AlterTableSpec {
         partition: String,
         table: TableName,
     },
+    /// `TTL = <expr>` / `TTL_ENABLE = 'ON'|'OFF'` / `TTL_JOB_INTERVAL = '1d'`
+    /// (`AlterTTLInfo`).
+    SetTtl {
+        /// `TTL = <expr>` (`None` for an ENABLE / JOB_INTERVAL change).
+        expr: Option<String>,
+        enable: Option<bool>,
+        job_interval: Option<String>,
+    },
+    /// `REMOVE TTL`.
+    RemoveTtl,
+    /// `ALTER [COLUMN] col SET DEFAULT <expr>` / `ALTER [COLUMN] col DROP DEFAULT`.
+    AlterColumnDefault {
+        name: String,
+        /// The new default literal, `None` for `DROP DEFAULT`.
+        default: Option<String>,
+    },
+    /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t (cols)` — only the
+    /// referenced table is validated (TTL conflict); enforcement lands later.
+    AddForeignKey {
+        ref_table: String,
+    },
 }
 
 impl AlterTableSpec {
@@ -885,6 +947,8 @@ impl AlterTableSpec {
                 old_name,
                 new_name,
                 type_name,
+                default,
+                generated,
                 position,
             } => {
                 ctx.write_str("CHANGE COLUMN ");
@@ -893,18 +957,60 @@ impl AlterTableSpec {
                 ctx.write_name(new_name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
+                if let Some(default) = default {
+                    ctx.write_str(" DEFAULT ");
+                    ctx.write_str(default);
+                }
+                if let Some(generated) = generated {
+                    ctx.write_str(" GENERATED ALWAYS AS (");
+                    ctx.write_str(&generated.expr);
+                    ctx.write_str(") ");
+                    ctx.write_str(if generated.stored {
+                        "STORED"
+                    } else {
+                        "VIRTUAL"
+                    });
+                }
                 position.restore(ctx)
             }
             AlterTableSpec::ModifyColumn {
                 name,
                 type_name,
+                default,
+                generated,
                 position,
             } => {
                 ctx.write_str("MODIFY COLUMN ");
                 ctx.write_name(name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
+                if let Some(default) = default {
+                    ctx.write_str(" DEFAULT ");
+                    ctx.write_str(default);
+                }
+                if let Some(generated) = generated {
+                    ctx.write_str(" GENERATED ALWAYS AS (");
+                    ctx.write_str(&generated.expr);
+                    ctx.write_str(") ");
+                    ctx.write_str(if generated.stored {
+                        "STORED"
+                    } else {
+                        "VIRTUAL"
+                    });
+                }
                 position.restore(ctx)
+            }
+            AlterTableSpec::AlterColumnDefault { name, default } => {
+                ctx.write_str("ALTER COLUMN ");
+                ctx.write_name(name);
+                match default {
+                    Some(default) => {
+                        ctx.write_str(" SET DEFAULT ");
+                        ctx.write_str(default);
+                    }
+                    None => ctx.write_str(" DROP DEFAULT"),
+                }
+                Ok(())
             }
             AlterTableSpec::RenameColumn { old_name, new_name } => {
                 ctx.write_str("RENAME COLUMN ");
@@ -1003,6 +1109,42 @@ impl AlterTableSpec {
                 ctx.write_name(partition);
                 ctx.write_str(" WITH TABLE ");
                 table.restore(ctx)
+            }
+            AlterTableSpec::SetTtl {
+                expr,
+                enable,
+                job_interval,
+            } => {
+                if let Some(expr) = expr {
+                    ctx.write_str("TTL = ");
+                    ctx.write_str(expr);
+                    if enable.is_some() || job_interval.is_some() {
+                        ctx.write_str(" ");
+                    }
+                }
+                if let Some(enable) = enable {
+                    ctx.write_str("TTL_ENABLE = '");
+                    ctx.write_str(if *enable { "ON" } else { "OFF" });
+                    ctx.write_str("'");
+                    if job_interval.is_some() {
+                        ctx.write_str(" ");
+                    }
+                }
+                if let Some(interval) = job_interval {
+                    ctx.write_str("TTL_JOB_INTERVAL = '");
+                    ctx.write_str(interval);
+                    ctx.write_str("'");
+                }
+                Ok(())
+            }
+            AlterTableSpec::RemoveTtl => {
+                ctx.write_str("REMOVE TTL");
+                Ok(())
+            }
+            AlterTableSpec::AddForeignKey { ref_table } => {
+                ctx.write_str("ADD FOREIGN KEY REFERENCES ");
+                ctx.write_name(ref_table);
+                Ok(())
             }
         }
     }

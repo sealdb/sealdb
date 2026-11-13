@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **52 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 2 / R7 8），新转绿的 4 个（`infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 8/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **53 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 2 / R7 9），新转绿的 5 个（`infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 9/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **52 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 52 | 20.5% |
+| `green` | 53 | 20.9% |
 | `in_progress` | 14 | 5.5% |
-| `pending` | 178 | 70.1% |
+| `pending` | 177 | 69.7% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -40,7 +40,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **52 个** �
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 1 | 0 | 11 | `session/txn` 已绿 |
 | R6 | 2 | 0 | 33 | DDL / infoschema 起步 |
-| R7 | 8 | 0 | 102 | 零散长尾 |
+| R7 | 9 | 0 | 101 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 8 套冒烟 |
 
@@ -410,7 +410,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），50 套件�
 | 11 | `executor/chunk_reuse` | pending | 0% | ✓ | — |
 | 12 | `executor/cluster_table` | pending | 0% | ✓ | — |
 | 13 | `executor/compact_table` | pending | 0% | ✓ | — |
-| 14 | `executor/ddl` | pending | 0% | ✓ | — |
+| 14 | `executor/ddl` | green | 100% | ✓ | 1 |
 | 15 | `executor/delete` | pending | 0% | ✓ | — |
 | 16 | `executor/distsql` | pending | 0% | ✓ | — |
 | 17 | `executor/executor` | pending | 0% | ✓ | — |

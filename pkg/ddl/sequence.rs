@@ -21,7 +21,7 @@ pub fn create_sequence(
         }
         return Err(Error::new(
             ERR_TABLE_EXISTS,
-            format!("Table '{name}' already exists"),
+            format!("Table '{schema}.{name}' already exists"),
         ));
     }
     let db = is

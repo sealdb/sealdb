@@ -1,6 +1,10 @@
-use crate::create_table::{build_table_info, build_table_info_with_like, columns_from_select};
+use crate::create_table::{
+    build_table_info, build_table_info_with_like, columns_from_select, referenced_by_foreign_key,
+    validate_ttl,
+};
 use sealdb_errno::{
-    ERR_BAD_DB, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_WRONG_OBJECT, Error, Result,
+    ERR_BAD_DB, ERR_BAD_TABLE, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
+    ERR_TTL_FK_REFERENCED, ERR_UNKNOWN_ERROR, ERR_WRONG_OBJECT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -21,7 +25,7 @@ pub fn create_table(
         }
         return Err(Error::new(
             ERR_TABLE_EXISTS,
-            format!("Table '{table}' already exists"),
+            format!("Table '{schema}.{table}' already exists"),
         ));
     }
     let db = is
@@ -52,6 +56,24 @@ pub fn create_table(
                 job_interval: ttl.job_interval.clone(),
             });
         }
+        validate_ttl(&info)?;
+        // A FOREIGN KEY child cannot reference a TTL table (8152).
+        for fk in &info.foreign_keys {
+            if let Some(parent) = is.table_by_name(&schema, &fk.ref_table)
+                && parent.ttl.is_some()
+            {
+                return Err(Error::new(
+                    ERR_TTL_FK_REFERENCED,
+                    "Set TTL for a table referenced by foreign key is not allowed",
+                ));
+            }
+        }
+        if info.ttl.is_some() && referenced_by_foreign_key(is, &table) {
+            return Err(Error::new(
+                ERR_TTL_FK_REFERENCED,
+                "Set TTL for a table referenced by foreign key is not allowed",
+            ));
+        }
         if let Some(spec) = &built.partition {
             crate::partition::attach_partitions(meta, &mut info, spec)?;
         }
@@ -74,6 +96,13 @@ pub fn drop_table(
             Err(err) if stmt.if_exists && err.code == ERR_NO_DB => continue,
             Err(err) => return Err(err),
         };
+        // GC tables are managed by TiDB itself; dropping them is refused with 1105.
+        if schema.eq_ignore_ascii_case("mysql") && table.eq_ignore_ascii_case("gc_delete_range") {
+            return Err(Error::new(
+                ERR_UNKNOWN_ERROR,
+                format!("Drop tidb system table 'mysql.{table}' is forbidden"),
+            ));
+        }
         match (
             is.schema_by_name(&schema),
             is.table_by_name(&schema, &table),
@@ -87,8 +116,8 @@ pub fn drop_table(
                 }
                 if !stmt.is_view && tbl.is_view() {
                     return Err(Error::new(
-                        ERR_WRONG_OBJECT,
-                        format!("'{schema}.{table}' is not BASE TABLE"),
+                        ERR_BAD_TABLE,
+                        format!("Unknown table '{schema}.{table}'"),
                     ));
                 }
                 if !stmt.is_view && tbl.is_sequence() {
@@ -100,11 +129,26 @@ pub fn drop_table(
                 meta.drop_table_or_view(db.id, tbl.id)?;
                 meta.gen_schema_version()?;
             }
-            _ if stmt.if_exists => {}
+            _ if stmt.if_exists => {
+                // MySQL reports a note per missing object for
+                // `DROP {TABLE|VIEW} IF EXISTS` (1051).
+                if is.schema_by_name(&schema).is_some() {
+                    sealdb_expression::note_warning(
+                        ERR_BAD_TABLE,
+                        format!("Unknown table '{schema}.{table}'"),
+                    );
+                }
+            }
             (None, _) => {
                 return Err(Error::new(
                     ERR_BAD_DB,
                     format!("Unknown database '{schema}'"),
+                ));
+            }
+            (_, None) if stmt.is_view => {
+                return Err(Error::new(
+                    ERR_BAD_TABLE,
+                    format!("Unknown table '{schema}.{table}'"),
                 ));
             }
             (_, None) => {
@@ -127,16 +171,21 @@ pub fn truncate_table(
     storage: &dyn Storage,
 ) -> Result<()> {
     let (schema, table) = resolve_name(&stmt.table, current_db)?;
-    let tbl = is.table_by_name(&schema, &table).ok_or_else(|| {
-        if is.schema_by_name(&schema).is_none() {
-            Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
-        } else {
-            Error::new(
-                ERR_NO_SUCH_TABLE,
-                format!("Table '{schema}.{table}' doesn't exist"),
-            )
-        }
-    })?;
+    let tbl = is
+        .table_by_name(&schema, &table)
+        // A VIEW or SEQUENCE is not a table: TiDB resolves `TRUNCATE` against
+        // the table map only, so those names report `ErrNoSuchTable`.
+        .filter(|tbl| tbl.view.is_none() && tbl.sequence.is_none())
+        .ok_or_else(|| {
+            if is.schema_by_name(&schema).is_none() {
+                Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'"))
+            } else {
+                Error::new(
+                    ERR_NO_SUCH_TABLE,
+                    format!("Table '{schema}.{table}' doesn't exist"),
+                )
+            }
+        })?;
     clear_table_keys(storage, &tbl.physical_ids())?;
     meta.reset_handle(tbl.id);
     meta.gen_schema_version()?;

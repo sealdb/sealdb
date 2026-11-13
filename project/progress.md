@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-13（green 52 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-13（green 53 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2187,6 +2187,28 @@
 - **下一步**:
   - 继续 `topn_push_down`：`TIDB_SMJ` / `TIDB_HJ` 左外连接的 build 侧选择与 index order
   - 然后 `explain_easy` / `explain_easy_stats` / `explain_complex_stats`
+
+### 2026-11-13（`executor/ddl` 转正：视图 / 列默认值 / TTL 选项 / 错误文案）
+
+- **Phase**: R7 DDL × 错误码
+- **完成**:
+  - 视图：`CREATE/ALTER VIEW` 的 definer 校验文案对齐（1470 用户名/主机名分段截断），
+    `VIEWS` 信息表补 `DEFINER` / `SECURITY_TYPE` / `CHARACTER_SET_CLIENT` /
+    `COLLATION_CONNECTION`，`CHECK_OPTION` 缺省 `CASCADED`；简单视图合并保留投影别名
+  - DDL：新增 `ALTER [COLUMN] c SET/DROP DEFAULT` 的 AST + 下推 + 表元数据变更；
+    建表 / 加列 / 改列时对 time/date/datetime 字面量默认值按 `fsp` 规整
+  - 渲染：`TYPE_DURATION` 映射 `time`，`SHOW CREATE TABLE` 的 `time(fsp)` 仅在 `fsp>0` 时带精度
+  - TTL：修复 `TTL = ... TTL = ...` 重复选项解析边界
+  - 错误码：3102 去掉函数名后缀、3107/3754/8153 文案与 TiDB 逐字一致；
+    1051 在 `DROP ... IF EXISTS` 时按 `Note` 输出；系统表 drop 拒绝文案对齐
+- **验证**:
+  - `run-tests.sh -s memory -t executor/ddl --status pending` → PASS（1 套）
+  - `run-tests.sh -s tikv -t executor/ddl --status pending` → PASS（1 套）
+  - manifest `executor/ddl` → `green`，green 52→53
+- **阻塞/风险**:
+  - 无；后续按 R7 长尾继续扫底
+- **下一步**:
+  - 继续 R3 `explain_easy` / `explain_complex` / `explain_complex_stats` / `explain_join_stats`
 
 ### 2026-10-19
 

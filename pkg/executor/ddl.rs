@@ -23,6 +23,19 @@ impl DDLExec {
         current_db: impl Into<String>,
         persist: bool,
     ) -> Self {
+        // `CREATE VIEW` without an explicit definer stores the connection user
+        // (`root@%`), like TiDB; `SHOW CREATE VIEW` prints it verbatim.
+        let stmt = match stmt {
+            Statement::CreateView(mut create) => {
+                if create.definer.eq_ignore_ascii_case("CURRENT_USER")
+                    && let Some(user) = sealdb_privilege::thread_user()
+                {
+                    create.definer = format!("`{}`@`{}`", user.username, user.hostname);
+                }
+                Statement::CreateView(create)
+            }
+            other => other,
+        };
         Self {
             domain,
             stmt,

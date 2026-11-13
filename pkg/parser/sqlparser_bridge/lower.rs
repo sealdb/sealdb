@@ -36,13 +36,14 @@ use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
-    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_UNSUPPORTED, Error, Result,
+    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG,
+    ERR_TTL_TEMPORARY_TABLE, ERR_UNSUPPORTED, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
-    Action, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind, AssignmentTarget,
-    BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind, CreateView,
-    CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
+    Action, AlterColumnOperation, AlterTableOperation, AnalyzeFormat, AnalyzeFormatKind,
+    AssignmentTarget, BinaryOperator, ContextModifier, CreateTable, CreateTableLikeKind,
+    CreateView, CreateViewAlgorithm, CreateViewSecurity, Cte, CteAsMaterialized, DataType, Delete,
     Distinct as SqlDistinct, DuplicateTreatment, Expr, FlushType, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Grant, GrantObjects, GranteeName,
     GroupByExpr, JoinConstraint, JoinOperator, KillType, LimitClause, LockClause,
@@ -77,6 +78,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
     // would otherwise drop the trailing visibility keyword.
     let rewritten = rewrite_alter_index_visibility(&rewritten);
+    let rewritten = rewrite_auto_random_option(&rewritten);
     let rewritten = rewrite_primary_key_nonclustered(&rewritten);
     // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
     // drop index-option/table-option clauses sqlparser rejects.
@@ -204,9 +206,12 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 }
                 AlterPartOp::Options(options) => {
                     for (name, value) in options {
-                        alter.specs.push(AlterTableSpec::TableOption { name, value });
+                        alter
+                            .specs
+                            .push(AlterTableSpec::TableOption { name, value });
                     }
                 }
+                AlterPartOp::Ttl(spec) => alter.specs.push(spec),
             }
         }
         if let Statement::Prepare(prepare) = &mut lowered
@@ -1190,6 +1195,78 @@ fn rewrite_rename_index(sql: &str) -> String {
 
 const NONCLUSTERED_MARKER: &str = "__sealdb_nonclustered__";
 const CLUSTERED_MARKER: &str = "__sealdb_clustered__";
+/// `AUTO_RANDOM[(shard_bits…)]` column option, rewritten to a `COMMENT`
+/// marker because sqlparser has no grammar for it.
+const AUTO_RANDOM_MARKER_PREFIX: &str = "__sealdb_auto_random_";
+/// TiDB default shard bits for a bare `AUTO_RANDOM`.
+const DEFAULT_AUTO_RANDOM_SHARD_BITS: u32 = 5;
+
+/// Rewrite TiDB `AUTO_RANDOM[(shard_bits[, range_bits])]` column options into
+/// `COMMENT '__sealdb_auto_random_<shard_bits>__'`. The range bits only bound
+/// the allocator's increment range and are ignored by the storage layer.
+fn rewrite_auto_random_option(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let q = bytes[i];
+            out.push(q as char);
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == q {
+                    out.push(q as char);
+                    i += 1;
+                    break;
+                }
+                i = push_sql_char(&mut out, sql, i);
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if keyword_at(bytes, i, "AUTO_RANDOM") {
+            let mut j = skip_ws(bytes, i + "AUTO_RANDOM".len());
+            let mut bits = DEFAULT_AUTO_RANDOM_SHARD_BITS;
+            if j < bytes.len() && bytes[j] == b'(' {
+                if let Some(close) = matching_paren(bytes, j) {
+                    if let Some(first) = sql[j + 1..close].split(',').next() {
+                        if let Ok(n) = first.trim().parse::<u32>() {
+                            bits = n;
+                        }
+                    }
+                    j = close + 1;
+                }
+            }
+            out.push_str("COMMENT '");
+            out.push_str(AUTO_RANDOM_MARKER_PREFIX);
+            out.push_str(&bits.to_string());
+            out.push_str("__'");
+            i = j;
+            continue;
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+fn lower_auto_random(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<u32> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::Comment(comment) => comment
+            .strip_prefix(AUTO_RANDOM_MARKER_PREFIX)
+            .and_then(|rest| rest.strip_suffix("__"))
+            .and_then(|bits| bits.parse().ok()),
+        _ => None,
+    })
+}
 
 /// sqlparser drops TiDB `PRIMARY KEY (...) NONCLUSTERED` / `CLUSTERED`. Mark
 /// the first PK column so `lower_primary_key` can record the option; the
@@ -5789,9 +5866,17 @@ fn lower_explain_format(
 #[derive(Clone, Debug)]
 enum AlterPartOp {
     Add(Vec<PartitionDef>),
-    Drop { if_exists: bool, names: Vec<String> },
-    Exchange { partition: String, table: TableName },
+    Drop {
+        if_exists: bool,
+        names: Vec<String>,
+    },
+    Exchange {
+        partition: String,
+        table: TableName,
+    },
     Options(Vec<(String, String)>),
+    /// `TTL = …` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` / `REMOVE TTL`.
+    Ttl(AlterTableSpec),
 }
 
 /// `ALTER TABLE` table options TiDB accepts in the spec list
@@ -5977,6 +6062,13 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                         continue;
                     }
                 }
+                if let Some((spec, end)) = parse_alter_ttl_spec(bytes, sql, after_name)? {
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::Ttl(spec)));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
                 // Non-partition ALTER TABLE — still consume one alter slot as None.
                 ops.push(None);
             }
@@ -5984,6 +6076,92 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
         i = push_sql_char(&mut out, sql, i);
     }
     Ok((out, ops))
+}
+
+/// `ALTER TABLE … TTL = <expr>` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` /
+/// `REMOVE TTL`. Returns the spec plus the position right after it, or `None`
+/// when the spec list does not start with a TTL change.
+fn parse_alter_ttl_spec(
+    bytes: &[u8],
+    sql: &str,
+    start: usize,
+) -> Result<Option<(AlterTableSpec, usize)>> {
+    let mut p = start;
+    let mut expr: Option<String> = None;
+    let mut enable: Option<bool> = None;
+    let mut interval: Option<String> = None;
+    let mut removed = false;
+    let mut count = 0usize;
+    loop {
+        p = skip_ws(bytes, p);
+        if p >= bytes.len() || bytes[p] == b';' {
+            break;
+        }
+        if keyword_at(bytes, p, "TTL_ENABLE") || keyword_at(bytes, p, "TTL_JOB_INTERVAL") {
+            let is_enable = keyword_at(bytes, p, "TTL_ENABLE");
+            let kw_len = if is_enable {
+                "TTL_ENABLE".len()
+            } else {
+                "TTL_JOB_INTERVAL".len()
+            };
+            let after = skip_ws(bytes, p + kw_len);
+            if after >= bytes.len() || bytes[after] != b'=' {
+                break;
+            }
+            let (value, next) = read_ttl_option_value(sql, bytes, skip_ws(bytes, after + 1));
+            if is_enable {
+                enable = Some(value.eq_ignore_ascii_case("on") || value == "1");
+            } else {
+                interval = Some(value);
+            }
+            count += 1;
+            p = skip_ws(bytes, next);
+        } else if keyword_at(bytes, p, "TTL") {
+            let after = skip_ws(bytes, p + "TTL".len());
+            if after >= bytes.len() || bytes[after] != b'=' {
+                break;
+            }
+            let expr_start = skip_ws(bytes, after + 1);
+            let expr_end = scan_ttl_expr_end(bytes, expr_start);
+            expr = Some(normalize_ttl_expr(sql[expr_start..expr_end].trim()));
+            count += 1;
+            p = skip_ws(bytes, expr_end);
+        } else if keyword_at(bytes, p, "REMOVE") {
+            let after = skip_ws(bytes, p + "REMOVE".len());
+            if !keyword_at(bytes, after, "TTL") {
+                break;
+            }
+            removed = true;
+            count += 1;
+            p = skip_ws(bytes, after + "TTL".len());
+        } else {
+            break;
+        }
+        if p < bytes.len() && bytes[p] == b',' {
+            p += 1;
+        }
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    let rest = skip_ws(bytes, p);
+    if count > 1 || (rest < bytes.len() && bytes[rest] != b';') {
+        return Err(Error::new(
+            ERR_TTL_MULTI_SCHEMA_CHANGE,
+            "Unsupported multi schema change for alter table ttl",
+        ));
+    }
+    if removed {
+        return Ok(Some((AlterTableSpec::RemoveTtl, rest)));
+    }
+    Ok(Some((
+        AlterTableSpec::SetTtl {
+            expr,
+            enable,
+            job_interval: interval,
+        },
+        rest,
+    )))
 }
 
 fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
@@ -6058,8 +6236,9 @@ fn parse_add_partition_defs(body: &str) -> Result<Vec<PartitionDef>> {
 /// sqlparser-rs MySQL dialect does not accept TiDB/MySQL `PARTITION BY`.
 /// Strip the clause and re-attach it after lowering, same pattern as
 /// `BEGIN PESSIMISTIC`.
-/// Strip `TTL = expr` table options so sqlparser / PARTITION extract see a
-/// clean CREATE TABLE (...). One Option slot per CREATE TABLE.
+/// Strip `TTL = expr` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` table options
+/// so sqlparser / PARTITION extract see a clean CREATE TABLE (...). One slot per
+/// CREATE TABLE. Repeated options keep the last value (TiDB semantics).
 fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
@@ -6067,32 +6246,93 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
     let mut i = 0;
     while i < bytes.len() {
         if keyword_at(bytes, i, "CREATE") {
-            let after_create = skip_ws(bytes, i + "CREATE".len());
-            if keyword_at(bytes, after_create, "TABLE") {
-                let after_table = skip_ws(bytes, after_create + "TABLE".len());
+            let mut p = skip_ws(bytes, i + "CREATE".len());
+            let mut temporary = false;
+            if keyword_at(bytes, p, "TEMPORARY") {
+                temporary = true;
+                p = skip_ws(bytes, p + "TEMPORARY".len());
+            }
+            if keyword_at(bytes, p, "TABLE") {
+                let after_table = skip_ws(bytes, p + "TABLE".len());
                 let after_name = skip_ws(bytes, skip_create_table_name(bytes, after_table));
                 if after_name < bytes.len()
                     && bytes[after_name] == b'('
                     && let Some(close) = matching_paren(bytes, after_name)
                 {
-                    let after_cols = skip_ws(bytes, close + 1);
-                    if keyword_at(bytes, after_cols, "TTL") {
-                        let after_ttl = skip_ws(bytes, after_cols + "TTL".len());
-                        if after_ttl < bytes.len() && bytes[after_ttl] == b'=' {
-                            let expr_start = skip_ws(bytes, after_ttl + 1);
-                            let expr_end = scan_ttl_expr_end(bytes, expr_start);
-                            let raw = sql[expr_start..expr_end].trim();
-                            out.push_str(&sql[i..close + 1]);
-                            out.push(' ');
-                            ttls.push(Some(TtlInfo::new(normalize_ttl_expr(raw))));
-                            i = skip_ws(bytes, expr_end);
+                    out.push_str(&sql[i..close + 1]);
+                    let mut ttl: Option<TtlInfo> = None;
+                    let mut enable: Option<bool> = None;
+                    let mut interval: Option<String> = None;
+                    let mut j = close + 1;
+                    while j < bytes.len() {
+                        if bytes[j].is_ascii_whitespace() {
+                            out.push(bytes[j] as char);
+                            j += 1;
                             continue;
                         }
+                        if bytes[j] == b';' {
+                            break;
+                        }
+                        if keyword_at(bytes, j, "TTL_ENABLE")
+                            || keyword_at(bytes, j, "TTL_JOB_INTERVAL")
+                        {
+                            let is_enable = keyword_at(bytes, j, "TTL_ENABLE");
+                            let kw_len = if is_enable {
+                                "TTL_ENABLE".len()
+                            } else {
+                                "TTL_JOB_INTERVAL".len()
+                            };
+                            let after = skip_ws(bytes, j + kw_len);
+                            if after < bytes.len() && bytes[after] == b'=' {
+                                let value_start = skip_ws(bytes, after + 1);
+                                let (value, next) = read_ttl_option_value(sql, bytes, value_start);
+                                if is_enable {
+                                    enable = Some(value.eq_ignore_ascii_case("on") || value == "1");
+                                } else {
+                                    interval = Some(value);
+                                }
+                                j = next;
+                                continue;
+                            }
+                        }
+                        if keyword_at(bytes, j, "TTL") {
+                            let after = skip_ws(bytes, j + "TTL".len());
+                            if after < bytes.len() && bytes[after] == b'=' {
+                                let expr_start = skip_ws(bytes, after + 1);
+                                let expr_end = scan_ttl_expr_end(bytes, expr_start);
+                                let raw = sql[expr_start..expr_end].trim();
+                                ttl = Some(TtlInfo::new(normalize_ttl_expr(raw)));
+                                j = skip_ws(bytes, expr_end);
+                                continue;
+                            }
+                        }
+                        j = copy_sql_token(&mut out, sql, bytes, j);
                     }
-                    // CREATE TABLE with columns but no TTL — keep text, push None.
-                    out.push_str(&sql[i..close + 1]);
-                    ttls.push(None);
-                    i = close + 1;
+                    if ttl.is_none() && (enable.is_some() || interval.is_some()) {
+                        let name = if enable.is_some() {
+                            "TTL_ENABLE"
+                        } else {
+                            "TTL_JOB_INTERVAL"
+                        };
+                        return Err(Error::new(
+                            ERR_TTL_NO_CONFIG,
+                            format!("Cannot set {name} on a table without TTL config"),
+                        ));
+                    }
+                    if let Some(mut ttl) = ttl {
+                        if temporary {
+                            return Err(Error::new(
+                                ERR_TTL_TEMPORARY_TABLE,
+                                "Set TTL for temporary table is not allowed",
+                            ));
+                        }
+                        ttl.enable = enable.unwrap_or(true);
+                        ttl.job_interval = interval.unwrap_or_else(|| "1h".to_string());
+                        ttls.push(Some(ttl));
+                    } else {
+                        ttls.push(None);
+                    }
+                    i = j;
                     continue;
                 }
             }
@@ -6103,12 +6343,71 @@ fn extract_create_table_ttl(sql: &str) -> Result<(String, Vec<Option<TtlInfo>>)>
     Ok((out, ttls))
 }
 
+/// Value of `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …`: a quoted literal or a
+/// bare word. Returns the value and the position right after it.
+fn read_ttl_option_value(sql: &str, bytes: &[u8], start: usize) -> (String, usize) {
+    if start >= bytes.len() {
+        return (String::new(), start);
+    }
+    if matches!(bytes[start], b'\'' | b'"') {
+        let quote = bytes[start];
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        (
+            sql[start + 1..end.min(bytes.len())].to_string(),
+            (end + 1).min(bytes.len()),
+        )
+    } else {
+        let mut end = start;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b',' | b';')
+        {
+            end += 1;
+        }
+        (sql[start..end].to_string(), end)
+    }
+}
+
+/// Copy one SQL token (quoted literal, backticked name, word run or single
+/// character) starting at `i`. Whitespace is copied by the caller so options
+/// stay separated.
+fn copy_sql_token(out: &mut String, sql: &str, bytes: &[u8], i: usize) -> usize {
+    if matches!(bytes[i], b'\'' | b'"' | b'`') {
+        let quote = bytes[i];
+        out.push(quote as char);
+        let mut j = i + 1;
+        while j < bytes.len() {
+            let ch = sql[j..].chars().next().expect("sql index in bounds");
+            j += ch.len_utf8();
+            out.push(ch);
+            if ch as u8 == quote {
+                break;
+            }
+        }
+        return j;
+    }
+    if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$' {
+        let mut j = i;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'$'))
+        {
+            out.push(bytes[j] as char);
+            j += 1;
+        }
+        return j;
+    }
+    push_sql_char(out, sql, i)
+}
+
 /// End of `TTL = <expr>`: stop before PARTITION / ENGINE / CHARSET / `;`.
 fn scan_ttl_expr_end(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     while i < bytes.len() {
         let rest = skip_ws(bytes, i);
-        if rest >= bytes.len() || bytes[rest] == b';' {
+        if rest >= bytes.len() || bytes[rest] == b';' || bytes[rest] == b',' {
             return rest.min(bytes.len());
         }
         if keyword_at(bytes, rest, "PARTITION")
@@ -6119,6 +6418,12 @@ fn scan_ttl_expr_end(bytes: &[u8], start: usize) -> usize {
             || keyword_at(bytes, rest, "COMMENT")
             || keyword_at(bytes, rest, "TTL_ENABLE")
             || keyword_at(bytes, rest, "TTL_JOB_INTERVAL")
+            // Another `TTL = …` clause ends the previous expression (repeated
+            // options keep the last value).
+            || (keyword_at(bytes, rest, "TTL")
+                && bytes
+                    .get(skip_ws(bytes, rest + "TTL".len()))
+                    .is_some_and(|b| *b == b'='))
         {
             return rest;
         }
@@ -7131,6 +7436,7 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
                     },
                     limit: set.limit,
                     offset: set.offset,
+                    derived: false,
                 });
             };
             // TiDB: when the very first arm already names the CTE (e.g. a
@@ -7199,6 +7505,7 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
         },
         limit,
         offset,
+        derived: false,
     })
 }
 
@@ -7301,6 +7608,7 @@ fn isolate_setopr_group(query: &Query) -> Result<SelectStmt> {
         materialize: CteMaterialize::NotMaterialized,
         limit: set.limit,
         offset: set.offset,
+        derived: true,
     };
     Ok(SelectStmt {
         fields: vec![SelectField {
@@ -7418,12 +7726,23 @@ fn lower_query(query: &Query) -> Result<SelectStmt> {
             stmt.with = merge_with_ctes(lower_with(query.with.as_ref())?, derived)?;
             Ok(stmt)
         }
+        // `(SELECT …)` / `((SELECT … UNION …))`: unwrap the parens.
+        SetExpr::Query(inner) => lower_query(inner),
         // UNION in FROM derived table still uses this path.
         other => Err(Error::new(
             ERR_UNSUPPORTED,
             format!("query body {:?} is not available in this phase", other),
         )),
     }
+}
+
+/// Strip `SetExpr::Query` (parenthesized) wrappers to reach the real body.
+fn unparenthesized_query(query: &Query) -> &Query {
+    let mut current = query;
+    while let SetExpr::Query(inner) = current.body.as_ref() {
+        current = inner;
+    }
+    current
 }
 
 /// Lower a subquery body that may be either SELECT or a set operation.
@@ -8160,6 +8479,7 @@ fn table_factor(
                 materialize: CteMaterialize::NotMaterialized,
                 limit: None,
                 offset: None,
+                derived: true,
             });
             // CTE physical name is the alias; ON refs already use that name.
             Ok((TableName::new(None, name), None, ctes))
@@ -9010,11 +9330,26 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
     if create.if_not_exists {
         return Err(Error::unsupported("CREATE VIEW IF NOT EXISTS"));
     }
-    let mut select = lower_query(&create.query)?;
-    // Keep restore text for ViewInfo.select_stmt persistence.
-    let mut ctx = crate::format::RestoreCtx::new();
-    select.restore(&mut ctx)?;
-    select.text = ctx.into_string();
+    let view_query = unparenthesized_query(&create.query);
+    let (select, select_set) = match view_query.body.as_ref() {
+        SetExpr::SetOperation { .. } => {
+            let mut set = lower_set_opr(view_query)?;
+            set.with = lower_with(view_query.with.as_ref())?;
+            let mut ctx = crate::format::RestoreCtx::new();
+            set.restore(&mut ctx)?;
+            let mut first = set.first.clone();
+            first.text = ctx.into_string();
+            (first, Some(Box::new(set)))
+        }
+        _ => {
+            let mut select = lower_query(view_query)?;
+            // Keep restore text for ViewInfo.select_stmt persistence.
+            let mut ctx = crate::format::RestoreCtx::new();
+            select.restore(&mut ctx)?;
+            select.text = ctx.into_string();
+            (select, None)
+        }
+    };
     let (algorithm, definer, security) = match &create.params {
         Some(params) => {
             let algorithm = params
@@ -9063,6 +9398,7 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
             .map(|col| col.name.value.clone())
             .collect(),
         select: Box::new(select),
+        select_set,
         algorithm,
         definer,
         security,
@@ -9077,6 +9413,15 @@ fn lower_column_default(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<S
     })
 }
 
+/// `DEFAULT <expr>` from an `ALTER TABLE … CHANGE/MODIFY COLUMN` option list
+/// (sqlparser stores those as bare `ColumnOption`s).
+fn lower_column_option_default(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
+        _ => None,
+    })
+}
+
 fn lower_generated_column(
     options: &[sqlparser::ast::ColumnOptionDef],
 ) -> Result<Option<GeneratedColumn>> {
@@ -9086,6 +9431,31 @@ fn lower_generated_column(
             generation_expr_mode,
             ..
         } = &opt.option
+        {
+            let stored = matches!(
+                generation_expr_mode,
+                Some(sqlparser::ast::GeneratedExpressionMode::Stored)
+            );
+            return Ok(Some(GeneratedColumn {
+                expr: lower_expr(expr)?.restore_string(),
+                stored,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// `GENERATED ALWAYS AS (expr)` from an `ALTER TABLE … CHANGE/MODIFY COLUMN`
+/// option list (sqlparser stores those as bare `ColumnOption`s).
+fn lower_column_option_generated(
+    options: &[sqlparser::ast::ColumnOption],
+) -> Result<Option<GeneratedColumn>> {
+    for opt in options {
+        if let sqlparser::ast::ColumnOption::Generated {
+            generation_expr: Some(expr),
+            generation_expr_mode,
+            ..
+        } = opt
         {
             let stored = matches!(
                 generation_expr_mode,
@@ -9178,6 +9548,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             default: lower_column_default(&col.options),
             generated: lower_generated_column(&col.options)?,
             auto_increment: lower_auto_increment(&col.options),
+            auto_random: lower_auto_random(&col.options),
             not_null: lower_not_null(&col.options),
             charset: lower_column_charset(&col.options),
             collate: lower_column_collate(&col.options),
@@ -10401,6 +10772,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 default: lower_column_default(&column_def.options),
                 generated: lower_generated_column(&column_def.options)?,
                 auto_increment: lower_auto_increment(&column_def.options),
+                auto_random: lower_auto_random(&column_def.options),
                 not_null: lower_not_null(&column_def.options),
                 charset: lower_column_charset(&column_def.options),
                 collate: lower_column_collate(&column_def.options),
@@ -10431,13 +10803,25 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             options,
             column_position,
         } => {
-            if !options.is_empty() {
+            let has_other_options = options.iter().any(|opt| match opt {
+                sqlparser::ast::ColumnOption::Default(_) => false,
+                sqlparser::ast::ColumnOption::Generated { .. } => false,
+                sqlparser::ast::ColumnOption::Comment(c)
+                    if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
+                {
+                    false
+                }
+                _ => true,
+            });
+            if has_other_options {
                 return Err(Error::unsupported("CHANGE COLUMN option"));
             }
             Ok(AlterTableSpec::ChangeColumn {
                 old_name: old_name.value.clone(),
                 new_name: new_name.value.clone(),
                 type_name: data_type.to_string(),
+                default: lower_column_option_default(options),
+                generated: lower_column_option_generated(options)?,
                 position: lower_column_position(column_position),
             })
         }
@@ -10447,15 +10831,40 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             options,
             column_position,
         } => {
-            if !options.is_empty() {
+            // `MODIFY COLUMN … AUTO_RANDOM` only reassigns shard bits; the
+            // storage layer allocates ids the same way, so accept and move on.
+            let has_other_options = options.iter().any(|opt| match opt {
+                sqlparser::ast::ColumnOption::Default(_) => false,
+                sqlparser::ast::ColumnOption::Generated { .. } => false,
+                sqlparser::ast::ColumnOption::Comment(c)
+                    if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
+                {
+                    false
+                }
+                _ => true,
+            });
+            if has_other_options {
                 return Err(Error::unsupported("MODIFY COLUMN option"));
             }
             Ok(AlterTableSpec::ModifyColumn {
                 name: col_name.value.clone(),
                 type_name: data_type.to_string(),
+                default: lower_column_option_default(options),
+                generated: lower_column_option_generated(options)?,
                 position: lower_column_position(column_position),
             })
         }
+        AlterTableOperation::AlterColumn { column_name, op } => match op {
+            AlterColumnOperation::SetDefault { value } => Ok(AlterTableSpec::AlterColumnDefault {
+                name: column_name.value.clone(),
+                default: Some(value.to_string()),
+            }),
+            AlterColumnOperation::DropDefault => Ok(AlterTableSpec::AlterColumnDefault {
+                name: column_name.value.clone(),
+                default: None,
+            }),
+            other => Err(Error::unsupported(format!("ALTER COLUMN {other}"))),
+        },
         AlterTableOperation::RenameColumn {
             old_column_name,
             new_column_name,
@@ -10520,6 +10929,9 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             TableConstraint::PrimaryKey(idx) => {
                 Ok(AlterTableSpec::AddIndex(lower_primary_key(idx)?))
             }
+            TableConstraint::ForeignKey(fk) => Ok(AlterTableSpec::AddForeignKey {
+                ref_table: fk.foreign_table.to_string().trim_matches('`').to_string(),
+            }),
             other => Err(Error::unsupported(format!("ALTER TABLE ADD {other}"))),
         },
         other => Err(Error::unsupported(format!("ALTER TABLE {other}"))),
