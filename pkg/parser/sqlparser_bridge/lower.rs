@@ -75,6 +75,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_integer_type_aliases(&rewritten);
     // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
     let rewritten = rewrite_mysql_column_charset(&rewritten);
+    // MySQL `CAST(x AS CHAR CHARSET cs)`: no such clause in sqlparser's CAST.
+    let rewritten = rewrite_mysql_cast_charset(&rewritten);
     // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
     // would otherwise drop the trailing visibility keyword.
     let rewritten = rewrite_alter_index_visibility(&rewritten);
@@ -2509,6 +2511,8 @@ fn apply_with_materialize(
 
 /// Marker fn for TiDB `opcode.Not2` (`!`). Rewritten from `!(...)` before parse.
 const SEALDB_BANG_FN: &str = "__sealdb_bang";
+/// Marker for `CAST(x AS CHAR CHARSET cs)`, which sqlparser cannot parse.
+const SEALDB_CAST_CHARSET_FN: &str = "__sealdb_cast_charset";
 
 /// Rewrite MySQL/TiDB unary `! (` to `__sealdb_bang(` (sqlparser has no bang).
 /// Expand MySQL executable version comments `/*!NNNNN body */` → ` body `.
@@ -6706,6 +6710,106 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// MySQL/TiDB `CAST(x AS CHAR CHARSET cs)` / `CAST(x AS CHAR CHARACTER SET cs)`:
+/// sqlparser's CAST grammar stops after the type, so encode the clause as the
+/// [`SEALDB_CAST_CHARSET_FN`] marker (lowered back into a CAST).
+fn rewrite_mysql_cast_charset(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    let mut search = 0;
+    while let Some(pos) = find_word(&lower, "cast", search) {
+        let open = skip_ws(bytes, pos + "cast".len());
+        if open >= bytes.len() || bytes[open] != b'(' {
+            search = pos + "cast".len();
+            continue;
+        }
+        let Some(close) = matching_paren(bytes, open) else {
+            break;
+        };
+        let Some((value, charset)) = split_cast_charset(&sql[open + 1..close]) else {
+            search = close + 1;
+            continue;
+        };
+        out.push_str(&sql[cursor..pos]);
+        out.push_str(SEALDB_CAST_CHARSET_FN);
+        out.push('(');
+        out.push_str(&value);
+        out.push_str(", '");
+        out.push_str(&charset);
+        out.push_str("')");
+        cursor = close + 1;
+        search = close + 1;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+/// `expr AS CHAR [CHARSET|CHARACTER SET] cs` → `(expr, cs)`.
+fn split_cast_charset(inner: &str) -> Option<(String, String)> {
+    let lower = inner.to_ascii_lowercase();
+    let bytes = inner.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut depth = 0i32;
+    let mut as_positions: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0
+                && lower[i..].starts_with("as")
+                && (i == 0 || !ident(bytes[i - 1]))
+                && bytes.get(i + 2).is_none_or(|b| !ident(*b)) =>
+            {
+                as_positions.push(i)
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let (pos, tail) = as_positions.into_iter().rev().find_map(|pos| {
+        let tail = inner[pos + 2..].trim_start();
+        tail.to_ascii_lowercase()
+            .starts_with("char")
+            .then_some((pos, tail))
+    })?;
+    let tail_lower = tail.to_ascii_lowercase();
+    let (type_part, rest) = if let Some(k) = find_word(&tail_lower, "charset", 0) {
+        (&tail[..k], &tail[k + "charset".len()..])
+    } else if let Some(k) = find_word(&tail_lower, "character", 0) {
+        let after = &tail_lower[k + "character".len()..];
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with("set") {
+            return None;
+        }
+        let consumed = k + "character".len() + (after.len() - trimmed.len()) + "set".len();
+        (&tail[..k], &tail[consumed..])
+    } else {
+        return None;
+    };
+    if !type_part.trim().to_ascii_lowercase().starts_with("char") {
+        return None;
+    }
+    let charset = rest.trim().trim_start_matches('`').trim_end_matches('`');
+    if charset.is_empty()
+        || !charset
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some((inner[..pos].to_string(), charset.to_string()))
+}
+
 /// MySQL `INSERT INTO t PARTITION (p0, p1) (a, b) VALUES …` — sqlparser only
 /// accepts the column list *before* `PARTITION`, so swap them before parsing.
 fn rewrite_insert_partition_columns(sql: &str) -> String {
@@ -7102,6 +7206,7 @@ fn collect_expr_columns(expr: &ExprNode, out: &mut Vec<String>) {
 
 /// Lower a scalar SQL expression used as a PARTITION BY key.
 pub fn parse_expr(sql: &str) -> Result<ExprNode> {
+    let sql = rewrite_mysql_cast_charset(sql);
     let wrapped = format!("SELECT ({sql})");
     let stmts = Parser::parse_sql(&dialect(), &wrapped).map_err(|e| {
         Error::new(
@@ -9502,6 +9607,22 @@ fn lower_column_option_default(options: &[sqlparser::ast::ColumnOption]) -> Opti
     })
 }
 
+/// `CHARACTER SET <name>` in an `ALTER TABLE … CHANGE/MODIFY COLUMN` definition.
+fn lower_column_option_charset(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::CharacterSet(name) => Some(object_name_text(name)),
+        _ => None,
+    })
+}
+
+/// `COLLATE <name>` in an `ALTER TABLE … CHANGE/MODIFY COLUMN` definition.
+fn lower_column_option_collate(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::Collation(name) => Some(object_name_text(name)),
+        _ => None,
+    })
+}
+
 fn lower_generated_column(
     options: &[sqlparser::ast::ColumnOptionDef],
 ) -> Result<Option<GeneratedColumn>> {
@@ -9517,7 +9638,7 @@ fn lower_generated_column(
                 Some(sqlparser::ast::GeneratedExpressionMode::Stored)
             );
             return Ok(Some(GeneratedColumn {
-                expr: lower_expr(expr)?.restore_string(),
+                expr: lower_expr(expr)?.restore_string_generated(),
                 stored,
             }));
         }
@@ -9542,7 +9663,7 @@ fn lower_column_option_generated(
                 Some(sqlparser::ast::GeneratedExpressionMode::Stored)
             );
             return Ok(Some(GeneratedColumn {
-                expr: lower_expr(expr)?.restore_string(),
+                expr: lower_expr(expr)?.restore_string_generated(),
                 stored,
             }));
         }
@@ -10349,6 +10470,23 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
             expr: Box::new(args.into_iter().next().unwrap()),
         }));
     }
+    // `CAST(x AS CHAR CHARSET cs)` — sqlparser has no charset clause there, so
+    // `rewrite_mysql_cast_charset` turns it into this marker call.
+    if name.eq_ignore_ascii_case(SEALDB_CAST_CHARSET_FN) && args.len() == 2 {
+        let mut it = args.into_iter();
+        let expr = it.next().unwrap();
+        let charset = match it.next() {
+            Some(ExprNode::Value(v)) => match v.datum {
+                Datum::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+                _ => return Err(Error::unsupported("cast charset argument")),
+            },
+            _ => return Err(Error::unsupported("cast charset argument")),
+        };
+        return Ok(ExprNode::Cast(FuncCastExpr {
+            expr: Box::new(expr),
+            target: format!("char charset {charset}"),
+        }));
+    }
     let args = if name.eq_ignore_ascii_case("COUNT")
         && matches!(
             args.as_slice(),
@@ -10904,6 +11042,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 sqlparser::ast::ColumnOption::Default(_) => false,
                 sqlparser::ast::ColumnOption::Generated { .. } => false,
                 sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
+                sqlparser::ast::ColumnOption::CharacterSet(_)
+                | sqlparser::ast::ColumnOption::Collation(_) => false,
                 sqlparser::ast::ColumnOption::Comment(c)
                     if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
                 {
@@ -10921,6 +11061,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
                 not_null: lower_not_null_option(options),
+                charset: lower_column_option_charset(options),
+                collate: lower_column_option_collate(options),
                 position: lower_column_position(column_position),
             })
         }
@@ -10936,6 +11078,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 sqlparser::ast::ColumnOption::Default(_) => false,
                 sqlparser::ast::ColumnOption::Generated { .. } => false,
                 sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
+                sqlparser::ast::ColumnOption::CharacterSet(_)
+                | sqlparser::ast::ColumnOption::Collation(_) => false,
                 sqlparser::ast::ColumnOption::Comment(c)
                     if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
                 {
@@ -10952,6 +11096,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 default: lower_column_option_default(options),
                 generated: lower_column_option_generated(options)?,
                 not_null: lower_not_null_option(options),
+                charset: lower_column_option_charset(options),
+                collate: lower_column_option_collate(options),
                 position: lower_column_position(column_position),
             })
         }
@@ -11375,6 +11521,17 @@ mod paren_from_tests {
         parse_sql(sql).expect("union derived with arm parens");
         parse_sql("select * from ((select 4 as a) union all (select 33 as a)) as tmp")
             .expect("union derived with AS");
+    }
+
+    #[test]
+    fn cast_charset_round_trips() {
+        for sql in [
+            "cast(a as char character set latin1)",
+            "cast(a as char charset latin1)",
+        ] {
+            let expr = parse_expr(sql).expect("cast charset parses");
+            assert_eq!(expr.restore_string_generated(), "cast(`a` as char charset latin1)");
+        }
     }
 
     #[test]

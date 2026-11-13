@@ -4,10 +4,13 @@
 /// *view* context reproduces TiDB's `SHOW CREATE VIEW` rendering: table names
 /// carry their schema, select fields always get an `AS` alias, `WHERE`-style
 /// comparisons lose their surrounding spaces and string literals carry the
-/// `_UTF8MB4` introducer.
+/// `_UTF8MB4` introducer. A *generated* context reproduces TiDB's stored
+/// `GENERATED ALWAYS AS (…)` text: lowercased function names, back-quoted
+/// names and `_utf8mb4` string introducers.
 pub struct RestoreCtx {
     buf: String,
     view_db: Option<String>,
+    generated: bool,
 }
 
 impl RestoreCtx {
@@ -15,6 +18,17 @@ impl RestoreCtx {
         Self {
             buf: String::new(),
             view_db: None,
+            generated: false,
+        }
+    }
+
+    /// Context for `ColumnInfo.GeneratedExprString` (TiDB restore flags:
+    /// keywords lowercased, names back-quoted, string literals with charset).
+    pub fn new_generated() -> Self {
+        Self {
+            buf: String::new(),
+            view_db: None,
+            generated: true,
         }
     }
 
@@ -23,7 +37,13 @@ impl RestoreCtx {
         Self {
             buf: String::new(),
             view_db: Some(db.to_string()),
+            generated: false,
         }
+    }
+
+    /// Stored generated-column expression context (see [`Self::new_generated`]).
+    pub fn in_generated(&self) -> bool {
+        self.generated
     }
 
     /// Default schema used to qualify table names in view mode.

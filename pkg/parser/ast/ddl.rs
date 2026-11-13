@@ -832,6 +832,10 @@ pub enum AlterTableSpec {
         generated: Option<GeneratedColumn>,
         /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
         not_null: Option<bool>,
+        /// `CHARACTER SET <name>` in the new definition.
+        charset: Option<String>,
+        /// `COLLATE <name>` in the new definition.
+        collate: Option<String>,
         position: ColumnPosition,
     },
     /// `MODIFY [COLUMN] col type` — keep the name, change the type.
@@ -844,6 +848,10 @@ pub enum AlterTableSpec {
         generated: Option<GeneratedColumn>,
         /// `NOT NULL` (Some(true)) / `NULL` (Some(false)) in the definition.
         not_null: Option<bool>,
+        /// `CHARACTER SET <name>` in the new definition.
+        charset: Option<String>,
+        /// `COLLATE <name>` in the new definition.
+        collate: Option<String>,
         position: ColumnPosition,
     },
     /// `RENAME COLUMN old TO new`.
@@ -954,6 +962,8 @@ impl AlterTableSpec {
                 default,
                 generated,
                 not_null,
+                charset,
+                collate,
                 position,
             } => {
                 ctx.write_str("CHANGE COLUMN ");
@@ -962,6 +972,14 @@ impl AlterTableSpec {
                 ctx.write_name(new_name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
+                if let Some(charset) = charset {
+                    ctx.write_str(" CHARACTER SET ");
+                    ctx.write_str(charset);
+                }
+                if let Some(collate) = collate {
+                    ctx.write_str(" COLLATE ");
+                    ctx.write_str(collate);
+                }
                 if let Some(default) = default {
                     ctx.write_str(" DEFAULT ");
                     ctx.write_str(default);
@@ -989,12 +1007,22 @@ impl AlterTableSpec {
                 default,
                 generated,
                 not_null,
+                charset,
+                collate,
                 position,
             } => {
                 ctx.write_str("MODIFY COLUMN ");
                 ctx.write_name(name);
                 ctx.write_str(" ");
                 ctx.write_str(type_name);
+                if let Some(charset) = charset {
+                    ctx.write_str(" CHARACTER SET ");
+                    ctx.write_str(charset);
+                }
+                if let Some(collate) = collate {
+                    ctx.write_str(" COLLATE ");
+                    ctx.write_str(collate);
+                }
                 if let Some(default) = default {
                     ctx.write_str(" DEFAULT ");
                     ctx.write_str(default);

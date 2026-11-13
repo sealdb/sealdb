@@ -93,6 +93,14 @@ impl ExprNode {
         ctx.into_string()
     }
 
+    /// TiDB `ColumnInfo.GeneratedExprString`: lowercase keywords, back-quoted
+    /// names and `_utf8mb4` string introducers.
+    pub fn restore_string_generated(&self) -> String {
+        let mut ctx = RestoreCtx::new_generated();
+        let _ = self.restore(&mut ctx);
+        ctx.into_string()
+    }
+
     /// `*` select-item marker used by the bridge before star expansion.
     pub fn is_star_marker(&self) -> bool {
         matches!(
@@ -744,6 +752,13 @@ impl ColumnNameExpr {
     }
 }
 
+/// Escape a string for a MySQL single-quoted literal. Restored text is fed back
+/// into the parser (generated columns, views), so a literal backslash has to be
+/// doubled for the unescaped value to round-trip.
+fn escape_mysql_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
 #[derive(Clone, Debug)]
 pub struct ValueExpr {
     pub datum: Datum,
@@ -751,14 +766,18 @@ pub struct ValueExpr {
 
 impl ValueExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        if ctx.in_view()
+        if (ctx.in_view() || ctx.in_generated())
             && matches!(
                 &self.datum,
                 Datum::Bytes(_) | Datum::Bit(_) | Datum::Enum(_)
             )
         {
             // TiDB restores string literals with their charset introducer.
-            ctx.write_str("_UTF8MB4");
+            ctx.write_str(if ctx.in_view() {
+                "_UTF8MB4"
+            } else {
+                "_utf8mb4"
+            });
         }
         ctx.write_str(&match &self.datum {
             Datum::Null => "NULL".to_string(),
@@ -771,13 +790,13 @@ impl ValueExpr {
                     v.to_string()
                 }
             }
-            Datum::Bytes(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
-            Datum::Bit(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
+            Datum::Bytes(b) => format!("'{}'", escape_mysql_string(&String::from_utf8_lossy(b))),
+            Datum::Bit(b) => format!("'{}'", escape_mysql_string(&String::from_utf8_lossy(b))),
             Datum::Decimal(d) => d.to_string(),
             Datum::Time(t) => format!("'{t}'"),
             Datum::Enum(e) => format!(
                 "'{}'",
-                String::from_utf8_lossy(&e.label).replace('\'', "''")
+                escape_mysql_string(&String::from_utf8_lossy(&e.label))
             ),
         });
         Ok(())
@@ -877,6 +896,8 @@ impl FuncCallExpr {
         }
         if ctx.in_view() {
             ctx.write_str(&self.name.to_ascii_uppercase());
+        } else if ctx.in_generated() {
+            ctx.write_str(&self.name.to_ascii_lowercase());
         } else {
             ctx.write_str(&self.name);
         }
@@ -938,6 +959,15 @@ pub struct FuncCastExpr {
 
 impl FuncCastExpr {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        if ctx.in_generated() {
+            // TiDB stores the generated expression with lowercased keywords.
+            ctx.write_str("cast(");
+            self.expr.restore(ctx)?;
+            ctx.write_str(" as ");
+            ctx.write_str(&self.target.to_ascii_lowercase());
+            ctx.write_str(")");
+            return Ok(());
+        }
         ctx.write_str("CAST(");
         self.expr.restore(ctx)?;
         ctx.write_str(" AS ");
