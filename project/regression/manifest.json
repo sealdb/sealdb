@@ -1612,7 +1612,7 @@
     {
       "name": "infoschema/v2",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/infoschema/v2.test",
       "result": "r/infoschema/v2.result",
       "has_result": true,

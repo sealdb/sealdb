@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **48 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 1 / R7 5），本轮复验的 48 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 5/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **49 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 2 / R7 5），本轮复验的 49 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 5/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **48 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 39 | 15.4% |
-| `in_progress` | 15 | 5.9% |
-| `pending` | 190 | 74.8% |
+| `green` | 49 | 19.3% |
+| `in_progress` | 14 | 5.5% |
+| `pending` | 181 | 71.3% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -35,36 +35,39 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **48 个** �
 | Wave | green | in_progress | pending | 说明 |
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
-| R2（join / subquery / agg / window / cte） | 15 | 6 | 1 | 主波完成 ~68% |
-| R3（point_get / index / partition / explain*） | 20 | 9 | 19 | 当前主攻波 |
+| R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
+| R3（point_get / index / partition / explain*） | 21 | 9 | 18 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
-| R5 | 0 | 0 | 12 | 未开工 |
-| R6 | 0 | 0 | 35 | 未开工 |
-| R7 | 0 | 0 | 110 | 未开工 |
+| R5 | 1 | 0 | 11 | `session/txn` 已绿 |
+| R6 | 2 | 0 | 33 | DDL / infoschema 起步 |
+| R7 | 5 | 0 | 105 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 8 套冒烟 |
 
 ---
 
-## 3. 已绿 suite 清单（39）
+## 3. 已绿 suite 清单（49）
 
 | Wave | Suite |
 |---|---|
 | R1 | `select`, `show`, `types/const`, `types/time` |
-| R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_pushdown`, `window_function` |
-| R3 | `access_path_selection`, `clustered_index`, `executor/batch_point_get`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy_stats`, `explain_foreign_key`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
+| R2 | `agg_predicate_pushdown`, `executor/cte`, `executor/jointest/hash_join`, `executor/jointest/join`, `executor/union_scan`, `executor/window`, `explain_union_scan`, `globalindex/aggregate`, `globalindex/index_join`, `index_join`, `naaj`, `null_rejected`, `subquery`, `topn_push_down`, `topn_pushdown`, `window_function` |
+| R3 | `access_path_selection`, `clustered_index`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy_stats`, `explain_foreign_key`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
+| R5 | `session/txn` |
+| R6 | `ddl/fail_db`, `infoschema/v2` |
+| R7 | `executor/adapter`, `expression/enum_set`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `parser/integration` |
 
 **复验证据**
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory --status green
-→ PASS: memory=39 tikv=0 skipped=215
+→ PASS: memory=49 tikv=0 skipped=205
 
 ./tests/integrationtest/run-tests.sh -s tikv --status green
-→ PASS: memory=0 tikv=39 skipped=215
+→ PASS: memory=0 tikv=49 skipped=205
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），48 套件与 Mem 同一提交上复验通过。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），49 套件与 Mem 同一提交上复验通过（`PASS: tikv=49`）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 在 TiKV 全量 gate 中偶发超时（语句间累计 >1s），单套复跑稳定通过。
 
 ---
 
@@ -350,7 +353,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），48 套件�
 | 11 | `session/variable` | pending | 0% | ✓ | — |
 | 12 | `session/vars` | pending | 0% | ✓ | — |
 
-### R6（35 套，green 0）
+### R6（35 套，green 2）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -384,7 +387,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），48 套件�
 | 28 | `infoschema/cluster_tables` | pending | 0% | ✓ | — |
 | 29 | `infoschema/infoschema` | pending | 0% | ✓ | — |
 | 30 | `infoschema/tables` | pending | 0% | ✓ | — |
-| 31 | `infoschema/v2` | pending | 0% | ✓ | — |
+| 31 | `infoschema/v2` | green | 100% | ✓ | ✓ |
 | 32 | `statistics/handle` | pending | 0% | ✓ | — |
 | 33 | `statistics/integration` | pending | 0% | ✓ | — |
 | 34 | `statistics/lock_table_stats` | pending | 0% | ✓ | — |

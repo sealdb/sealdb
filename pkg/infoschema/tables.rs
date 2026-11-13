@@ -77,6 +77,122 @@ fn schema_row(name: &str) -> Vec<Datum> {
     ]
 }
 
+/// TiDB `autoid.InformationSchemaDBID` (`SystemSchemaIDFlag | 1`).
+const INFO_SCHEMA_DB_ID: i64 = 1 << 62 | 1;
+
+/// TiDB `tableIDMap` (`pkg/infoschema/tables.go`): the offset of every
+/// `information_schema` virtual table from `INFO_SCHEMA_DB_ID`. The gaps mirror
+/// TiDB's historical numbering (slot 66 is a removed table; `def` owns 9), so
+/// the ids stay byte-for-byte compatible with TiDB.
+const INFO_SCHEMA_TABLE_IDS: &[(&str, i64)] = &[
+    ("SCHEMATA", 1),
+    ("TABLES", 2),
+    ("COLUMNS", 3),
+    ("COLUMN_STATISTICS", 4),
+    ("STATISTICS", 5),
+    ("CHARACTER_SETS", 6),
+    ("COLLATIONS", 7),
+    ("FILES", 8),
+    ("PROFILING", 10),
+    ("PARTITIONS", 11),
+    ("KEY_COLUMN_USAGE", 12),
+    ("REFERENTIAL_CONSTRAINTS", 13),
+    ("SESSION_VARIABLES", 14),
+    ("PLUGINS", 15),
+    ("TABLE_CONSTRAINTS", 16),
+    ("TRIGGERS", 17),
+    ("USER_PRIVILEGES", 18),
+    ("SCHEMA_PRIVILEGES", 19),
+    ("TABLE_PRIVILEGES", 20),
+    ("COLUMN_PRIVILEGES", 21),
+    ("ENGINES", 22),
+    ("VIEWS", 23),
+    ("ROUTINES", 24),
+    ("PARAMETERS", 25),
+    ("EVENTS", 26),
+    ("GLOBAL_STATUS", 27),
+    ("GLOBAL_VARIABLES", 28),
+    ("SESSION_STATUS", 29),
+    ("OPTIMIZER_TRACE", 30),
+    ("TABLESPACES", 31),
+    ("COLLATION_CHARACTER_SET_APPLICABILITY", 32),
+    ("PROCESSLIST", 33),
+    ("TIDB_INDEXES", 34),
+    ("SLOW_QUERY", 35),
+    ("TIDB_HOT_REGIONS", 36),
+    ("TIKV_STORE_STATUS", 37),
+    ("ANALYZE_STATUS", 38),
+    ("TIKV_REGION_STATUS", 39),
+    ("TIKV_REGION_PEERS", 40),
+    ("TIDB_SERVERS_INFO", 41),
+    ("CLUSTER_INFO", 42),
+    ("CLUSTER_CONFIG", 43),
+    ("CLUSTER_LOAD", 44),
+    ("TIFLASH_REPLICA", 45),
+    ("CLUSTER_SLOW_QUERY", 46),
+    ("CLUSTER_PROCESSLIST", 47),
+    ("CLUSTER_LOG", 48),
+    ("CLUSTER_HARDWARE", 49),
+    ("CLUSTER_SYSTEMINFO", 50),
+    ("INSPECTION_RESULT", 51),
+    ("METRICS_SUMMARY", 52),
+    ("METRICS_SUMMARY_BY_LABEL", 53),
+    ("METRICS_TABLES", 54),
+    ("INSPECTION_SUMMARY", 55),
+    ("INSPECTION_RULES", 56),
+    ("DDL_JOBS", 57),
+    ("SEQUENCES", 58),
+    ("STATEMENTS_SUMMARY", 59),
+    ("STATEMENTS_SUMMARY_HISTORY", 60),
+    ("CLUSTER_STATEMENTS_SUMMARY", 61),
+    ("CLUSTER_STATEMENTS_SUMMARY_HISTORY", 62),
+    ("TABLE_STORAGE_STATS", 63),
+    ("TIFLASH_TABLES", 64),
+    ("TIFLASH_SEGMENTS", 65),
+    ("CLIENT_ERRORS_SUMMARY_GLOBAL", 67),
+    ("CLIENT_ERRORS_SUMMARY_BY_USER", 68),
+    ("CLIENT_ERRORS_SUMMARY_BY_HOST", 69),
+    ("TIDB_TRX", 70),
+    ("CLUSTER_TIDB_TRX", 71),
+    ("DEADLOCKS", 72),
+    ("CLUSTER_DEADLOCKS", 73),
+    ("DATA_LOCK_WAITS", 74),
+    ("STATEMENTS_SUMMARY_EVICTED", 75),
+    ("CLUSTER_STATEMENTS_SUMMARY_EVICTED", 76),
+    ("ATTRIBUTES", 77),
+    ("TIDB_HOT_REGIONS_HISTORY", 78),
+    ("PLACEMENT_POLICIES", 79),
+    ("TRX_SUMMARY", 80),
+    ("CLUSTER_TRX_SUMMARY", 81),
+    ("VARIABLES_INFO", 82),
+    ("USER_ATTRIBUTES", 83),
+    ("MEMORY_USAGE", 84),
+    ("MEMORY_USAGE_OPS_HISTORY", 85),
+    ("CLUSTER_MEMORY_USAGE", 86),
+    ("CLUSTER_MEMORY_USAGE_OPS_HISTORY", 87),
+    ("RESOURCE_GROUPS", 88),
+    ("RUNAWAY_WATCHES", 89),
+    ("CHECK_CONSTRAINTS", 90),
+    ("TIDB_CHECK_CONSTRAINTS", 91),
+    ("KEYWORDS", 92),
+    ("TIDB_INDEX_USAGE", 93),
+    ("CLUSTER_TIDB_INDEX_USAGE", 94),
+    ("TIFLASH_INDEXES", 95),
+];
+
+/// TiDB `information_schema.tables` sharding info column
+/// (`infoschema.GetShardingInfo`).
+fn sharding_info(table: &TableInfo, db: &str) -> Datum {
+    if table.is_view() || db.eq_ignore_ascii_case("information_schema") {
+        return Datum::Null;
+    }
+    if table.pk_is_handle {
+        bytes("NOT_SHARDED(PK_IS_HANDLE)")
+    } else {
+        bytes("NOT_SHARDED")
+    }
+}
+
 fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
     let schema = vec![
         "TABLE_CATALOG".to_string(),
@@ -84,22 +200,143 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         "TABLE_NAME".to_string(),
         "TABLE_TYPE".to_string(),
         "ENGINE".to_string(),
+        "VERSION".to_string(),
+        "ROW_FORMAT".to_string(),
+        "TABLE_ROWS".to_string(),
+        "AVG_ROW_LENGTH".to_string(),
+        "DATA_LENGTH".to_string(),
+        "MAX_DATA_LENGTH".to_string(),
+        "INDEX_LENGTH".to_string(),
+        "DATA_FREE".to_string(),
+        "AUTO_INCREMENT".to_string(),
+        "CREATE_TIME".to_string(),
+        "UPDATE_TIME".to_string(),
+        "CHECK_TIME".to_string(),
+        "TABLE_COLLATION".to_string(),
+        "CHECKSUM".to_string(),
+        "CREATE_OPTIONS".to_string(),
+        "TABLE_COMMENT".to_string(),
+        "TIDB_TABLE_ID".to_string(),
+        "TIDB_ROW_ID_SHARDING_INFO".to_string(),
+        "TIDB_PK_TYPE".to_string(),
+        "TIDB_PLACEMENT_POLICY_NAME".to_string(),
+        "TIDB_TABLE_MODE".to_string(),
+        "TIDB_AFFINITY".to_string(),
     ];
     let mut rows = Vec::new();
+    // TiDB sorts schemas by name, so `INFORMATION_SCHEMA` comes first.
+    for (name, offset) in INFO_SCHEMA_TABLE_IDS {
+        rows.push(vec![
+            bytes("def"),
+            bytes("INFORMATION_SCHEMA"),
+            bytes(name),
+            bytes("SYSTEM VIEW"),
+            bytes("InnoDB"),
+            Datum::I64(10),
+            bytes("Compact"),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            bytes("utf8mb4_bin"),
+            Datum::Null,
+            bytes(""),
+            bytes(""),
+            Datum::I64(INFO_SCHEMA_DB_ID + offset),
+            Datum::Null,
+            bytes("NONCLUSTERED"),
+            Datum::Null,
+            bytes("Normal"),
+            Datum::Null,
+        ]);
+    }
     for_each_table(is, |db, table| {
-        let (table_type, engine) = if table.is_view() {
-            ("VIEW", "")
-        } else if table.is_sequence() {
-            ("SEQUENCE", "")
+        let tidb_table_id = Datum::I64(table.id);
+        let pk_type = if table.pk_is_clustered() {
+            "CLUSTERED"
         } else {
-            ("BASE TABLE", "InnoDB")
+            "NONCLUSTERED"
+        };
+        if table.is_view() {
+            rows.push(vec![
+                bytes("def"),
+                bytes(db),
+                bytes(table.name.o()),
+                bytes("VIEW"),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                bytes("VIEW"),
+                tidb_table_id,
+                Datum::Null,
+                bytes(pk_type),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+            ]);
+            return;
+        }
+        let table_type = if table.is_sequence() {
+            "SEQUENCE"
+        } else {
+            "BASE TABLE"
+        };
+        let create_options = if table.partition.is_some() {
+            "partitioned"
+        } else {
+            ""
         };
         rows.push(vec![
             bytes("def"),
             bytes(db),
             bytes(table.name.o()),
             bytes(table_type),
-            bytes(engine),
+            bytes("InnoDB"),
+            Datum::I64(10),
+            bytes("Compact"),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::I64(0),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            bytes(if table.collate.is_empty() {
+                "utf8mb4_bin"
+            } else {
+                &table.collate
+            }),
+            Datum::Null,
+            bytes(create_options),
+            bytes(""),
+            tidb_table_id,
+            sharding_info(table, db),
+            bytes(pk_type),
+            Datum::Null,
+            bytes("Normal"),
+            Datum::Null,
         ]);
     });
     (schema, rows)

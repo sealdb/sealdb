@@ -3034,6 +3034,8 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         // the assignment without persisting a domain-wide default.
         "tidb_mem_oom_action" | "tidb_enable_tmp_storage_on_oom" => {}
         "tidb_mem_quota_query" => {}
+        // TiDB scheduler/cache knobs with no observable effect here.
+        "tidb_enable_dist_task" | "tidb_schema_cache_size" => {}
         other => {
             return Err(sealdb_errno::Error::unsupported(format!(
                 "SET GLOBAL {other}"

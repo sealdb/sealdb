@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-12（green 39 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-13（green 49 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -1994,6 +1994,27 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（`infoschema/v2` 转正：`TIDB_TABLE_ID` 与 TiDB 虚拟表 ID 映射）
+
+- **Phase**: R6
+- **完成**:
+  - `information_schema.tables` 补齐 TiDB 的 27 列（`VERSION` / `ROW_FORMAT` /
+    `TABLE_ROWS` / `CREATE_OPTIONS` / `TABLE_COMMENT` / `TIDB_TABLE_ID` /
+    `TIDB_ROW_ID_SHARDING_INFO` / `TIDB_PK_TYPE` / `TIDB_TABLE_MODE` …）。
+  - 按 TiDB `tableIDMap` 复刻 `information_schema` 虚拟表 ID：
+    `autoid.InformationSchemaDBID = 1<<62|1` 加偏移，保留已删除槽位（66）与
+    `def`（9）的空洞，因此 `CLUSTER_STATEMENTS_SUMMARY_HISTORY` 精确等于
+    `4611686018427387967`。
+  - 虚拟表在列表中以 `SYSTEM VIEW` 类型、`INFORMATION_SCHEMA` schema 名出现，
+    与 TiDB 排序一致（大写 schema 排在用户库之前）。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -t infoschema/v2 --status pending -s memory`
+    → `PASS: memory=1`
+  - `-s tikv` → `PASS: tikv=1`；随后升 `green`
+- **下一步**:
+  - `infoschema/tables` 与 `infoschema/infoschema` 依赖 `TIDB_ROW_ID_SHARDING_INFO`
+    的 `SHARD_BITS` / `PK_AUTO_RANDOM_BITS` 与表注释元数据，需要先落 `TableInfo`
+
 ### 2026-11-13（`parser/integration` + `ddl/fail_db` 转正：SET_VAR / 日期文案 / MODIFY 溢出告警）
 
 - **Phase**: R6/R7
@@ -2009,7 +2030,7 @@
     TiDB `ReorgMeta` 规则聚合为 `<n> warnings with this error code, first warning: …`。
 - **验证**:
   - 两套单独跑 Memory + TiKV 均 `PASS`
-  - `--status green` 双引擎：`PASS: memory=48` / `PASS: tikv=48`
+  - `--status green` 双引擎：`PASS: memory=49` / `PASS: tikv=49`（含本轮 `infoschema/v2`）
 - **下一步**:
   - `util/admin`（4 行）与 `planner/cardinality/trace`（3 行）继续扫尾；
     `partition` 需要 `CREATE PLACEMENT POLICY` 与 `ALTER … PARTITION BY` 语法
