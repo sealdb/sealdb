@@ -2502,7 +2502,7 @@
     {
       "name": "topn_push_down",
       "wave": "R2",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/topn_push_down.test",
       "result": "r/topn_push_down.result",
       "has_result": true,
