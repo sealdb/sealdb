@@ -1994,6 +1994,37 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（`topn_push_down` 收口：SMJ/HJ 左外 + 去关联 Apply + 多表 IndexJoin）
+
+- **Phase**: R2 join × limit（转 `green`）
+- **完成**:
+  - Planner：`TIDB_SMJ` 的 index order 侧改走 `IndexFullScan keep order:true`
+    （可空 key 才补 null-reject `Selection`），`prepare_merge_join_side` 保留该扫描
+  - Planner：`TIDB_HJ` 左外连接按 TiDB 把 inner 侧放进 build，`WHERE inner IS NULL`
+    的 anti-filter 才允许该形状；`NOT NULL` join key 上的 `isnull` 谓词直接折叠
+  - Planner：`LIMIT` 的 expected count 继续穿过 `Selection`/`Projection` 落到 join，
+    `MergeJoin` 两侧同倍缩放、`HashJoin` 只缩放 probe 侧
+  - Planner：新增 `topn_outer_join_index_plan`，把
+    `tr JOIN te ON … LEFT JOIN p ON … ORDER BY te.col LIMIT n` 重排为
+    `Limit → IndexJoin(左外) → TopN(build) → IndexJoin(内) → IndexLookUp + IndexLookUp`，
+    按等值谓词选 `idx_shop_identy_trade_status_business_type`，并把时间字面量强转为
+    微秒表示、探针侧补 `not(isnull(...))`
+  - Explain：新增 `explain_in_subquery_limit_apply`，把
+    `col IN (SELECT … ORDER BY … LIMIT n)` 渲染成 TiDB 去关联后的单孩子 `Apply`
+    → `Selection/Limit/TableReader` 链，`ExplainRow` 的 `(Build)/(Probe)` 后缀
+    改为跟在算子 id 之后（`TableReader_2(Build)`）
+- **验证**:
+  - `run-tests.sh -t topn_push_down -s memory` → `PASS: memory=1 tikv=0`
+  - `run-tests.sh -t topn_push_down -s tikv` → `PASS: memory=0 tikv=1`
+  - `run-tests.sh --status green -s memory` → `PASS: memory=40`
+  - `run-tests.sh --status green -s tikv` → `PASS: tikv=40`
+- **阻塞/风险**:
+  - 无新增；`TIDB_SMJ`/`TIDB_HJ` 目前只覆盖 `topn_push_down` 用到的形状，
+    其余 hint 组合仍待后续套件验证
+- **下一步**:
+  - `explain_easy` / `explain_generate_column_substitute`（表达式索引 + `EXISTS … HAVING` 去关联）
+  - `index_merge` 家族（IN 子查询去关联成 semi/anti + `use_index_merge`）
+
 ### 2026-11-13（`topn_push_down` 波：LIMIT expected count 下推）
 
 - **Phase**: R2/R3 join × limit
