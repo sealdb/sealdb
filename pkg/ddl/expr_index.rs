@@ -39,7 +39,19 @@ pub(crate) fn resolve_index_parts(
 ) -> Result<(Vec<IndexColumn>, Vec<ColumnInfo>)> {
     let mut hidden: Vec<ColumnInfo> = Vec::new();
     let mut columns = Vec::with_capacity(parts.len());
+    let mut seen: Vec<String> = Vec::with_capacity(parts.len());
     for (pos, part) in parts.iter().enumerate() {
+        // TiDB `buildIndexInfo`: a key may not name the same column twice
+        // (comparison is case-insensitive, the message keeps the spelling).
+        if let IndexPart::Column(name) | IndexPart::Prefix { name, .. } = part {
+            if seen.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+                return Err(Error::new(
+                    ERR_DUP_FIELDNAME,
+                    format!("Duplicate column name '{name}'"),
+                ));
+            }
+            seen.push(name.clone());
+        }
         match part {
             IndexPart::Column(name) | IndexPart::Prefix { name, .. } => {
                 let col = info

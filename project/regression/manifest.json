@@ -14,9 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 37,
-      "pending": 190,
-      "in_progress": 17,
+      "green": 56,
+      "pending": 174,
+      "in_progress": 14,
       "deferred": 2,
       "local": 8
     },
@@ -396,7 +396,7 @@
     {
       "name": "ddl/index_modify",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/index_modify.test",
       "result": "r/ddl/index_modify.result",
       "has_result": true,

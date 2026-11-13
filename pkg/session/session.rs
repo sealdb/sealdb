@@ -3120,6 +3120,13 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         "tidb_mem_quota_query" => {}
         // TiDB scheduler/cache knobs with no observable effect here.
         "tidb_enable_dist_task" | "tidb_schema_cache_size" => {}
+        // DDL reorg knobs: index builds are synchronous here, so the fast-reorg
+        // toggle and its retry settings are accepted as no-ops.
+        "tidb_ddl_enable_fast_reorg"
+        | "tidb_ddl_reorg_worker_cnt"
+        | "tidb_ddl_reorg_batch_size"
+        | "tidb_ddl_reorg_priority"
+        | "tidb_ddl_reorg_max_write_speed" => {}
         other => {
             return Err(sealdb_errno::Error::unsupported(format!(
                 "SET GLOBAL {other}"

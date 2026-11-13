@@ -135,6 +135,21 @@ impl Executor for IndexLookUpExecutor {
                             let handle = index_handle(&index, &key, &value)?;
                             if self.covering {
                                 let mut row = covering_row(&info, &index, &key, handle)?;
+                                if info.common_handle && common_handle_columns_missing(&info, &row)
+                                {
+                                    // TiDB stores a clustered PRIMARY KEY as the
+                                    // common handle inside every secondary index key,
+                                    // so `KEY idx(b)` alone answers `SELECT a` when `a`
+                                    // is part of that key. SealDB's index keys carry the
+                                    // heap row id instead, so the covering read fetches
+                                    // the row for the handle columns it cannot decode.
+                                    let row_key = encode_row_key_with_handle(physical_id, handle);
+                                    if let Some(raw) =
+                                        txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?
+                                    {
+                                        backfill_row(&info, &mut row, &raw);
+                                    }
+                                }
                                 if expose_rowid {
                                     row.push(Datum::I64(handle));
                                 }
@@ -583,6 +598,33 @@ fn covering_row(
         *slot = Datum::I64(handle);
     }
     Ok(row)
+}
+
+/// Whether a common-handle table's PRIMARY KEY columns are missing from the
+/// row a covering index read rebuilt (they are not part of the index key here).
+fn common_handle_columns_missing(info: &TableInfo, row: &[Datum]) -> bool {
+    let Some(pk) = info.indices.iter().find(|idx| idx.primary) else {
+        return false;
+    };
+    pk.columns.iter().any(|col| {
+        row.get(col.offset as usize)
+            .is_some_and(|value| value.is_null())
+    })
+}
+
+/// Recover the columns a covering index read left as `NULL` from the stored row.
+fn backfill_row(info: &TableInfo, row: &mut [Datum], raw: &[u8]) {
+    let decoded = decode_row(raw, &info.col_field_types());
+    for col in &info.columns {
+        if !matches!(row.get(col.offset as usize), Some(Datum::Null)) {
+            continue;
+        }
+        if let Some((_, value)) = decoded.iter().find(|(id, _)| *id == col.id)
+            && let Some(slot) = row.get_mut(col.offset as usize)
+        {
+            *slot = value.clone();
+        }
+    }
 }
 
 fn rehydrate_index_datum(info: &TableInfo, offset: usize, value: Datum) -> Result<Datum> {

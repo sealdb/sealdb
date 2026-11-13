@@ -1410,15 +1410,18 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
             let after_admin = skip_ws(bytes, i + "ADMIN".len());
             if keyword_at(bytes, after_admin, "CHECK") {
                 let after_check = skip_ws(bytes, after_admin + "CHECK".len());
-                if keyword_at(bytes, after_check, "TABLE") {
-                    // `ADMIN CHECK TABLE t` — verification no-op for now.
-                    out.push_str("DO 0");
-                    let mut j = after_check + "TABLE".len();
-                    while j < bytes.len() && bytes[j] != b';' {
-                        j += 1;
+                // `ADMIN CHECK TABLE t` / `ADMIN CHECK INDEX t idx` — the
+                // integrity check is a verification no-op for now.
+                for target in ["TABLE", "INDEX"] {
+                    if keyword_at(bytes, after_check, target) {
+                        out.push_str("DO 0");
+                        let mut j = after_check + target.len();
+                        while j < bytes.len() && bytes[j] != b';' {
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
                     }
-                    i = j;
-                    continue;
                 }
             }
             if keyword_at(bytes, after_admin, "RELOAD") {
