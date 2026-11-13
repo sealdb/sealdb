@@ -931,10 +931,32 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// `(seconds, microseconds)` since the Unix epoch.
+fn unix_now_parts() -> (i64, u32) {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() as i64, d.subsec_micros()))
+        .unwrap_or((0, 0))
+}
+
+/// Fractional-second precision from the optional `NOW(fsp)` argument.
+fn now_fsp(args: &[ExprNode]) -> i8 {
+    match args.first().and_then(|arg| arg.const_datum()) {
+        Some(Datum::I64(fsp)) => (fsp as i8).clamp(0, 6),
+        Some(Datum::U64(fsp)) => (fsp as i8).clamp(0, 6),
+        _ => 0,
+    }
+}
+
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" => {
-            let now = Time::from_unix_secs(unix_now_secs(), TimeType::Timestamp);
+            let (secs, micro) = unix_now_parts();
+            let mut now = Time::from_unix_secs(secs, TimeType::Timestamp);
+            now.fsp = now_fsp(&func.args);
+            if now.fsp > 0 {
+                now.micro = micro;
+            }
             Ok(Datum::Time(utc_to_session_local(now)?))
         }
         "UTC_TIMESTAMP" => Ok(Datum::Time(Time::from_unix_secs(
