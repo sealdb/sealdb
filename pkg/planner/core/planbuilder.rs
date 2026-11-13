@@ -1598,6 +1598,15 @@ impl PlanBuilder {
             prune_mode,
         )?;
         let first_tp = map_join_type(first.tp);
+        // Tie the propagated constants to the side plans: `fold_pinned_join_on`
+        // below may drop the equijoin key, so the mirrored `t2.b = 1` has to be
+        // a real filter on `t2` or the CARTESIAN product keeps every row.
+        for pred in &left_derived {
+            left = predicate_push_down(left, pred, is, current_db);
+        }
+        for pred in &right_derived {
+            right = predicate_push_down(right, pred, is, current_db);
+        }
         // not(isnull) goes into the null-supplying side: the right table of a
         // LEFT JOIN (build side) and the left table of a RIGHT JOIN.
         let inner_side = if matches!(first_tp, JoinType::RightOuter) {
@@ -19855,7 +19864,7 @@ pub fn derive_join_key_constants(
             ExprNode::Binary(BinaryOpExpr {
                 op: Op::Eq,
                 left: Box::new(ExprNode::Column(ColumnNameExpr {
-                    schema: None,
+                    schema: to_table.schema.clone(),
                     table: Some(to_table.name.clone()),
                     name: to.name.clone(),
                 })),
