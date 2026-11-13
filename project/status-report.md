@@ -165,7 +165,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件�
 
 | 套件 | 首差 | 需要的根能力 |
 |---|---|---|
-| `explain_easy` | `create index … ((a+b+1))`、`EXISTS … HAVING` 未去关联、`MemTableScan` 下推 | 表达式索引 + 去关联 + 内存表扫描 |
+| `explain_easy` | 仅剩 1 条语句（result 第 504 行）：`COUNT(1)` 外层聚合穿过 `LEFT JOIN` + `UNION ALL` 下推（`firstrow` + 部分 `count`）、`registration_num > 0` 下推到 union 分支并把常量 0 分支折成 `TableDual`、外层 join 转 `IndexJoin`（`TableRangeScan` 探针） | 聚合下推（join/union）+ 谓词穿 union + 列号对齐 |
 | `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效 | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
 | `explain_generate_column_substitute` | 生成列/虚拟列替换与统计缺失标记 | 生成列访问路径 |
 | `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表 |
@@ -202,7 +202,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件�
 
 ## 9. 下一步（有序队列）
 
-1. `explain_easy` 与 `explain_generate_column_substitute`：表达式/生成列索引 + `EXISTS … HAVING` 去关联。
+1. `explain_easy`：仅剩 `COUNT(1)` 外层聚合穿过 `LEFT JOIN`/`UNION ALL` 下推与 `TableDual` 折叠一条语句；同一根因可直接带 `explain_complex*` 的聚合下推。
 2. `index_merge` 家族（含 `globalindex/mem_index_merge*`）：IN 子查询去关联成 semi/anti + `use_index_merge` 提示。
 3. `executor/explain`：视图 `EXPLAIN` 权限位、`explain analyze` 运行时统计、`statements_summary`。
 4. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
