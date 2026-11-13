@@ -29,6 +29,8 @@ pub use evaluator::{
     with_allow_auto_random_explicit_insert, with_collation, with_collation_ci, with_current_db,
     with_div_by_zero_mode, with_index_dst_double, with_sql_mode, with_time_zone,
 };
-pub use funcs::{FuncCategory, FuncMeta, builtin_list, implemented_names, lookup};
+pub use funcs::{
+    FuncCategory, FuncMeta, builtin_list, check_arg_count, implemented_names, lookup,
+};
 pub use sealdb_util::collate::CollateMode;
 pub use vectorized::{VecEval, VecExprStub};

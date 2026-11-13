@@ -61,6 +61,27 @@ const FUNCS: &[FuncMeta] = &[
     // compare / logic helpers often seen as funcs
     meta("ISTRUE", FuncCategory::Compare, 1, 1, false),
     meta("ISFALSE", FuncCategory::Compare, 1, 1, false),
+    // string (subset)
+    meta("LOWER", FuncCategory::String, 1, 1, true),
+    meta("LCASE", FuncCategory::String, 1, 1, true),
+    meta("UPPER", FuncCategory::String, 1, 1, true),
+    meta("UCASE", FuncCategory::String, 1, 1, true),
+    meta("LENGTH", FuncCategory::String, 1, 1, true),
+    meta("CHAR_LENGTH", FuncCategory::String, 1, 1, true),
+    meta("CHARACTER_LENGTH", FuncCategory::String, 1, 1, true),
+    meta("REVERSE", FuncCategory::String, 1, 1, true),
+    meta("TRIM", FuncCategory::String, 1, 1, true),
+    meta("LTRIM", FuncCategory::String, 1, 1, true),
+    meta("RTRIM", FuncCategory::String, 1, 1, true),
+    meta("SUBSTRING", FuncCategory::String, 2, 3, true),
+    meta("SUBSTR", FuncCategory::String, 2, 3, true),
+    meta("CONCAT", FuncCategory::String, 1, -1, true),
+    meta("CONCAT_WS", FuncCategory::String, 2, -1, true),
+    meta("REPLACE", FuncCategory::String, 3, 3, true),
+    meta("LEFT", FuncCategory::String, 2, 2, true),
+    meta("RIGHT", FuncCategory::String, 2, 2, true),
+    meta("LPAD", FuncCategory::String, 3, 3, true),
+    meta("RPAD", FuncCategory::String, 3, 3, true),
 ];
 
 const fn meta(
@@ -91,6 +112,21 @@ pub fn implemented_names() -> Vec<&'static str> {
         .filter(|f| f.implemented)
         .map(|f| f.name)
         .collect()
+}
+
+/// TiDB `expression.Check`: invoking a native function with a parameter count
+/// outside its declared `[min_args, max_args]` fails with 1582
+/// (`ErrWrongParamcountToNativeFct`). Returns the accepted bounds on mismatch.
+pub fn check_arg_count(name: &str, argc: usize) -> Result<(), (i8, i8)> {
+    let Some(meta) = lookup(name) else {
+        return Ok(());
+    };
+    let too_few = argc < meta.min_args as usize;
+    let too_many = meta.max_args >= 0 && argc > meta.max_args as usize;
+    if too_few || too_many {
+        return Err((meta.min_args, meta.max_args));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
