@@ -435,11 +435,20 @@ impl PlanBuilder {
                     }
                     // `ORDER BY` an index key prefix reads the index in key
                     // order, so the sort is already satisfied. A multi-partition
-                    // read returns rows partition by partition, so it is not.
-                    let index_order = !select_spans_multiple_partitions(select, is, current_db)
+                    // read returns rows partition by partition, so it is not —
+                    // unless the read walks a GLOBAL index, which is one ordered
+                    // index shared by every partition.
+                    let index_order = (!select_spans_multiple_partitions(select, is, current_db)
+                        || plan_reads_global_index(&plan, select, is, current_db))
                         && plan_provides_order(select, &plan);
                     if index_order {
                         plan = set_index_range_keep_order(plan);
+                        // A GLOBAL index read restores each row through the
+                        // partition id, so TiDB projects the table columns back
+                        // above the lookup (`Projection → IndexLookUp`).
+                        if plan_reads_global_index(&plan, select, is, current_db) {
+                            plan = wrap_global_index_projection(plan, select, is, current_db);
+                        }
                     }
                     // `ORDER BY` a prefix of the point-get key needs no Sort: the
                     // single-row lookup already returns rows in key order.
@@ -20605,7 +20614,11 @@ fn access_plan_inner(
                     {
                         return plan;
                     }
-                    return index_plan(select, from, info, index, prune_mode, &join_keys);
+                    // The hint fixes the access path, but TiDB still drops the
+                    // `Sort` when `ORDER BY` is a prefix of that index.
+                    return ordered_index_plan(
+                        select, from, info, index, prune_mode, &join_keys, stats, current_db,
+                    );
                 }
             }
         }
@@ -21425,6 +21438,95 @@ fn handle_range_covers_domain(
     }
 }
 
+/// `ORDER BY` a prefix of `index`'s key columns: TiDB reads the index in key
+/// order (`IndexFullScan … keep order:true`) so the `Sort` disappears. The
+/// access path itself is already fixed (hint / costing), so this only rewrites
+/// the read's order flag. A GLOBAL index is a single ordered index across the
+/// partitions, so `partition:all` keeps its order too.
+fn ordered_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    prune_mode: PartitionPruneMode,
+    join_keys: &[String],
+    stats: Option<&Handle>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let plan = index_plan(select, from, info, index, prune_mode, join_keys);
+    if select.selection.is_some() || select.order_by.is_empty() {
+        return plan;
+    }
+    let keys = index_key_column_names(info, index);
+    let mut chain = keys.iter();
+    for item in &select.order_by {
+        // `keep order:true, desc` needs the reverse scan; only ascending is modeled.
+        if item.desc {
+            return plan;
+        }
+        let ExprNode::Column(col) = &item.expr else {
+            return plan;
+        };
+        match chain.next() {
+            Some(key) if key.eq_ignore_ascii_case(&col.name) => {}
+            _ => return plan,
+        }
+    }
+    if partition_read_spans_multiple(info, from) && !index.global {
+        return plan;
+    }
+    let PhysicalPlan::IndexLookUpReader {
+        table,
+        index: index_name,
+        index_columns,
+        partitions,
+        partition_access,
+        row_count,
+        selection_info,
+        probe_selection_info,
+        probe_est,
+        range_scan,
+        pushed,
+    } = plan
+    else {
+        return plan;
+    };
+    if range_scan.is_some() {
+        // A decided range keeps its own access path / order flag.
+        return PhysicalPlan::IndexLookUpReader {
+            table,
+            index: index_name,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            selection_info,
+            probe_selection_info,
+            probe_est,
+            range_scan,
+            pushed,
+        };
+    }
+    PhysicalPlan::IndexLookUpReader {
+        table,
+        index: index_name,
+        index_columns,
+        partitions,
+        partition_access,
+        // The cop task sizes the full index scan at the table's row count.
+        row_count: table_row_count(stats, from, current_db),
+        selection_info,
+        probe_selection_info,
+        probe_est,
+        range_scan,
+        pushed: if in_explain_build() {
+            Some(bytes_info("KEEP_ORDER"))
+        } else {
+            pushed
+        },
+    }
+}
+
 /// `ORDER BY` a secondary index key prefix: TiDB reads the index in key order
 /// and probes the table for the remaining columns
 /// (`IndexLookUp → IndexFullScan(Build) keep order:true / TableRowIDScan(Probe)`),
@@ -21480,9 +21582,10 @@ fn order_by_index_plan(
         return None;
     }
     let mut plan = index_plan(select, from, info, index, prune_mode, join_keys);
-    if partition_read_spans_multiple(info, from) {
+    if partition_read_spans_multiple(info, from) && !index.global {
         // Rows arrive partition by partition, so the index keys only order each
-        // partition, not the whole result.
+        // partition, not the whole result. A GLOBAL index is one ordered index
+        // across the partitions, so `keep order:true` still holds.
         return None;
     }
     if let PhysicalPlan::IndexLookUpReader {
@@ -21524,6 +21627,54 @@ fn select_spans_multiple_partitions(
     let (db, table) = from.qualified(current_db);
     is.and_then(|schema| schema.table_by_name(&db, &table))
         .is_some_and(|info| partition_read_spans_multiple(info, from))
+}
+
+/// A GLOBAL index lookup prints its columns back through a `Projection`
+/// (`Projection → IndexLookUp`), like TiDB's global-index reader schema.
+fn wrap_global_index_projection(
+    plan: PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    if !matches!(plan, PhysicalPlan::IndexLookUpReader { .. }) || !is_star_select(select) {
+        return plan;
+    }
+    let exprs = star_projection_exprs(select, is, current_db);
+    if exprs.is_empty() {
+        return plan;
+    }
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+        est_rows: None,
+    }
+}
+
+/// The plan's index read walks a GLOBAL index `(name, partition)` map, so its
+/// keys are ordered across partitions (`partition:all` keeps key order).
+fn plan_reads_global_index(
+    plan: &PhysicalPlan,
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
+    let index = match plan {
+        PhysicalPlan::IndexLookUpReader { index, .. }
+        | PhysicalPlan::IndexReader { index, .. } => index,
+        _ => return false,
+    };
+    let Some(from) = select.from.as_ref() else {
+        return false;
+    };
+    let (db, table) = from.qualified(current_db);
+    is.and_then(|schema| schema.table_by_name(&db, &table))
+        .and_then(|info| {
+            info.indices
+                .iter()
+                .find(|idx| idx.name.o().eq_ignore_ascii_case(index))
+        })
+        .is_some_and(|idx| idx.global)
 }
 
 /// The plan already yields its rows in `ORDER BY` order (a full index read

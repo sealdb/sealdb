@@ -1542,7 +1542,7 @@
     {
       "name": "globalindex/update",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/update.test",
       "result": "r/globalindex/update.result",
       "has_result": true,

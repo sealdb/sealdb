@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-13（green 51 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-13（green 52 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -1993,6 +1993,22 @@
 - **下一步**:
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
+
+### 2026-11-13（`globalindex/update` 转正：GLOBAL 索引保持键序）
+
+- **Phase**: R7
+- **完成**:
+  - 分区表上的 GLOBAL 索引是跨分区唯一有序的索引，`ORDER BY` 命中其键前缀时
+    TiDB 不再插入 `Sort`：`IndexFullScan keep order:true`（`partition:all` 照常打印）。
+  - `USE INDEX` 分支不再直接返回 `index_plan`：新增 `ordered_index_plan` 在访问路径
+    已定时仅改写读端顺序标记，并保留多分区读的键序豁免（LOCAL 索引仍然拒绝）。
+  - 选择率层同步放开 `select_spans_multiple_partitions` 对 GLOBAL 索引的否决，
+    并在有序 GLOBAL 索引查找上补 `Projection → IndexLookUp`（恢复行 schema）。
+- **验证**:
+  - `-t globalindex/update --status pending` Memory `PASS`、TiKV `PASS`
+  - green 闸门 52/52（Memory + TiKV）
+- **下一步**:
+  - R3 `explain_easy` / `explain_complex` / `explain_complex_stats` / `explain_join_stats`
 
 ### 2026-11-13（`planner/cardinality/trace` 转正：CE trace 输出）
 
