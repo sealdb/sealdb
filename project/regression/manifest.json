@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 56,
-      "pending": 174,
+      "green": 57,
+      "pending": 173,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -226,7 +226,7 @@
     {
       "name": "ddl/column_modify",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/column_modify.test",
       "result": "r/ddl/column_modify.result",
       "has_result": true,

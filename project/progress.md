@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 56 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 57 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2320,6 +2320,46 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - 已添加 `tools/spikes/tikv-client`（乐观事务最小示例 + 能力清单）。
 - 当前环境未运行 PD/TiKV，且 rsproxy 索引缺少 `web-sys 0.3.106`，编译验证暂未完成。
 - 解除条件：启动 v8.5.8 集群，或切换可用的 crates 稀疏索引/降级 web-sys。
+
+---
+
+### 2026-11-14（`ddl/column_modify` 转正：生成列 DDL 约束 + 字面量默认值归一）
+
+- **Phase**: R6（DDL 波）
+- **完成**:
+  - 生成列 DDL 约束按 TiDB 补齐：1582（`lower(a, 2)` 之类内建函数实参个数）、
+    3106（改 STORED/VIRTUAL 状态、改 STORED 列表达式、改被索引列的表达式、
+    `ADD COLUMN … STORED`、虚拟生成列做 PRIMARY KEY）、3107（引用定义在其后的
+    *生成* 列；基础列在其后不算）、3108（删除/修改被生成列依赖的列）、
+    1265（`MODIFY … NOT NULL` 重扫旧行遇到 NULL）
+  - `SHOW CREATE TABLE` / `DESC`：生成列输出
+    `GENERATED ALWAYS AS (<expr>) VIRTUAL|STORED` 与
+    `VIRTUAL GENERATED` / `STORED GENERATED` Extra（不再落成 `DEFAULT NULL`）
+  - `CAST(x AS CHAR CHARSET cs)` 在 bridge 里改写为内部标记再降级成
+    `FuncCastExpr`（sqlparser 无该子句）；`CHANGE/MODIFY` 的
+    `CHARACTER SET` / `COLLATE` 选项一并落到 `AlterTableSpec`
+  - 生成列表达式持久化文本里的反斜杠按 MySQL 字面量规则转义
+    （`_utf8mb4'\\'` 回读不再 `Unterminated string literal`）
+  - 字面量默认值归一：`int DEFAULT 0.00` → `'0'`、`int DEFAULT 2.8` →
+    `'3'`、`float DEFAULT '0012.32'` → `'12.32'`、`b'1'` → `'1'`；与列族
+    一致的数字字面量保持原样（`int DEFAULT 1`、`double DEFAULT 1.0`）；
+    `ALTER TABLE` 重建后整表字面量默认值重新求值并加引号（TiDB 行为）
+  - 修改虚拟生成列表达式后按新表达式重算已物理存储的列值（TiDB 惰性读，
+    本引擎物化存储）；无长度字符串列渲染为 `text`
+  - 视图里 `CAST(… AS CHAR(n))` 的列类型按 TiDB 记为 `varchar(n)`
+  - 顺手修复 gate 回归：3107 只拦「引用其后定义生成列」，`admin check` 的
+    `k json` 定义在生成列之后仍然合法；`BIT(2) DEFAULT b'111'` 仍按位宽报 1067
+- **验证**:
+  - `run-tests.sh -s memory -t ddl/column_modify --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t ddl/column_modify --status pending -k` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh -s memory` → `PASS: memory=65 skipped=189`
+  - gate 复验 `run-tests.sh -s tikv -k` → `PASS: tikv=64 skipped=190`
+  - manifest `ddl/column_modify` → `green`，green 56→57
+- **阻塞/风险**:
+  - 无；后续按 R6 继续 `ddl/column_type_change` / `ddl/db_table` /
+    `ddl/default_as_expression`
+- **下一步**:
+  - 继续 R6：`ddl/column_type_change` / `ddl/db_table` / `ddl/table_modify`
 
 ---
 
