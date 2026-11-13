@@ -2552,7 +2552,7 @@
     {
       "name": "util/admin",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/util/admin.test",
       "result": "r/util/admin.result",
       "has_result": true,

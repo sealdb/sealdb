@@ -21,6 +21,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_WARN_DATA_TRUNCATED => "ErrWarnDataTruncated",
         errcode::ERR_TRUNCATED_WRONG_VALUE => "ErrTruncatedWrongValue",
         errcode::ERR_UNKNOWN_FUNCTION => "ErrUnknownFunction",
+        errcode::ERR_INVALID_JSON_TEXT => "ErrInvalidJSONText",
         errcode::ERR_WRONG_ARGUMENTS => "ErrWrongArguments",
         errcode::ERR_UNSUPPORTED => "ErrNotSupportedYet",
         errcode::ERR_DIVISION_BY_ZERO => "ErrDivisionByZero",

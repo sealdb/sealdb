@@ -824,6 +824,12 @@ pub enum AlterTableSpec {
     Algorithm(String),
     /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
     Lock(String),
+    /// `ENGINE = InnoDB` / `ROW_FORMAT = DYNAMIC` table option in an
+    /// `ALTER TABLE` spec list — accepted and ignored (storage-level only).
+    TableOption {
+        name: String,
+        value: String,
+    },
     /// `ADD PARTITION (PARTITION ...)` for RANGE/LIST tables.
     AddPartition {
         defs: Vec<PartitionDef>,
@@ -932,6 +938,12 @@ impl AlterTableSpec {
             AlterTableSpec::Lock(name) => {
                 ctx.write_str("LOCK=");
                 ctx.write_str(name);
+                Ok(())
+            }
+            AlterTableSpec::TableOption { name, value } => {
+                ctx.write_str(name);
+                ctx.write_str("=");
+                ctx.write_str(value);
                 Ok(())
             }
             AlterTableSpec::AddPartition { defs } => {

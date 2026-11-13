@@ -118,8 +118,11 @@ pub fn alter_table(
             AlterTableSpec::AlterIndexVisibility { name, invisible } => {
                 alter_index_visibility(meta, &snapshot, stmt, name, *invisible, current_db)?
             }
-            // ALGORITHM/LOCK are accepted and ignored; SealDB DDL is in-place.
-            AlterTableSpec::Algorithm(_) | AlterTableSpec::Lock(_) => {}
+            // ALGORITHM/LOCK and storage table options are accepted and
+            // ignored; SealDB DDL is in-place and engine-independent.
+            AlterTableSpec::Algorithm(_)
+            | AlterTableSpec::Lock(_)
+            | AlterTableSpec::TableOption { .. } => {}
             AlterTableSpec::AddPartition { defs } => {
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
             }

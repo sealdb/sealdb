@@ -1171,6 +1171,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         }
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
+        "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
         "UNIX_TIMESTAMP" => eval_unix_timestamp(func, schema, row),
@@ -1226,6 +1227,109 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
 }
 
 /// MySQL `WEEKDAY`: Monday = 0 .. Sunday = 6.
+/// MySQL `JSON_EXTRACT(doc, path[, path…])`: the first matching JSON value.
+/// JSON columns are stored as text, so numbers/strings/null map onto the
+/// matching `Datum` and containers keep their JSON text (callers cast).
+fn eval_json_extract(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires at least 2 arguments", func.name),
+        ));
+    }
+    let doc = eval_expr_with_row(&func.args[0], schema, row)?;
+    if doc.is_null() {
+        return Ok(Datum::Null);
+    }
+    let doc_bytes = doc.as_bytes();
+    let parsed: serde_json::Value = serde_json::from_slice(&doc_bytes).map_err(|_| {
+        Error::new(
+            sealdb_errno::ERR_INVALID_JSON_TEXT,
+            format!(
+                "Invalid JSON text in argument 1 to function {}: \"{}\".",
+                func.name.to_ascii_lowercase(),
+                String::from_utf8_lossy(&doc_bytes)
+            ),
+        )
+    })?;
+    for arg in &func.args[1..] {
+        let path = eval_expr_with_row(arg, schema, row)?;
+        if path.is_null() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).to_string();
+        if let Some(value) = json_path_get(&parsed, &path) {
+            return Ok(json_scalar_datum(value));
+        }
+    }
+    Ok(Datum::Null)
+}
+
+/// Resolve a MySQL JSON path (`$.a.b`, `$[0]`, `$.a[1].b`) against a document.
+fn json_path_get<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut rest = path.trim();
+    if let Some(stripped) = rest.strip_prefix('$') {
+        rest = stripped;
+    }
+    let mut current = value;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch == '.' {
+            let start = chars.peek().map(|(i, _)| *i)?;
+            let mut end = start;
+            for (i, c) in chars.by_ref() {
+                if c == '.' || c == '[' {
+                    end = i;
+                    break;
+                }
+                end = i + c.len_utf8();
+            }
+            let key = &rest[start..end];
+            current = current.get(key)?;
+        } else if ch == '[' {
+            let start = chars.peek().map(|(i, _)| *i)?;
+            let mut end = start;
+            for (i, c) in chars.by_ref() {
+                if c == ']' {
+                    end = i;
+                    break;
+                }
+                end = i + c.len_utf8();
+            }
+            let index: usize = rest[start..end].parse().ok()?;
+            current = current.get(index)?;
+        } else {
+            return None;
+        }
+    }
+    Some(current)
+}
+
+/// Coerce a JSON value to the closest `Datum` scalar.
+fn json_scalar_datum(value: &serde_json::Value) -> Datum {
+    match value {
+        serde_json::Value::Null => Datum::Null,
+        serde_json::Value::Bool(b) => Datum::I64(i64::from(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Datum::I64(i)
+            } else if let Some(u) = n.as_u64() {
+                Datum::U64(u)
+            } else {
+                let text = n.to_string();
+                match sealdb_types::MyDecimal::parse(&text) {
+                    Ok(d) => Datum::Decimal(d),
+                    Err(_) => Datum::F64(n.as_f64().unwrap_or(0.0)),
+                }
+            }
+        }
+        serde_json::Value::String(s) => Datum::Bytes(s.clone().into_bytes()),
+        other => Datum::Bytes(
+            serde_json::to_vec(other).unwrap_or_else(|_| b"null".to_vec()),
+        ),
+    }
+}
+
 fn weekday_of(t: &Time) -> i64 {
     // 1970-01-01 was a Thursday (WEEKDAY 3).
     (days_from_civil(t.year, t.month, t.day) + 3).rem_euclid(7)

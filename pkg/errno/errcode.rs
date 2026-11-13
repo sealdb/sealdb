@@ -25,6 +25,8 @@ pub const ERR_TIMESTAMP_IN_DST_TRANSITION: i32 = 8179;
 /// TiDB `ErrMemoryExceedForQuery`: statement exceeded `tidb_mem_quota_query`.
 pub const ERR_MEMORY_EXCEEDED: i32 = 8175;
 pub const ERR_UNKNOWN_FUNCTION: i32 = 1305;
+/// TiDB `ErrInvalidJSONText`: malformed JSON document (3141).
+pub const ERR_INVALID_JSON_TEXT: i32 = 3141;
 pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
 pub const ERR_UNSUPPORTED: i32 = 1235;
 pub const ERR_DIVISION_BY_ZERO: i32 = 1365;

@@ -202,6 +202,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                         .specs
                         .push(AlterTableSpec::ExchangePartition { partition, table });
                 }
+                AlterPartOp::Options(options) => {
+                    for (name, value) in options {
+                        alter.specs.push(AlterTableSpec::TableOption { name, value });
+                    }
+                }
             }
         }
         if let Statement::Prepare(prepare) = &mut lowered
@@ -5783,6 +5788,67 @@ enum AlterPartOp {
     Add(Vec<PartitionDef>),
     Drop { if_exists: bool, names: Vec<String> },
     Exchange { partition: String, table: TableName },
+    Options(Vec<(String, String)>),
+}
+
+/// `ALTER TABLE` table options TiDB accepts in the spec list
+/// (`engine=innodb, ROW_FORMAT=DYNAMIC, …`); sqlparser only knows DDL ops.
+const ALTER_TABLE_OPTION_KEYWORDS: &[&str] = &[
+    "ENGINE",
+    "ROW_FORMAT",
+    "CHARSET",
+    "COLLATE",
+    "AUTO_INCREMENT",
+    "COMMENT",
+    "COMPRESSION",
+    "AVG_ROW_LENGTH",
+    "CHECKSUM",
+    "DELAY_KEY_WRITE",
+    "STATS_PERSISTENT",
+    "STATS_AUTO_RECALC",
+    "PACK_KEYS",
+    "PASSWORD",
+    "ENCRYPTION",
+    "INSERT_METHOD",
+    "KEY_BLOCK_SIZE",
+    "MAX_ROWS",
+    "MIN_ROWS",
+    "SECONDARY_ENGINE",
+    "SHARD_ROW_ID_BITS",
+    "PRE_SPLIT_REGIONS",
+    "TIFLASH_REPLICA",
+];
+
+/// Parse a raw `ALTER TABLE` spec list consisting only of table options:
+/// `engine=innodb, ROW_FORMAT=DYNAMIC`. Returns `None` when any part is not a
+/// known option assignment, so real DDL specs are left to sqlparser.
+fn parse_alter_table_options(body: &str) -> Option<Vec<(String, String)>> {
+    let mut options = Vec::new();
+    for raw in split_defs(body) {
+        let item = raw.trim();
+        if item.is_empty() {
+            return None;
+        }
+        let item_bytes = item.as_bytes();
+        let name_end = skip_ident_or_quoted(item_bytes, skip_ws(item_bytes, 0));
+        let name = item[..name_end].trim().trim_matches('`');
+        if !ALTER_TABLE_OPTION_KEYWORDS
+            .iter()
+            .any(|kw| kw.eq_ignore_ascii_case(name))
+        {
+            return None;
+        }
+        let mut j = skip_ws(item_bytes, name_end);
+        if j < item_bytes.len() && item_bytes[j] == b'=' {
+            j = skip_ws(item_bytes, j + 1);
+        }
+        let value = item[j..].trim().to_string();
+        if value.is_empty() {
+            return None;
+        }
+        options.push((name.to_ascii_uppercase(), value));
+    }
+    (!options.is_empty()).then_some(options)
 }
 
 /// sqlparser MySQL dialect rejects `ADD/DROP PARTITION`; strip and re-attach.
@@ -5803,6 +5869,18 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     after_name
                 };
                 let after_name = skip_ws(bytes, after_name);
+                // `ALTER TABLE t engine=innodb, ROW_FORMAT=DYNAMIC` — a bare
+                // option list sqlparser has no grammar for; keep the options
+                // as ignored specs.
+                let end = stmt_end(bytes, after_name);
+                let body = std::str::from_utf8(&bytes[after_name..end]).unwrap_or_default();
+                if let Some(options) = parse_alter_table_options(body) {
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::Options(options)));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
                 if keyword_at(bytes, after_name, "ADD") {
                     let after_add = skip_ws(bytes, after_name + "ADD".len());
                     if keyword_at(bytes, after_add, "PARTITION") {

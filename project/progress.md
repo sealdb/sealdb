@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-13（green 49 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-13（green 50 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -1993,6 +1993,25 @@
 - **下一步**:
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
+
+### 2026-11-13（`util/admin` 转正：ALTER TABLE 表选项 + JSON_EXTRACT）
+
+- **Phase**: R7
+- **完成**:
+  - `ALTER TABLE t engine=innodb, ROW_FORMAT=DYNAMIC` 这类纯表选项语法：桥接层
+    识别 `ENGINE` / `ROW_FORMAT` / `CHARSET` / `COMMENT` / `AUTO_INCREMENT` 等
+    选项赋值，改写为可解析的 `ALGORITHM=INPLACE` 并挂上
+    `AlterTableSpec::TableOption`（DDL 侧接受并忽略，存储无关）。
+  - 新增 `JSON_EXTRACT(doc, path…)`（含 `JSON_EXTRACT_SCALAR` 别名）：解析 JSON
+    文本、按 `$.a.b` / `$[n]` 路径取值；标量映射到对应 `Datum`（整数 / 无符号 /
+    Decimal / 字符串），容器保留 JSON 文本；非法文档报 3141。
+  - 于是 `GENERATED ALWAYS AS (JSON_EXTRACT(k,'$.x'))` 的 INT / DOUBLE /
+    DECIMAL / CHAR / DATE / TIME / DATETIME / TIMESTAMP / YEAR 生成列在
+    `INSERT … SET k='{…}'` 时按列类型强转，`ADMIN CHECK TABLE` 全绿。
+- **验证**:
+  - `-t util/admin --status pending` Memory `PASS`、TiKV `PASS`
+- **下一步**:
+  - `planner/cardinality/trace`（3 行）与 `globalindex/update`（8 行）
 
 ### 2026-11-13（`infoschema/v2` 转正：`TIDB_TABLE_ID` 与 TiDB 虚拟表 ID 映射）
 
