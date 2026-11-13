@@ -1994,6 +1994,26 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（`parser/integration` + `ddl/fail_db` 转正：SET_VAR / 日期文案 / MODIFY 溢出告警）
+
+- **Phase**: R6/R7
+- **完成**:
+  - 实现 `/*+ SET_VAR(var=value) */` 的语句级会话变量覆盖（先支持 `sql_mode`），
+    语句执行后恢复原值，与 TiDB 的单语句作用域一致。
+  - `ALLOW_INVALID_DATES`：DATE/DATETIME 列写入时放宽日期合法性（月 1–12、
+    日 1–31），`'2004-04-31'` 按字面值存储。
+  - 列类型转换失败的错误文案改为 TiDB 的
+    `Incorrect date|datetime value: '…' for column '…' at row 1`。
+  - `ALTER TABLE … MODIFY` 收窄整数类型时不再静默保留超界值：按 `(min, max)`
+    截断并记录 1690 `constant <v> overflows <type>` 告警；DDL 结束后按
+    TiDB `ReorgMeta` 规则聚合为 `<n> warnings with this error code, first warning: …`。
+- **验证**:
+  - 两套单独跑 Memory + TiKV 均 `PASS`
+  - `--status green` 双引擎：`PASS: memory=48` / `PASS: tikv=48`
+- **下一步**:
+  - `util/admin`（4 行）与 `planner/cardinality/trace`（3 行）继续扫尾；
+    `partition` 需要 `CREATE PLACEMENT POLICY` 与 `ALTER … PARTITION BY` 语法
+
 ### 2026-11-13（`session/txn` + `executor/adapter` 转正：USER_VAR 求值 + TIMESTAMPDIFF）
 
 - **Phase**: R5/R7

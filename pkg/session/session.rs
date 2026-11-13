@@ -220,9 +220,28 @@ impl Session {
         }
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
-            out.push(self.execute_one(&stmt)?);
+            // `/*+ SET_VAR(var=value) */` applies to this statement only.
+            let previous_sql_mode = self.begin_set_var_hint(sql);
+            let result = self.execute_one(&stmt);
+            self.end_set_var_hint(previous_sql_mode);
+            out.push(result?);
         }
         Ok(out)
+    }
+
+    /// TiDB `SET_VAR` optimizer hint: apply the listed session variables for a
+    /// single statement. The suite corpus only exercises `sql_mode`, so other
+    /// names are ignored rather than rejected.
+    fn begin_set_var_hint(&self, sql: &str) -> Option<String> {
+        let sql_mode = set_var_hint_sql_mode(sql)?;
+        let mut slot = self.sql_mode.lock().expect("session sql_mode lock");
+        Some(std::mem::replace(&mut *slot, sql_mode))
+    }
+
+    fn end_set_var_hint(&self, previous: Option<String>) {
+        if let Some(previous) = previous {
+            *self.sql_mode.lock().expect("session sql_mode lock") = previous;
+        }
     }
 
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
@@ -2326,6 +2345,39 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
     Err(Error::unsupported(format!(
         "AS OF TIMESTAMP with expression {text}"
     )))
+}
+
+/// `/*+ SET_VAR(name=value) */` extracted for the statement, honoring quoted
+/// values so a `sql_mode` list keeps its commas.
+fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
+    let mut rest = sql;
+    while let Some(pos) = rest.find("/*") {
+        rest = &rest[pos + 2..];
+        let Some(open) = rest.find("SET_VAR").or_else(|| rest.find("set_var")) else {
+            continue;
+        };
+        let after = rest[open..].find('(')? + open;
+        let args = &rest[after + 1..];
+        let mut value = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = args.chars();
+        while let Some(ch) = chars.next() {
+            match quote {
+                Some(q) if ch == q => quote = None,
+                Some(_) => value.push(ch),
+                None if ch == '\'' || ch == '"' => quote = Some(ch),
+                None if ch == ')' => break,
+                None => value.push(ch),
+            }
+        }
+        if let Some((name, val)) = value.split_once('=')
+            && name.trim().eq_ignore_ascii_case("sql_mode")
+        {
+            return Some(val.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+        }
+        rest = &rest[after + 1..];
+    }
+    None
 }
 
 /// `SET @var = <value>`: TiDB evaluates the right-hand side as an expression

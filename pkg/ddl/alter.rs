@@ -497,6 +497,7 @@ fn rewrite_column_rows(
 ) -> Result<()> {
     let old_types = info.col_field_types();
     let mut txn = storage.begin()?;
+    let mut reorg_warnings: Vec<(i32, String)> = Vec::new();
     for physical_id in info.physical_ids() {
         let start = gen_table_record_prefix(physical_id);
         let end = next_prefix(start.as_bytes());
@@ -512,7 +513,7 @@ fn rewrite_column_rows(
                     .map(|(_, v)| v.clone())
                     .unwrap_or(sealdb_types::Datum::Null);
                 if col.id == col_id {
-                    value = convert_column_value(&value, new_ft)?;
+                    value = convert_column_value(&value, new_ft, &mut reorg_warnings)?;
                 }
                 col_ids.push(col.id);
                 values.push(value);
@@ -520,14 +521,81 @@ fn rewrite_column_rows(
             txn.set(&key, &encode_row(&col_ids, &values))?;
         }
     }
-    txn.commit()
+    txn.commit()?;
+    push_reorg_warnings(&reorg_warnings);
+    Ok(())
+}
+
+/// TiDB collects reorg warnings per error code and hands them to the statement
+/// once the job finishes: one occurrence is reported verbatim, several collapse
+/// into `<n> warnings with this error code, first warning: <first>`.
+fn push_reorg_warnings(warnings: &[(i32, String)]) {
+    let mut order: Vec<i32> = Vec::new();
+    let mut counts: std::collections::HashMap<i32, (usize, &str)> = std::collections::HashMap::new();
+    for (code, message) in warnings {
+        let entry = counts.entry(*code).or_insert_with(|| {
+            order.push(*code);
+            (0, message.as_str())
+        });
+        entry.0 += 1;
+    }
+    for code in order {
+        let (count, first) = counts[&code];
+        let message = if count == 1 {
+            first.to_string()
+        } else {
+            format!("{count} warnings with this error code, first warning: {first}")
+        };
+        sealdb_expression::note_warning(code, message);
+    }
+}
+
+/// Integer bounds enforced when a `MODIFY`/`CHANGE` narrows the column type.
+fn integer_bounds(ft: &FieldType) -> Option<(i128, i128)> {
+    let (min, max) = match ft.tp {
+        sealdb_types::field_type::TYPE_TINY => (-128i128, 127i128),
+        sealdb_types::field_type::TYPE_SHORT => (-32_768, 32_767),
+        sealdb_types::field_type::TYPE_INT24 => (-8_388_608, 8_388_607),
+        sealdb_types::field_type::TYPE_LONG => (i64::from(i32::MIN) as i128, i64::from(i32::MAX) as i128),
+        sealdb_types::field_type::TYPE_LONG_LONG => (i64::MIN as i128, i64::MAX as i128),
+        _ => return None,
+    };
+    if ft.is_unsigned() {
+        Some((0, max * 2 + 1))
+    } else {
+        Some((min, max))
+    }
 }
 
 fn convert_column_value(
     value: &sealdb_types::Datum,
     ft: &FieldType,
+    reorg_warnings: &mut Vec<(i32, String)>,
 ) -> Result<sealdb_types::Datum> {
     let mut out = value.cast(ft)?;
+    // Non-strict reorg clamps an out-of-range constant and records a 1690
+    // warning instead of failing the `ALTER`.
+    if let Some((min, max)) = integer_bounds(ft) {
+        let observed = match &out {
+            sealdb_types::Datum::I64(v) => Some(*v as i128),
+            sealdb_types::Datum::U64(v) => Some(*v as i128),
+            _ => None,
+        };
+        if let Some(observed) = observed
+            && (observed < min || observed > max)
+        {
+            reorg_warnings.push((
+                sealdb_errno::ERR_DATA_OUT_OF_RANGE,
+                format!("constant {observed} overflows {}", ft.type_name()),
+            ));
+            let clamped = observed.clamp(min, max);
+            out = if min >= 0 {
+                sealdb_types::Datum::U64(clamped as u64)
+            } else {
+                sealdb_types::Datum::I64(clamped as i64)
+            };
+        }
+    }
     if ft.eval_type() == EvalType::String
         && ft.flen > 0
         && let sealdb_types::Datum::Bytes(bytes) = &mut out

@@ -1,7 +1,7 @@
 use super::kv::{LockWait, RowLock, Storage, Transaction};
 use sealdb_errno::{
-    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION,
-    ERR_WRITE_CONFLICT, Error, Result,
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_FUNCTION, Error,
+    Result,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};

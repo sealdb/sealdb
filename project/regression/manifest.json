@@ -376,7 +376,7 @@
     {
       "name": "ddl/fail_db",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/fail_db.test",
       "result": "r/ddl/fail_db.result",
       "has_result": true,
@@ -1752,7 +1752,7 @@
     {
       "name": "parser/integration",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/parser/integration.test",
       "result": "r/parser/integration.result",
       "has_result": true,

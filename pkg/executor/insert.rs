@@ -6,8 +6,8 @@ use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_NO_DB,
     ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED,
-    ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_PARTITION,
+    ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -15,7 +15,7 @@ use sealdb_parser::ast::InsertStmt;
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_types::EnumValue;
-use sealdb_types::field_type::{FieldType, TYPE_ENUM, TYPE_SET};
+use sealdb_types::field_type::{FieldType, TYPE_DATE, TYPE_DATETIME, TYPE_ENUM, TYPE_SET, TYPE_TIMESTAMP};
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
 
@@ -569,7 +569,19 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
     if matches!(col.field_type.tp, TYPE_ENUM | TYPE_SET) {
         return cast_enum_set(v, &col.field_type, col.name.o());
     }
-    let mut out = v.cast(&col.field_type)?;
+    // `ALLOW_INVALID_DATES` keeps a valid year/month with an out-of-range day
+    // (`2004-04-31`); TiDB stores the wall date as written.
+    if is_temporal(col.field_type.tp)
+        && sealdb_expression::sql_mode_flag("ALLOW_INVALID_DATES")
+        && let Datum::Bytes(bytes) = v
+        && let Some(t) = relaxed_temporal(&String::from_utf8_lossy(bytes), col.field_type.tp)
+    {
+        return Ok(Datum::Time(t));
+    }
+    let mut out = match v.cast(&col.field_type) {
+        Ok(out) => out,
+        Err(err) => return Err(temporal_column_error(v, col, err)),
+    };
     // TIMESTAMP columns store UTC; session wall clock → UTC on write.
     if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
         && let Datum::Time(t) = out
@@ -587,6 +599,94 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
 fn strict_sql_mode() -> bool {
     sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
         || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES")
+}
+
+fn is_temporal(tp: u8) -> bool {
+    matches!(tp, TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP)
+}
+
+/// TiDB `ErrTruncatedWrongValueForField` for a DATE/DATETIME column: the
+/// message names the column and the 1-based row of the failing value.
+fn temporal_column_error(v: &Datum, col: &sealdb_meta::ColumnInfo, err: Error) -> Error {
+    if err.code != ERR_TRUNCATED_WRONG_VALUE || !is_temporal(col.field_type.tp) {
+        return err;
+    }
+    let Datum::Bytes(bytes) = v else {
+        return err;
+    };
+    let kind = if col.field_type.tp == TYPE_DATE {
+        "date"
+    } else {
+        "datetime"
+    };
+    Error::new(
+        ERR_TRUNCATED_WRONG_VALUE,
+        format!(
+            "Incorrect {kind} value: '{}' for column '{}' at row 1",
+            String::from_utf8_lossy(bytes),
+            col.name.o()
+        ),
+    )
+}
+
+/// `ALLOW_INVALID_DATES`: accept `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` while only
+/// range-checking month (1-12) and day (1-31), the two fields MySQL keeps
+/// strict under that mode.
+fn relaxed_temporal(s: &str, tp: u8) -> Option<sealdb_types::Time> {
+    let s = s.trim();
+    let (date, clock) = match s.split_once([' ', 'T']) {
+        Some((date, clock)) => (date, Some(clock.trim())),
+        None => (s, None),
+    };
+    let mut date_parts = date.split('-');
+    let year: u16 = date_parts.next()?.parse().ok()?;
+    let month: u8 = date_parts.next()?.parse().ok()?;
+    let day: u8 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, minute, second, micro) = match clock {
+        Some(clock) => {
+            let mut clock_parts = clock.split(':');
+            let hour: u8 = clock_parts.next()?.parse().ok()?;
+            let minute: u8 = clock_parts.next()?.parse().ok()?;
+            let sec_part = clock_parts.next()?;
+            let (sec, frac) = match sec_part.split_once('.') {
+                Some((sec, frac)) => (sec, Some(frac)),
+                None => (sec_part, None),
+            };
+            let second: u8 = sec.parse().ok()?;
+            if clock_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            let micro = match frac {
+                Some(frac) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
+                    let digits: String = frac.chars().take(6).collect();
+                    let padded = format!("{digits:0<6}");
+                    padded.parse::<u32>().ok()?
+                }
+                Some(_) => return None,
+                None => 0,
+            };
+            (hour, minute, second, micro)
+        }
+        None => (0, 0, 0, 0),
+    };
+    Some(sealdb_types::Time {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        micro,
+        fsp: if micro == 0 { 0 } else { 6 },
+        tp: match tp {
+            TYPE_DATE => sealdb_types::TimeType::Date,
+            TYPE_TIMESTAMP => sealdb_types::TimeType::Timestamp,
+            _ => sealdb_types::TimeType::Datetime,
+        },
+    })
 }
 
 /// MySQL treats numbers (and numeric strings) as ENUM/SET indexes.
