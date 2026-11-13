@@ -402,6 +402,32 @@ impl Session {
                 self.load_stats_file(&stmt.path)?;
                 return Ok(empty_result());
             }
+            // `TRACE PLAN TARGET='estimation'` re-plans the inner statement with
+            // CE tracing on and returns the collected records (TiDB `TraceExec`).
+            Statement::Trace(trace)
+                if trace.trace_plan
+                    && trace
+                        .target
+                        .eq_ignore_ascii_case(sealdb_executor::trace::TRACE_ESTIMATION_TARGET) =>
+            {
+                let current_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                let text = sealdb_executor::trace::estimation_trace(
+                    &self.domain,
+                    &current_db,
+                    &trace.stmt_sql,
+                )?;
+                return Ok(QueryResult {
+                    columns: vec!["CE_trace".to_string()],
+                    rows: vec![vec![sealdb_types::Datum::Bytes(text.into_bytes())]],
+                    warnings: Vec::new(),
+                    affected_rows: 0,
+                    info: String::new(),
+                });
+            }
             Statement::Binlog(_)
             | Statement::Change(_)
             | Statement::AlterInstance(_)

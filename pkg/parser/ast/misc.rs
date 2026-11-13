@@ -1171,11 +1171,13 @@ impl AlterInstanceStmt {
     }
 }
 
-/// `TRACE [PLAN] [FORMAT=…] stmt` (TiDB `TraceStmt`) — accepted no-op.
+/// `TRACE [PLAN [TARGET=…]] [FORMAT=…] stmt` (TiDB `TraceStmt`).
 #[derive(Clone, Debug)]
 pub struct TraceStmt {
     pub format: String,
     pub trace_plan: bool,
+    /// `TRACE PLAN TARGET='estimation'|'optimizer'|'debug'` payload.
+    pub target: String,
     pub stmt_sql: String,
 }
 
@@ -1184,8 +1186,13 @@ impl TraceStmt {
         ctx.write_str("TRACE ");
         if self.trace_plan {
             ctx.write_str("PLAN ");
+            if !self.target.is_empty() {
+                ctx.write_str("TARGET = ");
+                ctx.write_str(&format!("'{}'", self.target));
+                ctx.write_str(" ");
+            }
         }
-        if !self.format.is_empty() && !self.format.eq_ignore_ascii_case("row") {
+        if !self.trace_plan && !self.format.is_empty() && !self.format.eq_ignore_ascii_case("row") {
             ctx.write_str("FORMAT = ");
             ctx.write_str(&format!("'{}'", self.format));
             ctx.write_str(" ");

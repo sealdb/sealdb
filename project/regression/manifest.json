@@ -1782,7 +1782,7 @@
     {
       "name": "planner/cardinality/trace",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/cardinality/trace.test",
       "result": "r/planner/cardinality/trace.result",
       "has_result": true,

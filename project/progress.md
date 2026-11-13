@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-13（green 50 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-13（green 51 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -27,7 +27,7 @@
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/point_get` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；9 套件 `in_progress` |
-| R4–R7 | plan_cache / session / ddl / CBO | `pending` | 依赖前波 green |
+| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R7 `planner/cardinality/trace` / `util/admin` / `infoschema/v2` / globalindex 若干 green；其余依赖前波 |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
 实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
@@ -1993,6 +1993,23 @@
 - **下一步**:
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
+
+### 2026-11-13（`planner/cardinality/trace` 转正：CE trace 输出）
+
+- **Phase**: R7
+- **完成**:
+  - `TRACE PLAN TARGET='estimation' <stmt>` 解析层保留 `target`，session 命中
+    `estimation` 时重规划内层语句并以 CE trace 结果返回单列 `CE_trace`。
+  - 新增 `pkg/executor/trace.rs`：按 TiDB `CETraceRecord` 顺序输出
+    `Column Stats-Range` → `Index Stats-Range` → `Table Stats-Expression-CNF`，
+    JSON 字段序 `table_name` / `type` / `expr` / `row_count` 与 TiDB 一致
+    （表达式文本复用我们的 restore，如 `` `ge`(db.t.a, 1) ``）。
+  - runner 输出补 statement 块终止换行：当最后一格自身以 `\n` 结尾时（trace 的
+    JSON 载荷），`normalize` 后正好多出一行空行，与 TiDB 金样一致。
+- **验证**:
+  - `-t planner/cardinality/trace --status pending` Memory `PASS`、TiKV `PASS`
+- **下一步**:
+  - `globalindex/update`（8 行），随后 R3 `explain_easy` / `explain_complex*`
 
 ### 2026-11-13（`util/admin` 转正：ALTER TABLE 表选项 + JSON_EXTRACT）
 

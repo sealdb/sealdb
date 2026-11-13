@@ -784,7 +784,12 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
         chunks.push(run_step(session, step)?);
     }
     let mut out = chunks.join("\n");
-    if !out.is_empty() && !out.ends_with('\n') {
+    // mysql-tester terminates every statement block with a newline, and that
+    // terminator is on top of whatever the block already ends with. A block
+    // whose last cell carries a trailing newline (the `TRACE ... TARGET=
+    // 'estimation'` JSON payload, a DOT `explain`) therefore records one blank
+    // line in TiDB's result files.
+    if !out.is_empty() {
         out.push('\n');
     }
     Ok(out)

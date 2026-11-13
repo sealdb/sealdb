@@ -23,6 +23,7 @@ pub mod select;
 pub mod show;
 pub mod sortexec;
 pub mod table_reader;
+pub mod trace;
 pub mod unionexec;
 pub mod update;
 pub mod window;

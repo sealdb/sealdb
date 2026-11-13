@@ -4408,6 +4408,7 @@ fn parse_trace_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
     let mut format = "row".to_string();
     let mut trace_plan = false;
+    let mut target = String::new();
     if keyword_at(bytes, i, "PLAN") {
         trace_plan = true;
         i = skip_ws(bytes, i + "PLAN".len());
@@ -4416,7 +4417,8 @@ fn parse_trace_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
             if i < bytes.len() && bytes[i] == b'=' {
                 i = skip_ws(bytes, i + 1);
             }
-            let (_target, after) = read_quoted_or_ident(bytes, i);
+            let (parsed, after) = read_quoted_or_ident(bytes, i);
+            target = parsed;
             i = skip_ws(bytes, after);
         }
     }
@@ -4438,6 +4440,7 @@ fn parse_trace_stmt(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
         Statement::Trace(TraceStmt {
             format,
             trace_plan,
+            target,
             stmt_sql,
         }),
         end,
