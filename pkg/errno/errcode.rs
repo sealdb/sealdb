@@ -145,3 +145,12 @@ pub const ERR_GENERATED_COLUMN_REF_AUTO_INC: i32 = 3109;
 pub const ERR_COLUMN_WITH_GENERATED_DEPENDENCIES: i32 = 3107;
 /// TiDB `ErrFunctionalIndexOnAutoIncrementColumn` (3754).
 pub const ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT: i32 = 3754;
+/// TiDB `ErrUnsupportedModifyCharset` (8200): an existing column's character
+/// set cannot be changed, e.g. `MODIFY c VARCHAR(10) CHARACTER SET gbk`.
+pub const ERR_UNSUPPORTED_MODIFY_CHARSET: i32 = 8200;
+/// TiDB `ErrWrongParamcountToNativeFct` (1582): a builtin function is called
+/// with an argument count outside its signature, e.g. `LOWER(a, 2)`.
+pub const ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT: i32 = 1582;
+/// MySQL `ER_BLOB_CANT_HAVE_DEFAULT` (1101): a literal default on a
+/// `BLOB`/`TEXT`/`JSON` column.
+pub const ERR_BLOB_CANT_HAVE_DEFAULT: i32 = 1101;
