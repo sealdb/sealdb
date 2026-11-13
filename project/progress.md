@@ -1994,6 +1994,27 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（pending 扫底：4 套天然全绿转正）
+
+- **Phase**: R3/R7
+- **完成**:
+  - 对 190 个 `pending` 套件逐个跑 Memory，发现 4 套不需要任何代码改动即已与金样一致：
+    `ddl/exchange_partition_global_index`（R3）、`expression/enum_set`、`globalindex/insert`、
+    `globalindex/mem_index_non_unique`（R7）
+  - manifest 状态 `pending → green`，并在 status-report §11 全量清单里补齐进度列
+- **验证**:
+  - 4 套单独复验：Memory / TiKV 均 `PASS`
+  - `run-tests.sh --status green -s memory` → `PASS: memory=44 skipped=210`
+  - `run-tests.sh --status green -s tikv` → `PASS: memory=0 tikv=44 skipped=210`
+- **阻塞/风险**:
+  - 其余 186 个 pending 套件首跑均红；`rule_derive_topn_from_window` 等 window 套件受
+    `Shuffle`/`ShuffleReceiver` 并行分发形状与 `derive_topn` 规则缺失阻挡
+- **下一步**:
+  - `explain_complex` / `explain_complex_stats`（cop `HashAgg` 进 IndexLookUp 探针侧 +
+    派生表 join 顺序）与 `explain_easy` 的聚合下推共用同一根因
+  - `explain_indexmerge_stats` 仅剩 12 行，但需要 `desc` 的 planID 分配模型与
+    `utf8mb4_0900_ai_ci` collation key
+
 ### 2026-11-13（`topn_push_down` 收口：SMJ/HJ 左外 + 去关联 Apply + 多表 IndexJoin）
 
 - **Phase**: R2 join × limit（转 `green`）

@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **40 个** 登记为 `green`（R1 4 / R2 16 / R3 20），本轮复验的 40 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 20/48，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **44 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R7 3），本轮复验的 44 个在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 3/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -64,7 +64,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **40 个** �
 → PASS: memory=0 tikv=39 skipped=215
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件与 Mem 同一提交上复验通过。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），44 套件与 Mem 同一提交上复验通过。
 
 ---
 
@@ -262,14 +262,14 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件�
 | 21 | `topn_pushdown` | green | 100% | ✓ | ✓ |
 | 22 | `window_function` | green | 100% | ✓ | ✓ |
 
-### R3 — point_get / index / partition / explain*（48 套，green 20）
+### R3 — point_get / index / partition / explain*（48 套，green 21）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
 | 1 | `access_path_selection` | green | 100% | ✓ | ✓ |
 | 2 | `clustered_index` | green | 100% | ✓ | ✓ |
 | 3 | `ddl/db_partition` | pending | 0% | ✓ | — |
-| 4 | `ddl/exchange_partition_global_index` | pending | 0% | ✓ | — |
+| 4 | `ddl/exchange_partition_global_index` | green | 100% | ✓ | ✓ |
 | 5 | `ddl/partition` | pending | 0% | ✓ | — |
 | 6 | `ddl/reorg_partition` | pending | 0% | ✓ | — |
 | 7 | `executor/batch_point_get` | green | 100% | ✓ | ✓ |
@@ -442,7 +442,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件�
 | 46 | `expression/builtin` | pending | 0% | ✓ | — |
 | 47 | `expression/cast` | pending | 0% | ✓ | — |
 | 48 | `expression/constant_fold` | pending | 0% | ✓ | — |
-| 49 | `expression/enum_set` | pending | 0% | ✓ | — |
+| 49 | `expression/enum_set` | green | 100% | ✓ | ✓ |
 | 50 | `expression/format` | pending | 0% | ✓ | — |
 | 51 | `expression/issues` | pending | 0% | ✓ | — |
 | 52 | `expression/json` | pending | 0% | ✓ | — |
@@ -456,9 +456,9 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），40 套件�
 | 60 | `globalindex/ddl` | pending | 0% | ✓ | — |
 | 61 | `globalindex/expression_index` | pending | 0% | ✓ | — |
 | 62 | `globalindex/information_schema` | pending | 0% | ✓ | — |
-| 63 | `globalindex/insert` | pending | 0% | ✓ | — |
+| 63 | `globalindex/insert` | green | 100% | ✓ | ✓ |
 | 64 | `globalindex/mem_index_lookup` | pending | 0% | ✓ | — |
-| 65 | `globalindex/mem_index_non_unique` | pending | 0% | ✓ | — |
+| 65 | `globalindex/mem_index_non_unique` | green | 100% | ✓ | ✓ |
 | 66 | `globalindex/mem_index_reader` | pending | 0% | ✓ | — |
 | 67 | `globalindex/misc` | pending | 0% | ✓ | — |
 | 68 | `globalindex/multi_valued_index` | pending | 0% | ✓ | — |

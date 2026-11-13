@@ -366,7 +366,7 @@
     {
       "name": "ddl/exchange_partition_global_index",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/exchange_partition_global_index.test",
       "result": "r/ddl/exchange_partition_global_index.result",
       "has_result": true,
@@ -1272,7 +1272,7 @@
     {
       "name": "expression/enum_set",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/enum_set.test",
       "result": "r/expression/enum_set.result",
       "has_result": true,
@@ -1452,7 +1452,7 @@
     {
       "name": "globalindex/insert",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/insert.test",
       "result": "r/globalindex/insert.result",
       "has_result": true,
@@ -1492,7 +1492,7 @@
     {
       "name": "globalindex/mem_index_non_unique",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/mem_index_non_unique.test",
       "result": "r/globalindex/mem_index_non_unique.result",
       "has_result": true,
