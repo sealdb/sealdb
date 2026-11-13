@@ -1994,6 +1994,26 @@
   - 实现 TiDB 形状的 DOT 输出器（`dot contents` + cluster + plan ID 分配器）
   - 修 `explain_easy` 的 join/IndexLookUp 估行，再转 `explain_easy_stats`
 
+### 2026-11-13（`session/txn` + `executor/adapter` 转正：USER_VAR 求值 + TIMESTAMPDIFF）
+
+- **Phase**: R5/R7
+- **完成**:
+  - `SET @var = <expr>` 原来只做字面量解析，`set @a = now(6)` 会把文本 `now(6)`
+    存进用户变量；改为用 `select <expr>` 解析并求值（用户变量先替换），
+    与 TiDB 在会话内求值右值的行为一致。
+  - `TIMESTAMPDIFF` 缺少 `MICROSECOND`，且原来的秒数用 `year*366 + month*31`
+    近似；改为按 `days_from_civil` 精确到微秒再换算，补齐
+    `MICROSECOND/MILLI…` 之外的 `SECOND/MINUTE/HOUR/DAY`。
+  - 结果列头还原：`TIMESTAMPADD/TIMESTAMPDIFF` 的第一个 unit 参数按裸关键字
+    打印（`microsecond` 而不是 `'microsecond'`），`@a` 不再加反引号。
+- **验证**:
+  - `session/txn`、`executor/adapter` 单独跑 Memory + TiKV 均 `PASS`
+  - `--status green` 双引擎：`PASS: memory=46` / `PASS: tikv=46`
+- **下一步**:
+  - 继续 pending 小差异队列：`ddl/fail_db`（ALTER 溢出 warnings）、
+    `parser/integration`（DATE 列报错文案 + ALLOW_INVALID_DATES）、
+    `partition`（CREATE PLACEMENT POLICY / ALTER … PARTITION BY 语法）
+
 ### 2026-11-13（pending 扫底：4 套天然全绿转正）
 
 - **Phase**: R3/R7

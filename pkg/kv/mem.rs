@@ -522,13 +522,7 @@ impl Transaction for MemTransaction {
             if let Some(current) = store.data.get(key).and_then(|versions| versions.last())
                 && current.commit_ts > self.start_ts
             {
-                return Err(Error::new(
-                    ERR_WRITE_CONFLICT,
-                    format!(
-                        "Write conflict, txnStartTS={}, conflictCommitTS={}",
-                        self.start_ts, current.commit_ts
-                    ),
-                ));
+                return Err(super::kv::write_conflict_error(self.start_ts, current.commit_ts));
             }
         }
         store.next_ts += 1;

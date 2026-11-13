@@ -2328,6 +2328,25 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
     )))
 }
 
+/// `SET @var = <value>`: TiDB evaluates the right-hand side as an expression
+/// in the current session, so `now(6)` stores a datetime rather than the text.
+fn eval_set_value(session: &Session, text: &str) -> Result<sealdb_types::Datum> {
+    let stmt = sealdb_parser::Parser::new().parse_one_stmt(&format!("select {text}"))?;
+    let Statement::Select(select) = stmt else {
+        return Ok(parse_set_literal(text));
+    };
+    if select.from.is_some()
+        || !select.joins.is_empty()
+        || select.fields.len() != 1
+        || select.selection.is_some()
+        || !select.order_by.is_empty()
+    {
+        return Ok(parse_set_literal(text));
+    }
+    let expr = subst_user_vars_in_expr(session, &select.fields[0].expr);
+    Ok(sealdb_expression::eval_expr(&expr)?)
+}
+
 fn parse_set_literal(value: &str) -> sealdb_types::Datum {
     let v = value.trim();
     if v.eq_ignore_ascii_case("null") {
@@ -2582,7 +2601,7 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             let datum = if a.value.trim().starts_with('(') {
                 eval_set_subquery(session, &a.value)?
             } else {
-                parse_set_literal(&a.value)
+                eval_set_value(session, &a.value)?
             };
             session
                 .user_vars

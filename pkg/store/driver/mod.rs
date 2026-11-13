@@ -462,7 +462,9 @@ fn map_tikv_err(err: tikv_client::Error) -> Error {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
     if lower.contains("writeconflict") || lower.contains("write conflict") {
-        Error::new(ERR_WRITE_CONFLICT, msg)
+        // TiKV reports its own key/TS details; render TiDB's errno-9007 shape so
+        // both storage engines answer a conflict the same way.
+        sealdb_kv::kv::write_conflict_error(0, 0)
     } else if lower.contains("deadlock") {
         Error::new(ERR_LOCK_DEADLOCK, msg)
     } else if lower.contains("nowait") {

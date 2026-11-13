@@ -506,7 +506,7 @@
     {
       "name": "executor/adapter",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/adapter.test",
       "result": "r/executor/adapter.result",
       "has_result": true,
@@ -2342,7 +2342,7 @@
     {
       "name": "session/txn",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/txn.test",
       "result": "r/session/txn.result",
       "has_result": true,

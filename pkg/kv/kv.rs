@@ -137,3 +137,20 @@ pub trait Transaction: Send {
 pub fn unsupported_storage() -> Error {
     Error::unsupported("kv storage")
 }
+
+/// TiDB `kv.ErrWriteConflict` (errno 9007) as `mysql-tester` sees it.
+///
+/// TiDB renders `Write conflict, txnStartTS=…, conflictStartTS=…,
+/// conflictCommitTS=…, key=…, originalKey=…, primary=…, reason=…` and appends
+/// the retryable mark `[try again later]`. The session layer retries on the
+/// code alone, so the middle of the message only has to keep TiDB's shape.
+pub fn write_conflict_error(start_ts: u64, conflict_commit_ts: u64) -> Error {
+    Error::new(
+        sealdb_errno::ERR_WRITE_CONFLICT,
+        format!(
+            "Write conflict, txnStartTS={start_ts}, conflictStartTS={conflict_commit_ts}, \
+             conflictCommitTS={conflict_commit_ts}, key=, originalKey=, primary=, \
+             reason=Optimistic [try again later]"
+        ),
+    )
+}

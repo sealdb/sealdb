@@ -625,7 +625,12 @@ impl ColumnNameExpr {
             ctx.write_name(table);
             ctx.write_str(".");
         }
-        ctx.write_name(&self.name);
+        // Session variables are not identifiers: TiDB prints `@a`, never `` `@a` ``.
+        if self.name.starts_with('@') {
+            ctx.write_str(&self.name);
+        } else {
+            ctx.write_name(&self.name);
+        }
         Ok(())
     }
 }
@@ -753,6 +758,17 @@ impl FuncCallExpr {
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {
                     ctx.write_str(", ");
+                }
+                // `TIMESTAMPADD`/`TIMESTAMPDIFF` keep their unit as a bare
+                // keyword (`timestampdiff(microsecond, …)`), not a string.
+                if i == 0
+                    && (self.name.eq_ignore_ascii_case("TIMESTAMPDIFF")
+                        || self.name.eq_ignore_ascii_case("TIMESTAMPADD"))
+                    && let ExprNode::Value(v) = arg
+                    && let Datum::Bytes(unit) = &v.datum
+                {
+                    ctx.write_str(&String::from_utf8_lossy(unit));
+                    continue;
                 }
                 arg.restore(ctx)?;
             }

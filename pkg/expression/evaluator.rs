@@ -1728,17 +1728,22 @@ fn eval_timestamp_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
     if matches!(b, Datum::Time(t) if matches!(t.tp, TimeType::Timestamp)) {
         tb = utc_to_session_local(tb)?;
     }
-    let secs = |t: &Time| -> i64 {
-        // Approximate absolute seconds from a fixed epoch (no TZ).
-        let days = i64::from(t.year) * 366 + i64::from(t.month) * 31 + i64::from(t.day);
-        days * 86400 + i64::from(t.hour) * 3600 + i64::from(t.minute) * 60 + i64::from(t.second)
+    let micros = |t: &Time| -> i64 {
+        // Exact absolute microseconds: the day count comes from the calendar so
+        // month lengths never leak into the difference.
+        let days = days_from_civil(t.year, t.month, t.day);
+        (((days * 24 + i64::from(t.hour)) * 60 + i64::from(t.minute)) * 60
+            + i64::from(t.second))
+            * 1_000_000
+            + i64::from(t.micro)
     };
-    let diff = secs(&tb) - secs(&ta);
+    let diff = micros(&tb) - micros(&ta);
     let out = match unit.as_str() {
-        "HOUR" | "HOURS" => diff / 3600,
-        "MINUTE" | "MINUTES" => diff / 60,
-        "SECOND" | "SECONDS" => diff,
-        "DAY" | "DAYS" => diff / 86400,
+        "MICROSECOND" | "MICROSECONDS" => diff,
+        "SECOND" | "SECONDS" => diff / 1_000_000,
+        "MINUTE" | "MINUTES" => diff / 60_000_000,
+        "HOUR" | "HOURS" => diff / 3_600_000_000,
+        "DAY" | "DAYS" => diff / 86_400_000_000,
         other => {
             return Err(Error::unsupported(format!("TIMESTAMPDIFF unit {other}")));
         }
