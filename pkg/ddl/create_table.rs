@@ -1,8 +1,9 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
-    ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE,
+    ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_DUP_FIELDNAME,
+    ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT,
+    ERR_NO_SUCH_TABLE,
     ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
-    ERR_VIEW_WRONG_LIST, Error, Result,
+    ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -10,6 +11,7 @@ use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
 use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
+use sealdb_types::EvalType;
 use sealdb_types::field_type::{
     FieldType, TYPE_BIT, TYPE_BLOB, TYPE_DATE, TYPE_DATETIME, TYPE_DOUBLE, TYPE_DURATION,
     TYPE_ENUM, TYPE_FLOAT, TYPE_INT24, TYPE_JSON, TYPE_LONG, TYPE_LONG_BLOB, TYPE_LONG_LONG,
@@ -53,6 +55,50 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
+/// MySQL stores `TEXT` as a `BLOB` code with a non-binary charset; SealDB keeps
+/// it as a length-less `VAR_STRING`, so both spellings count as LOB here.
+pub(crate) fn is_lob_type(field_type: &FieldType) -> bool {
+    matches!(
+        field_type.tp,
+        TYPE_BLOB | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB | TYPE_JSON
+    ) || (field_type.tp == TYPE_VAR_STRING
+        && field_type.flen < 0
+        && field_type.charset != "binary")
+}
+
+/// MySQL/TiDB: a literal default on a BLOB/TEXT/JSON column is error 1101 in
+/// strict mode; outside strict mode the default is dropped (`JSON` keeps a
+/// textual `'null'` default instead). `DEFAULT (…)` expression defaults and
+/// `DEFAULT NULL` are always allowed.
+pub(crate) fn normalize_lob_default(
+    name: &str,
+    field_type: &FieldType,
+    default: Option<String>,
+) -> Result<Option<String>> {
+    let Some(default) = default else {
+        return Ok(None);
+    };
+    if !is_lob_type(field_type) {
+        return Ok(Some(default));
+    }
+    let trimmed = default.trim();
+    if trimmed.eq_ignore_ascii_case("null") || trimmed.starts_with('(') {
+        return Ok(Some(default));
+    }
+    let strict = sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+        || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES");
+    if strict {
+        return Err(Error::new(
+            ERR_BLOB_CANT_HAVE_DEFAULT,
+            format!("BLOB/TEXT/JSON column '{name}' can't have a default value"),
+        ));
+    }
+    if field_type.tp == TYPE_JSON {
+        return Ok(Some("'null'".to_string()));
+    }
+    Ok(None)
+}
+
 /// Does `expr` (already lowercased) call `name(` as a standalone identifier?
 fn calls_function(expr: &str, name: &str) -> bool {
     let bytes = expr.as_bytes();
@@ -86,6 +132,78 @@ pub(crate) fn validate_generated_expr(col_name: &str, expr: &str) -> Result<()> 
                 ),
             ));
         }
+    }
+    // A builtin called with the wrong parameter count (e.g. `lower(a, 2)`)
+    // fails while the expression is built, exactly as in TiDB (1582).
+    if let Ok(parsed) = sealdb_parser::sqlparser_bridge::lower::parse_expr(expr) {
+        check_builtin_arg_counts(&parsed)?;
+    }
+    Ok(())
+}
+
+/// Walk `expr` and validate every builtin call's parameter count (1582).
+fn check_builtin_arg_counts(expr: &ExprNode) -> Result<()> {
+    match expr {
+        ExprNode::Value(_) | ExprNode::Column(_) => {}
+        ExprNode::Func(func) => {
+            if let Err((_min, _max)) = sealdb_expression::check_arg_count(&func.name, func.args.len())
+            {
+                return Err(Error::new(
+                    ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
+                    format!(
+                        "Incorrect parameter count in the call to native function '{}'",
+                        func.name
+                    ),
+                ));
+            }
+            for arg in &func.args {
+                check_builtin_arg_counts(arg)?;
+            }
+        }
+        ExprNode::Binary(binary) => {
+            check_builtin_arg_counts(&binary.left)?;
+            check_builtin_arg_counts(&binary.right)?;
+        }
+        ExprNode::Unary(unary) => check_builtin_arg_counts(&unary.expr)?,
+        ExprNode::Cast(cast) => check_builtin_arg_counts(&cast.expr)?,
+        ExprNode::IsNull(is_null) => check_builtin_arg_counts(&is_null.expr)?,
+        ExprNode::InList(in_list) => {
+            check_builtin_arg_counts(&in_list.expr)?;
+            for item in &in_list.list {
+                check_builtin_arg_counts(item)?;
+            }
+        }
+        ExprNode::Between(between) => {
+            check_builtin_arg_counts(&between.expr)?;
+            check_builtin_arg_counts(&between.low)?;
+            check_builtin_arg_counts(&between.high)?;
+        }
+        ExprNode::Like(like) => {
+            check_builtin_arg_counts(&like.expr)?;
+            check_builtin_arg_counts(&like.pattern)?;
+        }
+        ExprNode::Case(case) => {
+            if let Some(operand) = &case.operand {
+                check_builtin_arg_counts(operand)?;
+            }
+            for (when, then) in &case.when_then {
+                check_builtin_arg_counts(when)?;
+                check_builtin_arg_counts(then)?;
+            }
+            if let Some(else_expr) = &case.else_expr {
+                check_builtin_arg_counts(else_expr)?;
+            }
+        }
+        ExprNode::Row(row) => {
+            for item in &row.exprs {
+                check_builtin_arg_counts(item)?;
+            }
+        }
+        ExprNode::Window(_)
+        | ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_) => {}
     }
     Ok(())
 }
@@ -373,15 +491,154 @@ pub(crate) fn validate_default_literal(
 /// DDL time: temporal defaults are parsed and rounded to the column's
 /// fractional precision (`DEFAULT '12:12:13.4'` on `TIME` becomes `12:12:13`),
 /// and date/datetime defaults are re-rendered in canonical form.
+/// Numeric literal shape used to decide whether TiDB keeps a default unquoted.
+struct NumericLiteral<'a> {
+    text: &'a str,
+    is_integer: bool,
+}
+
+fn numeric_literal(text: &str) -> Option<NumericLiteral<'_>> {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if unsigned.is_empty() {
+        return None;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut seen_exp = false;
+    for (i, c) in unsigned.char_indices() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot && !seen_exp => seen_dot = true,
+            'e' | 'E' if seen_digit && !seen_exp => {
+                let rest = &unsigned[i + 1..];
+                let rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+                if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                return Some(NumericLiteral {
+                    text,
+                    is_integer: false,
+                });
+            }
+            _ => return None,
+        }
+    }
+    seen_digit.then_some(NumericLiteral {
+        text,
+        is_integer: !seen_dot,
+    })
+}
+
+/// Round a numeric literal to an integer the way TiDB casts to an integer
+/// column type (0.00 → 0, 2.8 → 3).
+fn round_integer_literal(text: &str) -> Option<String> {
+    if let Ok(v) = text.trim().parse::<i128>() {
+        return Some(v.to_string());
+    }
+    let v = text.trim().parse::<f64>().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    let rounded = v.round();
+    if rounded.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some((rounded as i64).to_string())
+}
+
+/// Unquoted `DEFAULT` literal normalization; `None` keeps the text as written.
+fn unquoted_default(field_type: &FieldType, trimmed: &str) -> Option<String> {
+    // A BIT column validates its own bit-string literal (`b'111'` must fit the
+    // width); leave it to `validate_default_literal`.
+    if field_type.tp == TYPE_BIT {
+        return None;
+    }
+    // MySQL bit/hex literals are values, not numbers of the column's family.
+    let lower = trimmed.get(..2).unwrap_or(trimmed).to_ascii_lowercase();
+    if matches!(lower.as_str(), "b'" | "x'" | "0b" | "0x") {
+        let inner = trimmed
+            .strip_prefix(['b', 'B', 'x', 'X'])
+            .and_then(|rest| rest.strip_prefix('\''))
+            .and_then(|rest| rest.strip_suffix('\''))
+            .or_else(|| trimmed.get(2..))?;
+        let radix = if lower.starts_with('b') || lower == "0b" {
+            2
+        } else {
+            16
+        };
+        let value = i128::from_str_radix(inner, radix).ok()?;
+        return Some(format!("'{value}'"));
+    }
+    let literal = numeric_literal(trimmed)?;
+    match field_type.eval_type() {
+        EvalType::Int => {
+            if literal.is_integer {
+                Some(literal.text.to_string())
+            } else {
+                round_integer_literal(literal.text).map(|v| format!("'{v}'"))
+            }
+        }
+        EvalType::Real if matches!(field_type.tp, TYPE_FLOAT | TYPE_DOUBLE) => {
+            Some(literal.text.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// TiDB re-evaluates every literal default when `ALTER TABLE` rebuilds the
+/// table, so afterwards SHOW CREATE spells numeric defaults as quoted strings
+/// (`int DEFAULT '1'`), even for columns the statement did not touch.
+pub(crate) fn requote_default(field_type: &FieldType, default: &str) -> String {
+    let trimmed = default.trim();
+    if trimmed.starts_with('\'') || trimmed.starts_with('(') || trimmed.eq_ignore_ascii_case("null")
+    {
+        return default.to_string();
+    }
+    match field_type.eval_type() {
+        EvalType::Int => round_integer_literal(trimmed)
+            .map(|v| format!("'{v}'"))
+            .unwrap_or_else(|| default.to_string()),
+        EvalType::Real if matches!(field_type.tp, TYPE_FLOAT | TYPE_DOUBLE) => trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| format!("'{v}'"))
+            .unwrap_or_else(|| default.to_string()),
+        _ => default.to_string(),
+    }
+}
+
+/// Quoted `DEFAULT` literal on a numeric column.
+fn quoted_numeric_default(field_type: &FieldType, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    match field_type.eval_type() {
+        EvalType::Int => round_integer_literal(trimmed).map(|v| format!("'{v}'")),
+        EvalType::Real if matches!(field_type.tp, TYPE_FLOAT | TYPE_DOUBLE) => {
+            let v = trimmed.parse::<f64>().ok()?;
+            v.is_finite().then(|| format!("'{v}'"))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String {
     let trimmed = default.trim();
     let Some(inner) = trimmed
         .strip_prefix('\'')
         .and_then(|rest| rest.strip_suffix('\''))
     else {
-        return default.to_string();
+        // Unquoted literal (number, bit/hex literal): TiDB evaluates it into
+        // the column type and quotes the value unless the literal already is a
+        // number of the column's own family (`int DEFAULT 1`, `double DEFAULT 1.0`).
+        return unquoted_default(field_type, trimmed).unwrap_or_else(|| default.to_string());
     };
     let value = inner.replace("''", "'");
+    // A quoted literal on a numeric column is converted at DDL time and stored
+    // as the canonical value, which SHOW CREATE TABLE prints back quoted
+    // (`float DEFAULT '0012.32'` → `DEFAULT '12.32'`).
+    if let Some(text) = quoted_numeric_default(field_type, &value) {
+        return text;
+    }
     let fsp = field_type.decimal.clamp(0, 6);
     match field_type.tp {
         TYPE_DURATION => normalize_duration_default(&value, fsp)
@@ -608,10 +865,11 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
         }
-        info.default_expr = col
+        let default = col
             .default
             .as_deref()
             .map(|default| normalize_default(&info.field_type, default));
+        info.default_expr = normalize_lob_default(info.name.o(), &info.field_type, default)?;
         info.auto_increment = col.auto_increment;
         info.auto_random = col.auto_random;
         validate_display_width(info.name.o(), &info.field_type)?;
@@ -632,10 +890,27 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     }
     validate_generated_auto_increment(&columns, None)?;
     validate_generated_column_refs(&columns, None)?;
+    let names: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
+    crate::alter::check_generated_order(&names, &columns)?;
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
     for index in stmt.indices.iter() {
         let (idx_cols, hidden) =
             crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
+        // TiDB `buildTableInfoWithCheck`: a virtual generated column cannot be
+        // a primary key (3106).
+        if index.primary {
+            for ic in &idx_cols {
+                if info
+                    .columns
+                    .iter()
+                    .any(|c| c.offset == ic.offset && c.generated_expr.is_some() && !c.generated_stored)
+                {
+                    return Err(crate::alter::unsupported_generated(
+                        "Defining a virtual generated column as primary key",
+                    ));
+                }
+            }
+        }
         for col in hidden {
             info.columns.push(col);
             info.max_col_id = info.max_col_id.max(info.columns.last().unwrap().id);
@@ -969,7 +1244,7 @@ pub(crate) fn select_field_name(field: &sealdb_parser::ast::SelectField, offset:
 fn type_name_from_expr(expr: &ExprNode, sources: &[SelectSource]) -> Result<String> {
     match expr {
         ExprNode::Column(col) => Ok(lookup_select_column(col, sources)?),
-        ExprNode::Cast(cast) => Ok(cast.target.clone()),
+        ExprNode::Cast(cast) => Ok(cast_view_type_name(&cast.target)),
         ExprNode::Value(ValueExpr { datum }) => Ok(type_name_from_datum(datum).to_string()),
         ExprNode::Func(func) if func.name.eq_ignore_ascii_case("COUNT") => Ok("bigint".to_string()),
         ExprNode::Func(func) if func.name.eq_ignore_ascii_case("SUM") => Ok("decimal".to_string()),
@@ -977,6 +1252,19 @@ fn type_name_from_expr(expr: &ExprNode, sources: &[SelectSource]) -> Result<Stri
         ExprNode::Window(_) => Ok("bigint".to_string()),
         _ => Ok("varchar".to_string()),
     }
+}
+
+/// TiDB types a `CAST(… AS CHAR(n))` select item as `varchar(n)`; every other
+/// cast keeps its target spelling.
+fn cast_view_type_name(target: &str) -> String {
+    let lower = target.trim().to_ascii_lowercase();
+    if lower == "char" {
+        return "varchar".to_string();
+    }
+    if let Some(rest) = lower.strip_prefix("char(") {
+        return format!("varchar({rest}");
+    }
+    target.to_string()
 }
 
 fn lookup_select_column(col: &ColumnNameExpr, sources: &[SelectSource]) -> Result<String> {
@@ -1097,7 +1385,14 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
                 ..numeric_ft()
             }
         }
-        "CHAR" | "VARCHAR" | "TEXT" | "STRING" => FieldType {
+        "CHAR" => FieldType {
+            // MySQL `CHAR` is `TYPE_STRING` (fixed length); SealDB stores it
+            // like a VARCHAR but keeps the type for `SHOW CREATE` / `DESC`.
+            tp: TYPE_STRING,
+            flen: parse_len(type_name).unwrap_or(1),
+            ..string_ft()
+        },
+        "VARCHAR" | "TEXT" | "STRING" => FieldType {
             tp: TYPE_VAR_STRING,
             flen: parse_len(type_name).unwrap_or(-1),
             ..string_ft()

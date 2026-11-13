@@ -105,7 +105,16 @@ impl FieldType {
                     };
                 }
                 if self.flen > 0 {
-                    return format!("varchar({})", self.flen);
+                    let name = if self.tp == TYPE_STRING { "char" } else { "varchar" };
+                    return format!("{name}({})", self.flen);
+                }
+                if self.flen < 0 {
+                    // MySQL `TEXT` is a length-less string type with a
+                    // non-binary charset (see `is_lob_type`).
+                    return "text".to_string();
+                }
+                if self.tp == TYPE_STRING {
+                    return "char".to_string();
                 }
                 "varchar"
             }

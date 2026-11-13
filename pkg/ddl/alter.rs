@@ -4,6 +4,7 @@
 // multi-schema-state jobs.
 use crate::create_table::{
     field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
+    requote_default,
     references_identifier, ttl_column_name, validate_default_fsp, validate_default_literal,
     validate_display_width, validate_generated_auto_increment, validate_generated_column_refs,
     validate_generated_expr,
@@ -16,7 +17,7 @@ use sealdb_errno::{
     ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
     ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
     ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
-    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
+    ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -87,6 +88,8 @@ pub fn alter_table(
                 default,
                 generated,
                 not_null,
+                charset,
+                collate,
                 position,
             } => change_column(
                 meta,
@@ -98,6 +101,8 @@ pub fn alter_table(
                 default.as_deref(),
                 generated.as_ref(),
                 *not_null,
+                charset.as_deref(),
+                collate.as_deref(),
                 position,
                 current_db,
                 storage,
@@ -108,6 +113,8 @@ pub fn alter_table(
                 default,
                 generated,
                 not_null,
+                charset,
+                collate,
                 position,
             } => change_column(
                 meta,
@@ -119,6 +126,8 @@ pub fn alter_table(
                 default.as_deref(),
                 generated.as_ref(),
                 *not_null,
+                charset.as_deref(),
+                collate.as_deref(),
                 position,
                 current_db,
                 storage,
@@ -129,6 +138,8 @@ pub fn alter_table(
                 stmt,
                 old_name,
                 new_name,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -387,13 +398,22 @@ fn add_column(
     );
     // Normalize a literal default to the column type (TiDB rounds temporal
     // defaults to the column's fractional precision at DDL time).
-    new_col.default_expr = column
-        .default
-        .as_deref()
-        .map(|default| normalize_default(&new_col.field_type, default));
+    new_col.default_expr = crate::create_table::normalize_lob_default(
+        &column.name,
+        &new_col.field_type,
+        column
+            .default
+            .as_deref()
+            .map(|default| normalize_default(&new_col.field_type, default)),
+    )?;
     new_col.auto_random = column.auto_random;
     if let Some(generated) = &column.generated {
         validate_generated_expr(&column.name, &generated.expr)?;
+        if generated.stored {
+            return Err(unsupported_generated(
+                "Adding generated stored column through ALTER TABLE",
+            ));
+        }
         new_col.generated_expr = Some(generated.expr.clone());
         new_col.generated_stored = generated.stored;
     }
@@ -544,6 +564,56 @@ pub(crate) fn backfill_generated_columns(
     txn.commit()
 }
 
+/// Recompute the materialised values of every generated column after one of
+/// their expressions changed. TiDB reads VIRTUAL columns lazily; this engine
+/// stores them, so the rows must be rewritten (dependent generated columns are
+/// evaluated in offset order and see the new value).
+fn recompute_generated_rows(storage: &dyn Storage, info: &TableInfo) -> Result<()> {
+    let mut pending = Vec::new();
+    for col in &info.columns {
+        let Some(text) = col.generated_expr.as_deref() else {
+            continue;
+        };
+        let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
+        pending.push((col.offset as usize, col, expr));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    pending.sort_by_key(|(offset, ..)| *offset);
+    let schema: Vec<String> = info
+        .columns
+        .iter()
+        .map(|c| c.name.o().to_string())
+        .collect();
+    let types = info.col_field_types();
+    let mut txn = storage.begin()?;
+    for physical_id in info.physical_ids() {
+        let start = gen_table_record_prefix(physical_id);
+        let end = next_prefix(start.as_bytes());
+        let pairs = txn.scan(start.as_bytes(), &end)?;
+        for (key, raw) in pairs {
+            let decoded = decode_row(&raw, &types);
+            let mut values = vec![sealdb_types::Datum::Null; info.columns.len()];
+            for (id, v) in &decoded {
+                if let Some(pos) = info.columns.iter().position(|c| c.id == *id) {
+                    values[pos] = v.clone();
+                }
+            }
+            for (offset, col, expr) in &pending {
+                if *offset >= values.len() {
+                    continue;
+                }
+                let value = sealdb_expression::eval_expr_with_row(expr, &schema, &values)?;
+                values[*offset] = value.cast(&col.field_type)?;
+            }
+            let col_ids: Vec<i64> = info.columns.iter().map(|c| c.id).collect();
+            txn.set(&key, &encode_row(&col_ids, &values))?;
+        }
+    }
+    txn.commit()
+}
+
 /// Whether the table's partitioning expression uses `name` (TiDB refuses to
 /// drop or rename such a column: 3855).
 fn used_by_partition_function(info: &TableInfo, name: &str) -> bool {
@@ -583,6 +653,37 @@ fn generated_column_dependency(name: &str) -> Error {
         ERR_DEPENDENT_BY_GENERATED_COLUMN,
         format!("Column '{name}' has a generated column dependency."),
     )
+}
+
+/// TiDB `ErrUnsupportedOnGeneratedColumn` with the reason TiDB prints, e.g.
+/// `'Changing the STORED status' is not supported for generated columns.`
+pub(crate) fn unsupported_generated(reason: &str) -> Error {
+    Error::new(
+        ERR_UNSUPPORTED_ON_GENERATED_COLUMN,
+        format!("'{reason}' is not supported for generated columns."),
+    )
+}
+
+/// Do two generated-column expressions denote the same computation? TiDB
+/// compares the restored expression text, so `(a+1)` and `(a + 1)` are equal
+/// while `` (`a` + 1) `` and `(a + 2)` are not.
+fn same_generated_expr(left: &str, right: &str) -> bool {
+    fn canonical(expr: &str) -> String {
+        expr.chars()
+            .filter(|c| !c.is_whitespace() && *c != '`')
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    canonical(left) == canonical(right)
+}
+
+/// Is `name` part of any index key?
+fn is_indexed_column(info: &TableInfo, name: &str) -> bool {
+    info.indices.iter().any(|idx| {
+        idx.columns
+            .iter()
+            .any(|c| c.name.o().eq_ignore_ascii_case(name))
+    })
 }
 
 fn drop_column(
@@ -681,8 +782,13 @@ fn validate_generated_order_after_move(
     };
     let to = to.min(names.len());
     names.insert(to, moved);
+    check_generated_order(&names, &info.columns)
+}
+
+/// Every generated column may only reference columns defined before it (3107).
+pub(crate) fn check_generated_order(names: &[String], columns: &[ColumnInfo]) -> Result<()> {
     let position = |name: &str| names.iter().position(|n| n.eq_ignore_ascii_case(name));
-    for col in &info.columns {
+    for col in columns {
         let Some(text) = col.generated_expr.as_deref() else {
             continue;
         };
@@ -691,8 +797,14 @@ fn validate_generated_order_after_move(
         };
         let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
         for (_table, dep) in expr.referenced_columns() {
+            // Only references to *generated* columns defined later are refused;
+            // a base column may appear after the generated one (admin.check).
+            let dep_generated = columns.iter().any(|c| {
+                c.name.o().eq_ignore_ascii_case(&dep) && c.generated_expr.is_some()
+            });
             if let Some(dep_pos) = position(&dep)
                 && dep_pos > col_pos
+                && dep_generated
             {
                 return Err(Error::new(
                     ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
@@ -715,6 +827,8 @@ fn change_column(
     default: Option<&str>,
     generated: Option<&GeneratedColumn>,
     not_null: Option<bool>,
+    charset: Option<&str>,
+    collate: Option<&str>,
     position: &ColumnPosition,
     current_db: &str,
     storage: &dyn Storage,
@@ -759,6 +873,23 @@ fn change_column(
         Some(false) => new_ft.flag &= !sealdb_types::field_type::NOT_NULL_FLAG,
         None => {}
     }
+    // TiDB `ErrUnsupportedModifyCharset` (8200): a column's charset is fixed
+    // once created, so `MODIFY … CHARACTER SET x` on a different charset fails.
+    let old_charset = info.columns[pos].field_type.charset.clone();
+    if let Some(charset) = charset
+        && !charset.eq_ignore_ascii_case(&old_charset)
+    {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_MODIFY_CHARSET,
+            format!("Unsupported modify charset from {old_charset} to {charset}"),
+        ));
+    }
+    if let Some(charset) = charset {
+        new_ft.charset = charset.to_string();
+    }
+    if let Some(collate) = collate {
+        new_ft.collate = collate.to_string();
+    }
     let renaming = !old_name.eq_ignore_ascii_case(new_name);
     if renaming && used_by_partition_function(&info, old_name) {
         return Err(partition_column_dependency(old_name));
@@ -797,6 +928,44 @@ fn change_column(
         return Err(Error::unsupported("MODIFY handle column type"));
     }
     let changed = field_type_changed(&info.columns[pos].field_type, &new_ft);
+    // TiDB `getModifiableColumnJob` refuses most reshapes of a generated
+    // column with 3106 and a reason-specific message.
+    let old_generated = info.columns[pos].generated_expr.is_some();
+    let old_stored = info.columns[pos].generated_stored;
+    // MODIFY / CHANGE always re-specify the type, so a missing `AS (...)` means
+    // the column becomes a plain one; RENAME COLUMN leaves it untouched.
+    let respecifies_column = type_name.is_some();
+    let mut generated_expr_changed = false;
+    if old_generated && respecifies_column {
+        match generated {
+            None => {
+                // Turning a stored generated column plain is allowed (the
+                // materialised values are kept); a virtual one is not.
+                if !old_stored {
+                    return Err(unsupported_generated("Changing the STORED status"));
+                }
+            }
+            Some(new_generated) => {
+                if new_generated.stored != old_stored {
+                    return Err(unsupported_generated("Changing the STORED status"));
+                }
+                let old_expr = info.columns[pos]
+                    .generated_expr
+                    .as_deref()
+                    .unwrap_or_default();
+                let expr_changed = !same_generated_expr(old_expr, &new_generated.expr);
+                if expr_changed && old_stored {
+                    return Err(unsupported_generated("modifying a stored column"));
+                }
+                if expr_changed && is_indexed_column(&info, old_name) {
+                    return Err(unsupported_generated("modifying an indexed column"));
+                }
+                generated_expr_changed = expr_changed;
+            }
+        }
+    } else if !old_generated && generated.is_some_and(|g| g.stored) {
+        return Err(unsupported_generated("modifying a stored column"));
+    }
     if changed && has_dependent_generated_column(&info, old_name) {
         // TiDB runs the MODIFY, hits the 3108 dependency check and reports it
         // wrapped in 3106 (`[ddl:3108]` keeps the inner error's code).
@@ -807,29 +976,62 @@ fn change_column(
             ),
         ));
     }
-    let effective_default = default
-        .map(|default| default.to_string())
-        .or_else(|| info.columns[pos].default_expr.clone())
-        .map(|default| normalize_default(&new_ft, &default));
+    let effective_default = crate::create_table::normalize_lob_default(
+        new_name,
+        &new_ft,
+        default
+            .map(|default| default.to_string())
+            .or_else(|| info.columns[pos].default_expr.clone())
+            .map(|default| normalize_default(&new_ft, &default)),
+    )?;
     validate_display_width(new_name, &new_ft)?;
     validate_default_literal(new_name, &new_ft, effective_default.as_deref())?;
     validate_default_fsp(new_name, &new_ft, effective_default.as_deref())?;
     if let Some(default) = effective_default {
         info.columns[pos].default_expr = Some(default);
     }
-    if let Some(generated) = generated {
-        validate_generated_expr(new_name, &generated.expr)?;
-        info.columns[pos].generated_expr = Some(generated.expr.clone());
-        info.columns[pos].generated_stored = generated.stored;
-        validate_generated_auto_increment(&info.columns, Some(new_name))?;
-        validate_generated_column_refs(&info.columns, Some(new_name))?;
+    if generated.is_some() || respecifies_column {
+        match generated {
+            Some(generated) => {
+                validate_generated_expr(new_name, &generated.expr)?;
+                info.columns[pos].generated_expr = Some(generated.expr.clone());
+                info.columns[pos].generated_stored = generated.stored;
+                validate_generated_auto_increment(&info.columns, Some(new_name))?;
+                validate_generated_column_refs(&info.columns, Some(new_name))?;
+                // A rewritten expression may only look backwards in the
+                // column list (3107).
+                let names: Vec<String> = info
+                    .columns
+                    .iter()
+                    .map(|c| c.name.o().to_string())
+                    .collect();
+                check_generated_order(&names, &info.columns)?;
+            }
+            None => {
+                info.columns[pos].generated_expr = None;
+                info.columns[pos].generated_stored = false;
+            }
+        }
     }
-    if changed {
-        rewrite_column_rows(storage, &info, info.columns[pos].id, &new_ft)?;
+    // A freshly added NOT NULL needs a reorg just like a type change: TiDB
+    // fails the job on the first NULL it meets (1265).
+    let not_null_added = new_ft.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
+        && info.columns[pos].field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG == 0;
+    if changed || not_null_added {
+        rewrite_column_rows(
+            storage,
+            &info,
+            info.columns[pos].id,
+            new_name,
+            &new_ft,
+        )?;
     }
     let previous = info.columns[pos].name.o().to_string();
     info.columns[pos].name = CIStr::new(new_name);
     info.columns[pos].field_type = new_ft;
+    if generated_expr_changed {
+        recompute_generated_rows(storage, &info)?;
+    }
     for idx in &mut info.indices {
         for ic in &mut idx.columns {
             if ic.name.o().eq_ignore_ascii_case(&previous) {
@@ -862,6 +1064,12 @@ fn change_column(
         info.columns.insert(insert_at, col);
         recompute_column_offsets(&mut info);
     }
+    // The rebuild re-evaluates literal defaults for the whole table.
+    for col in &mut info.columns {
+        if let Some(default) = col.default_expr.clone() {
+            col.default_expr = Some(requote_default(&col.field_type, &default));
+        }
+    }
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
@@ -878,16 +1086,19 @@ fn rewrite_column_rows(
     storage: &dyn Storage,
     info: &TableInfo,
     col_id: i64,
+    col_name: &str,
     new_ft: &FieldType,
 ) -> Result<()> {
     let old_types = info.col_field_types();
     let mut txn = storage.begin()?;
     let mut reorg_warnings: Vec<(i32, String)> = Vec::new();
+    let mut row_no = 0usize;
     for physical_id in info.physical_ids() {
         let start = gen_table_record_prefix(physical_id);
         let end = next_prefix(start.as_bytes());
         let pairs = txn.scan(start.as_bytes(), &end)?;
         for (key, raw) in pairs {
+            row_no += 1;
             let decoded = decode_row(&raw, &old_types);
             let mut col_ids = Vec::with_capacity(info.columns.len());
             let mut values = Vec::with_capacity(info.columns.len());
@@ -898,6 +1109,16 @@ fn rewrite_column_rows(
                     .map(|(_, v)| v.clone())
                     .unwrap_or(sealdb_types::Datum::Null);
                 if col.id == col_id {
+                    // A NULL left in a column that just became NOT NULL aborts
+                    // the reorg job (TiDB reports 1265 for the first row).
+                    if new_ft.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
+                        && value.is_null()
+                    {
+                        return Err(Error::new(
+                            sealdb_errno::ERR_WARN_DATA_TRUNCATED,
+                            format!("Data truncated for column '{col_name}' at row {row_no}"),
+                        ));
+                    }
                     value = convert_column_value(&value, new_ft, &mut reorg_warnings)?;
                 }
                 col_ids.push(col.id);

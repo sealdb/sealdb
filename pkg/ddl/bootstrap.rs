@@ -54,9 +54,9 @@ const SYSTEM_TABLES: &[&str] = &[
         Trigger_priv ENUM('N','Y') NOT NULL DEFAULT 'N',\n\
         Create_tablespace_priv ENUM('N','Y') NOT NULL DEFAULT 'N',\n\
         ssl_type ENUM('','ANY','X509','SPECIFIED') NOT NULL DEFAULT '',\n\
-        ssl_cipher BLOB NOT NULL DEFAULT '',\n\
-        x509_issuer BLOB NOT NULL DEFAULT '',\n\
-        x509_subject BLOB NOT NULL DEFAULT '',\n\
+        ssl_cipher BLOB NOT NULL,\n\
+        x509_issuer BLOB NOT NULL,\n\
+        x509_subject BLOB NOT NULL,\n\
         max_questions INT(11) UNSIGNED NOT NULL DEFAULT 0,\n\
         max_updates INT(11) UNSIGNED NOT NULL DEFAULT 0,\n\
         max_connections INT(11) UNSIGNED NOT NULL DEFAULT 0,\n\

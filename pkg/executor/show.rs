@@ -453,11 +453,17 @@ fn column_row(info: &TableInfo, col: &ColumnInfo, full: bool) -> Vec<Datum> {
     } else {
         "YES"
     };
+    // MySQL `Field::Extra`: generated columns are flagged and may not be written.
+    let extra = match col.generated_expr {
+        Some(_) if col.generated_stored => "STORED GENERATED",
+        Some(_) => "VIRTUAL GENERATED",
+        None => "",
+    };
     row.extend([
         Datum::Bytes(null.as_bytes().to_vec()),
         Datum::Bytes(key.as_bytes().to_vec()),
         default,
-        Datum::Bytes(Vec::new()),
+        Datum::Bytes(extra.as_bytes().to_vec()),
     ]);
     if full {
         row.push(Datum::Bytes(b"select,insert,update,references".to_vec()));
@@ -484,6 +490,18 @@ fn render_create_table(info: &TableInfo) -> String {
         .filter(|col| !col.hidden)
         .map(|col| {
             let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
+            // TiDB prints the generation expression in place of DEFAULT.
+            if let Some(expr) = &col.generated_expr {
+                line.push_str(&format!(
+                    " GENERATED ALWAYS AS ({expr}) {}",
+                    if col.generated_stored {
+                        "STORED"
+                    } else {
+                        "VIRTUAL"
+                    }
+                ));
+                return line;
+            }
             if col.field_type.flag & NOT_NULL_FLAG != 0 {
                 line.push_str(" NOT NULL");
             }
