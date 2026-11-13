@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 55 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 56 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -27,7 +27,7 @@
 | R1 | select, show, types/* | `green` | 四套件 Mem+TiKV 全绿；进入 R2 |
 | R2 | join / subquery / agg / window / cte | `in_progress` | `agg_predicate_pushdown` / `topn_pushdown` / `window_function` / `null_rejected` / `subquery` / `naaj` / `executor/window` / `executor/cte` / `executor/union_scan` / `index_join` / `explain_union_scan` / `executor/jointest/join` green |
 | R3 | point_get / index / partition / explain* | `in_progress` | partition 五套件 + `explain-non-select-stmt` / `globalindex/point_get` / `explain_stats` / `planner/core/point_get_plan`（含 `casetest/point_get_plan`）/ `access_path_selection` / `clustered_index` / `explain` / `executor/point_get` / `executor/batch_point_get` / `explain_shard_index` / `explain_easy_stats` green；9 套件 `in_progress` |
-| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R7 `planner/cardinality/trace` / `util/admin` / `infoschema/v2` / globalindex 若干 green；其余依赖前波 |
+| R4–R7 | plan_cache / session / ddl / CBO | `pending` | R6 `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/fail_db` / `infoschema/v2` green；R7 `planner/cardinality/trace` / `util/admin` / globalindex 若干 green；其余依赖前波 |
 | D | *tiflash* / *mpp* | `deferred` | 不丢弃，延后 |
 
 实现纪律：[parity-discipline.md](./parity-discipline.md) — 失败用例 → TiDB 同名包/文件 → SealDB 同路径一比一；生产级清单勾满才升 `green`；禁止改权威 `r/*.result`。
@@ -2258,6 +2258,35 @@
   - `explain_easy` 仍差一条查询：外连接聚合下推 + Union 下推 + 列编号重建
 - **下一步**:
   - 继续 R6：`ddl/default_as_expression` / `ddl/db_table` 等
+
+### 2026-11-14（`ddl/index_modify` 转正：ADMIN CHECK INDEX + 公共句柄覆盖读）
+
+- **Phase**: R6 DDL × 索引变更
+- **完成**:
+  - Parser：`rewrite_admin_show_ddl` 除 `ADMIN CHECK TABLE` 外同时吞掉
+    `ADMIN CHECK INDEX t idx`（整条语句改写为 `DO 0`，索引校验暂为 no-op）
+  - Session：`SET GLOBAL tidb_ddl_enable_fast_reorg` / `tidb_ddl_reorg_worker_cnt`
+    / `_batch_size` / `_priority` / `_max_write_speed` 按兼容口径接受为 no-op
+    （SealDB 索引构建同步完成，没有 reorg 阶段）
+  - Executor：公共句柄（字符串/复合 PRIMARY KEY）表的 covering 索引读在索引键
+    里只带 heap rowid，缺的 PRIMARY KEY 列按 TiDB 的 handle 语义从行记录回填
+    （`common_handle_columns_missing` / `backfill_row`），
+    `select a from t use index(idx)` 不再返回 NULL
+  - `CREATE INDEX` / `ADD INDEX` 同一列重复出现 → 1060 `Duplicate column name`
+    （`resolve_index_parts`，大小写不敏感、保留原拼写）
+  - 顺手修复 gate 暴露的两处回归：内连接常量传播（`derive_join_key_constants`）
+    的镜像谓词现在真正下推到两侧（`fold_pinned_join_on` 折叠成 CARTESIAN 后
+    不再多出 build 侧整表行），`NOW(6)` 补回微秒与 fsp（`timestampdiff(...) <
+    1000000` 不再在跨秒时误判为 0）
+- **验证**:
+  - `run-tests.sh -s memory -t ddl/index_modify --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t ddl/index_modify --status pending -k` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh` → `PASS: memory=64 tikv=63 skipped=191`
+  - manifest `ddl/index_modify` → `green`，green 55→56
+- **阻塞/风险**:
+  - 无；后续按 R6 继续 `ddl/column_modify` / `ddl/db_table` / `ddl/default_as_expression`
+- **下一步**:
+  - 继续 R6：`ddl/column_modify` / `ddl/db_table` / `ddl/table_modify`
 
 ### 2026-10-19
 
