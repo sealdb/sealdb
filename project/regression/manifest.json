@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 63,
-      "pending": 167,
+      "green": 64,
+      "pending": 166,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -76,7 +76,7 @@
     {
       "name": "bindinfo/temptable",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/bindinfo/temptable.test",
       "result": "r/bindinfo/temptable.result",
       "has_result": true,

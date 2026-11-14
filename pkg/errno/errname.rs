@@ -101,6 +101,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_TTL_TEMPORARY_TABLE => "ErrTTLTemporaryTable",
         errcode::ERR_TTL_FK_REFERENCED => "ErrTTLFKReferenced",
         errcode::ERR_TTL_MULTI_SCHEMA_CHANGE => "ErrTTLMultiSchemaChange",
+        errcode::ERR_OPT_ON_TEMPORARY_TABLE => "ErrOptOnTemporaryTable",
         errcode::ERR_MEMORY_EXCEEDED => "ErrMemoryExceedForQuery",
         _ => "ErrUnknown",
     }

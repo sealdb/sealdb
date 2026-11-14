@@ -2525,6 +2525,30 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R7 长尾与 R2 `cte` 剩余差异
 
+### 2026-11-14（`bindinfo/temptable` 转正：绑定禁止临时表 + 绑定语法解析）
+
+- **Phase**: R7
+- **完成**:
+  - `CREATE GLOBAL BINDING` 在原始语句引用本会话临时表时返回 TiDB 的
+    8006（`ErrOptOnTemporaryTable`，消息 `` `create binding` is unsupported on
+    temporary tables.``）；检测复用临时表改写器的完整遍历（含子查询、CTE、
+    INSERT/UPDATE/DELETE 的语句级 `WITH`）。
+  - 绑定语法解析特性：`CREATE BINDING` 的原始 SQL 允许无别名派生表，并为
+    其合成内部别名；普通语句仍报「派生表缺少别名」。绑定场景下两表逗号
+    `DELETE t1 FROM t1,t2` 也能解析（普通语句仍不支持）。
+  - `DROP TABLE` 与非临时 `DROP TEMPORARY` 语义对齐 TiDB：普通
+    `DROP TABLE` 会先删除同名会话临时表（遮蔽永久表），剩余表名继续走持久化
+    DDL；全部命中临时表时直接返回。
+- **验证**:
+  - `run-tests.sh -s memory -t bindinfo/temptable --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t bindinfo/temptable --status pending` → `PASS: tikv=1`
+  - 全量 memory gate → `PASS: memory=71 skipped=183`
+  - manifest `bindinfo/temptable` → `green`，green 63→64
+- **阻塞/风险**:
+  - 无别名派生表仅在绑定解析上下文放宽；普通查询仍维持原错误。
+- **下一步**:
+  - 继续 R7 长尾与 R2 `cte` 剩余差异
+
 ---
 
 ## 5. Gate 证据索引

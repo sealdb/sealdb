@@ -166,6 +166,9 @@ pub const ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT: i32 = 3754;
 /// TiDB `ErrUnsupportedModifyCharset` (8200): an existing column's character
 /// set cannot be changed, e.g. `MODIFY c VARCHAR(10) CHARACTER SET gbk`.
 pub const ERR_UNSUPPORTED_MODIFY_CHARSET: i32 = 8200;
+/// TiDB `ErrOptOnTemporaryTable` (8006): an option or operation that is not
+/// supported on temporary tables, e.g. `CREATE GLOBAL BINDING` over one.
+pub const ERR_OPT_ON_TEMPORARY_TABLE: i32 = 8006;
 /// TiDB `ErrWrongParamcountToNativeFct` (1582): a builtin function is called
 /// with an argument count outside its signature, e.g. `LOWER(a, 2)`.
 pub const ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT: i32 = 1582;

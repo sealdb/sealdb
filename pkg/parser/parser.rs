@@ -20,6 +20,30 @@ pub fn high_not_precedence() -> bool {
     HIGH_NOT_PRECEDENCE.with(Cell::get)
 }
 
+thread_local! {
+    /// Binding-grammar parse: TiDB accepts a derived table without an alias in
+    /// `CREATE [GLOBAL] BINDING` original SQL and reports temporary-table or
+    /// alias errors later. Off for ordinary statements (alias required).
+    static ALLOW_DERIVED_WITHOUT_ALIAS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_allow_derived_without_alias(on: bool) {
+    ALLOW_DERIVED_WITHOUT_ALIAS.with(|flag| flag.set(on));
+}
+
+pub fn allow_derived_without_alias() -> bool {
+    ALLOW_DERIVED_WITHOUT_ALIAS.with(Cell::get)
+}
+
+/// Parse with alias-less derived tables accepted, restoring the previous flag.
+pub fn with_allow_derived_without_alias<T>(f: impl FnOnce() -> T) -> T {
+    let previous = allow_derived_without_alias();
+    set_allow_derived_without_alias(true);
+    let out = f();
+    set_allow_derived_without_alias(previous);
+    out
+}
+
 pub struct Parser;
 
 impl Parser {

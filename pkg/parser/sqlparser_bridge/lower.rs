@@ -9111,15 +9111,27 @@ fn table_factor(
             if sample.is_some() {
                 return Err(Error::unsupported("TABLESAMPLE"));
             }
-            let alias = alias
-                .as_ref()
-                .ok_or_else(|| Error::unsupported("derived table without alias"))?;
-            let name = alias.name.value.clone();
+            let name = match alias {
+                Some(a) => a.name.value.clone(),
+                None if crate::parser::allow_derived_without_alias() => {
+                    // `CREATE BINDING` parses its original SQL before semantic
+                    // alias checks (TiDB reports the temporary-table error
+                    // first), so give the derived table a private name.
+                    static NEXT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    format!(
+                        "__sealdb_derived_{}",
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                }
+                None => {
+                    return Err(Error::unsupported("derived table without alias"));
+                }
+            };
             let col_name_list: Vec<String> = alias
-                .columns
-                .iter()
-                .map(|col| col.name.value.clone())
-                .collect();
+                .as_ref()
+                .map(|a| a.columns.iter().map(|col| col.name.value.clone()).collect())
+                .unwrap_or_default();
             // Derived may be SELECT or UNION ALL — flatten into CTE seed + set_rest.
             let (mut query, set_rest) = match subquery.body.as_ref() {
                 SetExpr::SetOperation { .. } => flatten_set_expr(subquery.body.as_ref())?,
@@ -9349,6 +9361,29 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
                 .collect::<Result<Vec<_>>>()?
         };
         (rel, tables)
+    } else if from.len() == 2 && crate::parser::allow_derived_without_alias() {
+        // Binding grammar (`CREATE BINDING ... DELETE t1 FROM t1, t2`) parses
+        // the comma list; ordinary statements keep reporting it unsupported.
+        let (left, left_join) = lower_dml_table(&from[0])?;
+        let (right, right_join) = lower_dml_table(&from[1])?;
+        if left_join.is_some() || right_join.is_some() {
+            return Err(Error::unsupported("JOIN in DELETE FROM list"));
+        }
+        let join = Join {
+            left: left.clone(),
+            right,
+            tp: JoinType::Cross,
+            on: true_expr(),
+            using_cols: Vec::new(),
+            natural: false,
+            straight: false,
+        };
+        let tables = delete
+            .tables
+            .iter()
+            .map(object_table_name)
+            .collect::<Result<Vec<_>>>()?;
+        ((left, Some(join)), tables)
     } else {
         if from.len() != 1 {
             return Err(Error::unsupported("multi-table DELETE"));

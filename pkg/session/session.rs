@@ -409,6 +409,36 @@ impl Session {
         TempTablesGuard
     }
 
+    /// Whether `stmt` reads or writes one of this session's temporary tables.
+    fn references_temp_table(&self, stmt: &Statement, current_db: &str) -> bool {
+        let temps = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock")
+            .clone();
+        if temps.is_empty() {
+            return false;
+        }
+        let mut stmt = stmt.clone();
+        rewrite_temp_table_refs(&mut stmt, &temps, current_db)
+    }
+
+    /// Remove a session-local temporary table entry and its rows.
+    fn drop_temp_table_entry(
+        &self,
+        key: &(String, String),
+    ) -> Result<Option<sealdb_meta::TableInfo>> {
+        let info = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock")
+            .remove(key);
+        if let Some(info) = &info {
+            sealdb_ddl::clear_table_keys(self.domain.storage().as_ref(), &info.physical_ids())?;
+        }
+        Ok(info)
+    }
+
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {        // Publish this session's `tidb_window_concurrency` for the planner and
         // executor (thread-local), so a suite that changes it cannot leak its
         // value into a later session on the same thread.
@@ -666,13 +696,25 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::CreateBinding(create) => {
-                let original = self.parser.parse_one_stmt(&create.original_sql)?;
-                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
+                // TiDB accepts alias-less derived tables in binding grammar and
+                // reports temporary-table errors before alias semantics.
+                let original = sealdb_parser::with_allow_derived_without_alias(|| {
+                    self.parser.parse_one_stmt(&create.original_sql)
+                })?;
                 let db = self
                     .current_db
                     .lock()
                     .expect("session current_db lock")
                     .clone();
+                // TiDB rejects a global binding whose original statement reads
+                // or writes a temporary table.
+                if self.references_temp_table(&original, &db) {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_OPT_ON_TEMPORARY_TABLE,
+                        "`create binding` is unsupported on temporary tables.",
+                    ));
+                }
+                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
                 self.domain.bind_handle().create_binding(
                     sealdb_bindinfo::Binding::manual(
                         create.original_sql.clone(),
@@ -849,6 +891,36 @@ impl Session {
             .lock()
             .expect("session current_db lock")
             .clone();
+        // TiDB `DROP TABLE` drops a same-named session-local temporary table
+        // (it shadows the permanent one); the remaining names keep the
+        // persisted DDL path.
+        let mut drop_owned = None;
+        if let Statement::DropTable(drop) = stmt
+            && !drop.temporary
+        {
+            let mut remaining = Vec::new();
+            let mut dropped = false;
+            for name in &drop.tables {
+                let (schema, table) = name.qualified(&current_db);
+                if !schema.is_empty() {
+                    let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+                    if self.drop_temp_table_entry(&key)?.is_some() {
+                        dropped = true;
+                        continue;
+                    }
+                }
+                remaining.push(name.clone());
+            }
+            if dropped {
+                if remaining.is_empty() {
+                    return Ok(empty_result());
+                }
+                let mut next = drop.clone();
+                next.tables = remaining;
+                drop_owned = Some(Statement::DropTable(next));
+            }
+        }
+        let stmt = drop_owned.as_ref().unwrap_or(stmt);
         self.acquire_mdl(stmt, &current_db)?;
         // Autocommit statements release MDL when the statement ends (including
         // error paths). Explicit txns hold until COMMIT/ROLLBACK.
@@ -4670,8 +4742,16 @@ fn rewrite_temp_table_refs(
     stmt: &mut Statement,
     temps: &HashMap<(String, String), sealdb_meta::TableInfo>,
     current_db: &str,
-) {
-    let mut map = |table: &mut TableName| rewrite_temp_table_name(table, temps, current_db);
+) -> bool {
+    if let Statement::Explain(explain) = stmt {
+        return rewrite_temp_table_refs(&mut explain.stmt, temps, current_db);
+    }
+    let mut hit = false;
+    let mut map = |table: &mut TableName| {
+        if rewrite_temp_table_name(table, temps, current_db) {
+            hit = true;
+        }
+    };
     match stmt {
         Statement::Select(select) => map_select_with_ctes(select, &mut map),
         Statement::SetOpr(set) => {
@@ -4681,59 +4761,60 @@ fn rewrite_temp_table_refs(
             }
         }
         Statement::Insert(insert) => {
-            rewrite_temp_table_name(&mut insert.table, temps, current_db);
+            let cte_names = map_statement_ctes(&mut insert.with, &mut map);
+            map(&mut insert.table);
             if let Some(select) = insert.select.as_deref_mut() {
-                map_select_with_ctes(select, &mut map);
+                map_select_tables(select, &cte_names, &mut map);
             }
             if let Some(set) = insert.select_set.as_deref_mut() {
-                map_select_with_ctes(&mut set.first, &mut map);
+                map_select_tables(&mut set.first, &cte_names, &mut map);
                 for (_, arm) in &mut set.rest {
-                    map_select_with_ctes(arm, &mut map);
+                    map_select_tables(arm, &cte_names, &mut map);
                 }
             }
         }
         Statement::Update(update) => {
-            rewrite_temp_table_name(&mut update.table, temps, current_db);
+            let cte_names = map_statement_ctes(&mut update.with, &mut map);
+            map(&mut update.table);
             if let Some(join) = update.join.as_mut() {
-                rewrite_temp_table_name(&mut join.left, temps, current_db);
-                rewrite_temp_table_name(&mut join.right, temps, current_db);
+                map(&mut join.left);
+                map(&mut join.right);
             }
             for item in &mut update.list {
-                map_tables_in_expr(&mut item.expr, &[], &mut map);
+                map_tables_in_expr(&mut item.expr, &cte_names, &mut map);
             }
             if let Some(sel) = update.selection.as_mut() {
-                map_tables_in_expr(sel, &[], &mut map);
+                map_tables_in_expr(sel, &cte_names, &mut map);
             }
         }
         Statement::Delete(delete) => {
-            rewrite_temp_table_name(&mut delete.table, temps, current_db);
+            let cte_names = map_statement_ctes(&mut delete.with, &mut map);
+            map(&mut delete.table);
             for table in &mut delete.tables {
-                rewrite_temp_table_name(table, temps, current_db);
+                map(table);
             }
             if let Some(join) = delete.join.as_mut() {
-                rewrite_temp_table_name(&mut join.left, temps, current_db);
-                rewrite_temp_table_name(&mut join.right, temps, current_db);
+                map(&mut join.left);
+                map(&mut join.right);
             }
             if let Some(sel) = delete.selection.as_mut() {
-                map_tables_in_expr(sel, &[], &mut map);
+                map_tables_in_expr(sel, &cte_names, &mut map);
             }
-        }
-        Statement::Explain(explain) => {
-            rewrite_temp_table_refs(&mut explain.stmt, temps, current_db)
         }
         _ => {}
     }
+    hit
 }
 
 fn rewrite_temp_table_name(
     table: &mut TableName,
     temps: &HashMap<(String, String), sealdb_meta::TableInfo>,
     current_db: &str,
-) {
+) -> bool {
     // An explicitly qualified name (`db.t`) is not shadowed: VIEW bodies rely
     // on this, and TiDB resolves them against the permanent catalog.
     if table.schema.is_some() || table.name.eq_ignore_ascii_case("dual") {
-        return;
+        return false;
     }
     let key = (
         current_db.to_ascii_lowercase(),
@@ -4741,7 +4822,9 @@ fn rewrite_temp_table_name(
     );
     if temps.contains_key(&key) {
         table.schema = Some(TEMP_TABLE_SCHEMA.to_string());
+        return true;
     }
+    false
 }
 
 /// Apply `map` to every table reference of `select`, skipping names bound by
@@ -4778,8 +4861,18 @@ fn map_select_tables(
 /// Recurse into a SELECT's nested `WITH` (sibling CTE scoping), then map the
 /// outer SELECT.
 fn map_select_with_ctes(select: &mut SelectStmt, map: &mut dyn FnMut(&mut TableName)) {
+    let cte_names = map_statement_ctes(&mut select.with, map);
+    map_select_tables(select, &cte_names, map);
+}
+
+/// Map the bodies of a statement-level `WITH` clause (sibling scoping) and
+/// return the CTE names visible to the statement body.
+fn map_statement_ctes(
+    with: &mut Option<WithClause>,
+    map: &mut dyn FnMut(&mut TableName),
+) -> Vec<String> {
     let mut cte_names = Vec::new();
-    if let Some(with) = select.with.as_mut() {
+    if let Some(with) = with.as_mut() {
         for cte in &mut with.ctes {
             // Nested WITH bodies see only preceding sibling CTE names.
             map_select_tables(cte.query.as_mut(), &cte_names, map);
@@ -4795,7 +4888,7 @@ fn map_select_with_ctes(select: &mut SelectStmt, map: &mut dyn FnMut(&mut TableN
             cte_names.push(cte.name.clone());
         }
     }
-    map_select_tables(select, &cte_names, map);
+    cte_names
 }
 
 fn qualify_select_tables(select: &mut SelectStmt, schema: &str, cte_names: &[String]) {
