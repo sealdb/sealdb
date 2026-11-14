@@ -1400,8 +1400,9 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
         },
         "FLOAT" => {
             let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((12, -1));
+            // MySQL: `FLOAT(p)` with p > 24 widens to a 8-byte DOUBLE.
             FieldType {
-                tp: TYPE_FLOAT,
+                tp: if flen > 24 { TYPE_DOUBLE } else { TYPE_FLOAT },
                 flen,
                 decimal,
                 ..numeric_ft()
