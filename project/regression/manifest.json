@@ -14,9 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 64,
-      "pending": 166,
-      "in_progress": 14,
+      "green": 68,
+      "pending": 163,
+      "in_progress": 13,
       "deferred": 2,
       "local": 8
     },
@@ -656,7 +656,7 @@
     {
       "name": "executor/executor_txn",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/executor_txn.test",
       "result": "r/executor/executor_txn.result",
       "has_result": true,

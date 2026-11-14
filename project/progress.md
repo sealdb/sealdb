@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 67 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 68 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2655,6 +2655,30 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续啃 pending 长尾里 diff 最小的套件（`executor/executor_txn` /
     `table/cache` / `globalindex/information_schema`）。
+
+### 2026-11-14（`executor/executor_txn` 转正：语句级回滚 + `ON COMMIT DELETE ROWS`）
+
+- **Phase**: R7
+- **完成**:
+  - 语句原子性：显式事务内失败语句只回滚自身写入（MySQL/TiDB 语义）。
+    `execute_one` 在执行 DML 前打隐藏 savepoint，失败时 `ROLLBACK TO` 再
+    `RELEASE`；`rollback to s1` 后重插同键不再报 1062。
+  - `TikvTransaction` 补 `SAVEPOINT` / `ROLLBACK TO` / `RELEASE SAVEPOINT`：
+    按写集 overlay 快照重放底层 TiKV mutation buffer，双引擎行为一致。
+  - `ON COMMIT DELETE ROWS`：`CreateTableStmt` 新增
+    `on_commit_delete_rows`，会话记录带标记的临时表；显式 `COMMIT` 与
+    autocommit 提交成功后清空这些表的行。
+- **验证**:
+  - `run-tests.sh -t executor/executor_txn --status pending -s memory` → PASS
+  - `run-tests.sh -t executor/executor_txn --status pending -s tikv` → PASS
+  - `run-tests.sh -s memory --status green` → PASS（67 套）
+- **阻塞/风险**:
+  - 语句级 savepoint 每条语句克隆一次写集，大事务内存开销 O(n²)。
+  - TiKV 回滚只重放数据，失败语句已取的悲观锁保留到事务结束。
+  - `GLOBAL TEMPORARY TABLE` 仍按会话级临时表处理（未做跨会话共享）。
+- **下一步**:
+  - 继续 `table/cache` / `globalindex/information_schema` 等低 diff pending
+    套件，并推进 R3 `explain_easy` 剩余项。
 
 ---
 
