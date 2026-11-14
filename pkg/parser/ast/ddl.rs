@@ -429,6 +429,9 @@ impl TtlInfo {
 #[derive(Clone, Debug)]
 pub struct CreateTableStmt {
     pub if_not_exists: bool,
+    /// `CREATE TEMPORARY TABLE`: a session-local table that shadows a
+    /// permanent table of the same name.
+    pub temporary: bool,
     pub table: TableName,
     pub cols: Vec<ColumnDef>,
     pub indices: Vec<IndexDef>,
@@ -449,7 +452,11 @@ pub struct CreateTableStmt {
 
 impl CreateTableStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("CREATE TABLE ");
+        if self.temporary {
+            ctx.write_str("CREATE TEMPORARY TABLE ");
+        } else {
+            ctx.write_str("CREATE TABLE ");
+        }
         if self.if_not_exists {
             ctx.write_str("IF NOT EXISTS ");
         }
@@ -550,12 +557,16 @@ pub struct DropTableStmt {
     pub tables: Vec<TableName>,
     /// TiDB `IsView`: `DROP VIEW` vs `DROP TABLE`.
     pub is_view: bool,
+    /// `DROP TEMPORARY TABLE`: only session-local temporary tables.
+    pub temporary: bool,
 }
 
 impl DropTableStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         if self.is_view {
             ctx.write_str("DROP VIEW ");
+        } else if self.temporary {
+            ctx.write_str("DROP TEMPORARY TABLE ");
         } else {
             ctx.write_str("DROP TABLE ");
         }

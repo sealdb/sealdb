@@ -697,9 +697,6 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             temporary,
             ..
         } => {
-            if *temporary {
-                return Err(Error::unsupported("DROP TEMPORARY"));
-            }
             match object_type {
                 ObjectType::Database | ObjectType::Schema => {
                     let name = names
@@ -717,6 +714,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         .map(object_table_name)
                         .collect::<Result<Vec<_>>>()?,
                     is_view: false,
+                    temporary: *temporary,
                 })),
                 ObjectType::View => Ok(Statement::DropTable(DropTableStmt {
                     if_exists: *if_exists,
@@ -725,6 +723,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                         .map(object_table_name)
                         .collect::<Result<Vec<_>>>()?,
                     is_view: true,
+                    temporary: false,
                 })),
                 ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
                     if_exists: *if_exists,
@@ -10244,10 +10243,8 @@ fn lower_auto_increment(options: &[sqlparser::ast::ColumnOptionDef]) -> bool {
 }
 
 fn lower_create_table(create: &CreateTable) -> Result<Statement> {
-    // LIKE / AS SELECT. TEMPORARY stays deferred ( gaps).
-    if create.temporary {
-        return Err(Error::unsupported("TEMPORARY CREATE TABLE"));
-    }
+    // LIKE / AS SELECT. TEMPORARY tables are session-local (handled by the
+    // session, not the persisted DDL path).
     let refer_table = match &create.like {
         Some(CreateTableLikeKind::Plain(like) | CreateTableLikeKind::Parenthesized(like)) => {
             if like.defaults.is_some() {
@@ -10358,6 +10355,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     let (charset, collate) = lower_table_charset_collate(&create.table_options);
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
+        temporary: create.temporary,
         table: object_table_name(&create.name)?,
         cols,
         indices,

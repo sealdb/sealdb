@@ -2239,6 +2239,7 @@ dependencies = [
  "reqwest",
  "sealdb-bindinfo",
  "sealdb-config",
+ "sealdb-ddl",
  "sealdb-domain",
  "sealdb-errno",
  "sealdb-executor",

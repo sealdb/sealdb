@@ -15,4 +15,5 @@ pub mod table;
 pub mod view;
 
 pub use create_table::build_table_info;
+pub use table::clear_table_keys;
 pub use ddl::execute_ddl;

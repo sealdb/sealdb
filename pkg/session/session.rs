@@ -18,6 +18,30 @@ use sealdb_sessiontxn::TxnManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Reserved schema under which a session's temporary tables are exposed to the
+/// planner. User statements never spell it: references to unqualified names
+/// that resolve to a temporary table are rewritten to this schema.
+const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
+
+/// Synthetic ids for session-local temporary tables, far above the ids the
+/// catalog allocates so their rows never collide with a persisted table.
+static NEXT_TEMP_TABLE_ID: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(1i64 << 60);
+
+fn next_temp_table_id() -> i64 {
+    NEXT_TEMP_TABLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clears the thread-local temporary table catalog when a statement ends, so
+/// another session running later on the same thread cannot see it.
+struct TempTablesGuard;
+
+impl Drop for TempTablesGuard {
+    fn drop(&mut self) {
+        sealdb_infoschema::infoschema::clear_thread_temp_tables();
+    }
+}
+
 pub struct Session {
     parser: Parser,
     planner: PlanBuilder,
@@ -42,6 +66,10 @@ pub struct Session {
     time_zone: Mutex<String>,
     /// Session user variables (`SET @a = …` / `SELECT @a`).
     user_vars: Mutex<HashMap<String, sealdb_types::Datum>>,
+    /// `CREATE TEMPORARY TABLE` definitions, keyed by `(schema, table)` and
+    /// visible only to this session. Rows live in the shared storage under a
+    /// synthetic table id and are removed by `DROP TEMPORARY TABLE`.
+    temp_tables: Mutex<HashMap<(String, String), sealdb_meta::TableInfo>>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
     partition_prune_mode: Mutex<PartitionPruneMode>,
     /// TiDB `tidb_enable_clustered_index` (default ON). Read by CREATE TABLE to
@@ -114,6 +142,7 @@ impl Session {
             sql_mode: Mutex::new(globals.sql_mode),
             time_zone: Mutex::new("SYSTEM".to_string()),
             user_vars: Mutex::new(HashMap::new()),
+            temp_tables: Mutex::new(HashMap::new()),
             partition_prune_mode: Mutex::new(
                 PartitionPruneMode::parse(&globals.partition_prune_mode)
                     .unwrap_or(PartitionPruneMode::Dynamic),
@@ -250,8 +279,137 @@ impl Session {
         }
     }
 
-    fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
-        // Publish this session's `tidb_window_concurrency` for the planner and
+    /// `CREATE TEMPORARY TABLE`: keep the definition session-local and give it
+    /// a synthetic table id so its rows never collide with a catalog table.
+    fn create_temporary_table(
+        &self,
+        create: &sealdb_parser::ast::ddl::CreateTableStmt,
+    ) -> Result<QueryResult> {
+        if create.refer_table.is_some() || create.select.is_some() {
+            return Err(Error::unsupported(
+                "CREATE TEMPORARY TABLE ... LIKE/AS SELECT",
+            ));
+        }
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let (schema, table) = create.table.qualified(&current_db);
+        if schema.is_empty() {
+            return Err(Error::new(
+                sealdb_errno::ERR_NO_DB,
+                "No database selected",
+            ));
+        }
+        let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock")
+            .contains_key(&key)
+        {
+            if create.if_not_exists {
+                return Ok(empty_result());
+            }
+            return Err(Error::new(
+                sealdb_errno::ERR_TABLE_EXISTS,
+                format!("Table '{table}' already exists"),
+            ));
+        }
+        let mut info = sealdb_ddl::build_table_info(create, next_temp_table_id())?;
+        info.name = sealdb_parser::model::CIStr::new(table);
+        self.temp_tables
+            .lock()
+            .expect("session temp tables lock")
+            .insert(key, info);
+        Ok(empty_result())
+    }
+
+    /// `DROP TEMPORARY TABLE`: only session-local definitions are affected;
+    /// their rows are removed from storage.
+    fn drop_temporary_tables(
+        &self,
+        drop: &sealdb_parser::ast::ddl::DropTableStmt,
+    ) -> Result<QueryResult> {
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let mut removed = Vec::new();
+        for name in &drop.tables {
+            let (schema, table) = name.qualified(&current_db);
+            if schema.is_empty() {
+                if drop.if_exists {
+                    continue;
+                }
+                return Err(Error::new(
+                    sealdb_errno::ERR_NO_DB,
+                    "No database selected",
+                ));
+            }
+            let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+            match self
+                .temp_tables
+                .lock()
+                .expect("session temp tables lock")
+                .remove(&key)
+            {
+                Some(info) => removed.push(info),
+                None if drop.if_exists => sealdb_expression::note_warning(
+                    sealdb_errno::ERR_BAD_TABLE,
+                    format!("Unknown table '{schema}.{table}'"),
+                ),
+                None => {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_BAD_TABLE,
+                        format!("Unknown table '{schema}.{table}'"),
+                    ));
+                }
+            }
+        }
+        let storage = self.domain.storage();
+        for info in &removed {
+            sealdb_ddl::clear_table_keys(storage.as_ref(), &info.physical_ids())?;
+        }
+        Ok(empty_result())
+    }
+
+    /// Add this session's temporary tables (those in `current_db`) to the
+    /// planning catalog under their reserved schema.
+    fn overlay_temp_tables(&self, is: &mut InfoSchema, current_db: &str) {
+        let db = current_db.to_ascii_lowercase();
+        let temps = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock");
+        for ((schema, _), info) in temps.iter() {
+            if *schema == db {
+                is.insert_temp_table(TEMP_TABLE_SCHEMA, info.clone());
+            }
+        }
+    }
+
+    /// Publish this session's temporary tables for `Domain::infoschema`, which
+    /// executors consult while the statement runs.
+    fn publish_temp_tables(&self, current_db: &str) -> TempTablesGuard {
+        let db = current_db.to_ascii_lowercase();
+        let temps = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock");
+        let mut map = HashMap::new();
+        for ((schema, name), info) in temps.iter() {
+            if *schema == db {
+                map.insert((TEMP_TABLE_SCHEMA.to_string(), name.clone()), info.clone());
+            }
+        }
+        sealdb_infoschema::infoschema::set_thread_temp_tables(map);
+        TempTablesGuard
+    }
+
+    fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {        // Publish this session's `tidb_window_concurrency` for the planner and
         // executor (thread-local), so a suite that changes it cannot leak its
         // value into a later session on the same thread.
         sealdb_expression::set_window_concurrency(
@@ -283,6 +441,17 @@ impl Session {
         }
         // Schema lease 8027 (disabled when lease is Duration::ZERO).
         self.domain.check_schema_lease()?;
+        // Session-local temporary tables bypass the persisted DDL path.
+        if let Statement::CreateTable(create) = stmt
+            && create.temporary
+        {
+            return self.create_temporary_table(create);
+        }
+        if let Statement::DropTable(drop) = stmt
+            && drop.temporary
+        {
+            return self.drop_temporary_tables(drop);
+        }
         match stmt {
             Statement::Use(use_stmt) => {
                 let is = self.domain.infoschema();
@@ -688,7 +857,9 @@ impl Session {
             session_id: self.session_id,
             active: !self.txn.lock().expect("session txn lock").is_explicit(),
         };
-        let is = self.domain.infoschema();
+        let mut is = self.domain.infoschema();
+        self.overlay_temp_tables(&mut is, &current_db);
+        let _temp_guard = self.publish_temp_tables(&current_db);
         let ctas_insert = match stmt {
             Statement::CreateTable(create) => create.select.as_ref().and_then(|select| {
                 let (schema, table) = create.table.qualified(&current_db);
@@ -714,6 +885,17 @@ impl Session {
         let rebound = self.apply_sql_binding(stmt)?;
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         inherit_cte_scope(&mut expanded);
+        // Temporary tables shadow permanent ones only for unqualified names;
+        // rewrite them before VIEW expansion so a view body (qualified with its
+        // schema) keeps resolving to the permanent table.
+        let temp_tables = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock")
+            .clone();
+        if !temp_tables.is_empty() {
+            rewrite_temp_table_refs(&mut expanded, &temp_tables, &current_db);
+        }
         let priv_mgr = self.domain.privilege();
         let view_priv = ViewPrivCtx {
             mgr: priv_mgr.as_ref(),
@@ -4465,55 +4647,161 @@ fn qualify_view_body_tables(select: &mut SelectStmt, schema: &str) {
     if schema.is_empty() {
         return;
     }
+    map_select_with_ctes(select, &mut |table| qualify_table_name(table, schema));
+}
+
+/// `db.`-qualify an unqualified table reference (`dual` and CTE names are
+/// filtered by the caller).
+fn qualify_table_name(table: &mut TableName, schema: &str) {
+    if table.schema.is_some() {
+        return;
+    }
+    if table.name.eq_ignore_ascii_case("dual") {
+        return;
+    }
+    table.schema = Some(schema.to_string());
+}
+
+/// Rewrite unqualified references to this session's temporary tables to the
+/// reserved schema (`TEMP_TABLE_SCHEMA`). Runs before VIEW expansion: a view
+/// body is qualified with its own schema, so it keeps reading the permanent
+/// table even while a temporary table shadows the name.
+fn rewrite_temp_table_refs(
+    stmt: &mut Statement,
+    temps: &HashMap<(String, String), sealdb_meta::TableInfo>,
+    current_db: &str,
+) {
+    let mut map = |table: &mut TableName| rewrite_temp_table_name(table, temps, current_db);
+    match stmt {
+        Statement::Select(select) => map_select_with_ctes(select, &mut map),
+        Statement::SetOpr(set) => {
+            map_select_with_ctes(&mut set.first, &mut map);
+            for (_, arm) in &mut set.rest {
+                map_select_with_ctes(arm, &mut map);
+            }
+        }
+        Statement::Insert(insert) => {
+            rewrite_temp_table_name(&mut insert.table, temps, current_db);
+            if let Some(select) = insert.select.as_deref_mut() {
+                map_select_with_ctes(select, &mut map);
+            }
+            if let Some(set) = insert.select_set.as_deref_mut() {
+                map_select_with_ctes(&mut set.first, &mut map);
+                for (_, arm) in &mut set.rest {
+                    map_select_with_ctes(arm, &mut map);
+                }
+            }
+        }
+        Statement::Update(update) => {
+            rewrite_temp_table_name(&mut update.table, temps, current_db);
+            if let Some(join) = update.join.as_mut() {
+                rewrite_temp_table_name(&mut join.left, temps, current_db);
+                rewrite_temp_table_name(&mut join.right, temps, current_db);
+            }
+            for item in &mut update.list {
+                map_tables_in_expr(&mut item.expr, &[], &mut map);
+            }
+            if let Some(sel) = update.selection.as_mut() {
+                map_tables_in_expr(sel, &[], &mut map);
+            }
+        }
+        Statement::Delete(delete) => {
+            rewrite_temp_table_name(&mut delete.table, temps, current_db);
+            for table in &mut delete.tables {
+                rewrite_temp_table_name(table, temps, current_db);
+            }
+            if let Some(join) = delete.join.as_mut() {
+                rewrite_temp_table_name(&mut join.left, temps, current_db);
+                rewrite_temp_table_name(&mut join.right, temps, current_db);
+            }
+            if let Some(sel) = delete.selection.as_mut() {
+                map_tables_in_expr(sel, &[], &mut map);
+            }
+        }
+        Statement::Explain(explain) => {
+            rewrite_temp_table_refs(&mut explain.stmt, temps, current_db)
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_temp_table_name(
+    table: &mut TableName,
+    temps: &HashMap<(String, String), sealdb_meta::TableInfo>,
+    current_db: &str,
+) {
+    // An explicitly qualified name (`db.t`) is not shadowed: VIEW bodies rely
+    // on this, and TiDB resolves them against the permanent catalog.
+    if table.schema.is_some() || table.name.eq_ignore_ascii_case("dual") {
+        return;
+    }
+    let key = (
+        current_db.to_ascii_lowercase(),
+        table.resolve_name().to_ascii_lowercase(),
+    );
+    if temps.contains_key(&key) {
+        table.schema = Some(TEMP_TABLE_SCHEMA.to_string());
+    }
+}
+
+/// Apply `map` to every table reference of `select`, skipping names bound by
+/// the CTEs in scope. Table refs inside subqueries recurse.
+fn map_select_tables(
+    select: &mut SelectStmt,
+    cte_names: &[String],
+    map: &mut dyn FnMut(&mut TableName),
+) {
+    let mut map_ref = |table: &mut TableName| {
+        if cte_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(table.resolve_name()))
+        {
+            return;
+        }
+        map(table);
+    };
+    if let Some(from) = select.from.as_mut() {
+        map_ref(from);
+    }
+    for join in &mut select.joins {
+        map_ref(&mut join.left);
+        map_ref(&mut join.right);
+    }
+    for field in &mut select.fields {
+        map_tables_in_expr(&mut field.expr, cte_names, map);
+    }
+    if let Some(sel) = select.selection.as_mut() {
+        map_tables_in_expr(sel, cte_names, map);
+    }
+}
+
+/// Recurse into a SELECT's nested `WITH` (sibling CTE scoping), then map the
+/// outer SELECT.
+fn map_select_with_ctes(select: &mut SelectStmt, map: &mut dyn FnMut(&mut TableName)) {
     let mut cte_names = Vec::new();
     if let Some(with) = select.with.as_mut() {
         for cte in &mut with.ctes {
             // Nested WITH bodies see only preceding sibling CTE names.
-            qualify_select_tables(cte.query.as_mut(), schema, &cte_names);
+            map_select_tables(cte.query.as_mut(), &cte_names, map);
             for (_, arm) in &mut cte.set_rest {
-                qualify_select_tables(arm, schema, &cte_names);
+                map_select_tables(arm, &cte_names, map);
             }
             if let Some((_, rec)) = cte.recursive.as_mut() {
                 // Recursive arm may self-ref this CTE.
                 let mut with_self = cte_names.clone();
                 with_self.push(cte.name.clone());
-                qualify_select_tables(rec, schema, &with_self);
+                map_select_tables(rec, &with_self, map);
             }
             cte_names.push(cte.name.clone());
         }
     }
-    qualify_select_tables(select, schema, &cte_names);
+    map_select_tables(select, &cte_names, map);
 }
 
 fn qualify_select_tables(select: &mut SelectStmt, schema: &str, cte_names: &[String]) {
-    let qualify = |table: &mut TableName| {
-        if table.schema.is_some() {
-            return;
-        }
-        if table.name.eq_ignore_ascii_case("dual") {
-            return;
-        }
-        if cte_names
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(table.resolve_name()))
-        {
-            return;
-        }
-        table.schema = Some(schema.to_string());
-    };
-    if let Some(from) = select.from.as_mut() {
-        qualify(from);
-    }
-    for join in &mut select.joins {
-        qualify(&mut join.left);
-        qualify(&mut join.right);
-    }
-    for field in &mut select.fields {
-        qualify_tables_in_expr(&mut field.expr, schema, cte_names);
-    }
-    if let Some(sel) = select.selection.as_mut() {
-        qualify_tables_in_expr(sel, schema, cte_names);
-    }
+    map_select_tables(select, cte_names, &mut |table| {
+        qualify_table_name(table, schema)
+    });
 }
 
 fn qualify_tables_in_expr(
@@ -4521,71 +4809,9 @@ fn qualify_tables_in_expr(
     schema: &str,
     cte_names: &[String],
 ) {
-    use sealdb_parser::ast::expressions::ExprNode;
-    match expr {
-        ExprNode::ScalarSubquery(s) => {
-            qualify_tables_in_result_set(&mut s.query, schema, cte_names)
-        }
-        ExprNode::Exists(e) => qualify_tables_in_result_set(&mut e.query, schema, cte_names),
-        ExprNode::InSubquery(s) => {
-            qualify_tables_in_expr(&mut s.expr, schema, cte_names);
-            qualify_tables_in_result_set(&mut s.query, schema, cte_names);
-        }
-        ExprNode::QuantifiedCmp(q) => {
-            qualify_tables_in_expr(&mut q.expr, schema, cte_names);
-            qualify_tables_in_result_set(&mut q.query, schema, cte_names);
-        }
-        ExprNode::Binary(b) => {
-            qualify_tables_in_expr(&mut b.left, schema, cte_names);
-            qualify_tables_in_expr(&mut b.right, schema, cte_names);
-        }
-        ExprNode::Unary(u) => qualify_tables_in_expr(&mut u.expr, schema, cte_names),
-        ExprNode::Func(f) => {
-            for arg in &mut f.args {
-                qualify_tables_in_expr(arg, schema, cte_names);
-            }
-        }
-        ExprNode::Cast(c) => qualify_tables_in_expr(&mut c.expr, schema, cte_names),
-        ExprNode::InList(i) => {
-            qualify_tables_in_expr(&mut i.expr, schema, cte_names);
-            for item in &mut i.list {
-                qualify_tables_in_expr(item, schema, cte_names);
-            }
-        }
-        ExprNode::Between(b) => {
-            qualify_tables_in_expr(&mut b.expr, schema, cte_names);
-            qualify_tables_in_expr(&mut b.low, schema, cte_names);
-            qualify_tables_in_expr(&mut b.high, schema, cte_names);
-        }
-        ExprNode::Like(l) => {
-            qualify_tables_in_expr(&mut l.expr, schema, cte_names);
-            qualify_tables_in_expr(&mut l.pattern, schema, cte_names);
-        }
-        ExprNode::IsNull(i) => qualify_tables_in_expr(&mut i.expr, schema, cte_names),
-        ExprNode::Case(c) => {
-            if let Some(operand) = &mut c.operand {
-                qualify_tables_in_expr(operand, schema, cte_names);
-            }
-            for (when, then) in &mut c.when_then {
-                qualify_tables_in_expr(when, schema, cte_names);
-                qualify_tables_in_expr(then, schema, cte_names);
-            }
-            if let Some(branch) = &mut c.else_expr {
-                qualify_tables_in_expr(branch, schema, cte_names);
-            }
-        }
-        ExprNode::Window(w) => {
-            for arg in &mut w.args {
-                qualify_tables_in_expr(arg, schema, cte_names);
-            }
-        }
-        ExprNode::Row(r) => {
-            for expr in &mut r.exprs {
-                qualify_tables_in_expr(expr, schema, cte_names);
-            }
-        }
-        ExprNode::Column(_) | ExprNode::Value(_) => {}
-    }
+    map_tables_in_expr(expr, cte_names, &mut |table| {
+        qualify_table_name(table, schema)
+    });
 }
 
 fn qualify_tables_in_result_set(
@@ -4593,30 +4819,110 @@ fn qualify_tables_in_result_set(
     schema: &str,
     cte_names: &[String],
 ) {
+    map_tables_in_result_set(query, cte_names, &mut |table| {
+        qualify_table_name(table, schema)
+    });
+}
+
+fn map_tables_in_expr(
+    expr: &mut sealdb_parser::ast::expressions::ExprNode,
+    cte_names: &[String],
+    map: &mut dyn FnMut(&mut TableName),
+) {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::ScalarSubquery(s) => map_tables_in_result_set(&mut s.query, cte_names, map),
+        ExprNode::Exists(e) => map_tables_in_result_set(&mut e.query, cte_names, map),
+        ExprNode::InSubquery(s) => {
+            map_tables_in_expr(&mut s.expr, cte_names, map);
+            map_tables_in_result_set(&mut s.query, cte_names, map);
+        }
+        ExprNode::QuantifiedCmp(q) => {
+            map_tables_in_expr(&mut q.expr, cte_names, map);
+            map_tables_in_result_set(&mut q.query, cte_names, map);
+        }
+        ExprNode::Binary(b) => {
+            map_tables_in_expr(&mut b.left, cte_names, map);
+            map_tables_in_expr(&mut b.right, cte_names, map);
+        }
+        ExprNode::Unary(u) => map_tables_in_expr(&mut u.expr, cte_names, map),
+        ExprNode::Func(f) => {
+            for arg in &mut f.args {
+                map_tables_in_expr(arg, cte_names, map);
+            }
+        }
+        ExprNode::Cast(c) => map_tables_in_expr(&mut c.expr, cte_names, map),
+        ExprNode::InList(i) => {
+            map_tables_in_expr(&mut i.expr, cte_names, map);
+            for item in &mut i.list {
+                map_tables_in_expr(item, cte_names, map);
+            }
+        }
+        ExprNode::Between(b) => {
+            map_tables_in_expr(&mut b.expr, cte_names, map);
+            map_tables_in_expr(&mut b.low, cte_names, map);
+            map_tables_in_expr(&mut b.high, cte_names, map);
+        }
+        ExprNode::Like(l) => {
+            map_tables_in_expr(&mut l.expr, cte_names, map);
+            map_tables_in_expr(&mut l.pattern, cte_names, map);
+        }
+        ExprNode::IsNull(i) => map_tables_in_expr(&mut i.expr, cte_names, map),
+        ExprNode::Case(c) => {
+            if let Some(operand) = &mut c.operand {
+                map_tables_in_expr(operand, cte_names, map);
+            }
+            for (when, then) in &mut c.when_then {
+                map_tables_in_expr(when, cte_names, map);
+                map_tables_in_expr(then, cte_names, map);
+            }
+            if let Some(branch) = &mut c.else_expr {
+                map_tables_in_expr(branch, cte_names, map);
+            }
+        }
+        ExprNode::Window(w) => {
+            for arg in &mut w.args {
+                map_tables_in_expr(arg, cte_names, map);
+            }
+        }
+        ExprNode::Row(r) => {
+            for expr in &mut r.exprs {
+                map_tables_in_expr(expr, cte_names, map);
+            }
+        }
+        ExprNode::Column(_) | ExprNode::Value(_) => {}
+    }
+}
+
+fn map_tables_in_result_set(
+    query: &mut sealdb_parser::ast::ResultSetNode,
+    cte_names: &[String],
+    map: &mut dyn FnMut(&mut TableName),
+) {
     match query {
         sealdb_parser::ast::ResultSetNode::Select(select) => {
-            // Nested WITH on a scalar subquery: qualify bodies, then the select.
+            // Nested WITH on a scalar subquery: map bodies, then the select.
             let mut nested = cte_names.to_vec();
             if let Some(with) = select.with.as_mut() {
                 for cte in &mut with.ctes {
-                    qualify_select_tables(cte.query.as_mut(), schema, &nested);
+                    map_select_tables(cte.query.as_mut(), &nested, map);
                     for (_, arm) in &mut cte.set_rest {
-                        qualify_select_tables(arm, schema, &nested);
+                        map_select_tables(arm, &nested, map);
                     }
                     if let Some((_, rec)) = cte.recursive.as_mut() {
                         let mut with_self = nested.clone();
                         with_self.push(cte.name.clone());
-                        qualify_select_tables(rec, schema, &with_self);
+                        map_select_tables(rec, &with_self, map);
                     }
                     nested.push(cte.name.clone());
                 }
             }
-            qualify_select_tables(select, schema, &nested);
+            map_select_tables(select, &nested, map);
         }
         sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
-            qualify_select_tables(&mut set.first, schema, cte_names);
+            map_select_tables(&mut set.first, cte_names, map);
             for (_, arm) in &mut set.rest {
-                qualify_select_tables(arm, schema, cte_names);
+                map_select_tables(arm, cte_names, map);
             }
         }
     }

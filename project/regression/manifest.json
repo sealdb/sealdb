@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 62,
-      "pending": 168,
+      "green": 63,
+      "pending": 167,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -2492,7 +2492,7 @@
     {
       "name": "table/temptable",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/table/temptable.test",
       "result": "r/table/temptable.result",
       "has_result": true,

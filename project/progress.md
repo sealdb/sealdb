@@ -2502,6 +2502,29 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R7 长尾：`table/temptable`（需要会话级临时表）/ `cte` 剩余差异
 
+### 2026-11-14（`table/temptable` 转正：会话级临时表）
+
+- **Phase**: R7
+- **完成**:
+  - `CREATE TEMPORARY TABLE` / `DROP TEMPORARY TABLE` 解析（`CreateTableStmt.temporary`
+    / `DropTableStmt.temporary`），会话内 `temp_tables` 以 `(schema, table)` 存放，
+    表 ID 由 `NEXT_TEMP_TABLE_ID` 在 `1 << 60` 之上合成，行数据与会话生命周期绑定。
+  - 非限定名解析：临时表遮蔽同名永久表——在 VIEW 展开前把用户语句中的非限定表
+    引用改写到保留 schema `__sealdb_temporary`，因此 `CREATE VIEW`（展开后带库名）
+    仍读永久表；`DROP TEMPORARY TABLE` 清理表定义并删除对应行键。
+  - 执行器可见性：`Domain::infoschema()` 合并线程级临时表目录（语句执行期间由
+    session 发布、`TempTablesGuard` 结束时清理），使 `InsertExec`、`TableReader`、
+    `PointGet` 等自行重建 catalog 的执行器也能解析临时表。
+- **验证**:
+  - `run-tests.sh -s memory -t table/temptable --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t table/temptable --status pending` → `PASS: tikv=1`
+  - manifest `table/temptable` → `green`，green 62→63
+- **阻塞/风险**:
+  - `SHOW TABLES` / `information_schema.tables` 尚未列出临时表；plan cache 未按临时表
+    存在性失效（本套件未覆盖）。
+- **下一步**:
+  - 继续 R7 长尾与 R2 `cte` 剩余差异
+
 ---
 
 ## 5. Gate 证据索引

@@ -192,7 +192,8 @@ pub fn truncate_table(
     Ok(())
 }
 
-fn clear_table_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<()> {
+/// Remove every row/index key of the given physical table ids.
+pub fn clear_table_keys(storage: &dyn Storage, physical_ids: &[i64]) -> Result<()> {
     if physical_ids.is_empty() {
         return Ok(());
     }
