@@ -2580,6 +2580,30 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `explain_easy` 剩余 UNION ALL 聚合下推 + `IndexJoin` 左外连接，随后
     `explain_complex` / `explain_complex_stats` / `explain_join_stats`
 
+### 2026-11-14（`explain_easy` 增量：UNION ALL 聚合下推 + 左外 IndexJoin 形状）
+
+- **Phase**: R3
+- **完成**:
+  - 派生聚合穿透 `UNION ALL` + `LEFT JOIN` 唯一键的形状渲染
+    （`explain_agg_push_union_join`）：解包内联 CTE、解析 cop 投影标记
+    （`COP_PROJ|…`），按 TiDB 的两次下推展开为
+    `StreamAgg(count) → HashAgg(count) → Projection → IndexJoin(HashAgg ⋈ b)`。
+  - 常量分支折叠：`cast(0 AS decimal) > 0` 恒假 → `TableDual rows:0`；另一分支
+    合并外推谓词（TiDB 的 `cast(bigint unsigned AS decimal(20,0) BINARY)` 包装），
+    查找侧渲染为 `TableRangeScan … decided by [Column#16]`。
+  - 被下推的 cop 谓词仍带派生别名（`t`），渲染时统一改为物理表名；
+    `COALESCE` 尾缀 quote/别名按 TiDB 形式归一。
+- **验证**:
+  - `run-tests.sh -s memory --status in_progress -t explain_easy` → 该语句已对齐，
+    后续差异推进到第 570 行（左右/内连接派生命题下推、IN 子查询 Apply 去关联）
+  - 全量 memory gate → `PASS: memory=72 skipped=182`
+- **阻塞/风险**:
+  - `executor/explain` 的外层投影/扫描计数改动与本次渲染均只影响 EXPLAIN 文本，
+    不动执行计划语义。
+- **下一步**:
+  - `explain_easy`：外连接两侧的派生条件下推（`or(cast(nb),0)` 同时进 Build/Probe）
+    与 `IN (SELECT count(*) …)` 的 Apply 去关联；随后 `explain_complex*`
+
 ---
 
 ## 5. Gate 证据索引
