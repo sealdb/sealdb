@@ -21259,7 +21259,14 @@ fn union_scan_over_dirty(
     let Some(info) = is.table_by_name(&db, &table) else {
         return plan;
     };
-    if !table_is_dirty(info.id) {
+    // Partitioned tables store their rows under the *partition* table ids, so a
+    // pending write dirties a partition, not the logical table id.
+    let dirty = table_is_dirty(info.id)
+        || info
+            .partition
+            .as_ref()
+            .is_some_and(|p| p.definitions.iter().any(|d| table_is_dirty(d.id)));
+    if !dirty {
         return plan;
     }
     // TiDB reads a `Point_Get` straight from the transaction's snapshot plus
