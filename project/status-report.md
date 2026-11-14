@@ -61,10 +61,10 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **65 个** �
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory
-→ PASS: memory=70 tikv=0 skipped=184
+→ PASS: memory=72 tikv=0 skipped=182
 
 ./tests/integrationtest/run-tests.sh -s tikv
-→ 除 `executor/adapter` 的亚秒计时断言外全部通过
+→ PASS: memory=0 tikv=71 skipped=183
 ```
 
 TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），65 个 `green` 套件与 Mem 同一提交上复验通过（`local` 套件中有一支仅 Mem 运行）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。

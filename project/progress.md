@@ -2597,6 +2597,7 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `run-tests.sh -s memory --status in_progress -t explain_easy` → 该语句已对齐，
     后续差异推进到第 570 行（左右/内连接派生命题下推、IN 子查询 Apply 去关联）
   - 全量 memory gate → `PASS: memory=72 skipped=182`
+  - 全量 TiKV gate → `PASS: memory=0 tikv=71 skipped=183`（green 双引擎复验通过）
 - **阻塞/风险**:
   - `executor/explain` 的外层投影/扫描计数改动与本次渲染均只影响 EXPLAIN 文本，
     不动执行计划语义。
