@@ -1172,6 +1172,28 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out))
         }
+        // MySQL `MD5(str)`: lowercase hex digest; NULL in → NULL.
+        "MD5" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "MD5 requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let digest = sealdb_meta::model::key_hash::md5(&v.as_bytes());
+            let mut out = String::with_capacity(32);
+            for b in digest {
+                out.push_str(&format!("{b:02x}"));
+            }
+            Ok(Datum::Bytes(out.into_bytes()))
+        }
+        // MySQL `LOWER(str)` / `UPPER(str)`: case-fold the text argument.
+        "LOWER" | "LCASE" => eval_case_convert(func, schema, row, false),
+        "UPPER" | "UCASE" => eval_case_convert(func, schema, row, true),
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
         // MySQL `QUOTE(str)`: single-quoted, with `'` `\` NUL and `0x1a`
         // escaped. Numbers print as their own text (`QUOTE(1.5)` → `'1.5'`).
@@ -1241,6 +1263,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
+        "TIMEDIFF" => eval_time_diff(func, schema, row),
         "UNIX_TIMESTAMP" => eval_unix_timestamp(func, schema, row),
         // MySQL `SLEEP(n)`: block `n` seconds and return 0.
         "SLEEP" => {
@@ -1421,6 +1444,33 @@ fn json_scalar_datum(value: &serde_json::Value) -> Datum {
 fn weekday_of(t: &Time) -> i64 {
     // 1970-01-01 was a Thursday (WEEKDAY 3).
     (days_from_civil(t.year, t.month, t.day) + 3).rem_euclid(7)
+}
+
+/// MySQL `LOWER(str)` / `UPPER(str)` (also `LCASE` / `UCASE`): NULL in → NULL,
+/// non-text arguments go through their string form.
+fn eval_case_convert(
+    func: &FuncCallExpr,
+    schema: &[String],
+    row: &[Datum],
+    upper: bool,
+) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 1 argument", func.name),
+        ));
+    }
+    let v = eval_expr_with_row(&func.args[0], schema, row)?;
+    if v.is_null() {
+        return Ok(Datum::Null);
+    }
+    let text = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+    let out = if upper {
+        text.to_uppercase()
+    } else {
+        text.to_lowercase()
+    };
+    Ok(Datum::Bytes(out.into_bytes()))
 }
 
 /// MySQL `SUBSTRING(str, pos[, len])`: 1-based; negative `pos` counts from the
@@ -1682,6 +1732,13 @@ fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<
             let mins = total.div_euclid(60);
             t.second = total.rem_euclid(60) as u8;
             return add_interval(t, "MINUTE", mins, false);
+        }
+        "MICROSECOND" | "MICROSECONDS" => {
+            let total = i64::from(t.micro) + amount;
+            let secs = total.div_euclid(1_000_000);
+            t.micro = total.rem_euclid(1_000_000) as u32;
+            t.fsp = t.fsp.max(6);
+            return add_interval(t, "SECOND", secs, false);
         }
         "DAY" | "DAYS" => add_days(&mut t, amount)?,
         "YEAR" | "YEARS" => {
@@ -2016,6 +2073,53 @@ fn shift_minutes(t: &mut Time, minutes: i64) -> Result<()> {
         add_days(t, days)?;
     }
     Ok(())
+}
+
+/// `TIMEDIFF(expr1, expr2)`: `expr1 - expr2` as a signed `TIME` value.
+fn eval_time_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 2 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "TIMEDIFF requires 2 arguments",
+        ));
+    }
+    let a = eval_expr_with_row(&func.args[0], schema, row)?;
+    let b = eval_expr_with_row(&func.args[1], schema, row)?;
+    if a.is_null() || b.is_null() {
+        return Ok(Datum::Null);
+    }
+    let ta = datum_as_time(&a)?;
+    let tb = datum_as_time(&b)?;
+    let micros = |t: &Time| -> i64 {
+        let days = days_from_civil(t.year, t.month, t.day);
+        (((days * 24 + i64::from(t.hour)) * 60 + i64::from(t.minute)) * 60 + i64::from(t.second))
+            * 1_000_000
+            + i64::from(t.micro)
+    };
+    let diff = micros(&ta) - micros(&tb);
+    // `TIME` has no sign slot here; render TiDB's signed duration text so the
+    // value still compares equal to itself and prints `-00:00:00.000001`.
+    Ok(Datum::Bytes(format_duration(diff, ta.fsp.max(tb.fsp)).into_bytes()))
+}
+
+fn format_duration(micros: i64, fsp: i8) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let abs = micros.unsigned_abs();
+    let secs = abs / 1_000_000;
+    let frac = (abs % 1_000_000) as u32;
+    let mut out = format!(
+        "{sign}{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    );
+    if fsp <= 0 {
+        return out;
+    }
+    let fsp = fsp.min(6) as u32;
+    let scale = 10u32.pow(6 - fsp);
+    out.push_str(&format!(".{:0width$}", frac / scale, width = fsp as usize));
+    out
 }
 
 fn eval_timestamp_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
@@ -2408,10 +2512,60 @@ fn num_bin(
     f: impl Fn(f64, f64) -> Result<f64>,
 ) -> Result<Datum> {
     if matches!(left, Datum::F64(_)) || matches!(right, Datum::F64(_)) {
-        Ok(Datum::F64(f(left.as_f64()?, right.as_f64()?)?))
+        Ok(Datum::F64(f(
+            string_lenient_f64(left)?,
+            string_lenient_f64(right)?,
+        )?))
     } else {
-        Ok(Datum::I64(i(left.as_i64()?, right.as_i64()?)?))
+        Ok(Datum::I64(i(
+            string_lenient_i64(left)?,
+            string_lenient_i64(right)?,
+        )?))
     }
+}
+
+/// MySQL string→number: the leading numeric prefix, `0` when there is none
+/// (`'0000-00-00 00:00:00.00001' + 1` is `1` with a warning). A restated
+/// expression index part re-parses its literal as a string, so its arithmetic
+/// must follow the same rule as the typed literal the query uses.
+fn string_lenient_i64(d: &Datum) -> Result<i64> {
+    match d {
+        Datum::Bytes(b) => Ok(numeric_prefix(std::str::from_utf8(b).unwrap_or(""))
+            .parse::<i64>()
+            .unwrap_or(0)),
+        other => other.as_i64(),
+    }
+}
+
+fn string_lenient_f64(d: &Datum) -> Result<f64> {
+    match d {
+        Datum::Bytes(b) => Ok(numeric_prefix(std::str::from_utf8(b).unwrap_or(""))
+            .parse::<f64>()
+            .unwrap_or(0.0)),
+        other => other.as_f64(),
+    }
+}
+
+/// Longest prefix of `s` that parses as a decimal number (`-12.5abc` → `-12.5`).
+fn numeric_prefix(s: &str) -> &str {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    let mut end = 0;
+    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+        end = 1;
+    }
+    let mut seen_dot = false;
+    while let Some(&b) = bytes.get(end) {
+        if b.is_ascii_digit() {
+            end += 1;
+        } else if b == b'.' && !seen_dot {
+            seen_dot = true;
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    &s[..end]
 }
 
 fn datum_as_i128(d: &Datum) -> Result<i128> {

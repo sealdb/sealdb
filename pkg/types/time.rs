@@ -694,7 +694,10 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
             return Err(incorrect("datetime", s));
         }
     }
-    if !valid_ymd(year, month, day) || hour > 23 || minute > 59 {
+    let zero_date = year == 0 && month == 0 && day == 0;
+    // `0000-00-00 …` is the zero date. TiDB parses it at the literal layer and
+    // leaves `NO_ZERO_DATE` / strict-mode checks to storage.
+    if (!valid_ymd(year, month, day) && !zero_date) || hour > 23 || minute > 59 {
         return Err(incorrect("datetime", s));
     }
     // When frac absorbed into second, display still uses original fsp.
