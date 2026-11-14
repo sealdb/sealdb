@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 60,
-      "pending": 170,
+      "green": 61,
+      "pending": 169,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -2162,7 +2162,7 @@
     {
       "name": "planner/core/preprocess",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/preprocess.test",
       "result": "r/planner/core/preprocess.result",
       "has_result": true,

@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **60 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 8 / R7 10），新转绿的 12 个（`infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 10/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **61 个** 登记为 `green`（R1 4 / R2 16 / R3 21 / R5 1 / R6 8 / R7 11），新转绿的 13 个（`infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 21/48，R7 完成 11/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **60 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 60 | 23.6% |
+| `green` | 61 | 24.0% |
 | `in_progress` | 14 | 5.5% |
-| `pending` | 170 | 66.9% |
+| `pending` | 169 | 66.5% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -40,13 +40,13 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **60 个** �
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 1 | 0 | 11 | `session/txn` 已绿 |
 | R6 | 8 | 0 | 27 | DDL / infoschema 起步 |
-| R7 | 10 | 0 | 100 | 零散长尾 |
+| R7 | 11 | 0 | 99 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 8 套冒烟 |
 
 ---
 
-## 3. 已绿 suite 清单（60）
+## 3. 已绿 suite 清单（61）
 
 | Wave | Suite |
 |---|---|
@@ -55,19 +55,19 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **60 个** �
 | R3 | `access_path_selection`, `clustered_index`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy_stats`, `explain_foreign_key`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/point_get`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 | R5 | `session/txn` |
 | R6 | `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/fail_db`, `ddl/index_modify`, `infoschema/v2` |
-| R7 | `executor/adapter`, `executor/ddl`, `expression/enum_set`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/binary_plan`, `util/admin` |
+| R7 | `executor/adapter`, `executor/ddl`, `expression/enum_set`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `planner/core/binary_plan`, `planner/core/preprocess`, `util/admin` |
 
 **复验证据**
 
 ```text
 ./tests/integrationtest/run-tests.sh -s memory
-→ PASS: memory=68 tikv=0 skipped=186
+→ PASS: memory=69 tikv=0 skipped=185
 
 ./tests/integrationtest/run-tests.sh -s tikv
-→ PASS: memory=0 tikv=67 skipped=187
+→ PASS: memory=0 tikv=68 skipped=186
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），67 套件与 Mem 同一提交上复验通过（`PASS: tikv=67`；全量 gate 含 60 个 `green` + 8 个 `local`，`local` 有一支仅 Mem 运行）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 在 TiKV 全量 gate 中偶发超时（语句间累计 >1s），单套复跑稳定通过。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），68 套件与 Mem 同一提交上复验通过（`PASS: tikv=68`；全量 gate 含 61 个 `green` + 8 个 `local`，`local` 有一支仅 Mem 运行）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 在 TiKV 全量 gate 中偶发超时（语句间累计 >1s），单套复跑稳定通过。
 
 ---
 
@@ -492,7 +492,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），67 套件�
 | 93 | `planner/core/memtable_predicate_extractor` | pending | 0% | ✓ | — |
 | 94 | `planner/core/partial_order_topn` | pending | 0% | ✓ | — |
 | 95 | `planner/core/plan` | pending | 0% | ✓ | — |
-| 96 | `planner/core/preprocess` | pending | 0% | ✓ | — |
+| 96 | `planner/core/preprocess` | green | 100% | ✓ | ✓ |
 | 97 | `planner/core/range_scan_for_like` | pending | 0% | ✓ | — |
 | 98 | `planner/core/rule_constant_propagation` | pending | 0% | ✓ | — |
 | 99 | `planner/core/rule_join_reorder` | pending | 0% | ✓ | — |

@@ -12,7 +12,7 @@ use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT,
     ERR_FUNCTIONAL_INDEX_ON_BLOB, ERR_FUNCTIONAL_INDEX_ON_FIELD,
     ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,
-    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, Error, Result,
+    ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED, ERR_WRONG_KEY_COLUMN, Error, Result,
 };
 use sealdb_meta::{ColumnInfo, IndexColumn, TableInfo};
 use sealdb_parser::ast::ExprNode;
@@ -54,6 +54,16 @@ pub(crate) fn resolve_index_parts(
         }
         match part {
             IndexPart::Column(name) | IndexPart::Prefix { name, .. } => {
+                // TiDB `checkIndexPartLength`: a zero-length key part is
+                // `ErrWrongKeyColumn` (1391).
+                if part.prefix_length() == 0
+                    && matches!(part, IndexPart::Prefix { .. })
+                {
+                    return Err(Error::new(
+                        ERR_WRONG_KEY_COLUMN,
+                        format!("Key part '{name}' length cannot be 0"),
+                    ));
+                }
                 let col = info
                     .columns
                     .iter()

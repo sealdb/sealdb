@@ -138,6 +138,9 @@ pub const ERR_BLOB_USED_AS_KEY: i32 = 1170;
 /// MySQL `ER_NO_DEFAULT_FOR_FIELD`: a strict insert supplies no value and the
 /// column has no default (1364).
 pub const ERR_FIELD_NOT_DEFAULT: i32 = 1364;
+/// MySQL `ER_WRONG_KEY_COLUMN`: a key part has an invalid length, e.g. the
+/// prefix length 0 in `KEY (b(0))` (1391).
+pub const ERR_WRONG_KEY_COLUMN: i32 = 1391;
 /// TiDB `ErrFKIncompatibleColumns`: an `ALTER` would make a foreign key's
 /// referencing and referenced columns disagree on type (3780).
 pub const ERR_FK_INCOMPATIBLE_COLUMNS: i32 = 3780;

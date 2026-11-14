@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 60 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 61 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2453,6 +2453,28 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R7 / R2 长尾：`table/temptable`、`planner/core/preprocess`、
     `executor/inspection_common`、`cte` / `explain_cte` 剩余差异
+
+---
+
+### 2026-11-14（`planner/core/preprocess` 转正：索引前缀长度 0 报 1391）
+
+- **Phase**: R7
+- **完成**:
+  - 新增 errno `ERR_WRONG_KEY_COLUMN`（1391）。
+  - `resolve_index_parts` 对 `IndexPart::Prefix` 长度为 0 的键部分返回
+    `Key part '<col>' length cannot be 0`；CREATE TABLE、ALTER TABLE ADD
+    INDEX 共用该检查，三条语句（主键前缀、普通 KEY 前缀、ALTER 加索引）
+    同时覆盖。
+- **验证**:
+  - `run-tests.sh -s memory -t planner/core/preprocess --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t planner/core/preprocess --status pending` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh -s memory` → `PASS: memory=69 skipped=185`
+  - gate 复验 `run-tests.sh -s tikv` → `PASS: memory=0 tikv=68 skipped=186`
+  - manifest `planner/core/preprocess` → `green`，green 60→61
+- **阻塞/风险**:
+  - 无。
+- **下一步**:
+  - 继续 R7 长尾：`executor/inspection_common` / `table/temptable`
 
 ---
 
