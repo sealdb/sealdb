@@ -26,8 +26,25 @@ const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
 
 /// Synthetic ids for session-local temporary tables, far above the ids the
 /// catalog allocates so their rows never collide with a persisted table.
-static NEXT_TEMP_TABLE_ID: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(1i64 << 60);
+///
+/// The base carries a per-process random offset. Temporary-table rows live in
+/// the shared cluster under the synthetic id, so a process that dies without
+/// dropping its temporary tables must not hand its leftover rows to the next
+/// process that allocates the same ids from a fixed base.
+fn temp_table_id_base() -> i64 {
+    use std::hash::{BuildHasher, Hasher};
+    const TEMP_ID_BASE: i64 = 1i64 << 60;
+    // 2^40 slots keeps the probability of two processes sharing a base
+    // negligible while staying far below `i64::MAX`.
+    const TEMP_ID_OFFSET_MASK: u64 = (1u64 << 40) - 1;
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    let offset = hasher.finish() & TEMP_ID_OFFSET_MASK;
+    TEMP_ID_BASE + offset as i64
+}
+
+static NEXT_TEMP_TABLE_ID: std::sync::LazyLock<std::sync::atomic::AtomicI64> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicI64::new(temp_table_id_base()));
 
 fn next_temp_table_id() -> i64 {
     NEXT_TEMP_TABLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
