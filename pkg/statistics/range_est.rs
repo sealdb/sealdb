@@ -169,6 +169,7 @@ fn datum_scalar(kind: HistValueKind, value: &Datum) -> Option<Bound> {
     match (kind, value) {
         (_, Datum::Null) => None,
         (HistValueKind::Number, Datum::I64(v)) => Some(Bound::Int(*v as i128)),
+        (HistValueKind::Number, Datum::Year(v)) => Some(Bound::Int(*v as i128)),
         (HistValueKind::Number, Datum::U64(v)) => Some(Bound::Int(*v as i128)),
         (HistValueKind::Number, Datum::F64(v)) => Some(Bound::Num(*v)),
         (HistValueKind::Number, Datum::Decimal(d)) => d.to_f64().ok().map(Bound::Num),
@@ -788,6 +789,10 @@ pub fn encode_index_key(ft: &FieldType, value: &Datum) -> Option<Vec<u8>> {
         Datum::I64(v) => {
             out.push(0x03);
             out.extend_from_slice(&((*v as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+        }
+        Datum::Year(v) => {
+            out.push(0x04);
+            out.extend_from_slice(&(*v as u64).to_be_bytes());
         }
         Datum::U64(v) => {
             out.push(0x04);

@@ -18,3 +18,4 @@ sealdb-tablecodec.workspace = true
 sealdb-types.workspace = true
 thiserror.workspace = true
 sealdb-expression.workspace = true
+serde_json.workspace = true

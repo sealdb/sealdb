@@ -77,6 +77,7 @@ pub fn key_partition_index(value: &sealdb_types::Datum, num: usize) -> Option<us
     }
     let bytes: Vec<u8> = match value {
         sealdb_types::Datum::I64(v) => (*v as u64).to_be_bytes().to_vec(),
+        sealdb_types::Datum::Year(v) => (*v as u64).to_be_bytes().to_vec(),
         sealdb_types::Datum::U64(v) => v.to_be_bytes().to_vec(),
         // TiDB feeds `codec.EncodeValue` output to the hash: integers are their
         // 8-byte big-endian form, while bytes carry a `u64` length prefix.

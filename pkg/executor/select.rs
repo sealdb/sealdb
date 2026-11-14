@@ -378,6 +378,10 @@ fn row_key(row: &[sealdb_types::Datum], idxs: &[usize]) -> Vec<u8> {
                 out.push(1);
                 out.extend(v.to_le_bytes());
             }
+            sealdb_types::Datum::Year(v) => {
+                out.push(1);
+                out.extend(v.to_le_bytes());
+            }
             sealdb_types::Datum::U64(v) => {
                 out.push(2);
                 out.extend(v.to_le_bytes());

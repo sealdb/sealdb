@@ -482,6 +482,8 @@ pub fn create_view(
         cols,
         indices: Vec::new(),
         foreign_keys: Vec::new(),
+        charset: None,
+        collate: None,
         partition: None,
         ttl: None,
         refer_table: None,

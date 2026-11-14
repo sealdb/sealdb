@@ -118,6 +118,8 @@ pub struct ColumnDef {
     pub charset: Option<String>,
     /// Column `COLLATE <name>` (TiDB `FieldType.Collate`).
     pub collate: Option<String>,
+    /// Column `COMMENT '<text>'` (TiDB `ColumnInfo.Comment`).
+    pub comment: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +162,11 @@ impl ColumnDef {
             ctx.write_str(" /*T![auto_rand] AUTO_RANDOM(");
             ctx.write_str(&bits.to_string());
             ctx.write_str(") */");
+        }
+        if let Some(comment) = &self.comment {
+            ctx.write_str(" COMMENT '");
+            ctx.write_str(&comment.replace('\'', "''"));
+            ctx.write_str("'");
         }
         Ok(())
     }
@@ -430,6 +437,10 @@ pub struct CreateTableStmt {
     pub ttl: Option<TtlInfo>,
     /// `FOREIGN KEY` constraints in definition order (TiDB `TableInfo.ForeignKeys`).
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Table-level `DEFAULT CHARSET = <name>` option.
+    pub charset: Option<String>,
+    /// Table-level `COLLATE = <name>` option.
+    pub collate: Option<String>,
     /// TiDB `ReferTable` (`CREATE TABLE t LIKE src`).
     pub refer_table: Option<TableName>,
     /// TiDB `Select` (`CREATE TABLE t AS SELECT ...`).
@@ -836,6 +847,8 @@ pub enum AlterTableSpec {
         charset: Option<String>,
         /// `COLLATE <name>` in the new definition.
         collate: Option<String>,
+        /// `COMMENT '<text>'` in the new definition.
+        comment: Option<String>,
         position: ColumnPosition,
     },
     /// `MODIFY [COLUMN] col type` — keep the name, change the type.
@@ -852,6 +865,8 @@ pub enum AlterTableSpec {
         charset: Option<String>,
         /// `COLLATE <name>` in the new definition.
         collate: Option<String>,
+        /// `COMMENT '<text>'` in the new definition.
+        comment: Option<String>,
         position: ColumnPosition,
     },
     /// `RENAME COLUMN old TO new`.
@@ -964,6 +979,7 @@ impl AlterTableSpec {
                 not_null,
                 charset,
                 collate,
+                comment,
                 position,
             } => {
                 ctx.write_str("CHANGE COLUMN ");
@@ -999,6 +1015,11 @@ impl AlterTableSpec {
                     Some(false) => ctx.write_str(" NULL"),
                     None => {}
                 }
+                if let Some(comment) = comment {
+                    ctx.write_str(" COMMENT '");
+                    ctx.write_str(&comment.replace('\'', "''"));
+                    ctx.write_str("'");
+                }
                 position.restore(ctx)
             }
             AlterTableSpec::ModifyColumn {
@@ -1009,6 +1030,7 @@ impl AlterTableSpec {
                 not_null,
                 charset,
                 collate,
+                comment,
                 position,
             } => {
                 ctx.write_str("MODIFY COLUMN ");
@@ -1041,6 +1063,11 @@ impl AlterTableSpec {
                     Some(true) => ctx.write_str(" NOT NULL"),
                     Some(false) => ctx.write_str(" NULL"),
                     None => {}
+                }
+                if let Some(comment) = comment {
+                    ctx.write_str(" COMMENT '");
+                    ctx.write_str(&comment.replace('\'', "''"));
+                    ctx.write_str("'");
                 }
                 position.restore(ctx)
             }

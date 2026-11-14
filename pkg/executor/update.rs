@@ -739,6 +739,7 @@ pub(crate) fn apply_row_update(
             .and_then(|c| new_values.get(c.offset as usize))
             .and_then(|d| match d {
                 Datum::I64(v) => Some(*v),
+                Datum::Year(v) => Some(*v),
                 Datum::U64(v) => Some(*v as i64),
                 _ => None,
             })

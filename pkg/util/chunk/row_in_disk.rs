@@ -19,6 +19,7 @@ const TAG_DECIMAL: u8 = 5;
 const TAG_TIME: u8 = 6;
 const TAG_ENUM: u8 = 7;
 const TAG_BIT: u8 = 8;
+const TAG_YEAR: u8 = 9;
 
 pub fn mem_row_limit() -> usize {
     std::env::var("SEALDB_SPILL_MEM_ROWS")
@@ -130,6 +131,10 @@ fn encode_datum(w: &mut impl Write, value: &Datum) -> Result<()> {
             w.write_all(&[TAG_I64]).map_err(io_err)?;
             w.write_all(&v.to_le_bytes()).map_err(io_err)
         }
+        Datum::Year(v) => {
+            w.write_all(&[TAG_YEAR]).map_err(io_err)?;
+            w.write_all(&v.to_le_bytes()).map_err(io_err)
+        }
         Datum::U64(v) => {
             w.write_all(&[TAG_U64]).map_err(io_err)?;
             w.write_all(&v.to_le_bytes()).map_err(io_err)
@@ -189,6 +194,7 @@ fn decode_datum(r: &mut impl Read) -> Result<Datum> {
     match tag[0] {
         TAG_NULL => Ok(Datum::Null),
         TAG_I64 => Ok(Datum::I64(read_fixed::<8>(r).map(i64::from_le_bytes)?)),
+        TAG_YEAR => Ok(Datum::Year(read_fixed::<8>(r).map(i64::from_le_bytes)?)),
         TAG_U64 => Ok(Datum::U64(read_fixed::<8>(r).map(u64::from_le_bytes)?)),
         TAG_F64 => Ok(Datum::F64(read_fixed::<8>(r).map(f64::from_le_bytes)?)),
         TAG_BYTES => Ok(Datum::Bytes(read_len_bytes(r)?)),

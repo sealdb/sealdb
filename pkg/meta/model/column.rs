@@ -22,6 +22,15 @@ pub struct ColumnInfo {
     /// `DEFAULT <expr>` body, restored as SQL text.
     #[serde(rename = "default", default, skip_serializing_if = "Option::is_none")]
     pub default_expr: Option<String>,
+    /// TiDB `OriginDefaultValue`: a literal TIMESTAMP default pinned to UTC at
+    /// DDL time (the time zone of the session that created/modified the
+    /// column), so later inserts do not reinterpret it in the current zone.
+    #[serde(
+        rename = "origin_default",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub origin_default_expr: Option<String>,
     /// `AUTO_INCREMENT` column option (TiDB `ColumnInfo.AutoIncrement`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_increment: bool,
@@ -34,6 +43,9 @@ pub struct ColumnInfo {
     /// clients (`SELECT *`, `SHOW CREATE TABLE`, `information_schema`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// `COMMENT '<text>'` column option (TiDB `ColumnInfo.Comment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl ColumnInfo {
@@ -48,9 +60,11 @@ impl ColumnInfo {
             generated_expr: None,
             generated_stored: false,
             default_expr: None,
+            origin_default_expr: None,
             auto_increment: false,
             auto_random: None,
             hidden: false,
+            comment: None,
         }
     }
 }

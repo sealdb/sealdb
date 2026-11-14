@@ -30,6 +30,11 @@ pub fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
             buf.push(UINT_FLAG);
             encode_uint(buf, *v);
         }
+        // YEAR is an unsigned integer on the wire; the padding is display-only.
+        Datum::Year(v) => {
+            buf.push(UINT_FLAG);
+            encode_uint(buf, *v as u64);
+        }
         Datum::F64(v) => {
             buf.push(FLOAT_FLAG);
             encode_float(buf, *v);

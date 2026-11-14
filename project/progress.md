@@ -2363,6 +2363,45 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-14（`ddl/column_type_change` 转正：TIMESTAMP 默认值/时区与列重排）
+
+- **Phase**: R6（DDL 波）
+- **完成**:
+  - `MODIFY COLUMN` 未写 `DEFAULT` 时按 TiDB 丢掉旧默认值（不再沿用并校验旧
+    `default_expr`）；非 TIMESTAMP NULL → NOT NULL TIMESTAMP 的重排用
+    `CURRENT_TIMESTAMP` 填旧行
+  - TIMESTAMP 统一 UTC 存储 + 会话时区墙钟：`utc_to_session_local` /
+    `session_local_to_utc` 支持 IANA 时区（`chrono` / `chrono-tz`，含 DST），
+    零值 `0000-00-00 00:00:00` 在任何时区都不做偏移；TIMESTAMP 转 BIGINT 等
+    类型时先换算到会话墙钟再取数
+  - 字面量 TIMESTAMP 默认值在 DDL 时固化 UTC 到 `OriginDefaultValue`
+    （`origin_default_expr`），插入时不再按当前会话时区重算；超出
+    `1970-01-01 00:00:01 .. 2038-01-19 03:14:07` 非严格模式落零值 + 1292
+  - `SHOW CREATE TABLE` 只在可空且无默认值时输出 `timestamp NULL DEFAULT NULL`
+  - 顺带修复 gate 暴露的回归：
+    - `AUTO_RANDOM` 列不受 1364/1048 默认值/非空检查影响（由
+      `fill_auto_random` 生成）
+    - `MyDecimal::parse` 去掉整数字面前导零（`000003.000000` 打印 `3.000000`）
+    - `ONLY_FULL_GROUP_BY` 认可 `USING (col)` 两侧列等价
+      （`SELECT t2.t0 … GROUP BY t1.t0`）
+    - `YEAR` 值参与 HASH/KEY 分区定位，并可作为整数聚簇主键 handle
+      （insert/update），修复全局索引回表读到行号而非年份
+    - `0.0` / `1.0` 这类小数全零字面量按 DOUBLE 折叠（EXPLAIN 常量打印 `0`）
+    - `AS OF TIMESTAMP @var` 的用户变量是会话墙钟，只做一次 local→UTC
+      换算（不再二次偏移导致读到未来快照）
+- **验证**:
+  - `run-tests.sh -s memory -t ddl/column_type_change` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t ddl/column_type_change` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh -s memory` → `PASS: memory=66 skipped=188`
+  - gate 复验 `run-tests.sh -s tikv` → `PASS: memory=0 tikv=65 skipped=189`
+  - manifest `ddl/column_type_change` → `green`，green 57→58
+- **阻塞/风险**:
+  - 无；后续按 R6 继续 `ddl/db_table` / `ddl/table_modify` / `ddl/modify_column`
+- **下一步**:
+  - 继续 R6：`ddl/db_table` / `ddl/table_modify` / `ddl/modify_column`
+
+---
+
 ## 5. Gate 证据索引
 
 | Gate | 报告/命令 | 状态 |

@@ -504,7 +504,7 @@ fn numeric_literal(text: &str) -> Option<NumericLiteral<'_>> {
     }
     let mut seen_digit = false;
     let mut seen_dot = false;
-    let mut seen_exp = false;
+    let seen_exp = false;
     for (i, c) in unsigned.char_indices() {
         match c {
             '0'..='9' => seen_digit = true,
@@ -641,6 +641,17 @@ pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String
     }
     let fsp = field_type.decimal.clamp(0, 6);
     match field_type.tp {
+        // TiDB pads a `BINARY(N)` default to N bytes with `\0`, and the
+        // padding is part of the printed definition.
+        TYPE_STRING if field_type.charset == "binary" && field_type.flen > 0 => {
+            let mut text = value;
+            let width = field_type.flen as usize;
+            let pad = width.saturating_sub(text.len());
+            for _ in 0..pad {
+                text.push_str("\\0");
+            }
+            format!("'{text}'")
+        }
         TYPE_DURATION => normalize_duration_default(&value, fsp)
             .map(|text| format!("'{text}'"))
             .unwrap_or_else(|| default.to_string()),
@@ -662,8 +673,32 @@ pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String
     }
 }
 
-fn round_time(mut time: sealdb_types::Time, fsp: i32) -> sealdb_types::Time {
-    let fsp = fsp.clamp(0, 6) as u32;
+/// TiDB `OriginDefaultValue` for a literal TIMESTAMP default: the wall clock is
+/// read in the session zone at DDL time and pinned as a UTC spelling, so later
+/// inserts (in another session zone) use the same instant.
+pub(crate) fn origin_default_for(field_type: &FieldType, default: &str) -> Option<String> {
+    if field_type.tp != TYPE_TIMESTAMP {
+        return None;
+    }
+    let trimmed = default.trim();
+    let inner = trimmed.strip_prefix('\'')?.strip_suffix('\'')?;
+    let value = inner.replace("''", "'");
+    if value.starts_with('(') {
+        return None;
+    }
+    let mut t = sealdb_types::parse_datetime_literal(&value)
+        .or_else(|_| sealdb_types::parse_datetime_literal(&format!("{value} 00:00:00")))
+        .ok()?;
+    t.tp = sealdb_types::TimeType::Timestamp;
+    // A zero timestamp is not shifted (TiDB keeps `0000-00-00 00:00:00`).
+    if t.year == 0 {
+        return Some(t.to_string());
+    }
+    let utc = sealdb_expression::session_local_to_utc(t).ok()?;
+    Some(utc.to_string())
+}
+
+fn round_time(mut time: sealdb_types::Time, fsp: i32) -> sealdb_types::Time {    let fsp = fsp.clamp(0, 6) as u32;
     let scale = 10u32.pow(6 - fsp);
     let mut micro = ((time.micro + scale / 2) / scale) * scale;
     if micro >= 1_000_000 {
@@ -870,8 +905,13 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             .as_deref()
             .map(|default| normalize_default(&info.field_type, default));
         info.default_expr = normalize_lob_default(info.name.o(), &info.field_type, default)?;
+        info.origin_default_expr = info
+            .default_expr
+            .as_deref()
+            .and_then(|default| origin_default_for(&info.field_type, default));
         info.auto_increment = col.auto_increment;
         info.auto_random = col.auto_random;
+        info.comment = col.comment.clone();
         validate_display_width(info.name.o(), &info.field_type)?;
         validate_default_literal(
             info.name.o(),
@@ -893,6 +933,16 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     let names: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
     crate::alter::check_generated_order(&names, &columns)?;
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
+    // Table-level `DEFAULT CHARSET` / `COLLATE` (TiDB `TableInfo.Charset/Collate`).
+    if let Some(charset) = &stmt.charset {
+        info.charset = charset.to_ascii_lowercase();
+        info.collate = sealdb_parser::charset::Collation::default_for_charset(charset).name;
+    }
+    if let Some(collate) = &stmt.collate {
+        let parsed = sealdb_parser::charset::Collation::parse(collate);
+        info.charset = parsed.charset;
+        info.collate = parsed.name;
+    }
     for index in stmt.indices.iter() {
         let (idx_cols, hidden) =
             crate::expr_index::resolve_index_parts(&info, &index.name, &index.columns)?;
@@ -1187,6 +1237,7 @@ fn push_select_column(
         not_null,
         charset: None,
         collate: None,
+        comment: None,
     });
     Ok(())
 }
@@ -1300,7 +1351,7 @@ fn lookup_select_column(col: &ColumnNameExpr, sources: &[SelectSource]) -> Resul
 
 fn type_name_from_datum(datum: &Datum) -> &'static str {
     match datum {
-        Datum::I64(_) | Datum::U64(_) | Datum::Bit(_) => "int",
+        Datum::I64(_) | Datum::Year(_) | Datum::U64(_) | Datum::Bit(_) => "int",
         Datum::F64(_) => "double",
         Datum::Decimal(_) => "decimal",
         Datum::Time(_) => "datetime",
@@ -1392,10 +1443,24 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             flen: parse_len(type_name).unwrap_or(1),
             ..string_ft()
         },
-        "VARCHAR" | "TEXT" | "STRING" => FieldType {
+        "VARCHAR" | "STRING" => FieldType {
             tp: TYPE_VAR_STRING,
             flen: parse_len(type_name).unwrap_or(-1),
             ..string_ft()
+        },
+        // `TEXT(n)` picks the smallest TEXT family member that holds `n` bytes
+        // (TiDB: `TEXT(10)` is `tinytext`); a bare `TEXT` stays unbounded.
+        "TEXT" => match parse_len(type_name) {
+            Some(len) => FieldType {
+                tp: lob_tp_for_len(len),
+                flen: -1,
+                ..string_ft()
+            },
+            None => FieldType {
+                tp: TYPE_VAR_STRING,
+                flen: -1,
+                ..string_ft()
+            },
         },
         // ENUM/SET store their member labels as text; comparisons keep the
         // label until numeric-vs-enum coercion lands (TiDB numeric path).
@@ -1435,18 +1500,27 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             ..string_ft()
         },
         "BLOB" => FieldType {
-            tp: TYPE_BLOB,
+            tp: match parse_len(type_name) {
+                Some(len) => lob_tp_for_len(len),
+                None => TYPE_BLOB,
+            },
             flen: -1,
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
             ..string_ft()
         },
         "TINYBLOB" => FieldType {
             tp: TYPE_TINY_BLOB,
             flen: -1,
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
             ..string_ft()
         },
         "MEDIUMBLOB" => FieldType {
             tp: TYPE_MEDIUM_BLOB,
             flen: -1,
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
             ..string_ft()
         },
         // TINYTEXT/MEDIUMTEXT/LONGTEXT share the blob type codes in MySQL and
@@ -1469,6 +1543,8 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
         "LONGBLOB" => FieldType {
             tp: TYPE_LONG_BLOB,
             flen: -1,
+            charset: "binary".to_string(),
+            collate: "binary".to_string(),
             ..string_ft()
         },
         // JSON is stored as its serialized text for now; comparisons still use
@@ -1538,6 +1614,19 @@ fn numeric_ft() -> FieldType {
         collate: "binary".to_string(),
         decimal: 0,
         ..FieldType::default()
+    }
+}
+
+/// The smallest BLOB/TEXT storage class that fits `len` bytes.
+fn lob_tp_for_len(len: i32) -> u8 {
+    if len <= 255 {
+        TYPE_TINY_BLOB
+    } else if len <= 65_535 {
+        TYPE_BLOB
+    } else if len <= 16_777_215 {
+        TYPE_MEDIUM_BLOB
+    } else {
+        TYPE_LONG_BLOB
     }
 }
 

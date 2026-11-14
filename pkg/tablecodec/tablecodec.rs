@@ -67,6 +67,10 @@ pub fn encode_index_datum(buf: &mut Vec<u8>, value: &Datum) {
             buf.push(1);
             encode_int(buf, *v);
         }
+        Datum::Year(v) => {
+            buf.push(1);
+            encode_int(buf, *v);
+        }
         Datum::U64(v) => {
             buf.push(1);
             encode_int(buf, *v as i64);

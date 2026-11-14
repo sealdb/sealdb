@@ -168,6 +168,7 @@ impl PartitionInfo {
         // through their signed bit pattern, matching TiDB.
         let v = match value {
             Datum::I64(v) => *v,
+            Datum::Year(v) => *v,
             Datum::U64(v) => *v as i64,
             _ => return Err(no_partition()),
         };
@@ -487,7 +488,7 @@ fn tuple_less(row: &[Datum], bound: &[String]) -> bool {
 /// vs `2022-12-30`), not by the integer parsing used before literal bounds.
 fn compare_bound(value: &Datum, bound: &str) -> Option<Ordering> {
     match value {
-        Datum::I64(_) | Datum::U64(_) => {
+        Datum::I64(_) | Datum::Year(_) | Datum::U64(_) => {
             let v = datum_i64(value)?;
             if let Ok(b) = bound.parse::<i64>() {
                 return Some(v.cmp(&b));
@@ -642,6 +643,7 @@ fn datum_i128(value: &Datum) -> Option<i128> {
 fn datum_i64(value: &Datum) -> Option<i64> {
     match value {
         Datum::I64(v) => Some(*v),
+        Datum::Year(v) => Some(*v),
         Datum::U64(v) => i64::try_from(*v).ok(),
         _ => None,
     }

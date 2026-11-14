@@ -118,7 +118,21 @@ impl FieldType {
                 }
                 "varchar"
             }
-            TYPE_BLOB | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => "blob",
+            TYPE_YEAR => return format!("year({})", self.flen.max(4)),
+            TYPE_BLOB | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB => {
+                let size = match self.tp {
+                    TYPE_TINY_BLOB => "tiny",
+                    TYPE_MEDIUM_BLOB => "medium",
+                    TYPE_LONG_BLOB => "long",
+                    _ => "",
+                };
+                // The utf8 charsets spell the same storage class as TEXT.
+                return if self.charset == "binary" {
+                    format!("{size}blob")
+                } else {
+                    format!("{size}text")
+                };
+            }
             TYPE_DATE => "date",
             TYPE_DATETIME => "datetime",
             TYPE_TIMESTAMP => "timestamp",
@@ -132,6 +146,9 @@ impl FieldType {
         let mut rendered = if matches!(self.tp, TYPE_NEW_DECIMAL | TYPE_DECIMAL) && self.flen > 0 {
             // TiDB always spells DECIMAL as `decimal(M,D)`.
             format!("{base}({},{})", self.flen, self.decimal.max(0))
+        } else if matches!(self.tp, TYPE_FLOAT | TYPE_DOUBLE) && self.flen > 0 && self.decimal > 0 {
+            // `real(20,12)` is a DOUBLE that TiDB spells `double(20,12)`.
+            format!("{base}({},{})", self.flen, self.decimal)
         } else if matches!(self.tp, TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION)
             && self.decimal > 0
         {

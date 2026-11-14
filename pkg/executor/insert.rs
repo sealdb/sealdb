@@ -4,8 +4,8 @@ use crate::join::apply::SubqueryEvalCtx;
 use crate::table_reader::scan_table;
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_ENTRY, ERR_FIELD_SPECIFIED_TWICE, ERR_INVALID_AUTO_RANDOM, ERR_NO_DB,
-    ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
+    ERR_BAD_FIELD, ERR_BAD_NULL, ERR_DUP_ENTRY, ERR_FIELD_NOT_DEFAULT, ERR_FIELD_SPECIFIED_TWICE,
+    ERR_INVALID_AUTO_RANDOM, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
     ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_PARTITION,
     ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
@@ -167,6 +167,7 @@ impl Executor for InsertExec {
         for values in &mut pending {
             fill_auto_increment(&self.domain, info, values)?;
             fill_auto_random(&self.domain, info, values)?;
+            enforce_not_null_columns(info, values, self.stmt.ignore)?;
         }
         if !self.stmt.partitions.is_empty() {
             pending =
@@ -369,9 +370,104 @@ fn wrong_value_count_on_row(row_no: usize) -> Error {
     )
 }
 
-/// Evaluate a column's `DEFAULT <expr>` (NULL when it has none).
+/// Refuse an explicit NULL in a NOT NULL column (1048); `INSERT IGNORE`
+/// downgrades it to a warning and stores the type's zero value.
+fn enforce_not_null_columns(
+    info: &sealdb_meta::TableInfo,
+    values: &mut [Datum],
+    ignore: bool,
+) -> Result<()> {
+    for col in &info.columns {
+        if col.hidden
+            || col.auto_increment
+            || col.auto_random.is_some()
+            || col.generated_expr.is_some()
+        {
+            continue;
+        }
+        if col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG == 0 {
+            continue;
+        }
+        let idx = col.offset as usize;
+        if !values.get(idx).is_some_and(|value| value.is_null()) {
+            continue;
+        }
+        let msg = format!("Column '{}' cannot be null", col.name.o());
+        if ignore {
+            sealdb_expression::note_warning(ERR_BAD_NULL, msg);
+            values[idx] = implicit_zero(&col.field_type);
+        } else {
+            return Err(Error::new(ERR_BAD_NULL, msg));
+        }
+    }
+    Ok(())
+}
+
+/// The type's zero value, used when a NOT NULL column gets no value.
+fn implicit_zero(ft: &FieldType) -> Datum {
+    use sealdb_types::field_type::*;
+    match ft.tp {
+        TYPE_YEAR => Datum::Year(0),
+        TYPE_TINY | TYPE_SHORT | TYPE_LONG | TYPE_INT24 | TYPE_LONG_LONG => {
+            if ft.is_unsigned() {
+                Datum::U64(0)
+            } else {
+                Datum::I64(0)
+            }
+        }
+        TYPE_FLOAT | TYPE_DOUBLE => Datum::F64(0.0),
+        TYPE_NEW_DECIMAL => Datum::Decimal(
+            sealdb_types::MyDecimal::parse("0")
+                .map(|d| d.with_frac(ft.decimal))
+                .unwrap_or_else(|_| sealdb_types::MyDecimal::from_i64(0)),
+        ),
+        TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_DURATION => {
+            let mut t = sealdb_types::Time::new(0, 0, 0, 0, 0, 0);
+            t.tp = match ft.tp {
+                TYPE_DATE => sealdb_types::TimeType::Date,
+                TYPE_TIMESTAMP => sealdb_types::TimeType::Timestamp,
+                TYPE_DURATION => sealdb_types::TimeType::Time,
+                _ => sealdb_types::TimeType::Datetime,
+            };
+            t.fsp = ft.decimal.max(0) as i8;
+            Datum::Time(t)
+        }
+        TYPE_ENUM | TYPE_SET => Datum::Enum(EnumValue {
+            label: Vec::new(),
+            number: 0,
+        }),
+        TYPE_BIT => Datum::Bit(Vec::new()),
+        _ => Datum::Bytes(Vec::new()),
+    }
+}
+
+/// Use the column's `DEFAULT <expr>` body for an inserted row.
 fn column_default_value(col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    // A TIMESTAMP literal default was pinned to UTC at DDL time
+    // (`OriginDefaultValue`); use it as-is instead of re-reading the printed
+    // default in the current session zone.
+    if let Some(text) = col.origin_default_expr.as_deref()
+        && col.field_type.tp == TYPE_TIMESTAMP
+        && let Ok(mut t) = sealdb_types::parse_datetime_literal(text)
+    {
+        t.tp = sealdb_types::TimeType::Timestamp;
+        return Ok(Datum::Time(t));
+    }
     let Some(text) = col.default_expr.as_deref() else {
+        // A strict insert that leaves a NOT NULL column without a default
+        // fails (1364); generated and auto-increment columns are filled later.
+        let not_null = col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0;
+        if not_null
+            && strict_sql_mode()
+            && !col.auto_increment
+            && col.auto_random.is_none()
+            && col.generated_expr.is_none()
+        {
+            return Err(Error::new(
+                ERR_FIELD_NOT_DEFAULT,
+                format!("Field '{}' doesn't have a default value", col.name.o()),
+            ));
+        }
         return Ok(Datum::Null);
     };
     let expr = sealdb_parser::sqlparser_bridge::lower::parse_expr(text)?;
@@ -646,10 +742,28 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
         Ok(out) => out,
         Err(err) => return Err(temporal_column_error(v, col, err)),
     };
-    // TIMESTAMP columns store UTC; session wall clock → UTC on write.
+    // TIMESTAMP columns store UTC; session wall clock → UTC on write. A wall
+    // clock outside 1970-01-01 00:00:01 .. 2038-01-19 03:14:07 becomes the zero
+    // timestamp (1292 warning) outside strict mode and fails with 1292 in it.
     if col.field_type.tp == sealdb_types::TYPE_TIMESTAMP
         && let Datum::Time(t) = out
     {
+        if t.year != 0 {
+            let utc = sealdb_expression::session_local_to_utc(t).unwrap_or(t);
+            let stamp = (
+                utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+            );
+            if stamp <= (1970, 1, 1, 0, 0, 0) || stamp > (2038, 1, 19, 3, 14, 7) {
+                let msg = format!("Incorrect timestamp value: '{t}'");
+                if strict_sql_mode() {
+                    return Err(Error::new(ERR_TRUNCATED_WRONG_VALUE, msg));
+                }
+                sealdb_expression::note_warning(ERR_TRUNCATED_WRONG_VALUE, msg);
+                let mut zero = sealdb_types::time::Time::new(0, 0, 0, 0, 0, 0);
+                zero.tp = sealdb_types::TimeType::Timestamp;
+                return Ok(Datum::Time(zero));
+            }
+        }
         let mut t = t;
         t.tp = sealdb_types::TimeType::Timestamp;
         t = sealdb_expression::session_local_to_utc(t)?;
@@ -911,6 +1025,7 @@ fn write_row(
     let handle = if info.pk_is_handle {
         match pk_offset.and_then(|off| values.get(off)) {
             Some(Datum::I64(v)) => *v,
+            Some(Datum::Year(v)) => *v,
             Some(Datum::U64(v)) => *v as i64,
             _ => domain.next_handle(info.id)?,
         }

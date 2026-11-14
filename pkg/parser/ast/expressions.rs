@@ -136,6 +136,7 @@ impl ExprNode {
                 Datum::Bit(b) => format!("'{}'", String::from_utf8_lossy(b)),
                 Datum::Enum(e) => format!("'{}'", String::from_utf8_lossy(&e.label)),
                 Datum::I64(n) => n.to_string(),
+                Datum::Year(n) => n.to_string(),
                 Datum::U64(n) => n.to_string(),
                 Datum::F64(f) => {
                     if f.fract() == 0.0 && f.is_finite() {
@@ -191,6 +192,7 @@ impl ExprNode {
                 Datum::Bit(b) => String::from_utf8_lossy(b).into_owned(),
                 Datum::Enum(e) => String::from_utf8_lossy(&e.label).into_owned(),
                 Datum::I64(n) => n.to_string(),
+                Datum::Year(n) => n.to_string(),
                 Datum::U64(n) => n.to_string(),
                 Datum::F64(f) => {
                     if f.fract() == 0.0 && f.is_finite() {
@@ -782,6 +784,7 @@ impl ValueExpr {
         ctx.write_str(&match &self.datum {
             Datum::Null => "NULL".to_string(),
             Datum::I64(v) => v.to_string(),
+            Datum::Year(v) => v.to_string(),
             Datum::U64(v) => v.to_string(),
             Datum::F64(v) => {
                 if v.fract() == 0.0 && v.is_finite() {

@@ -1175,13 +1175,16 @@ impl ExecutorBuilder {
 }
 
 /// TIMESTAMP is stored UTC; convert to session TZ for result rows (TiDB display).
+/// The converted value is marked as a plain DATETIME so the later text render
+/// (`format_timestamp_display`, which runs outside the session zone scope) does
+/// not shift it a second time.
 fn localize_timestamp_row(row: Vec<sealdb_types::Datum>) -> Vec<sealdb_types::Datum> {
     row.into_iter()
         .map(|d| match d {
             sealdb_types::Datum::Time(t) if matches!(t.tp, sealdb_types::TimeType::Timestamp) => {
                 match sealdb_expression::utc_to_session_local(t) {
                     Ok(mut local) => {
-                        local.tp = sealdb_types::TimeType::Timestamp;
+                        local.tp = sealdb_types::TimeType::Datetime;
                         sealdb_types::Datum::Time(local)
                     }
                     Err(_) => sealdb_types::Datum::Time(t),
@@ -1989,6 +1992,7 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
             }
             sealdb_types::Datum::Null => "NULL".into(),
             sealdb_types::Datum::I64(_)
+            | sealdb_types::Datum::Year(_)
             | sealdb_types::Datum::U64(_)
             | sealdb_types::Datum::F64(_)
             | sealdb_types::Datum::Decimal(_) => {
@@ -2083,6 +2087,7 @@ fn tidb_expr_display_name_inner(expr: &ExprNode, keep_table_qual: bool) -> Strin
         }
         ExprNode::Value(v) => match &v.datum {
             sealdb_types::Datum::I64(n) => n.to_string(),
+            sealdb_types::Datum::Year(n) => n.to_string(),
             sealdb_types::Datum::U64(n) => n.to_string(),
             sealdb_types::Datum::F64(n) => n.to_string(),
             sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),

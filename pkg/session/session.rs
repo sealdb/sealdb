@@ -1637,7 +1637,7 @@ fn check_select_only_full_group_by(select: &SelectStmt, current_db: &str) -> Res
     if !select.group_by.is_empty() {
         let cte_loose = cte_group_by_allows_peer_columns(select);
         for (i, field) in select.fields.iter().enumerate() {
-            if select_field_ok_for_group_by(&field.expr, &select.group_by) {
+            if select_field_ok_for_group_by(&field.expr, &select.group_by, select) {
                 continue;
             }
             if cte_loose && matches!(&field.expr, ExprNode::Column(_)) {
@@ -1899,7 +1899,11 @@ fn double_backslashes_in_sql_strings(sql: &str) -> String {
     out
 }
 
-fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
+fn select_field_ok_for_group_by(
+    expr: &ExprNode,
+    group_by: &[ExprNode],
+    select: &SelectStmt,
+) -> bool {
     if matches!(expr, ExprNode::Value(_)) {
         return true;
     }
@@ -1922,11 +1926,14 @@ fn select_field_ok_for_group_by(expr: &ExprNode, group_by: &[ExprNode]) -> bool 
     // not itself a grouping item is legal as long as every column it reads is
     // a bare grouped column (`a+1` / `if(a>2,1,0)` with `GROUP BY a`).
     // Aggregate arguments are outside the check.
-    group_by_columns(expr, group_by)
+    group_by_columns(expr, group_by, select)
 }
 
 /// Every non-aggregate column of `expr` is a bare column of `group_by`.
-fn group_by_columns(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
+///
+/// `USING (col)` makes the named column of both join sides the same value, so
+/// `SELECT t2.t0 … GROUP BY t1.t0` is legal under ONLY_FULL_GROUP_BY.
+fn group_by_columns(expr: &ExprNode, group_by: &[ExprNode], select: &SelectStmt) -> bool {
     let grouped: Vec<&ColumnNameExpr> = group_by
         .iter()
         .filter_map(|g| match g {
@@ -1940,11 +1947,94 @@ fn group_by_columns(expr: &ExprNode, group_by: &[ExprNode]) -> bool {
         grouped.iter().any(|g| {
             g.name.eq_ignore_ascii_case(&c.name)
                 && match (g.table.as_deref(), c.table.as_deref()) {
-                    (Some(gt), Some(ct)) => gt.eq_ignore_ascii_case(ct),
+                    (Some(gt), Some(ct)) => {
+                        gt.eq_ignore_ascii_case(ct)
+                            || using_connects_tables(select, &c.name, gt, ct)
+                    }
                     _ => true,
                 }
         })
     })
+}
+
+/// Whether a `USING (col)` chain in `select` equates the `col` of table `a`
+/// with that of table `b` (`t1 JOIN t2 USING (c) JOIN t3 USING (c)`).
+fn using_connects_tables(select: &SelectStmt, col: &str, a: &str, b: &str) -> bool {
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for join in &select.joins {
+        if join
+            .using_cols
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(col))
+        {
+            edges.push((join.left.name.clone(), join.right.name.clone()));
+        }
+    }
+    if let Some(item) = &select.from_item {
+        collect_using_edges(item, col, &mut edges);
+    }
+    // Breadth-first walk over the `USING` edges.
+    let mut reached: Vec<&str> = vec![a];
+    loop {
+        let mut grew = false;
+        for (left, right) in &edges {
+            let (left, right) = (left.as_str(), right.as_str());
+            if reached.contains(&left) || reached.contains(&right) {
+                if left == b || right == b {
+                    return true;
+                }
+                if !reached.contains(&left) {
+                    reached.push(left);
+                    grew = true;
+                }
+                if !reached.contains(&right) {
+                    reached.push(right);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return false;
+        }
+    }
+}
+
+/// `USING` edges inside a bushy `FromItem` tree.
+fn collect_using_edges(
+    item: &sealdb_parser::ast::FromItem,
+    col: &str,
+    edges: &mut Vec<(String, String)>,
+) {
+    let sealdb_parser::ast::FromItem::Join {
+        left,
+        right,
+        using_cols,
+        ..
+    } = item
+    else {
+        return;
+    };
+    if using_cols.iter().any(|name| name.eq_ignore_ascii_case(col)) {
+        for l in from_item_tables(left) {
+            for r in from_item_tables(right) {
+                edges.push((l.clone(), r.clone()));
+            }
+        }
+    }
+    collect_using_edges(left, col, edges);
+    collect_using_edges(right, col, edges);
+}
+
+fn from_item_tables(item: &sealdb_parser::ast::FromItem) -> Vec<String> {
+    match item {
+        sealdb_parser::ast::FromItem::Table(t) => vec![t.name.clone()],
+        sealdb_parser::ast::FromItem::Join { left, right, .. } => {
+            let mut tables = from_item_tables(left);
+            tables.extend(from_item_tables(right));
+            tables
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Column references that force a group-by dependency: aggregate arguments and
@@ -2754,7 +2844,14 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     Collation::parse(&value);
             }
             "sql_mode" => {
-                *session.sql_mode.lock().expect("session sql_mode lock") = value;
+                // `SET sql_mode = DEFAULT` restores the instance default, not
+                // the literal word (TiDB falls back to the global value).
+                let mode = if value.eq_ignore_ascii_case("DEFAULT") {
+                    session.domain.global_vars().sql_mode
+                } else {
+                    value
+                };
+                *session.sql_mode.lock().expect("session sql_mode lock") = mode;
             }
             "tidb_partition_prune_mode" => {
                 // `SET … = DEFAULT` resets to TiDB's default (dynamic).
@@ -2957,6 +3054,13 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             // Session time zone (DST / TIMESTAMP display). Value stored for later
             // conversion; offset literals like '+00:00' / named zones accepted.
             "time_zone" => {
+                // `SET time_zone = DEFAULT` restores the server default
+                // (`SYSTEM`), not a literal zone.
+                let value = if value.eq_ignore_ascii_case("DEFAULT") {
+                    "SYSTEM".to_string()
+                } else {
+                    value
+                };
                 *session.time_zone.lock().expect("session time_zone lock") = value;
             }
             // `tx_isolation` / `transaction_isolation`: TiDB's alias pair for
@@ -3229,6 +3333,7 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
 fn literal_field_name(datum: &sealdb_types::Datum) -> String {
     match datum {
         sealdb_types::Datum::I64(n) => n.to_string(),
+        sealdb_types::Datum::Year(n) => n.to_string(),
         sealdb_types::Datum::U64(n) => n.to_string(),
         sealdb_types::Datum::F64(n) => n.to_string(),
         sealdb_types::Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),

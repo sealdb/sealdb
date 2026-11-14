@@ -93,6 +93,13 @@ impl Time {
         let minute = ((hms >> 6) & 0x3f) as u8;
         let second = (hms & 0x3f) as u8;
         let micro = (v & ((1 << 24) - 1)) as u32;
+        // Fractional digits are implied by the packed microseconds: `1000` is
+        // `.001` (three digits).
+        let fsp = if micro == 0 {
+            0
+        } else {
+            (6 - (micro.trailing_zeros() / 4).min(6)) as i8
+        };
         Self {
             year,
             month,
@@ -101,7 +108,7 @@ impl Time {
             minute,
             second,
             micro,
-            fsp: 0,
+            fsp,
             tp: TimeType::Datetime,
         }
     }
@@ -137,6 +144,29 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
         return None;
     }
     let digits = n.to_string();
+    // A number with fewer than six digits is right-aligned into `YYMMDD`
+    // (`1111` → `001111` → `2000-11-11`, `11111` → `2001-11-11`).
+    if digits.len() < 6 {
+        let padded = format!("{digits:0>6}");
+        let yy: i64 = padded[0..2].parse().ok()?;
+        let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
+        let month: i64 = padded[2..4].parse().ok()?;
+        let day: i64 = padded[4..6].parse().ok()?;
+        if !valid_ymd(year as u16, month as u8, day as u8) {
+            return None;
+        }
+        return Some(Time {
+            year: year as u16,
+            month: month as u8,
+            day: day as u8,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            micro: 0,
+            fsp: 0,
+            tp,
+        });
+    }
     let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
         match digits.len() {
             14 | 12 => {
@@ -177,6 +207,19 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
                     0,
                 )
             }
+            // A stray digit past YYMMDD (`2008261`) still reads as the YYMMDD
+            // date part (TiDB `ParseTimeFromNum`).
+            7 => {
+                let yy: i64 = digits[0..2].parse().ok()?;
+                (
+                    if yy < 70 { 2000 + yy } else { 1900 + yy },
+                    digits[2..4].parse().ok()?,
+                    digits[4..6].parse().ok()?,
+                    0,
+                    0,
+                    0,
+                )
+            }
             _ => return None,
         };
     if !valid_ymd(year as u16, month as u8, day as u8) || hour > 23 || minute > 59 || second > 59 {
@@ -192,6 +235,40 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
         micro: 0,
         fsp: 0,
         tp,
+    })
+}
+
+/// TIME from a numeric value: `HHMMSS` for up to six digits, the clock part
+/// of `[YY]YYMMDDHHMMSS` for 12/14 digits (`307` → `00:03:07`, `200805` →
+/// `20:08:05`, `20200805111307` → `11:13:07`). Eight digits (a bare date) and
+/// 7/9-11 digits (`20200805`, …) have no TIME form.
+pub fn duration_from_numeric(int_digits: &str) -> Option<Time> {
+    let digits: String = int_digits
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let hms = match digits.len() {
+        0 => return None,
+        1..=6 => format!("{digits:0>6}"),
+        12 | 14 => digits[digits.len() - 6..].to_string(),
+        _ => return None,
+    };
+    let hour: u16 = hms[0..2].parse().ok()?;
+    let minute: u16 = hms[2..4].parse().ok()?;
+    let second: u16 = hms[4..6].parse().ok()?;
+    if hour > 838 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(Time {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        micro: 0,
+        fsp: 0,
+        tp: TimeType::Time,
     })
 }
 
@@ -489,6 +566,54 @@ fn valid_ymd(year: u16, month: u8, day: u8) -> bool {
     day <= days_in_month(year, month)
 }
 
+/// Round the fractional seconds of `t` to `fsp` digits. MySQL rounds rather
+/// than truncates: `.888` into `DATETIME(0)` becomes the next second.
+pub fn round_to_fsp(mut t: Time, fsp: i8) -> Time {
+    let fsp = fsp.clamp(0, 6) as u32;
+    if u32::from(t.fsp.max(0) as u8) <= fsp {
+        t.fsp = fsp as i8;
+        return t;
+    }
+    let mut digits: Vec<u8> = format!("{:06}", t.micro)
+        .bytes()
+        .map(|b| b - b'0')
+        .collect();
+    let round = digits.get(fsp as usize).copied().unwrap_or(0) >= 5;
+    for d in digits.iter_mut().skip(fsp as usize) {
+        *d = 0;
+    }
+    let mut micro = 0u32;
+    for (i, d) in digits.iter().enumerate() {
+        micro += u32::from(*d) * 10u32.pow((5 - i) as u32);
+    }
+    t.micro = micro;
+    t.fsp = fsp as i8;
+    if round {
+        t.second += 1;
+        if t.second >= 60 {
+            t.second = 0;
+            t.minute += 1;
+            if t.minute >= 60 {
+                t.minute = 0;
+                t.hour += 1;
+                if t.hour >= 24 {
+                    t.hour = 0;
+                    t.day += 1;
+                    if t.day > days_in_month(t.year, t.month) {
+                        t.day = 1;
+                        t.month += 1;
+                        if t.month > 12 {
+                            t.month = 1;
+                            t.year = t.year.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    t
+}
+
 fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -694,3 +819,4 @@ mod parse_tests {
         assert_eq!(t.to_string(), "2024-01-01 14:00:01.000000");
     }
 }
+

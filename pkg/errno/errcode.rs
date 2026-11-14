@@ -23,6 +23,8 @@ pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
+/// MySQL `ER_WARN_DATA_OUT_OF_RANGE`: value outside the target type's range (1264).
+pub const ERR_WARN_DATA_OUT_OF_RANGE: i32 = 1264;
 /// MySQL `ER_WARN_DATA_TRUNCATED`: invalid ENUM/SET member coerced to `''`.
 pub const ERR_WARN_DATA_TRUNCATED: i32 = 1265;
 /// TiDB: timestamp falls in a DST transition gap.
@@ -30,8 +32,10 @@ pub const ERR_TIMESTAMP_IN_DST_TRANSITION: i32 = 8179;
 /// TiDB `ErrMemoryExceedForQuery`: statement exceeded `tidb_mem_quota_query`.
 pub const ERR_MEMORY_EXCEEDED: i32 = 8175;
 pub const ERR_UNKNOWN_FUNCTION: i32 = 1305;
-/// TiDB `ErrInvalidJSONText`: malformed JSON document (3141).
-pub const ERR_INVALID_JSON_TEXT: i32 = 3141;
+/// TiDB `ErrInvalidJSONText`: malformed JSON document (3140).
+pub const ERR_INVALID_JSON_TEXT: i32 = 3140;
+/// TiDB `ErrInvalidJSONTextInParam`: malformed JSON passed to a function (3141).
+pub const ERR_INVALID_JSON_TEXT_IN_PARAM: i32 = 3141;
 pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
 pub const ERR_UNSUPPORTED: i32 = 1235;
 pub const ERR_DIVISION_BY_ZERO: i32 = 1365;
@@ -126,6 +130,17 @@ pub const ERR_TTL_DROP_COLUMN: i32 = 8149;
 pub const ERR_TTL_NO_CONFIG: i32 = 8150;
 /// TiDB `ErrTTLTemporaryTable`: `TTL` is not allowed on temporary tables.
 pub const ERR_TTL_TEMPORARY_TABLE: i32 = 8151;
+/// MySQL `ER_PRIMARY_CANT_HAVE_NULL`: a PRIMARY KEY column cannot be NULL (1171).
+pub const ERR_PRIMARY_CANT_HAVE_NULL: i32 = 1171;
+/// MySQL `ER_BLOB_USED_AS_KEY`: a BLOB/TEXT column cannot be a full index key
+/// (1170).
+pub const ERR_BLOB_USED_AS_KEY: i32 = 1170;
+/// MySQL `ER_NO_DEFAULT_FOR_FIELD`: a strict insert supplies no value and the
+/// column has no default (1364).
+pub const ERR_FIELD_NOT_DEFAULT: i32 = 1364;
+/// TiDB `ErrFKIncompatibleColumns`: an `ALTER` would make a foreign key's
+/// referencing and referenced columns disagree on type (3780).
+pub const ERR_FK_INCOMPATIBLE_COLUMNS: i32 = 3780;
 /// TiDB `ErrTTLFKReferenced`: `TTL` is not allowed on a table that is
 /// referenced by a foreign key.
 pub const ERR_TTL_FK_REFERENCED: i32 = 8152;

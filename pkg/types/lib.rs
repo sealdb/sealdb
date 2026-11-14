@@ -5,6 +5,7 @@ pub mod field_type;
 pub mod mydecimal;
 pub mod time;
 
+pub use datum::shortest_f64;
 pub use datum::Datum;
 pub use datum::EnumValue;
 pub use field_type::{

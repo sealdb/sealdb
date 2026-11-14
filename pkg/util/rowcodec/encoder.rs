@@ -33,6 +33,7 @@ fn encode_value(buf: &mut Vec<u8>, value: &Datum) {
     match value {
         Datum::Null => {}
         Datum::I64(v) => encode_int(buf, *v),
+        Datum::Year(v) => encode_int(buf, *v),
         Datum::U64(v) => encode_uint(buf, *v),
         Datum::F64(v) => encode_float(buf, *v),
         Datum::Bytes(b) => buf.extend_from_slice(b),

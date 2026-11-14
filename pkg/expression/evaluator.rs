@@ -14,6 +14,8 @@ use sealdb_types::field_type::FieldType;
 use sealdb_types::time::{Time, TimeType, parse_timestamp_literal};
 use sealdb_util::collate::{CollateMode, compare_bytes};
 use std::cell::{Cell, RefCell};
+// `TzOffset::fix()` comes from the `Offset` trait (chrono-tz offsets).
+use chrono::Offset as _;
 
 thread_local! {
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
@@ -1130,10 +1132,19 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 ),
                 // Integers: uppercase hex, negatives as two's complement u64.
                 Datum::I64(i) => format!("{:X}", *i as u64),
+                Datum::Year(y) => format!("{:X}", *y as u64),
                 Datum::U64(u) => format!("{u:X}"),
                 Datum::F64(f) => format!("{:X}", (*f as i64) as u64),
                 Datum::Decimal(d) => format!("{:X}", d.to_i64()? as u64),
-                Datum::Time(t) => format!("{:X}", t.to_packed_u64()),
+                // TIME/DATETIME hexes its text form (`20:08:05` → 32303A…).
+                Datum::Time(t) => {
+                    let text = if matches!(t.tp, sealdb_types::TimeType::Timestamp) {
+                        format_timestamp_display(*t)
+                    } else {
+                        t.to_string()
+                    };
+                    text.bytes().map(|x| format!("{x:02X}")).collect::<String>()
+                }
                 // ENUM/SET hex is taken over the label text (MySQL string path).
                 Datum::Enum(e) => e
                     .label
@@ -1259,6 +1270,9 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "TO_DAYS" => eval_date_part(func, schema, row, |t| {
             days_from_civil(t.year, t.month, t.day) + 719528
         }),
+        // `DATE(expr)` / `TIME(expr)` / `TIMESTAMP(expr)`: the temporal part of
+        // the argument (TiDB `builtinCastXxxSig`).
+        "DATE" | "TIME" | "TIMESTAMP" => eval_temporal_cast(func, schema, row),
         "FLOOR" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1300,7 +1314,7 @@ fn eval_json_extract(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> R
     let doc_bytes = doc.as_bytes();
     let parsed: serde_json::Value = serde_json::from_slice(&doc_bytes).map_err(|_| {
         Error::new(
-            sealdb_errno::ERR_INVALID_JSON_TEXT,
+            sealdb_errno::ERR_INVALID_JSON_TEXT_IN_PARAM,
             format!(
                 "Invalid JSON text in argument 1 to function {}: \"{}\".",
                 func.name.to_ascii_lowercase(),
@@ -1559,6 +1573,62 @@ fn eval_date_part(
     Ok(Datum::I64(part(&t)))
 }
 
+/// MySQL `DATE()` / `TIME()` / `TIMESTAMP()`: take the matching temporal part
+/// of one argument (TiDB `builtinCastDateSig` / `builtinCastTimeSig` /
+/// `builtinCastTimestampSig`). A numeric zero reads as the zero temporal value;
+/// `NO_ZERO_DATE` turns `DATE(0)` into NULL.
+fn eval_temporal_cast(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("{} requires 1 argument", func.name),
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let name = func.name.to_ascii_uppercase();
+    let (tp, target) = match name.as_str() {
+        "DATE" => (sealdb_types::field_type::TYPE_DATE, TimeType::Date),
+        "TIME" => (sealdb_types::field_type::TYPE_DURATION, TimeType::Time),
+        _ => (sealdb_types::field_type::TYPE_DATETIME, TimeType::Datetime),
+    };
+    if is_zero_number(&value) {
+        if name == "DATE" && sql_mode_flag("NO_ZERO_DATE") {
+            return Ok(Datum::Null);
+        }
+        let mut t = Time::new(0, 0, 0, 0, 0, 0);
+        t.tp = target;
+        return Ok(Datum::Time(t));
+    }
+    let decimal = match &value {
+        Datum::Time(t) => i32::from(t.fsp.max(0)),
+        _ => 6,
+    };
+    let mut ft = FieldType::default();
+    ft.tp = tp;
+    ft.decimal = decimal;
+    let out = value.cast(&ft)?;
+    Ok(match out {
+        Datum::Time(mut t) => {
+            t.tp = target;
+            Datum::Time(t)
+        }
+        other => other,
+    })
+}
+
+fn is_zero_number(d: &Datum) -> bool {
+    match d {
+        Datum::I64(v) => *v == 0,
+        Datum::U64(v) => *v == 0,
+        Datum::F64(v) => *v == 0.0,
+        Datum::Decimal(d) => d.to_f64().map(|v| v == 0.0).unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn unit_name(d: &Datum) -> Result<String> {
     match d {
         Datum::Bytes(b) => Ok(String::from_utf8_lossy(b).to_ascii_uppercase()),
@@ -1757,69 +1827,133 @@ fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
     Ok(Datum::Time(t))
 }
 
-/// Minimal UTC→session TZ for types/time Europe/Paris DST suite.
+/// Minutes east of UTC for a session time zone value. `SYSTEM` resolves to the
+/// host offset (what TiDB does: `time_zone=SYSTEM` means the OS zone), named
+/// IANA zones go through the tz database (DST included) and digit-only
+/// offsets like `+05:30` parse directly.
+fn zone_offset_minutes(tz: &str) -> Option<i64> {
+    if tz.eq_ignore_ascii_case("UTC") || tz == "+00:00" {
+        return Some(0);
+    }
+    if tz.eq_ignore_ascii_case("SYSTEM") {
+        return Some(
+            time::OffsetDateTime::now_local()
+                .map(|now| i64::from(now.offset().whole_seconds()) / 60)
+                .unwrap_or(0),
+        );
+    }
+    parse_tz_offset(tz)
+}
+
+/// An IANA zone parsed from the session `time_zone` value.
+fn named_zone(tz: &str) -> Option<chrono_tz::Tz> {
+    if tz.eq_ignore_ascii_case("UTC")
+        || tz.eq_ignore_ascii_case("SYSTEM")
+        || parse_tz_offset(tz).is_some()
+    {
+        return None;
+    }
+    tz.parse::<chrono_tz::Tz>().ok()
+}
+
+/// The `chrono` naive wall clock for a [`Time`] (zero dates cannot reach an
+/// IANA zone and return `None`).
+fn naive_of(t: &Time) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDate::from_ymd_opt(i32::from(t.year), u32::from(t.month), u32::from(t.day))?
+        .and_hms_opt(u32::from(t.hour), u32::from(t.minute), u32::from(t.second))
+}
+
+/// Minutes east of UTC for `t` read as a UTC instant in `tz`.
+fn utc_offset_minutes(tz: chrono_tz::Tz, t: &Time) -> Option<i64> {
+    let naive = naive_of(t)?;
+    let offset = chrono::TimeZone::offset_from_utc_datetime(&tz, &naive);
+    Some(i64::from(offset.fix().local_minus_utc()).div_euclid(60))
+}
+
+/// Minutes east of UTC for `t` read as a wall clock in `tz`. An ambiguous
+/// wall clock (fall back) keeps the earlier/DST offset; a nonexistent one
+/// (spring-forward gap) is read with the post-transition offset, which is how
+/// TiDB stores such a value.
+fn local_offset_minutes(tz: chrono_tz::Tz, t: &Time) -> Option<i64> {
+    let naive = naive_of(t)?;
+    match chrono::TimeZone::from_local_datetime(&tz, &naive) {
+        chrono::LocalResult::Single(dt) => {
+            Some(i64::from(dt.offset().fix().local_minus_utc()).div_euclid(60))
+        }
+        chrono::LocalResult::Ambiguous(dt, _) => {
+            Some(i64::from(dt.offset().fix().local_minus_utc()).div_euclid(60))
+        }
+        chrono::LocalResult::None => {
+            // Walk past the gap (at most a couple of hours) and use the offset
+            // that applies once the clock has moved to the other side.
+            for hours in 1..=3 {
+                let later = naive + chrono::Duration::hours(hours);
+                if let chrono::LocalResult::Single(dt) =
+                    chrono::TimeZone::from_local_datetime(&tz, &later)
+                {
+                    return Some(i64::from(dt.offset().fix().local_minus_utc()).div_euclid(60));
+                }
+            }
+            Some(0)
+        }
+    }
+}
+
+/// UTC → session time zone for TIMESTAMP display/conversion. The zero
+/// timestamp stays as-is in every zone.
 pub fn utc_to_session_local(mut t: Time) -> Result<Time> {
+    if t.year == 0 && t.month == 0 && t.day == 0 {
+        return Ok(t);
+    }
     let tz = current_time_zone();
-    if tz.eq_ignore_ascii_case("UTC") || tz == "+00:00" || tz.eq_ignore_ascii_case("SYSTEM") {
-        return Ok(t);
-    }
-    if let Some(minutes) = parse_tz_offset(&tz) {
-        shift_minutes(&mut t, minutes)?;
-        return Ok(t);
-    }
-    if tz.eq_ignore_ascii_case("Europe/Paris") {
-        // 2025-03-30 spring forward at 01:00 UTC (02:00 CET → 03:00 CEST).
-        let offset = if t.year == 2025 && t.month == 3 && t.day == 30 && t.hour >= 1 {
-            2
-        } else {
-            1
-        };
-        // Shift hours without DST validation (conversion, not TIMESTAMPADD).
-        let total = i64::from(t.hour) + offset;
-        let days = total.div_euclid(24);
-        t.hour = total.rem_euclid(24) as u8;
-        if days != 0 {
-            add_days(&mut t, days)?;
+    let minutes = if let Some(zone) = named_zone(&tz) {
+        utc_offset_minutes(zone, &t)
+    } else {
+        zone_offset_minutes(&tz)
+    };
+    match minutes {
+        Some(minutes) => {
+            if std::env::var("SEALDB_DEBUG_TZ").is_ok() {
+                eprintln!("DEBUG utc_to_local tz={tz} minutes={minutes} in={t}");
+            }
+            shift_minutes(&mut t, minutes)?;
+            Ok(t)
         }
-        return Ok(t);
+        None => Ok(t),
     }
-    Ok(t)
 }
 
-/// Session-local wall clock → UTC for TIMESTAMP storage.
+/// Session-local wall clock → UTC for TIMESTAMP storage. The zero timestamp
+/// stays as-is in every zone.
 pub fn session_local_to_utc(mut t: Time) -> Result<Time> {
+    if t.year == 0 && t.month == 0 && t.day == 0 {
+        return Ok(t);
+    }
     let tz = current_time_zone();
-    if tz.eq_ignore_ascii_case("UTC") || tz == "+00:00" || tz.eq_ignore_ascii_case("SYSTEM") {
-        return Ok(t);
-    }
-    if let Some(minutes) = parse_tz_offset(&tz) {
-        shift_minutes(&mut t, -minutes)?;
-        return Ok(t);
-    }
-    if tz.eq_ignore_ascii_case("Europe/Paris") {
-        // Inverse of utc_to_session_local for the suite DST day.
-        let offset = if t.year == 2025 && t.month == 3 && t.day == 30 && t.hour >= 3 {
-            2
-        } else if t.year == 2025 && t.month == 3 && t.day == 30 && t.hour >= 2 {
-            // Gap 02:xx — treat as post-transition (+2) for storage attempts.
-            2
-        } else {
-            1
-        };
-        let total = i64::from(t.hour) - offset;
-        let days = total.div_euclid(24);
-        t.hour = total.rem_euclid(24) as u8;
-        if days != 0 {
-            add_days(&mut t, days)?;
+    let minutes = if let Some(zone) = named_zone(&tz) {
+        local_offset_minutes(zone, &t)
+    } else {
+        zone_offset_minutes(&tz)
+    };
+    match minutes {
+        Some(minutes) => {
+            if std::env::var("SEALDB_DEBUG_TZ").is_ok() {
+                eprintln!("DEBUG local_to_utc tz={tz} minutes={minutes} in={t}");
+            }
+            shift_minutes(&mut t, -minutes)?;
+            Ok(t)
         }
-        return Ok(t);
+        None => Ok(t),
     }
-    Ok(t)
 }
 
-/// Display TIMESTAMP (UTC storage) in the session time zone.
+/// Display TIMESTAMP (UTC storage) in the session time zone. The zero
+/// timestamp is not shifted (TiDB prints `0000-00-00 00:00:00` in every zone).
 pub fn format_timestamp_display(t: Time) -> String {
     if !matches!(t.tp, TimeType::Timestamp) {
+        return t.to_string();
+    }
+    if t.year == 0 && t.month == 0 && t.day == 0 {
         return t.to_string();
     }
     match utc_to_session_local(t) {
@@ -1956,11 +2090,9 @@ fn eval_unix_timestamp(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
 /// Unix epoch milliseconds for a datetime/timestamp `Time` value, using the
 /// current session time zone. Used by `AS OF TIMESTAMP` stale reads.
 pub fn time_to_unix_millis(t: &Time) -> Result<u64> {
-    let mut t = t.clone();
-    if matches!(t.tp, TimeType::Timestamp) {
-        t = utc_to_session_local(t)?;
-    }
-    let utc = session_local_to_utc(t)?;
+    // `Time` datums reach expression evaluation as session-local wall clocks
+    // (both literals and `now()`), so only the local -> UTC shift applies.
+    let utc = session_local_to_utc(t.clone())?;
     let secs = wall_secs(&utc);
     if secs < 0 {
         return Err(Error::new(

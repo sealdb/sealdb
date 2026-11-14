@@ -391,6 +391,7 @@ fn datum_to_json(d: &Datum) -> serde_json::Value {
     match d {
         Datum::Null => serde_json::Value::Null,
         Datum::I64(v) => serde_json::json!(*v),
+        Datum::Year(v) => serde_json::json!(*v),
         Datum::U64(v) => serde_json::json!(*v),
         Datum::F64(v) => serde_json::json!(*v),
         Datum::Bytes(v) | Datum::Bit(v) => {

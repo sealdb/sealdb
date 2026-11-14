@@ -509,9 +509,22 @@ fn render_create_table(info: &TableInfo) -> String {
                 line.push_str(" AUTO_INCREMENT");
             }
             if let Some(default) = &col.default_expr {
-                line.push_str(&format!(" DEFAULT {default}"));
+                // A NOT NULL column has no implicit `DEFAULT NULL` to print.
+                if !(default.eq_ignore_ascii_case("null")
+                    && col.field_type.flag & NOT_NULL_FLAG != 0)
+                {
+                    line.push_str(&format!(" DEFAULT {default}"));
+                }
             } else if col.field_type.flag & NOT_NULL_FLAG == 0 {
+                // TiDB spells the implicit NULL of a timestamp column out only
+                // when it also has no default (`timestamp NULL DEFAULT NULL`).
+                if col.field_type.tp == sealdb_types::field_type::TYPE_TIMESTAMP {
+                    line.push_str(" NULL");
+                }
                 line.push_str(" DEFAULT NULL");
+            }
+            if let Some(comment) = &col.comment {
+                line.push_str(&format!(" COMMENT '{}'", comment.replace('\'', "''")));
             }
             line
         })
@@ -528,19 +541,39 @@ fn render_create_table(info: &TableInfo) -> String {
             .columns
             .iter()
             .map(|c| {
-                match info
+                if let Some(col) = info
                     .columns
                     .iter()
                     .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(c.name.o()))
                 {
                     // Expression key part: TiDB prints the generating expression
                     // wrapped in an extra paren pair.
-                    Some(col) => format!("({})", col.generated_expr.clone().unwrap_or_default()),
+                    return format!("({})", col.generated_expr.clone().unwrap_or_default());
+                }
+                // A prefix index prints its length right after the name
+                // (`` `a`(10) ``), with no space before the paren. TiDB only
+                // keeps the length while it still covers less than the whole
+                // string column (`modify a int` / `char(9)` drop it).
+                let prefix = info
+                    .columns
+                    .iter()
+                    .find(|col| col.name.o().eq_ignore_ascii_case(c.name.o()))
+                    .filter(|col| {
+                        matches!(
+                            col.field_type.tp,
+                            sealdb_types::field_type::TYPE_STRING
+                                | sealdb_types::field_type::TYPE_VARCHAR
+                                | sealdb_types::field_type::TYPE_VAR_STRING
+                        ) && c.length > 0
+                            && col.field_type.flen as i32 > c.length
+                    });
+                match prefix {
+                    Some(_) => format!("`{}`({})", c.name.o(), c.length),
                     None => format!("`{}`", c.name.o()),
                 }
             })
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(",");
         cols.push(if idx.primary {
             // TiDB prints the PRIMARY KEY without an index name and annotates
             // how the key is stored (`/*T![clustered_index] … */`).
@@ -553,6 +586,25 @@ fn render_create_table(info: &TableInfo) -> String {
         } else {
             format!("  {key} `{}` ({parts})", idx.name.o())
         });
+    }
+    // FOREIGN KEY constraints follow the keys (`CONSTRAINT `fk` FOREIGN KEY …`).
+    for fk in &info.foreign_keys {
+        let local = fk
+            .cols
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let referenced = fk
+            .ref_cols
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(",");
+        cols.push(format!(
+            "  CONSTRAINT `{}` FOREIGN KEY ({local}) REFERENCES `{}` ({referenced})",
+            fk.name, fk.ref_table
+        ));
     }
     let mut out = format!(
         "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET={} COLLATE={}",

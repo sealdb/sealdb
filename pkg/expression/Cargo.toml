@@ -9,6 +9,8 @@ license.workspace = true
 path = "lib.rs"
 
 [dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
 sealdb-errno.workspace = true
 sealdb-meta.workspace = true
 sealdb-parser.workspace = true
@@ -16,3 +18,4 @@ sealdb-types.workspace = true
 sealdb-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true

@@ -49,9 +49,23 @@ impl MyDecimal {
                 format!("invalid decimal {s}"),
             ));
         }
+        // TiDB drops leading integer zeros when it builds a decimal literal
+        // (`000003.000000` prints `3.000000`); the fractional scale is kept.
+        let (int_part, frac_part) = match rest.split_once('.') {
+            Some((int_part, frac)) => (int_part, Some(frac)),
+            None => (rest, None),
+        };
+        let int_part = int_part.trim_start_matches('0');
+        let int_part = if int_part.is_empty() { "0" } else { int_part };
+        let is_zero =
+            int_part == "0" && frac_part.is_none_or(|frac| frac.bytes().all(|b| b == b'0'));
+        let digits = match frac_part {
+            Some(frac) => format!("{int_part}.{frac}"),
+            None => int_part.to_string(),
+        };
         Ok(Self {
-            negative: negative && rest != "0" && rest != "0.0",
-            digits: rest.to_string(),
+            negative: negative && !is_zero,
+            digits,
         })
     }
 

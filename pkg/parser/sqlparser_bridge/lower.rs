@@ -73,8 +73,19 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // TiDB `int1`…`int4` type aliases: sqlparser only knows the canonical names,
     // and a Custom type cannot take `UNSIGNED`.
     let rewritten = rewrite_integer_type_aliases(&rewritten);
+    // TiDB `REAL(M,D)` is `DOUBLE(M,D)`; sqlparser's `REAL` takes no precision.
+    let rewritten = rewrite_real_type_precision(&rewritten);
     // MySQL column `CHARSET gbk`: sqlparser's column option is `CHARACTER SET`.
     let rewritten = rewrite_mysql_column_charset(&rewritten);
+    // `ENUM("a", "b")` / `SET("a", "b")`: double-quoted members are MySQL
+    // string literals, but sqlparser only accepts single quotes there.
+    let rewritten = rewrite_enum_set_double_quotes(&rewritten);
+    // `ENUM(b'10101')`: a bit literal member is its binary byte sequence;
+    // sqlparser's type grammar only takes string literals there.
+    let rewritten = rewrite_enum_set_bit_members(&rewritten);
+    // `COMMENT "text"`: MySQL (without ANSI_QUOTES) accepts a double-quoted
+    // string where sqlparser's column option only takes single quotes.
+    let rewritten = rewrite_comment_double_quotes(&rewritten);
     // MySQL `CAST(x AS CHAR CHARSET cs)`: no such clause in sqlparser's CAST.
     let rewritten = rewrite_mysql_cast_charset(&rewritten);
     // `ALTER INDEX name [IN]VISIBLE` must precede option stripping below, which
@@ -1119,8 +1130,429 @@ fn rewrite_integer_type_aliases(sql: &str) -> String {
     out
 }
 
+/// TiDB `REAL(M,D)` behaves like `DOUBLE(M,D)`, but sqlparser's `REAL` takes
+/// no precision list. Rewrite only the parenthesised spelling, so a bare `REAL`
+/// column and identifiers named `real` keep working.
+fn rewrite_real_type_precision(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            let ch = sql[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            if b == b'\\' && q != b'`' {
+                if let Some(ch) = sql[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(b, b'\'' | b'"' | b'`') {
+            quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if keyword_at(bytes, i, "real") {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                out.push_str("double");
+                i = j;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// MySQL column option `a varchar(255) CHARSET gbk` → `CHARACTER SET gbk`
 /// (sqlparser's column option spelling). A table option keeps its `=` form.
+/// Identifier byte, used to tell a type keyword from part of a longer word.
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Rewrite `enum(b'10101')` / `set(0b101)` members: TiDB treats the bit
+/// literal as its binary byte sequence (a raw string), while sqlparser's type
+/// grammar only accepts string literals inside the member list.
+fn rewrite_enum_set_bit_members(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("enum(") && !lower.contains("set(") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == quote as char {
+                    break;
+                }
+            }
+            continue;
+        }
+        let kind_len = if (bytes[i] == b'e' || bytes[i] == b'E')
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && lower[i..].starts_with("enum")
+        {
+            4
+        } else if (bytes[i] == b's' || bytes[i] == b'S')
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && lower[i..].starts_with("set")
+        {
+            3
+        } else {
+            0
+        };
+        if kind_len > 0 {
+            let mut open = i + kind_len;
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if open < bytes.len()
+                && bytes[open] == b'('
+                && !is_ident_char(bytes.get(i + kind_len).copied().unwrap_or(b' '))
+                && let Some(close) = enum_member_paren(bytes, open)
+            {
+                out.push_str(&sql[i..=open]);
+                out.push_str(&rewrite_bit_literal_members(&sql[open + 1..close]));
+                out.push(')');
+                i = close + 1;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Index of the `)` matching the `(` at `open`, skipping quoted literals.
+fn enum_member_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && quote != b'`' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Rewrite the bit literals (`b'10101'`, `0b101`) inside an ENUM/SET member
+/// list to the string literal holding their binary bytes.
+fn rewrite_bit_literal_members(list: &str) -> String {
+    let bytes = list.as_bytes();
+    let mut out = String::with_capacity(list.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = list[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == quote as char {
+                    break;
+                }
+            }
+            continue;
+        }
+        let ident_before = i > 0 && is_ident_char(bytes[i - 1]);
+        if !ident_before
+            && (bytes[i] == b'b' || bytes[i] == b'B')
+            && bytes.get(i + 1) == Some(&b'\'')
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end] == b'0' || bytes[end] == b'1') {
+                end += 1;
+            }
+            if end > start
+                && bytes.get(end) == Some(&b'\'')
+                && let Some(literal) = bit_member_bytes(&list[start..end])
+            {
+                out.push_str(&literal);
+                i = end + 1;
+                continue;
+            }
+        }
+        if !ident_before && bytes[i] == b'0' && matches!(bytes.get(i + 1), Some(b'b') | Some(b'B'))
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end] == b'0' || bytes[end] == b'1') {
+                end += 1;
+            }
+            if end > start
+                && !is_ident_char(bytes.get(end).copied().unwrap_or(b' '))
+                && let Some(literal) = bit_member_bytes(&list[start..end])
+            {
+                out.push_str(&literal);
+                i = end;
+                continue;
+            }
+        }
+        let ch = list[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `b'10101'` → `'\x15'` spelled as a quoted literal of the byte characters.
+fn bit_member_bytes(bits: &str) -> Option<String> {
+    let bit_len = bits.len();
+    let byte_len = bit_len.div_ceil(8).max(1);
+    if byte_len > 16 {
+        return None;
+    }
+    let mut value: u128 = 0;
+    for bit in bits.bytes() {
+        value = (value << 1) | u128::from(bit == b'1');
+    }
+    let mut out = String::from("'");
+    for index in (0..byte_len).rev() {
+        let byte = (value >> (index * 8)) as u8;
+        match byte {
+            b'\'' => out.push_str("''"),
+            b'\\' => out.push_str("\\\\"),
+            _ => out.push(byte as char),
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
+/// Rewrite `COMMENT "text"` to a single-quoted literal: Without `ANSI_QUOTES`
+/// MySQL reads `"text"` as a string, while sqlparser's column option only
+/// accepts `'text'`.
+fn rewrite_comment_double_quotes(sql: &str) -> String {
+    if !sql.contains('"') {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Copy quoted literals/identifiers verbatim so their contents are safe.
+        if bytes[i] == b'\'' || bytes[i] == b'`' {
+            let quote = bytes[i];
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == quote as char {
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'"' {
+            // An unconverted double-quoted token outside COMMENT: copy as is.
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+                if ch == '"' {
+                    break;
+                }
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+        if (bytes[i] == b'c' || bytes[i] == b'C')
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && sql[i..].len() >= 7
+            && sql[i..i + 7].eq_ignore_ascii_case("comment")
+            && !is_ident_char(bytes.get(i + 7).copied().unwrap_or(b' '))
+        {
+            let mut j = i + 7;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                out.push_str(&sql[i..j]);
+                out.push('\'');
+                j += 1;
+                while j < bytes.len() {
+                    let ch = sql[j..].chars().next().unwrap();
+                    j += ch.len_utf8();
+                    if ch == '"' {
+                        break;
+                    }
+                    if ch == '\'' {
+                        out.push('\'');
+                    }
+                    out.push(ch);
+                }
+                out.push('\'');
+                i = j;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Rewrite `ENUM("a", "b")` / `SET("a", "b")` members to single-quoted
+/// literals. Outside `ANSI_QUOTES`, MySQL reads `"…"` as a string, while
+/// sqlparser's type grammar only accepts `'…'`.
+fn rewrite_enum_set_double_quotes(sql: &str) -> String {
+    if !sql.contains('"') {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Copy quoted literals verbatim so their contents are never touched.
+        if bytes[i] == b'\'' || bytes[i] == b'`' {
+            let quote = bytes[i];
+            out.push(quote as char);
+            i += 1;
+            while i < bytes.len() {
+                let ch = sql[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                if ch == quote as char {
+                    break;
+                }
+            }
+            continue;
+        }
+        if (bytes[i] == b'e' || bytes[i] == b'E' || bytes[i] == b's' || bytes[i] == b'S')
+            && (i == 0 || !is_ident_char(bytes[i - 1]))
+            && sql[i..].len() >= 3
+        {
+            let rest = sql[i..].to_ascii_lowercase();
+            let kind_len = if rest.starts_with("enum") {
+                4
+            } else if rest.starts_with("set") {
+                3
+            } else {
+                0
+            };
+            let after = i + kind_len;
+            if kind_len > 0
+                && after < bytes.len()
+                && !is_ident_char(bytes.get(after).copied().unwrap_or(b' '))
+            {
+                // Only a parenthesised member list is a type declaration.
+                let mut j = after;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'(' {
+                    out.push_str(&sql[i..j + 1]);
+                    j += 1;
+                    let mut depth = 1usize;
+                    while j < bytes.len() && depth > 0 {
+                        let c = bytes[j];
+                        if c == b'(' {
+                            depth += 1;
+                            out.push('(');
+                            j += 1;
+                        } else if c == b')' {
+                            depth -= 1;
+                            out.push(')');
+                            j += 1;
+                        } else if c == b'\'' {
+                            // A single-quoted member is already valid; copy it
+                            // verbatim (`'{"k1": "value"}'` keeps its quotes).
+                            out.push('\'');
+                            j += 1;
+                            while j < bytes.len() {
+                                let ch = sql[j..].chars().next().unwrap();
+                                out.push(ch);
+                                j += ch.len_utf8();
+                                if ch == '\'' {
+                                    if bytes.get(j) == Some(&b'\'') {
+                                        out.push('\'');
+                                        j += 1;
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if c == b'"' {
+                            // `""` inside a double-quoted member is an escaped quote.
+                            if bytes.get(j + 1) == Some(&b'"') {
+                                out.push_str("''");
+                                j += 2;
+                            } else {
+                                out.push('\'');
+                                j += 1;
+                            }
+                        } else {
+                            let ch = sql[j..].chars().next().unwrap();
+                            out.push(ch);
+                            j += ch.len_utf8();
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn rewrite_mysql_column_charset(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -9607,6 +10039,33 @@ fn lower_column_option_default(options: &[sqlparser::ast::ColumnOption]) -> Opti
     })
 }
 
+/// `COMMENT '<text>'` of a column definition (marker comments are options
+/// rewritten from other syntax, e.g. `AUTO_RANDOM`, and are never the comment).
+fn lower_column_comment(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
+    options.iter().find_map(|opt| match &opt.option {
+        sqlparser::ast::ColumnOption::Comment(text)
+            if !text.starts_with(AUTO_RANDOM_MARKER_PREFIX)
+                && text != CLUSTERED_MARKER
+                && text != NONCLUSTERED_MARKER =>
+        {
+            Some(text.clone())
+        }
+        _ => None,
+    })
+}
+
+/// `COMMENT '<text>'` of an `ALTER TABLE … CHANGE/MODIFY COLUMN` option list.
+fn lower_column_option_comment(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
+    options.iter().find_map(|opt| match opt {
+        sqlparser::ast::ColumnOption::Comment(text)
+            if !text.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
+        {
+            Some(text.clone())
+        }
+        _ => None,
+    })
+}
+
 /// `CHARACTER SET <name>` in an `ALTER TABLE … CHANGE/MODIFY COLUMN` definition.
 fn lower_column_option_charset(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
     options.iter().find_map(|opt| match opt {
@@ -9770,6 +10229,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             not_null: lower_not_null(&col.options),
             charset: lower_column_charset(&col.options),
             collate: lower_column_collate(&col.options),
+            comment: lower_column_comment(&col.options),
         });
         for opt in &col.options {
             match &opt.option {
@@ -9840,17 +10300,54 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             );
         }
     }
+    let (charset, collate) = lower_table_charset_collate(&create.table_options);
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
         table: object_table_name(&create.name)?,
         cols,
         indices,
         foreign_keys: lower_foreign_keys(&create.constraints)?,
+        charset,
+        collate,
         partition: None,
         ttl: None,
         refer_table,
         select,
     }))
+}
+
+/// Table-level `DEFAULT CHARSET` / `COLLATE` options of `CREATE TABLE`.
+fn lower_table_charset_collate(
+    options: &sqlparser::ast::CreateTableOptions,
+) -> (Option<String>, Option<String>) {
+    use sqlparser::ast::CreateTableOptions;
+    let list = match options {
+        CreateTableOptions::Plain(list) => list,
+        _ => return (None, None),
+    };
+    let mut charset = None;
+    let mut collate = None;
+    for opt in list {
+        let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
+            continue;
+        };
+        let name = key.value.to_ascii_uppercase();
+        let text = match value {
+            sqlparser::ast::Expr::Value(v) => match &v.value {
+                sqlparser::ast::Value::SingleQuotedString(s)
+                | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            },
+            other => other.to_string(),
+        };
+        let text = text.trim_matches(['\'', '"']).to_string();
+        match name.as_str() {
+            "CHARSET" => charset = Some(text.to_ascii_lowercase()),
+            "COLLATE" => collate = Some(text),
+            _ => {}
+        }
+    }
+    (charset, collate)
 }
 
 /// `FOREIGN KEY` constraints, in definition order (TiDB keeps them separate
@@ -10750,10 +11247,31 @@ fn lower_value(value: &Value) -> Result<Datum> {
             // TiDB accepts scientific notation (`1e23`) as float; sqlparser keeps the
             // token text so we must not force i64 when `e`/`E` is present.
             // Integers wider than i64 become u64 then Decimal (precise_types).
-            if n.contains('.') || n.contains('e') || n.contains('E') {
+            if n.contains('e') || n.contains('E') {
                 n.parse::<f64>()
                     .map(Datum::F64)
                     .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
+            } else if n.contains('.') {
+                // TiDB keeps a decimal literal's precision when the double
+                // cannot round-trip it: `20201030082133.455555` stays a DECIMAL
+                // (the nearest DOUBLE prints `20201030082133.457`), while
+                // `333.33` is exact as a DOUBLE and stays one. A trailing
+                // `.0` fraction folds to the plain double (`0.0` → `0`).
+                let parsed = n
+                    .parse::<f64>()
+                    .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))?;
+                let shortest = sealdb_types::shortest_f64(parsed);
+                let float_literal = shortest == n.as_str()
+                    || n.split_once('.').is_some_and(|(int_part, frac)| {
+                        frac.bytes().all(|b| b == b'0') && shortest == int_part
+                    });
+                if float_literal {
+                    Ok(Datum::F64(parsed))
+                } else {
+                    sealdb_types::MyDecimal::parse(n)
+                        .map(Datum::Decimal)
+                        .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
+                }
             } else if let Ok(v) = n.parse::<i64>() {
                 Ok(Datum::I64(v))
             } else if let Ok(v) = n.parse::<u64>() {
@@ -11011,6 +11529,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 not_null: lower_not_null(&column_def.options),
                 charset: lower_column_charset(&column_def.options),
                 collate: lower_column_collate(&column_def.options),
+                comment: lower_column_comment(&column_def.options),
             },
             position: lower_column_position(column_position),
         }),
@@ -11044,11 +11563,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
                 sqlparser::ast::ColumnOption::CharacterSet(_)
                 | sqlparser::ast::ColumnOption::Collation(_) => false,
-                sqlparser::ast::ColumnOption::Comment(c)
-                    if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
-                {
-                    false
-                }
+                // COMMENT and the AUTO_RANDOM marker are accepted options.
+                sqlparser::ast::ColumnOption::Comment(_) => false,
                 _ => true,
             });
             if has_other_options {
@@ -11063,6 +11579,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 not_null: lower_not_null_option(options),
                 charset: lower_column_option_charset(options),
                 collate: lower_column_option_collate(options),
+                comment: lower_column_option_comment(options),
                 position: lower_column_position(column_position),
             })
         }
@@ -11080,11 +11597,8 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 sqlparser::ast::ColumnOption::NotNull | sqlparser::ast::ColumnOption::Null => false,
                 sqlparser::ast::ColumnOption::CharacterSet(_)
                 | sqlparser::ast::ColumnOption::Collation(_) => false,
-                sqlparser::ast::ColumnOption::Comment(c)
-                    if c.starts_with(AUTO_RANDOM_MARKER_PREFIX) =>
-                {
-                    false
-                }
+                // COMMENT and the AUTO_RANDOM marker are accepted options.
+                sqlparser::ast::ColumnOption::Comment(_) => false,
                 _ => true,
             });
             if has_other_options {
@@ -11098,6 +11612,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                 not_null: lower_not_null_option(options),
                 charset: lower_column_option_charset(options),
                 collate: lower_column_option_collate(options),
+                comment: lower_column_option_comment(options),
                 position: lower_column_position(column_position),
             })
         }
@@ -11530,7 +12045,10 @@ mod paren_from_tests {
             "cast(a as char charset latin1)",
         ] {
             let expr = parse_expr(sql).expect("cast charset parses");
-            assert_eq!(expr.restore_string_generated(), "cast(`a` as char charset latin1)");
+            assert_eq!(
+                expr.restore_string_generated(),
+                "cast(`a` as char charset latin1)"
+            );
         }
     }
 
