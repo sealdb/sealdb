@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 68,
-      "pending": 163,
+      "green": 69,
+      "pending": 162,
       "in_progress": 13,
       "deferred": 2,
       "local": 8
@@ -2452,7 +2452,7 @@
     {
       "name": "table/cache",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/table/cache.test",
       "result": "r/table/cache.result",
       "has_result": true,

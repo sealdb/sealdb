@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 68 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 69 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2679,6 +2679,28 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 `table/cache` / `globalindex/information_schema` 等低 diff pending
     套件，并推进 R3 `explain_easy` 剩余项。
+
+### 2026-11-14（`table/cache` 转正：`ALTER TABLE … CACHE` + IN 列表求交）
+
+- **Phase**: R7
+- **完成**:
+  - `ALTER TABLE t CACHE` / `NOCACHE` 解析：sqlparser 无该语法，bridge 在
+    重写语句前抽取关键字，lowerer 产出 `AlterTableSpec::Cache { cached }`；
+    DDL 按 TiDB 语义接受为元数据开关（存储层无独立缓存，空实现）。
+  - `u IN (11, 13) AND u IN (12, 13)`：TiDB ranger 对同列 DNF 求交后只剩
+    `u = 13`。`in_list_plan` 先按列分组求交再构造 `PointGet`/`BatchPointGet`，
+    不再只看第一个列表（此前返回 11、13 两行）。
+  - 单值 IN 列表：`index_lookup_values` 同样求交后再取键值，交集收缩为单点
+    时仍走 PointGet；交集为空时不钉键，交给过滤条件，避免 seek 不存在的键。
+- **验证**:
+  - `./project/scripts/triage_itest.sh -t table/cache --status pending -s memory` → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -t table/cache -s tikv --status pending` → `PASS: tikv=1`
+  - manifest `table/cache` → `green`，green 68→69
+- **阻塞/风险**:
+  - `CACHE`/`NOCACHE` 只做语法接受，`SHOW CREATE TABLE` 与缓存语义尚未联动。
+- **下一步**:
+  - 继续 `globalindex/information_schema` / `sessiontxn/externals` / R3
+    `explain_easy` 剩余项。
 
 ---
 
