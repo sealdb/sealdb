@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 61 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 62 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2475,6 +2475,32 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 无。
 - **下一步**:
   - 继续 R7 长尾：`executor/inspection_common` / `table/temptable`
+
+---
+
+### 2026-11-14（`executor/inspection_common` 转正：INSPECTION_RULES 与空输入聚合）
+
+- **Phase**: R7
+- **完成**:
+  - `information_schema.INSPECTION_RULES` 虚拟表返回 TiDB 的 15 条规则
+    （5 条 `inspection`：config/version/node-load/critical-error/threshold-check；
+    10 条 `summary`：all/all-load/cpu/memory/io/network/region/time/tikv/pd），
+    列为 `RULE`、`TYPE`，可直接用于 `INSPECTION_RESULT`/`INSPECTION_SUMMARY`。
+  - 修复「不可满足谓词 + 标量聚合」的计划：`WHERE` 折叠成常量 0 时，
+    若 SELECT 列表含聚合且无 GROUP BY/HAVING，先构造零行 `TableDual` 再套
+    `build_agg_plan`，`count(*)` 因此返回一行 0（TiDB 语义），而不是空结果。
+- **验证**:
+  - `run-tests.sh -s memory -t executor/inspection_common --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t executor/inspection_common --status pending` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh -s memory` → `PASS: memory=70 skipped=184`
+  - TiKV 全量 gate 除 `executor/adapter` 亚秒计时断言（本机负载下环境性抖动，
+    干净工作区同样复现）外全部通过
+  - manifest `executor/inspection_common` → `green`，green 61→62
+- **阻塞/风险**:
+  - 规则名称/类型按 TiDB 列表实现；`INSPECTION_RESULT`/`INSPECTION_SUMMARY`
+    本身仍是空表（本套件不读取结果）。
+- **下一步**:
+  - 继续 R7 长尾：`table/temptable`（需要会话级临时表）/ `cte` 剩余差异
 
 ---
 

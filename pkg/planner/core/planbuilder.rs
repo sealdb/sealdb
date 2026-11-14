@@ -187,12 +187,25 @@ impl PlanBuilder {
                     None => select,
                 };
                 // TiDB folds an unsatisfiable predicate (`a = 2 AND a = 3`)
-                // to `0` and plans a zero-row TableDual.
+                // to `0` and plans a zero-row TableDual. A scalar aggregate
+                // still has to produce its one output row over that empty
+                // input (`count(*)` → 0), so build the aggregate on top.
                 if let Some(ExprNode::Value(ValueExpr {
                     datum: Datum::I64(0),
                 })) = &select.selection
                 {
-                    return Ok(PhysicalPlan::TableDual { row_count: 0 });
+                    let empty = PhysicalPlan::TableDual { row_count: 0 };
+                    let scalar_agg = select.group_by.is_empty()
+                        && select.having.is_none()
+                        && select
+                            .fields
+                            .iter()
+                            .any(|field| expr_contains_agg(&field.expr));
+                    if !scalar_agg {
+                        return Ok(empty);
+                    }
+                    let (plan, _) = build_agg_plan(select, empty, current_db, is, stats);
+                    return Ok(plan);
                 }
                 // TiDB quantified `!= ANY` / `= ALL` → agg + CARTESIAN join.
                 if let Some(plan) = quantified_cmp_plan(select, is, current_db, stats, prune_mode) {

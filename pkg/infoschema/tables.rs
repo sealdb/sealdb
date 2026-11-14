@@ -16,6 +16,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "table_constraints" => Ok(table_constraints(is)),
         "partitions" => Ok(partitions(is)),
         "attributes" => Ok(attributes(is)),
+        "inspection_rules" => Ok(inspection_rules()),
         "character_sets" => Ok(character_sets()),
         "collations" => Ok(collations()),
         "collation_character_set_applicability" => Ok(collation_applicability()),
@@ -840,6 +841,35 @@ fn attributes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             }
         }
     }
+    (schema, rows)
+}
+
+/// `information_schema.INSPECTION_RULES`: the built-in rule names usable with
+/// `INSPECTION_RESULT` / `INSPECTION_SUMMARY`, tagged `inspection` (single
+/// diagnostic checks) or `summary` (metric families).
+fn inspection_rules() -> (Vec<String>, Vec<Vec<Datum>>) {
+    const RULES: &[(&str, &str)] = &[
+        ("config", "inspection"),
+        ("version", "inspection"),
+        ("node-load", "inspection"),
+        ("critical-error", "inspection"),
+        ("threshold-check", "inspection"),
+        ("all", "summary"),
+        ("all-load", "summary"),
+        ("cpu", "summary"),
+        ("memory", "summary"),
+        ("io", "summary"),
+        ("network", "summary"),
+        ("region", "summary"),
+        ("time", "summary"),
+        ("tikv", "summary"),
+        ("pd", "summary"),
+    ];
+    let schema = vec!["RULE".to_string(), "TYPE".to_string()];
+    let rows = RULES
+        .iter()
+        .map(|(rule, tp)| vec![bytes(rule), bytes(tp)])
+        .collect();
     (schema, rows)
 }
 

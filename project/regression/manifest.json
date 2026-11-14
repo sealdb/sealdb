@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 61,
-      "pending": 169,
+      "green": 62,
+      "pending": 168,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -806,7 +806,7 @@
     {
       "name": "executor/inspection_common",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/inspection_common.test",
       "result": "r/executor/inspection_common.result",
       "has_result": true,
