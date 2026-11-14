@@ -1448,10 +1448,33 @@ fn index_lookup_values(
         {
             continue;
         }
-        if let Some(value) = selection
-            .and_then(|expr| expr.in_const_on(&key))
-            .and_then(|values| values.into_iter().next())
-        {
+        // `a IN (1, 3) AND a IN (3, 4)` pins `a = 3`: intersect every IN list on
+        // the key before taking a value (TiDB ranger intersects the per-column
+        // DNF). An empty intersection stays unpinned so the scan filters instead
+        // of seeking a value no row can match.
+        let lists: Vec<Vec<sealdb_types::Datum>> = selection
+            .map(|expr| {
+                expr.split_cnf()
+                    .into_iter()
+                    .filter_map(|conjunct| conjunct.column_in_consts_with_len())
+                    .filter(|(name, _, _)| name.eq_ignore_ascii_case(&key))
+                    .map(|(_, values, _)| values)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let intersected = lists.into_iter().reduce(|current, next| {
+            current
+                .into_iter()
+                .filter(|value| next.iter().any(|other| other == value))
+                .collect()
+        });
+        let single = match intersected {
+            Some(values) => values.into_iter().next(),
+            None => selection
+                .and_then(|expr| expr.in_const_on(&key))
+                .and_then(|values| values.into_iter().next()),
+        };
+        if let Some(value) = single {
             known.push((key, value));
         }
     }

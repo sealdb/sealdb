@@ -9265,6 +9265,28 @@ fn local_index_point_allowed(
     planned.names.len() == 1
 }
 
+/// Groups IN lists by column and intersects the value sets of every list that
+/// constrains the same column, mirroring TiDB's ranger DNF intersection.
+fn intersect_in_lists(
+    lists: Vec<(String, Vec<Datum>, usize)>,
+) -> Vec<(String, Vec<Datum>, usize)> {
+    let mut out: Vec<(String, Vec<Datum>, usize)> = Vec::new();
+    for (column, values, total) in lists {
+        match out
+            .iter_mut()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&column))
+        {
+            Some((_, current, current_total)) => {
+                current.retain(|value| values.iter().any(|other| other == value));
+                *current_total = (*current_total).min(total);
+            }
+            None => out.push((column, values, total)),
+        }
+    }
+    out.retain(|(_, values, _)| !values.is_empty());
+    out
+}
+
 fn in_list_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -9282,6 +9304,11 @@ fn in_list_plan(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // `a IN (1, 2) AND a IN (2, 3)` is `a IN (2)`: TiDB's ranger intersects the
+    // per-column DNF before it builds seek keys. Do the same here, otherwise a
+    // point get would fire on the first list alone and drop the other predicate
+    // instead of narrowing the keys.
+    let lists = intersect_in_lists(lists);
     if info.pk_is_handle
         && only_index.is_none()
         && let Some(first) = info.columns.first()
