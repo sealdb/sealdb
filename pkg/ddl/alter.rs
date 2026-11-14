@@ -170,6 +170,7 @@ pub fn alter_table(
             // ignored; SealDB DDL is in-place and engine-independent.
             AlterTableSpec::Algorithm(_)
             | AlterTableSpec::Lock(_)
+            | AlterTableSpec::Cache { .. }
             | AlterTableSpec::TableOption { .. } => {}
             AlterTableSpec::AddPartition { defs } => {
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;

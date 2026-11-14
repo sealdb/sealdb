@@ -230,6 +230,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                     }
                 }
                 AlterPartOp::Ttl(spec) => alter.specs.push(spec),
+                AlterPartOp::Cache(cached) => alter.specs.push(AlterTableSpec::Cache { cached }),
                 AlterPartOp::Attributes {
                     partition,
                     attributes,
@@ -6429,6 +6430,8 @@ enum AlterPartOp {
         partition: Option<String>,
         attributes: Option<String>,
     },
+    /// `CACHE` / `NOCACHE` (sqlparser has no cached-table grammar).
+    Cache(bool),
 }
 
 /// `ALTER TABLE` table options TiDB accepts in the spec list
@@ -6646,6 +6649,25 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     ops.push(Some(AlterPartOp::Ttl(spec)));
                     i = skip_ws(bytes, end);
                     continue;
+                }
+                // `ALTER TABLE t CACHE` / `NOCACHE` — cached-table toggle,
+                // which sqlparser has no grammar for.
+                if keyword_at(bytes, after_name, "CACHE") || keyword_at(bytes, after_name, "NOCACHE")
+                {
+                    let cached = keyword_at(bytes, after_name, "CACHE");
+                    let kw_len = if cached {
+                        "CACHE".len()
+                    } else {
+                        "NOCACHE".len()
+                    };
+                    let end = stmt_end(bytes, after_name + kw_len);
+                    if skip_ws(bytes, after_name + kw_len) == end {
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Cache(cached)));
+                        i = skip_ws(bytes, end);
+                        continue;
+                    }
                 }
                 // Non-partition ALTER TABLE — still consume one alter slot as None.
                 ops.push(None);

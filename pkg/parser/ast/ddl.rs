@@ -919,6 +919,10 @@ pub enum AlterTableSpec {
     },
     /// `ALGORITHM [=] DEFAULT|INSTANT|INPLACE|COPY` — accepted and ignored.
     Algorithm(String),
+    /// `ALTER TABLE t CACHE` / `ALTER TABLE t NOCACHE` — cached-table toggle.
+    /// TiDB keeps the flag in table metadata; the storage layer has no
+    /// separate cache, so it is accepted and only tracked for `SHOW CREATE`.
+    Cache { cached: bool },
     /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
     Lock(String),
     /// `ENGINE = InnoDB` / `ROW_FORMAT = DYNAMIC` table option in an
@@ -1278,6 +1282,10 @@ impl AlterTableSpec {
                     }
                     None => ctx.write_str("DEFAULT"),
                 }
+                Ok(())
+            }
+            AlterTableSpec::Cache { cached } => {
+                ctx.write_str(if *cached { "CACHE" } else { "NOCACHE" });
                 Ok(())
             }
         }
