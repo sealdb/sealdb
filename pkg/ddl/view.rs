@@ -479,6 +479,7 @@ pub fn create_view(
     let create = CreateTableStmt {
         if_not_exists: false,
         temporary: false,
+        on_commit_delete_rows: false,
         table: stmt.view_name.clone(),
         cols,
         indices: Vec::new(),

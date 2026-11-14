@@ -5,7 +5,8 @@
 /// READ COMMITTED `refresh_snapshot` uses a fresh PD TSO snapshot for plain
 /// reads while keeping the underlying txn buffer for writes/locks.
 use sealdb_errno::{
-    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR, Error, Result,
+    ERR_LOCK_DEADLOCK, ERR_LOCK_NOWAIT, ERR_LOCK_WAIT_TIMEOUT, ERR_UNKNOWN_ERROR,
+    ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use sealdb_kv::{Storage, Transaction};
 use std::collections::HashMap;
@@ -132,6 +133,7 @@ impl TikvStorage {
             pessimistic,
             read_snapshot: None,
             writes: HashMap::new(),
+            savepoints: Vec::new(),
         }))
     }
 }
@@ -166,6 +168,7 @@ impl Storage for TikvStorage {
             pessimistic: false,
             read_snapshot: Some(snapshot),
             writes: HashMap::new(),
+            savepoints: Vec::new(),
         }))
     }
 
@@ -188,6 +191,8 @@ struct TikvTransaction {
     read_snapshot: Option<Snapshot>,
     /// Own writes so RC snapshot reads still see uncommitted mutations.
     writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// `SAVEPOINT` markers: name plus a snapshot of the write overlay.
+    savepoints: Vec<(String, HashMap<Vec<u8>, Option<Vec<u8>>>)>,
 }
 
 impl TikvTransaction {
@@ -397,10 +402,70 @@ impl Transaction for TikvTransaction {
         self.pessimistic
     }
 
+    fn savepoint(&mut self, name: &str) -> Result<()> {
+        self.savepoints
+            .retain(|(sp, _)| !sp.eq_ignore_ascii_case(name));
+        self.savepoints.push((name.to_string(), self.writes.clone()));
+        Ok(())
+    }
+
+    fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|(sp, _)| sp.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                Error::new(
+                    ERR_UNKNOWN_FUNCTION,
+                    format!("SAVEPOINT {name} does not exist"),
+                )
+            })?;
+        let saved = self.savepoints[idx].1.clone();
+        // Re-apply the keys this statement changed so the underlying TiKV
+        // mutation buffer matches the savepoint snapshot again.
+        let mut changes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for (key, now) in &self.writes {
+            let want = saved.get(key).cloned().flatten();
+            if now.clone() != want {
+                changes.push((key.clone(), want));
+            }
+        }
+        if !changes.is_empty() {
+            let mut txn = self.take_txn()?;
+            for (key, want) in changes {
+                let out = match want {
+                    Some(value) => self.rt.block_on(txn.put(key, value)),
+                    None => self.rt.block_on(txn.delete(key)),
+                };
+                out.map_err(map_tikv_err)?;
+            }
+            self.put_txn(txn);
+        }
+        self.writes = saved;
+        self.savepoints.truncate(idx + 1);
+        Ok(())
+    }
+
+    fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .savepoints
+            .iter()
+            .rposition(|(sp, _)| sp.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                Error::new(
+                    ERR_UNKNOWN_FUNCTION,
+                    format!("SAVEPOINT {name} does not exist"),
+                )
+            })?;
+        self.savepoints.truncate(idx);
+        Ok(())
+    }
+
     fn commit(&mut self) -> Result<()> {
         let mut txn = self.inner.take().ok_or_else(finished_txn)?;
         self.read_snapshot = None;
         self.writes.clear();
+        self.savepoints.clear();
         self.rt
             .block_on(txn.commit())
             .map(|_| ())
@@ -410,6 +475,7 @@ impl Transaction for TikvTransaction {
     fn rollback(&mut self) -> Result<()> {
         self.read_snapshot = None;
         self.writes.clear();
+        self.savepoints.clear();
         let Some(mut txn) = self.inner.take() else {
             return Ok(());
         };
@@ -435,6 +501,7 @@ impl Drop for TikvTransaction {
     fn drop(&mut self) {
         self.read_snapshot = None;
         self.writes.clear();
+        self.savepoints.clear();
         if let Some(mut txn) = self.inner.take() {
             let _ = self.rt.block_on(txn.rollback());
         }

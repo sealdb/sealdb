@@ -508,6 +508,9 @@ pub struct CreateTableStmt {
     /// `CREATE TEMPORARY TABLE`: a session-local table that shadows a
     /// permanent table of the same name.
     pub temporary: bool,
+    /// `ON COMMIT DELETE ROWS` (TiDB global temporary tables): the table's
+    /// rows are wiped when the transaction commits.
+    pub on_commit_delete_rows: bool,
     pub table: TableName,
     pub cols: Vec<ColumnDef>,
     pub indices: Vec<IndexDef>,

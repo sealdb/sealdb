@@ -24,6 +24,11 @@ use std::sync::{Arc, Mutex};
 /// that resolve to a temporary table are rewritten to this schema.
 const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
 
+/// Reserved savepoint name for statement atomicity: a failed statement inside
+/// an explicit transaction rolls its own writes back, like MySQL does.
+/// The leading NUL byte cannot appear in a user-written `SAVEPOINT` name.
+const STATEMENT_SAVEPOINT: &str = "\u{0}sealdb_statement";
+
 thread_local! {
     /// `group_concat_max_len` before the current `SET_VAR` hint took effect, so
     /// the statement-scoped override can restore the session value.
@@ -94,6 +99,9 @@ pub struct Session {
     /// visible only to this session. Rows live in the shared storage under a
     /// synthetic table id and are removed by `DROP TEMPORARY TABLE`.
     temp_tables: Mutex<HashMap<(String, String), sealdb_meta::TableInfo>>,
+    /// Temporary tables created with `ON COMMIT DELETE ROWS`; their rows are
+    /// wiped when the transaction commits.
+    temp_tables_on_commit_delete: Mutex<HashSet<(String, String)>>,
     /// TiDB `tidb_partition_prune_mode` (default dynamic).
     partition_prune_mode: Mutex<PartitionPruneMode>,
     /// TiDB `tidb_enable_clustered_index` (default ON). Read by CREATE TABLE to
@@ -175,6 +183,7 @@ impl Session {
             time_zone: Mutex::new("SYSTEM".to_string()),
             user_vars: Mutex::new(HashMap::new()),
             temp_tables: Mutex::new(HashMap::new()),
+            temp_tables_on_commit_delete: Mutex::new(HashSet::new()),
             partition_prune_mode: Mutex::new(
                 PartitionPruneMode::parse(&globals.partition_prune_mode)
                     .unwrap_or(PartitionPruneMode::Dynamic),
@@ -367,7 +376,16 @@ impl Session {
         self.temp_tables
             .lock()
             .expect("session temp tables lock")
-            .insert(key, info);
+            .insert(key.clone(), info);
+        let mut on_commit = self
+            .temp_tables_on_commit_delete
+            .lock()
+            .expect("session temp tables on commit lock");
+        if create.on_commit_delete_rows {
+            on_commit.insert(key);
+        } else {
+            on_commit.remove(&key);
+        }
         Ok(empty_result())
     }
 
@@ -401,7 +419,13 @@ impl Session {
                 .expect("session temp tables lock")
                 .remove(&key)
             {
-                Some(info) => removed.push(info),
+                Some(info) => {
+                    self.temp_tables_on_commit_delete
+                        .lock()
+                        .expect("session temp tables on commit lock")
+                        .remove(&key);
+                    removed.push(info);
+                }
                 None if drop.if_exists => sealdb_expression::note_warning(
                     sealdb_errno::ERR_BAD_TABLE,
                     format!("Unknown table '{schema}.{table}'"),
@@ -478,10 +502,40 @@ impl Session {
             .lock()
             .expect("session temp tables lock")
             .remove(key);
+        self.temp_tables_on_commit_delete
+            .lock()
+            .expect("session temp tables on commit lock")
+            .remove(key);
         if let Some(info) = &info {
             sealdb_ddl::clear_table_keys(self.domain.storage().as_ref(), &info.physical_ids())?;
         }
         Ok(info)
+    }
+
+    /// `ON COMMIT DELETE ROWS` (global temporary tables): wipe the rows of
+    /// every temporary table that asked for it when a transaction commits.
+    fn wipe_temp_tables_on_commit(&self) -> Result<()> {
+        let keys: Vec<(String, String)> = self
+            .temp_tables_on_commit_delete
+            .lock()
+            .expect("session temp tables on commit lock")
+            .iter()
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let temps = self
+            .temp_tables
+            .lock()
+            .expect("session temp tables lock");
+        let storage = self.domain.storage();
+        for key in keys {
+            if let Some(info) = temps.get(&key) {
+                sealdb_ddl::clear_table_keys(storage.as_ref(), &info.physical_ids())?;
+            }
+        }
+        Ok(())
     }
 
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {        // Publish this session's `tidb_window_concurrency` for the planner and
@@ -854,6 +908,8 @@ impl Session {
                 } else {
                     txn.commit()?;
                 }
+                drop(txn);
+                self.wipe_temp_tables_on_commit()?;
                 self.domain.mdl_unlock_session(self.session_id);
                 return Ok(empty_result());
             }
@@ -1174,6 +1230,9 @@ impl Session {
             })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
+        // MySQL statement atomicity: a failed statement inside an explicit
+        // transaction only rolls back its own writes.
+        let mut statement_savepoint = None;
         let exec = if matches!(&plan, PhysicalPlan::DDL { .. }) {
             Box::new(DDLExec::new(
                 Arc::clone(&self.domain),
@@ -1189,6 +1248,15 @@ impl Session {
                     None => guard.ensure(self.domain.as_ref())?,
                 }
             };
+            let explicit = self.txn.lock().expect("session txn lock").is_explicit();
+            if explicit
+                && needs_statement_savepoint(stmt)
+                && txn
+                    .with_txn(|txn| txn.savepoint(STATEMENT_SAVEPOINT))
+                    .is_ok()
+            {
+                statement_savepoint = Some(Arc::clone(&txn));
+            }
             ExecutorBuilder::build(&plan, stmt, Arc::clone(&self.domain), &current_db, txn)?
         };
         let coll = self
@@ -1240,16 +1308,26 @@ impl Session {
                 })
             })
         });
+        if let Some(txn) = &statement_savepoint {
+            if result.is_err() {
+                let _ = txn.with_txn(|txn| txn.rollback_to(STATEMENT_SAVEPOINT));
+            }
+            let _ = txn.with_txn(|txn| txn.release_savepoint(STATEMENT_SAVEPOINT));
+        }
         if result.is_ok() && matches!(&plan, PhysicalPlan::DDL { .. }) && !persist_ddl {
             self.txn
                 .lock()
                 .expect("session txn lock")
                 .set_schema_ver(self.domain.infoschema().schema_meta_version());
         }
+        let was_explicit = self.txn.lock().expect("session txn lock").is_explicit();
         self.txn
             .lock()
             .expect("session txn lock")
             .finish_autocommit(result.is_ok())?;
+        if result.is_ok() && !was_explicit {
+            self.wipe_temp_tables_on_commit()?;
+        }
         // Explicit success path keeps MDL; autocommit Drop releases.
         if result.is_ok()
             && let Some(insert) = ctas_insert
@@ -4134,8 +4212,20 @@ fn mdl_targets(stmt: &Statement, current_db: &str) -> (Vec<String>, bool) {
     }
 }
 
-fn is_write_stmt(stmt: &Statement) -> bool {
-    matches!(
+/// Transaction-control statements manage the transaction itself, so they must
+/// not be wrapped in an implicit statement savepoint.
+fn needs_statement_savepoint(stmt: &Statement) -> bool {
+    !matches!(
+        stmt,
+        Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_)
+    )
+}
+
+fn is_write_stmt(stmt: &Statement) -> bool {    matches!(
         stmt,
         Statement::Insert(_)
             | Statement::Update(_)

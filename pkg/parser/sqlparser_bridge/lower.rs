@@ -10432,6 +10432,10 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
         temporary: create.temporary,
+        on_commit_delete_rows: matches!(
+            create.on_commit,
+            Some(sqlparser::ast::OnCommit::DeleteRows)
+        ),
         table: object_table_name(&create.name)?,
         cols,
         indices,
