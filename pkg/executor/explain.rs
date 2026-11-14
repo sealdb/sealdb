@@ -2,7 +2,9 @@ use crate::internal::exec::Executor;
 use sealdb_errno::Result;
 use sealdb_parser::ast::ExplainFormat;
 use sealdb_planner::PhysicalPlan;
-use sealdb_planner::core::explain::{explain_analyze_result, explain_result};
+use sealdb_planner::core::explain::{
+    begin_scan_stats, explain_analyze_result, explain_result, take_scan_stats,
+};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::time::Instant;
@@ -55,13 +57,16 @@ impl Executor for ExplainExec {
                 .take()
                 .expect("EXPLAIN ANALYZE requires a child executor");
             let start = Instant::now();
+            begin_scan_stats();
             child.open()?;
             let mut act_rows = 0usize;
             while let Some(chunk) = child.next()? {
                 act_rows += chunk.num_rows();
             }
             child.close()?;
-            explain_analyze_result(&self.plan, self.format, act_rows, start.elapsed())
+            let scan_stats = take_scan_stats();
+            let elapsed = start.elapsed();
+            explain_analyze_result(&self.plan, self.format, act_rows, &scan_stats, elapsed)
         } else {
             explain_result(&self.plan, self.format)
         };

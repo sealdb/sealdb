@@ -6359,7 +6359,15 @@ enum ExplainFormatRewrite {
 fn map_explain_format_kw(value: &str) -> ExplainFormatRewrite {
     match value.to_ascii_lowercase().as_str() {
         "brief" => ExplainFormatRewrite::Strip(Some(ExplainFormat::Brief)),
-        "row" | "traditional" | "text" | "tree" | "verbose" => {
+        // TiDB renders plan_cache output as the row format and reports the
+        // cache decision through warnings / `@@last_plan_from_cache`.
+        "plan_cache" => ExplainFormatRewrite::Strip(Some(ExplainFormat::PlanCache)),
+        "hint" => ExplainFormatRewrite::Strip(Some(ExplainFormat::Hint)),
+        "verbose" => ExplainFormatRewrite::Strip(Some(ExplainFormat::Verbose)),
+        "binary" => ExplainFormatRewrite::Strip(Some(ExplainFormat::Binary)),
+        "tidb_json" => ExplainFormatRewrite::Strip(Some(ExplainFormat::TidbJson)),
+        "cost_trace" => ExplainFormatRewrite::Strip(Some(ExplainFormat::CostTrace)),
+        "row" | "traditional" | "text" | "tree" => {
             ExplainFormatRewrite::Strip(Some(ExplainFormat::Row))
         }
         "json" => ExplainFormatRewrite::Keyword("JSON"),

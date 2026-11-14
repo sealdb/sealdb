@@ -111,6 +111,7 @@ impl Executor for TableReaderExec {
             &physical,
             self.pushed.as_ref(),
         )?;
+        let scanned_rows = scanned.len();
         // Heap tables expose the row handle as `_tidb_rowid` when referenced.
         let expose_rowid = self.with_rowid && !info.pk_is_handle;
         self.rows = filter_rows(
@@ -130,6 +131,18 @@ impl Executor for TableReaderExec {
             self.pushed.as_ref(),
             Some(&info),
         )?;
+        // `EXPLAIN ANALYZE` reports the rows a `TableFullScan` read from
+        // storage, which is not the row count that reaches its parent.
+        // Record under the SQL alias as well: a self join scans one table under
+        // several names and the plan labels each scan with its alias.
+        sealdb_planner::core::explain::record_scan_stats(&name, scanned_rows, self.rows.len());
+        if self.table.name != name {
+            sealdb_planner::core::explain::record_scan_stats(
+                &self.table.name,
+                scanned_rows,
+                self.rows.len(),
+            );
+        }
         if expose_rowid {
             self.schema.push("\u{1}_tidb_rowid".to_string());
         }

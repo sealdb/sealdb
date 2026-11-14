@@ -16,6 +16,7 @@ sealdb-meta.workspace = true
 sealdb-parser.workspace = true
 sealdb-statistics.workspace = true
 sealdb-types.workspace = true
+snap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

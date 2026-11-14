@@ -2549,6 +2549,37 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R7 长尾与 R2 `cte` 剩余差异
 
+### 2026-11-14（`executor/explain` 转正：EXPLAIN ANALYZE 扫描计数 + AGG 外层投影）
+
+- **Phase**: R3
+- **完成**:
+  - `EXPLAIN ANALYZE` 的 `actRows` 采集：`TableReaderExec` 在打开时同时以物理表名
+    与别名登记扫描统计（`record_scan_stats`），`ExplainExec` 用
+    `begin_scan_stats` / `take_scan_stats` 包裹子执行器，叶子 `TableFullScan`
+    通过 `measured_act_rows` 按 `table:<alias>` 访问对象取实测行数；自连接
+    (`t1` 别名) 不再退化为 0。
+  - 聚合外层投影：`SELECT` 含非平凡标量表达式（`(NOT ... OR NOT ...) IS TRUE`、
+    `QUOTE(t.i)`）且按列分组时，TiDB 在 `StreamAgg` / `HashAgg` 之上保留根
+    `Projection`；`build_agg_plan` 通过 `agg_outer_projection` 生成该投影，聚合
+    侧用 `funcs:firstrow(...)` 重新暴露分组列，并区分 `STREAM_AGG()`
+    （`Sort` 在 `StreamAgg` 之下）与 `AGG_TO_COP()`（两阶段 `HashAgg` 下发、
+    cop 侧 `funcs:max(Column#15)->Column#10`）。
+  - DNF/xOR 选择率：`i BETWEEN 'WVz' AND 'G#駧褉ZC領*lov'` 字节序下界大于上界，
+    字符串区间为空；`dnf_range_est` 让空区间贡献 0 选择率，使
+    `h > 240817 OR i BETWEEN ...` 收敛到 `h > 240817`（3333.33 行）。
+  - 清理编译告警：删除失效的 `constant_on_column`、`on_conjuncts_len`、
+    `qualify_tables_in_expr` / `qualify_tables_in_result_set`、不可达 `_` 分支
+    与临时调试日志钩子，`cargo build` 零告警。
+- **验证**:
+  - `run-tests.sh --status in_progress -t executor/explain` → `PASS: memory=1 tikv=1 skipped=253`
+  - 全量 gate → `PASS: memory=71 tikv=70 skipped=184`
+  - manifest `executor/explain` → `green`，green 63→64（另 8 `local`、14 `in_progress`）
+- **阻塞/风险**:
+  - 无
+- **下一步**:
+  - `explain_easy` 剩余 UNION ALL 聚合下推 + `IndexJoin` 左外连接，随后
+    `explain_complex` / `explain_complex_stats` / `explain_join_stats`
+
 ---
 
 ## 5. Gate 证据索引

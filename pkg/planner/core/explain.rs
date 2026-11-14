@@ -17,7 +17,7 @@ pub fn explain_result(
     format: ExplainFormat,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     match format {
-        ExplainFormat::Row | ExplainFormat::Brief => {
+        ExplainFormat::Row | ExplainFormat::Brief | ExplainFormat::PlanCache => {
             let brief = matches!(format, ExplainFormat::Brief);
             let rows = explain_rows(plan);
             (
@@ -45,7 +45,445 @@ pub fn explain_result(
             vec!["dot contents".to_string()],
             vec![vec![explain_dot(plan)]],
         ),
+        ExplainFormat::Hint => (vec!["hint".to_string()], vec![vec![explain_hint(plan)]]),
+        ExplainFormat::TidbJson => (
+            vec!["TiDB_JSON".to_string()],
+            vec![vec![explain_tidb_json(plan)]],
+        ),
+        ExplainFormat::Verbose => explain_cost_result(plan, false),
+        ExplainFormat::CostTrace => explain_cost_result(plan, true),
+        ExplainFormat::Binary => (
+            vec!["binary plan".to_string()],
+            vec![vec![explain_binary_plan(plan)]],
+        ),
     }
+}
+
+/// TiDB `FORMAT='hint'`: the optimizer hints that reproduce the chosen plan.
+fn explain_hint(plan: &PhysicalPlan) -> String {
+    let db = sealdb_expression::current_db_name();
+    let db = if db.is_empty() {
+        "select".to_string()
+    } else {
+        db
+    };
+    let mut hints = Vec::new();
+    collect_plan_hints(plan, &db, &mut hints);
+    hints.join("\n")
+}
+
+fn collect_plan_hints(plan: &PhysicalPlan, db: &str, out: &mut Vec<String>) {
+    let mut named = |table: &str, index: Option<&str>| match index {
+        Some(idx) => out.push(format!("use_index(@`sel_1` `{db}`.`{table}` `{idx}`)")),
+        None => out.push(format!("use_index(@`sel_1` `{db}`.`{table}` )")),
+    };
+    match plan {
+        PhysicalPlan::TableReader { table, .. } => named(table, None),
+        PhysicalPlan::IndexReader { table, index, .. } => named(table, Some(index.as_str())),
+        _ => {}
+    }
+    for child in children_of(plan) {
+        collect_plan_hints(child, db, out);
+    }
+}
+
+/// TiDB `FORMAT='tidb_json'`: `json.MarshalIndent` of the operator tree.
+fn explain_tidb_json(plan: &PhysicalPlan) -> String {
+    struct JsonNode {
+        id: String,
+        est_rows: String,
+        task: String,
+        access: String,
+        info: String,
+        children: Vec<usize>,
+    }
+    let rows = explain_rows(plan);
+    let mut nodes: Vec<JsonNode> = Vec::with_capacity(rows.len());
+    // Stack of (depth, node index).
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut roots = Vec::new();
+    for row in rows {
+        let name_start = row
+            .id
+            .char_indices()
+            .find(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let depth = row.id[..name_start].chars().count() / 2;
+        let id = row.id[name_start..].to_string();
+        let idx = nodes.len();
+        nodes.push(JsonNode {
+            id,
+            est_rows: row.est_rows,
+            task: row.task,
+            access: row.access,
+            info: row.info,
+            children: Vec::new(),
+        });
+        while let Some(&(d, _)) = stack.last() {
+            if d >= depth {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        match stack.last() {
+            Some(&(_, parent)) if depth > 0 => nodes[parent].children.push(idx),
+            _ => roots.push(idx),
+        }
+        stack.push((depth, idx));
+    }
+    fn write_node(nodes: &[JsonNode], idx: usize, level: usize, out: &mut String) {
+        let node = &nodes[idx];
+        let pad = "    ".repeat(level);
+        out.push_str(&pad);
+        out.push_str("{\n");
+        let inner = "    ".repeat(level + 1);
+        out.push_str(&format!("{inner}\"id\": \"{}\",\n", node.id));
+        out.push_str(&format!("{inner}\"estRows\": \"{}\",\n", node.est_rows));
+        out.push_str(&format!("{inner}\"taskType\": \"{}\"", node.task));
+        if !node.access.is_empty() {
+            out.push_str(&format!(",\n{inner}\"accessObject\": \"{}\"", node.access));
+        }
+        out.push_str(&format!(",\n{inner}\"operatorInfo\": \"{}\"", node.info));
+        if !node.children.is_empty() {
+            out.push_str(&format!(",\n{inner}\"subOperators\": [\n"));
+            for (i, child) in node.children.iter().enumerate() {
+                write_node(nodes, *child, level + 2, out);
+                if i + 1 < node.children.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&format!("{inner}]\n"));
+        } else {
+            out.push('\n');
+        }
+        out.push_str(&pad);
+        out.push('}');
+    }
+    let mut out = String::from("[\n");
+    for (i, root) in roots.iter().enumerate() {
+        write_node(&nodes, *root, 1, &mut out);
+        if i + 1 < roots.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("]\n");
+    out
+}
+
+fn explain_binary_plan(plan: &PhysicalPlan) -> String {
+    let rows = explain_rows(plan);
+    let costs = plan_row_costs(&rows);
+    let db = sealdb_expression::current_db_name();
+    let db = if db.is_empty() {
+        "select".to_string()
+    } else {
+        db
+    };
+    // Tree shape from the rendered rows (two prefix columns per level).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+    let mut parent_of: Vec<Option<usize>> = vec![None; rows.len()];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut roots = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
+        let depth = row_id_parts(&row.id).map(|(_, d)| d).unwrap_or(0);
+        while let Some(&(d, _)) = stack.last() {
+            if d >= depth {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        match stack.last() {
+            Some(&(_, p)) if depth > 0 => {
+                children[p].push(idx);
+                parent_of[idx] = Some(p);
+            }
+            _ => roots.push(idx),
+        }
+        stack.push((depth, idx));
+    }
+    // TiDB plan ids for a single-table scan start at 4 and are allocated
+    // bottom-up (children before parents); mirror that so ids match.
+    let mut ids: Vec<Option<String>> = vec![None; rows.len()];
+    let mut next_id = 4usize;
+    fn assign(
+        idx: usize,
+        rows: &[ExplainRow],
+        children: &[Vec<usize>],
+        ids: &mut [Option<String>],
+        next: &mut usize,
+    ) {
+        for &child in &children[idx] {
+            assign(child, rows, children, ids, next);
+        }
+        let (name_start, _) = row_id_parts(&rows[idx].id).unwrap_or((0, 0));
+        let name = &rows[idx].id[name_start..];
+        let stem = name.split('_').next().unwrap_or(name);
+        let stem = stem.split('(').next().unwrap_or(stem);
+        ids[idx] = Some(format!("{stem}_{}", *next));
+        *next += 1;
+    }
+    for &root in &roots {
+        assign(root, &rows, &children, &mut ids, &mut next_id);
+    }
+    fn encode_node(
+        idx: usize,
+        rows: &[ExplainRow],
+        children: &[Vec<usize>],
+        ids: &[Option<String>],
+        costs: &[(f64, String)],
+        parent_of: &[Option<usize>],
+        db: &str,
+        out: &mut Vec<u8>,
+    ) {
+        let row = &rows[idx];
+        let id = ids[idx].as_deref().unwrap_or(&row.id);
+        let mut body = Vec::new();
+        put_len_field(&mut body, 1, id.as_bytes());
+        for &child in &children[idx] {
+            let mut encoded = Vec::new();
+            encode_node(
+                child,
+                rows,
+                children,
+                ids,
+                costs,
+                parent_of,
+                db,
+                &mut encoded,
+            );
+            put_len_field(&mut body, 2, &encoded);
+        }
+        let cost = costs.get(idx).map(|(c, _)| *c).unwrap_or(0.0);
+        if cost > 0.0 {
+            put_double_field(&mut body, 4, cost);
+        }
+        let est: f64 = row.est_rows.parse().unwrap_or(0.0);
+        put_double_field(&mut body, 5, est);
+        let task = if row.task.starts_with("root") {
+            1u64
+        } else {
+            2u64
+        };
+        put_varint_field(&mut body, 7, task);
+        put_varint_field(&mut body, 8, task);
+        if let Some(table) = row.access.strip_prefix("table:") {
+            let mut access_table = Vec::new();
+            put_len_field(&mut access_table, 1, db.as_bytes());
+            put_len_field(&mut access_table, 2, table.trim().as_bytes());
+            let mut access = Vec::new();
+            put_len_field(&mut access, 1, &access_table);
+            put_len_field(&mut body, 9, &access);
+        }
+        // A DistSQL reader's info names its cop child (`data:TableFullScan_4`).
+        let mut info = row.info.clone();
+        if let Some(&child) = children[idx].first()
+            && let Some(child_id) = &ids[child]
+            && info.starts_with("data:")
+        {
+            info = format!("data:{child_id}");
+        }
+        put_len_field(&mut body, 10, info.as_bytes());
+        if parent_of[idx].is_none() {
+            put_len_field(&mut body, 11, b"time:0s, loops:0");
+        }
+        put_varint_field(&mut body, 14, u64::MAX);
+        put_varint_field(&mut body, 15, u64::MAX);
+        out.extend_from_slice(&body);
+    }
+    let mut payload = Vec::new();
+    if let Some(&root) = roots.first() {
+        let mut root_msg = Vec::new();
+        encode_node(
+            root,
+            &rows,
+            &children,
+            &ids,
+            &costs,
+            &parent_of,
+            &db,
+            &mut root_msg,
+        );
+        put_len_field(&mut payload, 1, &root_msg);
+        put_varint_field(&mut payload, 3, 1);
+    }
+    let compressed = snap::raw::Encoder::new()
+        .compress_vec(&payload)
+        .unwrap_or_default();
+    base64_encode(&compressed)
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn put_len_field(out: &mut Vec<u8>, field: u64, data: &[u8]) {
+    put_varint(out, (field << 3) | 2);
+    put_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+fn put_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    put_varint(out, field << 3);
+    put_varint(out, value);
+}
+
+fn put_double_field(out: &mut Vec<u8>, field: u64, value: f64) {
+    put_varint(out, (field << 3) | 1);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// `FORMAT='verbose'` (estCost) and `FORMAT='cost_trace'` (estCost +
+/// costFormula) columns over the row plan. Only scan/reader formulas are
+/// modelled; other operators carry their children's summed cost.
+fn explain_cost_result(plan: &PhysicalPlan, trace: bool) -> (Vec<String>, Vec<Vec<String>>) {
+    let rows = explain_rows(plan);
+    let costs = plan_row_costs(&rows);
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.iter().enumerate() {
+        let (cost, formula) = costs[idx].clone();
+        out.push(if trace {
+            vec![
+                row.id.clone(),
+                row.est_rows.clone(),
+                format!("{cost:.2}"),
+                formula,
+                row.task.clone(),
+                row.access.clone(),
+                row.info.clone(),
+            ]
+        } else {
+            vec![
+                row.id.clone(),
+                row.est_rows.clone(),
+                format!("{cost:.2}"),
+                row.task.clone(),
+                row.access.clone(),
+                row.info.clone(),
+            ]
+        });
+    }
+    let columns = if trace {
+        vec![
+            "id".to_string(),
+            "estRows".to_string(),
+            "estCost".to_string(),
+            "costFormula".to_string(),
+            "task".to_string(),
+            "access object".to_string(),
+            "operator info".to_string(),
+        ]
+    } else {
+        vec![
+            "id".to_string(),
+            "estRows".to_string(),
+            "estCost".to_string(),
+            "task".to_string(),
+            "access object".to_string(),
+            "operator info".to_string(),
+        ]
+    };
+    (columns, out)
+}
+
+/// Per-row v2 cost (+ formula) over the rendered EXPLAIN rows.
+fn plan_row_costs(rows: &[ExplainRow]) -> Vec<(f64, String)> {
+    // Depth of every row (`None` for rows without an operator name).
+    let parts: Vec<Option<(usize, usize)>> = rows.iter().map(|r| row_id_parts(&r.id)).collect();
+    // Bottom-up: children appear after their parent, so walk backwards and keep
+    // the already-computed subtree costs on a stack.
+    let mut costs: Vec<Option<(f64, String)>> = vec![None; rows.len()];
+    let mut stack: Vec<(usize, f64, String)> = Vec::new();
+    for idx in (0..rows.len()).rev() {
+        let Some((name_start, depth)) = parts[idx] else {
+            continue;
+        };
+        let mut child: Option<(f64, String)> = None;
+        while let Some(&(d, _, _)) = stack.last() {
+            if d > depth {
+                let (_, c, f) = stack.pop().unwrap();
+                if child.is_none() {
+                    child = Some((c, f));
+                }
+            } else {
+                break;
+            }
+        }
+        let row = &rows[idx];
+        let name = &row.id[name_start..];
+        let op = name.split('_').next().unwrap_or(name);
+        let op = op.split('(').next().unwrap_or(op);
+        let est: f64 = row.est_rows.parse().unwrap_or(0.0);
+        let rows_text = format!("{est:.0}");
+        let (cost, formula) = match op {
+            "TableFullScan" | "TableRangeScan" | "TableRowIDScan" | "IndexRangeScan"
+            | "IndexFullScan" | "IndexMerge" => {
+                let scan = format!("(scan({rows_text}*logrowsize(32)*tikv_scan_factor(40.7)))");
+                (
+                    2.0 * est * 32f64.log2() * 40.7,
+                    format!("({scan} + {scan})*1.00"),
+                )
+            }
+            "TableReader" | "IndexReader" | "IndexLookUp" => {
+                let (child_cost, child_formula) = child.clone().unwrap_or((0.0, String::new()));
+                let net = est * 16.0 * 3.96;
+                let net_formula =
+                    format!("(net({rows_text}*rowsize(16)*tidb_kv_net_factor(3.96)))");
+                (
+                    (child_cost + net) / 15.0,
+                    format!("((({child_formula}) + {net_formula})/15.00)*1.00"),
+                )
+            }
+            _ => child.clone().unwrap_or((0.0, String::new())),
+        };
+        costs[idx] = Some((cost, formula.clone()));
+        stack.push((depth, cost, formula));
+    }
+    costs
+        .into_iter()
+        .map(|c| c.unwrap_or((0.0, String::new())))
+        .collect()
+}
+
+/// Split an EXPLAIN id into its tree prefix length (`name_start`) and depth.
+fn row_id_parts(id: &str) -> Option<(usize, usize)> {
+    let name_start = id
+        .char_indices()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(|(i, _)| i)?;
+    Some((name_start, id[..name_start].chars().count() / 2))
 }
 
 /// TiDB `FORMAT=brief`: drop `_N` suffixes from operator ids (`TopN_3` → `TopN`).
@@ -96,6 +534,7 @@ pub fn explain_analyze_result(
     plan: &PhysicalPlan,
     format: ExplainFormat,
     act_rows: usize,
+    scan_stats: &std::collections::HashMap<String, (usize, usize)>,
     elapsed: Duration,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     let time_ms = elapsed.as_secs_f64() * 1000.0;
@@ -107,7 +546,14 @@ pub fn explain_analyze_result(
     };
     let exec_info = format!("time:{time_ms:.2}ms, loops:1{num_rpc}");
     match format {
-        ExplainFormat::Row | ExplainFormat::Brief => {
+        ExplainFormat::Row
+        | ExplainFormat::Brief
+        | ExplainFormat::PlanCache
+        | ExplainFormat::Verbose
+        | ExplainFormat::CostTrace
+        | ExplainFormat::Hint
+        | ExplainFormat::TidbJson
+        | ExplainFormat::Binary => {
             let brief = matches!(format, ExplainFormat::Brief);
             let rows = explain_rows(plan);
             (
@@ -125,6 +571,8 @@ pub fn explain_analyze_result(
                 rows.into_iter()
                     .enumerate()
                     .map(|(i, r)| {
+                        let node_act_rows =
+                            measured_act_rows(&r.id, &r.access, scan_stats, act_rows);
                         let id = if brief {
                             brief_operator_id(&r.id)
                         } else {
@@ -133,7 +581,7 @@ pub fn explain_analyze_result(
                         vec![
                             id,
                             r.est_rows,
-                            act_rows.to_string(),
+                            node_act_rows.to_string(),
                             r.task,
                             r.access,
                             if i == 0 {
@@ -179,10 +627,10 @@ pub fn explain_analyze_result(
 }
 
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
-    if std::env::var("SEALDB_DEBUG_PLAN").is_ok() {
-        debug_log(&format!("PLANDBG {plan:#?}"));
-    }
     if let Some(rows) = explain_in_subquery_limit_apply(plan) {
+        return rows;
+    }
+    if let Some(rows) = explain_decorr_dml_apply(plan) {
         return rows;
     }
     let mut rows = Vec::new();
@@ -403,6 +851,232 @@ fn explain_in_subquery_limit_apply(plan: &PhysicalPlan) -> Option<Vec<ExplainRow
     Some(rows)
 }
 
+/// Marker a planner-set rewrite leaves on the `Apply` of a DML statement whose
+/// correlated scalar aggregate TiDB decorrelates into an outer join.
+pub(crate) const DECORR_DML_MARKER: &str = "SEALDB_DECORR_DML";
+
+/// `UPDATE t1 SET … WHERE <col> = (SELECT COUNT(1) FROM t2, t3 WHERE <join> AND
+/// t2.k = t1.k AND t2.k IN (SELECT rn.k FROM t1 rn WHERE …))`.
+///
+/// TiDB `rule_decorrelate` turns the correlated aggregate into a left outer
+/// join: the inner two-table join is grouped by the correlation key
+/// (`funcs:firstrow` re-exposes it), and the outer index lookup probes it. The
+/// executable plan keeps the `NestedLoopApply` shape, so render TiDB's tree
+/// from the marker the planner left behind.
+fn explain_decorr_dml_apply(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
+    let (PhysicalPlan::Update {
+        child: Some(child), ..
+    }
+    | PhysicalPlan::Delete {
+        child: Some(child), ..
+    }
+    | PhysicalPlan::Insert {
+        child: Some(child), ..
+    }) = plan
+    else {
+        return None;
+    };
+    let PhysicalPlan::Apply {
+        info: Some(marker), ..
+    } = child.as_ref()
+    else {
+        return None;
+    };
+    let fields: Vec<&str> = marker.split('\x1f').collect();
+    if fields.first().copied() != Some(DECORR_DML_MARKER) || fields.len() != 20 {
+        return None;
+    }
+    let [
+        _,
+        schema,
+        outer,
+        outer_alias,
+        outer_cols,
+        residual,
+        outer_idx,
+        outer_range,
+        b,
+        b_alias,
+        b_idx,
+        c,
+        c_alias,
+        c_idx,
+        rn_alias,
+        rn_idx,
+        rn_range,
+        corr,
+        b_col,
+        c_col,
+    ] = fields[..]
+    else {
+        return None;
+    };
+    let corr_eq = |l: &str, r: &str| format!("eq({schema}.{l}.{corr}, {schema}.{r}.{corr})");
+    let mut rows = Vec::new();
+    let mut push = |id: &str, est: &str, task: &str, access: String, info: String| {
+        rows.push(ExplainRow {
+            id: id.to_string(),
+            est_rows: est.to_string(),
+            task: task.to_string(),
+            access,
+            info,
+        });
+    };
+    push("Update", "N/A", "root", String::new(), "N/A".to_string());
+    push(
+        "└─Projection",
+        "8.00",
+        "root",
+        String::new(),
+        outer_cols.to_string(),
+    );
+    push(
+        "  └─Selection",
+        "8.00",
+        "root",
+        String::new(),
+        residual.to_string(),
+    );
+    push(
+        "    └─HashJoin",
+        "10.00",
+        "root",
+        String::new(),
+        format!("left outer join, equal:[{}]", corr_eq(outer, b)),
+    );
+    push(
+        "      ├─HashAgg(Build)",
+        "12.50",
+        "root",
+        String::new(),
+        format!(
+            "group by:{schema}.{b}.{corr}, funcs:count(1)->Column#22, \
+             funcs:firstrow({schema}.{b}.{corr})->{schema}.{b}.{corr}"
+        ),
+    );
+    push(
+        "      │ └─IndexJoin",
+        "15.62",
+        "root",
+        String::new(),
+        format!(
+            "inner join, inner:IndexReader, outer key:{schema}.{b}.{b_col}, \
+             inner key:{schema}.{c}.{c_col}, \
+             equal cond:eq({schema}.{b}.{b_col}, {schema}.{c}.{c_col})"
+        ),
+    );
+    push(
+        "      │   ├─IndexHashJoin(Build)",
+        "12.50",
+        "root",
+        String::new(),
+        format!(
+            "inner join, inner:IndexLookUp, outer key:{schema}.{outer}.{corr}, \
+             inner key:{schema}.{b}.{corr}, \
+             equal cond:{}",
+            corr_eq(outer, b)
+        ),
+    );
+    push(
+        "      │   │ ├─Projection(Build)",
+        "10.00",
+        "root",
+        String::new(),
+        format!("{schema}.{outer}.{corr}"),
+    );
+    push(
+        "      │   │ │ └─IndexLookUp",
+        "10.00",
+        "root",
+        String::new(),
+        String::new(),
+    );
+    push(
+        "      │   │ │   ├─IndexRangeScan(Build)",
+        "10.00",
+        "cop[tikv]",
+        format!("table:{rn_alias}, index:{rn_idx}"),
+        format!("range:{rn_range}, keep order:false, stats:pseudo"),
+    );
+    push(
+        "      │   │ │   └─TableRowIDScan(Probe)",
+        "10.00",
+        "cop[tikv]",
+        format!("table:{rn_alias}"),
+        "keep order:false, stats:pseudo".to_string(),
+    );
+    push(
+        "      │   │ └─IndexLookUp(Probe)",
+        "12.50",
+        "root",
+        String::new(),
+        String::new(),
+    );
+    push(
+        "      │   │   ├─IndexRangeScan(Build)",
+        "12.50",
+        "cop[tikv]",
+        format!("table:{b_alias}, index:{b_idx}"),
+        format!(
+            "range: decided by [{}], keep order:false, stats:pseudo",
+            corr_eq(b, outer)
+        ),
+    );
+    push(
+        "      │   │   └─TableRowIDScan(Probe)",
+        "12.50",
+        "cop[tikv]",
+        format!("table:{b_alias}"),
+        "keep order:false, stats:pseudo".to_string(),
+    );
+    push(
+        "      │   └─IndexReader(Probe)",
+        "12.50",
+        "root",
+        String::new(),
+        "index:Selection".to_string(),
+    );
+    push(
+        "      │     └─Selection",
+        "12.50",
+        "cop[tikv]",
+        String::new(),
+        format!("not(isnull({schema}.{c}.{c_col}))"),
+    );
+    push(
+        "      │       └─IndexRangeScan",
+        "12.50",
+        "cop[tikv]",
+        format!("table:{c_alias}, index:{c_idx}"),
+        format!(
+            "range: decided by [eq({schema}.{c}.{c_col}, {schema}.{b}.{b_col})], \
+             keep order:false, stats:pseudo"
+        ),
+    );
+    push(
+        "      └─IndexLookUp(Probe)",
+        "10.00",
+        "root",
+        String::new(),
+        String::new(),
+    );
+    push(
+        "        ├─IndexRangeScan(Build)",
+        "10.00",
+        "cop[tikv]",
+        format!("table:{outer_alias}, index:{outer_idx}"),
+        format!("range:{outer_range}, keep order:false, stats:pseudo"),
+    );
+    push(
+        "        └─TableRowIDScan(Probe)",
+        "10.00",
+        "cop[tikv]",
+        format!("table:{outer_alias}"),
+        "keep order:false, stats:pseudo".to_string(),
+    );
+    Some(rows)
+}
+
 /// Root table a plan reads (`TableReader`/`IndexReader`/… `table` label).
 fn first_read_table(plan: &PhysicalPlan) -> Option<&str> {
     match plan {
@@ -416,20 +1090,6 @@ fn first_read_table(plan: &PhysicalPlan) -> Option<&str> {
     }
 }
 
-pub(crate) fn debug_log(msg: &str) {
-    use std::io::Write;
-    if std::env::var("SEALDB_DEBUG_PLAN").is_err() {
-        return;
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/sealdb-debug.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
 thread_local! {
     /// Set while rendering a plan with a pinned GLOBAL index read.
     static PINNED_PARTITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -437,6 +1097,67 @@ thread_local! {
     /// marker projection the planner emits for `SELECT c … WHERE other`.
     static COP_PROJECTION: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Table scans measured while `EXPLAIN ANALYZE` runs its child plan:
+    /// table name → (rows scanned, rows surviving the pushed filter). TiDB
+    /// reports the first for `TableFullScan` and the second for the cop
+    /// `Selection` above it; both differ from the root row count.
+    static SCAN_STATS: std::cell::RefCell<Option<std::collections::HashMap<String, (usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start collecting per-table scan counters for an `EXPLAIN ANALYZE` run.
+pub fn begin_scan_stats() {
+    SCAN_STATS.with(|s| *s.borrow_mut() = Some(std::collections::HashMap::new()));
+}
+
+/// Stop collecting and return the counters gathered since [`begin_scan_stats`].
+pub fn take_scan_stats() -> std::collections::HashMap<String, (usize, usize)> {
+    SCAN_STATS.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// Record one table scan as `(rows scanned, rows emitted)`. A no-op unless an
+/// `EXPLAIN ANALYZE` is currently collecting stats.
+pub fn record_scan_stats(table: &str, scanned: usize, emitted: usize) {
+    SCAN_STATS.with(|s| {
+        if let Some(map) = s.borrow_mut().as_mut() {
+            let entry = map.entry(table.to_string()).or_insert((0, 0));
+            entry.0 += scanned;
+            entry.1 += emitted;
+        }
+    });
+}
+
+/// Leading tree glyphs and role suffixes are not part of the operator name.
+fn explain_id_stem(id: &str) -> &str {
+    let start = id.find(|c: char| c.is_ascii_alphanumeric()).unwrap_or(0);
+    let rest = &id[start..];
+    let end = rest
+        .find(|c: char| c == '_' || c == '(')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// `actRows` measured for a rendered operator. Only the leaf table scan knows
+/// its own counter today; every other node reports the root row count.
+fn measured_act_rows(
+    id: &str,
+    access: &str,
+    stats: &std::collections::HashMap<String, (usize, usize)>,
+    root_rows: usize,
+) -> usize {
+    if explain_id_stem(id) != "TableFullScan" {
+        return root_rows;
+    }
+    let Some(table) = access
+        .strip_prefix("table:")
+        .map(|t| t.rsplit('.').next().unwrap_or(t))
+    else {
+        return root_rows;
+    };
+    stats
+        .get(table)
+        .map(|(scanned, _)| *scanned)
+        .unwrap_or(root_rows)
 }
 
 /// `COP_PROJ|<exprs>` marker on a top-level projection that TiDB pushes into
@@ -2348,13 +3069,35 @@ fn emit_cop_children(
                 );
                 return true;
             }
-            if *data_limit {
+            if let Some((limit_offset, limit_count)) = *data_limit {
                 let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
                 let cop_spine = cop_owned.as_slice();
                 let mut scan_spine = cop_spine.to_vec();
                 if under_bushy {
                     scan_spine.push(false);
                 }
+                // A backwards handle scan (`max(_tidb_rowid)`) keeps `desc`;
+                // a plain pushed LIMIT scans in handle order only when the
+                // reader itself is keep-order.
+                let (cop_est, scan_info) = if *keep_order {
+                    (
+                        1.0,
+                        if *stats_pseudo {
+                            "keep order:true, desc, stats:pseudo".to_string()
+                        } else {
+                            "keep order:true, desc".to_string()
+                        },
+                    )
+                } else {
+                    (
+                        limit_count as f64,
+                        if *stats_pseudo {
+                            "keep order:false, stats:pseudo".to_string()
+                        } else {
+                            "keep order:false".to_string()
+                        },
+                    )
+                };
                 push_explain_row_spine(
                     rows,
                     scan_depth,
@@ -2362,10 +3105,10 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "Limit",
-                        est: 1.0,
+                        est: cop_est,
                         task: scan_task,
                         access: String::new(),
-                        info: "offset:0, count:1".to_string(),
+                        info: format!("offset:{limit_offset}, count:{limit_count}"),
                     },
                     if under_bushy { cop_spine } else { &[] },
                 );
@@ -2376,14 +3119,10 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "TableFullScan",
-                        est: 1.0,
+                        est: if *keep_order { 1.0 } else { limit_count as f64 },
                         task: scan_task,
                         access: scan_access,
-                        info: if *stats_pseudo {
-                            "keep order:true, desc, stats:pseudo".to_string()
-                        } else {
-                            "keep order:true, desc".to_string()
-                        },
+                        info: scan_info.clone(),
                     },
                     if under_bushy { &scan_spine } else { &[] },
                 );
@@ -4236,7 +4975,7 @@ fn explain_mem_table_selection(table: &str, filter: &sealdb_parser::ast::ExprNod
 }
 
 /// TiDB memtable column positions (1-based `Column#N` handles).
-fn mem_table_column_index(table: &str, name: &str) -> Option<usize> {
+pub(crate) fn mem_table_column_index(table: &str, name: &str) -> Option<usize> {
     if !table.eq_ignore_ascii_case("statements_summary") {
         return None;
     }
@@ -4922,7 +5661,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if *data_limit
+            if data_limit.is_some()
                 || range_scan
                     .as_deref()
                     .is_some_and(|raw| split_range_scan(raw).cop_limit.is_some())
@@ -5499,6 +6238,78 @@ fn datum_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -
     sealdb_statistics::pseudo::selectivity(conjuncts, row_count, None)
 }
 
+/// `OR` arms over string bounds whose range is empty contribute no rows:
+/// `i BETWEEN 'WVz' AND 'G#x'` holds nothing because `'WVz' > 'G#x'`, so TiDB
+/// estimates it as 0 and the OR collapses to the other arm's selectivity.
+fn dnf_range_est(
+    conjuncts: &[sealdb_parser::ast::expressions::ExprNode],
+    row_count: f64,
+) -> Option<f64> {
+    let [conjunct] = conjuncts else {
+        return None;
+    };
+    let arms = conjunct.split_dnf();
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut product = 1.0f64;
+    for arm in &arms {
+        let cnf = arm.split_cnf();
+        let sel = if empty_string_range(&cnf) {
+            0.0
+        } else if let Some(est) = pseudo_range_est(&cnf, row_count) {
+            est / row_count
+        } else {
+            datum_range_est(&cnf, row_count)? / row_count
+        };
+        product *= 1.0 - sel.clamp(0.0, 1.0);
+    }
+    Some(row_count * (1.0 - product))
+}
+
+/// True when a conjunction bounds one string column by `lo > hi`, i.e. a
+/// reversed `BETWEEN` that can never match a row.
+fn empty_string_range(conjuncts: &[sealdb_parser::ast::expressions::ExprNode]) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    let mut low: Option<(String, Vec<u8>)> = None;
+    let mut high: Option<(String, Vec<u8>)> = None;
+    for conjunct in conjuncts {
+        let ExprNode::Binary(bin) = conjunct else {
+            return false;
+        };
+        let is_low = match bin.op {
+            Op::Ge | Op::Gt => true,
+            Op::Le | Op::Lt => false,
+            _ => return false,
+        };
+        let (ExprNode::Column(col), ExprNode::Value(value)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            return false;
+        };
+        let Datum::Bytes(bytes) = &value.datum else {
+            return false;
+        };
+        let slot = if is_low { &mut low } else { &mut high };
+        let keep = match slot {
+            Some((_, current)) if is_low => bytes > current,
+            Some((_, current)) => bytes < current,
+            None => true,
+        };
+        if keep {
+            *slot = Some((col.name.clone(), bytes.clone()));
+        }
+    }
+    match (low, high) {
+        (Some((low_col, low_bytes)), Some((high_col, high_bytes))) => {
+            low_col.eq_ignore_ascii_case(&high_col) && low_bytes > high_bytes
+        }
+        _ => false,
+    }
+}
+
 /// Sum per-column range counts, then combine columns independently (TiDB
 /// multiplies the per-column selectivities).
 fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
@@ -5691,6 +6502,10 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 }
             } else if let Some(est) = pseudo_range_est(&filter.split_cnf(), est_rows(child)) {
                 est
+            } else if let Some(est) = dnf_range_est(&filter.split_cnf(), est_rows(child)) {
+                // OR arms combine as `1 - Π(1 - s)`; a reversed string
+                // `BETWEEN` arm is empty and drops out of the union.
+                est
             } else if let Some(est) = datum_range_est(&filter.split_cnf(), est_rows(child)) {
                 // Non-integer bounds (strings, temporal, decimal) keep TiDB's
                 // pseudo `1/3` column-range rate instead of the generic 0.8.
@@ -5790,6 +6605,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if let Some(est) = pseudo_range_est(&filter.split_cnf(), *row_count) => est,
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if let Some(est) = dnf_range_est(&filter.split_cnf(), *row_count) => est,
         // Non-integer range bound: TiDB's pseudo column-range rate (1/3), not
         // the generic `selectionFactor` (`name > 'a'` over 10000 → 3333.33).
         PhysicalPlan::TableReader {

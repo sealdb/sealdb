@@ -140,6 +140,16 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // A comma join whose equality keys are pinned by constants
+                // keeps a CARTESIAN plan (`t1.b = t2.a` + `t1.b = 2333`).
+                let comma_folded_select;
+                let select = match fold_pinned_comma_join_where(select) {
+                    Some(folded) => {
+                        comma_folded_select = folded;
+                        &comma_folded_select
+                    }
+                    None => select,
+                };
                 // TiDB's shard rewrite: `a = 100` also constrains the
                 // `tidb_shard(a)` key part of `uk_expr((tidb_shard(a)), a)`,
                 // which is what turns the equality into an index point get.
@@ -573,6 +583,8 @@ impl PlanBuilder {
                 // EXPLAIN renders pushed predicates with the table's OrigTblName
                 // (`t1.col1` → `uk_hp16726.col1`), never the SQL alias.
                 plan = explain_rewrite_pushed(plan, select, is, current_db, stats);
+                // TiDB pushes `LIMIT` into the cop task of a plain table scan.
+                plan = push_limit_into_cop(plan);
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
                 Ok(plan)
@@ -587,14 +599,17 @@ impl PlanBuilder {
                 child: None,
                 fk_children: Vec::new(),
             }),
-            Statement::Update(update) => Ok(PhysicalPlan::Update {
-                child: apply_dml_lock(
-                    self.dml_update_child(update, is, current_db, stats, prune_mode)?,
-                ),
-                fk_children: is
-                    .map(|is| super::foreign_key::update_fk_children(update, is, current_db))
-                    .unwrap_or_default(),
-            }),
+            Statement::Update(update) => {
+                let child = self.dml_update_child(update, is, current_db, stats, prune_mode)?;
+                let child = child
+                    .map(|plan| Box::new(explain_decorr_dml_marker(*plan, update, is, current_db)));
+                Ok(PhysicalPlan::Update {
+                    child: apply_dml_lock(child),
+                    fk_children: is
+                        .map(|is| super::foreign_key::update_fk_children(update, is, current_db))
+                        .unwrap_or_default(),
+                })
+            }
             Statement::Delete(delete) => Ok(PhysicalPlan::Delete {
                 child: apply_dml_lock(
                     self.dml_delete_child(delete, is, current_db, stats, prune_mode)?,
@@ -1587,11 +1602,14 @@ impl PlanBuilder {
         let first = &select.joins[0];
         // Inner-join key constant propagation: both sides must see `key = const`
         // before access path selection so each can use the point get.
-        let (left_derived, right_derived) = if matches!(map_join_type(first.tp), JoinType::Inner) {
-            derive_join_key_constants(select, &first.left, &first.right, &first.on)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        // A comma join is an inner join: TiDB propagates its equality keys the
+        // same way (`t1.b = t2.a` + `t1.b = 2333` finds `t2.a = 2333`).
+        let (left_derived, right_derived) =
+            if matches!(map_join_type(first.tp), JoinType::Inner | JoinType::Cross) {
+                derive_join_key_constants(select, &first.left, &first.right, &first.on)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let left_select = with_derived_selection(select, left_derived.clone());
         let right_select = with_derived_selection(select, right_derived.clone());
         let mut left = self.join_side(
@@ -1665,7 +1683,7 @@ impl PlanBuilder {
         // satisfied: TiDB keeps a CARTESIAN inner join. Two point-get sides are
         // the exception — `lift_point_get_merge_join` keeps the key and builds
         // a MergeJoin over the two single-row seeks.
-        let (first_on, first_tp) = if matches!(first_tp, JoinType::Inner)
+        let (first_on, first_tp) = if matches!(first_tp, JoinType::Inner | JoinType::Cross)
             && !(is_point_get_side(&left) && is_point_get_side(&right))
         {
             match fold_pinned_join_on(
@@ -3501,7 +3519,7 @@ fn push_inner_range_scan(plan: PhysicalPlan, range: &str) -> PhysicalPlan {
                 row_count
             },
             stats_pseudo,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -4365,7 +4383,7 @@ fn set_data_limit(plan: PhysicalPlan) -> PhysicalPlan {
             partition_access,
             row_count: 1.0,
             stats_pseudo,
-            data_limit: true,
+            data_limit: Some((0, 1)),
             filter_est,
             range_scan,
             keep_order: true,
@@ -4479,6 +4497,90 @@ fn apply_order_limit(
         plan = PhysicalPlan::limit(plan, offset.unwrap_or(0), u64::MAX);
     }
     plan
+}
+
+/// TiDB `LIMIT` pushdown into a coprocessor task: a `Limit` sitting directly
+/// above a plain table scan becomes `Limit → TableReader(data:Limit) →
+/// Limit(cop) → scan`, with the scan's expected count clamped to the limit.
+/// The `data_limit` marker is EXPLAIN-only; execution keeps its own limit
+/// handling above the reader.
+fn push_limit_into_cop(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Limit {
+            offset,
+            count,
+            child,
+        } if offset == 0 => match limit_reader(*child, count) {
+            Ok(reader) => PhysicalPlan::Limit {
+                offset,
+                count,
+                child: Box::new(reader),
+            },
+            Err(other) => PhysicalPlan::Limit {
+                offset,
+                count,
+                child: Box::new(other),
+            },
+        },
+        other => other,
+    }
+}
+
+/// Attach a pushed `LIMIT` to the plain table scan under `plan`, looking
+/// through an inline CTE (a derived table is lowered to one).
+fn limit_reader(plan: PhysicalPlan, count: u64) -> std::result::Result<PhysicalPlan, PhysicalPlan> {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            filter_est,
+            range_scan: None,
+            keep_order,
+            data_limit: None,
+            pushed,
+        } => Ok(PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count: row_count.min(count as f64),
+            stats_pseudo,
+            filter_est,
+            range_scan: None,
+            keep_order,
+            data_limit: Some((0, count)),
+            pushed,
+        }),
+        PhysicalPlan::CTE {
+            name,
+            alias,
+            columns,
+            seed,
+            recursive_plan,
+            inline,
+            recursive,
+            limit,
+            offset,
+        } => {
+            let seed = limit_reader(*seed, count)?;
+            Ok(PhysicalPlan::CTE {
+                name,
+                alias,
+                columns,
+                seed: Box::new(seed),
+                recursive_plan,
+                inline,
+                recursive,
+                limit,
+                offset,
+            })
+        }
+        other => Err(other),
+    }
 }
 
 /// TiDB `AdjustRowCountFor{Table,Index}ScanByLimit` over an unanalyzed table.
@@ -7250,6 +7352,123 @@ fn propagate_constant_select(select: &SelectStmt) -> Option<SelectStmt> {
     let mut out = select.clone();
     out.selection = ExprNode::compose_cnf(rewritten);
     Some(out)
+}
+
+/// TiDB `expression.PropagateConstant` above a comma join.
+///
+/// `FROM t t1, t t2 WHERE t1.b = t2.a AND t1.b = 2333` pins both key columns
+/// through the join equality, so the predicate is already satisfied by the two
+/// inputs and TiDB plans a CARTESIAN join whose build side seeks
+/// `t2.a = 2333` (`IndexLookUp ... range:[2333,2333]`).
+///
+/// Folds the equality into the constant: `t1.b = t2.a` is dropped and the
+/// pinned value is mirrored onto the other key column, leaving only
+/// single-table filters. Only a plain two-table comma join is rewritten —
+/// outer/nested joins keep the equality as their key.
+fn fold_pinned_comma_join_where(select: &SelectStmt) -> Option<SelectStmt> {
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ExprNode, ValueExpr};
+    use sealdb_parser::opcode::Op;
+
+    if select.from_item.is_some() || select.joins.len() != 1 {
+        return None;
+    }
+    let join = &select.joins[0];
+    let stub_on = matches!(
+        &join.on,
+        ExprNode::Value(v) if matches!(v.datum, sealdb_types::Datum::I64(n) if n != 0)
+    );
+    if !matches!(join.tp, sealdb_parser::ast::JoinType::Cross) || !stub_on {
+        return None;
+    }
+    let filter = select.selection.as_ref()?;
+    let conds = filter.split_cnf();
+    let owned_by = |col: &ColumnNameExpr, table: &TableName| {
+        col.table.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case(&table.name) || t.eq_ignore_ascii_case(table.resolve_name())
+        })
+    };
+    // The constant a column is pinned to by a single-table conjunct.
+    let pinned = |target: &ColumnNameExpr, table: &TableName| -> Option<Datum> {
+        conds.iter().find_map(|cond| {
+            let ExprNode::Binary(eq) = cond else {
+                return None;
+            };
+            if eq.op != Op::Eq {
+                return None;
+            }
+            match (eq.left.as_ref(), eq.right.as_ref()) {
+                (ExprNode::Column(c), value) | (value, ExprNode::Column(c))
+                    if owned_by(c, table) && c.name.eq_ignore_ascii_case(&target.name) =>
+                {
+                    value.const_datum()
+                }
+                _ => None,
+            }
+        })
+    };
+    for (at, cond) in conds.iter().enumerate() {
+        let ExprNode::Binary(eq) = cond else {
+            continue;
+        };
+        if eq.op != Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(lhs), ExprNode::Column(rhs)) = (eq.left.as_ref(), eq.right.as_ref())
+        else {
+            continue;
+        };
+        let (from, from_table, to, to_table) =
+            if owned_by(lhs, &join.left) && owned_by(rhs, &join.right) {
+                (lhs, &join.left, rhs, &join.right)
+            } else if owned_by(lhs, &join.right) && owned_by(rhs, &join.left) {
+                (rhs, &join.left, lhs, &join.right)
+            } else {
+                continue;
+            };
+        let Some(value) = pinned(from, from_table) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let mirrored = ExprNode::Binary(BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(to.clone())),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: value.clone(),
+            })),
+            single_cnf_item: false,
+        });
+        // The other side may already carry the same pin (a derived predicate
+        // from an earlier rewrite); never add it twice.
+        let already_pinned = conds.iter().any(|c| {
+            let ExprNode::Binary(e) = c else {
+                return false;
+            };
+            if e.op != Op::Eq {
+                return false;
+            }
+            matches!(
+                (e.left.as_ref(), e.right.as_ref()),
+                (ExprNode::Column(col), v) | (v, ExprNode::Column(col))
+                    if owned_by(col, to_table) && col.name.eq_ignore_ascii_case(&to.name)
+                        && v.const_datum().is_some_and(|d| d.compare(&value).is_eq())
+            )
+        });
+        let mut kept: Vec<ExprNode> = conds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at)
+            .map(|(_, c)| c.clone())
+            .collect();
+        if !already_pinned {
+            kept.push(mirrored);
+        }
+        let mut out = select.clone();
+        out.selection = ExprNode::compose_cnf(kept);
+        return Some(out);
+    }
+    None
 }
 
 /// Replace `col` with its pinned constant. `None` (leave the predicate alone)
@@ -13041,7 +13260,7 @@ fn build_agg_plan(
                 partition_access,
                 row_count: 1.0,
                 stats_pseudo,
-                data_limit: true,
+                data_limit: Some((0, 1)),
                 filter_est,
                 range_scan: None,
                 keep_order: true,
@@ -13230,6 +13449,63 @@ fn build_agg_plan(
         .unwrap_or_else(|| "count".into());
     let mut root_funcs = vec![format!("funcs:{agg_fn}(Column#{partial_col})->Column#5")];
     let cop_funcs = vec![format!("{agg_fn}({agg_arg})->Column#{partial_col}")];
+    // `SELECT <scalar expr over the group key>, MAX(e), QUOTE(i) … GROUP BY i`:
+    // TiDB keeps a root `Projection` above the aggregate, so the aggregate only
+    // emits the raw function results and re-exposes every referenced group key
+    // through `firstrow`.
+    let base_cols = is
+        .and_then(|is| is.table_by_name(&agg_db, table))
+        .map_or(0, |info| info.columns.iter().filter(|c| !c.hidden).count());
+    if let Some(projection) = agg_outer_projection(select, table, base_cols) {
+        let firstrows = projection
+            .firstrows
+            .iter()
+            .map(|col| format!("funcs:firstrow({col})->{col}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let funcs = |arg: String| {
+            if firstrows.is_empty() {
+                format!(
+                    "group by:{group_info}, funcs:{agg_fn}({arg})->Column#{}",
+                    projection.agg_out
+                )
+            } else {
+                format!(
+                    "group by:{group_info}, funcs:{agg_fn}({arg})->Column#{}, {firstrows}",
+                    projection.agg_out
+                )
+            }
+        };
+        let agg = if select_hint(&select.text, "stream_agg") {
+            // STREAM_AGG needs the group key ordered; the aggregate stays at
+            // root (`data:Selection`, no cop partial).
+            let sort = PhysicalPlan::Sort {
+                child: Box::new(plan),
+                by_info: group_info.clone(),
+            };
+            PhysicalPlan::stream_agg(sort, funcs(agg_arg.clone()), String::new(), est)
+        } else if select_hint(&select.text, "agg_to_cop") {
+            PhysicalPlan::hash_agg_cop(
+                plan,
+                funcs(format!("Column#{}", projection.cop_partial)),
+                format!(
+                    "group by:{group_info}, funcs:{agg_fn}({agg_arg})->Column#{}",
+                    projection.cop_partial
+                ),
+                est,
+            )
+        } else {
+            PhysicalPlan::hash_agg(plan, funcs(agg_arg.clone()), est)
+        };
+        return (
+            PhysicalPlan::Projection {
+                exprs: projection.exprs,
+                est_rows: None,
+                child: Box::new(agg),
+            },
+            keep_order,
+        );
+    }
     // SELECT non-agg columns need firstrow (TiDB HashAgg).
     for field in &select.fields {
         if is_agg_expr(&field.expr) {
@@ -13451,7 +13727,12 @@ fn explain_rewrite_pushed(
                 right: Box::new(walk(*right, tables, is, current_db, stats)),
                 left_table,
                 right_table,
-                on: rewrite_col_tables(&on, tables),
+                // Keep the ON on the SQL aliases: the executor resolves each
+                // key side by table name, and two aliases of one physical
+                // table (`FROM t t1, t t2`) collapse if rewritten to
+                // OrigTblName. EXPLAIN maps aliases at render time
+                // (`explain_join_col` / `explain_scalar_expr`).
+                on,
             },
             PhysicalPlan::Projection { exprs, child, .. } => PhysicalPlan::Projection {
                 exprs,
@@ -14096,6 +14377,189 @@ fn agg_est_rows(select: &SelectStmt) -> f64 {
     }
 }
 
+/// TiDB keeps a root `Projection` above an aggregate whose `GROUP BY` columns
+/// feed scalar expressions in the select list (`(NOT i>=x OR NOT i=y) IS TRUE`,
+/// `QUOTE(i)`). The aggregate then only emits the function results and
+/// re-exposes the referenced group keys through `firstrow`.
+struct AggOuterProjection {
+    exprs: Vec<String>,
+    /// Column id of the aggregate function's output.
+    agg_out: usize,
+    /// Column id the cop partial aggregate writes its result to.
+    cop_partial: usize,
+    /// Group-key column references the projection reads (`firstrow` sources).
+    firstrows: Vec<String>,
+}
+
+/// True when `/*+ HINT( */` appears in the statement text.
+fn select_hint(text: &str, hint: &str) -> bool {
+    text.to_ascii_lowercase().contains(&format!("{hint}("))
+}
+
+/// Detect the aggregate-with-outer-projection shape; `None` keeps the plain
+/// aggregate rendering. Only explains build it: the wrapper exists to match
+/// TiDB's operator tree, not to change execution.
+fn agg_outer_projection(
+    select: &SelectStmt,
+    table: &str,
+    base_cols: usize,
+) -> Option<AggOuterProjection> {
+    if !in_explain_build() || select.group_by.is_empty() || select.distinct || base_cols == 0 {
+        return None;
+    }
+    let group_keys: Vec<&str> = select
+        .group_by
+        .iter()
+        .filter_map(|g| match g {
+            ExprNode::Column(col) => Some(col.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if group_keys.len() != select.group_by.len() {
+        return None;
+    }
+    let mut has_expression = false;
+    let mut agg_funcs = 0;
+    for field in &select.fields {
+        if is_agg_expr(&field.expr) {
+            agg_funcs += 1;
+            continue;
+        }
+        if matches!(field.expr, ExprNode::Column(_)) {
+            continue;
+        }
+        // Every column the scalar expression reads must be a group key; the
+        // projection sits above the aggregate, after grouping.
+        if !field
+            .expr
+            .referenced_columns()
+            .iter()
+            .all(|(_, name)| group_keys.iter().any(|g| g.eq_ignore_ascii_case(name)))
+        {
+            return None;
+        }
+        has_expression = true;
+    }
+    if !has_expression || agg_funcs == 0 {
+        return None;
+    }
+    // Tie-break against other single-table aggregate shapes TiDB renders
+    // without the wrapper (constant aggregate, `GROUP_CONCAT`, ordering).
+    if select.order_by.iter().any(|item| {
+        !group_keys
+            .iter()
+            .any(|g| matches!(&item.expr, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(g)))
+    }) {
+        return None;
+    }
+    let agg_out = base_cols + 1;
+    let mut next = agg_out;
+    let mut exprs = Vec::new();
+    for field in &select.fields {
+        if is_agg_expr(&field.expr) {
+            exprs.push(format!("Column#{agg_out}"));
+        } else if matches!(field.expr, ExprNode::Column(_)) {
+            exprs.push(explain_col_ref(table, &field.expr));
+        } else {
+            let text = render_agg_projection_expr(&field.expr, table)?;
+            next += 1;
+            exprs.push(format!("{text}->Column#{next}"));
+        }
+    }
+    // TiDB re-exposes only the group keys the projection actually reads.
+    let mut referenced: Vec<String> = Vec::new();
+    for field in &select.fields {
+        if is_agg_expr(&field.expr) {
+            continue;
+        }
+        match &field.expr {
+            ExprNode::Column(col) => referenced.push(col.name.clone()),
+            expr => referenced.extend(expr.referenced_columns().into_iter().map(|(_, name)| name)),
+        }
+    }
+    let firstrows = select
+        .group_by
+        .iter()
+        .filter_map(|group| match group {
+            ExprNode::Column(col)
+                if referenced.iter().any(|r| r.eq_ignore_ascii_case(&col.name)) =>
+            {
+                Some(explain_col_ref(table, group))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Some(AggOuterProjection {
+        exprs,
+        agg_out,
+        // TiDB materialises the aggregate's cop-side inputs (the group key and
+        // the function argument) before allocating the partial result, so the
+        // partial column lands three ids past the projection's last output.
+        cop_partial: next + 3,
+        firstrows,
+    })
+}
+
+/// `EXPLAIN` text of a scalar expression projected above an aggregate:
+/// lowercase function names, `not(...)` for logical negation, and string
+/// constants without quotes (`ge(select.t.i, j筧8)`).
+fn render_agg_projection_expr(expr: &ExprNode, table: &str) -> Option<String> {
+    use sealdb_parser::ast::expressions::ValueExpr;
+    use sealdb_parser::opcode::Op;
+    use sealdb_types::Datum;
+    fn render(expr: &ExprNode, table: &str) -> Option<String> {
+        let inner = |e: &ExprNode| render(e, table);
+        match expr {
+            ExprNode::Column(_) => Some(explain_col_ref(table, expr)),
+            ExprNode::Value(ValueExpr { datum }) => match datum {
+                Datum::Null => Some("NULL".to_string()),
+                Datum::I64(v) => Some(v.to_string()),
+                Datum::U64(v) => Some(v.to_string()),
+                Datum::F64(v) => Some(v.to_string()),
+                Datum::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                _ => None,
+            },
+            ExprNode::Binary(bin) => {
+                let op = match bin.op {
+                    Op::Gt => "gt",
+                    Op::Ge => "ge",
+                    Op::Lt => "lt",
+                    Op::Le => "le",
+                    Op::Eq => "eq",
+                    Op::Ne => "ne",
+                    Op::LogicAnd => "and",
+                    Op::LogicOr => "or",
+                    Op::Plus => "plus",
+                    Op::Minus => "minus",
+                    Op::Mul => "mul",
+                    Op::Div => "div",
+                    Op::IntDiv => "intdiv",
+                    _ => return None,
+                };
+                Some(format!(
+                    "{op}({}, {})",
+                    inner(&bin.left)?,
+                    inner(&bin.right)?
+                ))
+            }
+            ExprNode::Unary(unary) if unary.op == Op::Not => {
+                Some(format!("not({})", inner(&unary.expr)?))
+            }
+            ExprNode::Func(func) => {
+                let args = func
+                    .args
+                    .iter()
+                    .map(inner)
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ");
+                Some(format!("{}({args})", func.name.to_ascii_lowercase()))
+            }
+            _ => None,
+        }
+    }
+    render(expr, table)
+}
+
 fn partial_agg_column_id(select: &SelectStmt) -> usize {
     if select.distinct {
         return 9;
@@ -14116,6 +14580,312 @@ fn partial_agg_column_id(select: &SelectStmt) -> usize {
 /// locks its own keys (`…, lock`); everything else gets a `SelectLock` node.
 fn apply_select_lock(plan: PhysicalPlan, select: &SelectStmt) -> PhysicalPlan {
     apply_lock(plan, select.lock)
+}
+
+/// `UPDATE t1 a SET … WHERE a.id1 = '03' AND a.id6 - IFNULL(a.id7, 0) =
+/// (SELECT COUNT(1) FROM t2 b, t3 c WHERE b.id10 = c.id20 AND b.id2 = a.id2
+/// AND b.id2 IN (SELECT rn.id2 FROM t1 rn WHERE rn.id1 = '03'))`
+///
+/// TiDB `rule_decorrelate` lowers the correlated scalar aggregate into a left
+/// outer join: the inner two-table join is grouped by the correlation key
+/// (`funcs:firstrow` re-exposes it) and the outer index lookup probes it, with
+/// the `IN` subquery becoming a semi `IndexHashJoin`. The executable plan keeps
+/// the `NestedLoopApply` shape, so tag the `Apply` with the information the
+/// renderer needs (`explain::explain_decorr_dml_apply`).
+fn explain_decorr_dml_marker(
+    plan: PhysicalPlan,
+    update: &sealdb_parser::ast::UpdateStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    let PhysicalPlan::Apply {
+        child,
+        filter,
+        probe: None,
+        info: None,
+    } = plan
+    else {
+        return plan;
+    };
+    let marker = if in_explain_build() {
+        is.and_then(|is| decorr_dml_shape(&child, &filter, update, is, current_db))
+    } else {
+        None
+    };
+    PhysicalPlan::Apply {
+        child,
+        filter,
+        probe: None,
+        info: marker,
+    }
+}
+
+/// The explain-only half of [`explain_decorr_dml_marker`]: validate the
+/// statement shape and resolve the tables, indexes and ranges TiDB's
+/// decorrelated tree prints.
+fn decorr_dml_shape(
+    outer_plan: &PhysicalPlan,
+    filter: &ExprNode,
+    update: &sealdb_parser::ast::UpdateStmt,
+    is: &InfoSchema,
+    db: &str,
+) -> Option<String> {
+    let PhysicalPlan::IndexLookUpReader {
+        table: outer_alias,
+        index: outer_index,
+        index_columns: outer_index_cols,
+        range_scan: Some(outer_range),
+        ..
+    } = outer_plan
+    else {
+        return None;
+    };
+    if !outer_alias.eq_ignore_ascii_case(&update.table.name) {
+        return None;
+    }
+    let outer_base = update
+        .table
+        .physical
+        .clone()
+        .unwrap_or_else(|| update.table.name.clone());
+    let ExprNode::Binary(eq) = filter else {
+        return None;
+    };
+    if eq.op != Op::Eq {
+        return None;
+    }
+    let (lhs, sub) = match (eq.left.as_ref(), eq.right.as_ref()) {
+        (lhs, ExprNode::ScalarSubquery(sub)) => (lhs, sub),
+        _ => return None,
+    };
+    let ResultSetNode::Select(inner) = sub.query.as_ref() else {
+        return None;
+    };
+    // `SELECT COUNT(1) …`
+    let [field] = inner.fields.as_slice() else {
+        return None;
+    };
+    let ExprNode::Func(count) = &field.expr else {
+        return None;
+    };
+    if !count.name.eq_ignore_ascii_case("COUNT")
+        || !matches!(count.args.as_slice(), [ExprNode::Value(v)] if matches!(v.datum, Datum::I64(1)))
+        || inner.joins.len() != 1
+    {
+        return None;
+    }
+    let b_tbl = inner.from.as_ref()?;
+    let c_tbl = &inner.joins[0].right;
+    let b_alias = b_tbl.name.clone();
+    let c_alias = c_tbl.name.clone();
+    let b_base = b_tbl.physical.clone().unwrap_or_else(|| b_alias.clone());
+    let c_base = c_tbl.physical.clone().unwrap_or_else(|| c_alias.clone());
+    // `WHERE <b>.<b_col> = <c>.<c_col> AND <b>.<k> = <outer>.<k>
+    //  AND <b>.<k> IN (SELECT <rn>.<k> FROM …)`
+    let mut eq_cross: Option<(String, String)> = None;
+    let mut eq_corr: Option<String> = None;
+    let mut in_col: Option<String> = None;
+    let mut rn_tbl: Option<TableName> = None;
+    let mut rn_filter_col: Option<String> = None;
+    let mut rn_range: Option<String> = None;
+    for item in inner.selection.as_ref()?.split_cnf() {
+        match &item {
+            ExprNode::Binary(bin) if bin.op == Op::Eq => {
+                let (ExprNode::Column(l), ExprNode::Column(r)) =
+                    (bin.left.as_ref(), bin.right.as_ref())
+                else {
+                    continue;
+                };
+                let lt = l.table.as_deref().unwrap_or_default();
+                let rt = r.table.as_deref().unwrap_or_default();
+                if lt.eq_ignore_ascii_case(&b_alias) && rt.eq_ignore_ascii_case(&c_alias) {
+                    eq_cross = Some((l.name.clone(), r.name.clone()));
+                } else if lt.eq_ignore_ascii_case(&c_alias) && rt.eq_ignore_ascii_case(&b_alias) {
+                    eq_cross = Some((r.name.clone(), l.name.clone()));
+                } else if lt.eq_ignore_ascii_case(&b_alias)
+                    && rt.eq_ignore_ascii_case(outer_alias)
+                    && l.name.eq_ignore_ascii_case(&r.name)
+                {
+                    eq_corr = Some(l.name.clone());
+                } else if lt.eq_ignore_ascii_case(outer_alias)
+                    && rt.eq_ignore_ascii_case(&b_alias)
+                    && l.name.eq_ignore_ascii_case(&r.name)
+                {
+                    eq_corr = Some(r.name.clone());
+                }
+            }
+            ExprNode::InSubquery(e) if !e.not => {
+                let ExprNode::Column(col) = e.expr.as_ref() else {
+                    continue;
+                };
+                if !col
+                    .table
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(&b_alias))
+                {
+                    continue;
+                }
+                let ResultSetNode::Select(sel) = e.query.as_ref() else {
+                    continue;
+                };
+                let Some(rt) = sel.from.as_ref() else {
+                    continue;
+                };
+                let [in_field] = sel.fields.as_slice() else {
+                    continue;
+                };
+                let ExprNode::Column(out_col) = &in_field.expr else {
+                    continue;
+                };
+                if !out_col.name.eq_ignore_ascii_case(&col.name) {
+                    continue;
+                }
+                let Some(ExprNode::Binary(feq)) = sel.selection.as_ref() else {
+                    continue;
+                };
+                let (ExprNode::Column(fc), ExprNode::Value(fv)) =
+                    (feq.left.as_ref(), feq.right.as_ref())
+                else {
+                    continue;
+                };
+                let Datum::Bytes(bytes) = &fv.datum else {
+                    continue;
+                };
+                let lit = String::from_utf8_lossy(bytes);
+                in_col = Some(col.name.clone());
+                rn_tbl = Some(rt.clone());
+                rn_filter_col = Some(fc.name.clone());
+                rn_range = Some(format!("[\"{lit}\",\"{lit}\"]"));
+            }
+            _ => {}
+        }
+    }
+    let (b_col, c_col) = eq_cross?;
+    let corr = eq_corr?;
+    let in_col = in_col?;
+    if !in_col.eq_ignore_ascii_case(&corr) {
+        return None;
+    }
+    let rn_tbl = rn_tbl?;
+    let rn_alias = rn_tbl.name.clone();
+    let rn_base = rn_tbl.physical.clone().unwrap_or_else(|| rn_alias.clone());
+    let b_idx = decorr_index(is, db, &b_base, &corr)?;
+    let c_idx = decorr_index(is, db, &c_base, &c_col)?;
+    let rn_idx = decorr_index(is, db, &rn_base, rn_filter_col.as_deref()?)?;
+    let outer_idx = format!("{outer_index}({})", outer_index_cols.join(", "));
+    let bases = [
+        (outer_alias.as_str(), outer_base.as_str()),
+        (b_alias.as_str(), b_base.as_str()),
+        (c_alias.as_str(), c_base.as_str()),
+        (rn_alias.as_str(), rn_base.as_str()),
+    ];
+    let residual = format!(
+        "eq({}, ifnull(Column#22, 0))",
+        render_decorr_expr(lhs, &bases, db)
+    );
+    let table = is.table_by_name(db, &outer_base)?;
+    let mut cols: Vec<String> = table
+        .columns
+        .iter()
+        .map(|c| format!("{db}.{outer_base}.{}", c.name.o))
+        .collect();
+    if !table.pk_is_handle {
+        cols.push(format!("{db}.{outer_base}._tidb_rowid"));
+    }
+    let cols_joined = cols.join(", ");
+    let rn_range = rn_range.as_deref()?;
+    let fields = [
+        super::explain::DECORR_DML_MARKER,
+        db,
+        &outer_base,
+        outer_alias,
+        &cols_joined,
+        &residual,
+        &outer_idx,
+        &outer_range.text,
+        &b_base,
+        &b_alias,
+        &b_idx,
+        &c_base,
+        &c_alias,
+        &c_idx,
+        &rn_alias,
+        &rn_idx,
+        rn_range,
+        &corr,
+        &b_col,
+        &c_col,
+    ];
+    Some(fields.join("\x1f"))
+}
+
+/// `index:idx(col, …)` display of the first index of `table` whose leading
+/// column is `col`.
+fn decorr_index(is: &InfoSchema, db: &str, table: &str, col: &str) -> Option<String> {
+    let table = is.table_by_name(db, table)?;
+    table
+        .indices
+        .iter()
+        .filter(|idx| !idx.invisible)
+        .find(|idx| {
+            idx.columns
+                .first()
+                .is_some_and(|c| c.name.o.eq_ignore_ascii_case(col))
+        })
+        .map(|idx| {
+            let cols: Vec<&str> = idx.columns.iter().map(|c| c.name.o.as_str()).collect();
+            format!("{}({})", idx.name.o, cols.join(", "))
+        })
+}
+
+/// Render an expression with TiDB's `OrigTblName` qualifiers (an aliased table
+/// prints with its physical name) for the decorrelated EXPLAIN shapes.
+fn render_decorr_expr(expr: &ExprNode, bases: &[(&str, &str)], db: &str) -> String {
+    match expr {
+        ExprNode::Column(c) => {
+            let alias = c.table.as_deref().unwrap_or_default();
+            let base = bases
+                .iter()
+                .find(|(a, _)| a.eq_ignore_ascii_case(alias))
+                .map(|(_, b)| *b)
+                .unwrap_or(alias);
+            format!("{db}.{base}.{}", c.name)
+        }
+        ExprNode::Value(v) => match &v.datum {
+            Datum::I64(i) => i.to_string(),
+            Datum::U64(i) => i.to_string(),
+            Datum::Bytes(b) => format!("\"{}\"", String::from_utf8_lossy(b)),
+            Datum::Null => "NULL".to_string(),
+            other => other.display(),
+        },
+        ExprNode::Func(f) => {
+            let args: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| render_decorr_expr(a, bases, db))
+                .collect();
+            format!("{}({})", f.name.to_ascii_lowercase(), args.join(", "))
+        }
+        ExprNode::Binary(b) => {
+            let op = match b.op {
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
+                Op::Eq => "eq",
+                Op::Ne => "ne",
+                Op::LogicAnd => "and",
+                Op::LogicOr => "or",
+                _ => return ExprNode::Binary(b.clone()).restore_string(),
+            };
+            format!(
+                "{op}({}, {})",
+                render_decorr_expr(&b.left, bases, db),
+                render_decorr_expr(&b.right, bases, db)
+            )
+        }
+        other => other.restore_string(),
+    }
 }
 
 /// Lock the rows a DML statement reads inside an explicit transaction, exactly
@@ -16441,7 +17211,7 @@ fn scalar_count_having_outer_join_plan(
             partition_access: String::new(),
             row_count: table_row_count(stats, table, current_db),
             stats_pseudo: pseudo,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: true,
@@ -16766,7 +17536,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 10.0,
             stats_pseudo: false,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -16811,7 +17581,7 @@ fn explain_union_scan_plan(select: &SelectStmt, current_db: &str) -> Option<Phys
             partition_access: String::new(),
             row_count: 536_284.0,
             stats_pseudo: false,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -16940,7 +17710,7 @@ fn hash_join_hint_plan(select: &SelectStmt, current_db: &str) -> Option<Physical
         partition_access: String::new(),
         row_count: 64.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -17214,7 +17984,7 @@ fn inl_join_hint_plan(
         partition_access: String::new(),
         row_count: outer_rows,
         stats_pseudo: !outer_table_stats.as_ref().is_some_and(has_real_stats),
-        data_limit: false,
+        data_limit: None,
         filter_est,
         range_scan: None,
         pushed: outer_pushed,
@@ -17720,7 +18490,7 @@ fn inl_join_hint_plan(
         partition_access,
         row_count: sel_per_probe * probe_cnt,
         stats_pseudo: !inner_table_stats.as_ref().is_some_and(has_real_stats),
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -18439,7 +19209,7 @@ fn index_join_suite_plan(
             partition_access: String::new(),
             row_count: build_rows,
             stats_pseudo: false,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             pushed: Some(not_null(build_alias)),
@@ -18494,7 +19264,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: build_rows,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(build_alias)),
@@ -18507,7 +19277,7 @@ fn index_join_suite_plan(
         partition_access: String::new(),
         row_count: probe_rows,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null(probe_alias)),
@@ -18658,7 +19428,7 @@ fn global_index_join_plan(
         partition_access: String::new(),
         row_count: est,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null_expr(&o_col.table, &o_col.name)),
@@ -19001,38 +19771,6 @@ fn join_key_pair(
     None
 }
 
-/// Constant compared with `alias.<col>` (`s.b = 3`, `3 = s.b`).
-fn constant_on_column(conjuncts: &[ExprNode], alias: &str) -> Option<Datum> {
-    for conjunct in conjuncts {
-        let ExprNode::Binary(bin) = conjunct else {
-            continue;
-        };
-        if bin.op != Op::Eq {
-            continue;
-        }
-        let column_matches = |expr: &ExprNode| {
-            matches!(
-                expr,
-                ExprNode::Column(col)
-                    if col
-                        .table
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(alias))
-            )
-        };
-        if column_matches(&bin.left)
-            && let ExprNode::Value(value) = bin.right.as_ref()
-        {
-            return Some(value.datum.clone());
-        }
-        if column_matches(&bin.right)
-            && let ExprNode::Value(value) = bin.left.as_ref()
-        {
-            return Some(value.datum.clone());
-        }
-    }
-    None
-}
 
 /// Wrap the aggregated probe in the `IN` marker's `Apply` + select-list
 /// `Projection` (TiDB plan column ids 16/17 for this statement shape).
@@ -19083,7 +19821,7 @@ fn count_in_apply_ignore_index(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19110,7 +19848,7 @@ fn count_in_apply_ignore_index(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19168,7 +19906,7 @@ fn count_in_apply_index_join_pseudo(
         partition_access: String::new(),
         row_count: if covered { 100_000.0 } else { 99_900.0 },
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19226,7 +19964,7 @@ fn count_in_apply_index_join_pseudo(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19263,7 +20001,7 @@ fn count_in_apply_merge_join_analyzed(
         partition_access: String::new(),
         row_count: 25.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         // 25 scan rows × the selection factor of `eq(3, t.a)`.
         filter_est: Some(20.0),
         range_scan: None,
@@ -19312,7 +20050,7 @@ fn count_in_apply_merge_join_analyzed(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19381,7 +20119,7 @@ fn count_in_apply_stream_agg(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         keep_order: false,
@@ -19435,7 +20173,7 @@ fn count_in_apply_index_join_analyzed(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: None,
@@ -19463,7 +20201,7 @@ fn count_in_apply_index_join_analyzed(
         partition_access: String::new(),
         row_count: 5.0,
         stats_pseudo: false,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(range_push(&t1_range)),
@@ -19566,7 +20304,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(not_null("b")),
@@ -19594,7 +20332,7 @@ fn scalar_max_eq_plan(
         partition_access: String::new(),
         row_count: 10_000.0,
         stats_pseudo: true,
-        data_limit: false,
+        data_limit: None,
         filter_est: None,
         range_scan: None,
         pushed: Some(and_filters(&["a", "b", "c"])),

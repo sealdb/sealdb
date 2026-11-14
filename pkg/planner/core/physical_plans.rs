@@ -179,8 +179,10 @@ pub enum PhysicalPlan {
         keep_order: bool,
         /// `max(_tidb_rowid)`: TiDB pushes `Limit 1` into the cop task and scans
         /// the handle in descending order (`data:Limit`, `keep order:true, desc`).
+        /// Also carries a plain pushed `LIMIT` as `(offset, count)` so EXPLAIN
+        /// renders the cop `Limit` child; execution is unaffected.
         #[serde(default)]
-        data_limit: bool,
+        data_limit: Option<(u64, u64)>,
         #[serde(skip)]
         pushed: Option<ExprNode>,
     },
@@ -800,7 +802,7 @@ impl PhysicalPlan {
             partition_access: String::new(),
             row_count: 10_000.0,
             stats_pseudo: true,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: false,
@@ -823,7 +825,7 @@ impl PhysicalPlan {
             partition_access: partition_access.into(),
             row_count,
             stats_pseudo,
-            data_limit: false,
+            data_limit: None,
             filter_est: None,
             range_scan: None,
             keep_order: false,

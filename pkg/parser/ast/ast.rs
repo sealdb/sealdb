@@ -311,6 +311,19 @@ pub enum ExplainFormat {
     Brief,
     Dot,
     Json,
+    /// TiDB `FORMAT = 'plan_cache'`: show the plan chosen by the non-prepared
+    /// plan cache (or why the statement skipped it).
+    PlanCache,
+    /// TiDB `FORMAT = 'hint'`: plan hints that reproduce the chosen plan.
+    Hint,
+    /// TiDB `FORMAT = 'verbose'`: row format plus an `estCost` column.
+    Verbose,
+    /// TiDB `FORMAT = 'binary'`: base64 of the snappy-compressed protobuf plan.
+    Binary,
+    /// TiDB `FORMAT = 'tidb_json'`: JSON tree keyed by operator ids.
+    TidbJson,
+    /// TiDB `FORMAT = 'cost_trace'`: row format plus `estCost`/`costFormula`.
+    CostTrace,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +344,12 @@ impl ExplainStmt {
             ExplainFormat::Brief => ctx.write_str("FORMAT = 'brief' "),
             ExplainFormat::Dot => ctx.write_str("FORMAT = 'dot' "),
             ExplainFormat::Json => ctx.write_str("FORMAT = 'json' "),
+            ExplainFormat::PlanCache => ctx.write_str("FORMAT = 'plan_cache' "),
+            ExplainFormat::Hint => ctx.write_str("FORMAT = 'hint' "),
+            ExplainFormat::Verbose => ctx.write_str("FORMAT = 'verbose' "),
+            ExplainFormat::Binary => ctx.write_str("FORMAT = 'binary' "),
+            ExplainFormat::TidbJson => ctx.write_str("FORMAT = 'tidb_json' "),
+            ExplainFormat::CostTrace => ctx.write_str("FORMAT = 'cost_trace' "),
         }
         self.stmt.restore(ctx)
     }

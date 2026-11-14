@@ -9,13 +9,14 @@ use sealdb_parser::Parser;
 use sealdb_parser::ast::ddl::TableName;
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode};
 use sealdb_parser::ast::{
-    CommonTableExpression, CteMaterialize, InsertStmt, IsolationLevel as AstIsolation,
-    PrivilegeType, SelectStmt, SetVarScope, Statement, UserIdentity, WithClause,
+    CommonTableExpression, CteMaterialize, ExplainFormat, InsertStmt,
+    IsolationLevel as AstIsolation, PrivilegeType, SelectStmt, SetVarScope, Statement,
+    UserIdentity, WithClause,
 };
 use sealdb_parser::charset::Collation;
 use sealdb_planner::{PartitionPruneMode, PhysicalPlan, PlanBuilder, normalize_prep_cache_key};
 use sealdb_sessiontxn::TxnManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Reserved schema under which a session's temporary tables are exposed to the
@@ -105,6 +106,14 @@ pub struct Session {
     /// non-correlated `IN (SELECT …)` into an inner join with a de-duplicating
     /// aggregation on the subquery side.
     opt_insubq_to_join_and_agg: Mutex<bool>,
+    /// TiDB `tidb_enable_non_prepared_plan_cache` (default OFF): gates
+    /// `EXPLAIN FORMAT='plan_cache'` on non-prepared statements.
+    non_prepared_plan_cache: Mutex<bool>,
+    /// TiDB `last_plan_from_cache`: whether the last plan-cache probe found a
+    /// reusable plan in the non-prepared plan cache.
+    last_plan_from_cache: Mutex<bool>,
+    /// Statement texts already inserted into the non-prepared plan cache.
+    plan_cache_stmts: Mutex<HashSet<String>>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
 }
@@ -161,6 +170,9 @@ impl Session {
             hashagg_final_concurrency: Mutex::new(5),
             opt_agg_push_down: Mutex::new(false),
             opt_insubq_to_join_and_agg: Mutex::new(true),
+            non_prepared_plan_cache: Mutex::new(false),
+            last_plan_from_cache: Mutex::new(false),
+            plan_cache_stmts: Mutex::new(HashSet::new()),
             last_warnings: Mutex::new(Vec::new()),
         }
     }
@@ -1183,6 +1195,7 @@ impl Session {
                                             sealdb_expression::clear_warnings();
                                             // TiDB allocates a fresh memory tracker per query.
                                             sealdb_expression::reset_query_mem_usage();
+                                            self.probe_plan_cache(stmt);
                                             ExecutorBuilder::run(exec)
                                         })
                                     })
@@ -1222,6 +1235,60 @@ impl Session {
                 .expect("session last_warnings lock") = qr.warnings.clone();
         }
         result
+    }
+
+    /// TiDB non-prepared plan cache probe for `EXPLAIN FORMAT='plan_cache'`.
+    ///
+    /// The plan shown is always the freshly optimized row plan; this only
+    /// reports whether the statement could enter the cache (warnings) and
+    /// whether the last probe reused an entry (`@@last_plan_from_cache`).
+    fn probe_plan_cache(&self, stmt: &Statement) {
+        let format = match stmt {
+            Statement::Explain(explain) => explain.format,
+            _ => ExplainFormat::Row,
+        };
+        if format != ExplainFormat::PlanCache {
+            *self
+                .last_plan_from_cache
+                .lock()
+                .expect("session last plan from cache lock") = false;
+            return;
+        }
+        let Statement::Explain(explain) = stmt else {
+            return;
+        };
+        if !*self
+            .non_prepared_plan_cache
+            .lock()
+            .expect("session non prepared plan cache lock")
+        {
+            *self
+                .last_plan_from_cache
+                .lock()
+                .expect("session last plan from cache lock") = false;
+            return;
+        }
+        if let Some(reason) = plan_cache_skip_reason(&explain.stmt) {
+            sealdb_expression::note_warning(
+                1105,
+                format!("skip non-prepared plan-cache: {reason}"),
+            );
+            *self
+                .last_plan_from_cache
+                .lock()
+                .expect("session last plan from cache lock") = false;
+            return;
+        }
+        let key = restore_sql(&explain.stmt);
+        let mut cached = self
+            .plan_cache_stmts
+            .lock()
+            .expect("session plan cache stmts lock");
+        let hit = !cached.insert(key);
+        *self
+            .last_plan_from_cache
+            .lock()
+            .expect("session last plan from cache lock") = hit;
     }
 
     fn acquire_mdl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
@@ -2287,7 +2354,6 @@ fn from_item_tables(item: &sealdb_parser::ast::FromItem) -> Vec<String> {
             tables.extend(from_item_tables(right));
             tables
         }
-        _ => Vec::new(),
     }
 }
 
@@ -3370,9 +3436,33 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .lock()
                     .expect("session insubq lock") = on;
             }
+            // Non-prepared plan cache gate (TiDB default OFF). Turning it off
+            // also drops the statements already cached for this session.
+            "tidb_enable_non_prepared_plan_cache" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .non_prepared_plan_cache
+                    .lock()
+                    .expect("session non prepared plan cache lock") = on;
+                if !on {
+                    session
+                        .plan_cache_stmts
+                        .lock()
+                        .expect("session plan cache stmts lock")
+                        .clear();
+                }
+                *session
+                    .last_plan_from_cache
+                    .lock()
+                    .expect("session last plan from cache lock") = false;
+            }
+            "tidb_enable_plan_cache" => {}
             // Per-query memory quota (TiDB `tidb_mem_quota_query`): `0` = no
-            // limit, `DEFAULT` = 1 GiB. Values are byte counts, possibly written
-            // as an integer expression (`1 << 18`).
+            // limit, `DEFAULT` = 1 GiB. Values are byte counts, possibly written            // as an integer expression (`1 << 18`).
             "tidb_mem_quota_query" => {
                 let quota = if value.eq_ignore_ascii_case("DEFAULT") {
                     sealdb_expression::memquota::DEFAULT_QUERY_MEM_QUOTA
@@ -3599,6 +3689,47 @@ fn literal_field_name(datum: &sealdb_types::Datum) -> String {
     }
 }
 
+/// Why a statement cannot enter TiDB's non-prepared plan cache, in TiDB's
+/// wording (`skip non-prepared plan-cache: <reason>`).
+fn plan_cache_skip_reason(stmt: &Statement) -> Option<&'static str> {
+    const SUBQUERY: &str = "queries that have sub-queries are not supported";
+    let Statement::Select(select) = stmt else {
+        return None;
+    };
+    // Derived tables are lowered into synthetic CTEs, so `with` covers both
+    // `WITH …` and `FROM (SELECT …)`.
+    if select.with.is_some() || select_has_subquery(select) {
+        return Some(SUBQUERY);
+    }
+    None
+}
+
+fn select_has_subquery(select: &SelectStmt) -> bool {
+    fn from_item_has_subquery(item: &sealdb_parser::ast::FromItem) -> bool {
+        match item {
+            sealdb_parser::ast::FromItem::Table(_) => false,
+            sealdb_parser::ast::FromItem::Join {
+                left, right, on, ..
+            } => {
+                from_item_has_subquery(left)
+                    || from_item_has_subquery(right)
+                    || on.has_subquery()
+            }
+        }
+    }
+    select.fields.iter().any(|f| f.expr.has_subquery())
+        || select.selection.as_ref().is_some_and(|e| e.has_subquery())
+        || select.group_by.iter().any(|e| e.has_subquery())
+        || select.having.as_ref().is_some_and(|e| e.has_subquery())
+        || select.order_by.iter().any(|b| b.expr.has_subquery())
+        || select.joins.iter().any(|j| j.on.has_subquery())
+        || select.from_item.as_ref().is_some_and(from_item_has_subquery)
+        || select
+            .with
+            .as_ref()
+            .is_some_and(|w| w.ctes.iter().any(|c| select_has_subquery(&c.query)))
+}
+
 fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
     Some(match name {
         "sql_mode" => session
@@ -3727,6 +3858,28 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             .expect("session window_concurrency lock")
             .to_string(),
         "tidb_enable_window_function" => "1".into(),
+        "tidb_enable_non_prepared_plan_cache" => {
+            if *session
+                .non_prepared_plan_cache
+                .lock()
+                .expect("session non prepared plan cache lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "last_plan_from_cache" => {
+            if *session
+                .last_plan_from_cache
+                .lock()
+                .expect("session last plan from cache lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         // Common TiDB session vars referenced by integrationtest; defaults.
         other if other.starts_with("tidb_") => "0".into(),
         _ => return None,
@@ -3756,8 +3909,7 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
     })
 }
 
-fn restore_sql(stmt: &Statement) -> String {
-    let mut ctx = sealdb_parser::format::RestoreCtx::new();
+fn restore_sql(stmt: &Statement) -> String {    let mut ctx = sealdb_parser::format::RestoreCtx::new();
     let _ = sealdb_parser::ast::Node::restore(stmt, &mut ctx);
     ctx.into_string()
 }
@@ -4893,26 +5045,6 @@ fn map_statement_ctes(
 
 fn qualify_select_tables(select: &mut SelectStmt, schema: &str, cte_names: &[String]) {
     map_select_tables(select, cte_names, &mut |table| {
-        qualify_table_name(table, schema)
-    });
-}
-
-fn qualify_tables_in_expr(
-    expr: &mut sealdb_parser::ast::expressions::ExprNode,
-    schema: &str,
-    cte_names: &[String],
-) {
-    map_tables_in_expr(expr, cte_names, &mut |table| {
-        qualify_table_name(table, schema)
-    });
-}
-
-fn qualify_tables_in_result_set(
-    query: &mut sealdb_parser::ast::ResultSetNode,
-    schema: &str,
-    cte_names: &[String],
-) {
-    map_tables_in_result_set(query, cte_names, &mut |table| {
         qualify_table_name(table, schema)
     });
 }

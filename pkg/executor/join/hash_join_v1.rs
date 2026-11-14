@@ -791,8 +791,14 @@ fn split_on_conditions<'a>(
         }
         residual.push(conjunct);
     }
-    let (left_key, right_key) =
-        key.ok_or_else(|| Error::unsupported("JOIN ON must compare columns from both tables"))?;
+    let (left_key, right_key) = match key {
+        Some(k) => k,
+        None => {
+            return Err(Error::unsupported(
+                "JOIN ON must compare columns from both tables",
+            ));
+        }
+    };
     Ok((left_key, right_key, residual))
 }
 

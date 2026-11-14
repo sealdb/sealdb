@@ -506,7 +506,7 @@
     {
       "name": "executor/adapter",
       "wave": "R7",
-      "status": "green",
+      "status": "in_progress",
       "test": "t/executor/adapter.test",
       "result": "r/executor/adapter.result",
       "has_result": true,
@@ -676,7 +676,7 @@
     {
       "name": "executor/explain",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/explain.test",
       "result": "r/executor/explain.result",
       "has_result": true,

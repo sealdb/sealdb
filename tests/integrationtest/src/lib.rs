@@ -1059,14 +1059,27 @@ fn normalize(text: &str) -> String {
 /// Gate B: strip unstable EXPLAIN operator id suffixes (`Projection_3` → `Projection`)
 /// and normalize partition physical id lists.
 fn normalize_line(line: &str) -> String {
+    // `EXPLAIN FORMAT='tidb_json'` cells are multi-line JSON without tabs, but
+    // they carry the same unstable operator ids (`"id": "TableReader_5"`) as
+    // explain body rows.
+    if line.contains("\"id\": \"") || line.contains("\"operatorInfo\": \"") {
+        return strip_embedded_op_ids(line);
+    }
     let Some((id, rest)) = line.split_once('\t') else {
         return line.to_string();
     };
     let Some((est, _)) = rest.split_once('\t') else {
         return line.to_string();
     };
-    // Only rewrite explain/desc body rows (numeric estRows).
-    if est.parse::<f64>().is_err() {
+    // Only rewrite explain/desc body rows (numeric estRows), plus the DML
+    // roots that print `N/A` there (`Update_17 N/A root N/A`) — they carry the
+    // same unstable plan ids.
+    let dml_root = est == "N/A"
+        && rest
+            .split('\t')
+            .nth(1)
+            .is_some_and(|task| task == "root" || task.starts_with("cop"));
+    if est.parse::<f64>().is_err() && !dml_root {
         return line.to_string();
     }
     let id = strip_explain_id_suffix(id);
@@ -1125,7 +1138,7 @@ fn strip_embedded_op_ids(rest: &str) -> String {
             // Keep `_digits` unless it looks like an operator id suffix
             // (followed by tab/end/comma/space or end of token).
             let next = chars.peek().copied();
-            if next.is_none_or(|n| matches!(n, '\t' | ' ' | ',' | ')' | ']')) {
+            if next.is_none_or(|n| matches!(n, '\t' | ' ' | ',' | ')' | ']' | '"')) {
                 out.pop(); // drop '_'
             // drop digits (already consumed)
             } else {

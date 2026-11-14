@@ -783,7 +783,9 @@ fn push_into(
             for conjunct in conjuncts {
                 match mem_table_range(&conjunct) {
                     Some((column, values))
-                        if columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) =>
+                        if columns.iter().any(|c| c.eq_ignore_ascii_case(&column))
+                            || super::explain::mem_table_column_index(&table, &column)
+                                .is_some() =>
                     {
                         ranges.extend(values.into_iter().map(|v| (column.clone(), v)));
                     }

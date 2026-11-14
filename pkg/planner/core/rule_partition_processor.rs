@@ -142,14 +142,6 @@ fn prune_with_expr(info: &TableInfo, selection: Option<&ExprNode>) -> Vec<i64> {
         monotonic,
         info,
     );
-    if std::env::var("SEALDB_DEBUG_PRUNE").is_ok() {
-        eprintln!(
-            "DEBUG prune expr={:?} monotonic={monotonic} sel={} rewritten={}",
-            part.expr,
-            selection.restore_string(),
-            rewritten.restore_string()
-        );
-    }
     info.prune_partitions(Some(&rewritten))
 }
 
