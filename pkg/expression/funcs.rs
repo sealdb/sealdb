@@ -82,6 +82,8 @@ const FUNCS: &[FuncMeta] = &[
     meta("RIGHT", FuncCategory::String, 2, 2, true),
     meta("LPAD", FuncCategory::String, 3, 3, true),
     meta("RPAD", FuncCategory::String, 3, 3, true),
+    // info
+    meta("TIDB_DECODE_BINARY_PLAN", FuncCategory::Info, 1, 1, true),
 ];
 
 const fn meta(

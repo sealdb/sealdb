@@ -1289,6 +1289,26 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 other => Ok(Datum::I64(other.as_f64()?.floor() as i64)),
             }
         }
+        "TIDB_DECODE_BINARY_PLAN" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "TIDB_DECODE_BINARY_PLAN requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let encoded = String::from_utf8_lossy(value.as_bytes().as_slice()).into_owned();
+            match crate::builtin_binary_plan::decode_binary_plan(&encoded) {
+                Ok(text) => Ok(Datum::Bytes(text.into_bytes())),
+                Err(message) => {
+                    push_warning(1105, message);
+                    Ok(Datum::Bytes(Vec::new()))
+                }
+            }
+        }
         other => Err(Error::new(
             ERR_UNKNOWN_FUNCTION,
             format!("FUNCTION {other} does not exist"),

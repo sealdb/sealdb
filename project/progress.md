@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 59 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 60 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2424,6 +2424,35 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 无；属性仅存储/展示，尚未参与 placement 调度（与当前存储层一致）
 - **下一步**:
   - 继续 R6：`ddl/affinity` / `ddl/bdr_mode` / `ddl/constraint`
+
+---
+
+### 2026-11-14（`planner/core/binary_plan` 转正：`tidb_decode_binary_plan` 解码失败路径）
+
+- **Phase**: R7
+- **完成**:
+  - 新增内建 `tidb_decode_binary_plan(str)`（`FuncCategory::Info`，1 参数），
+    返回 `Datum::Bytes`；参数为 NULL 时结果为 NULL。
+  - 新增 `pkg/expression/builtin_binary_plan.rs`：按 TiDB 顺序
+    base64（标准填充）→ snappy block 解压 → protobuf wire-format 校验；
+    任一步失败时返回空串并追加 `Warning 1105`。
+  - 错误文本与 TiDB 逐字节一致：`illegal base64 data at input byte N`、
+    `snappy: corrupt input`、`proto: illegal wireType N`（含 group 跳读与
+    truncation/overflow 分支）。
+  - 合法载荷目前返回空计划文本：plan 的 protobuf schema 尚未建模，
+    该内建函数当前完整覆盖的是用户实际会遇到的解码错误路径。
+- **验证**:
+  - `run-tests.sh -s memory -t planner/core/binary_plan --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t planner/core/binary_plan --status pending` → `PASS: tikv=1`
+  - gate 复验 `run-tests.sh -s memory` → `PASS: memory=68 skipped=186`
+  - gate 复验 `run-tests.sh -s tikv` → `PASS: memory=0 tikv=67 skipped=187`
+  - manifest `planner/core/binary_plan` → `green`，green 59→60
+- **阻塞/风险**:
+  - 合法 binary plan 的文本渲染依赖 `tipb`/`plannercore` protobuf schema，
+    待需要时补；现有语料仅覆盖非法输入。
+- **下一步**:
+  - 继续 R7 / R2 长尾：`table/temptable`、`planner/core/preprocess`、
+    `executor/inspection_common`、`cte` / `explain_cte` 剩余差异
 
 ---
 

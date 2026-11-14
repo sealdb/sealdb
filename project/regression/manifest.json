@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 59,
-      "pending": 171,
+      "green": 60,
+      "pending": 170,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -1802,7 +1802,7 @@
     {
       "name": "planner/core/binary_plan",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/binary_plan.test",
       "result": "r/planner/core/binary_plan.result",
       "has_result": true,
