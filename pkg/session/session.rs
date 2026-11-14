@@ -24,6 +24,12 @@ use std::sync::{Arc, Mutex};
 /// that resolve to a temporary table are rewritten to this schema.
 const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
 
+thread_local! {
+    /// `group_concat_max_len` before the current `SET_VAR` hint took effect, so
+    /// the statement-scoped override can restore the session value.
+    static SET_VAR_PREV_GCML: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Synthetic ids for session-local temporary tables, far above the ids the
 /// catalog allocates so their rows never collide with a persisted table.
 ///
@@ -294,15 +300,25 @@ impl Session {
     }
 
     /// TiDB `SET_VAR` optimizer hint: apply the listed session variables for a
-    /// single statement. The suite corpus only exercises `sql_mode`, so other
-    /// names are ignored rather than rejected.
+    /// single statement. `sql_mode` takes the statement-scoped slot below;
+    /// `group_concat_max_len` rides the executor's thread-local (reset when the
+    /// statement finishes).
     fn begin_set_var_hint(&self, sql: &str) -> Option<String> {
+        SET_VAR_PREV_GCML.with(|c| c.set(Some(sealdb_executor::aggfuncs::group_concat_max_len())));
+        if let Some(len) = set_var_hint_value(sql, "group_concat_max_len")
+            && let Ok(len) = len.trim().trim_matches(|c| c == '\'' || c == '"').parse::<usize>()
+        {
+            sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
+        }
         let sql_mode = set_var_hint_sql_mode(sql)?;
         let mut slot = self.sql_mode.lock().expect("session sql_mode lock");
         Some(std::mem::replace(&mut *slot, sql_mode))
     }
 
     fn end_set_var_hint(&self, previous: Option<String>) {
+        if let Some(previous) = SET_VAR_PREV_GCML.with(|c| c.take()) {
+            sealdb_executor::aggfuncs::set_group_concat_max_len(Some(previous));
+        }
         if let Some(previous) = previous {
             *self.sql_mode.lock().expect("session sql_mode lock") = previous;
         }
@@ -2830,7 +2846,7 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
 
 /// `/*+ SET_VAR(name=value) */` extracted for the statement, honoring quoted
 /// values so a `sql_mode` list keeps its commas.
-fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
+fn set_var_hint_value(sql: &str, wanted: &str) -> Option<String> {
     let mut rest = sql;
     while let Some(pos) = rest.find("/*") {
         rest = &rest[pos + 2..];
@@ -2852,7 +2868,7 @@ fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
             }
         }
         if let Some((name, val)) = value.split_once('=')
-            && name.trim().eq_ignore_ascii_case("sql_mode")
+            && name.trim().eq_ignore_ascii_case(wanted)
         {
             return Some(
                 val.trim()
@@ -2863,6 +2879,10 @@ fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
         rest = &rest[after + 1..];
     }
     None
+}
+
+fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
+    set_var_hint_value(sql, "sql_mode")
 }
 
 /// `SET @var = <value>`: TiDB evaluates the right-hand side as an expression
@@ -3389,6 +3409,21 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 };
                 sealdb_executor::cte::set_cte_max_recursion_depth(depth);
             }
+            "group_concat_max_len" => {
+                let len = if value.eq_ignore_ascii_case("DEFAULT") {
+                    sealdb_executor::aggfuncs::func_group_concat::DEFAULT_GROUP_CONCAT_MAX_LEN
+                } else {
+                    value.parse::<usize>().map_err(|_| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!(
+                                "Variable 'group_concat_max_len' can't be set to the value of '{value}'"
+                            ),
+                        )
+                    })?
+                };
+                sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
+            }
             // Session time zone (DST / TIMESTAMP display). Value stored for later
             // conversion; offset literals like '+00:00' / named zones accepted.
             "time_zone" => {
@@ -3870,6 +3905,7 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             }
         }
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
+        "group_concat_max_len" => sealdb_executor::aggfuncs::group_concat_max_len().to_string(),
         "tidb_window_concurrency" => session
             .window_concurrency
             .lock()
@@ -3899,6 +3935,15 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
             }
         }
         // Common TiDB session vars referenced by integrationtest; defaults.
+        "tidb_allow_function_for_expression_index" => {
+            "json_array, json_array_append, json_array_insert, json_contains, \
+             json_contains_path, json_depth, json_extract, json_insert, json_keys, \
+             json_length, json_merge_patch, json_merge_preserve, json_object, json_pretty, \
+             json_quote, json_remove, json_replace, json_schema_valid, json_search, json_set, \
+             json_storage_size, json_type, json_unquote, json_valid, lower, md5, reverse, \
+             tidb_shard, upper, vitess_hash"
+                .into()
+        }
         other if other.starts_with("tidb_") => "0".into(),
         _ => return None,
     })
@@ -5636,6 +5681,17 @@ impl Session {
             Statement::Select(_) => {
                 let restored = restore_sql(stmt);
                 if let Some(binding) = self.domain.bind_handle().match_binding(&restored) {
+                    // A binding may carry its own `SET_VAR` hint (`… using select
+                    // /*+ SET_VAR(group_concat_max_len = 4) */ …`); TiDB applies it
+                    // as part of the replaced statement.
+                    if let Some(len) = set_var_hint_value(&binding.bind_sql, "group_concat_max_len")
+                        && let Ok(len) = len
+                            .trim()
+                            .trim_matches(|c| c == '\'' || c == '"')
+                            .parse::<usize>()
+                    {
+                        sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
+                    }
                     return Ok(Some(self.parser.parse_one_stmt(&binding.bind_sql)?));
                 }
             }

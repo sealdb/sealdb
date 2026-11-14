@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 62 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 67 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2633,6 +2633,28 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `explain_easy`：外连接两侧派生条件下推与 `IN (SELECT count(*) …)` 的
     Apply 去关联；随后 `explain_complex*` / `explain_join_stats`。
+
+---
+
+### 2026-11-14（`bindinfo/session_handle` 转正：GROUP_CONCAT + SET_VAR 绑定提示）
+
+- **Phase**: R7
+- **完成**:
+  - `GROUP_CONCAT` 聚合：`aggfuncs` 新增 `func_group_concat`（逗号连接、
+    `DISTINCT`、按 `group_concat_max_len` 截断），并补进执行器与规划器两处
+    聚合识别表；此前 `select group_concat(b) …` 直接报 1305。
+  - `group_concat_max_len` session 变量（读/写/DEFAULT）接到执行器线程本地量。
+  - `/*+ SET_VAR(name=value) */` 从「只认 `sql_mode`」改为通用取值，语句结束
+    恢复上一个值；绑定 SQL 自带的 `SET_VAR` 也会在命中 binding 时生效。
+- **验证**:
+  - `run-tests.sh -t bindinfo/session_handle -s memory` → PASS
+  - `run-tests.sh -t bindinfo/session_handle -s tikv` → PASS
+- **阻塞/风险**:
+  - 解析器尚不识别 `GROUP_CONCAT(… SEPARATOR 'x')` 与多参数形式；执行器只
+    读取首参（`var_string(20)` 投影已由规划器完成）。
+- **下一步**:
+  - 继续啃 pending 长尾里 diff 最小的套件（`executor/executor_txn` /
+    `table/cache` / `globalindex/information_schema`）。
 
 ---
 

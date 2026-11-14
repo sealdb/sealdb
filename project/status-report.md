@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **66 个** 登记为 `green`（R1 4 / R2 16 / R3 23 / R5 1 / R6 8 / R7 14），新转绿的 17 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 23/48，R7 完成 14/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **67 个** 登记为 `green`（R1 4 / R2 16 / R3 23 / R5 1 / R6 8 / R7 15），新转绿的 17 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 23/48，R7 完成 14/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,9 +22,9 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **66 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 66 | 25.9% |
-| `in_progress` | 14 | 5.5% |
-| `pending` | 165 | 64.7% |
+| `green` | 67 | 26.4% |
+| `in_progress` | 13 | 5.1% |
+| `pending` | 165 | 65.0% |
 | `local`（SealDB 冒烟） | 9 | 3.5% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
 
@@ -40,13 +40,13 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **66 个** �
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 1 | 0 | 11 | `session/txn` 已绿 |
 | R6 | 8 | 0 | 27 | DDL / infoschema 起步 |
-| R7 | 14 | 0 | 96 | 零散长尾 |
+| R7 | 15 | 0 | 95 | 零散长尾 |
 | D（TiFlash/MPP） | 0 | 0 | 2 | deferred |
 | local | — | — | — | 9 套冒烟 |
 
 ---
 
-## 3. 已绿 suite 清单（66）
+## 3. 已绿 suite 清单（67）
 
 | Wave | Suite |
 |---|---|
@@ -55,7 +55,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **66 个** �
 | R3 | `access_path_selection`, `clustered_index`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy_stats`, `explain_foreign_key`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 | R5 | `session/txn` |
 | R6 | `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/fail_db`, `ddl/index_modify`, `infoschema/v2` |
-| R7 | `bindinfo/temptable`, `executor/adapter`, `executor/ddl`, `expression/enum_set`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `table/temptable`, `util/admin` |
+| R7 | `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/ddl`, `expression/enum_set`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `table/temptable`, `util/admin` |
 
 **复验证据**
 
@@ -397,7 +397,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up），66 个 `gr
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
 | 1 | `bindinfo/bind` | pending | 0% | ✓ | — |
-| 2 | `bindinfo/session_handle` | pending | 0% | ✓ | — |
+| 2 | `bindinfo/session_handle` | green | 100% | ✓ | ✓ |
 | 3 | `bindinfo/temptable` | green | 100% | ✓ | ✓ |
 | 4 | `black_list` | pending | 0% | ✓ | — |
 | 5 | `executor/adapter` | green | 100% | ✓ | skip |

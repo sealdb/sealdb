@@ -16079,7 +16079,7 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
         ExprNode::Func(func)
             if matches!(
                 func.name.to_ascii_uppercase().as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
             )
     )
 }

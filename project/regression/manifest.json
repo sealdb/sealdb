@@ -66,7 +66,7 @@
     {
       "name": "bindinfo/session_handle",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/bindinfo/session_handle.test",
       "result": "r/bindinfo/session_handle.result",
       "has_result": true,

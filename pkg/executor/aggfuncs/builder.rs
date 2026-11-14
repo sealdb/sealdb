@@ -1,6 +1,7 @@
 use super::aggfuncs::AggFunc;
 use super::func_avg::Avg;
 use super::func_count::Count;
+use super::func_group_concat::GroupConcat;
 use super::func_max_min::Extremum;
 use super::func_sum::Sum;
 use sealdb_errno::{ERR_UNKNOWN_FUNCTION, Error, Result};
@@ -10,6 +11,8 @@ pub fn build_agg_func(func: &FuncCallExpr) -> Result<Box<dyn AggFunc>> {
     match func.name.to_ascii_uppercase().as_str() {
         "COUNT" if func.distinct => Ok(Box::new(Count::distinct())),
         "COUNT" => Ok(Box::new(Count::new(func.args.is_empty()))),
+        "GROUP_CONCAT" if func.distinct => Ok(Box::new(GroupConcat::new(true))),
+        "GROUP_CONCAT" => Ok(Box::new(GroupConcat::new(false))),
         "SUM" if func.distinct => Ok(Box::new(Sum::distinct())),
         "SUM" => Ok(Box::new(Sum::default())),
         "AVG" if func.distinct => Ok(Box::new(Avg::distinct())),
