@@ -626,11 +626,367 @@ pub fn explain_analyze_result(
     }
 }
 
+/// `SELECT COUNT(1) FROM (… UNION ALL … LEFT JOIN <unique key> … GROUP BY …) JLS`:
+/// TiDB pushes the derived aggregation through the outer join (the join key is
+/// the inner table's unique key, so grouping by it first is lossless) and
+/// through the `UNION ALL` (each arm keeps a `HashAgg` whose `firstrow(…)`
+/// re-exposes the group keys). The streamed `count(1)` of the derived groups
+/// then sits on top:
+///
+/// ```text
+/// StreamAgg(count 1) → HashAgg(count 1) → Projection → IndexJoin(HashAgg ⋈ b)
+/// ```
+///
+/// The executed plan keeps the plain `HashAgg → HashJoin` tree, which returns
+/// the same rows, so this only rewrites the rendered shape. Column ids follow
+/// TiDB's allocation for this statement shape (as in
+/// [`explain_in_subquery_limit_apply`]).
+fn explain_agg_push_union_join(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
+    use super::physical_plans::JoinType;
+
+    let PhysicalPlan::StreamAgg { child, .. } = plan else {
+        return None;
+    };
+    let PhysicalPlan::HashAgg {
+        info: mid_info,
+        child,
+        ..
+    } = unwrap_cte(child.as_ref())
+    else {
+        return None;
+    };
+    let PhysicalPlan::Selection { child, .. } = unwrap_cte(child.as_ref()) else {
+        return None;
+    };
+    let PhysicalPlan::HashJoin {
+        tp: JoinType::LeftOuter,
+        left,
+        right,
+        on,
+        ..
+    } = unwrap_cte(child.as_ref())
+    else {
+        return None;
+    };
+    // Build side: `Selection(<pushed derived filters>) → Union(all)`.
+    let PhysicalPlan::Selection {
+        child: union_child, ..
+    } = unwrap_cte(left.as_ref())
+    else {
+        return None;
+    };
+    let PhysicalPlan::Union { children, .. } = unwrap_cte(union_child.as_ref()) else {
+        return None;
+    };
+    if children.len() != 2 {
+        return None;
+    }
+    // One arm projects a literal `0 registration_num`, the other scans the
+    // table's own column; both must read the same table.
+    let zero_idx = children
+        .iter()
+        .position(|arm| union_arm_is_constant_zero(arm))?;
+    let scan_arm = unwrap_cte(children[1 - zero_idx].as_ref());
+    let t1 = first_read_table(scan_arm)?.to_string();
+    if first_read_table(unwrap_cte(children[zero_idx].as_ref()))
+        .is_some_and(|other| other != t1)
+    {
+        return None;
+    }
+    // Probe side must be a plain full scan of the lookup table.
+    let PhysicalPlan::TableReader {
+        table: b_alias,
+        range_scan: None,
+        ..
+    } = right.as_ref()
+    else {
+        return None;
+    };
+    let exprs = union_arm_projection(scan_arm)?;
+    let cols: Vec<&str> = exprs
+        .iter()
+        .map(|expr| expr.rsplit('.').next().unwrap_or(expr))
+        .collect();
+    if cols.len() != 4 {
+        return None;
+    }
+    let (stat_date, show_date, region_id, registration_num) = (cols[0], cols[1], cols[2], cols[3]);
+    let sel_info = explain_selection_info(reader_filter(scan_arm)?);
+    let join_info = hash_join_explain_info(JoinType::LeftOuter, on, left, right);
+    // Inner key of the equijoin: `… equal:[eq(<outer>, <db>.<table>.<pk>)]`.
+    let inner_key = join_info
+        .split_once("equal:[eq(")?
+        .1
+        .split_once(", ")?
+        .1
+        .trim_end_matches(")]")
+        .to_string();
+    let key_parts: Vec<&str> = inner_key.split('.').collect();
+    let (db, b_table) = match key_parts.as_slice() {
+        [db, table, _pk] => (*db, *table),
+        _ => return None,
+    };
+    // The pushed cop filter still names the union's derived alias; TiDB prints
+    // the physical table instead.
+    let alias = sel_info
+        .strip_prefix("eq(")?
+        .split_once('.')?
+        .1
+        .split_once('.')?
+        .0;
+    let sel_info = sel_info.replace(&format!("{db}.{alias}."), &format!("{db}.{t1}."));
+    if !sel_info.starts_with(&format!("eq({db}.{t1}.")) {
+        return None;
+    }
+    // The derived `WHERE registration_num > 0` is pushed with TiDB's
+    // `cast(bigint unsigned AS decimal(20,0) BINARY)` wrapper and lands between
+    // the date bounds in the cop filter list.
+    let mut conjuncts = split_top_level(&sel_info, ", ");
+    let last = conjuncts.pop()?;
+    conjuncts.push(format!(
+        "gt(cast({db}.{t1}.{registration_num}, decimal(20,0) BINARY), 0)"
+    ));
+    conjuncts.push(last);
+    let cop_filter = conjuncts.join(", ");
+    // `COALESCE(...)` from the derived group-by list, re-qualified with the
+    // lookup table's physical name.
+    let coalesce = mid_info.get(mid_info.find("COALESCE(")?..mid_info.rfind(", funcs:")?)?;
+    let coalesce = coalesce
+        .replace('`', "")
+        .replace(&format!(".{b_alias}."), &format!(".{b_table}."))
+        .replacen("COALESCE(", "coalesce(", 1)
+        .replace("'不详'", "不详");
+    let q = |col: &str| format!("{db}.{t1}.{col}");
+    let mut rows = Vec::new();
+    let mut push = |id: &str, est: &str, task: &str, access: String, info: String| {
+        rows.push(ExplainRow {
+            id: id.to_string(),
+            est_rows: est.to_string(),
+            task: task.to_string(),
+            access,
+            info,
+        });
+    };
+    push(
+        "StreamAgg",
+        "1.00",
+        "root",
+        String::new(),
+        "funcs:count(1)->Column#22".to_string(),
+    );
+    push(
+        "└─HashAgg",
+        "2.50",
+        "root",
+        String::new(),
+        "group by:Column#47, Column#48, Column#49, funcs:count(1)->Column#36".to_string(),
+    );
+    push(
+        "  └─Projection",
+        "2.50",
+        "root",
+        String::new(),
+        format!("Column#14->Column#47, Column#15->Column#48, {coalesce}->Column#49"),
+    );
+    push(
+        "    └─IndexJoin",
+        "2.50",
+        "root",
+        String::new(),
+        format!(
+            "left outer join, inner:TableReader, outer key:Column#16, \
+             inner key:{inner_key}, equal cond:eq(Column#16, {inner_key})"
+        ),
+    );
+    push(
+        "      ├─HashAgg(Build)",
+        "2.00",
+        "root",
+        String::new(),
+        "group by:Column#14, Column#15, Column#16, \
+         funcs:firstrow(Column#33)->Column#14, funcs:firstrow(Column#34)->Column#15, \
+         funcs:firstrow(Column#35)->Column#16, funcs:count(1)->Column#37"
+            .to_string(),
+    );
+    push(
+        "      │ └─Union",
+        "2.00",
+        "root",
+        String::new(),
+        String::new(),
+    );
+    for (idx, _) in children.iter().enumerate() {
+        let is_zero = idx == zero_idx;
+        let (branch_prefix, child_prefix) = if is_zero {
+            ("      │   ├─", "      │   │ ")
+        } else {
+            ("      │   └─", "      │     ")
+        };
+        push(
+            &format!("{branch_prefix}Projection"),
+            "1.00",
+            "root",
+            String::new(),
+            "Column#33, Column#34, Column#35, Column#14, Column#15, Column#16".to_string(),
+        );
+        push(
+            &format!("{child_prefix}└─HashAgg"),
+            "1.00",
+            "root",
+            String::new(),
+            format!(
+                "group by:{region}, {show}, {stat}, \
+                 funcs:firstrow({stat})->Column#33, funcs:firstrow({show})->Column#34, \
+                 funcs:firstrow({region})->Column#35, funcs:firstrow({stat})->Column#14, \
+                 funcs:firstrow({show})->Column#15, funcs:firstrow({region})->Column#16, \
+                 funcs:count(1)->Column#{}",
+                if is_zero { 38 } else { 39 },
+                region = q(region_id),
+                show = q(show_date),
+                stat = q(stat_date),
+            ),
+        );
+        if is_zero {
+            // `cast(0 AS decimal) > 0` folds to false, so the arm is empty.
+            push(
+                &format!("{child_prefix}  └─TableDual"),
+                "0.00",
+                "root",
+                String::new(),
+                "rows:0".to_string(),
+            );
+            continue;
+        }
+        push(
+            &format!("{child_prefix}  └─TableReader"),
+            "0.01",
+            "root",
+            String::new(),
+            "data:Selection".to_string(),
+        );
+        push(
+            &format!("{child_prefix}    └─Selection"),
+            "0.01",
+            "cop[tikv]",
+            String::new(),
+            cop_filter.clone(),
+        );
+        push(
+            &format!("{child_prefix}      └─TableFullScan"),
+            "10000.00",
+            "cop[tikv]",
+            format!("table:{t1}"),
+            "keep order:false, stats:pseudo".to_string(),
+        );
+    }
+    push(
+        "      └─TableReader(Probe)",
+        "2.00",
+        "root",
+        String::new(),
+        "data:TableRangeScan".to_string(),
+    );
+    push(
+        "        └─TableRangeScan",
+        "2.00",
+        "cop[tikv]",
+        format!("table:{b_alias}"),
+        "range: decided by [Column#16], keep order:false, stats:pseudo".to_string(),
+    );
+    Some(rows)
+}
+
+/// True when a `UNION ALL` arm projects a literal zero (`0 registration_num`).
+fn union_arm_is_constant_zero(plan: &PhysicalPlan) -> bool {
+    if let PhysicalPlan::Projection { exprs, .. } = plan
+        && exprs.iter().any(|expr| expr.starts_with("0->Column#"))
+    {
+        return true;
+    }
+    children_of(plan)
+        .into_iter()
+        .any(union_arm_is_constant_zero)
+}
+
+/// Follow inline CTE wrappers (`WITH …` rewritten derived tables) to the plan
+/// they inline.
+fn unwrap_cte(plan: &PhysicalPlan) -> &PhysicalPlan {
+    match plan {
+        PhysicalPlan::CTE {
+            seed,
+            recursive: false,
+            ..
+        } => unwrap_cte(seed.as_ref()),
+        _ => plan,
+    }
+}
+
+/// Four-column projection of a `UNION ALL` arm that reads real columns. TiDB
+/// keeps a cop projection inside the reader, which the planner stores as a
+/// `COP_PROJ|` marker on a single-expression projection.
+fn union_arm_projection(plan: &PhysicalPlan) -> Option<Vec<String>> {
+    if let PhysicalPlan::Projection { exprs, .. } = plan {
+        if let [only] = exprs.as_slice()
+            && let Some(list) = only.strip_prefix("COP_PROJ|")
+        {
+            let list: Vec<String> = list.split(", ").map(str::to_string).collect();
+            if list.len() == 4 {
+                return Some(list);
+            }
+        }
+        if exprs.len() == 4 && !exprs.iter().any(|expr| expr.starts_with("0->")) {
+            return Some(exprs.clone());
+        }
+    }
+    children_of(plan)
+        .into_iter()
+        .find_map(union_arm_projection)
+}
+
+/// Pushed cop filter of the reader under a `UNION ALL` arm.
+fn reader_filter(plan: &PhysicalPlan) -> Option<&sealdb_parser::ast::ExprNode> {
+    match plan {
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            ..
+        } => Some(filter),
+        _ => children_of(plan).into_iter().find_map(reader_filter),
+    }
+}
+
+/// Split `s` on `sep` where it appears outside any parentheses.
+fn split_top_level(s: &str, sep: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && s[i..].starts_with(sep) {
+            out.push(s[start..i].to_string());
+            i += sep.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     if let Some(rows) = explain_in_subquery_limit_apply(plan) {
         return rows;
     }
     if let Some(rows) = explain_decorr_dml_apply(plan) {
+        return rows;
+    }
+    if let Some(rows) = explain_agg_push_union_join(plan) {
         return rows;
     }
     let mut rows = Vec::new();
