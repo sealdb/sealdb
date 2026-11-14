@@ -1172,6 +1172,35 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out))
         }
+        // MySQL `CONCAT_WS(sep, str, …)`: joins the non-NULL arguments with the
+        // separator; a NULL separator yields NULL.
+        "CONCAT_WS" => {
+            if func.args.len() < 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "CONCAT_WS requires at least 2 arguments",
+                ));
+            }
+            let sep = eval_expr_with_row(&func.args[0], schema, row)?;
+            if sep.is_null() {
+                return Ok(Datum::Null);
+            }
+            let sep = sep.as_bytes();
+            let mut out = Vec::new();
+            let mut first = true;
+            for arg in &func.args[1..] {
+                let v = eval_expr_with_row(arg, schema, row)?;
+                if v.is_null() {
+                    continue;
+                }
+                if !first {
+                    out.extend_from_slice(&sep);
+                }
+                first = false;
+                out.extend_from_slice(v.as_bytes().as_slice());
+            }
+            Ok(Datum::Bytes(out))
+        }
         // MySQL `MD5(str)`: lowercase hex digest; NULL in → NULL.
         "MD5" => {
             if func.args.len() != 1 {
@@ -1871,9 +1900,13 @@ fn eval_date_add_sub(
     let amount = eval_expr_with_row(&func.args[1], schema, row)?.as_i64()?;
     let unit = unit_name(&eval_expr_with_row(&func.args[2], schema, row)?)?;
     let mut t = datum_as_time(&base)?;
-    if matches!(base, Datum::Time(_)) {
-        // Column TIMESTAMP → session local; DATE_ADD returns DATETIME (no DST reject).
-        t = utc_to_session_local(t)?;
+    if let Datum::Time(base_time) = &base {
+        // Only a TIMESTAMP column is stored in UTC; DATE and DATETIME columns
+        // are wall clocks and must not shift with the session time zone.
+        if matches!(base_time.tp, TimeType::Timestamp) {
+            t = utc_to_session_local(t)?;
+        }
+        // DATE_ADD always returns DATETIME (no DST reject).
         t.tp = TimeType::Datetime;
     }
     let t = add_interval(t, &unit, amount, subtract)?;
