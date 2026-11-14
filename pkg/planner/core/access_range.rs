@@ -192,9 +192,20 @@ fn conjunction_key_ranges(
             {
                 continue;
             }
-            let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) else {
-                continue;
-            };
+            // A `LIKE 'prefix%'` only bounds the key; the pattern still has to
+            // filter the rows the range returns, so it is never consumed.
+            let (name, bounds, encoded) =
+                if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
+                    (name, bounds, true)
+                } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
+                    (
+                        name,
+                        vec![(Some((low, true)), Some((high, false)))],
+                        false,
+                    )
+                } else {
+                    continue;
+                };
             if !name.eq_ignore_ascii_case(&part.column) {
                 continue;
             }
@@ -226,7 +237,9 @@ fn conjunction_key_ranges(
                     return None;
                 }
             }
-            part_conjuncts.push(conjunct.clone());
+            if encoded {
+                part_conjuncts.push(conjunct.clone());
+            }
         }
         if bounds_set.is_empty() {
             break;
@@ -318,13 +331,17 @@ pub fn index_access_range(
     // An expression key part is seeked through its generating expression
     // (`tidb_shard(a) = 8` → `range:[8,8]`), not through the hidden column.
     let column = super::expr_index::part_key(info, leading);
-    let column_info = match super::expr_index::hidden_column(info, leading) {
+    let hidden = super::expr_index::hidden_column(info, leading);
+    let column_info = match hidden {
         Some(hidden) => hidden,
         None => info
             .columns
             .iter()
             .find(|c| c.name.o().eq_ignore_ascii_case(&column))?,
     };
+    // Statistics are keyed by the column behind the key part: the hidden
+    // generated column for an expression part.
+    let stats_column = column_info.name.o().to_ascii_lowercase();
     let key_access = index_key_ranges(info, index, conjuncts)?;
     let key_len = index_key_parts(info, index).map(|parts| parts.len())?;
     let key_ranges = key_access.ranges;
@@ -332,10 +349,23 @@ pub fn index_access_range(
     // arms; the composite ranges drive the seek itself.
     let mut ranges: Vec<pseudo::Bounds> = Vec::new();
     let mut consumed = key_access.consumed;
+    // Conjuncts that bounded the leading key. A `LIKE 'prefix%'` stays in the
+    // cop filter (the range is not exact) but its selectivity is already part
+    // of the range estimate, so it must not shrink the filter's row count.
+    let mut bound_conjuncts: Vec<ExprNode> = Vec::new();
     for conjunct in conjuncts {
-        let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) else {
-            continue;
-        };
+        let (name, bounds, encoded) =
+            if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
+                (name, bounds, true)
+            } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
+                (
+                    name,
+                    vec![(Some((low, true)), Some((high, false)))],
+                    false,
+                )
+            } else {
+                continue;
+            };
         if !name.eq_ignore_ascii_case(&column) {
             continue;
         }
@@ -369,9 +399,11 @@ pub fn index_access_range(
                 return None;
             }
         }
-        if !consumed
-            .iter()
-            .any(|used| used.restore_string() == conjunct.restore_string())
+        bound_conjuncts.push(conjunct.clone());
+        if encoded
+            && !consumed
+                .iter()
+                .any(|used| used.restore_string() == conjunct.restore_string())
         {
             consumed.push(conjunct.clone());
         }
@@ -407,20 +439,26 @@ pub fn index_access_range(
         None => (rows, true),
     };
     // TiDB `stats:partial[…]`: the index histogram is present but the column
-    // statistics of the key column is not, so EXPLAIN marks the scan.
+    // statistics of the key column is not, so EXPLAIN marks the scan. A hidden
+    // generated column behind an expression key part is reported through the
+    // index statistics instead, never as a missing column.
     let partial_columns = table_stats.and_then(|stats| {
-        if stats.column(&column).is_some() {
+        if hidden.is_some() || stats.column(&stats_column).is_some() {
             return None;
         }
         Some(column.to_ascii_lowercase())
     });
     // Residual conjuncts (columns beyond the leading one) keep TiDB's
     // per-column selectivity on top of the range cardinality.
+    // Both the encoded conjuncts the ranger consumed (a DNF of point arms is
+    // consumed by `index_key_ranges`, not by the leading-column loop) and the
+    // `LIKE 'prefix%'` bounds already feed the range estimate.
     let residual: Vec<ExprNode> = conjuncts
         .iter()
         .filter(|conjunct| {
             !consumed
                 .iter()
+                .chain(bound_conjuncts.iter())
                 .any(|used| used.restore_string() == conjunct.restore_string())
         })
         .cloned()
@@ -453,6 +491,17 @@ fn coerce_bound(
 ) -> Option<(sealdb_types::Datum, bool)> {
     let (value, inclusive) = bound?;
     let value = match field_type.tp {
+        // A REAL key part is a float: `e = 3` seeks the encoded `3.0`, so an
+        // integer (or decimal) literal has to take the column's type first or
+        // the encoded bounds never match the stored keys.
+        sealdb_types::TYPE_FLOAT => match &value {
+            sealdb_types::Datum::F64(_) => value,
+            other => sealdb_types::Datum::F64(f64::from(other.as_f64().ok()? as f32)),
+        },
+        sealdb_types::TYPE_DOUBLE => match &value {
+            sealdb_types::Datum::F64(_) => value,
+            other => sealdb_types::Datum::F64(other.as_f64().ok()?),
+        },
         sealdb_types::TYPE_DECIMAL | sealdb_types::TYPE_NEW_DECIMAL => match &value {
             sealdb_types::Datum::Decimal(_) => value,
             sealdb_types::Datum::I64(v) => {

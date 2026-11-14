@@ -329,6 +329,43 @@ impl ExprNode {
         }
     }
 
+    /// `expr <op> const` on any left-hand side, keyed by [`ExprNode::expr_key`]:
+    /// `a+1 > 2` reports key `a+1` so an expression index part is seeked the
+    /// same way a plain column is.
+    pub fn cmp_key_const(&self) -> Option<(String, Op, Datum)> {
+        let ExprNode::Binary(bin) = self else {
+            return None;
+        };
+        if !matches!(bin.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+            return None;
+        }
+        match (bin.left.as_ref(), bin.right.as_ref()) {
+            (left, right) if !matches!(left, ExprNode::Column(_)) => {
+                right.const_datum().map(|value| (left.expr_key(), bin.op, value))
+            }
+            (left, right) if !matches!(right, ExprNode::Column(_)) => {
+                flip_cmp(bin.op).and_then(|op| {
+                    left.const_datum().map(|value| (right.expr_key(), op, value))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `expr BETWEEN low AND high` on any left-hand side (see
+    /// [`ExprNode::cmp_key_const`]).
+    pub fn between_key_const(&self) -> Option<(String, Datum, Datum)> {
+        let ExprNode::Between(b) = self else {
+            return None;
+        };
+        if b.not || matches!(b.expr.as_ref(), ExprNode::Column(_)) {
+            return None;
+        }
+        let low = b.low.const_datum()?;
+        let high = b.high.const_datum()?;
+        Some((b.expr.expr_key(), low, high))
+    }
+
     /// Canonical text of an expression, used to match an index key part with
     /// the predicate that constrains it. Table qualifiers and quoting are
     /// dropped, so `` tidb_shard(`a`) `` and `test3.a`'s `tidb_shard(test3.a)`

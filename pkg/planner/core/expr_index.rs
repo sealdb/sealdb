@@ -16,7 +16,10 @@
 
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, TableInfo};
 use sealdb_parser::ast::dml::SelectStmt;
-use sealdb_parser::ast::expressions::{BinaryOpExpr, ExprNode};
+use sealdb_parser::ast::expressions::{
+    BetweenExpr, BinaryOpExpr, ColumnNameExpr, ExprNode, FuncCallExpr, FuncCastExpr, InListExpr,
+    IsNullExpr, PatternLikeExpr, UnaryOpExpr,
+};
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::lower::parse_expr;
 use sealdb_types::Datum;
@@ -57,6 +60,123 @@ pub fn has_expression_part(info: &TableInfo, index: &IndexInfo) -> bool {
         .columns
         .iter()
         .any(|part| hidden_column(info, part).is_some())
+}
+
+/// Expression key parts as `(expression key, hidden column name)`.
+pub fn expression_parts(info: &TableInfo, index: &IndexInfo) -> Vec<(String, String)> {
+    index
+        .columns
+        .iter()
+        .filter_map(|part| {
+            let expr = part_expr(info, part)?;
+            Some((expr.expr_key(), part.name.o().to_string()))
+        })
+        .collect()
+}
+
+/// Rewrite an expression so every expression key part stands in for the
+/// expression it stores: the part is what a covering read can return.
+pub fn substitute_parts_expr(info: &TableInfo, index: &IndexInfo, expr: &ExprNode) -> ExprNode {
+    let parts = expression_parts(info, index);
+    if parts.is_empty() {
+        return expr.clone();
+    }
+    let mut changed = false;
+    substitute_expr(expr, &parts, &mut changed)
+}
+
+/// Hidden key part that stores the value of a `VIRTUAL` generated column with
+/// the same body (`expr_idx((a+1))` answers `SELECT c` when `c` is `(a+1)`).
+pub fn part_for_virtual_column(
+    info: &TableInfo,
+    index: &IndexInfo,
+    column: &str,
+) -> Option<String> {
+    let col = info
+        .columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(column))?;
+    if col.generated_stored {
+        return None;
+    }
+    let body = parse_expr(col.generated_expr.as_deref()?).ok()?;
+    let key = body.expr_key();
+    expression_parts(info, index)
+        .into_iter()
+        .find(|(part, _)| *part == key)
+        .map(|(_, name)| name)
+}
+
+/// An index part that is a generated column defined as exactly another column
+/// (`c1 double AS (c0)`) answers that base column when both share the storage
+/// type — TiDB's generated-column substitution for covering reads.
+pub fn part_for_identity_generated(
+    info: &TableInfo,
+    index: &IndexInfo,
+    column: &str,
+) -> Option<String> {
+    let base = info
+        .columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(column))?;
+    index.columns.iter().find_map(|part| {
+        let generated = info
+            .columns
+            .iter()
+            .find(|col| col.name.o().eq_ignore_ascii_case(part.name.o()))?;
+        let body = parse_expr(generated.generated_expr.as_deref()?).ok()?;
+        let ExprNode::Column(referenced) = body else {
+            return None;
+        };
+        if !referenced.name.eq_ignore_ascii_case(column) {
+            return None;
+        }
+        // The index holds the generated column's type; only an identical type
+        // round-trips the base value (`FLOAT` vs `DOUBLE` does not).
+        if generated.field_type.tp != base.field_type.tp {
+            return None;
+        }
+        if generated.field_type.charset != base.field_type.charset
+            || generated.field_type.collate != base.field_type.collate
+        {
+            return None;
+        }
+        Some(part.name.o().to_string())
+    })
+}
+
+/// Map a covering read's projection onto the hidden key columns: the index read
+/// cannot provide the base columns an expression spells out (`a + 1`), only the
+/// value it stores, and a virtual generated column with the same body likewise.
+pub fn substitute_index_parts_for_read(
+    info: &TableInfo,
+    index: &IndexInfo,
+    expr: &ExprNode,
+) -> ExprNode {
+    let mut map = expression_parts(info, index);
+    if map.is_empty() {
+        return expr.clone();
+    }
+    for col in info
+        .columns
+        .iter()
+        .filter(|col| !col.hidden && !col.generated_stored)
+    {
+        let Some(key) = col
+            .generated_expr
+            .as_deref()
+            .and_then(|text| parse_expr(text).ok())
+            .map(|body| body.expr_key())
+        else {
+            continue;
+        };
+        if let Some((_, part)) = map.iter().find(|(candidate, _)| *candidate == key) {
+            let part = part.clone();
+            map.push((col.name.o().to_string(), part));
+        }
+    }
+    let mut changed = false;
+    substitute_expr_impl(expr, &map, true, &mut changed)
 }
 
 /// Evaluate an index part expression over the constants a predicate pins.
@@ -324,4 +444,177 @@ fn or(left: ExprNode, right: ExprNode) -> ExprNode {
         right: Box::new(right),
         single_cnf_item: false,
     })
+}
+
+/// Visible columns whose `GENERATED ALWAYS AS (expr)` body can stand in for the
+/// expression text, keyed by [`ExprNode::expr_key`].
+///
+/// Only a generated column that a secondary index keys on is substituted: TiDB
+/// `gcSubstituter` rewrites the expression so the access path can use that
+/// index, and leaves the text alone otherwise (`a+1` must keep matching an
+/// expression index `expr_idx((a+1))` when no index stores the column).
+fn generated_column_keys(info: &TableInfo) -> Vec<(String, String)> {
+    let indexed = |name: &str| {
+        info.indices.iter().any(|index| {
+            index
+                .columns
+                .iter()
+                .any(|part| part.name.o().eq_ignore_ascii_case(name))
+        })
+    };
+    info.columns
+        .iter()
+        .filter(|col| !col.hidden && indexed(col.name.o()))
+        .filter_map(|col| {
+            let body = parse_expr(col.generated_expr.as_deref()?).ok()?;
+            Some((body.expr_key(), col.name.o().to_string()))
+        })
+        .collect()
+}
+
+/// TiDB `gcSubstituter`: replace a subexpression that spells out a generated
+/// column's body with the column itself, so `WHERE a+1 = 3` seeks `idx_c(c)`.
+///
+/// A select field that is exactly the body (`SELECT a+1`) is rewritten too and
+/// keeps its written text as the output name, which lets a covering index read
+/// the stored column instead of re-evaluating the expression. Predicates and
+/// `ORDER BY` are rewritten recursively; aggregation stays as written.
+pub fn substitute_generated_columns(info: &TableInfo, select: &SelectStmt) -> Option<SelectStmt> {
+    let columns = generated_column_keys(info);
+    if columns.is_empty() {
+        return None;
+    }
+    let mut changed = false;
+    let mut rewritten = select.clone();
+    for (field, field_out) in select.fields.iter().zip(rewritten.fields.iter_mut()) {
+        if matches!(field.expr, ExprNode::Column(_)) {
+            continue;
+        }
+        let key = field.expr.expr_key();
+        if let Some((_, name)) = columns.iter().find(|(candidate, _)| *candidate == key) {
+            changed = true;
+            if field_out.as_name.as_deref().is_none_or(str::is_empty) {
+                field_out.as_name = Some(field.expr.name());
+            }
+            field_out.expr = ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: name.clone(),
+            });
+        }
+    }
+    if let Some(selection) = &select.selection {
+        rewritten.selection = Some(substitute_expr(selection, &columns, &mut changed));
+    }
+    for item in &mut rewritten.order_by {
+        item.expr = substitute_expr(&item.expr, &columns, &mut changed);
+    }
+    changed.then_some(rewritten)
+}
+
+/// [`substitute_generated_columns`] for a bare predicate. The executor's ranger
+/// rebuilds key ranges from the statement's own `WHERE`, so it has to apply the
+/// same rewrite the planner used or it scans a different range than `EXPLAIN`.
+pub fn substitute_generated_expr(info: &TableInfo, expr: &ExprNode) -> Option<ExprNode> {
+    let columns = generated_column_keys(info);
+    if columns.is_empty() {
+        return None;
+    }
+    let mut changed = false;
+    let rewritten = substitute_expr(expr, &columns, &mut changed);
+    changed.then_some(rewritten)
+}
+
+/// Recursive rewrite behind [`substitute_generated_columns`]. Subqueries keep
+/// their own scope, so they are left as written.
+fn substitute_expr(expr: &ExprNode, columns: &[(String, String)], changed: &mut bool) -> ExprNode {
+    substitute_expr_impl(expr, columns, false, changed)
+}
+
+/// `columns_too` also matches bare column references by name, which a covering
+/// expression-index read needs (`SELECT c` → the hidden key column).
+fn substitute_expr_impl(
+    expr: &ExprNode,
+    columns: &[(String, String)],
+    columns_too: bool,
+    changed: &mut bool,
+) -> ExprNode {
+    if let ExprNode::Column(col) = expr {
+        if columns_too
+            && let Some((_, name)) = columns
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&col.name))
+        {
+            *changed = true;
+            return ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: name.clone(),
+            });
+        }
+    } else {
+        let key = expr.expr_key();
+        if let Some((_, name)) = columns.iter().find(|(candidate, _)| *candidate == key) {
+            *changed = true;
+            return ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: name.clone(),
+            });
+        }
+    }
+    let substitute = |child: &ExprNode, changed: &mut bool| {
+        substitute_expr_impl(child, columns, columns_too, changed)
+    };
+    match expr {
+        ExprNode::Binary(bin) => ExprNode::Binary(BinaryOpExpr {
+            op: bin.op,
+            left: Box::new(substitute(&bin.left, changed)),
+            right: Box::new(substitute(&bin.right, changed)),
+            single_cnf_item: bin.single_cnf_item,
+        }),
+        ExprNode::Unary(unary) => ExprNode::Unary(UnaryOpExpr {
+            op: unary.op,
+            expr: Box::new(substitute(&unary.expr, changed)),
+        }),
+        ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
+            name: func.name.clone(),
+            args: func
+                .args
+                .iter()
+                .map(|arg| substitute(arg, changed))
+                .collect(),
+            distinct: func.distinct,
+        }),
+        ExprNode::Cast(cast) => ExprNode::Cast(FuncCastExpr {
+            expr: Box::new(substitute(&cast.expr, changed)),
+            target: cast.target.clone(),
+        }),
+        ExprNode::InList(list) => ExprNode::InList(InListExpr {
+            expr: Box::new(substitute(&list.expr, changed)),
+            not: list.not,
+            list: list
+                .list
+                .iter()
+                .map(|item| substitute(item, changed))
+                .collect(),
+        }),
+        ExprNode::Between(between) => ExprNode::Between(BetweenExpr {
+            expr: Box::new(substitute(&between.expr, changed)),
+            not: between.not,
+            low: Box::new(substitute(&between.low, changed)),
+            high: Box::new(substitute(&between.high, changed)),
+        }),
+        ExprNode::Like(like) => ExprNode::Like(PatternLikeExpr {
+            expr: Box::new(substitute(&like.expr, changed)),
+            not: like.not,
+            pattern: Box::new(substitute(&like.pattern, changed)),
+            ci: like.ci,
+        }),
+        ExprNode::IsNull(is_null) => ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(substitute(&is_null.expr, changed)),
+            not: is_null.not,
+        }),
+        other => other.clone(),
+    }
 }

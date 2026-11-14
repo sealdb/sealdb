@@ -47,7 +47,7 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         // TiDB `ExplainInfo` qualifies a column with the *table's* schema, not
         // the session schema (`FROM other_db.t` still prints `other_db.t.c`).
-        let _db_scope = TableDbScope::new(stmt, current_db);
+        let _db_scope = TableDbScope::new(stmt, current_db, is);
         let _stats_scope = StatsScope::new(stmt, current_db, stats);
         // Statement-wide CTE reference counts (TiDB `computeCTEInlineFlag`).
         // Computed once for the outermost statement and reused by nested
@@ -328,6 +328,29 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // TiDB `gcSubstituter`: on a single table, a predicate or
+                // `ORDER BY` that spells out a virtual generated column's body
+                // (`a+1`) is rewritten to the column (`c`) so the access path
+                // can seek/scan an index on it. Substituting before the access
+                // path *and* the pushdown keeps the range on the index instead
+                // of a `Selection` over a full scan.
+                let generated_select;
+                let select = match select
+                    .from
+                    .as_ref()
+                    .filter(|_| select.from_item.is_none() && select.joins.is_empty())
+                    .and_then(|from| {
+                        let (db, table) = from.qualified(current_db);
+                        is.and_then(|schema| schema.table_by_name(&db, &table))
+                    })
+                    .and_then(|info| super::expr_index::substitute_generated_columns(info, select))
+                {
+                    Some(rewritten) => {
+                        generated_select = rewritten;
+                        &generated_select
+                    }
+                    None => select,
+                };
                 let mut plan = if select.from_item.is_some() || !select.joins.is_empty() {
                     self.build_join_plan(select, is, current_db, stats, prune_mode)?
                 } else if let Some(from) = &select.from
@@ -463,15 +486,15 @@ impl PlanBuilder {
                     // index shared by every partition.
                     let index_order = (!select_spans_multiple_partitions(select, is, current_db)
                         || plan_reads_global_index(&plan, select, is, current_db))
-                        && plan_provides_order(select, &plan);
+                        && plan_provides_order(select, &plan, is, current_db);
                     if index_order {
                         plan = set_index_range_keep_order(plan);
-                        // A GLOBAL index read restores each row through the
-                        // partition id, so TiDB projects the table columns back
-                        // above the lookup (`Projection → IndexLookUp`).
-                        if plan_reads_global_index(&plan, select, is, current_db) {
-                            plan = wrap_global_index_projection(plan, select, is, current_db);
-                        }
+                        // The ordered index read's schema may not match the
+                        // SELECT list: a GLOBAL index lookup restores each row
+                        // through the partition id, and an index over a virtual
+                        // generated column carries the key instead of the
+                        // stored row. TiDB prints `Projection → IndexLookUp`.
+                        plan = wrap_index_order_projection(plan, select, is, current_db);
                     }
                     // `ORDER BY` a prefix of the point-get key needs no Sort: the
                     // single-row lookup already returns rows in key order.
@@ -1255,6 +1278,91 @@ fn dml_delete_rowid_projection(
     }
 }
 
+/// TiDB `DELETE` over a heap table whose indexed *virtual* generated columns
+/// are not part of the row: the DML child projects them (plus the handle) so the
+/// delete can remove their secondary index entries.
+fn dml_delete_virtual_projection(
+    plan: PhysicalPlan,
+    delete: &sealdb_parser::ast::DeleteStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> PhysicalPlan {
+    if delete.join.is_some() || !delete.tables.is_empty() {
+        return plan;
+    }
+    if !matches!(
+        plan,
+        PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+    ) {
+        return plan;
+    }
+    let Some(info) = is.and_then(|is| is.table_by_name(current_db, delete.table.resolve_name()))
+    else {
+        return plan;
+    };
+    if info.pk_is_handle {
+        return plan;
+    }
+    let schema = schema_prefix(current_db);
+    let table = delete.table.resolve_name();
+    // An expression index key part is a hidden generated column; the deleted
+    // row's key is recomputed from the base columns.
+    let mut extra: Vec<String> = Vec::new();
+    for index in &info.indices {
+        for part in &index.columns {
+            if let Some(expr) = super::expr_index::part_expr(&info, part) {
+                let text = expr_text_with_numeric_cast(&table, &info, &expr);
+                if !extra.contains(&text) {
+                    extra.push(text);
+                }
+            }
+        }
+    }
+    let mut exprs: Vec<String> = info
+        .columns
+        .iter()
+        .filter(|col| !col.hidden && col.generated_expr.is_some() && !col.generated_stored)
+        .filter(|col| {
+            // An expression-index table's DataSource computes every virtual
+            // generated column; otherwise only the ones a key part stores.
+            !extra.is_empty()
+                || info.indices.iter().any(|index| {
+                    index.columns.iter().any(|part| part.name.o() == col.name.o())
+                })
+        })
+        .map(|col| format!("{schema}.{table}.{}", col.name.o()))
+        .collect();
+    let rowid = format!("{schema}.{table}._tidb_rowid");
+    if !extra.is_empty() {
+        // TiDB keeps the DataSource projection (generated columns + expression
+        // keys + rowid) and prunes it again to just the DML's needed columns.
+        let mut inner = exprs;
+        inner.extend(extra.iter().cloned());
+        inner.push(rowid.clone());
+        let inner = PhysicalPlan::Projection {
+            exprs: inner,
+            child: Box::new(plan),
+            est_rows: None,
+        };
+        let mut outer = extra;
+        outer.push(rowid);
+        return PhysicalPlan::Projection {
+            exprs: outer,
+            child: Box::new(inner),
+            est_rows: None,
+        };
+    }
+    if exprs.is_empty() {
+        return plan;
+    }
+    exprs.push(rowid);
+    PhysicalPlan::Projection {
+        exprs,
+        child: Box::new(plan),
+        est_rows: None,
+    }
+}
+
 /// Single range comparison (`>`, `>=`, `<`, `<=`) — TiDB pseudo selectivity 1/3.
 fn dml_is_range_comparison(expr: &ExprNode) -> bool {
     use sealdb_parser::opcode::Op;
@@ -1379,8 +1487,11 @@ impl PlanBuilder {
         } else {
             plan
         };
-        Ok(Some(Box::new(dml_delete_rowid_projection(
-            plan, delete, is, current_db, stats,
+        Ok(Some(Box::new(dml_delete_virtual_projection(
+            dml_delete_rowid_projection(plan, delete, is, current_db, stats),
+            delete,
+            is,
+            current_db,
         ))))
     }
 
@@ -4273,6 +4384,14 @@ fn set_index_range_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
                 range.keep_order = true;
                 range
             });
+            // A full index scan (no decided range) keeps key order without a
+            // range: the EXPLAIN-only `KEEP_ORDER` marker is the only carrier,
+            // and the executor reads it to avoid re-sorting by handle.
+            let pushed = if range_scan.is_none() && pushed.is_none() {
+                Some(bytes_info("KEEP_ORDER"))
+            } else {
+                pushed
+            };
             PhysicalPlan::IndexReader {
                 table,
                 index,
@@ -4301,6 +4420,11 @@ fn set_index_range_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
                 range.keep_order = true;
                 range
             });
+            let pushed = if range_scan.is_none() && pushed.is_none() {
+                Some(bytes_info("KEEP_ORDER"))
+            } else {
+                pushed
+            };
             PhysicalPlan::IndexLookUpReader {
                 table,
                 index,
@@ -6171,6 +6295,17 @@ thread_local! {
     /// (OrigTblName) always qualifies columns with the physical name.
     static TABLE_PHYS_MAP: std::cell::RefCell<Vec<std::collections::HashMap<String, String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// `(table, column)` → field type of the statement's tables. TiDB EXPLAIN
+    /// prints the implicit string cast a string builtin wraps around a
+    /// non-string argument (`md5(cast(s, var_string(20)))`).
+    static TABLE_COL_TYPE: std::cell::RefCell<
+        Vec<std::collections::HashMap<(String, String), sealdb_types::FieldType>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// Flattened snapshot of [`TABLE_COL_TYPE`] (EXPLAIN renders after the
+    /// statement scope drops).
+    static LAST_TABLE_COL_TYPE: std::cell::RefCell<
+        std::collections::HashMap<(String, String), sealdb_types::FieldType>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
     /// Flattened alias → physical map of the statement(s) built most recently
     /// on this thread. EXPLAIN renders a finished plan *after* [`TableDbScope`]
     /// drops, so this snapshot keeps OrigTblName qualification available.
@@ -6340,7 +6475,7 @@ fn in_explain_build() -> bool {
 struct TableDbScope;
 
 impl TableDbScope {
-    fn new(stmt: &Statement, current_db: &str) -> Self {
+    fn new(stmt: &Statement, current_db: &str, is: Option<&InfoSchema>) -> Self {
         let mut map = std::collections::HashMap::new();
         // `EXPLAIN <select>` plans the inner statement.
         let stmt = match stmt {
@@ -6362,14 +6497,39 @@ impl TableDbScope {
         }
         TABLE_DB_MAP.with(|stack| stack.borrow_mut().push(map));
         let mut phys = std::collections::HashMap::new();
+        let mut types = std::collections::HashMap::new();
         if let Statement::Select(select) = stmt {
             for table in select.join_tables() {
                 let physical = table.resolve_name().to_ascii_lowercase();
                 phys.insert(table.name.to_ascii_lowercase(), physical.clone());
                 phys.insert(physical.clone(), physical);
+                let db = table
+                    .schema
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| (!current_db.is_empty()).then(|| current_db.to_string()));
+                let Some(info) = is.and_then(|is| {
+                    let db = db.as_deref()?;
+                    is.table_by_name(db, &table.resolve_name())
+                }) else {
+                    continue;
+                };
+                for column in info.columns.iter().filter(|c| !c.hidden) {
+                    let key = (
+                        table.name.to_ascii_lowercase(),
+                        column.name.o().to_ascii_lowercase(),
+                    );
+                    types.insert(key, column.field_type.clone());
+                    let key = (
+                        table.resolve_name().to_ascii_lowercase(),
+                        column.name.o().to_ascii_lowercase(),
+                    );
+                    types.insert(key, column.field_type.clone());
+                }
             }
         }
         TABLE_PHYS_MAP.with(|stack| stack.borrow_mut().push(phys));
+        TABLE_COL_TYPE.with(|stack| stack.borrow_mut().push(types));
         Self
     }
 }
@@ -6382,7 +6542,35 @@ impl Drop for TableDbScope {
         TABLE_PHYS_MAP.with(|stack| {
             stack.borrow_mut().pop();
         });
+        if let Some(types) = TABLE_COL_TYPE.with(|stack| stack.borrow_mut().pop()) {
+            LAST_TABLE_COL_TYPE.with(|last| {
+                let mut last = last.borrow_mut();
+                for (key, value) in types {
+                    last.insert(key, value);
+                }
+            });
+        }
     }
+}
+
+/// Field type of `table.column` as recorded by [`TableDbScope`].
+pub(crate) fn explain_column_type(
+    table: &str,
+    column: &str,
+) -> Option<sealdb_types::FieldType> {
+    let key = (
+        table.to_ascii_lowercase(),
+        column.to_ascii_lowercase(),
+    );
+    TABLE_COL_TYPE
+        .with(|stack| {
+            stack
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|map| map.get(&key).cloned())
+        })
+        .or_else(|| LAST_TABLE_COL_TYPE.with(|last| last.borrow().get(&key).cloned()))
 }
 
 /// Schema of `table` as recorded by [`TableDbScope`] (`None` for derived
@@ -6973,6 +7161,12 @@ fn wrap_output_projection(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
+    // UPDATE/DELETE scan the target through a synthesized empty-text SELECT;
+    // TiDB reads the row handle there and the DML node owns the projection, so
+    // the SELECT-list projection belongs to a real query only.
+    if select.text.is_empty() && select.from_item.is_none() {
+        return plan;
+    }
     // A table with an expression index carries a hidden generated column in
     // its DataSource schema, so `SELECT *` must project the user columns back
     // out. TiDB only adds that column when the expression index takes part in
@@ -8273,7 +8467,12 @@ fn normalize_bit_expr(
 /// Shard rewrite for a single-table SELECT: `a = const` gains the folded
 /// `tidb_shard(a) = <bucket>` conjunct TiDB's planner adds (see
 /// [`super::expr_index::shard_index_rewrite`]).
-/// Projection TiDB puts above a point get on an expression index.
+/// Projection TiDB puts above a read of an expression index.
+///
+/// The index stores a hidden generated column instead of the expression text,
+/// so the reader's schema cannot answer the SELECT list: a star select gets the
+/// table columns back, and an expression field is re-evaluated above the read
+/// (`plus(t.a, 1)->Column#8`).
 fn expr_index_point_projection(
     plan: PhysicalPlan,
     select: &SelectStmt,
@@ -8286,9 +8485,24 @@ fn expr_index_point_projection(
         }
         | PhysicalPlan::BatchPointGet {
             index: Some(index), ..
-        } => index.clone(),
+        }
+        | PhysicalPlan::IndexReader { index, .. }
+        | PhysicalPlan::IndexLookUpReader { index, .. } => index.clone(),
         _ => return plan,
     };
+    // UPDATE/DELETE scan their target through a synthesized empty-text SELECT.
+    // TiDB reads the row handle there, not the select list, so the projection
+    // that restores `*` belongs to UPDATE, not to the read.
+    if std::env::var("SEALDB_DEBUG_EXPRPROJ").is_ok() {
+        eprintln!(
+            "exprproj index={index} star={} text={:?}",
+            is_star_select(select),
+            select.text
+        );
+    }
+    if select.text.is_empty() {
+        return plan;
+    }
     let (Some(is), Some(from)) = (is, select.from.as_ref()) else {
         return plan;
     };
@@ -8310,13 +8524,40 @@ fn expr_index_point_projection(
         return plan;
     }
     let exprs = if is_star_select(select) {
-        let exprs = star_projection_exprs(select, Some(is), current_db);
+        let mut exprs = star_projection_exprs(select, Some(is), current_db);
         if exprs.is_empty() {
             return plan;
         }
+        if index_read_keeps_order(&plan) {
+            // An ordered expression-index read hands the table side no hidden
+            // key column, so TiDB's projection recomputes every expression
+            // index part from the base columns (`plus(t.a, 1)`).
+            for idx in &info.indices {
+                for part in &idx.columns {
+                    if let Some(expr) = super::expr_index::part_expr(info, part) {
+                        exprs.push(expr_text_with_numeric_cast(&from.name, info, &expr));
+                    }
+                }
+            }
+        }
         exprs
     } else {
-        let mut next_id = info.max_col_id + 1;
+        // A re-evaluated expression that an expression key part also stores
+        // consumes one intermediate column below the projection, so TiDB's
+        // output column id starts one higher (`plus(t.a, 1)->Column#8`); an
+        // ordered read allocates one more for the sort key (`->Column#9`).
+        let mut next_id: i64 = info.max_col_id
+            + 1
+            + i64::from(
+                matches!(
+                    plan,
+                    PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+                ) && select
+                    .fields
+                    .iter()
+                    .any(|field| expression_part_matches(info, index_info, &field.expr)),
+            )
+            + i64::from(index_read_keeps_order(&plan));
         select
             .fields
             .iter()
@@ -8327,7 +8568,7 @@ fn expr_index_point_projection(
                 expr => {
                     let text = format!(
                         "{}->Column#{}",
-                        crate::core::explain::explain_pushed_filter(&from.name, expr),
+                        expr_text_with_numeric_cast(&from.name, info, expr),
                         next_id
                     );
                     next_id += 1;
@@ -8341,6 +8582,89 @@ fn expr_index_point_projection(
         child: Box::new(plan),
         est_rows: None,
     }
+}
+
+/// TiDB's expression text spells out the implicit numeric coercion of a mixed
+/// integer/float arithmetic (`plus(t.b, cast(t.a, double BINARY))`).
+fn expr_text_with_numeric_cast(
+    table: &str,
+    info: &sealdb_meta::TableInfo,
+    expr: &ExprNode,
+) -> String {
+    let rendered = |expr: &ExprNode| crate::core::explain::explain_pushed_filter(table, expr);
+    if let ExprNode::Binary(bin) = expr {
+        let op = match bin.op {
+            Op::Plus => Some("plus"),
+            Op::Minus => Some("minus"),
+            Op::Mul => Some("mul"),
+            Op::Div => Some("div"),
+            _ => None,
+        };
+        if let Some(op) = op {
+            let (left, right) = (bin.left.as_ref(), bin.right.as_ref());
+            if expr_column_is_float(info, left) && expr_column_is_integer(info, right) {
+                return format!(
+                    "{op}({}, cast({}, double BINARY))",
+                    rendered(left),
+                    rendered(right)
+                );
+            }
+            if expr_column_is_float(info, right) && expr_column_is_integer(info, left) {
+                return format!(
+                    "{op}(cast({}, double BINARY), {})",
+                    rendered(left),
+                    rendered(right)
+                );
+            }
+        }
+    }
+    rendered(expr)
+}
+
+fn expr_column_type<'a>(
+    info: &'a sealdb_meta::TableInfo,
+    expr: &ExprNode,
+) -> Option<&'a sealdb_meta::ColumnInfo> {
+    let ExprNode::Column(column) = expr else {
+        return None;
+    };
+    info.columns
+        .iter()
+        .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))
+}
+
+fn expr_column_is_float(info: &sealdb_meta::TableInfo, expr: &ExprNode) -> bool {
+    expr_column_type(info, expr).is_some_and(|col| {
+        matches!(
+            col.field_type.tp,
+            sealdb_types::TYPE_FLOAT | sealdb_types::TYPE_DOUBLE
+        )
+    })
+}
+
+fn expr_column_is_integer(info: &sealdb_meta::TableInfo, expr: &ExprNode) -> bool {
+    expr_column_type(info, expr).is_some_and(|col| {
+        matches!(
+            col.field_type.tp,
+            sealdb_types::TYPE_TINY
+                | sealdb_types::TYPE_SHORT
+                | sealdb_types::TYPE_INT24
+                | sealdb_types::TYPE_LONG
+                | sealdb_types::TYPE_LONG_LONG
+        )
+    })
+}
+
+/// `expr` is exactly one of the index's expression key parts.
+fn expression_part_matches(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    expr: &ExprNode,
+) -> bool {
+    let key = expr.expr_key();
+    super::expr_index::expression_parts(info, index)
+        .iter()
+        .any(|(part, _)| *part == key)
 }
 
 fn shard_rewrite_select(
@@ -8712,6 +9036,19 @@ fn has_timestamp_bound(
 }
 
 fn index_ignored(from: &TableName, name: &str) -> bool {
+    // An empty hint list forbids every index: `IGNORE INDEX()` and `USE INDEX()`
+    // both leave the table scan (`FROM t USE INDEX()` is TiDB's "no index").
+    if from.ignore_index_hint && from.ignore_indexes.is_empty() {
+        return true;
+    }
+    if from.use_index_hint
+        && !from
+            .use_indexes
+            .iter()
+            .any(|used| used.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
     from.ignore_indexes
         .iter()
         .any(|ignored| ignored.eq_ignore_ascii_case(name))
@@ -8727,6 +9064,9 @@ fn index_allowed(from: &TableName, name: &str, only_index: Option<&str>) -> bool
 /// TiDB index visibility: an `INVISIBLE` index is never an access path unless a
 /// `USE INDEX` / `FORCE INDEX` hint names it.
 fn index_visible(from: &TableName, index: &sealdb_meta::model::IndexInfo) -> bool {
+    if index_ignored(from, index.name.o()) {
+        return false;
+    }
     !index.invisible
         || from
             .use_indexes
@@ -8759,7 +9099,9 @@ fn unique_index_eq_point(
             // handle is reached through the handle path instead of an index.
             && !(idx.primary && info.pk_is_handle)
             && !idx.invisible
-            && idx.columns.len() > 1
+            // A unique expression index pins its hidden key just like a plain
+            // unique column (`where a+1 = 3` → `Point_Get`).
+            && (idx.columns.len() > 1 || super::expr_index::has_expression_part(info, idx))
             && index_allowed(from, idx.name.o(), only_index)
             && idx
                 .columns
@@ -11031,15 +11373,37 @@ fn expr_range_plan(
         !(idx.primary && info.pk_is_clustered())
             && !index_ignored(from, idx.name.o())
             && super::expr_index::has_expression_part(info, idx)
-            && idx.columns.first().is_some_and(|leading| {
-                let key = super::expr_index::part_key(info, leading);
-                conjuncts.iter().any(|conjunct| {
-                    sealdb_statistics::pseudo::conjunct_bound_sets(conjunct)
-                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&key))
-                })
-            })
+            // A range over the leading part (`tidb_shard(a) = 8`, `a+1 > 2`, a
+            // LIKE prefix), or one point range per DNF arm that pins every
+            // expression part (`(lower(b)="a" and a+1=2) or …`).
+            && super::access_range::index_key_ranges(info, idx, &conjuncts).is_some()
+            // A DNF of full-key points on a UNIQUE expression index is a
+            // `Batch_Point_Get` (`a=100 or a=300` → `uk_expr((tidb_shard(a)),a)`),
+            // which `dnf_unique_point` builds; an index range would lose it.
+            && !dnf_pins_unique_key(info, idx, &conjuncts)
     })?;
     Some(index_plan(select, from, info, index, prune_mode, join_keys))
+}
+
+/// Every DNF arm pins the whole key of the `UNIQUE` index, so TiDB reads the
+/// statement as a batch point get instead of one range per arm.
+fn dnf_pins_unique_key(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::model::IndexInfo,
+    conjuncts: &[ExprNode],
+) -> bool {
+    if !index.unique {
+        return false;
+    }
+    let [single] = conjuncts else {
+        return false;
+    };
+    let arms = single.split_dnf();
+    if arms.len() < 2 {
+        return false;
+    }
+    arms.iter()
+        .all(|arm| super::expr_index::pinned_tuple(info, index, &arm.split_cnf_all()).is_some())
 }
 
 /// `col = a OR col = b …` on one indexed leading column: TiDB ranger seeks the
@@ -12090,7 +12454,42 @@ fn select_covers_index_for(
                 .collect::<Vec<_>>(),
         );
     }
-    info.index_covers(index, &select_needed_columns(select, name))
+    // An expression key part answers the expression it stores, and a virtual
+    // generated column with the same body (`expr_idx((a+1))` serves
+    // `a+1` / `c` without a table lookup), so rewrite before collecting the
+    // needed columns.
+    let mut rewritten = select.clone();
+    let rewrite = |expr: &ExprNode| super::expr_index::substitute_parts_expr(info, index, expr);
+    for field in &mut rewritten.fields {
+        field.expr = rewrite(&field.expr);
+    }
+    if let Some(selection) = &mut rewritten.selection {
+        *selection = rewrite(selection);
+    }
+    for expr in &mut rewritten.group_by {
+        *expr = rewrite(expr);
+    }
+    if let Some(having) = &mut rewritten.having {
+        *having = rewrite(having);
+    }
+    for item in &mut rewritten.order_by {
+        item.expr = rewrite(&item.expr);
+    }
+    for join in &mut rewritten.joins {
+        join.on = rewrite(&join.on);
+    }
+    let mut needed = select_needed_columns(&rewritten, name);
+    for column in needed.iter_mut() {
+        if let Some(part) = super::expr_index::part_for_virtual_column(info, index, column) {
+            *column = part;
+        }
+    }
+    for column in needed.iter_mut() {
+        if let Some(part) = super::expr_index::part_for_identity_generated(info, index, column) {
+            *column = part;
+        }
+    }
+    info.index_covers(index, &needed)
 }
 
 fn select_needed_columns(select: &SelectStmt, table: Option<&str>) -> Vec<String> {
@@ -12364,14 +12763,39 @@ fn group_by_index_plan(
     info: &sealdb_meta::TableInfo,
     prune_mode: PartitionPruneMode,
     join_keys: &[String],
+    stats: Option<&Handle>,
+    current_db: &str,
 ) -> Option<PhysicalPlan> {
     let group_cols = group_by_column_names(select)?;
     if group_cols.is_empty() {
         return None;
     }
     for index in &info.indices {
-        if !index_has_group_prefix(index, &group_cols) {
+        if index_ignored(from, index.name.o()) {
             continue;
+        }
+        if !index_has_group_prefix(info, index, &group_cols) {
+            continue;
+        }
+        // An expression index key part answers `GROUP BY upper(b)` from the
+        // index alone: the scan keeps key order and the StreamAgg groups on the
+        // key expression. The index schema only carries the hidden column, so
+        // the shape is EXPLAIN-only and execution keeps the table scan.
+        if super::expr_index::has_expression_part(info, index) {
+            if !in_explain_build() || select.selection.is_some() {
+                continue;
+            }
+            let reader = PhysicalPlan::IndexReader {
+                table: from.name.clone(),
+                index: index.name.o().to_string(),
+                index_columns: index_key_column_names(info, index),
+                partitions: Vec::new(),
+                partition_access: String::new(),
+                row_count: table_row_count(stats, from, current_db),
+                pushed: None,
+                range_scan: None,
+            };
+            return Some(set_index_range_keep_order(reader));
         }
         if select_covers_index_for(select, Some(&from.name), info, index) {
             return Some(index_plan(select, from, info, index, prune_mode, join_keys));
@@ -12609,22 +13033,34 @@ fn count_star_unique_join_plan(
 fn group_by_column_names(select: &SelectStmt) -> Option<Vec<String>> {
     let mut cols = Vec::with_capacity(select.group_by.len());
     for expr in &select.group_by {
-        match expr {
-            ExprNode::Column(col) => cols.push(col.name.clone()),
-            _ => return None,
-        }
+        // A group-by expression (`GROUP BY upper(b)`) matches an expression
+        // index key part through its canonical text.
+        cols.push(match expr {
+            ExprNode::Column(col) => col.name.clone(),
+            other => other.expr_key(),
+        });
     }
     Some(cols)
 }
 
-fn index_has_group_prefix(index: &sealdb_meta::IndexInfo, group_cols: &[String]) -> bool {
-    if group_cols.is_empty() || group_cols.len() > index.columns.len() {
+fn index_has_group_prefix(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    group_cols: &[String],
+) -> bool {
+    if group_cols.is_empty() {
+        return false;
+    }
+    // An expression key part is named by its expression (`upper(b)`), not by
+    // the hidden column the DDL stores it in.
+    let keys = super::expr_index::part_keys(info, index);
+    if group_cols.len() > keys.len() {
         return false;
     }
     group_cols
         .iter()
-        .enumerate()
-        .all(|(i, name)| index.columns[i].name.o().eq_ignore_ascii_case(name))
+        .zip(keys.iter())
+        .all(|(name, key)| key.eq_ignore_ascii_case(name))
 }
 
 fn order_prefix_of_group_by(select: &SelectStmt) -> bool {
@@ -12984,10 +13420,12 @@ fn agg_int_decimal_cast(
 /// TiDB cost model v2 picks the physical aggregate for a scalar aggregation by
 /// cost: a 2-phase `HashAgg` amortises the cop partial aggregation over
 /// `tidb_executor_concurrency` while `StreamAgg` pays the full per-row CPU, so
-/// hash wins once the input cardinality exceeds the ~234-row crossover. With
+/// hash only wins once the input cardinality is large. The recorded goldens
+/// bound the cop crossover between 107 rows (`clustered_index`, StreamAgg) and
+/// 799 rows (`clustered_index`, HashAgg); 512 sits inside that window. With
 /// pseudo (unanalyzed) statistics TiDB keeps the streaming aggregate.
 fn scalar_agg_prefers_hash(plan: &PhysicalPlan) -> bool {
-    const HASH_AGG_CROSSOVER_ROWS: f64 = 234.0;
+    const HASH_AGG_CROSSOVER_ROWS: f64 = 512.0;
     match agg_input_cardinality(plan) {
         Some((rows, false)) => rows > HASH_AGG_CROSSOVER_ROWS,
         _ => false,
@@ -13140,6 +13578,67 @@ fn build_agg_plan(
         matches!(plan, PhysicalPlan::IndexReader { .. }) && !select.group_by.is_empty();
     let stream = select.group_by.is_empty() || keep_order;
     let partial_col = partial_agg_column_id(select);
+
+    // `GROUP BY <expr>` over a single table: TiDB evaluates the group key in a
+    // Projection below the aggregate when no index key provides it
+    // (`HashAgg group by:Column#10 → Projection upper(t.b)->Column#10`), or
+    // groups straight on the key expression when an expression index answers
+    // it (`StreamAgg group by:upper(t.b)`). Explain-only: both shapes print
+    // column ids the executor does not build.
+    if in_explain_build()
+        && select.joins.is_empty()
+        && select.group_by.len() == 1
+        && !matches!(&select.group_by[0], ExprNode::Column(_))
+        && !select.distinct
+        && let Some(field) = select.fields.first()
+        && let ExprNode::Func(agg) = &field.expr
+        && is_agg_expr(&field.expr)
+        && agg.args.len() == 1
+        && agg.args[0].expr_key() == select.group_by[0].expr_key()
+    {
+        let group_info = super::explain::explain_scalar_expr(&select.group_by[0], table);
+        let agg_fn = agg.name.to_ascii_lowercase();
+        let arg = super::explain::explain_scalar_expr(&agg.args[0], table);
+        if let PhysicalPlan::IndexReader {
+            row_count,
+            index_columns,
+            ..
+        } = &plan
+        {
+            // The key expression is the index's leading part, so a full index
+            // scan streams the groups in key order. The aggregate's output id
+            // follows the partial state reserved over the index key.
+            let _ = index_columns;
+            let out_col = scalar_agg_out_column(table, &agg_db, is).unwrap_or(5);
+            let info = format!("group by:{group_info}, funcs:{agg_fn}({arg})->Column#{out_col}");
+            let est = (row_count * DISTINCT_UNION_EST_FACTOR).max(1.0);
+            return (
+                PhysicalPlan::stream_agg(plan, info, String::new(), est),
+                true,
+            );
+        }
+        if let PhysicalPlan::TableReader {
+            row_count,
+            stats_pseudo: false,
+            ..
+        } = &plan
+        {
+            let row_count = *row_count;
+            // TiDB `AllocPlanColumnID`: the projection output follows the
+            // aggregate's own ids (group key + partial state).
+            let proj_col = partial_agg_column_id(select);
+            let agg_out = scalar_agg_out_column(table, &agg_db, is).unwrap_or(proj_col);
+            let info = format!(
+                "group by:Column#{proj_col}, funcs:{agg_fn}(Column#{proj_col})->Column#{agg_out}"
+            );
+            let projection = PhysicalPlan::Projection {
+                exprs: vec![format!("{group_info}->Column#{proj_col}")],
+                child: Box::new(plan),
+                est_rows: None,
+            };
+            return (PhysicalPlan::hash_agg(projection, info, row_count), false);
+        }
+    }
 
     if select.distinct && select.group_by.is_empty() {
         // TiDB `AggregationEliminator`: `DISTINCT` over columns that contain a
@@ -21379,6 +21878,18 @@ fn access_plan_inner(
             };
             &visible_info
         };
+        // TiDB `gcSubstituter`: `WHERE a+1 = 3` names the body of the virtual
+        // generated column `c`, so the predicate rewrites to `c = 3` and
+        // `idx_c(c)` serves it. `ORDER BY a+1` rewrites the same way to let the
+        // index provide the order.
+        let generated_select;
+        let select = match super::expr_index::substitute_generated_columns(info, select) {
+            Some(rewritten) => {
+                generated_select = rewritten;
+                &generated_select
+            }
+            None => select,
+        };
         // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
         let eqs = eq_key_consts(select.selection.as_ref());
         if !from.use_indexes.is_empty() {
@@ -21774,7 +22285,9 @@ fn access_plan_inner(
             return plan;
         }
         // GROUP BY prefix of a secondary index → IndexReader + StreamAgg keep order.
-        if let Some(plan) = group_by_index_plan(select, from, info, prune_mode, &join_keys) {
+        if let Some(plan) =
+            group_by_index_plan(select, from, info, prune_mode, &join_keys, stats, current_db)
+        {
             return plan;
         }
         // Plain column projection fully covered by a secondary index (or by a
@@ -22305,7 +22818,7 @@ fn ordered_index_plan(
         probe_selection_info,
         probe_est,
         range_scan,
-        pushed: if in_explain_build() {
+        pushed: if pushed.is_none() {
             Some(bytes_info("KEEP_ORDER"))
         } else {
             pushed
@@ -22337,15 +22850,17 @@ fn order_by_index_plan(
     }
     let mut columns = Vec::with_capacity(select.order_by.len());
     for item in &select.order_by {
-        let ExprNode::Column(col) = &item.expr else {
-            return None;
-        };
         // `keep order:true, desc` needs the reverse index scan; only the
         // ascending shape is modeled.
         if item.desc {
             return None;
         }
-        columns.push(col.name.clone());
+        // An expression key part is ordered through its body (`ORDER BY a+1`
+        // on `expr_idx_c((a+1))`), not through a plain column.
+        columns.push(match &item.expr {
+            ExprNode::Column(col) => col.name.clone(),
+            other => other.expr_key(),
+        });
     }
     let index = info
         .indices
@@ -22353,20 +22868,15 @@ fn order_by_index_plan(
         .filter(|idx| {
             !(idx.primary && info.pk_is_clustered())
                 && !index_ignored(from, idx.name.o())
-                && !super::expr_index::has_expression_part(info, idx)
         })
         .find(|idx| {
-            let keys = index_key_column_names(info, idx);
+            let keys = super::expr_index::part_keys(info, idx);
             keys.len() >= columns.len()
                 && keys
                     .iter()
                     .zip(&columns)
                     .all(|(key, col)| key.eq_ignore_ascii_case(col))
         })?;
-    if index_covers_needed(index, select, join_keys, info, from) {
-        // A covering index is the plain projection path's job.
-        return None;
-    }
     let mut plan = index_plan(select, from, info, index, prune_mode, join_keys);
     if partition_read_spans_multiple(info, from) && !index.global {
         // Rows arrive partition by partition, so the index keys only order each
@@ -22381,12 +22891,29 @@ fn order_by_index_plan(
         // The index read scans every key, so the cop task sizes the scan (and
         // the table probe) at the table's row count.
         *row_count = table_row_count(stats, from, current_db);
-        if in_explain_build() {
+        if pushed.is_none() {
             *pushed = Some(bytes_info("KEEP_ORDER"));
         }
         return Some(plan);
     }
+    // A covering expression index answers `ORDER BY a+1` from the index alone:
+    // the scan keeps key order and no `Sort` is needed.
+    if matches!(plan, PhysicalPlan::IndexReader { .. }) {
+        return Some(set_index_range_keep_order(plan));
+    }
     None
+}
+
+/// One of the index key columns is a `VIRTUAL` generated column: the index read
+/// yields its value, and the table row does not store it.
+fn index_has_virtual_key(info: &sealdb_meta::TableInfo, index: &sealdb_meta::IndexInfo) -> bool {
+    index_key_column_names(info, index).iter().any(|key| {
+        info.columns.iter().any(|col| {
+            col.name.o().eq_ignore_ascii_case(key)
+                && col.generated_expr.is_some()
+                && !col.generated_stored
+        })
+    })
 }
 
 /// A read of a partitioned table that spans more than one partition returns its
@@ -22415,20 +22942,85 @@ fn select_spans_multiple_partitions(
         .is_some_and(|info| partition_read_spans_multiple(info, from))
 }
 
-/// A GLOBAL index lookup prints its columns back through a `Projection`
-/// (`Projection → IndexLookUp`), like TiDB's global-index reader schema.
-fn wrap_global_index_projection(
+/// An ordered index read whose schema is not the SELECT list prints the columns
+/// back through a `Projection` (`Projection → IndexLookUp`). Two shapes need it:
+/// a GLOBAL index lookup (rows are restored through the partition id) and an
+/// index over a `VIRTUAL` generated column (the index carries the value, the
+/// stored row does not).
+fn wrap_index_order_projection(
     plan: PhysicalPlan,
     select: &SelectStmt,
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
-    if !matches!(plan, PhysicalPlan::IndexLookUpReader { .. }) || !is_star_select(select) {
+    if !is_star_select(select) {
+        return plan;
+    }
+    // The read may already wear its expression-index projection (the reader
+    // schema cannot answer the select list); the order still comes from the
+    // index plan underneath.
+    let index_name = match &plan {
+        PhysicalPlan::IndexLookUpReader { index, .. } | PhysicalPlan::IndexReader { index, .. } => {
+            index.clone()
+        }
+        PhysicalPlan::Projection { child, .. } => match child.as_ref() {
+            PhysicalPlan::IndexLookUpReader { index, .. }
+            | PhysicalPlan::IndexReader { index, .. } => index.clone(),
+            _ => return plan,
+        },
+        _ => return plan,
+    };
+    let Some(from) = select.from.as_ref() else {
+        return plan;
+    };
+    let (db, table) = from.qualified(current_db);
+    let Some(info) = is.and_then(|schema| schema.table_by_name(&db, &table)) else {
+        return plan;
+    };
+    let Some(index) = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(&index_name))
+    else {
+        return plan;
+    };
+    if !index.global && !index_has_virtual_key(&info, index) && !super::expr_index::has_expression_part(&info, index) {
         return plan;
     }
     let exprs = star_projection_exprs(select, is, current_db);
     if exprs.is_empty() {
         return plan;
+    }
+    if super::expr_index::has_expression_part(&info, index) {
+        // The table row does not carry an expression key part, so TiDB keeps a
+        // Projection above the lookup that recomputes every expression index's
+        // hidden key from the base columns, then prunes back to `*`. The
+        // expression-index projection already present is that inner layer.
+        if matches!(plan, PhysicalPlan::Projection { .. }) {
+            return PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(plan),
+                est_rows: None,
+            };
+        }
+        let mut inner = exprs.clone();
+        for idx in &info.indices {
+            for part in &idx.columns {
+                if let Some(expr) = super::expr_index::part_expr(&info, part) {
+                    inner.push(expr_text_with_numeric_cast(&from.name, &info, &expr));
+                }
+            }
+        }
+        let inner = PhysicalPlan::Projection {
+            exprs: inner,
+            child: Box::new(plan),
+            est_rows: None,
+        };
+        return PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(inner),
+            est_rows: None,
+        };
     }
     PhysicalPlan::Projection {
         exprs,
@@ -22570,7 +23162,32 @@ fn equality_prefix_len(index_columns: &[String], pushed: Option<&ExprNode>) -> u
     index_columns.iter().take_while(|key| fixed(key)).count()
 }
 
-fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
+/// Does this index read keep its key order (explicit range flag or the
+/// EXPLAIN-only `KEEP_ORDER` marker on a full scan)?
+fn index_read_keeps_order(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::IndexLookUpReader {
+            range_scan, pushed, ..
+        }
+        | PhysicalPlan::IndexReader {
+            range_scan, pushed, ..
+        } => {
+            range_scan.as_ref().is_some_and(|range| range.keep_order)
+                || pushed.as_ref().is_some_and(|pushed| {
+                    matches!(pushed, ExprNode::Value(value)
+                        if matches!(&value.datum, Datum::Bytes(bytes) if bytes.starts_with(b"KEEP_ORDER")))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn plan_provides_order(
+    select: &SelectStmt,
+    plan: &PhysicalPlan,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> bool {
     if select.order_by.is_empty() {
         return false;
     }
@@ -22579,6 +23196,16 @@ fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
     // below a `UnionScan`, which passes the order through.
     let plan = match plan {
         PhysicalPlan::UnionScan { child, .. } => child.as_ref(),
+        // An expression-index read wears a Projection that restores the select
+        // list; the ordered index underneath still fixes the row order.
+        PhysicalPlan::Projection { child, .. }
+            if matches!(
+                child.as_ref(),
+                PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+            ) =>
+        {
+            child.as_ref()
+        }
         other => other,
     };
     if let PhysicalPlan::IndexMerge {
@@ -22601,17 +23228,19 @@ fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
     // ordered by the remaining keys). A non-equality decided range carries its
     // own `keep order` flag (and `Sort` semantics) in EXPLAIN, and a
     // multi-partition read returns rows partition by partition.
-    let (keys, fixed) = match plan {
+    let (keys, fixed, index_name) = match plan {
         PhysicalPlan::IndexLookUpReader {
             index_columns,
             range_scan,
             pushed,
+            index,
             ..
         }
         | PhysicalPlan::IndexReader {
             index_columns,
             range_scan,
             pushed,
+            index,
             ..
         } => (
             index_columns,
@@ -22619,18 +23248,35 @@ fn plan_provides_order(select: &SelectStmt, plan: &PhysicalPlan) -> bool {
                 equality_prefix_len(index_columns, pushed.as_ref())
                     .max(range_equality_prefix(&range.text))
             }),
+            index,
         ),
         _ => return false,
     };
+    // Expression key parts are ordered through their generating expression
+    // (`ORDER BY a+1` on `expr_idx_c((a+1))`), so compare against the canonical
+    // part keys instead of the printed index columns.
+    let canonical = is
+        .zip(select.from.as_ref())
+        .and_then(|(is, from)| {
+            let (db, table) = from.qualified(current_db);
+            let info = is.table_by_name(&db, &table)?;
+            let index = info
+                .indices
+                .iter()
+                .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+            Some(super::expr_index::part_keys(info, index))
+        });
+    let keys: Vec<String> = canonical.unwrap_or_else(|| keys.clone());
     let mut keys = keys[fixed.min(keys.len())..].iter();
     for item in &select.order_by {
-        let ExprNode::Column(col) = &item.expr else {
+        let key = match &item.expr {
+            ExprNode::Column(col) => col.name.clone(),
+            other => other.expr_key(),
+        };
+        let Some(key_part) = keys.next() else {
             return false;
         };
-        let Some(key) = keys.next() else {
-            return false;
-        };
-        if item.desc || !key.eq_ignore_ascii_case(&col.name) {
+        if item.desc || !key_part.eq_ignore_ascii_case(&key) {
             return false;
         }
     }

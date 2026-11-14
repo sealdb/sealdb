@@ -138,6 +138,54 @@ impl IndexHistogram {
     pub fn not_null_count(&self) -> f64 {
         self.buckets.last().map(|b| b.count as f64).unwrap_or(0.0)
     }
+
+    /// TiDB `BuildHistAndTopN` over encoded index keys: an equi-depth histogram
+    /// of `keys` (sorted, one entry per non-null row). Bucket bounds are raw
+    /// `codec.EncodeKey` bytes so the interpolation runs in the same space as
+    /// TiDB's index histograms.
+    pub fn from_sorted_keys(keys: &[Vec<u8>], ndv: u64, max_buckets: usize) -> Self {
+        if keys.is_empty() || max_buckets == 0 {
+            return Self {
+                ndv,
+                buckets: Vec::new(),
+            };
+        }
+        let n = keys.len();
+        let bucket_count = max_buckets.min(n).max(1);
+        let mut buckets = Vec::with_capacity(bucket_count);
+        let mut start = 0usize;
+        for b in 0..bucket_count {
+            let end = ((b + 1) * n) / bucket_count;
+            let end = end.max(start + 1).min(n);
+            let slice = &keys[start..end];
+            let mut distinct = 0u64;
+            let mut prev: Option<&[u8]> = None;
+            let mut repeats = 1u64;
+            let mut max_repeats = 1u64;
+            for key in slice {
+                if prev == Some(key.as_slice()) {
+                    repeats += 1;
+                    max_repeats = max_repeats.max(repeats);
+                } else {
+                    distinct += 1;
+                    repeats = 1;
+                    prev = Some(key.as_slice());
+                }
+            }
+            buckets.push(IndexBucket {
+                lower: slice.first().cloned().unwrap_or_default(),
+                upper: slice.last().cloned().unwrap_or_default(),
+                count: end as u64,
+                repeats: max_repeats,
+                ndv: distinct,
+            });
+            start = end;
+            if start >= n {
+                break;
+            }
+        }
+        Self { ndv, buckets }
+    }
 }
 
 /// TiDB `statistics.Index`.

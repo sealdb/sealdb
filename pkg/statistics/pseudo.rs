@@ -269,6 +269,13 @@ pub fn column_bound_sets(expr: &ExprNode) -> Vec<(String, Vec<Bounds>)> {
 
 /// Ranges one conjunct imposes on one column.
 pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    // `NOT (a >= 1)` is `a < 1`; TiDB's ranger flips the comparison before it
+    // builds the range, so the scan still seeks instead of scanning.
+    if let ExprNode::Unary(unary) = expr
+        && unary.op == Op::Not
+    {
+        return negated_bound_sets(&unary.expr);
+    }
     // DNF of equalities on the same column (`a = 1 OR a = 2`) → one multi-range
     // set. TiDB ranger builds these as `["1","1"], ["2","2"]` on a single index.
     if let Some(sets) = dnf_eq_bound_sets(expr) {
@@ -308,6 +315,113 @@ pub fn conjunct_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
             .find(|range| range.column.eq_ignore_ascii_case(&column))
             .map(|range| (column, vec![(range.low, range.high)]));
     }
+    // Expression key parts (`a+1 > 2`, `a+1 BETWEEN 1 AND 4`) seek an
+    // expression index exactly like a plain column of the same shape.
+    if let Some((column, op, value)) = expr.cmp_key_const() {
+        let bounds = match op {
+            Op::Lt => vec![(None, Some((value, false)))],
+            Op::Le => vec![(None, Some((value, true)))],
+            Op::Gt => vec![(Some((value, false)), None)],
+            Op::Ge => vec![(Some((value, true)), None)],
+            _ => return None,
+        };
+        return Some((column, bounds));
+    }
+    if let Some((column, low, high)) = expr.between_key_const() {
+        return Some((column, vec![(Some((low, true)), Some((high, true)))]));
+    }
+    None
+}
+
+/// Bounds of `NOT <comparison>` (TiDB ranger negation).
+fn negated_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
+    if let Some((column, op, value)) = expr.cmp_key_const() {
+        let flipped = match op {
+            Op::Lt => Op::Ge,
+            Op::Le => Op::Gt,
+            Op::Gt => Op::Le,
+            Op::Ge => Op::Lt,
+            _ => return None,
+        };
+        return Some((column, cmp_bounds(flipped, value)?));
+    }
+    if let Some((column, low, high)) = expr.between_key_const() {
+        // `NOT BETWEEN` keeps everything outside `[low, high]`.
+        return Some((
+            column,
+            vec![
+                (None, Some((low, false))),
+                (Some((high, false)), None),
+            ],
+        ));
+    }
+    if let Some((column, value)) = expr.eq_key_const() {
+        let below = (None, Some((value.clone(), false)));
+        let above = (Some((value, false)), None);
+        return Some((column, vec![below, above]));
+    }
+    None
+}
+
+/// One-sided bounds of `expr <op> value` (`<`, `<=`, `>`, `>=`).
+fn cmp_bounds(op: Op, value: Datum) -> Option<Vec<Bounds>> {
+    Some(match op {
+        Op::Lt => vec![(None, Some((value, false)))],
+        Op::Le => vec![(None, Some((value, true)))],
+        Op::Gt => vec![(Some((value, false)), None)],
+        Op::Ge => vec![(Some((value, true)), None)],
+        _ => return None,
+    })
+}
+
+/// `expr LIKE 'prefix%'`: the leading literal bytes of a literal pattern seek
+/// `[prefix, prefix_next)`. A prefix shorter than the whole pattern keeps the
+/// LIKE as a residual filter (the range alone matches extra rows), so callers
+/// must not consume the conjunct.
+pub fn like_prefix_bound(expr: &ExprNode) -> Option<(String, Datum, Datum)> {
+    let ExprNode::Like(like) = expr else {
+        return None;
+    };
+    if like.not {
+        return None;
+    }
+    let column = match like.expr.as_ref() {
+        ExprNode::Column(column) => column.name.clone(),
+        other => other.expr_key(),
+    };
+    let Datum::Bytes(pattern) = like.pattern.const_datum()? else {
+        return None;
+    };
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut wildcard = false;
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'%' | b'_' => {
+                wildcard = true;
+                break;
+            }
+            // MySQL escapes: `\%`, `\_`, `\\`.
+            b'\\' if index + 1 < pattern.len() => {
+                prefix.push(pattern[index + 1]);
+                index += 2;
+                continue;
+            }
+            byte => prefix.push(byte),
+        }
+        index += 1;
+    }
+    if !wildcard || prefix.is_empty() {
+        return None;
+    }
+    // Next prefix: bump the last byte that is not already saturated.
+    let mut upper = prefix.clone();
+    while let Some(last) = upper.pop() {
+        if last < 0xff {
+            upper.push(last + 1);
+            return Some((column, Datum::Bytes(prefix), Datum::Bytes(upper)));
+        }
+    }
     None
 }
 
@@ -341,8 +455,12 @@ fn in_list_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
     if in_list.not || in_list.list.is_empty() {
         return None;
     }
-    let ExprNode::Column(column) = in_list.expr.as_ref() else {
-        return None;
+    // A bare column keeps its declared spelling; a generated-column body or a
+    // functional index key (`a+1 IN (1, 2, 3)`) matches the index part through
+    // the canonical expression text.
+    let column = match in_list.expr.as_ref() {
+        ExprNode::Column(column) => column.name.clone(),
+        other => other.expr_key(),
     };
     let mut ranges = Vec::with_capacity(in_list.list.len());
     for item in &in_list.list {
@@ -362,7 +480,7 @@ fn in_list_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
     });
-    Some((column.name.clone(), ranges))
+    Some((column, ranges))
 }
 
 /// Intersect two range sets over the same column (empty ranges drop out).

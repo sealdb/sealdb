@@ -7,7 +7,7 @@ use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::Statement;
-use sealdb_statistics::{ColumnStats, Histogram, Table, TopN, datum_key};
+use sealdb_statistics::{ColumnStats, Histogram, IndexHistogram, IndexStats, Table, TopN, datum_key};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::collections::{HashMap, HashSet};
@@ -90,6 +90,7 @@ impl AnalyzeExec {
         )?;
         let index_cols = resolve_index_columns(&info, indexes)?;
         let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets);
+        let index_stats = collect_index_stats(&info, &rows, buckets);
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
             if index_cols.is_some() {
                 prev.count = rows.len() as u64;
@@ -105,13 +106,38 @@ impl AnalyzeExec {
                         prev.columns.push((cname, cstats));
                     }
                 }
+                // A plain index keys off its column's statistics, but an
+                // expression index has no column of its own: keep the encoded
+                // key histogram collected above.
+                for (iname, istats) in index_stats {
+                    if let Some((_, slot)) = prev
+                        .indices
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&iname))
+                    {
+                        *slot = istats;
+                    } else {
+                        prev.indices.push((iname, istats));
+                    }
+                }
                 prev
             } else {
+                let mut indices = prev.indices;
+                for (iname, istats) in index_stats {
+                    if let Some((_, slot)) = indices
+                        .iter_mut()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&iname))
+                    {
+                        *slot = istats;
+                    } else {
+                        indices.push((iname, istats));
+                    }
+                }
                 Table {
                     count: rows.len() as u64,
                     modify_count: 0,
                     columns,
-                    indices: prev.indices,
+                    indices,
                     version: prev.version + 1,
                 }
             }
@@ -120,7 +146,7 @@ impl AnalyzeExec {
                 count: rows.len() as u64,
                 modify_count: 0,
                 columns,
-                indices: Vec::new(),
+                indices: index_stats,
                 version: 1,
             }
         };
@@ -128,6 +154,102 @@ impl AnalyzeExec {
         self.domain.persist_stats()?;
         Ok(())
     }
+}
+
+fn collect_index_stats(
+    info: &TableInfo,
+    rows: &[crate::table_reader::ScannedRow],
+    buckets: Option<u64>,
+) -> Vec<(String, IndexStats)> {
+    let max_buckets = buckets
+        .map(|n| n as usize)
+        .unwrap_or(Table::DEFAULT_HIST_BUCKETS);
+    let mut out = Vec::new();
+    for index in &info.indices {
+        // A plain index is estimated from its key column's statistics; only an
+        // expression key part (a hidden generated column) needs a histogram of
+        // its own, which TiDB keeps as the index's encoded-key statistics.
+        let mut parts = Vec::with_capacity(index.columns.len());
+        let mut expression = false;
+        for part in &index.columns {
+            let Some(pos) = info
+                .columns
+                .iter()
+                .position(|c| c.name.o().eq_ignore_ascii_case(part.name.o()))
+            else {
+                break;
+            };
+            expression |= info.columns[pos].hidden;
+            parts.push(pos);
+        }
+        if !expression || parts.len() != index.columns.len() || rows.is_empty() {
+            continue;
+        }
+        let mut freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        for row in rows {
+            let mut key = Vec::new();
+            for &pos in &parts {
+                let field_type = info.columns[pos].field_type.clone();
+                let value = row.values.get(pos).unwrap_or(&Datum::Null);
+                match sealdb_statistics::range_est::encode_index_key(&field_type, value) {
+                    Some(encoded) => key.extend_from_slice(&encoded),
+                    None => {
+                        key.clear();
+                        break;
+                    }
+                }
+            }
+            if key.is_empty() {
+                continue;
+            }
+            *freq.entry(key).or_default() += 1;
+        }
+        if freq.is_empty() {
+            continue;
+        }
+        // TiDB `BuildHistAndTopN`: the TopN keeps the most frequent keys, the
+        // histogram holds the rest. When the TopN covers every distinct key
+        // (`haveAllNDV`) no bucket is built and every estimate comes from TopN.
+        let mut counts: Vec<(Vec<u8>, u64)> = freq.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let ndv = counts.len() as u64;
+        let (topn, histogram) = if counts.len() <= Table::DEFAULT_TOPN {
+            (
+                counts,
+                IndexHistogram {
+                    ndv,
+                    buckets: Vec::new(),
+                },
+            )
+        } else {
+            let rest = counts.split_off(Table::DEFAULT_TOPN);
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for (key, count) in &rest {
+                for _ in 0..*count {
+                    keys.push(key.clone());
+                }
+            }
+            keys.sort();
+            (
+                counts,
+                IndexHistogram::from_sorted_keys(&keys, ndv, max_buckets),
+            )
+        };
+        out.push((
+            index.name.o().to_string(),
+            IndexStats {
+                ndv,
+                null_count: 0,
+                histogram: Some(histogram),
+                topn,
+                cm_sketch: None,
+                // Version 2 keeps the TopN rows out of the histogram, matching
+                // `IndexStats::total_row_count`.
+                stats_ver: 2,
+            },
+        ));
+    }
+    out
 }
 
 fn resolve_index_columns(info: &TableInfo, indexes: &[String]) -> Result<Option<HashSet<String>>> {

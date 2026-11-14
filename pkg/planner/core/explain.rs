@@ -5634,7 +5634,56 @@ fn range_marker(plan: &PhysicalPlan) -> Option<String> {
 }
 
 /// TiDB-style scalar: `gt(Column#5, 3)` / `or(and(…), …)`.
-fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> String {
+/// Does `expr` evaluate to a string? Used for the implicit cast TiDB's string
+/// builtins print (`md5(cast(s, var_string(20)))`).
+fn explain_expr_is_string(expr: &sealdb_parser::ast::ExprNode, table: &str) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+            datum: sealdb_types::Datum::Bytes(_) | sealdb_types::Datum::Bit(_),
+        }) => true,
+        ExprNode::Column(col) => {
+            let table = col.table.as_deref().unwrap_or(table);
+            crate::core::planbuilder::explain_column_type(table, &col.name)
+                .is_some_and(|ft| sealdb_statistics::kind_of(&ft) == sealdb_statistics::HistValueKind::Text)
+        }
+        ExprNode::Func(f) => matches!(
+            f.name.to_ascii_lowercase().as_str(),
+            "md5"
+                | "sha"
+                | "sha1"
+                | "sha2"
+                | "concat"
+                | "upper"
+                | "lower"
+                | "substring"
+                | "substr"
+                | "ltrim"
+                | "rtrim"
+                | "trim"
+                | "left"
+                | "right"
+                | "replace"
+                | "repeat"
+                | "reverse"
+                | "hex"
+                | "unhex"
+                | "date_format"
+                | "format"
+                | "char"
+                | "cast"
+                | "decode"
+                | "encode"
+                | "ifnull"
+                | "coalesce"
+                | "json_extract"
+        ),
+        ExprNode::Cast(_) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
     use sealdb_types::Datum;
@@ -5721,15 +5770,26 @@ fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &str) -> Stri
             format!("cast({}, {target})", explain_scalar_expr(&c.expr, table))
         }
         // Expression index key part (`tidb_shard(a) = 8`): TiDB prints the
-        // scalar call with the same column spelling as its arguments.
+        // scalar call with the same column spelling as its arguments. A string
+        // builtin casts a non-string argument to `var_string(20)`
+        // (`md5(cast(s, var_string(20)))`), which the ExplainInfo prints.
         ExprNode::Func(f) => {
+            let name = f.name.to_ascii_lowercase();
+            let casts_to_string = matches!(name.as_str(), "md5" | "sha" | "sha1" | "sha2");
             let args = f
                 .args
                 .iter()
-                .map(|arg| explain_scalar_expr(arg, table))
+                .map(|arg| {
+                    let rendered = explain_scalar_expr(arg, table);
+                    if casts_to_string && !explain_expr_is_string(arg, table) {
+                        format!("cast({rendered}, var_string(20))")
+                    } else {
+                        rendered
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{}({args})", f.name.to_ascii_lowercase())
+            format!("{name}({args})")
         }
         ExprNode::InList(list) => {
             let values = list

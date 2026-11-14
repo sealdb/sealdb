@@ -702,7 +702,10 @@ impl Table {
     ) -> Option<f64> {
         let idx = self.index(index)?;
         let hist = idx.histogram.as_ref()?;
-        if hist.buckets.is_empty() {
+        // `BuildHistAndTopN` leaves the buckets empty when the TopN already
+        // holds every distinct key (`haveAllNDV`): the statistics are still
+        // valid and every point estimate comes from the TopN rows.
+        if hist.buckets.is_empty() && idx.topn.is_empty() {
             return None;
         }
         let realtime = self.count as f64;
@@ -766,9 +769,15 @@ impl Table {
             count += counted;
         }
         // TiDB `GetRowCountByIndexRanges` caps the estimate at the realtime row
-        // count but never lifts a zero: an equality that falls in a gap between
-        // two histogram buckets estimates no rows.
-        Some((count * increase).min(realtime))
+        // count. Stats version 2 also lifts the result to at least one row
+        // (`mathutil.Clamp(totalCount, 1, realtimeRowCount)`), so an equality
+        // that falls between TopN keys still costs one row.
+        let scaled = count * increase;
+        if idx.stats_ver >= 2 && realtime >= 1.0 {
+            Some(scaled.clamp(1.0_f64.min(realtime), realtime))
+        } else {
+            Some(scaled.min(realtime))
+        }
     }
 
     pub fn index(&self, name: &str) -> Option<&IndexStats> {

@@ -148,7 +148,28 @@ pub fn remove_index(
     };
     let idx_id = info.indices[pos].id;
     drop_index_keys(storage, &info, idx_id)?;
-    info.indices.remove(pos);
+    let removed = info.indices.remove(pos);
+    // An expression key part is backed by a hidden generated column owned by
+    // this index; dropping the index drops the column so the name can be
+    // reused (`DROP INDEX expr_idx` then `ADD UNIQUE expr_idx((a+1))`).
+    let hidden: Vec<String> = removed
+        .columns
+        .iter()
+        .filter(|part| {
+            info.columns
+                .iter()
+                .any(|col| col.hidden && col.name.o().eq_ignore_ascii_case(part.name.o()))
+        })
+        .map(|part| part.name.o().to_string())
+        .collect();
+    if !hidden.is_empty() {
+        info.columns.retain(|col| {
+            !hidden
+                .iter()
+                .any(|name| col.name.o().eq_ignore_ascii_case(name))
+        });
+        crate::alter::recompute_column_offsets(&mut info);
+    }
     meta.update_table(db_id, &info)?;
     meta.gen_schema_version()?;
     Ok(())

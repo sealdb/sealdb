@@ -280,9 +280,22 @@ fn function_field_type(
             }
             ty
         }
+        // TiDB `md5` returns a 32-byte hex string.
+        "md5" => {
+            let mut ty = FieldType::new_string();
+            ty.flen = 32;
+            ty
+        }
         "abs" | "floor" | "ceil" | "ceiling" | "round" | "conv" | "crc32" | "str_to_date" => {
             FieldType::new_longlong()
         }
+        // TiDB `TIMEDIFF` returns a TIME (fsp = max of the argument fsp).
+        "timediff" | "addtime" | "subtime" => FieldType {
+            tp: sealdb_types::TYPE_DURATION,
+            flen: 17,
+            decimal: 6,
+            ..FieldType::default()
+        },
         "length" | "char_length" | "character_length" | "octet_length" | "instr" | "locate"
         | "position" | "bit_length" | "unix_timestamp_of" => FieldType::new_longlong(),
         _ => {

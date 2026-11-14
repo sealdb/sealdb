@@ -98,7 +98,30 @@ impl ExecutorBuilder {
                 {
                     return Ok(child_exec);
                 }
-                let (exprs, names) = expand_projection_fields(select, &from_cols);
+                let (exprs, names) = {
+                    // The planner rewrote a virtual generated column's body in
+                    // the SELECT list (`a+1` → `c`) so a covering index that
+                    // stores `c` can answer the query without the base columns.
+                    // Evaluate the same expression here: the original `a+1`
+                    // would read a column the covering read does not carry.
+                    let substituted = select
+                        .from
+                        .as_ref()
+                        .filter(|_| select.from_item.is_none() && select.joins.is_empty())
+                        .and_then(|from| {
+                            let is = domain.infoschema();
+                            let (db, table) = from.qualified(current_db);
+                            let info = is.table_by_name(&db, &table)?;
+                            sealdb_planner::core::expr_index::substitute_generated_columns(
+                                info, select,
+                            )
+                        });
+                    expand_projection_fields(substituted.as_ref().unwrap_or(select), &from_cols)
+                };
+                // A covering read over an expression index only carries the
+                // hidden key column, so the SELECT expressions re-evaluate
+                // against it (`plus(t.a, 1)` → the stored `(a+1)` value).
+                let exprs = expr_index_read_exprs(&domain, child, current_db, exprs);
                 let mut exec = ProjectionExec::new(exprs, names, child_exec);
                 if select.fields.iter().any(|field| field.expr.has_subquery()) {
                     exec = exec.with_subquery(SubqueryEvalCtx::new(
@@ -270,6 +293,7 @@ impl ExecutorBuilder {
                 index,
                 partitions,
                 pushed,
+                range_scan,
                 ..
             }
             | PhysicalPlan::IndexReader {
@@ -277,9 +301,18 @@ impl ExecutorBuilder {
                 index,
                 partitions,
                 pushed,
+                range_scan,
                 ..
             } => {
                 let covering = matches!(plan, PhysicalPlan::IndexReader { .. });
+                // TiDB's probe-side `TableRowIDScan` batches the build handles
+                // into one `BatchGet` (key order) unless the read must keep the
+                // index-key order (`keep order:true`) for an ORDER BY.
+                let keep_order = !covering
+                    && (range_scan
+                        .as_ref()
+                        .is_some_and(|range| range.keep_order)
+                        || keep_order_pushed(pushed.as_ref()));
                 let select = stmt
                     .as_select()
                     .ok_or_else(|| Error::unsupported("index lookup without select"))?;
@@ -300,8 +333,9 @@ impl ExecutorBuilder {
                     select_row_lock(select),
                     select_lock_wait(select),
                     partitions.clone(),
-                    pushed.clone(),
+                    keep_order_filter(pushed),
                     covering,
+                    keep_order,
                     Self::select_references_tidb_rowid(select),
                 )))
             }
@@ -1538,6 +1572,67 @@ fn index_reader_table(
         .or_else(|| select.joins.first().map(|j| j.right.clone()))
 }
 
+/// TiDB `keep order` markers replace the pushed filter when the index read
+/// already yields the query's `ORDER BY` order (`keep order:true`).
+fn keep_order_pushed(pushed: Option<&ExprNode>) -> bool {
+    let Some(ExprNode::Value(value)) = pushed else {
+        return false;
+    };
+    match &value.datum {
+        sealdb_types::Datum::Bytes(bytes) => std::str::from_utf8(bytes)
+            .map(|text| text.starts_with("KEEP_ORDER"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// The marker is EXPLAIN-only bookkeeping, never a row filter.
+fn keep_order_filter(pushed: &Option<ExprNode>) -> Option<ExprNode> {
+    if keep_order_pushed(pushed.as_ref()) {
+        None
+    } else {
+        pushed.clone()
+    }
+}
+
+/// Rewrite a covering read's projection onto the hidden key columns an
+/// expression index stores: the read cannot provide the base columns the
+/// expression spells out (`a + 1`), only the stored value.
+fn expr_index_read_exprs(
+    domain: &Domain,
+    child: &PhysicalPlan,
+    current_db: &str,
+    exprs: Vec<ExprNode>,
+) -> Vec<ExprNode> {
+    let PhysicalPlan::IndexReader { table, index, .. } = child else {
+        return exprs;
+    };
+    let is = domain.infoschema();
+    let Some(info) = is.table_by_name(current_db, table).cloned() else {
+        return exprs;
+    };
+    let Some(index_info) = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(index))
+    else {
+        return exprs;
+    };
+    if !sealdb_planner::core::expr_index::has_expression_part(&info, index_info) {
+        return exprs;
+    }
+    exprs
+        .into_iter()
+        .map(|expr| {
+            sealdb_planner::core::expr_index::substitute_index_parts_for_read(
+                &info,
+                index_info,
+                &expr,
+            )
+        })
+        .collect()
+}
+
 fn index_access(
     domain: &Domain,
     current_db: &str,
@@ -1552,6 +1647,12 @@ fn index_access(
         .indices
         .iter()
         .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+    // The planner rewrote virtual generated column bodies (`a+1` → `c`) before
+    // it picked this index; rebuild the same predicate so the seek range
+    // matches the `EXPLAIN` range instead of a full index scan.
+    let substituted = selection
+        .and_then(|sel| sealdb_planner::core::expr_index::substitute_generated_expr(info, sel));
+    let selection = substituted.as_ref().or(selection);
     let conjuncts = selection
         .map(|selection| selection.split_cnf())
         .unwrap_or_default();

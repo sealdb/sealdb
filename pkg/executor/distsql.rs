@@ -45,6 +45,9 @@ pub struct IndexLookUpExecutor {
     partitions: Vec<i64>,
     pushed: Option<ExprNode>,
     covering: bool,
+    /// The read must return rows in index-key order (`keep order:true`), so the
+    /// probe keeps the Build side's handle order instead of batching.
+    keep_order: bool,
     /// Project TiDB's `_tidb_rowid` (the heap table handle) as an extra column.
     with_rowid: bool,
     schema: Vec<String>,
@@ -66,6 +69,7 @@ impl IndexLookUpExecutor {
         partitions: Vec<i64>,
         pushed: Option<ExprNode>,
         covering: bool,
+        keep_order: bool,
         with_rowid: bool,
     ) -> Self {
         Self {
@@ -80,11 +84,27 @@ impl IndexLookUpExecutor {
             partitions,
             pushed,
             covering,
+            keep_order,
             with_rowid,
             schema: Vec::new(),
             rows: Vec::new(),
             emitted: false,
         }
+    }
+
+    /// True when the current transaction has buffered writes under any of the
+    /// table's physical ids (TiDB's dirty table / UnionScan path).
+    fn txn_has_writes(&self, physical_ids: &[i64]) -> bool {
+        let dirty = self
+            .txn
+            .with_txn(|txn| Ok(txn.dirty_keys()))
+            .unwrap_or_default();
+        dirty.iter().any(|key| {
+            physical_ids.iter().any(|id| {
+                let prefix = sealdb_tablecodec::encode_table_prefix(*id);
+                key.starts_with(prefix.as_bytes())
+            })
+        })
     }
 }
 
@@ -120,8 +140,18 @@ impl Executor for IndexLookUpExecutor {
             info.physical_ids()
         };
         let expose_rowid = self.with_rowid && !info.pk_is_handle;
+        // TiDB's `TableRowIDScan` probe batches the row ids the Build side
+        // produced into one `BatchGet`, which TiKV answers in key order. An
+        // unordered lookup therefore returns rows in handle order even when
+        // the index arms (`a = 1 or a = 2`) yielded their handles out of order.
+        // A dirty table (UnionScan over this txn's own writes) merges the dirty
+        // index entries instead and keeps the index key order, so only batch a
+        // read with no pending writes under the table.
+        let probe_batched =
+            !self.covering && !self.keep_order && !self.txn_has_writes(&physical);
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
+            let mut pending: Vec<(i64, i64)> = Vec::new();
             for physical_id in physical {
                 for access in &self.access {
                     let (start, end) = scan_bounds(physical_id, index.id, access);
@@ -156,37 +186,47 @@ impl Executor for IndexLookUpExecutor {
                                 rows.push(row);
                                 continue;
                             }
+                            if probe_batched {
+                                pending.push((physical_id, handle));
+                                continue;
+                            }
                             let row_key = encode_row_key_with_handle(physical_id, handle);
                             let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
                             if let Some(raw) = raw {
-                                let decoded = decode_row(&raw, &info.col_field_types());
-                                let mut row: Vec<Datum> = info
-                                    .columns
-                                    .iter()
-                                    .map(|col| {
-                                        decoded
-                                            .iter()
-                                            .find(|(id, _)| *id == col.id)
-                                            .map(|(_, v)| v.clone())
-                                            .unwrap_or(Datum::Null)
-                                    })
-                                    .collect();
-                                if expose_rowid {
-                                    row.push(Datum::I64(handle));
-                                }
-                                rows.push(row);
+                                rows.push(decode_lookup_row(&info, &raw, expose_rowid, handle));
                             }
                         }
                     }
                 }
             }
+            if probe_batched {
+                // Key order is the storage order: table id, then the row handle.
+                pending.sort_unstable();
+                for (physical_id, handle) in pending {
+                    let row_key = encode_row_key_with_handle(physical_id, handle);
+                    let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                    if let Some(raw) = raw {
+                        rows.push(decode_lookup_row(&info, &raw, expose_rowid, handle));
+                    }
+                }
+            }
             Ok(rows)
         })?;
+        // A covering read only has the index's key values: an expression key
+        // part answers the expression it stores, so evaluate the pushed filter
+        // on the part (`like(md5(s), …)` → `like(_V$_idx_0, …)`).
+        let pushed = if self.covering {
+            self.pushed.as_ref().map(|filter| {
+                sealdb_planner::core::expr_index::substitute_parts_expr(&info, &index, filter)
+            })
+        } else {
+            self.pushed.clone()
+        };
         self.rows = sealdb_expression::with_index_dst_double(|| {
             filter_rows(
                 std::mem::take(&mut self.rows),
                 &self.schema,
-                self.pushed.as_ref(),
+                pushed.as_ref(),
                 Some(&info),
             )
         })?;
@@ -574,6 +614,26 @@ fn index_handle(index: &IndexInfo, key: &[u8], value: &[u8]) -> Result<i64> {
     }
 }
 
+/// Decode one probe-side row from its stored value.
+fn decode_lookup_row(info: &TableInfo, raw: &[u8], expose_rowid: bool, handle: i64) -> Vec<Datum> {
+    let decoded = decode_row(raw, &info.col_field_types());
+    let mut row: Vec<Datum> = info
+        .columns
+        .iter()
+        .map(|col| {
+            decoded
+                .iter()
+                .find(|(id, _)| *id == col.id)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Datum::Null)
+        })
+        .collect();
+    if expose_rowid {
+        row.push(Datum::I64(handle));
+    }
+    row
+}
+
 fn covering_row(
     info: &TableInfo,
     index: &IndexInfo,
@@ -590,6 +650,10 @@ fn covering_row(
         }
     }
     if let Some(handle_col) = info.handle_column()
+        // A table with an implicit `_tidb_rowid` has no user column holding the
+        // handle: `handle_column` only borrows the first INT column for its
+        // type, so filling it would overwrite real data with the row id.
+        && (info.pk_is_handle || info.common_handle)
         && let Some(slot) = row.get_mut(handle_col.offset as usize)
         // Index already decoded this column (e.g. KEY(a,b,c) on non-PK table);
         // do not clobber with the artificial/common handle.
