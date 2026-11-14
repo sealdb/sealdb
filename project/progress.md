@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 57 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 59 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2399,6 +2399,31 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 无；后续按 R6 继续 `ddl/db_table` / `ddl/table_modify` / `ddl/modify_column`
 - **下一步**:
   - 继续 R6：`ddl/db_table` / `ddl/table_modify` / `ddl/modify_column`
+
+---
+
+### 2026-11-14（`ddl/attributes_sql` 转正：ALTER TABLE ATTRIBUTES 与 information_schema.ATTRIBUTES）
+
+- **Phase**: R6-DDL
+- **完成**:
+  - Parser bridge：`extract_alter_partitions` 新增 `ATTRIBUTES` 识别，支持
+    `ALTER TABLE t ATTRIBUTES [=] '<key=value,...>'`、`ALTER TABLE t PARTITION p ATTRIBUTES ...`
+    与 `ATTRIBUTES = DEFAULT`（重置）；sqlparser-rs 无此语法，按既有 bridge 机制在
+    `ALGORITHM=INPLACE` 占位后回填 `AlterTableSpec::Attributes`。
+  - 元数据：`TableInfo.attributes` / `PartitionDefinition.attributes`（serde 默认空，
+    兼容旧 meta）；`alter_table` 新增 `alter_attributes`，按 `key=value[, ...]` 解析去重，
+    `DEFAULT` 清空；分区名不存在返回 1735。
+  - `information_schema.ATTRIBUTES` 虚拟表：`ID` = `schema/<db>/<table>` 或
+    `schema/<db>/<table>/partition/<p>`（对齐 TiDB `attrs.GetAttrID`），`ATTRIBUTES`
+    为 JSON 文本；DROP TABLE / DROP DATABASE 随表元数据一并消失。
+- **验证**:
+  - `run-tests.sh -s memory -t ddl/attributes_sql --status pending` → `PASS: memory=1`
+  - `run-tests.sh -s tikv -t ddl/attributes_sql --status pending` → `PASS: tikv=1`
+  - manifest `ddl/attributes_sql` → `green`，green 58→59
+- **阻塞/风险**:
+  - 无；属性仅存储/展示，尚未参与 placement 调度（与当前存储层一致）
+- **下一步**:
+  - 继续 R6：`ddl/affinity` / `ddl/bdr_mode` / `ddl/constraint`
 
 ---
 

@@ -15,6 +15,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "key_column_usage" => Ok(key_column_usage(is)),
         "table_constraints" => Ok(table_constraints(is)),
         "partitions" => Ok(partitions(is)),
+        "attributes" => Ok(attributes(is)),
         "character_sets" => Ok(character_sets()),
         "collations" => Ok(collations()),
         "collation_character_set_applicability" => Ok(collation_applicability()),
@@ -809,6 +810,53 @@ fn views(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
 
 fn empty(cols: &[&str]) -> (Vec<String>, Vec<Vec<Datum>>) {
     (cols.iter().map(|c| (*c).to_string()).collect(), Vec::new())
+}
+
+/// `information_schema.ATTRIBUTES`: TiDB placement attributes of tables and
+/// partitions (`ALTER TABLE … ATTRIBUTES`, `ALTER TABLE … PARTITION p
+/// ATTRIBUTES`). IDs mirror TiDB's `attrs.GetAttrID`.
+fn attributes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec!["ID".to_string(), "ATTRIBUTES".to_string()];
+    let mut rows = Vec::new();
+    for db in is.all_schemas() {
+        for table in is.schema_tables(db.name.o()) {
+            let prefix = format!("schema/{}/{}", db.name.o(), table.name.o());
+            if !table.attributes.is_empty() {
+                rows.push(vec![
+                    bytes(&prefix),
+                    bytes(&attributes_json(&table.attributes)),
+                ]);
+            }
+            if let Some(partition) = &table.partition {
+                for def in &partition.definitions {
+                    if def.attributes.is_empty() {
+                        continue;
+                    }
+                    rows.push(vec![
+                        bytes(&format!("{prefix}/partition/{}", def.name.o())),
+                        bytes(&attributes_json(&def.attributes)),
+                    ]);
+                }
+            }
+        }
+    }
+    (schema, rows)
+}
+
+/// Render an attribute map as the JSON object TiDB stores in `ATTRIBUTES`.
+fn attributes_json(attributes: &[(String, String)]) -> String {
+    let body = attributes
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "\"{}\":\"{}\"",
+                key.replace('"', "\\\""),
+                value.replace('"', "\\\"")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
 }
 
 fn for_each_table(is: &InfoSchema, mut f: impl FnMut(&str, &TableInfo)) {

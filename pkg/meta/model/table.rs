@@ -223,6 +223,10 @@ pub struct TableInfo {
     pub view: Option<ViewInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<SequenceInfo>,
+    /// TiDB placement attributes (`ALTER TABLE … ATTRIBUTES`), surfaced through
+    /// `information_schema.attributes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<(String, String)>,
 }
 
 /// Persisted TTL metadata (TiDB `TTLInfo`).
@@ -276,6 +280,7 @@ impl TableInfo {
             ttl: None,
             view: None,
             sequence: None,
+            attributes: Vec::new(),
         }
     }
 

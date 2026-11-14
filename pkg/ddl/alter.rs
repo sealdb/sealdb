@@ -19,6 +19,7 @@ use sealdb_errno::{
     ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_NO_SUCH_TABLE,
     ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
     ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
+    ERR_UNKNOWN_PARTITION,
     ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
@@ -237,9 +238,102 @@ pub fn alter_table(
                     ));
                 }
             }
+            AlterTableSpec::Attributes {
+                partition,
+                attributes,
+            } => alter_attributes(
+                meta,
+                &snapshot,
+                stmt,
+                partition.as_deref(),
+                attributes.as_deref(),
+                current_db,
+            )?,
         }
         snapshot = InfoSchema::from_meta(meta)?;
     }
+    Ok(())
+}
+
+/// Parse TiDB placement attribute text (`key=value[, key=value]`).
+fn parse_attributes(attributes: &str) -> Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pair in attributes.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("invalid attributes '{attributes}', should be in key=value format"),
+            ));
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key.is_empty() || value.is_empty() {
+            return Err(Error::new(
+                ERR_BAD_FIELD,
+                format!("invalid attributes '{attributes}', should be in key=value format"),
+            ));
+        }
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+        {
+            existing.1 = value.to_string();
+        } else {
+            out.push((key.to_string(), value.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// `ALTER TABLE t [PARTITION p] ATTRIBUTES = '<attrs>'`: store the attribute
+/// map on the table or partition (`DEFAULT` clears it).
+fn alter_attributes(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    partition: Option<&str>,
+    attributes: Option<&str>,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let Some(mut info) = is.table_by_name(&schema, &table).cloned() else {
+        return Err(Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        ));
+    };
+    let parsed = attributes
+        .map(parse_attributes)
+        .transpose()?
+        .unwrap_or_default();
+    match partition {
+        Some(pname) => {
+            let def = info
+                .partition
+                .as_mut()
+                .and_then(|p| {
+                    p.definitions
+                        .iter_mut()
+                        .find(|def| def.name.l().eq_ignore_ascii_case(pname))
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        ERR_UNKNOWN_PARTITION,
+                        format!("Unknown partition '{pname}' in table '{schema}.{table}'"),
+                    )
+                })?;
+            def.attributes = parsed;
+        }
+        None => info.attributes = parsed,
+    }
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
     Ok(())
 }
 

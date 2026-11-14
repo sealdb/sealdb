@@ -226,6 +226,13 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                     }
                 }
                 AlterPartOp::Ttl(spec) => alter.specs.push(spec),
+                AlterPartOp::Attributes {
+                    partition,
+                    attributes,
+                } => alter.specs.push(AlterTableSpec::Attributes {
+                    partition,
+                    attributes,
+                }),
             }
         }
         if let Statement::Prepare(prepare) = &mut lowered
@@ -6393,6 +6400,11 @@ enum AlterPartOp {
     Options(Vec<(String, String)>),
     /// `TTL = …` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` / `REMOVE TTL`.
     Ttl(AlterTableSpec),
+    /// `[PARTITION p] ATTRIBUTES [=] '<key=value>'` / `DEFAULT`.
+    Attributes {
+        partition: Option<String>,
+        attributes: Option<String>,
+    },
 }
 
 /// `ALTER TABLE` table options TiDB accepts in the spec list
@@ -6482,6 +6494,18 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     out.push_str(&sql[i..after_name]);
                     out.push_str("ALGORITHM=INPLACE");
                     ops.push(Some(AlterPartOp::Options(options)));
+                    i = skip_ws(bytes, end);
+                    continue;
+                }
+                if let Some((partition, attributes, end)) =
+                    parse_alter_attributes_spec(bytes, after_name)?
+                {
+                    out.push_str(&sql[i..after_name]);
+                    out.push_str("ALGORITHM=INPLACE");
+                    ops.push(Some(AlterPartOp::Attributes {
+                        partition,
+                        attributes,
+                    }));
                     i = skip_ws(bytes, end);
                     continue;
                 }
@@ -6592,6 +6616,37 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
         i = push_sql_char(&mut out, sql, i);
     }
     Ok((out, ops))
+}
+
+/// `ALTER TABLE t [PARTITION p] ATTRIBUTES [=] '<key=value, ...>'|DEFAULT`.
+/// Returns `(partition, attributes, end)` or `None` when the spec list does not
+/// start with an attributes change.
+fn parse_alter_attributes_spec(
+    bytes: &[u8],
+    start: usize,
+) -> Result<Option<(Option<String>, Option<String>, usize)>> {
+    let mut p = skip_ws(bytes, start);
+    let mut partition = None;
+    if keyword_at(bytes, p, "PARTITION") {
+        let (name, next) = read_ident(bytes, skip_ws(bytes, p + "PARTITION".len()));
+        if name.is_empty() {
+            return Ok(None);
+        }
+        partition = Some(name);
+        p = skip_ws(bytes, next);
+    }
+    if !keyword_at(bytes, p, "ATTRIBUTES") {
+        return Ok(None);
+    }
+    let mut j = skip_ws(bytes, p + "ATTRIBUTES".len());
+    if j < bytes.len() && bytes[j] == b'=' {
+        j = skip_ws(bytes, j + 1);
+    }
+    if keyword_at(bytes, j, "DEFAULT") {
+        return Ok(Some((partition, None, j + "DEFAULT".len())));
+    }
+    let (value, end) = read_sql_string(bytes, j)?;
+    Ok(Some((partition, Some(value), end)))
 }
 
 /// `ALTER TABLE … TTL = <expr>` / `TTL_ENABLE = …` / `TTL_JOB_INTERVAL = …` /

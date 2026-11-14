@@ -933,6 +933,14 @@ pub enum AlterTableSpec {
     AddForeignKey {
         ref_table: String,
     },
+    /// `ALTER TABLE t [PARTITION p] ATTRIBUTES [=] '<key=value, ...>'`; `DEFAULT`
+    /// resets the attributes of the table or of the named partition.
+    Attributes {
+        /// Partition name, `None` for table-level attributes.
+        partition: Option<String>,
+        /// Raw attribute text (`key=value[, ...]`), `None` for `DEFAULT`.
+        attributes: Option<String>,
+    },
 }
 
 impl AlterTableSpec {
@@ -1215,6 +1223,26 @@ impl AlterTableSpec {
             AlterTableSpec::AddForeignKey { ref_table } => {
                 ctx.write_str("ADD FOREIGN KEY REFERENCES ");
                 ctx.write_name(ref_table);
+                Ok(())
+            }
+            AlterTableSpec::Attributes {
+                partition,
+                attributes,
+            } => {
+                if let Some(partition) = partition {
+                    ctx.write_str("PARTITION ");
+                    ctx.write_name(partition);
+                    ctx.write_str(" ");
+                }
+                ctx.write_str("ATTRIBUTES = ");
+                match attributes {
+                    Some(attributes) => {
+                        ctx.write_str("'");
+                        ctx.write_str(attributes);
+                        ctx.write_str("'");
+                    }
+                    None => ctx.write_str("DEFAULT"),
+                }
                 Ok(())
             }
         }

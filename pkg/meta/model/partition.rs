@@ -28,6 +28,9 @@ pub struct PartitionDefinition {
     /// LIST `VALUES IN` values (`None` is SQL `NULL`). Empty for RANGE/HASH/KEY.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_values: Vec<Option<i64>>,
+    /// TiDB placement attributes (`ALTER TABLE … PARTITION p ATTRIBUTES`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributes: Vec<(String, String)>,
 }
 
 impl PartitionDefinition {
@@ -37,6 +40,7 @@ impl PartitionDefinition {
             name: CIStr::new(name),
             less_than,
             in_values: Vec::new(),
+            attributes: Vec::new(),
         }
     }
 

@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 58,
-      "pending": 172,
+      "green": 59,
+      "pending": 171,
       "in_progress": 14,
       "deferred": 2,
       "local": 8
@@ -186,7 +186,7 @@
     {
       "name": "ddl/attributes_sql",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/attributes_sql.test",
       "result": "r/ddl/attributes_sql.result",
       "has_result": true,
