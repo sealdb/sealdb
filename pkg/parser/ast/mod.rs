@@ -29,7 +29,8 @@ pub use expressions::{
 pub use misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
     CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    CreateBindingStmt, CreateResourceGroupStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
+    CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
+    CreateUserStmt, DeallocateStmt,
     DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
     DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,

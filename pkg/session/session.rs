@@ -679,6 +679,7 @@ impl Session {
             | Statement::FlashBackToTimestamp(_)
             | Statement::RecoverTable(_)
             | Statement::DropPlacementPolicy(_)
+            | Statement::CreatePlacementPolicy(_)
             | Statement::CreateResourceGroup(_)
             | Statement::SetResourceGroup(_)
             | Statement::AddQueryWatch(_)

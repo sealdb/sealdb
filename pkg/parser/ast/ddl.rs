@@ -10,8 +10,13 @@ pub struct TableName {
     pub physical: Option<String>,
     /// `USE INDEX` / `FORCE INDEX` names (TiDB index hints on the table factor).
     pub use_indexes: Vec<String>,
+    /// A `USE INDEX` / `FORCE INDEX` hint was written (an empty list means the
+    /// statement forbids every index, `USE INDEX()`).
+    pub use_index_hint: bool,
     /// `IGNORE INDEX` names.
     pub ignore_indexes: Vec<String>,
+    /// An `IGNORE INDEX` hint was written (an empty list forbids every index).
+    pub ignore_index_hint: bool,
     /// `FROM t PARTITION (p2, p1)` name filter (definition order after resolve).
     pub partition_names: Vec<String>,
     /// `FROM t AS OF TIMESTAMP <expr>` stale read: raw expression text.
@@ -25,7 +30,9 @@ impl TableName {
             name: name.into(),
             physical: None,
             use_indexes: Vec::new(),
+            use_index_hint: false,
             ignore_indexes: Vec::new(),
+            ignore_index_hint: false,
             partition_names: Vec::new(),
             as_of_ts: None,
         }
@@ -407,6 +414,75 @@ pub struct PartitionOption {
     pub subpartition_ignored: bool,
 }
 
+impl PartitionOption {
+    /// Render the clause after `PARTITION BY `.
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        match self.tp {
+            PartitionType::Range if self.columns.len() > 1 => ctx.write_str("RANGE COLUMNS"),
+            PartitionType::Range => ctx.write_str("RANGE"),
+            PartitionType::Hash => ctx.write_str("HASH"),
+            PartitionType::List => ctx.write_str("LIST"),
+            PartitionType::Key => ctx.write_str("KEY"),
+        }
+        ctx.write_str(" (");
+        if let Some(expr) = &self.expr {
+            ctx.write_str(expr);
+        } else if self.columns.len() > 1 {
+            for (i, col) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(col);
+            }
+        } else {
+            ctx.write_name(&self.column);
+        }
+        ctx.write_str(")");
+        if matches!(self.tp, PartitionType::Hash | PartitionType::Key) && self.defs.is_empty() {
+            ctx.write_str(" PARTITIONS ");
+            ctx.write_str(&self.num.to_string());
+        } else {
+            ctx.write_str(" (");
+            for (i, def) in self.defs.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_str("PARTITION ");
+                ctx.write_name(&def.name);
+                if self.tp == PartitionType::Range {
+                    ctx.write_str(" VALUES LESS THAN (");
+                    match &def.less_than {
+                        Some(v) => write_partition_bound(ctx, v),
+                        None => ctx.write_str("MAXVALUE"),
+                    }
+                    for bound in &def.extra_bounds {
+                        ctx.write_str(", ");
+                        match bound {
+                            Some(v) => write_partition_bound(ctx, v),
+                            None => ctx.write_str("MAXVALUE"),
+                        }
+                    }
+                    ctx.write_str(")");
+                } else if self.tp == PartitionType::List {
+                    ctx.write_str(" VALUES IN (");
+                    for (j, v) in def.in_values.iter().enumerate() {
+                        if j > 0 {
+                            ctx.write_str(", ");
+                        }
+                        match v {
+                            Some(v) => ctx.write_str(&v.to_string()),
+                            None => ctx.write_str("NULL"),
+                        }
+                    }
+                    ctx.write_str(")");
+                }
+            }
+            ctx.write_str(")");
+        }
+        Ok(())
+    }
+}
+
 /// TiDB table TTL option (`TTL = col + INTERVAL 1 HOUR`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TtlInfo {
@@ -480,68 +556,7 @@ impl CreateTableStmt {
         }
         if let Some(part) = &self.partition {
             ctx.write_str(" PARTITION BY ");
-            match part.tp {
-                PartitionType::Range if part.columns.len() > 1 => ctx.write_str("RANGE COLUMNS"),
-                PartitionType::Range => ctx.write_str("RANGE"),
-                PartitionType::Hash => ctx.write_str("HASH"),
-                PartitionType::List => ctx.write_str("LIST"),
-                PartitionType::Key => ctx.write_str("KEY"),
-            }
-            ctx.write_str(" (");
-            if let Some(expr) = &part.expr {
-                ctx.write_str(expr);
-            } else if part.columns.len() > 1 {
-                for (i, col) in part.columns.iter().enumerate() {
-                    if i > 0 {
-                        ctx.write_str(", ");
-                    }
-                    ctx.write_name(col);
-                }
-            } else {
-                ctx.write_name(&part.column);
-            }
-            ctx.write_str(")");
-            if matches!(part.tp, PartitionType::Hash | PartitionType::Key) && part.defs.is_empty() {
-                ctx.write_str(" PARTITIONS ");
-                ctx.write_str(&part.num.to_string());
-            } else {
-                ctx.write_str(" (");
-                for (i, def) in part.defs.iter().enumerate() {
-                    if i > 0 {
-                        ctx.write_str(", ");
-                    }
-                    ctx.write_str("PARTITION ");
-                    ctx.write_name(&def.name);
-                    if part.tp == PartitionType::Range {
-                        ctx.write_str(" VALUES LESS THAN (");
-                        match &def.less_than {
-                            Some(v) => write_partition_bound(ctx, v),
-                            None => ctx.write_str("MAXVALUE"),
-                        }
-                        for bound in &def.extra_bounds {
-                            ctx.write_str(", ");
-                            match bound {
-                                Some(v) => write_partition_bound(ctx, v),
-                                None => ctx.write_str("MAXVALUE"),
-                            }
-                        }
-                        ctx.write_str(")");
-                    } else if part.tp == PartitionType::List {
-                        ctx.write_str(" VALUES IN (");
-                        for (j, v) in def.in_values.iter().enumerate() {
-                            if j > 0 {
-                                ctx.write_str(", ");
-                            }
-                            match v {
-                                Some(v) => ctx.write_str(&v.to_string()),
-                                None => ctx.write_str("NULL"),
-                            }
-                        }
-                        ctx.write_str(")");
-                    }
-                }
-                ctx.write_str(")");
-            }
+            part.restore(ctx)?;
         }
         if let Some(select) = &self.select {
             ctx.write_str(" AS ");
@@ -913,6 +928,8 @@ pub enum AlterTableSpec {
     AddPartition {
         defs: Vec<PartitionDef>,
     },
+    /// `ALTER TABLE t PARTITION BY ...` — repartition an existing table.
+    Repartition(PartitionOption),
     /// `DROP PARTITION p0 [, p1 ...]`.
     DropPartition {
         if_exists: bool,
@@ -1180,6 +1197,10 @@ impl AlterTableSpec {
                 }
                 ctx.write_str(")");
                 Ok(())
+            }
+            AlterTableSpec::Repartition(spec) => {
+                ctx.write_str("PARTITION BY ");
+                spec.restore(ctx)
             }
             AlterTableSpec::DropPartition { if_exists, names } => {
                 ctx.write_str("DROP PARTITION ");

@@ -1400,6 +1400,19 @@ impl DropPlacementPolicyStmt {
     }
 }
 
+/// TiDB `CreatePlacementPolicyStmt` — accepted no-op.
+#[derive(Clone, Debug)]
+pub struct CreatePlacementPolicyStmt {
+    pub raw_sql: String,
+}
+
+impl CreatePlacementPolicyStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
 /// TiDB `CreateResourceGroupStmt` — accepted no-op.
 #[derive(Clone, Debug)]
 pub struct CreateResourceGroupStmt {

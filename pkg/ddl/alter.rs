@@ -10,7 +10,7 @@ use crate::create_table::{
     validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
-use crate::partition::{add_partitions, drop_partitions, exchange_partition};
+use crate::partition::{add_partitions, drop_partitions, exchange_partition, repartition};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
@@ -173,6 +173,16 @@ pub fn alter_table(
             | AlterTableSpec::TableOption { .. } => {}
             AlterTableSpec::AddPartition { defs } => {
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
+            }
+            AlterTableSpec::Repartition(option) => {
+                repartition(
+                    meta,
+                    &snapshot,
+                    &stmt.table,
+                    option,
+                    current_db,
+                    storage,
+                )?;
             }
             AlterTableSpec::ExchangePartition {
                 partition,
@@ -2703,7 +2713,7 @@ fn needs_column_move(position: &ColumnPosition, col_name: &str) -> bool {
     }
 }
 
-fn recompute_column_offsets(info: &mut TableInfo) {
+pub(crate) fn recompute_column_offsets(info: &mut TableInfo) {
     for (offset, col) in info.columns.iter_mut().enumerate() {
         col.offset = offset as i32;
     }

@@ -20,7 +20,8 @@ use crate::ast::expressions::{
 use crate::ast::misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
     CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    CreateBindingStmt, CreateResourceGroupStmt, CreateRoleStmt, CreateUserStmt, DeallocateStmt,
+    CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
+    CreateUserStmt, DeallocateStmt,
     DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
     DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
@@ -207,6 +208,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             match op {
                 AlterPartOp::Add(defs) => {
                     alter.specs.push(AlterTableSpec::AddPartition { defs });
+                }
+                AlterPartOp::Repartition(option) => {
+                    alter.specs.push(AlterTableSpec::Repartition(option));
                 }
                 AlterPartOp::Drop { if_exists, names } => {
                     alter
@@ -4722,6 +4726,18 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                     continue;
                 }
             }
+            if keyword_at(bytes, after, "PLACEMENT") {
+                let after_pl = skip_ws(bytes, after + "PLACEMENT".len());
+                if keyword_at(bytes, after_pl, "POLICY") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::CreatePlacementPolicy(
+                        CreatePlacementPolicyStmt { raw_sql },
+                    )));
+                    i = end;
+                    continue;
+                }
+            }
         }
         if keyword_at(bytes, i, "DROP") {
             let after = skip_ws(bytes, i + "DROP".len());
@@ -6396,6 +6412,7 @@ fn lower_explain_format(
 #[derive(Clone, Debug)]
 enum AlterPartOp {
     Add(Vec<PartitionDef>),
+    Repartition(PartitionOption),
     Drop {
         if_exists: bool,
         names: Vec<String>,
@@ -6515,6 +6532,20 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                     }));
                     i = skip_ws(bytes, end);
                     continue;
+                }
+                // `ALTER TABLE t PARTITION BY ...` — repartitioning has no
+                // sqlparser grammar; capture the spec for the DDL layer.
+                if keyword_at(bytes, after_name, "PARTITION") {
+                    let after_part = skip_ws(bytes, after_name + "PARTITION".len());
+                    if keyword_at(bytes, after_part, "BY") {
+                        let after_by = skip_ws(bytes, after_part + "BY".len());
+                        let (option, _) = parse_partition_by(bytes, after_by)?;
+                        out.push_str(&sql[i..after_name]);
+                        out.push_str("ALGORITHM=INPLACE");
+                        ops.push(Some(AlterPartOp::Repartition(option)));
+                        i = skip_ws(bytes, stmt_end(bytes, after_by));
+                        continue;
+                    }
                 }
                 if keyword_at(bytes, after_name, "ADD") {
                     let after_add = skip_ws(bytes, after_name + "ADD".len());
@@ -9081,10 +9112,12 @@ fn table_factor(
                     sqlparser::ast::TableIndexHintType::Use
                         | sqlparser::ast::TableIndexHintType::Force
                 ) {
+                    physical.use_index_hint = true;
                     physical
                         .use_indexes
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
                 } else if hint.hint_type == sqlparser::ast::TableIndexHintType::Ignore {
+                    physical.ignore_index_hint = true;
                     physical
                         .ignore_indexes
                         .extend(hint.index_names.iter().map(|n| n.value.clone()));
@@ -11846,7 +11879,30 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
             }
         }
     }
-    Ok(indices)
+    Ok(rename_duplicate_index_names(indices))
+}
+
+/// TiDB `renameIndexes`: duplicate non-PRIMARY index names get a `_2`, `_3`, …
+/// suffix (`expression_index`, `expression_index_2`, …).
+fn rename_duplicate_index_names(mut indices: Vec<IndexDef>) -> Vec<IndexDef> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for idx in &mut indices {
+        if idx.name.eq_ignore_ascii_case("PRIMARY") {
+            continue;
+        }
+        if used.insert(idx.name.clone()) {
+            continue;
+        }
+        let base = idx.name.clone();
+        for i in 2.. {
+            let candidate = format!("{base}_{i}");
+            if used.insert(candidate.clone()) {
+                idx.name = candidate;
+                break;
+            }
+        }
+    }
+    indices
 }
 
 fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef> {

@@ -806,6 +806,9 @@ impl PlanBuilder {
             Statement::DropPlacementPolicy(_) => Ok(PhysicalPlan::Simple {
                 kind: "DropPlacementPolicy".to_string(),
             }),
+            Statement::CreatePlacementPolicy(_) => Ok(PhysicalPlan::Simple {
+                kind: "CreatePlacementPolicy".to_string(),
+            }),
             Statement::CreateResourceGroup(_) => Ok(PhysicalPlan::Simple {
                 kind: "CreateResourceGroup".to_string(),
             }),

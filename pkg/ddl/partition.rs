@@ -351,3 +351,47 @@ fn range_bounds(def: &PartitionDef) -> Vec<String> {
     }
     out
 }
+
+/// `ALTER TABLE t PARTITION BY ...` — rebuild the partition metadata.
+///
+/// TiDB redistributes existing rows into the new partitions; SealDB currently
+/// only supports the metadata step, so a table that already holds rows is
+/// rejected rather than silently dropping them (REORGANIZE lands later).
+pub fn repartition(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    table: &TableName,
+    spec: &PartitionOption,
+    current_db: &str,
+    storage: &dyn Storage,
+) -> Result<()> {
+    let (schema, name) = resolve_name(table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &name).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{name}' doesn't exist"),
+        )
+    })?;
+    let physical_ids = match &info.partition {
+        Some(part) => part.definitions.iter().map(|d| d.id).collect::<Vec<_>>(),
+        None => vec![info.id],
+    };
+    let mut txn = storage.begin()?;
+    for id in physical_ids {
+        let start = encode_table_prefix(id);
+        let end = next_prefix(start.as_bytes());
+        if !txn.scan(start.as_bytes(), &end)?.is_empty() {
+            return Err(Error::unsupported(
+                "ALTER TABLE PARTITION BY on a table that contains data",
+            ));
+        }
+    }
+    drop(txn);
+    attach_partitions(meta, &mut info, spec)?;
+    meta.update_table(db.id, &info)?;
+    meta.gen_schema_version()?;
+    Ok(())
+}

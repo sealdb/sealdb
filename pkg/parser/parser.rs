@@ -300,6 +300,33 @@ mod tests {
             other => panic!("expected DropPlacementPolicyStmt, got {other:?}"),
         }
         match parser
+            .parse_one_stmt("CREATE PLACEMENT POLICY p1 FOLLOWERS = 2")
+            .unwrap()
+        {
+            crate::ast::Statement::CreatePlacementPolicy(_) => {}
+            other => panic!("expected CreatePlacementPolicyStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt(
+                "ALTER TABLE t PARTITION BY RANGE (a) (PARTITION p0 VALUES LESS THAN (10), \
+                 PARTITION pMax VALUES LESS THAN (MAXVALUE))",
+            )
+            .unwrap()
+        {
+            crate::ast::Statement::AlterTable(alter) => {
+                let repart = alter
+                    .specs
+                    .iter()
+                    .find_map(|spec| match spec {
+                        crate::ast::AlterTableSpec::Repartition(part) => Some(part),
+                        _ => None,
+                    })
+                    .expect("expected Repartition spec");
+                assert_eq!(repart.defs.len(), 2);
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+        match parser
             .parse_one_stmt("CREATE RESOURCE GROUP rg1 RU_PER_SEC = 100")
             .unwrap()
         {
@@ -716,10 +743,13 @@ mod tests {
             }
             other => panic!("expected CreateTableStmt, got {other:?}"),
         }
-        let err = parser
+        match parser
             .parse_one_stmt("CREATE TEMPORARY TABLE db1.t (id INT)")
-            .unwrap_err();
-        assert!(err.message.contains("TEMPORARY"));
+            .unwrap()
+        {
+            crate::ast::Statement::CreateTable(create) => assert!(create.temporary),
+            other => panic!("expected CreateTableStmt, got {other:?}"),
+        }
     }
 
     #[test]
