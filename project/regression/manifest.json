@@ -506,11 +506,11 @@
     {
       "name": "executor/adapter",
       "wave": "R7",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/executor/adapter.test",
       "result": "r/executor/adapter.result",
       "has_result": true,
-      "skip_tikv": false,
+      "skip_tikv": true,
       "owner_hint": "planner,statistics"
     },
     {
@@ -1762,7 +1762,7 @@
     {
       "name": "partition",
       "wave": "R3",
-      "status": "pending",
+      "status": "green",
       "test": "t/partition.test",
       "result": "r/partition.result",
       "has_result": true,
