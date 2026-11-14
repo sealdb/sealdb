@@ -11,6 +11,9 @@ pub struct RestoreCtx {
     buf: String,
     view_db: Option<String>,
     generated: bool,
+    /// CTE names in scope while restoring a view body. References to these are
+    /// written unqualified even in view mode (they are not base tables).
+    cte_names: Vec<String>,
 }
 
 impl RestoreCtx {
@@ -19,6 +22,7 @@ impl RestoreCtx {
             buf: String::new(),
             view_db: None,
             generated: false,
+            cte_names: Vec::new(),
         }
     }
 
@@ -29,6 +33,7 @@ impl RestoreCtx {
             buf: String::new(),
             view_db: None,
             generated: true,
+            cte_names: Vec::new(),
         }
     }
 
@@ -38,6 +43,7 @@ impl RestoreCtx {
             buf: String::new(),
             view_db: Some(db.to_string()),
             generated: false,
+            cte_names: Vec::new(),
         }
     }
 
@@ -53,6 +59,26 @@ impl RestoreCtx {
 
     pub fn in_view(&self) -> bool {
         self.view_db.is_some()
+    }
+
+    /// Enter the scope of a `WITH` clause while restoring a view body.
+    pub fn push_cte_names(&mut self, names: &[String]) {
+        self.cte_names.extend(names.iter().cloned());
+    }
+
+    /// Leave a `WITH` scope, restoring the previous CTE name set.
+    pub fn truncate_cte_names(&mut self, len: usize) {
+        self.cte_names.truncate(len);
+    }
+
+    pub fn cte_name_scope_len(&self) -> usize {
+        self.cte_names.len()
+    }
+
+    pub fn is_cte_name(&self, name: &str) -> bool {
+        self.cte_names
+            .iter()
+            .any(|cte| cte.eq_ignore_ascii_case(name))
     }
 
     pub fn write_str(&mut self, s: &str) {

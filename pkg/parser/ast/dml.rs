@@ -478,6 +478,21 @@ impl SelectStmt {
     /// tables, an explicit `AS` alias on every select field, and derived tables
     /// (flattened into CTEs by the bridge) inlined back into the `FROM` clause.
     fn restore_view(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        // `WITH` names are visible to their bodies (sibling references) and to
+        // the select itself, so restore everything under their scope.
+        let before = ctx.cte_name_scope_len();
+        let names: Vec<String> = self
+            .with
+            .as_ref()
+            .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
+            .unwrap_or_default();
+        ctx.push_cte_names(&names);
+        let restored = self.restore_view_body(ctx);
+        ctx.truncate_cte_names(before);
+        restored
+    }
+
+    fn restore_view_body(&self, ctx: &mut RestoreCtx) -> Result<()> {
         let ctes: Vec<&CommonTableExpression> = self
             .with
             .as_ref()
@@ -645,6 +660,7 @@ fn restore_view_table(
     if ctes
         .iter()
         .any(|cte| !cte.derived && cte.name.eq_ignore_ascii_case(&table.name))
+        || ctx.is_cte_name(&table.name)
     {
         ctx.write_name(&table.name);
         return Ok(());

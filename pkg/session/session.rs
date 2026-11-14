@@ -4266,6 +4266,7 @@ fn validate_view_shape<'a>(
 }
 
 /// One `FROM` source while validating a view body's column references.
+#[derive(Clone)]
 struct ViewCheckSource {
     names: Vec<String>,
     columns: Vec<String>,
@@ -4273,38 +4274,49 @@ struct ViewCheckSource {
 
 /// True when the view body references a table or column that no longer exists.
 fn view_arm_invalid(select: &SelectStmt, is: &InfoSchema, current_db: &str) -> bool {
+    view_arm_invalid_scoped(select, is, current_db, &[])
+}
+
+/// Columns a CTE exposes (`AS alias` or the expression's name).
+fn cte_output_columns(cte: &sealdb_parser::ast::CommonTableExpression) -> Vec<String> {
+    cte.query
+        .fields
+        .iter()
+        .map(|field| match &field.as_name {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => field.expr.name(),
+        })
+        .collect()
+}
+
+/// `view_arm_invalid` with CTE/outer sources inherited from enclosing scopes.
+fn view_arm_invalid_scoped(
+    select: &SelectStmt,
+    is: &InfoSchema,
+    current_db: &str,
+    inherited: &[ViewCheckSource],
+) -> bool {
+    let mut cte_sources = inherited.to_vec();
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            if view_arm_invalid(&cte.query, is, current_db) {
+            // A CTE body sees the preceding siblings (and outer CTEs).
+            if view_arm_invalid_scoped(&cte.query, is, current_db, &cte_sources) {
                 return true;
             }
             if cte
                 .set_rest
                 .iter()
-                .any(|(_, arm)| view_arm_invalid(arm, is, current_db))
+                .any(|(_, arm)| view_arm_invalid_scoped(arm, is, current_db, &cte_sources))
             {
                 return true;
             }
-        }
-    }
-    let mut sources: Vec<ViewCheckSource> = Vec::new();
-    if let Some(with) = &select.with {
-        for cte in &with.ctes {
-            let columns = cte
-                .query
-                .fields
-                .iter()
-                .map(|field| match &field.as_name {
-                    Some(name) if !name.is_empty() => name.clone(),
-                    _ => field.expr.name(),
-                })
-                .collect();
-            sources.push(ViewCheckSource {
+            cte_sources.push(ViewCheckSource {
                 names: vec![cte.name.clone()],
-                columns,
+                columns: cte_output_columns(cte),
             });
         }
     }
+    let mut sources = cte_sources;
     for table in select.join_tables() {
         if sources.iter().any(|source| {
             source
@@ -4422,15 +4434,15 @@ fn expr_columns_exist(
             .exprs
             .iter()
             .all(|item| expr_columns_exist(item, sources, is, current_db)),
-        ExprNode::ScalarSubquery(sub) => !result_set_invalid(&sub.query, is, current_db),
-        ExprNode::Exists(exists) => !result_set_invalid(&exists.query, is, current_db),
+        ExprNode::ScalarSubquery(sub) => !result_set_invalid(&sub.query, is, current_db, sources),
+        ExprNode::Exists(exists) => !result_set_invalid(&exists.query, is, current_db, sources),
         ExprNode::InSubquery(sub) => {
             expr_columns_exist(&sub.expr, sources, is, current_db)
-                && !result_set_invalid(&sub.query, is, current_db)
+                && !result_set_invalid(&sub.query, is, current_db, sources)
         }
         ExprNode::QuantifiedCmp(cmp) => {
             expr_columns_exist(&cmp.expr, sources, is, current_db)
-                && !result_set_invalid(&cmp.query, is, current_db)
+                && !result_set_invalid(&cmp.query, is, current_db, sources)
         }
         ExprNode::Value(_) => true,
     }
@@ -4440,11 +4452,12 @@ fn result_set_invalid(
     query: &sealdb_parser::ast::ResultSetNode,
     is: &InfoSchema,
     current_db: &str,
+    scope: &[ViewCheckSource],
 ) -> bool {
     query
         .selects()
         .into_iter()
-        .any(|select| view_arm_invalid(select, is, current_db))
+        .any(|select| view_arm_invalid_scoped(select, is, current_db, scope))
 }
 
 /// Attach `schema` to unqualified table refs that are not CTE names in scope.
