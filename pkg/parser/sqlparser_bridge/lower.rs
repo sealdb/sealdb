@@ -10521,6 +10521,14 @@ fn lower_foreign_keys(constraints: &[TableConstraint]) -> Result<Vec<ForeignKeyD
         let TableConstraint::ForeignKey(fk) = constraint else {
             continue;
         };
+        fks.push(lower_foreign_key_constraint(fk)?);
+    }
+    Ok(fks)
+}
+
+fn lower_foreign_key_constraint(
+    fk: &sqlparser::ast::ForeignKeyConstraint,
+) -> Result<ForeignKeyDef> {
         let columns = fk
             .columns
             .iter()
@@ -10530,7 +10538,7 @@ fn lower_foreign_keys(constraints: &[TableConstraint]) -> Result<Vec<ForeignKeyD
             return Err(Error::unsupported("FOREIGN KEY without columns"));
         }
         let ref_table = object_table_name(&fk.foreign_table)?;
-        fks.push(ForeignKeyDef {
+        Ok(ForeignKeyDef {
             name: fk
                 .name
                 .as_ref()
@@ -10553,9 +10561,7 @@ fn lower_foreign_keys(constraints: &[TableConstraint]) -> Result<Vec<ForeignKeyD
                 fk.on_delete,
                 Some(sqlparser::ast::ReferentialAction::Cascade)
             ),
-        });
-    }
-    Ok(fks)
+        })
 }
 
 fn lower_values(values: &Values) -> Result<Vec<Vec<crate::ast::expressions::ExprNode>>> {
@@ -11854,9 +11860,9 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
             TableConstraint::PrimaryKey(idx) => {
                 Ok(AlterTableSpec::AddIndex(lower_primary_key(idx)?))
             }
-            TableConstraint::ForeignKey(fk) => Ok(AlterTableSpec::AddForeignKey {
-                ref_table: fk.foreign_table.to_string().trim_matches('`').to_string(),
-            }),
+            TableConstraint::ForeignKey(fk) => Ok(AlterTableSpec::AddForeignKey(
+                lower_foreign_key_constraint(fk)?,
+            )),
             other => Err(Error::unsupported(format!("ALTER TABLE ADD {other}"))),
         },
         other => Err(Error::unsupported(format!("ALTER TABLE {other}"))),

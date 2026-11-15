@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 70,
-      "pending": 161,
+      "green": 72,
+      "pending": 159,
       "in_progress": 13,
       "deferred": 2,
       "local": 8
@@ -286,7 +286,7 @@
     {
       "name": "ddl/db_foreign_key",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_foreign_key.test",
       "result": "r/ddl/db_foreign_key.result",
       "has_result": true,
@@ -316,7 +316,7 @@
     {
       "name": "ddl/db_rename",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_rename.test",
       "result": "r/ddl/db_rename.result",
       "has_result": true,
@@ -336,7 +336,7 @@
     {
       "name": "ddl/ddl_error",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/ddl_error.test",
       "result": "r/ddl/ddl_error.result",
       "has_result": true,

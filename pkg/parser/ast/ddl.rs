@@ -963,11 +963,8 @@ pub enum AlterTableSpec {
         /// The new default literal, `None` for `DROP DEFAULT`.
         default: Option<String>,
     },
-    /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t (cols)` — only the
-    /// referenced table is validated (TTL conflict); enforcement lands later.
-    AddForeignKey {
-        ref_table: String,
-    },
+    /// `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES t (cols)`.
+    AddForeignKey(ForeignKeyDef),
     /// `ALTER TABLE t [PARTITION p] ATTRIBUTES [=] '<key=value, ...>'`; `DEFAULT`
     /// resets the attributes of the table or of the named partition.
     Attributes {
@@ -1259,9 +1256,42 @@ impl AlterTableSpec {
                 ctx.write_str("REMOVE TTL");
                 Ok(())
             }
-            AlterTableSpec::AddForeignKey { ref_table } => {
-                ctx.write_str("ADD FOREIGN KEY REFERENCES ");
-                ctx.write_name(ref_table);
+            AlterTableSpec::AddForeignKey(fk) => {
+                ctx.write_str("ADD ");
+                if !fk.name.is_empty() {
+                    ctx.write_str("CONSTRAINT ");
+                    ctx.write_name(&fk.name);
+                    ctx.write_str(" ");
+                }
+                ctx.write_str("FOREIGN KEY (");
+                for (i, col) in fk.columns.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(col);
+                }
+                ctx.write_str(") REFERENCES ");
+                if let Some(schema) = &fk.ref_schema {
+                    ctx.write_name(schema);
+                    ctx.write_str(".");
+                }
+                ctx.write_name(&fk.ref_table);
+                if !fk.ref_columns.is_empty() {
+                    ctx.write_str(" (");
+                    for (i, col) in fk.ref_columns.iter().enumerate() {
+                        if i > 0 {
+                            ctx.write_str(", ");
+                        }
+                        ctx.write_name(col);
+                    }
+                    ctx.write_str(")");
+                }
+                if fk.on_update_cascade {
+                    ctx.write_str(" ON UPDATE CASCADE");
+                }
+                if fk.on_delete_cascade {
+                    ctx.write_str(" ON DELETE CASCADE");
+                }
                 Ok(())
             }
             AlterTableSpec::Attributes {

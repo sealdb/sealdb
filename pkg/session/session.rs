@@ -993,6 +993,44 @@ impl Session {
             .lock()
             .expect("session current_db lock")
             .clone();
+        // TiDB `ALTER TABLE ... ADD FOREIGN KEY` on a session-local temporary
+        // table is rejected before any catalog lookup: a local temporary table
+        // reports `ErrUnsupportedDDLOperation` (8200), a global one reports
+        // `ErrCannotAddForeign` (1215).
+        if let Statement::AlterTable(alter) = stmt
+            && alter.specs.iter().any(|spec| {
+                matches!(
+                    spec,
+                    sealdb_parser::ast::AlterTableSpec::AddForeignKey(_)
+                )
+            })
+        {
+            let (schema, table) = alter.table.qualified(&current_db);
+            let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
+            let is_temp = self
+                .temp_tables
+                .lock()
+                .expect("session temp tables lock")
+                .contains_key(&key);
+            if is_temp {
+                let global = self
+                    .temp_tables_on_commit_delete
+                    .lock()
+                    .expect("session temp tables on commit lock")
+                    .contains(&key);
+                return Err(if global {
+                    Error::new(
+                        sealdb_errno::ERR_CANNOT_ADD_FOREIGN,
+                        "Cannot add foreign key constraint",
+                    )
+                } else {
+                    Error::new(
+                        sealdb_errno::ERR_UNSUPPORTED_DDL_OPERATION,
+                        "TiDB doesn't support ALTER TABLE for local temporary table",
+                    )
+                });
+            }
+        }
         // TiDB `DROP TABLE` drops a same-named session-local temporary table
         // (it shadows the permanent one); the remaining names keep the
         // persisted DDL path.

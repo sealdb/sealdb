@@ -1,5 +1,5 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_DUP_FIELDNAME,
+    ERR_BAD_FIELD, ERR_CANNOT_ADD_FOREIGN, ERR_FK_DUP_NAME, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_DUP_FIELDNAME,
     ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT,
     ERR_NO_SUCH_TABLE,
     ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
@@ -8,7 +8,7 @@ use sealdb_errno::{
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
 use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, ValueExpr};
-use sealdb_parser::ast::{ColumnDef, CreateTableStmt, SelectStmt};
+use sealdb_parser::ast::{ColumnDef, CreateTableStmt, ForeignKeyDef, SelectStmt};
 use sealdb_parser::model::CIStr;
 use sealdb_types::Datum;
 use sealdb_types::EvalType;
@@ -1019,50 +1019,82 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     // TiDB `BuildTableInfo`: a FOREIGN KEY needs a local index whose prefix is
     // exactly the FK columns; one is created implicitly (named after the
     // constraint) when no existing index (or the integer row handle) covers it.
+    // A temporary table (TiDB `TempTableLocal` or `TempTableGlobal`) cannot own
+    // a foreign key (`ErrCannotAddForeign`, 1215).
+    if !stmt.foreign_keys.is_empty()
+        && (stmt.temporary || stmt.on_commit_delete_rows)
+    {
+        return Err(Error::new(
+            ERR_CANNOT_ADD_FOREIGN,
+            "Cannot add foreign key constraint",
+        ));
+    }
     for (n, fk) in stmt.foreign_keys.iter().enumerate() {
-        let name = if fk.name.is_empty() {
-            format!("{}_ibfk_{}", info.name.o(), n + 1)
-        } else {
-            fk.name.clone()
-        };
-        let cols = fk
-            .columns
-            .iter()
-            .map(|col_name| {
-                info.columns
-                    .iter()
-                    .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
-                    .map(|c| (c.name.o().to_string(), c.offset))
-                    .ok_or_else(|| {
-                        Error::new(
-                            sealdb_errno::ERR_BAD_FIELD,
-                            format!("Unknown column '{col_name}' in foreign key '{name}'"),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !fk_index_covers(&info, &cols) {
-            let idx_id = info.max_idx_id + 1;
-            info.indices.push(IndexInfo::new(
-                idx_id,
-                name.clone(),
-                info.name.o(),
-                cols.iter()
-                    .map(|(col, offset)| IndexColumn::new(col.clone(), *offset))
-                    .collect(),
-            ));
-            info.max_idx_id = idx_id;
-        }
-        info.foreign_keys.push(sealdb_meta::ForeignKeyInfo {
-            name,
-            cols: cols.iter().map(|(col, _)| col.clone()).collect(),
-            ref_table: fk.ref_table.clone(),
-            ref_cols: fk.ref_columns.clone(),
-            on_update_cascade: fk.on_update_cascade,
-            on_delete_cascade: fk.on_delete_cascade,
-        });
+        add_foreign_key(&mut info, fk, n)?;
     }
     Ok(info)
+}
+
+/// TiDB `BuildTableInfo` / `AlterTableAddForeignKey`: append one FOREIGN KEY,
+/// materialising the implicit index over its local columns and rejecting a
+/// constraint name already used by the table (`ErrFkDupName`, 1826).
+pub(crate) fn add_foreign_key(
+    info: &mut TableInfo,
+    fk: &ForeignKeyDef,
+    position: usize,
+) -> Result<()> {
+    let name = if fk.name.is_empty() {
+        format!("{}_ibfk_{}", info.name.o(), position + 1)
+    } else {
+        fk.name.clone()
+    };
+    if info
+        .foreign_keys
+        .iter()
+        .any(|existing| existing.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(Error::new(
+            ERR_FK_DUP_NAME,
+            format!("Duplicate foreign key constraint name '{name}'"),
+        ));
+    }
+    let cols = fk
+        .columns
+        .iter()
+        .map(|col_name| {
+            info.columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
+                .map(|c| (c.name.o().to_string(), c.offset))
+                .ok_or_else(|| {
+                    Error::new(
+                        ERR_CANNOT_ADD_FOREIGN,
+                        "Cannot add foreign key constraint",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !fk_index_covers(info, &cols) {
+        let idx_id = info.max_idx_id + 1;
+        info.indices.push(IndexInfo::new(
+            idx_id,
+            name.clone(),
+            info.name.o(),
+            cols.iter()
+                .map(|(col, offset)| IndexColumn::new(col.clone(), *offset))
+                .collect(),
+        ));
+        info.max_idx_id = idx_id;
+    }
+    info.foreign_keys.push(sealdb_meta::ForeignKeyInfo {
+        name,
+        cols: cols.iter().map(|(col, _)| col.clone()).collect(),
+        ref_table: fk.ref_table.clone(),
+        ref_cols: fk.ref_columns.clone(),
+        on_update_cascade: fk.on_update_cascade,
+        on_delete_cascade: fk.on_delete_cascade,
+    });
+    Ok(())
 }
 
 /// Whether an index (or the integer row handle) already covers the FK columns

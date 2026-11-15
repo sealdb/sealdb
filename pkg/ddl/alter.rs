@@ -14,7 +14,7 @@ use crate::partition::{add_partitions, drop_partitions, exchange_partition, repa
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
-    ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
+    ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST, ERR_UNSUPPORTED_DDL_OPERATION,
     ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
     ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
     ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_NO_SUCH_TABLE,
@@ -26,6 +26,9 @@ use sealdb_errno::{
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
 use sealdb_meta::{ColumnInfo, Mutator, TableInfo};
+
+/// Reserved schema holding a session's temporary tables.
+const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
 use sealdb_parser::ast::{
     AlterTableSpec, AlterTableStmt, ColumnPosition, GeneratedColumn, TableName,
 };
@@ -238,17 +241,8 @@ pub fn alter_table(
                 meta.update_table(db.id, &info)?;
                 meta.gen_schema_version()?;
             }
-            AlterTableSpec::AddForeignKey { ref_table } => {
-                let (schema, table) = resolve_name(&stmt.table, current_db)?;
-                let _ = table;
-                if let Some(parent) = snapshot.table_by_name(&schema, ref_table)
-                    && parent.ttl.is_some()
-                {
-                    return Err(Error::new(
-                        ERR_TTL_FK_REFERENCED,
-                        "Set TTL for a table referenced by foreign key is not allowed",
-                    ));
-                }
+            AlterTableSpec::AddForeignKey(fk) => {
+                add_foreign_key_spec(meta, &snapshot, stmt, fk, current_db)?
             }
             AlterTableSpec::Attributes {
                 partition,
@@ -2615,6 +2609,48 @@ fn rename_table(
         meta.drop_table_or_view(db.id, info.id)?;
         meta.create_table_or_view(new_db.id, &info)?;
     }
+    meta.gen_schema_version()?;
+    Ok(())
+}
+
+/// `ALTER TABLE t ADD [CONSTRAINT name] FOREIGN KEY …` (TiDB
+/// `AlterTableAddForeignKey`): metadata-only, like the CREATE TABLE path.
+fn add_foreign_key_spec(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    fk: &sealdb_parser::ast::ForeignKeyDef,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    // Session temporary tables live under a reserved schema and TiDB rejects
+    // ADD FOREIGN KEY on them as an unsupported DDL (8200).
+    if schema.eq_ignore_ascii_case(TEMP_TABLE_SCHEMA) {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_DDL_OPERATION,
+            "Unsupported add foreign key constraint on a temporary table",
+        ));
+    }
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let mut info = is.table_by_name(&schema, &table).cloned().ok_or_else(|| {
+        Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        )
+    })?;
+    if let Some(parent) = is.table_by_name(&schema, &fk.ref_table)
+        && parent.ttl.is_some()
+    {
+        return Err(Error::new(
+            ERR_TTL_FK_REFERENCED,
+            "Set TTL for a table referenced by foreign key is not allowed",
+        ));
+    }
+    let position = info.foreign_keys.len();
+    crate::create_table::add_foreign_key(&mut info, fk, position)?;
+    meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())
 }

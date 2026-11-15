@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 70 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 72 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2734,6 +2734,67 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R7 低 diff pending（`sessiontxn/externals`、`globalindex/analyze`）
     与 R3 `explain_easy` 剩余项。
+
+### 2026-11-14（`ddl/db_rename` + `ddl/ddl_error` 转正：重命名错误码对齐）
+
+- **Phase**: R6
+- **完成**:
+  - `RENAME TABLE` 把视图迁到别的 schema：TiDB 在解析目标库之前就用
+    `ErrForbidSchemaChange`（1450，"Changing schema from 'a' to 'b' is not
+    allowed."）拒绝，SealDB 之前先查目标库报 1049。
+  - `RENAME INDEX` 指向不存在的索引：改报 `ErrKeyDoesNotExist`（1176，
+    "Key 'x' doesn't exist in table 't'"）；`DROP` 仍是 1091。
+  - `RENAME KEY` 是 TiDB 的 `RENAME INDEX` 同义词，bridge 之前只重写后者，
+    `ALTER TABLE t RENAME KEY k TO k2` 会落到语法错误 1064。
+  - 重命名表达式索引时一并改名其隐藏生成列 `_V$_<index>_<pos>`，旧索引名
+    可以再次 `ADD INDEX`，此前会撞 `Duplicate column name '_V$_idx1_0'`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -t ddl/db_rename --status pending -s memory` → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -t ddl/db_rename --status pending -s tikv` → `PASS: tikv=1`
+  - `./tests/integrationtest/run-tests.sh -t ddl/ddl_error --status pending -s memory` → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -t ddl/ddl_error --status pending -s tikv` → `PASS: tikv=1`
+  - manifest 两套 → `green`，green 70→72
+- **阻塞/风险**:
+  - 隐藏列改名只改元数据；已写入的行数据不扫描，只影响后续 DML 维护。
+  - `RENAME INDEX` 的 1176 只覆盖 `ALTER TABLE … RENAME`，`ADMIN` 路径未改。
+- **下一步**:
+  - 继续 `ddl/db_foreign_key`（约束重名 1826 / 临时表 FK 限制）与
+    `ddl/resource_group`（`DROP RESOURCE GROUP` 语法）。
+
+---
+
+### 2026-11-14（`ddl/db_foreign_key` 转正：FK 约束重名 1826 + 临时表限制 1215/8200）
+
+- **Phase**: R6
+- **完成**:
+  - TiDB `BuildTableInfo` 里 FOREIGN KEY 的隐式索引与约束重名检查抽成
+    `create_table::add_foreign_key`，`CREATE TABLE` 与 `ALTER TABLE … ADD
+    [CONSTRAINT] FOREIGN KEY` 共用：约束名大小写不敏感去重，重复时报
+    `ErrFkDupName`（1826，"Duplicate foreign key constraint name 'x'"）。
+    `ALTER` 之前只做了一条 TTL 引用检查，`AddForeignKey` 的列/索引/约束
+    全部丢弃。
+  - AST `AlterTableSpec::AddForeignKey` 改为携带完整 `ForeignKeyDef`
+    （bridge 由 `TableConstraint::ForeignKey(fk)` 直接 lower），
+    `create_table` 的 `add_foreign_key` 因此可被 ALTER 复用。
+  - 临时表不能带外键：`CREATE [GLOBAL] TEMPORARY TABLE` 的定义里出现 FK
+    时报 `ErrCannotAddForeign`（1215）；`ALTER TABLE` 命中会话临时表时按
+    TiDB 分流——global temporary（`ON COMMIT DELETE ROWS`）报 1215，local
+    temporary 报 `ErrUnsupportedDDLOperation`（8200，"TiDB doesn't support
+    ALTER TABLE for local temporary table"），此前落到 1146 表不存在。
+  - `ErrUnsupportedDDLOperation`（8200）的 SQLSTATE 由 42000 改为 TiDB 的
+    HY000（金样中 157 处 8200 全部按 HY000 记录）。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -t ddl/db_foreign_key --status pending -s memory` → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -t ddl/db_foreign_key --status pending -s tikv` → `PASS: tikv=1`
+  - manifest → `green`，green 72→73
+- **阻塞/风险**:
+  - FK 只有元数据：DML 不校验引用完整性（TiDB 建 FK 后语义上是弱检查，
+    但当前连 `FOREIGN_KEY_CHECKS` 相关的告警都未建模）。
+  - `ADD FOREIGN KEY` 对列不存在仍报 1215（TiDB 用同一 errno 包住
+    `ErrKeyColumnDoesNotExist` 等细节），仅当列存在时才真正落元数据。
+- **下一步**:
+  - 继续 `ddl/resource_group`（`DROP RESOURCE GROUP` 语法）、
+    `planner/core/indexmerge_intersection`、`expression/constant_fold`。
 
 ---
 

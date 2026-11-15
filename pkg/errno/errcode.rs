@@ -67,6 +67,13 @@ pub const ERR_KEY_DOES_NOT_EXIST: i32 = 1176;
 /// MySQL `ER_FORBID_SCHEMA_CHANGE`: a view cannot move to another schema
 /// (TiDB `ErrForbidSchemaChange`, used by `RENAME TABLE`).
 pub const ERR_FORBID_SCHEMA_CHANGE: i32 = 1450;
+/// MySQL `ER_CANNOT_ADD_FOREIGN`: a foreign key cannot be created (temporary
+/// table, or the constraint itself is invalid).
+pub const ERR_CANNOT_ADD_FOREIGN: i32 = 1215;
+/// MySQL `ER_FK_DUP_NAME`: two foreign keys share a constraint name.
+pub const ERR_FK_DUP_NAME: i32 = 1826;
+/// MySQL `ER_UNSUPPORTED_DDL_OPERATION` (TiDB `ErrUnsupportedDDLOperation`).
+pub const ERR_UNSUPPORTED_DDL_OPERATION: i32 = 8200;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;
 /// MySQL `ER_UNKNOWN_PARTITION`: named partition does not exist (1735).
 pub const ERR_UNKNOWN_PARTITION: i32 = 1735;
