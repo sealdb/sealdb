@@ -2798,6 +2798,38 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-14（`planner/core/indexmerge_intersection` 转正：hinted 交集合并 + IS NULL 分支）
+
+- **Phase**: R7
+- **完成**:
+  - `USE_INDEX_MERGE(t, i1, i2, …)` 命中纯合取过滤时，先于任何单索引访问
+    路径构建交集合并。TiDB 的 hint 型 IndexMerge 不是候选路径之一，而是
+    直接替换逐列索引选择；此前 `a=10 and b=20 and …` 会先落 `ia` 的
+    `IndexLookUp`，hint 完全失效。
+  - 交集的每个 hinted 索引各出一条 `IndexRangeScan`；`col IS NULL` 由
+    臂构造器单独处理为 NULL 点区间（`range:[NULL,NULL]`，按伪统计
+    `table_rows/1000` 估 10 行），不再残留成 probe 侧 `Selection isnull`。
+    该分支只服务 IndexMerge 臂：`conjunct_bound_sets` 保持不识别 IS NULL，
+    否则 outer-join 侧 `t2.a IS NULL` 反连接过滤会被误当成可 seek 区间，
+    `topn_push_down` 的 MergeJoin 会因此丢掉索引有序性并插入 Sort。
+  - 绑定（SPM）回放注入同一 hint 后复用同一路径，`create global binding`
+    后的 `explain` 与 hint 版本计划一致。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -t planner/core/indexmerge_intersection --status pending -s memory` → `PASS: memory=1`
+  - `--status pending -s tikv` → `PASS: tikv=1`
+  - 全量：Memory `green=74`、TiKV `green=73`（仅 `executor/adapter` skip_tikv）
+  - manifest → `green`，green 73→74
+- **阻塞/风险**:
+  - 只覆盖 hint 显式给出的交集；`indexmerge_path` 等自动选择交集的场景
+    仍未建模（TiDB 也只在 `USE_INDEX_MERGE` 下建交集）。
+  - NULL 点区间的行数用伪统计，ANALYZE 后的真实 null_count 尚未接入。
+- **下一步**:
+  - 继续 `ddl/resource_group`（`DROP RESOURCE GROUP` 语法 + processlist
+    `RESOURCE_GROUP` 列）、`expression/constant_fold`（`COLLATION()` /
+    `TRUNCATE()`）、`executor/kv`（`mysql.stats_*` 系统表）。
+
+---
+
 ## 5. Gate 证据索引
 
 | Gate | 报告/命令 | 状态 |

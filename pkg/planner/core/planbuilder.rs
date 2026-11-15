@@ -11624,6 +11624,52 @@ fn index_merge_index_arm(
     table_rows: f64,
     table_stats: Option<&super::access_range::TableStats>,
 ) -> Option<(IndexMergePath, Vec<ExprNode>)> {
+    // TiDB ranger turns `col IS NULL` into the NULL point range, so the index
+    // over that column is a usable merge arm (`IndexRangeScan range:[NULL,NULL]`,
+    // sized by the pseudo NULL share `table_rows / 1000`). `conjunct_bound_sets`
+    // deliberately leaves IS NULL out (the outer-join `t2.a IS NULL` anti filter
+    // must not turn into a range elsewhere), so the arm builder handles it.
+    let leading = index
+        .columns
+        .first()
+        .map(|col| super::expr_index::part_key(info, col));
+    if let Some(cond) = conds.iter().find(|cond| {
+        is_null_column(cond).is_some_and(|name| {
+            leading
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case(name))
+        })
+    }) {
+        let ranges = vec![(Some((Datum::Null, true)), Some((Datum::Null, true)))];
+        let width = index_key_column_names(info, index).len().max(1);
+        let rows = sealdb_statistics::pseudo::index_ranges_rows(
+            table_rows,
+            &ranges,
+            width,
+            1,
+            false,
+        );
+        return Some((
+            IndexMergePath {
+                index: index.name.o().to_string(),
+                range: Some(super::physical_plans::IndexScanRange {
+                    text: sealdb_statistics::pseudo::ranges_text(&ranges),
+                    rows,
+                    filter_rows: rows,
+                    pseudo: true,
+                    partial: None,
+                    keep_order: false,
+                }),
+                table_range: false,
+                index_columns: index_key_column_names(info, index),
+                keep_order: false,
+                desc: false,
+                limit: None,
+                ranges,
+            },
+            vec![cond.clone()],
+        ));
+    }
     let access =
         super::access_range::index_access_range(info, index, conds, table_rows, table_stats)?;
     Some((
@@ -11639,6 +11685,20 @@ fn index_merge_index_arm(
         },
         access.consumed,
     ))
+}
+
+/// Column of a bare `col IS NULL` conjunct (positive form only).
+fn is_null_column(expr: &ExprNode) -> Option<&str> {
+    let ExprNode::IsNull(is_null) = expr else {
+        return None;
+    };
+    if is_null.not {
+        return None;
+    }
+    let ExprNode::Column(column) = is_null.expr.as_ref() else {
+        return None;
+    };
+    Some(column.name.as_str())
 }
 
 /// One clustered-handle arm (`TableRangeScan` in EXPLAIN).
@@ -21948,6 +22008,32 @@ fn access_plan_inner(
                     );
                 }
             }
+        }
+        // `USE_INDEX_MERGE(t, …)` on a conjunctive filter (`a = 1 and b = 2`)
+        // builds an intersection merge before any single-index path: TiDB's
+        // hinted IndexMerge is not an alternative access path, it replaces the
+        // per-column index selection (`IndexMerge type: intersection` over one
+        // `IndexRangeScan` per hinted index).
+        if select
+            .selection
+            .as_ref()
+            .is_some_and(|selection| {
+                selection
+                    .split_cnf()
+                    .iter()
+                    .all(|conjunct| conjunct.split_dnf().len() < 2)
+            })
+            && index_merge_hint(&select.text, &from.name)
+                .or_else(|| {
+                    from.physical
+                        .as_deref()
+                        .and_then(|name| index_merge_hint(&select.text, name))
+                })
+                .is_some_and(|hint| !hint.disabled && hint.indexes.len() > 1)
+            && let Some(plan) =
+                index_merge_plan(select, from, info, prune_mode, stats, current_db)
+        {
+            return plan;
         }
         // `_tidb_rowid` is the row handle of a heap table (no integer PRIMARY
         // KEY and no common handle). TiDB seeks it like an integer handle:

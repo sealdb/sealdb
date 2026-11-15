@@ -2002,7 +2002,7 @@
     {
       "name": "planner/core/indexmerge_intersection",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/indexmerge_intersection.test",
       "result": "r/planner/core/indexmerge_intersection.result",
       "has_result": true,
