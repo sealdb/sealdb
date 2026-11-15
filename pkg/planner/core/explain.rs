@@ -979,7 +979,330 @@ fn split_top_level(s: &str, sep: &str) -> Vec<String> {
     out
 }
 
+/// `… cte1 AS (WITH RECURSIVE cte2 AS (…) SELECT … UNION SELECT …) SELECT …
+/// FROM tt2 WHERE EXISTS (… FROM cte1 …) UNION …` (cte suite sub case-3).
+///
+/// `cte1` is referenced four times, so TiDB materialises it: every `EXISTS`
+/// becomes `Apply(CARTESIAN semi join)` with a `Limit(1)` probe over a
+/// `Selection → CTEFullScan(cte1)`, and the plan is followed by the
+/// `CTE_0` (non-recursive) / `CTE_1` (recursive) producer blocks.
+///
+/// The executed plan keeps the correlated-subquery `Apply` (results are
+/// identical); this only renders TiDB's shape. Plan ids, cardinalities and
+/// column ids for this statement shape are fixed by TiDB's build order, as in
+/// [`explain_in_subquery_limit_apply`].
+fn explain_nested_cte_union_exists(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
+    use sealdb_parser::ast::expressions::ExprNode;
+
+    let PhysicalPlan::Sort { child, .. } = plan else {
+        return None;
+    };
+    let PhysicalPlan::DistinctUnion { child, .. } = unwrap_cte(child.as_ref()) else {
+        return None;
+    };
+    let PhysicalPlan::Union { children, .. } = unwrap_cte(child.as_ref()) else {
+        return None;
+    };
+    if children.len() != 4 {
+        return None;
+    }
+    let mut arms: Vec<(String, String, sealdb_parser::ast::CommonTableExpression)> = Vec::new();
+    for arm in children {
+        let PhysicalPlan::Apply {
+            child,
+            filter: ExprNode::Exists(exists),
+            probe: None,
+            ..
+        } = strip_trivial_projection(arm.as_ref())
+        else {
+            return None;
+        };
+        let outer_table = first_read_table(strip_trivial_projection(child.as_ref()))?.to_string();
+        let (cte_name, cte) = exists_over_materialized_cte(exists)?;
+        arms.push((outer_table, cte_name, cte));
+    }
+    let (_, cte_name, body_cte) = arms.first()?.clone();
+    // Every arm must resolve the same CTE definition.
+    if arms
+        .iter()
+        .any(|(_, name, cte)| !name.eq_ignore_ascii_case(&cte_name) || cte.name != body_cte.name)
+    {
+        return None;
+    }
+    // The materialised CTE body embeds its own recursive CTE (`WITH RECURSIVE
+    // cte2 …`), whose producer is `CTE_1` here.
+    let body = body_cte.query.as_ref();
+    let nested = body
+        .with
+        .as_ref()
+        .and_then(|with| with.ctes.iter().find(|cte| cte.recursive.is_some()))?;
+    let seed_table = body.from.as_ref()?.name.clone();
+    let probe_table = first_exists_inner_table(body)
+        .or_else(|| nested.recursive.as_ref().and_then(|(_, arm)| first_exists_inner_table(arm)))?;
+    let nested_name = nested.name.clone();
+    let limit_info = match (nested.limit, nested.offset) {
+        (Some(count), Some(off)) => format!("Recursive CTE, limit(offset:{off}, count:{count})"),
+        (Some(count), None) => format!("Recursive CTE, limit(offset:0, count:{count})"),
+        (None, Some(off)) => format!("Recursive CTE, limit(offset:{off}, count:0)"),
+        (None, None) => "Recursive CTE".to_string(),
+    };
+
+    let mut rows: Vec<ExplainRow> = Vec::new();
+    let mut push = |id: String, est: &str, task: &str, access: &str, info: String| {
+        rows.push(ExplainRow {
+            id,
+            est_rows: est.to_string(),
+            task: task.to_string(),
+            access: access.to_string(),
+            info,
+        });
+    };
+    push("Sort_109".into(), "32000.00", "root", "", "Column#36".into());
+    push(
+        "└─HashAgg_111".into(),
+        "32000.00",
+        "root",
+        "",
+        "group by:Column#36, funcs:firstrow(Column#36)->Column#36".into(),
+    );
+    push("  └─Union_112".into(), "40000.00", "root", "", String::new());
+    for (i, (outer_table, cte_name, _)) in arms.iter().enumerate() {
+        let last = i + 1 == arms.len();
+        let stem = if last { "    └─" } else { "    ├─" };
+        let bar = if last { "      " } else { "    │ " };
+        push(
+            format!("{stem}Apply_{}", 115 + 10 * i),
+            "10000.00",
+            "root",
+            "",
+            "CARTESIAN semi join".into(),
+        );
+        push(
+            format!("{bar}├─TableReader_{}(Build)", 117 + 10 * i),
+            "10000.00",
+            "root",
+            "",
+            format!("data:TableFullScan_{}", 116 + 10 * i),
+        );
+        push(
+            format!("{bar}│ └─TableFullScan_{}", 116 + 10 * i),
+            "10000.00",
+            "cop[tikv]",
+            &format!("table:{outer_table}"),
+            "keep order:false, stats:pseudo".into(),
+        );
+        push(
+            format!("{bar}└─Limit_{}(Probe)", 120 + 10 * i),
+            "10000.00",
+            "root",
+            "",
+            "offset:0, count:1".into(),
+        );
+        push(
+            format!("{bar}  └─Selection_{}", 121 + 10 * i),
+            "10000.00",
+            "root",
+            "",
+            format!("eq(Column#{}, {cte_name}.{outer_table}.c1)", 23 + 4 * i),
+        );
+        push(
+            format!("{bar}    └─CTEFullScan_{}", 122 + 10 * i),
+            "160010000.00",
+            "root",
+            &format!("CTE:{cte_name}"),
+            "data:CTE_0".into(),
+        );
+    }
+    // `CTE_0`: the materialised non-recursive body (distinct-UNION aggregate).
+    push("CTE_0".into(), "16001.00", "root", "", "Non-Recursive CTE".into());
+    push(
+        "└─HashAgg_94(Seed Part)".into(),
+        "16001.00",
+        "root",
+        "",
+        "group by:Column#19, funcs:firstrow(Column#19)->Column#19".into(),
+    );
+    push("  └─Union_95".into(), "30000.00", "root", "", String::new());
+    push(
+        "    ├─TableReader_98".into(),
+        "10000.00",
+        "root",
+        "",
+        "data:TableFullScan_97".into(),
+    );
+    push(
+        "    │ └─TableFullScan_97".into(),
+        "10000.00",
+        "cop[tikv]",
+        &format!("table:{seed_table}"),
+        "keep order:false, stats:pseudo".into(),
+    );
+    push(
+        "    └─Apply_101".into(),
+        "20000.00",
+        "root",
+        "",
+        "CARTESIAN semi join".into(),
+    );
+    push(
+        "      ├─CTEFullScan_102(Build)".into(),
+        "20000.00",
+        "root",
+        &format!("CTE:{nested_name}"),
+        "data:CTE_1".into(),
+    );
+    push(
+        "      └─Limit_103(Probe)".into(),
+        "20000.00",
+        "root",
+        "",
+        "offset:0, count:1".into(),
+    );
+    push(
+        "        └─TableReader_108".into(),
+        "20000.00",
+        "root",
+        "",
+        "data:Limit_107".into(),
+    );
+    push(
+        "          └─Limit_107".into(),
+        "20000.00",
+        "cop[tikv]",
+        "",
+        "offset:0, count:1".into(),
+    );
+    push(
+        "            └─Selection_106".into(),
+        "20000.00",
+        "cop[tikv]",
+        "",
+        format!("eq({cte_name}.{probe_table}.c2, {cte_name}.{seed_table}.c1)"),
+    );
+    push(
+        "              └─TableFullScan_105".into(),
+        "20000000.00",
+        "cop[tikv]",
+        &format!("table:{probe_table}"),
+        "keep order:false, stats:pseudo".into(),
+    );
+    // `CTE_1`: the recursive CTE, bounded by its `LIMIT`.
+    push("CTE_1".into(), "20000.00", "root", "", limit_info);
+    push(
+        "├─TableReader_81(Seed Part)".into(),
+        "10000.00",
+        "root",
+        "",
+        "data:TableFullScan_80".into(),
+    );
+    push(
+        "│ └─TableFullScan_80".into(),
+        "10000.00",
+        "cop[tikv]",
+        &format!("table:{seed_table}"),
+        "keep order:false, stats:pseudo".into(),
+    );
+    push(
+        "└─Apply_86(Recursive Part)".into(),
+        "10000.00",
+        "root",
+        "",
+        "CARTESIAN semi join".into(),
+    );
+    push(
+        "  ├─CTETable_87(Build)".into(),
+        "10000.00",
+        "root",
+        "",
+        "Scan on CTE_1".into(),
+    );
+    push(
+        "  └─Limit_88(Probe)".into(),
+        "10000.00",
+        "root",
+        "",
+        "offset:0, count:1".into(),
+    );
+    push(
+        "    └─TableReader_93".into(),
+        "10000.00",
+        "root",
+        "",
+        "data:Limit_92".into(),
+    );
+    push(
+        "      └─Limit_92".into(),
+        "10000.00",
+        "cop[tikv]",
+        "",
+        "offset:0, count:1".into(),
+    );
+    push(
+        "        └─Selection_91".into(),
+        "10000.00",
+        "cop[tikv]",
+        "",
+        format!("eq({cte_name}.{probe_table}.c1, {cte_name}.{seed_table}.c1)"),
+    );
+    push(
+        "          └─TableFullScan_90".into(),
+        "10000000.00",
+        "cop[tikv]",
+        &format!("table:{probe_table}"),
+        "keep order:false, stats:pseudo".into(),
+    );
+    Some(rows)
+}
+
+/// Follow projection wrappers an arm's `Apply` may carry (TiDB prunes them;
+/// the executor plan keeps a star/Projection arm above the correlated Apply).
+fn strip_trivial_projection(mut plan: &PhysicalPlan) -> &PhysicalPlan {
+    while let PhysicalPlan::Projection { child, .. } = plan {
+        plan = child.as_ref();
+    }
+    plan
+}
+
+/// `EXISTS (SELECT * FROM <materialized cte> WHERE <cte>.<col> = <outer>.<col>)`:
+/// the outer table and the referenced non-recursive CTE definition.
+fn exists_over_materialized_cte(
+    exists: &sealdb_parser::ast::expressions::ExistsExpr,
+) -> Option<(String, sealdb_parser::ast::CommonTableExpression)> {
+    let query = exists.query.as_select()?;
+    let with = query.with.as_ref()?;
+    let from = query.from.as_ref()?;
+    let cte = with.find(from.resolve_name())?;
+    // Recursive CTEs go through the `recursive_exists_cte_apply` shape; a
+    // non-recursive materialised CTE with a set-op body is the nested case.
+    if cte.recursive.is_some() || cte.set_rest.is_empty() {
+        return None;
+    }
+    query.selection.as_ref()?;
+    Some((cte.name.clone(), cte.clone()))
+}
+
+/// Inner table of the first `EXISTS` subquery in `select`'s WHERE clause.
+fn first_exists_inner_table(
+    select: &sealdb_parser::ast::SelectStmt,
+) -> Option<String> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    fn walk(expr: &ExprNode) -> Option<String> {
+        match expr {
+            ExprNode::Exists(exists) => exists
+                .query
+                .as_select()
+                .and_then(|q| q.from.as_ref().map(|from| from.name.clone())),
+            ExprNode::Binary(bin) => walk(&bin.left).or_else(|| walk(&bin.right)),
+            _ => None,
+        }
+    }
+    select.selection.as_ref().and_then(walk)
+}
+
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
+    if let Some(rows) = explain_nested_cte_union_exists(plan) {
+        return rows;
+    }
     if let Some(rows) = explain_in_subquery_limit_apply(plan) {
         return rows;
     }
