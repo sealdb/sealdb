@@ -3166,6 +3166,39 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 去关联 `index_merge` 的 IN 子查询（semi join + marker），再核
     `explain_indexmerge_stats` 的交叉臂选择与 sel 估算。
 
+### 2026-11-15（`sessiontxn/externals` 转正：`tidb_external_ts` 外部时间戳读取）
+
+- **Phase**: R7（`sessiontxn/externals`）
+- **完成**:
+  - `Storage`/`Transaction` 新增 `begin_stale_read_at` / `start_timestamp`：
+    Mem 保留 `commit_ts <= ts` 的版本，TiKV 用该 TSO 建只读 snapshot。
+    `AS OF TIMESTAMP` 的毫秒粒度无法区分“同一毫秒内的事务开始与提交”，
+    外部时间戳走逻辑版本才与 TiDB 一致。
+  - `@@tidb_current_ts` 返回当前事务的起始版本（无事务时取
+    `Storage::current_timestamp()`）；`SET GLOBAL tidb_external_ts =
+    @@tidb_current_ts` 会求值右侧系统变量，而不再把字面量 `@@...` 存进去。
+  - `tidb_enable_external_ts_read=ON` 时新的读快照钉在
+    `tidb_external_ts`：autocommit 语句、`BEGIN`/`START TRANSACTION`
+    都按该版本开 snapshot；已开启的事务保持自己的快照，事务内切换开关
+    不影响，与 TiDB 一致。
+  - `SET @@tidb_current_ts = …` 改为 1238（read only variable）。
+  - 派生窗口谓词改写只对 DECIMAL 结果（`avg`/`sum` 等）补
+    `cast(…, decimal(10,0) BINARY)`；`row_number()`/`rank()` 等整数结果
+    保持 `le(Column#N, k)`，`explain_easy` 与 `rule_derive_topn_from_window`
+    的两种形状同时成立。
+- **验证**:
+  - `run-tests.sh --status pending -t sessiontxn/externals`：Mem / TiKV 各 1 套 `PASS`。
+  - 全量 green+local gate：memory `PASS: memory=95`，tikv `PASS: tikv=93`。
+- **阻塞/风险**:
+  - 外部时间戳按逻辑版本比较，`tidb_external_ts` 若被写成毫秒值（如
+    `19980613`）只能读回、不能用于真实读路径；TiDB 同样以 TSO 语义解释。
+  - `kill -0` 在受限环境返回 EPERM 时 meta 文件锁会把已死进程当成活锁，
+    导致 `timed out locking meta persist`；清理 `$TMPDIR/sealdb-meta.lock`
+    后可恢复。
+- **下一步**:
+  - 继续 R2/R3 的 in_progress：`cte`（物质化非递归 CTE producer/consumer）
+    与 `explain_cte` 的 `CTEFullScan`/`CTE_N` 渲染。
+
 ---
 
 ## 5. Gate 证据索引

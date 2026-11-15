@@ -13722,10 +13722,15 @@ fn rewrite_derived_window_predicates(
             _ => None,
         })
         .collect();
-    if part_cols.is_empty() {
-        return None;
-    }
     let win_col = super::window::window_result_column_id(&cte.query, is, current_db);
+    // `avg(int)` / `sum(int)` are DECIMAL in TiDB; their comparisons coerce
+    // the other side with `cast(…, decimal(10,0))`. Ranking functions and
+    // `count`/`min`/`max` keep integer types, so no cast is printed.
+    let decimal_window = matches!(
+        win.name.to_ascii_lowercase().as_str(),
+        "avg" | "sum" | "std" | "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop"
+            | "var_samp"
+    ) && !win.args.is_empty();
     let mut pushed = Vec::new();
     let mut residual = Vec::new();
     let mut changed = false;
@@ -13741,7 +13746,7 @@ fn rewrite_derived_window_predicates(
             pushed.push(strip_predicate_qualifiers(&conjunct));
             changed = true;
         } else {
-            let rewritten = rewrite_window_result_refs(&conjunct, &alias, win_col);
+            let rewritten = rewrite_window_result_refs(&conjunct, &alias, win_col, decimal_window);
             if rewritten.restore_string() != conjunct.restore_string() {
                 changed = true;
             }
@@ -13801,6 +13806,7 @@ fn strip_predicate_qualifiers(expr: &ExprNode) -> ExprNode {
     }
 }
 
+/// A bare plan column (`Column#N`) introduced by the rewrite below.
 fn is_plan_column(expr: &ExprNode) -> bool {
     matches!(
         expr,
@@ -13809,10 +13815,17 @@ fn is_plan_column(expr: &ExprNode) -> bool {
     )
 }
 
-/// Replace references to the derived window output with its plan column. A
-/// comparison against that decimal result coerces the other operand with
-/// `cast(…, decimal(10,0))`, matching TiDB's expression rewrite.
-fn rewrite_window_result_refs(expr: &ExprNode, alias: &str, win_col: usize) -> ExprNode {
+/// Replace references to the derived window output with its plan column.
+/// When the window result is DECIMAL (e.g. `avg` over an exact type) TiDB's
+/// type coercion casts the other operand (`gt(cast(a, decimal(10,0) BINARY),
+/// Column#5)`); integer results such as `row_number()` stay untyped, so the
+/// comparison prints as `le(Column#6, 3)`.
+fn rewrite_window_result_refs(
+    expr: &ExprNode,
+    alias: &str,
+    win_col: usize,
+    decimal: bool,
+) -> ExprNode {
     let cast_operand = |expr: ExprNode| {
         ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
             expr: Box::new(expr),
@@ -13828,15 +13841,15 @@ fn rewrite_window_result_refs(expr: &ExprNode, alias: &str, win_col: usize) -> E
             })
         }
         ExprNode::Binary(bin) => {
-            let left = rewrite_window_result_refs(&bin.left, alias, win_col);
-            let right = rewrite_window_result_refs(&bin.right, alias, win_col);
+            let left = rewrite_window_result_refs(&bin.left, alias, win_col, decimal);
+            let right = rewrite_window_result_refs(&bin.right, alias, win_col, decimal);
             let compare = matches!(
                 bin.op,
                 Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
             );
-            let (left, right) = if compare && is_plan_column(&left) && !is_plan_column(&right) {
+            let (left, right) = if compare && decimal && is_plan_column(&left) && !is_plan_column(&right) {
                 (left, cast_operand(right))
-            } else if compare && is_plan_column(&right) && !is_plan_column(&left) {
+            } else if compare && decimal && is_plan_column(&right) && !is_plan_column(&left) {
                 (cast_operand(left), right)
             } else {
                 (left, right)
@@ -13850,10 +13863,10 @@ fn rewrite_window_result_refs(expr: &ExprNode, alias: &str, win_col: usize) -> E
         }
         ExprNode::Unary(unary) => ExprNode::Unary(UnaryOpExpr {
             op: unary.op,
-            expr: Box::new(rewrite_window_result_refs(&unary.expr, alias, win_col)),
+            expr: Box::new(rewrite_window_result_refs(&unary.expr, alias, win_col, decimal)),
         }),
         ExprNode::Cast(cast) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
-            expr: Box::new(rewrite_window_result_refs(&cast.expr, alias, win_col)),
+            expr: Box::new(rewrite_window_result_refs(&cast.expr, alias, win_col, decimal)),
             target: cast.target.clone(),
         }),
         ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
@@ -13861,7 +13874,7 @@ fn rewrite_window_result_refs(expr: &ExprNode, alias: &str, win_col: usize) -> E
             args: func
                 .args
                 .iter()
-                .map(|arg| rewrite_window_result_refs(arg, alias, win_col))
+                .map(|arg| rewrite_window_result_refs(arg, alias, win_col, decimal))
                 .collect(),
             distinct: func.distinct,
         }),
