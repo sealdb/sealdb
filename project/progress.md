@@ -3087,6 +3087,52 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-15（`cte` 推进到 93%：LIMIT 下推保 CTE 壳 + star 重排别名对齐）
+
+- **Phase**: R2（`cte`）
+- **完成**:
+  - `limit_reader` 进入 `PhysicalPlan::CTE` 时，若 seed 不是可直接下推的
+    叶子（投影 / 嵌套子查询等），返回整个 `CTE` 节点而不是裸 seed。
+    此前上层 `Limit` 会把 `CTE` 壳剥掉，导致根 `Projection` 重新解析时
+    丢失 CTE 声明的输出列（`qn2(b)` 被内联成 `3*a`），报
+    `Error 1054: Unknown column 'b' in 'where clause'`。
+    (`with qn as (select 10 as a), qn2 as (select 3*a as b from qn)
+    select * from qn2 limit 1`)
+  - `join_output_order_differs` 比较 join 叶子输出顺序时改用 join 节点里
+    的别名 `t.name`（而非 `t.resolve_name()`）：`t1 dt1` 形式的别名表
+    之前被判成“顺序不一致”，在已经保序的 `MergeJoin` 上多插了一层
+    `Sort` + 双层 `Projection`，`cte` 金样回归。
+  - `pkg/session/session.rs` 增加单测
+    `test_cte_star_projection_under_limit` 覆盖上述 LIMIT 场景。
+- **验证**:
+  - `cte`：memory `PASS: memory=1`，tikv `PASS: tikv=1`；首个归一化差异从
+    0 推到 862 行（约 93% 行已一致）
+  - 全量 green+local gate：memory `PASS: memory=92`，tikv `PASS: tikv=90`
+- **阻塞/风险**:
+  - `cte` 仅余 862 行起的 1 段（sub case-3，嵌套 CTE + UNION）：
+    `cte1` 是**非递归但被共享（物化）**的 CTE，其 body 里含递归 `cte2`。
+    外层各 union 分支的 `EXISTS (SELECT * FROM cte1 WHERE corr)` 本应像
+    case-2 一样变成 `Apply(… CARTESIAN semi join) → Limit(Probe) →
+    Selection → CTEFullScan`，我们却退回 `Apply … EXISTS (<原始子查询 SQL>)`
+    （无 probe），因为 `rule_semi_join::recursive_exists_cte_apply` 只认
+    `with` 里带递归标记的 CTE。
+  - 同段还缺非递归物化 CTE 的 producer 渲染：`explain_rows` 末尾目前只
+    emit `recursive: true` 的 `CTE_i`，TiDB 对共享非递归 CTE 会输出
+    `CTE_0 … Non-Recursive CTE` 及其 `(Seed Part)` 子树。
+  - 上述两点修好后，上游 `Column#36` vs `Column#37` 的列号偏移应由
+    case-2/case-3 共享的列号基数一并对齐。
+  - 说明：自测 runner 的 Gate B 归一化会剥掉 `_N` 算子编号，因此
+    `TableReader_9` vs `_1`、`CTE_0` vs `CTE` 这类差异不计入失败，双端
+    goldens 不受影响。
+  - `explain_cte`（34 处差异）与上面同族：非递归物化 CTE 的生产/消费
+    渲染 + 列号基数，单独立项。
+- **下一步**:
+  - 在 `rule_semi_join` 放开“物化（inline=false）CTE”的 EXISTS→Apply
+    半连接形态；在 `explain_rows` 为 `recursive: false, inline: false`
+    的 CTE 输出 producer 子树，再核 `explain_cte`。
+
+---
+
 ## 5. Gate 证据索引
 
 | Gate | 报告/命令 | 状态 |

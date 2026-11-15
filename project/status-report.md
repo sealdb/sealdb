@@ -174,7 +174,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表（**已转绿**） |
 | `globalindex/mem_index_merge*` | 同 `index_merge` | 同上 |
 | `explain_complex*` / `explain_indexmerge_stats` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
-| `cte` / `explain_cte` | 递归 CTE 形状与 `CTEFullScan` 列编号 | CTE 统计与列编号 |
+| `cte` / `explain_cte` | `cte` 仅余 1 段（sub case-3）：共享非递归物化 CTE 上的 EXISTS 未转 `Apply` 半连接、缺 Non-Recursive CTE producer；`explain_cte` 同族 + 列号基数 | 物化非递归 CTE 的消费/生产渲染 |
 | `join_reorder2` / `join_reorder_through_projection` | MergeJoin 选择与 `Column#N` 编号 | cost 驱动 join 顺序 |
 
 结论：R3 剩余项仍是四块基础设施——**统计驱动访问路径/基数**、**子查询去关联（semi/anti/marker）**、**表达式（函数）索引**、**权限 + 运行时统计**；其中统计与去关联两块已在 `explain_easy_stats` / `explain_join_stats` / `executor/point_get` 上验证成型，接下来按套件收口而不是重做基础设施。
@@ -243,13 +243,13 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 |---:|---|---|---:|:--:|:--:|
 | 1 | `agg_predicate_pushdown` | green | 100% | ✓ | ✓ |
 | 2 | `collation_agg_func` | pending | 0% | ✗ | — |
-| 3 | `cte` | in_progress | 65%（首差 862/1329） | ✓ | — |
+| 3 | `cte` | in_progress | 93%（首差 862，物质化非递归 CTE 的 EXISTS 半连接与 producer） | ✓ | — |
 | 4 | `executor/cte` | green | 100% | ✓ | ✓ |
 | 5 | `executor/jointest/hash_join` | green | 100% | ✓ | ✓ |
 | 6 | `executor/jointest/join` | green | 100% | ✓ | ✓ |
 | 7 | `executor/union_scan` | green | 100% | ✓ | ✓ |
 | 8 | `executor/window` | green | 100% | ✓ | ✓ |
-| 9 | `explain_cte` | in_progress | 2%（首差 9/520） | ✓ | — |
+| 9 | `explain_cte` | in_progress | 2%（34 处差异：CTE 列号基数 + 物化/内联渲染） | ✓ | — |
 | 10 | `explain_union_scan` | green | 100% | ✓ | ✓ |
 | 11 | `globalindex/aggregate` | green | 100% | ✓ | ✓ |
 | 12 | `globalindex/index_join` | green | 100% | ✓ | ✓ |
