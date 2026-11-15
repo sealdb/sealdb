@@ -1,6 +1,6 @@
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DATA_OUT_OF_RANGE, ERR_DIVISION_BY_ZERO, ERR_TIMESTAMP_IN_DST_TRANSITION,
-    ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
+    ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
@@ -10,6 +10,7 @@ use sealdb_parser::ast::expressions::{
 use sealdb_parser::opcode::Op;
 use sealdb_parser::sqlparser_bridge::parse_expr;
 use sealdb_types::Datum;
+use sealdb_types::MyDecimal;
 use sealdb_types::field_type::FieldType;
 use sealdb_types::time::{Time, TimeType, parse_timestamp_literal};
 use sealdb_util::collate::{CollateMode, compare_bytes};
@@ -1325,6 +1326,32 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         // `DATE(expr)` / `TIME(expr)` / `TIMESTAMP(expr)`: the temporal part of
         // the argument (TiDB `builtinCastXxxSig`).
         "DATE" | "TIME" | "TIMESTAMP" => eval_temporal_cast(func, schema, row),
+        // MySQL `TRUNCATE(X, D)`: drop the digits right of `D` decimals
+        // (toward zero); negative `D` zeroes the integer digits instead.
+        "TRUNCATE" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "TRUNCATE requires 2 arguments",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            let digits = eval_expr_with_row(&func.args[1], schema, row)?;
+            if value.is_null() || digits.is_null() {
+                return Ok(Datum::Null);
+            }
+            let scale = digits.as_i64()?;
+            let decimal = match &value {
+                Datum::Decimal(d) => d.clone(),
+                Datum::F64(f) => MyDecimal::parse(&format!("{f}"))?,
+                Datum::Bytes(b) => MyDecimal::parse(&String::from_utf8_lossy(b))?,
+                Datum::I64(_) | Datum::U64(_) | Datum::Year(_) => {
+                    MyDecimal::from_i64(value.as_i64()?)
+                }
+                other => MyDecimal::parse(&format!("{}", other.as_f64()?))?,
+            };
+            truncate_decimal(decimal, scale)
+        }
         "FLOOR" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1648,8 +1675,43 @@ fn time_from_yyyymmdd(n: i64) -> Option<Time> {
     })
 }
 
-fn eval_date_part(
-    func: &FuncCallExpr,
+/// MySQL `TRUNCATE`: keep `scale` fractional digits (dropping the rest toward
+/// zero); a negative scale zeros `-scale` integer digits instead.
+fn truncate_decimal(decimal: MyDecimal, scale: i64) -> Result<Datum> {
+    let text = format!("{decimal}");
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (body, ""),
+    };
+    if scale <= 0 {
+        let int_len = int_part.len() as i64;
+        let keep = (int_len + scale).max(0) as usize;
+        let mut out: String = int_part.chars().take(keep).collect();
+        out.push_str(&"0".repeat(int_len as usize - keep));
+        if out.is_empty() {
+            out.push('0');
+        }
+        let value: i64 = out
+            .parse()
+            .map_err(|_| Error::new(ERR_TRUNCATED_WRONG_VALUE, "decimal overflow"))?;
+        return Ok(Datum::I64(if sign == "-" { -value } else { value }));
+    }
+    let scale = scale as usize;
+    let frac: String = if frac_part.len() >= scale {
+        frac_part[..scale].to_string()
+    } else {
+        format!("{frac_part}{:0>width$}", "", width = scale - frac_part.len())
+    };
+    Ok(Datum::Decimal(MyDecimal::parse(&format!(
+        "{sign}{int_part}.{frac}"
+    ))?))
+}
+
+fn eval_date_part(    func: &FuncCallExpr,
     schema: &[String],
     row: &[Datum],
     part: impl Fn(&Time) -> i64,

@@ -1262,7 +1262,7 @@
     {
       "name": "expression/constant_fold",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/constant_fold.test",
       "result": "r/expression/constant_fold.result",
       "has_result": true,

@@ -118,6 +118,11 @@ impl ExecutorBuilder {
                         });
                     expand_projection_fields(substituted.as_ref().unwrap_or(select), &from_cols)
                 };
+                // `COLLATION(expr)` reports the *static* collation of its
+                // argument, so fold it here where the table types are known.
+                // The output names were derived from the original fields, so
+                // the display label keeps `collation(…)`.
+                let exprs = resolve_collation_exprs(&domain, select, current_db, exprs);
                 // A covering read over an expression index only carries the
                 // hidden key column, so the SELECT expressions re-evaluate
                 // against it (`plus(t.a, 1)` → the stored `(a+1)` value).
@@ -1919,10 +1924,150 @@ fn expand_projection_fields(
     (exprs, names)
 }
 
+/// Fold `COLLATION(expr)` in a SELECT list into its static collation name.
+fn resolve_collation_exprs(
+    domain: &Domain,
+    select: &SelectStmt,
+    current_db: &str,
+    exprs: Vec<ExprNode>,
+) -> Vec<ExprNode> {
+    if !exprs.iter().any(contains_collation) {
+        return exprs;
+    }
+    let is = domain.infoschema();
+    let info = select
+        .from
+        .as_ref()
+        .filter(|_| select.from_item.is_none() && select.joins.is_empty())
+        .and_then(|from| {
+            let (db, table) = from.qualified(current_db);
+            is.table_by_name(&db, &table)
+        });
+    exprs
+        .into_iter()
+        .map(|expr| fold_collation(expr, info.as_deref()))
+        .collect()
+}
+
+fn contains_collation(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Func(func) => {
+            func.name.eq_ignore_ascii_case("collation") || func.args.iter().any(contains_collation)
+        }
+        ExprNode::Cast(cast) => contains_collation(&cast.expr),
+        ExprNode::Binary(binary) => {
+            contains_collation(&binary.left) || contains_collation(&binary.right)
+        }
+        ExprNode::Unary(unary) => contains_collation(&unary.expr),
+        _ => false,
+    }
+}
+
+fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> ExprNode {
+    match expr {
+        ExprNode::Func(mut func) => {
+            if func.name.eq_ignore_ascii_case("collation") && func.args.len() == 1 {
+                let collation = expr_collation(&func.args[0], info);
+                return ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                    datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
+                });
+            }
+            func.args = func
+                .args
+                .into_iter()
+                .map(|arg| fold_collation(arg, info))
+                .collect();
+            ExprNode::Func(func)
+        }
+        ExprNode::Cast(mut cast) => {
+            cast.expr = Box::new(fold_collation(*cast.expr, info));
+            ExprNode::Cast(cast)
+        }
+        ExprNode::Binary(mut binary) => {
+            binary.left = Box::new(fold_collation(*binary.left, info));
+            binary.right = Box::new(fold_collation(*binary.right, info));
+            ExprNode::Binary(binary)
+        }
+        ExprNode::Unary(mut unary) => {
+            unary.expr = Box::new(fold_collation(*unary.expr, info));
+            ExprNode::Unary(unary)
+        }
+        other => other,
+    }
+}
+
+/// TiDB `expression.GetCollation`: the collation of an expression's static
+/// type. A binary string (VARBINARY/BLOB) or a non-string operand reports
+/// `binary`; string literals and character columns report their charset's
+/// default collation. `binary` wins when a control function unifies arms.
+fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> String {
+    const DEFAULT: &str = "utf8mb4_general_ci";
+    let neutral = |coll: &str| coll.is_empty();
+    match expr {
+        ExprNode::Value(value) => match &value.datum {
+            sealdb_types::Datum::Bytes(_) => DEFAULT.to_string(),
+            sealdb_types::Datum::Null => String::new(),
+            _ => "binary".to_string(),
+        },
+        ExprNode::Column(column) => info
+            .and_then(|info| {
+                info.columns
+                    .iter()
+                    .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))
+            })
+            .map(|col| {
+                if col.field_type.charset == "binary" || col.field_type.collate == "binary" {
+                    "binary".to_string()
+                } else if !col.field_type.collate.is_empty() {
+                    col.field_type.collate.clone()
+                } else if col.field_type.eval_type() == sealdb_types::field_type::EvalType::String {
+                    DEFAULT.to_string()
+                } else {
+                    "binary".to_string()
+                }
+            })
+            .unwrap_or_else(|| DEFAULT.to_string()),
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => {
+            unify_collations(func.args.iter().map(|arg| expr_collation(arg, info)), neutral)
+        }
+        ExprNode::Func(func)
+            if matches!(
+                func.name.to_ascii_lowercase().as_str(),
+                "ifnull" | "coalesce" | "if" | "nullif" | "greatest" | "least"
+            ) =>
+        {
+            unify_collations(func.args.iter().map(|arg| expr_collation(arg, info)), neutral)
+        }
+        ExprNode::Case(case) => unify_collations(
+            case.when_then
+                .iter()
+                .map(|(_, then)| expr_collation(then, info))
+                .chain(case.else_expr.as_deref().map(|e| expr_collation(e, info))),
+            neutral,
+        ),
+        _ => "binary".to_string(),
+    }
+}
+
+fn unify_collations(collations: impl Iterator<Item = String>, neutral: impl Fn(&str) -> bool) -> String {
+    const DEFAULT: &str = "utf8mb4_general_ci";
+    let mut out = String::new();
+    for coll in collations {
+        if neutral(&coll) {
+            continue;
+        }
+        if out.is_empty() {
+            out = coll;
+        } else if coll == "binary" || out == "binary" {
+            out = "binary".to_string();
+        }
+    }
+    if out.is_empty() { DEFAULT.to_string() } else { out }
+}
+
 /// Attach FROM table name onto bare columns so overflow messages match TiDB
 /// (`db.table.col`).
-fn qualify_expr_table(expr: ExprNode, table: &str) -> ExprNode {
-    match expr {
+fn qualify_expr_table(expr: ExprNode, table: &str) -> ExprNode {    match expr {
         ExprNode::Column(mut c) if c.table.is_none() => {
             c.table = Some(table.to_string());
             ExprNode::Column(c)

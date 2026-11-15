@@ -2866,6 +2866,31 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 继续 `expression/constant_fold`（`COLLATION()` / `TRUNCATE()`）、
     `executor/kv`（`mysql.stats_*` 系统表）、`ddl/resource_group`。
 
+### 2026-11-15（`expression/constant_fold` 转正：`COLLATION()` / `TRUNCATE()`）
+
+- **Phase**: R7
+- **完成**:
+  - `COLLATION(expr)` 之前报 1305（函数不存在）。它返回参数的**静态**collation，
+    在 `Projection` 构建处（类型信息可得、输出列名已由原始字段算好）折叠成
+    字符串常量：字符串字面量 → `utf8mb4_general_ci`，`VARBINARY`/`BLOB` 与非
+    字符串操作数 → `binary`，`CONCAT`/`IFNULL`/`COALESCE`/`IF`/`CASE` 逐支
+    归并（`binary` 优先，`NULL` 字面量视为中性）。这样列头仍是
+    `collation(ifnull(concat(id),'~'))` 而值正确。
+  - `TRUNCATE(X, D)` 之前报 1305。按 MySQL 语义实现：任一参数 NULL → NULL；
+    `D > 0` 截断小数位（返回 DECIMAL，补零到 D 位），`D <= 0` 把整数位
+    低位清零（返回整数），负数向零截断。
+- **验证**:
+  - `expression/constant_fold`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - manifest → `green`，green 76→77（TiKV 可跑 76）
+- **阻塞/风险**:
+  - `COLLATION` 只在 SELECT 列表投影处折叠；`ORDER BY` / `GROUP BY` 中的
+    `collation()` 仍会 1305（当前语料未覆盖）。
+  - 归并规则是 TiDB `inferType4ControlFuncs` 的简化版，未覆盖 `ELT` 等函数。
+- **下一步**:
+  - 继续 `executor/kv`（`mysql.stats_*` 系统表）、
+    `ddl/resource_group`（`DROP RESOURCE GROUP` 语法 +
+    `information_schema.processlist.RESOURCE_GROUP`）。
+
 ---
 
 ## 5. Gate 证据索引
