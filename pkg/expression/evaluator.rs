@@ -2200,8 +2200,9 @@ fn eval_timestamp_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
 }
 
 fn eval_unix_timestamp(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    // `UNIX_TIMESTAMP()` without an argument returns the current epoch seconds.
     if func.args.is_empty() {
-        return Err(Error::unsupported("UNIX_TIMESTAMP()"));
+        return Ok(Datum::I64(unix_now_secs()));
     }
     if func.args.len() != 1 {
         return Err(Error::new(

@@ -75,6 +75,9 @@ pub const ERR_FK_DUP_NAME: i32 = 1826;
 /// MySQL `ER_UNSUPPORTED_DDL_OPERATION` (TiDB `ErrUnsupportedDDLOperation`).
 pub const ERR_UNSUPPORTED_DDL_OPERATION: i32 = 8200;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;
+/// TiDB `ErrColumnHasExprIndexDependent`: a column used by an expression
+/// index key part cannot be dropped or renamed.
+pub const ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT: i32 = 3837;
 /// MySQL `ER_UNKNOWN_PARTITION`: named partition does not exist (1735).
 pub const ERR_UNKNOWN_PARTITION: i32 = 1735;
 /// TiDB `ErrRowDoesNotMatchGivenPartitionSet` (`INSERT ... PARTITION` skip).

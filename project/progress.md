@@ -2830,6 +2830,44 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-15（`ddl/db_change` + `executor/compact_table` 转正）
+
+- **Phase**: R6 / R7
+- **完成**:
+  - 表达式索引依赖列改名/删除报 `ErrColumnHasExprIndexDependent`（3837，
+    "Column 'x' has an expression index dependency and cannot be dropped or
+    renamed"）：`ALTER TABLE t RENAME COLUMN b` / `DROP COLUMN b` 在
+    `INDEX idx((a+b))` 上之前落到 3108（普通生成列依赖），TiDB 先判表达式
+    索引隐藏列 `_V$_idx_0` 的表达式是否引用该列。
+  - `DROP STATS t` 之前是语法错误（1064）。新增 `DropStatsStmt`（bridge 在
+    `DROP` 后识别 `STATS`/`STATISTICS`），按当前库解析表名并从统计 handle
+    删除后持久化，优化器回落到伪统计。
+  - `ALTER TABLE … COMPACT` 之前是纯 no-op。改为按 TiDB 语义解析表名与可选
+    分区列表：库未选 1046、表不存在 1146、非分区表带分区列表 1105
+    （`list:[p1 p2]`）、未知分区 1735，其余情况记 1105 warning
+    "compact skipped: no tiflash replica in the table"（no-op 语句路径绕过
+    通用 warning 收集，需显式写入 `last_warnings`）。
+  - `UNIX_TIMESTAMP()` 零参数返回当前 epoch 秒（此前报 1235）。
+  - ENUM/SET 严格模式下 `Data truncated for column 'c' at row 1` 不再附带
+    `(value '…')` 后缀，与 TiDB 消息一致。
+  - DDL reorg 把 NULL 填成 `NOT NULL TIMESTAMP` 时用 `NOW()` 的会话本地
+    墙钟（再走 `session_local_to_utc`），此前直接写 UTC 被二次换算，
+    时间戳整体偏一个时区偏移（db_change 的
+    `unix_timestamp() - unix_timestamp(a)` 差 8/9 小时）。
+- **验证**:
+  - `ddl/db_change`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - `executor/compact_table`：memory / tikv 各 1 通过
+  - 全量：Memory `green=76`、TiKV `green=75`（仅 `executor/adapter` skip_tikv）
+  - manifest 两套 → `green`，green 74→76
+- **阻塞/风险**:
+  - COMPACT 只做元数据与告警，不触发任何 region 合并。
+  - `DROP STATS` 不接受 `ALL` / 列级语法，table_list 形式已足够当前语料。
+- **下一步**:
+  - 继续 `expression/constant_fold`（`COLLATION()` / `TRUNCATE()`）、
+    `executor/kv`（`mysql.stats_*` 系统表）、`ddl/resource_group`。
+
+---
+
 ## 5. Gate 证据索引
 
 | Gate | 报告/命令 | 状态 |

@@ -1296,9 +1296,35 @@ impl DistributeTableStmt {
     }
 }
 
-/// TiDB `CompactTableStmt` (`ALTER TABLE … COMPACT`) — accepted no-op.
+/// TiDB `DROP STATS <table_list>`: remove every table's statistics so the
+/// optimizer falls back to pseudo estimates.
+#[derive(Clone, Debug)]
+pub struct DropStatsStmt {
+    pub tables: Vec<TableName>,
+}
+
+impl DropStatsStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str("DROP STATS ");
+        for (i, table) in self.tables.iter().enumerate() {
+            if i > 0 {
+                ctx.write_str(", ");
+            }
+            table.restore(ctx)?;
+        }
+        Ok(())
+    }
+}
+
+/// TiDB `CompactTableStmt` (`ALTER TABLE … COMPACT`) — metadata-only no-op in
+/// SealDB, but the table and optional partition list drive TiDB's errors
+/// (1046/1146, 1105 for a non-partitioned table, 1735 for an unknown partition)
+/// and the "no tiflash replica" warning.
 #[derive(Clone, Debug)]
 pub struct CompactTableStmt {
+    pub table: TableName,
+    /// `PARTITION (p1, p2)` / `PARTITION p1, p2`; empty compacts the whole table.
+    pub partitions: Vec<String>,
     pub raw_sql: String,
 }
 

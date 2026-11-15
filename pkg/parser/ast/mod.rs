@@ -31,7 +31,7 @@ pub use misc::{
     CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
     CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
     CreateUserStmt, DeallocateStmt,
-    DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
+    DistributeTableStmt, DoStmt, DropBindingStmt, DropStatsStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
     DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
     GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,

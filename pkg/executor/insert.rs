@@ -987,11 +987,10 @@ fn cast_enum_set(v: &Datum, ft: &FieldType, col: &str) -> Result<Datum> {
     )))
 }
 
-fn truncated_error(v: &Datum, col: &str) -> Error {
-    let raw = String::from_utf8_lossy(&v.as_bytes()).into_owned();
+fn truncated_error(_v: &Datum, col: &str) -> Error {
     Error::new(
         ERR_WARN_DATA_TRUNCATED,
-        format!("Data truncated for column '{col}' at row 1 (value '{raw}')"),
+        format!("Data truncated for column '{col}' at row 1"),
     )
 }
 

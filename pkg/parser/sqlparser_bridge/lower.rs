@@ -22,7 +22,7 @@ use crate::ast::misc::{
     CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
     CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
     CreateUserStmt, DeallocateStmt,
-    DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
+    DistributeTableStmt, DoStmt, DropStatsStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
     DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
     GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
@@ -4750,6 +4750,18 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
         }
         if keyword_at(bytes, i, "DROP") {
             let after = skip_ws(bytes, i + "DROP".len());
+            if keyword_at(bytes, after, "STATS") || keyword_at(bytes, after, "STATISTICS") {
+                let kw_len = if keyword_at(bytes, after, "STATS") {
+                    "STATS".len()
+                } else {
+                    "STATISTICS".len()
+                };
+                let (tables, end) = parse_table_name_list(bytes, after + kw_len)?;
+                out.push_str("SET NAMES '__sealdb_misc__'");
+                ops.push(Some(Statement::DropStats(DropStatsStmt { tables })));
+                i = end;
+                continue;
+            }
             if keyword_at(bytes, after, "PLACEMENT") {
                 let after_pl = skip_ws(bytes, after + "PLACEMENT".len());
                 if keyword_at(bytes, after_pl, "POLICY") {
@@ -4788,8 +4800,14 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 let end = skip_stmt_tail(bytes, i);
                 if stmt_contains_keyword(&bytes[i..end], "COMPACT") {
                     let raw_sql = String::from_utf8_lossy(&bytes[i..end]).trim().to_string();
+                    let (table, _) = parse_table_name(bytes, after + "TABLE".len())?;
+                    let partitions = compact_partition_names(&raw_sql);
                     out.push_str("SET NAMES '__sealdb_misc__'");
-                    ops.push(Some(Statement::CompactTable(CompactTableStmt { raw_sql })));
+                    ops.push(Some(Statement::CompactTable(CompactTableStmt {
+                        table,
+                        partitions,
+                        raw_sql,
+                    })));
                     i = end;
                     continue;
                 }
@@ -4800,6 +4818,28 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
         i += ch.len_utf8();
     }
     Ok((out, ops))
+}
+
+/// Partition names of `ALTER TABLE t COMPACT PARTITION (p1, p2)` (TiDB also
+/// accepts the list without parentheses). Empty when the whole table is named.
+fn compact_partition_names(raw_sql: &str) -> Vec<String> {
+    let upper = raw_sql.to_ascii_uppercase();
+    let Some(pos) = upper.find("PARTITION") else {
+        return Vec::new();
+    };
+    let rest = &raw_sql[pos + "PARTITION".len()..];
+    // A `TIFLASH REPLICA` clause after the list is not a partition name.
+    let rest = match rest.to_ascii_uppercase().find("TIFLASH") {
+        Some(cut) => &rest[..cut],
+        None => rest,
+    };
+    rest.trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|name| name.trim().trim_matches('`').to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn stmt_end(bytes: &[u8], mut i: usize) -> usize {

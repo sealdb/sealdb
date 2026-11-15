@@ -389,6 +389,67 @@ impl Session {
         Ok(empty_result())
     }
 
+    /// TiDB `CompactTableStmt` (`ALTER TABLE … COMPACT`): resolves the table so
+    /// a missing database (1046) or table (1146) still fails, validates an
+    /// explicit partition list (1105 / 1735), and otherwise reports that the
+    /// compaction was skipped because SealDB tables carry no tiflash replica.
+    fn compact_table(&self, compact: &sealdb_parser::ast::CompactTableStmt) -> Result<QueryResult> {
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let (schema, table) = compact.table.qualified(&current_db);
+        if schema.is_empty() {
+            return Err(Error::new(
+                sealdb_errno::ERR_NO_DB,
+                "No database selected",
+            ));
+        }
+        let is = self.domain.infoschema();
+        let info = is.table_by_name(&schema, &table).ok_or_else(|| {
+            Error::new(
+                sealdb_errno::ERR_NO_SUCH_TABLE,
+                format!("Table '{schema}.{table}' doesn't exist"),
+            )
+        })?;
+        if !compact.partitions.is_empty() {
+            let Some(partition) = info.partition.as_ref() else {
+                return Err(Error::new(
+                    sealdb_errno::ERR_UNKNOWN_ERROR,
+                    format!(
+                        "table:{table} is not a partition table, but user specify partition name list:[{}]",
+                        compact.partitions.join(" ")
+                    ),
+                ));
+            };
+            for name in &compact.partitions {
+                if !partition
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.name.o().eq_ignore_ascii_case(name))
+                {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_UNKNOWN_PARTITION,
+                        format!("Unknown partition '{name}' in table '{table}'"),
+                    ));
+                }
+            }
+        }
+        let mut result = empty_result();
+        result.warnings.push((
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            "compact skipped: no tiflash replica in the table".to_string(),
+        ));
+        // The no-op statement path returns before the generic warning capture,
+        // so `SHOW WARNINGS` reads what this statement recorded.
+        *self
+            .last_warnings
+            .lock()
+            .expect("session last_warnings lock") = result.warnings.clone();
+        Ok(result)
+    }
+
     /// `DROP TEMPORARY TABLE`: only session-local definitions are affected;
     /// their rows are removed from storage.
     fn drop_temporary_tables(
@@ -741,7 +802,6 @@ impl Session {
             | Statement::PlanReplayer(_)
             | Statement::ImportInto(_)
             | Statement::DistributeTable(_)
-            | Statement::CompactTable(_)
             | Statement::RecommendIndex(_)
             | Statement::CalibrateResource(_)
             | Statement::FlashBackTable(_)
@@ -755,6 +815,29 @@ impl Session {
             | Statement::AddQueryWatch(_)
             | Statement::DropQueryWatch(_) => {
                 return Ok(empty_result());
+            }
+            Statement::DropStats(drop) => {
+                let current_db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                let stats = self.domain.stats();
+                for table in &drop.tables {
+                    let (schema, name) = table.qualified(&current_db);
+                    if schema.is_empty() {
+                        return Err(Error::new(
+                            sealdb_errno::ERR_NO_DB,
+                            "No database selected",
+                        ));
+                    }
+                    stats.delete(&schema, &name);
+                }
+                self.domain.persist_stats()?;
+                return Ok(empty_result());
+            }
+            Statement::CompactTable(compact) => {
+                return self.compact_table(compact);
             }
             Statement::BRIE(brie) => {
                 return crate::brie::execute_brie(self, &brie.raw_sql);

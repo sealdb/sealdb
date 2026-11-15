@@ -785,6 +785,9 @@ impl PlanBuilder {
             Statement::CompactTable(_) => Ok(PhysicalPlan::Simple {
                 kind: "CompactTable".to_string(),
             }),
+            Statement::DropStats(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropStats".to_string(),
+            }),
             Statement::RecommendIndex(_) => Ok(PhysicalPlan::Simple {
                 kind: "RecommendIndex".to_string(),
             }),

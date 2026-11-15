@@ -14,6 +14,7 @@ use crate::partition::{add_partitions, drop_partitions, exchange_partition, repa
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
+    ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT,
     ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST, ERR_UNSUPPORTED_DDL_OPERATION,
     ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
     ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
@@ -738,6 +739,21 @@ fn used_by_partition_function(info: &TableInfo, name: &str) -> bool {
     !part.expr.is_empty() && references_identifier(&part.expr, name)
 }
 
+/// Whether an expression index key part depends on `name`: the part is backed
+/// by a hidden generated column whose expression references the column. TiDB
+/// reports this before the plain generated-column dependency (3837 vs 3108).
+fn has_dependent_expression_index(info: &TableInfo, name: &str) -> bool {
+    info.indices.iter().any(|idx| {
+        idx.columns.iter().any(|part| {
+            info.columns
+                .iter()
+                .find(|col| col.hidden && col.name.o().eq_ignore_ascii_case(part.name.o()))
+                .and_then(|col| col.generated_expr.as_deref())
+                .is_some_and(|expr| references_identifier(expr, name))
+        })
+    })
+}
+
 /// Whether a generated column depends on `name`.
 fn has_dependent_generated_column(info: &TableInfo, name: &str) -> bool {
     info.columns.iter().any(|col| {
@@ -752,6 +768,15 @@ fn partition_column_dependency(name: &str) -> Error {
         ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL,
         format!(
             "Column '{name}' has a partitioning function dependency and cannot be dropped or renamed"
+        ),
+    )
+}
+
+fn expression_index_dependency(name: &str) -> Error {
+    Error::new(
+        ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT,
+        format!(
+            "Column '{name}' has an expression index dependency and cannot be dropped or renamed"
         ),
     )
 }
@@ -827,6 +852,9 @@ fn drop_column(
     };
     if used_by_partition_function(&info, name) {
         return Err(partition_column_dependency(name));
+    }
+    if has_dependent_expression_index(&info, name) {
+        return Err(expression_index_dependency(name));
     }
     if has_dependent_generated_column(&info, name) {
         return Err(generated_column_dependency(name));
@@ -1083,6 +1111,9 @@ fn change_column(
     let renaming = !old_name.eq_ignore_ascii_case(new_name);
     if renaming && used_by_partition_function(&info, old_name) {
         return Err(partition_column_dependency(old_name));
+    }
+    if renaming && has_dependent_expression_index(&info, old_name) {
+        return Err(expression_index_dependency(old_name));
     }
     if renaming && has_dependent_generated_column(&info, old_name) {
         return Err(generated_column_dependency(old_name));
@@ -1345,7 +1376,7 @@ fn rewrite_column_rows(
                         && new_ft.tp == sealdb_types::field_type::TYPE_TIMESTAMP
                         && col.field_type.tp != sealdb_types::field_type::TYPE_TIMESTAMP
                     {
-                        value = sealdb_types::Datum::Time(current_timestamp_value(new_ft));
+                        value = sealdb_types::Datum::Time(current_timestamp_value(new_ft)?);
                     }
                     // A NULL left in a column that just became NOT NULL aborts
                     // the reorg job (TiDB reports 1265 for the first row).
@@ -2156,18 +2187,24 @@ fn zero_number(d: &sealdb_types::Datum) -> bool {
 
 /// `CURRENT_TIMESTAMP` as a stored TIMESTAMP value (UTC wall clock). TiDB uses
 /// it when a NULL of another type lands in a NOT NULL TIMESTAMP column.
-fn current_timestamp_value(ft: &FieldType) -> sealdb_types::time::Time {
+fn current_timestamp_value(ft: &FieldType) -> Result<sealdb_types::time::Time> {
     let (secs, micro) = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| (d.as_secs() as i64, d.subsec_micros()))
         .unwrap_or((0, 0));
-    let mut t = sealdb_types::time::Time::from_unix_secs(secs, sealdb_types::TimeType::Timestamp);
+    // The substitution behaves like `NOW()`: a session-local wall clock that
+    // `convert_column_value` later shifts into UTC storage. Handing it a UTC
+    // clock instead would shift it a second time and store `now - offset`.
+    let mut t = sealdb_expression::utc_to_session_local(
+        sealdb_types::time::Time::from_unix_secs(secs, sealdb_types::TimeType::Timestamp),
+    )?;
+    t.tp = sealdb_types::TimeType::Timestamp;
     let fsp = ft.decimal.clamp(0, 6) as i8;
     t.fsp = fsp;
     if fsp > 0 {
         t.micro = micro;
     }
-    t
+    Ok(t)
 }
 
 /// The zero value of a temporal target type.
