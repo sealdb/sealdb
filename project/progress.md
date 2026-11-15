@@ -3229,6 +3229,42 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `explain_join_stats`（统计等值基数、HashAgg vs StreamAgg 代价、
     `TIDB_INLJ` 提示的 `IndexJoin` 形状）。
 
+### 2026-11-15（`sealdb-session` 单测归零：隐藏生成列泄漏 + TiDB 8.5 计划/错误形状）
+
+- **Phase**: R3（`pkg/session` 单测 ⇄ TiDB 8.5 黄金对照）
+- **完成**:
+  - `SELECT *` 结果不再泄漏表达式索引的隐藏生成列（`_V$_idx_0`）：
+    `ExecutorBuilder::run` 与既有的 `\u{1}` USING 隐藏列一起过滤 `_V$*`
+    表项（`EXPLAIN` 侧保持“未被访问的表达式索引不加投影”的黄金形状）。
+  - 堆表二级索引键的最后一段是隐藏 `_tidb_rowid`：`index_key_parts` 仅在
+    `pk_is_handle` 时追加具名 handle 列，`KEY(name) AND id > 1` 不再把
+    `id` 变成索引范围。
+  - 单测按 TiDB 8.5 对齐：`SHOW CREATE VIEW` 四列（含
+    `character_set_client`/`collation_connection`）；`DROP TABLE` 视图报
+    1051（TiDB `dropTableObject` 把非基表当作不存在）；`EXISTS`/`NOT
+    EXISTS` 保持 semi/anti semi join 且内层无 `HashAgg`，只有 `IN` 改写
+    （`tidb_opt_insubq_to_join_and_agg` 默认 ON）才带去重聚合，故 `= ANY`
+    内连接 + `HashAgg`。
+  - 事务内 DDL 按 TiDB 语义“隐式提交”（TiDB simpletest
+    `TestTransaction`）：`test_transactional_ddl` 改名
+    `test_ddl_implicitly_commits`，断言 DDL 与挂起 DML 都不被回滚。
+  - 伪统计的开区间取 1/3 基数，cost model v2 下按不覆盖索引探针计价比
+    全表扫描更贵（`plan_cost::index_lookup_cost`），`EXPLAIN` 期望改为
+    `TableReader`；另加 ANALYZE 后 1% 选择性的用例继续覆盖
+    `IndexLookUp`。
+- **验证**:
+  - `cargo test -p sealdb-session --lib`：120 passed。
+  - `cargo test --workspace`：除 `sealdb-store` 两个 `_if_pd_available`
+    环境探测外全绿（本机 PD 有 TiKV 但无 `t` 区域任务）。
+  - 全量 green+local gate：memory `PASS: memory=96`、TiKV
+    `PASS: tikv=94`。
+- **阻塞/风险**:
+  - `sealdb-store::copr` 的两个 `_if_pd_available` 探针在“PD 在线但无
+    TiFlash/TiKV 区域任务”的机器上会断言失败，与本次改动无关。
+- **下一步**:
+  - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
+    `explain_join_stats`，以及 `cte` 的物化 CTE 生产者/消费者渲染。
+
 ---
 
 ## 5. Gate 证据索引
