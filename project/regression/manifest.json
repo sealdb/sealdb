@@ -2382,12 +2382,12 @@
     {
       "name": "sessiontxn/externals",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/sessiontxn/externals.test",
       "result": "r/sessiontxn/externals.result",
       "has_result": true,
       "skip_tikv": false,
-      "owner_hint": "planner,statistics"
+      "owner_hint": "sessiontxn,kv"
     },
     {
       "name": "show",

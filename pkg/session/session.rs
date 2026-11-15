@@ -137,6 +137,11 @@ pub struct Session {
     allow_auto_random_explicit_insert: Mutex<bool>,
     /// TiDB `tidb_enable_auto_increment_in_generated` (default OFF).
     enable_auto_increment_in_generated: Mutex<bool>,
+    /// TiDB `tidb_enable_external_ts_read` (default OFF): when ON, a new read
+    /// snapshot is pinned at `tidb_external_ts`.
+    enable_external_ts_read: Mutex<bool>,
+    /// Session override for `tidb_external_ts` (`None` inherits the global).
+    external_ts: Mutex<Option<u64>>,
     /// TiDB `tidb_cost_model_version` (default 2 in 8.x; 1 is the legacy model).
     cost_model_version: Mutex<i32>,
     /// TiDB `tidb_hashagg_partial_concurrency` (default 5).
@@ -213,6 +218,8 @@ impl Session {
             autocommit: Mutex::new(true),
             allow_auto_random_explicit_insert: Mutex::new(false),
             enable_auto_increment_in_generated: Mutex::new(false),
+            enable_external_ts_read: Mutex::new(globals.enable_external_ts_read),
+            external_ts: Mutex::new(None),
             cost_model_version: Mutex::new(2),
             hashagg_partial_concurrency: Mutex::new(5),
             hashagg_final_concurrency: Mutex::new(5),
@@ -1077,6 +1084,9 @@ impl Session {
                     .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
                 self.apply_pending_schema(true)?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
+                // `tidb_enable_external_ts_read`: the new transaction's
+                // snapshot is pinned at `tidb_external_ts`.
+                let stale_at = external_ts_snapshot(self);
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
                     txn.enter_begin_pessimistic(
@@ -1084,9 +1094,16 @@ impl Session {
                         schema_ver,
                         isolation,
                         read_only,
+                        stale_at,
                     )?;
                 } else {
-                    txn.enter_begin(self.domain.as_ref(), schema_ver, isolation, read_only)?;
+                    txn.enter_begin(
+                        self.domain.as_ref(),
+                        schema_ver,
+                        isolation,
+                        read_only,
+                        stale_at,
+                    )?;
                 }
                 return Ok(empty_result());
             }
@@ -1405,7 +1422,12 @@ impl Session {
         };
         // `FROM t AS OF TIMESTAMP <expr>`: resolve the stale-read wall clock
         // before opening the transaction so every read uses that snapshot.
-        let stale_millis = stmt_as_of_millis(self, stmt)?;
+        // Otherwise `tidb_enable_external_ts_read` pins the snapshot at the
+        // configured external TSO.
+        let stale_at = match stmt_as_of_millis(self, stmt)? {
+            Some(ms) => Some(StaleSnapshot::Millis(ms)),
+            None => stmt_external_ts(self, stmt).map(StaleSnapshot::Ts),
+        };
         let foreign_key_checks = *self
             .foreign_key_checks
             .lock()
@@ -1500,8 +1522,13 @@ impl Session {
         } else {
             let txn = {
                 let mut guard = self.txn.lock().expect("session txn lock");
-                match stale_millis {
-                    Some(ms) => guard.ensure_stale(self.domain.as_ref(), ms)?,
+                match stale_at {
+                    Some(StaleSnapshot::Millis(ms)) => {
+                        guard.ensure_stale(self.domain.as_ref(), ms)?
+                    }
+                    Some(StaleSnapshot::Ts(ts)) => {
+                        guard.ensure_stale_at(self.domain.as_ref(), ts)?
+                    }
                     None => guard.ensure(self.domain.as_ref())?,
                 }
             };
@@ -3099,6 +3126,37 @@ fn eval_set_subquery(session: &Session, value: &str) -> Result<sealdb_types::Dat
     sealdb_expression::with_time_zone(tz, || sealdb_expression::eval_expr(&field.expr))
 }
 
+/// Snapshot pin for a statement: either the `AS OF TIMESTAMP` wall clock or
+/// the `tidb_external_ts` version.
+enum StaleSnapshot {
+    Millis(u64),
+    Ts(u64),
+}
+
+/// `tidb_enable_external_ts_read` + `tidb_external_ts`: the version a query
+/// should read at. Only plain queries take the external snapshot; DDL keeps
+/// the schema path and DML writes through the current transaction.
+fn stmt_external_ts(session: &Session, stmt: &Statement) -> Option<u64> {
+    if !matches!(stmt, Statement::Select(_)) {
+        return None;
+    }
+    external_ts_snapshot(session)
+}
+
+/// Version to pin a new snapshot at when `tidb_enable_external_ts_read` is ON.
+fn external_ts_snapshot(session: &Session) -> Option<u64> {
+    if !*session
+        .enable_external_ts_read
+        .lock()
+        .expect("session external ts read lock")
+    {
+        return None;
+    }
+    let ts = (*session.external_ts.lock().expect("session external ts lock"))
+        .unwrap_or_else(|| session.domain.global_vars().external_ts);
+    (ts > 0).then_some(ts)
+}
+
 /// Stale read (`SELECT ... AS OF TIMESTAMP <expr>`): the wall clock in unix
 /// millis. `None` when the statement has no as-of clause.
 fn stmt_as_of_millis(session: &Session, stmt: &Statement) -> Result<Option<u64>> {
@@ -3561,6 +3619,54 @@ fn parse_set_resource_group(raw_sql: &str) -> Option<String> {
     (!name.is_empty()).then_some(name.to_ascii_lowercase())
 }
 
+/// RHS text of a `SET` assignment. `SET GLOBAL tidb_external_ts =
+/// @@tidb_current_ts` evaluates the referenced system variable; everything
+/// else keeps the raw text (stripped of quoting) for the per-variable parsers.
+fn set_assignment_value(session: &Session, raw: &str) -> String {
+    let text = raw.trim();
+    if let Some(rest) = text.strip_prefix("@@") {
+        let rest = rest.trim_start_matches('@');
+        let (global, name) = match rest.split_once('.') {
+            Some((scope, name)) if scope.eq_ignore_ascii_case("global") => (true, name),
+            Some((scope, name)) if scope.eq_ignore_ascii_case("session") => (false, name),
+            _ => (false, rest),
+        };
+        let name = name.trim_matches('`').to_ascii_lowercase();
+        let value = if global {
+            read_global_sysvar(session, &name)
+        } else {
+            read_session_sysvar(session, &name)
+        };
+        if let Some(value) = value {
+            return value;
+        }
+    }
+    text.trim_matches(|c| c == '\'' || c == '"').to_string()
+}
+
+fn parse_sysvar_u64(name: &str, value: &str) -> Result<u64> {
+    if value.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(0);
+    }
+    value.trim().parse::<u64>().map_err(|_| {
+        sealdb_errno::Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("Variable '{name}' can't be set to the value of '{value}'"),
+        )
+    })
+}
+
+fn parse_sysvar_flag(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "default" => Ok(true),
+        "0" | "off" | "false" => Ok(false),
+        _ => Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!("Variable '{name}' can't be set to the value of '{value}'"),
+        )),
+    }
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Vec<(i32, String)>> {
     let mut warnings = Vec::new();
     for a in &stmt.assignments {
@@ -3584,13 +3690,31 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             continue;
         }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
-        let value = a.value.trim_matches(|c| c == '\'' || c == '"').to_string();
+        let value = set_assignment_value(session, &a.value);
         if a.scope == SetVarScope::Global {
             let mut global_warnings = apply_set_global(session, &name, &value)?;
             warnings.append(&mut global_warnings);
             continue;
         }
         match name.as_str() {
+            // TiDB rejects assignments to the transaction timestamp.
+            "tidb_current_ts" => {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_VAR_CANT_BE_READ,
+                    "Variable 'tidb_current_ts' is a read only variable",
+                ));
+            }
+            "tidb_external_ts" => {
+                *session.external_ts.lock().expect("session external ts lock") =
+                    Some(parse_sysvar_u64("tidb_external_ts", &value)?);
+            }
+            "tidb_enable_external_ts_read" => {
+                *session
+                    .enable_external_ts_read
+                    .lock()
+                    .expect("session external ts read lock") =
+                    parse_sysvar_flag("tidb_enable_external_ts_read", &value)?;
+            }
             "names"
             | "character_set_client"
             | "character_set_connection"
@@ -4035,6 +4159,19 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
                 .domain
                 .set_shard_allocate_step(parse_shard_allocate_step(value)?);
         }
+        // External-timestamp reads (`tidb_enable_external_ts_read`): the global
+        // version is what `@@tidb_external_ts` reports to new sessions.
+        "tidb_external_ts" => {
+            session
+                .domain
+                .set_global_external_ts(parse_sysvar_u64("tidb_external_ts", value)?);
+        }
+        "tidb_enable_external_ts_read" => {
+            session.domain.set_global_enable_external_ts_read(parse_sysvar_flag(
+                "tidb_enable_external_ts_read",
+                value,
+            )?);
+        }
         // Accepted for compatibility; only the session value gates DML.
         "allow_auto_random_explicit_insert" => {}
         // FK feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
@@ -4340,6 +4477,27 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "tidb_enable_external_ts_read" => {
+            if *session
+                .enable_external_ts_read
+                .lock()
+                .expect("session external ts read lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_external_ts" => (*session.external_ts.lock().expect("session external ts lock"))
+            .unwrap_or_else(|| session.domain.global_vars().external_ts)
+            .to_string(),
+        "tidb_current_ts" => session
+            .txn
+            .lock()
+            .expect("session txn lock")
+            .current_ts(session.domain.as_ref())
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|_| "0".into()),
         "cte_max_recursion_depth" => sealdb_executor::cte::cte_max_recursion_depth().to_string(),
         "group_concat_max_len" => sealdb_executor::aggfuncs::group_concat_max_len().to_string(),
         "tidb_window_concurrency" => session
@@ -4402,6 +4560,14 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
         | "character_set_database"
         | "character_set_server" => globals.character_set_connection,
         "tidb_partition_prune_mode" => globals.partition_prune_mode.clone(),
+        "tidb_external_ts" => globals.external_ts.to_string(),
+        "tidb_enable_external_ts_read" => {
+            if globals.enable_external_ts_read {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "allow_auto_random_explicit_insert" => "0".into(),
         "tidb_enable_auto_increment_in_generated" => "0".into(),
         _ => return None,

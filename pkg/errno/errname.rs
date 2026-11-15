@@ -31,6 +31,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_FIELD_NOT_DEFAULT => "ErrNoDefaultForField",
         errcode::ERR_INVALID_JSON_TEXT_IN_PARAM => "ErrInvalidJSONTextInParam",
         errcode::ERR_WRONG_ARGUMENTS => "ErrWrongArguments",
+        errcode::ERR_VAR_CANT_BE_READ => "ErrVarCantBeRead",
         errcode::ERR_UNSUPPORTED => "ErrNotSupportedYet",
         errcode::ERR_DIVISION_BY_ZERO => "ErrDivisionByZero",
         errcode::ERR_INVALID_KEY => "ErrInvalidKey",

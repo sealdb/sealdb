@@ -37,6 +37,8 @@ pub const ERR_INVALID_JSON_TEXT: i32 = 3140;
 /// TiDB `ErrInvalidJSONTextInParam`: malformed JSON passed to a function (3141).
 pub const ERR_INVALID_JSON_TEXT_IN_PARAM: i32 = 3141;
 pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
+/// MySQL `ER_VAR_CANT_BE_READ`: assignment to a read-only system variable.
+pub const ERR_VAR_CANT_BE_READ: i32 = 1238;
 pub const ERR_UNSUPPORTED: i32 = 1235;
 pub const ERR_DIVISION_BY_ZERO: i32 = 1365;
 pub const ERR_INVALID_KEY: i32 = 6100;

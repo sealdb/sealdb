@@ -40,6 +40,14 @@ pub trait Storage: Send + Sync {
         let _ = unix_millis;
         Err(Error::unsupported("AS OF TIMESTAMP"))
     }
+    /// Stale read pinned at an opaque timestamp previously reported by
+    /// [`Transaction::start_timestamp`] / [`Storage::current_timestamp`] (the
+    /// `tidb_external_ts` mechanism, which passes a TSO rather than a wall
+    /// clock). Same visibility rule: versions committed at or before `ts`.
+    fn begin_stale_read_at(&self, ts: u64) -> Result<Box<dyn Transaction>> {
+        let _ = ts;
+        Err(Error::unsupported("stale read at timestamp"))
+    }
     /// Logical timestamp for snapshot / RC refresh. TiKV uses PD TSO;
     /// MemStorage returns a monotonic local counter.
     fn current_timestamp(&self) -> Result<u64> {
@@ -68,6 +76,11 @@ pub trait Transaction: Send {
     /// caller's: `kv` only reports the raw bytes.
     fn dirty_keys(&self) -> Vec<Vec<u8>> {
         Vec::new()
+    }
+    /// Opaque transaction start timestamp (`@@tidb_current_ts`). MemStorage
+    /// reports its MVCC counter, TiKV its PD TSO version.
+    fn start_timestamp(&self) -> Option<u64> {
+        None
     }
     fn get_for_update(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan_for_update(&mut self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;

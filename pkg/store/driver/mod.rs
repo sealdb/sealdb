@@ -180,6 +180,28 @@ impl Storage for TikvStorage {
             .map_err(map_tikv_err)?;
         Ok(ts.version())
     }
+
+    /// Stale read pinned at an explicit TSO (`tidb_external_ts`, which stores
+    /// a `@@tidb_current_ts` version rather than a wall clock).
+    fn begin_stale_read_at(&self, ts: u64) -> Result<Box<dyn Transaction>> {
+        let txn = self
+            .rt
+            .block_on(self.client.begin_optimistic())
+            .map_err(map_tikv_err)?;
+        let snapshot = self.client.snapshot(
+            <tikv_client::Timestamp as tikv_client::TimestampExt>::from_version(ts),
+            TransactionOptions::default().read_only(),
+        );
+        Ok(Box::new(TikvTransaction {
+            inner: Some(txn),
+            client: self.client.clone(),
+            rt: Arc::clone(&self.rt),
+            pessimistic: false,
+            read_snapshot: Some(snapshot),
+            writes: HashMap::new(),
+            savepoints: Vec::new(),
+        }))
+    }
 }
 
 struct TikvTransaction {
@@ -264,6 +286,11 @@ impl TikvTransaction {
 impl Transaction for TikvTransaction {
     fn dirty_keys(&self) -> Vec<Vec<u8>> {
         self.writes.keys().cloned().collect()
+    }
+
+    fn start_timestamp(&self) -> Option<u64> {
+        use tikv_client::TimestampExt;
+        self.inner.as_ref().map(|txn| txn.start_timestamp().version())
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {

@@ -29,6 +29,10 @@ pub struct GlobalSysVars {
     pub character_set_connection: String,
     /// `tidb_partition_prune_mode`; new sessions inherit this value.
     pub partition_prune_mode: String,
+    /// `tidb_external_ts`: TSO used by external-timestamp reads (0 = unset).
+    pub external_ts: u64,
+    /// `tidb_enable_external_ts_read`: gate for external-timestamp snapshots.
+    pub enable_external_ts_read: bool,
 }
 
 impl Default for GlobalSysVars {
@@ -38,6 +42,8 @@ impl Default for GlobalSysVars {
             enable_auto_analyze: true,
             character_set_connection: "utf8mb4".to_string(),
             partition_prune_mode: "dynamic".to_string(),
+            external_ts: 0,
+            enable_external_ts_read: false,
         }
     }
 }
@@ -551,6 +557,22 @@ impl Domain {
             .partition_prune_mode = mode;
     }
 
+    /// `SET GLOBAL tidb_external_ts = <ts>`.
+    pub fn set_global_external_ts(&self, ts: u64) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .external_ts = ts;
+    }
+
+    /// `SET GLOBAL tidb_enable_external_ts_read = <on>`.
+    pub fn set_global_enable_external_ts_read(&self, on: bool) {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .enable_external_ts_read = on;
+    }
+
     pub fn set_global_enable_auto_analyze(&self, on: bool) {
         self.global_vars
             .lock()
@@ -937,6 +959,10 @@ impl Storage for Domain {
     /// `SELECT ... AS OF TIMESTAMP`: snapshot at the wall clock's PD TSO.
     fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn sealdb_kv::Transaction>> {
         self.storage.begin_stale_read(unix_millis)
+    }
+
+    fn begin_stale_read_at(&self, ts: u64) -> Result<Box<dyn sealdb_kv::Transaction>> {
+        self.storage.begin_stale_read_at(ts)
     }
 }
 

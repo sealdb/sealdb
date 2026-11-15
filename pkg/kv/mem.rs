@@ -119,6 +119,32 @@ impl MemStorage {
             pessimistic: false,
         }))
     }
+
+    /// Stale-read snapshot pinned at a logical timestamp (`tidb_external_ts`):
+    /// keep the versions committed at or before `ts`, i.e. the rows a
+    /// transaction that started at `ts` would have seen.
+    fn begin_stale_at(&self, ts: u64) -> Result<Box<dyn Transaction>> {
+        let mut store = self.store.lock().expect("mem kv");
+        store.next_ts += 1;
+        let start_ts = store.next_ts;
+        let mut snapshot = store.data.clone();
+        for versions in snapshot.values_mut() {
+            versions.retain(|v| v.commit_ts <= ts);
+        }
+        snapshot.retain(|_, versions| !versions.is_empty());
+        Ok(Box::new(MemTransaction {
+            store: Arc::clone(&self.store),
+            wait: Arc::clone(&self.wait),
+            start_ts,
+            read_ts: start_ts,
+            snapshot,
+            writes: BTreeMap::new(),
+            deletes: HashSet::new(),
+            locked: HashSet::new(),
+            savepoints: Vec::new(),
+            pessimistic: false,
+        }))
+    }
 }
 
 impl Storage for MemStorage {
@@ -132,6 +158,10 @@ impl Storage for MemStorage {
 
     fn begin_stale_read(&self, unix_millis: u64) -> Result<Box<dyn Transaction>> {
         self.begin_stale(unix_millis)
+    }
+
+    fn begin_stale_read_at(&self, ts: u64) -> Result<Box<dyn Transaction>> {
+        self.begin_stale_at(ts)
     }
 
     fn current_timestamp(&self) -> Result<u64> {
@@ -415,6 +445,10 @@ impl Transaction for MemTransaction {
             .chain(self.deletes.iter())
             .cloned()
             .collect()
+    }
+
+    fn start_timestamp(&self) -> Option<u64> {
+        Some(self.start_ts)
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {

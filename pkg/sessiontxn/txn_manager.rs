@@ -56,8 +56,9 @@ impl TxnManager {
         schema_ver: i64,
         isolation: IsolationLevel,
         read_only: bool,
+        stale_at: Option<u64>,
     ) -> Result<()> {
-        self.enter(storage, false, schema_ver, isolation, read_only)
+        self.enter(storage, false, schema_ver, isolation, read_only, stale_at)
     }
 
     pub fn enter_begin_pessimistic(
@@ -66,8 +67,16 @@ impl TxnManager {
         schema_ver: i64,
         isolation: IsolationLevel,
         read_only: bool,
+        stale_at: Option<u64>,
     ) -> Result<()> {
-        self.enter(storage, true, schema_ver, isolation, read_only)
+        self.enter(
+            storage,
+            true,
+            schema_ver,
+            isolation,
+            read_only,
+            stale_at,
+        )
     }
 
     fn enter(
@@ -77,14 +86,17 @@ impl TxnManager {
         schema_ver: i64,
         isolation: IsolationLevel,
         read_only: bool,
+        stale_at: Option<u64>,
     ) -> Result<()> {
         if self.handle.is_some() {
             self.commit()?;
         }
-        let txn = if pessimistic {
-            storage.begin_pessimistic()?
-        } else {
-            storage.begin()?
+        // `tidb_enable_external_ts_read`: the explicit transaction also starts
+        // from the external snapshot, like TiDB's `BEGIN` path.
+        let txn = match stale_at {
+            Some(ts) => storage.begin_stale_read_at(ts)?,
+            None if pessimistic => storage.begin_pessimistic()?,
+            None => storage.begin()?,
         };
         self.handle = Some(Arc::new(TxnHandle::new(txn)));
         self.explicit = true;
@@ -126,14 +138,14 @@ impl TxnManager {
         } else {
             self.rollback()?;
         }
-        self.enter(storage, pessimistic, schema_ver, isolation, read_only)
+        self.enter(storage, pessimistic, schema_ver, isolation, read_only, None)
     }
 
     /// Open an explicit transaction if the session has none, then record
     /// `name` on the KV txn (MySQL SAVEPOINT starts a transaction).
     pub fn savepoint(&mut self, storage: &dyn Storage, schema_ver: i64, name: &str) -> Result<()> {
         if self.handle.is_none() {
-            self.enter(storage, false, schema_ver, self.isolation, self.read_only)?;
+            self.enter(storage, false, schema_ver, self.isolation, self.read_only, None)?;
         }
         self.handle
             .as_ref()
@@ -187,6 +199,34 @@ impl TxnManager {
         self.handle = Some(Arc::clone(&handle));
         self.explicit = false;
         Ok(handle)
+    }
+
+    /// External-timestamp stale read (`tidb_external_ts`): open a snapshot
+    /// pinned at an explicit version. An explicit transaction keeps its own
+    /// snapshot, so toggling the feature mid-transaction changes nothing.
+    pub fn ensure_stale_at(
+        &mut self,
+        storage: &dyn Storage,
+        ts: u64,
+    ) -> Result<Arc<TxnHandle>> {
+        if let Some(handle) = &self.handle {
+            return Ok(Arc::clone(handle));
+        }
+        let handle = Arc::new(TxnHandle::new(storage.begin_stale_read_at(ts)?));
+        self.handle = Some(Arc::clone(&handle));
+        self.explicit = false;
+        Ok(handle)
+    }
+
+    /// `@@tidb_current_ts`: the open transaction's start version, else a fresh
+    /// storage timestamp.
+    pub fn current_ts(&self, storage: &dyn Storage) -> Result<u64> {
+        if let Some(handle) = &self.handle
+            && let Some(ts) = handle.with_txn(|txn| Ok(txn.start_timestamp()))?
+        {
+            return Ok(ts);
+        }
+        storage.current_timestamp()
     }
 
     /// Keys written by the current transaction (empty when there is none).
