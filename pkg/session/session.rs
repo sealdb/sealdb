@@ -7300,15 +7300,28 @@ mod tests {
             is_views.display_rows()[0][1]
         );
         let show = session.execute_stmt("SHOW CREATE VIEW db1.v").unwrap();
-        assert_eq!(show.columns, vec!["View", "Create View"]);
+        // MySQL 8.0 / TiDB also report the view's creation charset (the
+        // `character_set_client`/`collation_connection` the definition was
+        // stored with).
+        assert_eq!(
+            show.columns,
+            vec![
+                "View",
+                "Create View",
+                "character_set_client",
+                "collation_connection"
+            ]
+        );
         assert!(show.display_rows()[0][1].contains("CREATE ALGORITHM="));
         session
             .execute_stmt("CREATE OR REPLACE VIEW db1.v AS SELECT id FROM db1.t WHERE id = 2")
             .unwrap();
         let replaced = session.execute_stmt("SELECT * FROM db1.v").unwrap();
         assert_eq!(replaced.display_rows(), vec![vec!["2".to_string()]]);
+        // TiDB `dropTableObject`: a view is not a base table, so `DROP TABLE`
+        // reports it as a missing table (1051 Unknown table), not 1347.
         let err = session.execute_stmt("DROP TABLE db1.v").unwrap_err();
-        assert_eq!(err.code, sealdb_errno::ERR_WRONG_OBJECT);
+        assert_eq!(err.code, sealdb_errno::ERR_BAD_TABLE);
         session.execute_stmt("DROP VIEW db1.v").unwrap();
         let gone = session.execute_stmt("SELECT * FROM db1.v").unwrap_err();
         assert_eq!(gone.code, sealdb_errno::ERR_NO_SUCH_TABLE);
@@ -8471,7 +8484,14 @@ mod tests {
             .map(|r| r.join("|"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(lookup_text.contains("IndexLookUp"), "{lookup_text}");
+        // With no statistics TiDB estimates a range at 1/3 of the table, and
+        // cost model v2 prices a non-covering index probe so high (one table
+        // probe ≈ 100 sequential rows) that the un-hinted lookup loses: a
+        // 9999-row table flips to `TableReader` at 99 rows, ~1% selectivity
+        // (`plan_cost::index_lookup_cost`). The covering index below still
+        // costs one row per row, so it keeps the `IndexReader`.
+        assert!(lookup_text.contains("TableReader"), "{lookup_text}");
+        assert!(lookup_text.contains("TableFullScan"), "{lookup_text}");
         let covering = session
             .execute_stmt("EXPLAIN SELECT name FROM db1.t WHERE name > 'a'")
             .unwrap();
@@ -8536,6 +8556,35 @@ mod tests {
             unique_range.display_rows(),
             vec![vec!["y".to_string()], vec!["z".to_string()]]
         );
+        // A range under 1% of an analyzed table is selective enough for TiDB to
+        // keep the non-covering `IndexLookUp` (see `plan_cost`).
+        session
+            .execute_stmt(
+                "CREATE TABLE db1.big (id INT, name VARCHAR(20), extra VARCHAR(20), INDEX idx_name (name))",
+            )
+            .unwrap();
+        for i in 0..500 {
+            session
+                .execute_stmt(&format!(
+                    "INSERT INTO db1.big VALUES ({i}, 'k{i:04}', 'x')"
+                ))
+                .unwrap();
+        }
+        session.execute_stmt("ANALYZE TABLE db1.big").unwrap();
+        let selective = session
+            .execute_stmt("EXPLAIN SELECT * FROM db1.big WHERE name >= 'k0499'")
+            .unwrap();
+        let selective_text = selective
+            .display_rows()
+            .into_iter()
+            .map(|r| r.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(selective_text.contains("IndexLookUp"), "{selective_text}");
+        let one = session
+            .execute_stmt("SELECT extra FROM db1.big WHERE name >= 'k0499'")
+            .unwrap();
+        assert_eq!(one.display_rows(), vec![vec!["x".to_string()]]);
     }
 
     #[test]
@@ -8619,49 +8668,57 @@ mod tests {
         assert_eq!(chained.display_rows().len(), 4);
     }
 
+    /// TiDB does not make DDL transactional: a DDL statement inside an open
+    /// transaction implicitly commits it, so neither the statement nor the
+    /// pending DML is rolled back. TiDB `executor/test/simpletest`:
+    ///
+    /// ```text
+    /// begin; insert txn values (2); create table txn2 (a int); rollback;
+    /// select * from txn;  -- 1, 2
+    /// ```
     #[test]
-    fn test_transactional_ddl() {
+    fn test_ddl_implicitly_commits() {
         let session = Session::new();
         session
             .execute_stmt("CREATE DATABASE db1; CREATE TABLE db1.t (id INT, name VARCHAR(20))")
             .unwrap();
+        // The pending INSERT is committed by the CREATE TABLE, and the table
+        // survives the ROLLBACK.
         session
             .execute_stmt(
-                "BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); SELECT * FROM db1.t2",
+                "BEGIN; INSERT INTO db1.t VALUES (1, 'a'); CREATE TABLE db1.t2 (id INT); ROLLBACK",
             )
             .unwrap();
-        session.execute_stmt("ROLLBACK").unwrap();
-        let err = session.execute_stmt("SELECT * FROM db1.t2").unwrap_err();
-        assert_eq!(err.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+        let t = session.execute_stmt("SELECT * FROM db1.t").unwrap();
+        assert_eq!(
+            t.display_rows(),
+            vec![vec!["1".to_string(), "a".to_string()]]
+        );
+        session.execute_stmt("INSERT INTO db1.t2 VALUES (2)").unwrap();
+        let t2 = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
+        assert_eq!(t2.display_rows(), vec![vec!["2".to_string()]]);
 
-        session
-            .execute_stmt(
-                "BEGIN; CREATE TABLE db1.t2 (id INT); INSERT INTO db1.t2 VALUES (1); COMMIT",
-            )
-            .unwrap();
-        let committed = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
-        assert_eq!(committed.display_rows(), vec![vec!["1".to_string()]]);
-
+        // DROP TABLE is also DDL: it commits, so ROLLBACK cannot resurrect it.
         session
             .execute_stmt("BEGIN; DROP TABLE db1.t2; ROLLBACK")
             .unwrap();
-        let still = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
-        assert_eq!(still.display_rows(), vec![vec!["1".to_string()]]);
-
-        session
-            .execute_stmt("BEGIN; CREATE TABLE db1.ctas AS SELECT * FROM db1.t2; ROLLBACK")
-            .unwrap();
-        let err = session.execute_stmt("SELECT * FROM db1.ctas").unwrap_err();
+        let err = session.execute_stmt("SELECT * FROM db1.t2").unwrap_err();
         assert_eq!(err.code, sealdb_errno::ERR_NO_SUCH_TABLE);
+
+        // CTAS and CREATE DATABASE are DDL statements as well.
+        session
+            .execute_stmt("BEGIN; CREATE TABLE db1.ctas AS SELECT * FROM db1.t; ROLLBACK")
+            .unwrap();
+        let ctas = session.execute_stmt("SELECT id FROM db1.ctas").unwrap();
+        assert_eq!(ctas.display_rows(), vec![vec!["1".to_string()]]);
 
         session
             .execute_stmt("BEGIN; CREATE DATABASE db2; ROLLBACK")
             .unwrap();
-        let err = session
-            .execute_stmt("CREATE TABLE db2.t (id INT)")
-            .unwrap_err();
-        assert_eq!(err.code, sealdb_errno::ERR_BAD_DB);
+        session.execute_stmt("CREATE TABLE db2.t (id INT)").unwrap();
 
+        // After the implicit commit the transaction is over, so
+        // `COMMIT AND CHAIN` starts a fresh one for the following insert.
         session
             .execute_stmt(
                 "BEGIN; CREATE TABLE db1.t3 (id INT); INSERT INTO db1.t3 VALUES (7); COMMIT AND CHAIN",
@@ -9663,9 +9720,13 @@ mod tests {
             explain_text.contains("semi join"),
             "expected a semi join, got {explain_text}"
         );
+        // TiDB marks an `EXISTS` subquery as a semi join in its own right: the
+        // semi join executor already emits each outer row once, so there is no
+        // de-duplicating aggregation on the inner side. Only the `IN` rewrite
+        // (`tidb_opt_insubq_to_join_and_agg`, ON by default) pays for one.
         assert!(
-            explain_text.contains("HashAgg"),
-            "expected Distinct/HashAgg on Semi inner, got {explain_text}"
+            !explain_text.contains("HashAgg"),
+            "EXISTS needs no inner Distinct/HashAgg in TiDB, got {explain_text}"
         );
         assert!(
             !explain_text.contains("Apply"),
@@ -9683,8 +9744,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            anti_text.contains("anti join"),
-            "expected an anti join, got {anti_text}"
+            anti_text.contains("anti semi join"),
+            "expected an anti semi join, got {anti_text}"
         );
         let explain_in = session
             .execute_stmt("EXPLAIN SELECT * FROM db1.t1 WHERE id IN (SELECT id FROM db1.t2)")
@@ -9696,8 +9757,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            in_text.contains("semi join"),
-            "expected a semi join for IN, got {in_text}"
+            in_text.contains("inner join"),
+            "expected the IN-to-join rewrite (inner join) for IN, got {in_text}"
         );
         assert!(
             in_text.contains("HashAgg"),
@@ -9770,8 +9831,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            any_text.contains("semi join"),
-            "expected a semi join for = ANY, got {any_text}"
+            any_text.contains("inner join"),
+            "expected the IN-to-join rewrite (inner join) for = ANY, got {any_text}"
         );
         assert!(
             any_text.contains("HashAgg"),
@@ -11654,7 +11715,7 @@ mod expression_index_tests {
         assert_eq!(all.columns, vec!["id", "a", "b"]);
         let create = session.execute_stmt("show create table test3").unwrap();
         assert!(
-            create.display_rows()[0][1].contains("UNIQUE KEY `uk_expr` ((tidb_shard(`a`)), `a`)"),
+            create.display_rows()[0][1].contains("UNIQUE KEY `uk_expr` ((tidb_shard(`a`)),`a`)"),
             "{}",
             create.display_rows()[0][1]
         );
