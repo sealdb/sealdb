@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 69 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-14（green 70 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2701,6 +2701,39 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 `globalindex/information_schema` / `sessiontxn/externals` / R3
     `explain_easy` 剩余项。
+
+### 2026-11-14（`globalindex/information_schema` 转正：统计驱动的 DATA/INDEX_LENGTH + 分区列）
+
+- **Phase**: R7
+- **完成**:
+  - `information_schema.tidb_indexes.IS_GLOBAL`：`GLOBAL` 索引输出 1，普通
+    索引 0（此前固定 0）。
+  - `information_schema.partitions` 补齐 TiDB `partitionsCols` 的 28 列
+    （`SUBPARTITION_*` 暂以 NULL 呈现，SealDB 尚无子分区）。
+  - `information_schema.tables` / `partitions` 的 `TABLE_ROWS` /
+    `AVG_ROW_LENGTH` / `DATA_LENGTH` / `INDEX_LENGTH` 改由统计驱动：
+    `Domain::infoschema()` 挂上 stats `Handle`，仿
+    `StatsTableRowCache.EstimateDataLength` / `GetDataAndIndexLength`
+    计算——定长列按 `row_count * StorageLength`（TiDB 对数值/日期/枚举等
+    统一取 8，DECIMAL 走打包公式），变长列用分析得到的 `tot_col_size`；
+    分区表按物理分区 id 分别取行数与 `tot_col_size`，`GLOBAL` 索引只在
+    表级计一次，普通索引计入各分区。
+  - ANALYZE 侧记录 `tot_col_size` / 每分区 `part_tot_col_size` 与
+    `part_counts`，随统计快照持久化，旧快照以默认 0 兼容。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -t globalindex/information_schema -s memory` → `PASS: memory=1`
+  - `./tests/integrationtest/run-tests.sh -t globalindex/information_schema -s tikv` → `PASS: tikv=1`
+  - `./tests/integrationtest/run-tests.sh -s memory` → `PASS: memory=77 tikv=0 skipped=177`
+  - `./tests/integrationtest/run-tests.sh -s tikv` → `PASS: memory=0 tikv=75 skipped=179`
+  - manifest `globalindex/information_schema` → `green`，green 69→70
+- **阻塞/风险**:
+  - `LOAD STATS` 的 JSON 不含 `tot_col_size` 时按 0 处理，`data_length`
+    会偏小；TiDB 的 `mysql.stats_histograms` 才是权威来源。
+  - 分区级 `INDEX_LENGTH` 依赖索引列在 `info.columns` 中能按名匹配；
+    表达式索引此路径仍按 0 计。
+- **下一步**:
+  - 继续 R7 低 diff pending（`sessiontxn/externals`、`globalindex/analyze`）
+    与 R3 `explain_easy` 剩余项。
 
 ---
 

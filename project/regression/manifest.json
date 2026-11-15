@@ -14,8 +14,8 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 69,
-      "pending": 162,
+      "green": 70,
+      "pending": 161,
       "in_progress": 13,
       "deferred": 2,
       "local": 8
@@ -1442,7 +1442,7 @@
     {
       "name": "globalindex/information_schema",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/information_schema.test",
       "result": "r/globalindex/information_schema.result",
       "has_result": true,
