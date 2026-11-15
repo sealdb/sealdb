@@ -1472,7 +1472,7 @@
     {
       "name": "globalindex/mem_index_merge",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/globalindex/mem_index_merge.test",
       "result": "r/globalindex/mem_index_merge.result",
       "has_result": true,
@@ -1482,7 +1482,7 @@
     {
       "name": "globalindex/mem_index_merge_non_unique",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/globalindex/mem_index_merge_non_unique.test",
       "result": "r/globalindex/mem_index_merge_non_unique.result",
       "has_result": true,

@@ -504,7 +504,11 @@ impl PlanBuilder {
                     // unless the read walks a GLOBAL index, which is one ordered
                     // index shared by every partition.
                     let index_order = (!select_spans_multiple_partitions(select, is, current_db)
-                        || plan_reads_global_index(&plan, select, is, current_db))
+                        || plan_reads_global_index(&plan, select, is, current_db)
+                        // A keep-order merge orders the arms itself, so the
+                        // per-partition index order still yields one stream.
+                        || inner_merge(&plan)
+                            .is_some_and(|plan| matches!(plan, PhysicalPlan::IndexMerge { keep_order: true, .. })))
                         && plan_provides_order(select, &plan, is, current_db);
                     if index_order {
                         plan = set_index_range_keep_order(plan);
@@ -4974,6 +4978,12 @@ fn apply_order_limit(
     est_rows: f64,
     by_info: String,
 ) -> PhysicalPlan {
+    if std::env::var("SEALDB_DEBUG_MEP").is_ok() {
+        eprintln!(
+            "AOL ordered={ordered} limit={limit:?} plan={:?}",
+            std::mem::discriminant(&plan)
+        );
+    }
     // IndexMerge already carries the pushed LIMIT (`limit embedded(...)`), so no
     // Limit node is added above it.
     if !ordered
@@ -7728,7 +7738,20 @@ fn merge_extra_projection(
     // rowid table; other SELECT lists always prune the merge's extra columns.
     let existing = passthrough(&plan);
     let access = existing.unwrap_or(&plan);
-    if merge(access).is_none() || (star && !(rowid && keep_order(access))) {
+    if std::env::var("SEALDB_DEBUG_MEP").is_ok() {
+        eprintln!(
+            "MEP plan={:?} merge={} star={star} rowid={rowid} keep_order={}",
+            std::mem::discriminant(&plan),
+            merge(access).is_some(),
+            keep_order(access)
+        );
+    }
+    // A GLOBAL index on a partitioned table stores no partition id, so the
+    // lookup carries the row's partition (`_tidb_tid`) to restore the row;
+    // TiDB prunes it with the SELECT list's own Projection, which sits above a
+    // sunk `LIMIT` (`Projection -> Limit -> UnionScan -> IndexMerge`).
+    let global = merge(access).is_some_and(|merge| partition_global_index_read(merge, &info));
+    if merge(access).is_none() || (star && !(rowid && keep_order(access)) && !global) {
         return plan;
     }
     let prefix = schema_prefix(current_db);
@@ -12486,6 +12509,47 @@ fn clustered_handle_column(info: &sealdb_meta::TableInfo) -> Option<&str> {
     info.clustered_prefix_column().map(|col| col.name.o())
 }
 
+/// TiDB `GetRowCountByIntColumnRanges` reads an *integer handle* range whose
+/// low bound is `MinValue` / `MinNotNull` through the unsigned pseudo model:
+/// the count is `table_rows / 3` clamped to `high - 0`, so `pk < 10` reads ten
+/// rows. A concrete low bound keeps the signed model [`int_handle_pseudo_rows`]
+/// uses, and a common handle is not an integer column at all (it goes through
+/// `GetRowCountByIndexRanges`).
+fn pseudo_unsigned_int_handle_rows(
+    info: &sealdb_meta::TableInfo,
+    table_rows: f64,
+    ranges: &[sealdb_statistics::pseudo::Bounds],
+    fallback: f64,
+) -> f64 {
+    if !info.pk_is_handle {
+        return fallback;
+    }
+    /// TiDB reads the bound as `uint64`: a negative integer wraps around and
+    /// therefore never clamps the estimate.
+    fn as_u64(datum: &sealdb_types::Datum) -> Option<f64> {
+        match datum {
+            sealdb_types::Datum::I64(value) if *value < 0 => Some(u64::MAX as f64),
+            sealdb_types::Datum::I64(value) => Some(*value as f64),
+            sealdb_types::Datum::U64(value) => Some(*value as f64),
+            _ => None,
+        }
+    }
+    let mut rows = 0.0;
+    for (low, high) in ranges {
+        match low.as_ref().and_then(|(datum, _)| as_u64(datum)) {
+            Some(_) => rows += int_handle_pseudo_rows(table_rows, &[(low.clone(), high.clone())]),
+            None => {
+                let capped = high
+                    .as_ref()
+                    .and_then(|(datum, _)| as_u64(datum))
+                    .map_or(table_rows / 3.0, |high| (table_rows / 3.0).min(high));
+                rows += capped.max(0.0);
+            }
+        }
+    }
+    rows.min(table_rows)
+}
+
 /// TiDB pseudo estimate of an integer-handle range (`GetRowCountByIntColumnRanges`):
 /// a point pins one row, a one-sided range `1/3` of the table, a bounded range
 /// `1/40`. Unlike a secondary index the handle is unique and NOT NULL, so no
@@ -12556,6 +12620,8 @@ fn index_merge_index_arm(
                 keep_order: false,
                 desc: false,
                 limit: None,
+                tid_selection: None,
+                residual_selection: None,
                 ranges,
             },
             vec![cond.clone()],
@@ -12572,6 +12638,8 @@ fn index_merge_index_arm(
             keep_order: false,
             desc: false,
             limit: None,
+            tid_selection: None,
+            residual_selection: None,
             ranges: access.ranges,
         },
         access.consumed,
@@ -12661,6 +12729,8 @@ fn index_merge_handle_arm(
             keep_order: false,
             desc: false,
             limit: None,
+            tid_selection: None,
+            residual_selection: None,
             ranges,
         },
         consumed,
@@ -12724,12 +12794,26 @@ fn index_merge_union_arm(
                 .collect::<Vec<_>>())
         );
     }
-    if handle.is_some_and(|handle| {
-        conds.iter().any(|cond| {
-            sealdb_statistics::pseudo::conjunct_bound_sets(cond)
-                .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+    // The handle is a merge arm only when the hint allows it: a
+    // `USE_INDEX_MERGE(t, i1, i2)` listing secondary indexes keeps the row
+    // handle out, so an item on the common-column PK reads the named index
+    // (`uidx_b`) instead of a table range.
+    let hint_allows_handle = hint.indexes.is_empty()
+        || hint.indexes.iter().any(|name| {
+            name.eq_ignore_ascii_case("primary")
+                || info
+                    .indices
+                    .iter()
+                    .any(|idx| idx.primary && idx.name.o().eq_ignore_ascii_case(name))
+        });
+    if hint_allows_handle
+        && handle.is_some_and(|handle| {
+            conds.iter().any(|cond| {
+                sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+            })
         })
-    }) {
+    {
         return index_merge_handle_arm(info, conds, table_rows);
     }
     let candidates = index_merge_arm_candidates(info, hint, conds);
@@ -12838,12 +12922,15 @@ fn index_merge_intersection_paths(
     info: &sealdb_meta::TableInfo,
     table_rows: f64,
     table_stats: Option<&super::access_range::TableStats>,
-) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>)> {
+) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>, Vec<Vec<ExprNode>>)> {
     if hint.indexes.len() < 2 {
         return None;
     }
     let mut remaining: Vec<ExprNode> = cnf.to_vec();
     let mut paths = Vec::new();
+    // Conjuncts each arm consumed, in `paths` order: a residual filter for the
+    // *other* arms that can also see the column in their index key.
+    let mut consumed_by_arm: Vec<Vec<ExprNode>> = Vec::new();
     for name in &hint.indexes {
         let Some(index) = hint_index(info, name) else {
             continue;
@@ -12865,12 +12952,60 @@ fn index_merge_intersection_paths(
                 .iter()
                 .any(|used| used.restore_string() == cond.restore_string())
         });
+        consumed_by_arm.push(consumed);
         paths.push(path);
     }
     if paths.len() < 2 {
         return None;
     }
-    Some((paths, remaining))
+    Some((paths, remaining, consumed_by_arm))
+}
+
+/// TiDB keeps an intersection arm's index-key extras in the partial path, so
+/// the coprocessor re-checks a conjunct another arm consumed when this arm's
+/// index key also carries the column. A common handle is appended to every
+/// secondary index key, so `KEY uidx_a(a)` on `PRIMARY KEY (d, c) CLUSTERED`
+/// re-reads `c > 1` as `Selection(Build)` above its `IndexRangeScan`.
+fn attach_intersection_residual_filters(
+    info: &sealdb_meta::TableInfo,
+    paths: &mut [IndexMergePath],
+    consumed_by_arm: &[Vec<ExprNode>],
+) {
+    for (i, path) in paths.iter_mut().enumerate() {
+        if path.table_range {
+            continue;
+        }
+        let Some(index) = hint_index(info, &path.index) else {
+            continue;
+        };
+        let covering = info.covering_column_names(index);
+        let mut filters: Vec<ExprNode> = Vec::new();
+        for (j, consumed) in consumed_by_arm.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for cond in consumed {
+                let columns = cond.referenced_columns();
+                let [(_, column)] = columns.as_slice() else {
+                    continue;
+                };
+                if !covering
+                    .iter()
+                    .any(|have| have.eq_ignore_ascii_case(column))
+                {
+                    continue;
+                }
+                if filters
+                    .iter()
+                    .any(|have| have.restore_string() == cond.restore_string())
+                {
+                    continue;
+                }
+                filters.push(cond.clone());
+            }
+        }
+        path.residual_selection = ExprNode::compose_cnf(filters);
+    }
 }
 
 /// TiDB `Selectivity()` estimate for one DNF item on an int handle column.
@@ -12976,6 +13111,15 @@ fn index_merge_union_rows(
     if !real_stats && let Some(rows) = index_merge_union_dnf_index_rows(info, items, table_rows) {
         return rows;
     }
+    // No single index serves every DNF item: TiDB still estimates each item from
+    // its *cheapest* index (`cardinality.Selectivity` looks at every filled
+    // access path, not at the hinted arms), then combines the items under the
+    // independence assumption. `a = 1 or b = 4` on a pseudo table therefore reads
+    // 11 rows (unique `uidx_a` gives one, `idx_bc` ten) whichever index the hint
+    // names.
+    if !real_stats && let Some(rows) = index_merge_dnf_item_rows(info, items, table_rows) {
+        return rows;
+    }
     let mut selectivity = 0.0;
     for path in paths {
         let arm = index_merge_union_arm_selectivity(info, path, table_rows, real_stats);
@@ -13078,6 +13222,94 @@ fn index_merge_union_dnf_index_rows(
         }
     }
     best.map(|node| table_rows * node.selectivity)
+}
+
+/// Per-DNF-item estimate from the cheapest index that can serve the item.
+///
+/// TiDB's `cardinality.Selectivity` ignores the hinted arms: every index of the
+/// table contributes a stats node, and each DNF item is measured by the node
+/// with the fewest rows (a unique index equality pins one row even when the
+/// hint names a wider prefix index). Items then combine as
+/// `1 - Π(1 - selᵢ)`, exactly like the arm-wise union.
+fn index_merge_dnf_item_rows(
+    info: &sealdb_meta::TableInfo,
+    items: &[Vec<ExprNode>],
+    table_rows: f64,
+) -> Option<f64> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut selectivity = 0.0;
+    for conds in items {
+        // The row handle is a partial path of its own: `a = 10` on an integer
+        // PK pins one row, and the item's estimate is its access count.
+        let mut item_rows: Option<f64> = None;
+        if clustered_handle_column(info).is_some_and(|handle| {
+            conds.iter().any(|cond| {
+                sealdb_statistics::pseudo::conjunct_bound_sets(cond)
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case(handle))
+            })
+        }) && let Some((path, _)) = index_merge_handle_arm(info, conds, table_rows)
+        {
+            let fallback = path.range.as_ref().map_or(table_rows, |range| range.rows);
+            item_rows = Some(pseudo_unsigned_int_handle_rows(
+                info,
+                table_rows,
+                &path.ranges,
+                fallback,
+            ));
+        }
+        for index in &info.indices {
+            if index.primary && info.pk_is_handle {
+                continue;
+            }
+            let Some(key_len) = super::access_range::index_key_part_count(info, index) else {
+                continue;
+            };
+            // Only the index's own key parts encode a range: an integer handle
+            // suffix is not addressable from a predicate on the PK column, so
+            // `b = 10 and a = 10` leaves index `b` at its `b = 10` count.
+            let keyed: Vec<ExprNode> = conds
+                .iter()
+                .filter(|cond| {
+                    sealdb_statistics::pseudo::conjunct_bound_sets(cond).is_some_and(
+                        |(name, _)| {
+                            index.columns.iter().any(|col| {
+                                super::expr_index::part_key(info, col).eq_ignore_ascii_case(&name)
+                            })
+                        },
+                    )
+                })
+                .cloned()
+                .collect();
+            if keyed.is_empty() {
+                continue;
+            }
+            let Some(access) = super::access_range::index_key_ranges(info, index, &keyed) else {
+                continue;
+            };
+            if access.ranges.is_empty() {
+                continue;
+            }
+            let mut rows = sealdb_statistics::pseudo::index_key_ranges_rows(
+                table_rows,
+                &access.ranges,
+                key_len,
+                index.unique,
+            );
+            // TiDB `partCover`: the index leaves some item conditions as a
+            // filter, so the node pays one `selectionFactor`.
+            if keyed.len() < conds.len() {
+                rows *= sealdb_statistics::pseudo::SELECTION_FACTOR;
+            }
+            item_rows = Some(item_rows.map_or(rows, |best: f64| best.min(rows)));
+        }
+        // A DNF item no index can range-scan keeps the caller's arm-wise model.
+        let item_rows = item_rows?;
+        let item_sel = (item_rows / table_rows).clamp(0.0, 1.0);
+        selectivity = selectivity + item_sel - selectivity * item_sel;
+    }
+    Some(table_rows * selectivity)
 }
 
 /// TiDB probe-side selectivity for a residual filter. A DNF filter that was
@@ -13231,13 +13463,14 @@ fn index_merge_plan(
         }
         None => {
             hinted.as_ref()?;
-            let (paths, residual) = index_merge_intersection_paths(
+            let (mut paths, residual, consumed_by_arm) = index_merge_intersection_paths(
                 &cnf,
                 &hint,
                 info,
                 table_rows,
                 table_stats.as_ref(),
             )?;
+            attach_intersection_residual_filters(info, &mut paths, &consumed_by_arm);
             (paths, residual, true, None)
         }
     };
@@ -13362,15 +13595,62 @@ fn index_merge_plan(
     } else {
         index_merge_residual_rows(&residual, rowid_est, info, table_stats.as_ref())
     };
+    // TiDB `PhysicalLimit.sinkIntoIndexMerge`: the arm order answers the ORDER
+    // BY, so the LIMIT sinks into the merge too (one `Limit(Build)` per arm).
     let embedded = select
         .limit
-        .filter(|_| select.order_by.is_empty())
+        .filter(|_| select.order_by.is_empty() || keep_order)
         .map(|count| (0u64, count));
-    if let Some(limit) = embedded
-        && !keep_order
-    {
+    if let Some(limit) = embedded {
         for path in &mut paths {
             path.limit = Some(limit);
+        }
+    }
+    let planned = resolve_partitions(
+        info,
+        select.selection.as_ref(),
+        &from.partition_names,
+        prune_mode,
+    );
+    // A partitioned table's merge names the partitions its arms touch
+    // (`partition:all` unpinned, `partition:pN` when `FROM PARTITION (pN)`
+    // pins them) — TiDB prints the label as the access object.
+    let partition_access = if info.partition.as_ref().is_some_and(|part| part.enable) {
+        if !from.partition_names.is_empty() {
+            from.partition_names.join(",")
+        } else if planned.all {
+            "all".to_string()
+        } else if planned.names.is_empty() {
+            "dual".to_string()
+        } else {
+            planned.names.join(",")
+        }
+    } else {
+        String::new()
+    };
+    // A GLOBAL index does not encode the row's partition, so an arm pinned to
+    // specific partitions filters the merged row ids on `_tidb_tid`.
+    if !from.partition_names.is_empty() && !planned.ids.is_empty() {
+        let prefix = schema_prefix(current_db);
+        let ids = planned
+            .ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for path in &mut paths {
+            if path.index.is_empty() {
+                continue;
+            }
+            let global = info.indices.iter().any(|index| {
+                index.name.o().eq_ignore_ascii_case(&path.index) && index.global
+            });
+            if global {
+                path.tid_selection = Some(format!(
+                    "in({prefix}.{table}._tidb_tid, {ids})",
+                    table = from.name
+                ));
+            }
         }
     }
     Some(PhysicalPlan::IndexMerge {
@@ -13380,23 +13660,18 @@ fn index_merge_plan(
             .map(|path| path.index.clone())
             .filter(|index| !index.is_empty())
             .collect(),
-        partitions: resolve_partitions(
-            info,
-            select.selection.as_ref(),
-            &from.partition_names,
-            prune_mode,
-        )
-        .ids,
+        partitions: planned.ids,
         pushed: None,
         intersection,
         paths,
         est_rows: Some(probe_est),
         probe_est: rowid_est,
         probe_selection: ExprNode::compose_cnf(residual),
-        limit: embedded.filter(|_| !keep_order),
+        limit: embedded,
         keep_order,
         order_column,
         order_desc,
+        partition_access,
     })
 }
 
@@ -24077,6 +24352,10 @@ fn union_scan_over_dirty(
     if matches!(plan, PhysicalPlan::PointGet { .. }) {
         return plan;
     }
+    // A `LIMIT` embedded into the merge cannot run under the `UnionScan` (the
+    // dirty rows are filtered after the merge), so TiDB keeps the Limit above
+    // it and the arms read their full ranges (`IndexMerge` `keep order:true`).
+    let plan = strip_embedded_merge_limit(plan);
     // The UnionScan carries the filters this table's rows must satisfy; TiDB
     // prints them sorted (`SortedExplainExpressionList`).
     let aliases = table_alias_names(from);
@@ -24113,6 +24392,68 @@ fn union_scan_over_dirty(
         info: filters.join(", "),
         est_rows,
         child: Box::new(plan),
+    }
+}
+
+/// Drop a `LIMIT` sunk into an `IndexMerge` so it can sit under a `UnionScan`.
+fn strip_embedded_merge_limit(plan: PhysicalPlan) -> PhysicalPlan {
+    let PhysicalPlan::IndexMerge {
+        mut paths,
+        limit: _,
+        probe_est,
+        probe_selection,
+        est_rows,
+        intersection,
+        table,
+        indexes,
+        partitions,
+        pushed,
+        keep_order,
+        order_column,
+        order_desc,
+        partition_access,
+    } = plan
+    else {
+        return plan;
+    };
+    for path in &mut paths {
+        path.limit = None;
+    }
+    PhysicalPlan::IndexMerge {
+        table,
+        indexes,
+        partitions,
+        pushed,
+        intersection,
+        paths,
+        est_rows,
+        probe_est,
+        probe_selection,
+        limit: None,
+        keep_order,
+        order_column,
+        order_desc,
+        partition_access,
+    }
+}
+
+/// Whether `plan` reads a GLOBAL index of a partitioned table (see
+/// `union_scan_over_dirty`).
+fn partition_global_index_read(plan: &PhysicalPlan, info: &sealdb_meta::TableInfo) -> bool {
+    if !info.partition.as_ref().is_some_and(|part| part.enable) {
+        return false;
+    }
+    let global = |name: &str| {
+        info.indices
+            .iter()
+            .any(|index| index.name.o().eq_ignore_ascii_case(name) && index.global)
+    };
+    match plan {
+        PhysicalPlan::IndexReader { index, .. } | PhysicalPlan::IndexLookUpReader { index, .. } => {
+            global(index)
+        }
+        PhysicalPlan::IndexMerge { indexes, .. } => indexes.iter().any(|index| global(index)),
+        _ => false,
     }
 }
 
@@ -25611,18 +25952,45 @@ fn index_read_keeps_order(plan: &PhysicalPlan) -> bool {
     }
 }
 
+/// The `IndexMerge` under any number of output `Projection` / `UnionScan`
+/// wrappers (a dirty read of a partitioned star select).
+fn inner_merge(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
+    match plan {
+        PhysicalPlan::Projection { child, .. } | PhysicalPlan::UnionScan { child, .. } => {
+            inner_merge(child)
+        }
+        PhysicalPlan::IndexMerge { .. } => Some(plan),
+        _ => None,
+    }
+}
+
 fn plan_provides_order(
     select: &SelectStmt,
     plan: &PhysicalPlan,
     is: Option<&InfoSchema>,
     current_db: &str,
-) -> bool {
-    if select.order_by.is_empty() {
+) -> bool {    if select.order_by.is_empty() {
         return false;
     }
     // IndexMerge union arms that read their index in key order already provide
     // the query's ORDER BY (`keep order:true`). A dirty read keeps the merge
-    // below a `UnionScan`, which passes the order through.
+    // below a `UnionScan`, which passes the order through, and a star select
+    // adds an output `Projection` on top of that.
+    if let Some(PhysicalPlan::IndexMerge {
+        keep_order: true,
+        order_column: Some(column),
+        order_desc,
+        ..
+    }) = inner_merge(plan)
+    {
+        return match select.order_by.as_slice() {
+            [item] => {
+                matches!(&item.expr, ExprNode::Column(col) if col.name.eq_ignore_ascii_case(column))
+                    && item.desc == *order_desc
+            }
+            _ => false,
+        };
+    }
     let plan = match plan {
         PhysicalPlan::UnionScan { child, .. } => child.as_ref(),
         // An expression-index read wears a Projection that restores the select
@@ -25637,21 +26005,6 @@ fn plan_provides_order(
         }
         other => other,
     };
-    if let PhysicalPlan::IndexMerge {
-        keep_order: true,
-        order_column: Some(column),
-        order_desc,
-        ..
-    } = plan
-    {
-        return match select.order_by.as_slice() {
-            [item] => {
-                matches!(&item.expr, ExprNode::Column(col) if col.name.eq_ignore_ascii_case(column))
-                    && item.desc == *order_desc
-            }
-            _ => false,
-        };
-    }
     // A full index scan keeps key order; so does an equality-constrained key
     // prefix (`a = 1 ORDER BY b` on `idx(a, b)` reads `range:[1,1]` and stays
     // ordered by the remaining keys). A non-equality decided range carries its

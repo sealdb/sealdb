@@ -1560,6 +1560,14 @@ fn plan_reads_pinned_global_index(plan: &PhysicalPlan) -> bool {
             pushed.as_ref(),
             selection_info.as_deref(),
         ),
+        PhysicalPlan::IndexMerge {
+            partition_access,
+            paths,
+            ..
+        } => {
+            pinned_global_access(partition_access)
+                && paths.iter().any(|path| path.tid_selection.is_some())
+        }
         _ => children_of(plan)
             .into_iter()
             .any(plan_reads_pinned_global_index),
@@ -5020,10 +5028,12 @@ fn emit_cop_children(
             }
             for path in paths {
                 let arm_est = path.range.as_ref().map_or(1.0, |range| range.rows);
+                // The merge root names the partitions (`partition:pN`); the
+                // arms under it do not repeat the label.
                 let access = if path.table_range {
                     table_access(table, &[])
                 } else {
-                    index_access_cols(table, &path.index, &path.index_columns, partitions)
+                    index_access_cols(table, &path.index, &path.index_columns, &[])
                 };
                 let mut info = match &path.range {
                     Some(range) => format!(
@@ -5049,6 +5059,68 @@ fn emit_cop_children(
                 } else {
                     "IndexRangeScan"
                 };
+                let residual_info = path
+                    .residual_selection
+                    .as_ref()
+                    .map(|filter| explain_pushed_filter(table, filter));
+                let selection_info = match (residual_info, path.tid_selection.clone()) {
+                    (Some(residual), Some(tid)) => Some(format!("{residual}, {tid}")),
+                    (residual, tid) => residual.or(tid),
+                };
+                if let Some(tid_selection) = selection_info {
+                    push_explain_row(
+                        rows,
+                        depth,
+                        false,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            // A residual-filtered intersection path is sized by
+                            // the intersected row count, not its own arm's
+                            // range; the `_tidb_tid` filter alone keeps the
+                            // scan's count.
+                            est: if path.residual_selection.is_some() {
+                                root_est.unwrap_or(arm_est)
+                            } else {
+                                arm_est
+                            },
+                            task,
+                            // The GLOBAL-index arm label (`partition:pN`) hides
+                            // the access object; a bare residual filter keeps it
+                            // empty.
+                            access: if path.tid_selection.is_some() {
+                                "NULL".to_string()
+                            } else {
+                                String::new()
+                            },
+                            info: tid_selection,
+                        },
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Build)");
+                    }
+                    // The probe row follows every arm, so the arm's child keeps
+                    // the continuation bar.
+                    let mut spine = vec![false; depth];
+                    if depth > 0 {
+                        spine[depth - 1] = true;
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: scan,
+                            est: arm_est,
+                            task,
+                            access,
+                            info,
+                        },
+                        &spine,
+                    );
+                    continue;
+                }
                 let Some((offset, count)) = path.limit else {
                     push_explain_row(
                         rows,
@@ -6405,6 +6477,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         PhysicalPlan::IndexMerge {
             intersection,
             limit,
+            partition_access,
             ..
         } => {
             let kind = if *intersection {
@@ -6416,7 +6489,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             if let Some((offset, count)) = limit {
                 info.push_str(&format!(", limit embedded(offset:{offset}, count:{count})"));
             }
-            ("IndexMerge".to_string(), String::new(), info)
+            let access = if partition_access.is_empty() {
+                String::new()
+            } else {
+                format!("partition:{partition_access}")
+            };
+            ("IndexMerge".to_string(), access, info)
         }
         PhysicalPlan::Selection { child, filter, .. } => (
             "Selection".to_string(),

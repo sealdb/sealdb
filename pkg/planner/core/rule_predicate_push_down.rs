@@ -437,6 +437,7 @@ fn push_into(
             keep_order,
             order_column,
             order_desc,
+            partition_access,
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
@@ -468,6 +469,7 @@ fn push_into(
                     keep_order,
                     order_column,
                     order_desc,
+                    partition_access,
                 },
                 residual,
             )

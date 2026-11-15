@@ -97,6 +97,16 @@ pub struct IndexMergePath {
     /// Limit embedded into the arm (`Limit(Build)` over the scan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<(u64, u64)>,
+    /// A GLOBAL index arm under `FROM PARTITION (pN)` cannot tell the row's
+    /// partition from the index key, so TiDB filters the arm with
+    /// `_tidb_tid IN (…)`: the EXPLAIN `Selection(Build)` info text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid_selection: Option<String>,
+    /// A conjunct another arm already consumes, but this arm's index also
+    /// covers (a common handle column is in every secondary index key), so the
+    /// arm re-checks it as a cop `Selection(Build)`: the residual filter.
+    #[serde(skip)]
+    pub residual_selection: Option<sealdb_parser::ast::ExprNode>,
     /// KV seek bounds; `range` carries the EXPLAIN text / cardinality.
     #[serde(skip)]
     pub ranges: Vec<IndexBounds>,
@@ -339,6 +349,10 @@ pub enum PhysicalPlan {
         /// `ORDER BY <order_column> DESC`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         order_desc: bool,
+        /// TiDB `partition:all` / `partition:pN` label: a partitioned table's
+        /// merge still names the partitions its arms scan.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        partition_access: String,
     },
     Selection {
         child: Box<PhysicalPlan>,
