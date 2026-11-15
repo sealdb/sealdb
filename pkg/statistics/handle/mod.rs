@@ -123,8 +123,11 @@ impl Handle {
                         }),
                         topn: col.topn.as_ref().map(|t| t.items.clone()),
                         value_counts: col.value_counts.clone(),
+                        tot_col_size: col.tot_col_size,
+                        part_tot_col_size: col.part_tot_col_size.clone(),
                     })
                     .collect(),
+                part_counts: stats.part_counts.clone(),
             })
             .collect();
         serde_json::to_vec(&snap)
@@ -164,6 +167,8 @@ impl Handle {
                             }),
                             topn: c.topn.map(|items| TopN { items }),
                             value_counts: c.value_counts,
+                            tot_col_size: c.tot_col_size,
+                            part_tot_col_size: c.part_tot_col_size,
                         },
                     )
                 })
@@ -205,6 +210,7 @@ impl Handle {
                     modify_count: t.modify_count,
                     columns,
                     indices,
+                    part_counts: t.part_counts,
                     version: t.version,
                 },
             );
@@ -220,6 +226,15 @@ impl Default for Handle {
     }
 }
 
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().expect("stats lock");
+        f.debug_struct("Handle")
+            .field("tables", &inner.len())
+            .finish()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PersistTable {
     db: String,
@@ -231,6 +246,8 @@ struct PersistTable {
     #[serde(default)]
     indices: Vec<PersistIndex>,
     columns: Vec<PersistColumn>,
+    #[serde(default)]
+    part_counts: Vec<(i64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -275,6 +292,10 @@ struct PersistColumn {
     topn: Option<Vec<(String, u64)>>,
     #[serde(default)]
     value_counts: Option<Vec<(String, u64)>>,
+    #[serde(default)]
+    tot_col_size: u64,
+    #[serde(default)]
+    part_tot_col_size: Vec<(i64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]

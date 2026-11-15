@@ -217,6 +217,34 @@ impl FieldType {
     pub fn is_unsigned(&self) -> bool {
         self.unsigned || (self.flag & 32) != 0
     }
+
+    /// TiDB `types.FieldType.StorageLength`: bytes one value occupies in a row,
+    /// or `None` when the type is variable length (`VarStorageLen`). The fixed
+    /// lengths are the ones `information_schema.tables.DATA_LENGTH` uses.
+    pub fn storage_length(&self) -> Option<u64> {
+        match self.tp {
+            // TiDB `parser/types.FieldType.StorageLength` charges a fixed 8
+            // bytes for every numeric/date/enum/set/bit type ("This may not be
+            // the accurate length, because we may encode them as varint").
+            TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG
+            | TYPE_DOUBLE | TYPE_FLOAT | TYPE_YEAR | TYPE_DURATION | TYPE_DATE
+            | TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_ENUM | TYPE_SET | TYPE_BIT => Some(8),
+            TYPE_NEW_DECIMAL | TYPE_DECIMAL => {
+                // TiDB `digitsPerWord`/`wordSize`/`dig2bytes` decimal packing.
+                const DIGITS_PER_WORD: i32 = 9;
+                const WORD_SIZE: u64 = 4;
+                const DIG2BYTES: [u64; 10] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4];
+                let precision = self.flen - self.decimal;
+                let frac = self.decimal;
+                let int_len = (precision / DIGITS_PER_WORD) as u64 * WORD_SIZE
+                    + DIG2BYTES[(precision % DIGITS_PER_WORD) as usize];
+                let frac_len = (frac / DIGITS_PER_WORD) as u64 * WORD_SIZE
+                    + DIG2BYTES[(frac % DIGITS_PER_WORD) as usize];
+                Some(int_len + frac_len)
+            }
+            _ => None,
+        }
+    }
 }
 
 pub const TYPE_DECIMAL: u8 = 0;

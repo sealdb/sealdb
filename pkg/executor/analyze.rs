@@ -91,6 +91,20 @@ impl AnalyzeExec {
         let index_cols = resolve_index_columns(&info, indexes)?;
         let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets);
         let index_stats = collect_index_stats(&info, &rows, buckets);
+        // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
+        // partition's `DATA_LENGTH` reads its own count, not the table total.
+        let part_counts: Vec<(i64, u64)> = if info.partition.is_some() {
+            let mut counts: Vec<(i64, u64)> = Vec::new();
+            for row in &rows {
+                match counts.iter_mut().find(|(id, _)| *id == row.physical_id) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((row.physical_id, 1)),
+                }
+            }
+            counts
+        } else {
+            Vec::new()
+        };
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
             if index_cols.is_some() {
                 prev.count = rows.len() as u64;
@@ -138,6 +152,7 @@ impl AnalyzeExec {
                     modify_count: 0,
                     columns,
                     indices,
+                    part_counts,
                     version: prev.version + 1,
                 }
             }
@@ -147,6 +162,7 @@ impl AnalyzeExec {
                 modify_count: 0,
                 columns,
                 indices: index_stats,
+                part_counts,
                 version: 1,
             }
         };
@@ -292,8 +308,27 @@ fn collect_column_stats(
         let mut null_count = 0;
         let mut values = Vec::new();
         let mut freq: HashMap<String, u64> = HashMap::new();
+        // TiDB `stats_histograms.tot_col_size`: bytes one value takes in a row,
+        // a varint length byte plus the content, summed per physical table id.
+        // Only variable-length columns consume it (`StorageLength` wins for
+        // fixed types), but the collector records it for every column.
+        let var_len = col.field_type.storage_length().is_none();
+        let mut tot_col_size = 0u64;
+        let mut part_tot_col_size: Vec<(i64, u64)> = Vec::new();
         for row in rows {
-            match row.values.get(idx).unwrap_or(&Datum::Null) {
+            let value = row.values.get(idx).unwrap_or(&Datum::Null);
+            if var_len {
+                let size = stored_value_size(value);
+                tot_col_size += size;
+                match part_tot_col_size
+                    .iter_mut()
+                    .find(|(id, _)| *id == row.physical_id)
+                {
+                    Some((_, total)) => *total += size,
+                    None => part_tot_col_size.push((row.physical_id, size)),
+                }
+            }
+            match value {
                 Datum::Null => null_count += 1,
                 other => {
                     let key = datum_key(other);
@@ -336,8 +371,22 @@ fn collect_column_stats(
                 histogram,
                 topn,
                 value_counts,
+                tot_col_size,
+                part_tot_col_size,
             },
         ));
     }
     columns
+}
+
+/// TiDB's per-value row size for `tot_col_size`: a varint length byte plus the
+/// value content (TiDB `update_test` documents `2 + 1` for `'ss'`).
+fn stored_value_size(value: &Datum) -> u64 {
+    match value {
+        Datum::Null => 0,
+        Datum::Bytes(bytes) => bytes.len() as u64 + 1,
+        Datum::I64(_) | Datum::U64(_) | Datum::F64(_) => 9,
+        Datum::Time(_) => 1 + 8,
+        other => datum_key(other).len() as u64 + 1,
+    }
 }

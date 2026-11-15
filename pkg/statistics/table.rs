@@ -246,6 +246,13 @@ pub struct ColumnStats {
     pub null_count: u64,
     pub histogram: Option<Histogram>,
     pub topn: Option<TopN>,
+    /// TiDB `stats_histograms.tot_col_size`: total bytes of the column's
+    /// variable-length values. `information_schema.tables.DATA_LENGTH` uses it
+    /// for `VarStorageLen` columns; fixed-length columns use `StorageLength`.
+    pub tot_col_size: u64,
+    /// `tot_col_size` per partition physical id (TiDB keys `tot_col_size` by
+    /// physical table id). Empty for a non-partitioned table.
+    pub part_tot_col_size: Vec<(i64, u64)>,
     /// Exact per-value counts, kept for small columns so equality / IN-list /
     /// range selectivity is exact (TiDB leans on CMSketch here). `None` when
     /// the column is too wide to retain.
@@ -382,6 +389,10 @@ pub struct Table {
     /// `LOAD STATS` fills these from the JSON `indices` map; ANALYZE keeps them
     /// empty because the planner falls back to the leading column's histogram.
     pub indices: Vec<(String, IndexStats)>,
+    /// Per-partition row counts keyed by physical table id (TiDB
+    /// `mysql.stats_meta` keyed by physical ID). Empty for a non-partitioned
+    /// table, whose rows live under the table id in `count`.
+    pub part_counts: Vec<(i64, u64)>,
     pub version: u64,
 }
 

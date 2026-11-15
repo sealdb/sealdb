@@ -52,6 +52,7 @@ pub fn table_from_tidb_json(raw: &str) -> Result<(String, String, Table)> {
             modify_count,
             columns,
             indices,
+            part_counts: Vec::new(),
             version,
         },
     ))
@@ -84,6 +85,10 @@ fn column_from_json(col: &Value) -> Result<ColumnStats> {
         histogram,
         topn: None,
         value_counts: None,
+        // `LOAD STATS` carries TiDB's `mysql.stats_histograms` columns, where
+        // only the row-count and histogram matter to the planner.
+        tot_col_size: 0,
+        part_tot_col_size: Vec::new(),
     })
 }
 
