@@ -1149,12 +1149,16 @@ impl ExecutorBuilder {
             // `alias.col` suffix — expressions like `t.c1 + t.c2` or `1.23`
             // must keep their original text.
             // `\u{1}`-prefixed entries are hidden USING columns used only to
-            // evaluate parent filters; they never reach the result.
+            // evaluate parent filters; they never reach the result. A table
+            // read over a table with an expression index carries the hidden
+            // generated column (`_V$_idx_0`) in its DataSource schema, and
+            // TiDB never exposes it either: `SELECT *` lists the user columns
+            // only.
             let keep: Vec<usize> = exec
                 .schema()
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| !c.starts_with('\u{1}'))
+                .filter(|(_, c)| !c.starts_with('\u{1}') && !is_hidden_generated_column(c))
                 .map(|(i, _)| i)
                 .collect();
             let hidden = keep.len() != exec.schema().len();
@@ -1236,6 +1240,16 @@ fn localize_timestamp_row(row: Vec<sealdb_types::Datum>) -> Vec<sealdb_types::Da
             other => other,
         })
         .collect()
+}
+
+/// The hidden generated column that backs an expression index key part
+/// (`_V$<index>_<pos>`, TiDB `ColumnInfo.Hidden`). It is stored in the row but
+/// is not part of the table's user-visible schema.
+fn is_hidden_generated_column(schema_name: &str) -> bool {
+    schema_name
+        .rsplit('.')
+        .next()
+        .is_some_and(|name| name.starts_with("_V$"))
 }
 
 fn stmt_order_by(stmt: &Statement) -> Option<Vec<ByItem>> {
