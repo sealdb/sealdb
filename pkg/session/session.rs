@@ -1375,6 +1375,11 @@ impl Session {
         // EXPLAIN / semi-join strings use `current_db_name()` (suite schema).
         let explicit_txn = self.txn.lock().expect("session txn lock").is_explicit()
             || !*self.autocommit.lock().expect("session autocommit lock");
+        if !explicit_txn {
+            // Autocommit statements each start their own transaction, hence a
+            // fresh `_tidb_rowid` shard batch.
+            self.domain.begin_handle_batch();
+        }
         // TiDB `MemBuffer.DirtyTableExists`: tables with pending writes in this
         // transaction read through a `UnionScan`.
         let dirty_tables: Vec<i64> = {
@@ -3505,6 +3510,20 @@ fn parse_resource_control_flag(value: &str) -> bool {
     !matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
 }
 
+/// `tidb_shard_allocate_step` value: a positive row count, `DEFAULT` meaning
+/// TiDB's `math.MaxInt64` (one shard prefix per allocation batch).
+fn parse_shard_allocate_step(value: &str) -> Result<u64> {
+    if value.eq_ignore_ascii_case("default") {
+        return Ok(u64::MAX);
+    }
+    value.parse::<u64>().map_err(|_| {
+        Error::new(
+            1232,
+            format!("Variable 'tidb_shard_allocate_step' can't be set to the value of '{value}'"),
+        )
+    })
+}
+
 /// `RU_PER_SEC = <n>` of a `CREATE|ALTER RESOURCE GROUP` statement.
 fn parse_ru_per_sec(raw_sql: &str) -> Option<u64> {
     let upper = raw_sql.to_ascii_uppercase();
@@ -3663,6 +3682,10 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 // value mirrors it (`@@tidb_enable_resource_control`).
                 let on = parse_resource_control_flag(&value);
                 session.domain.set_enable_resource_control(on);
+            }
+            "tidb_shard_allocate_step" => {
+                let step = parse_shard_allocate_step(&value)?;
+                session.domain.set_shard_allocate_step(step);
             }
             "tidb_enable_auto_analyze" => {
                 let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -3996,6 +4019,11 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             session
                 .domain
                 .set_enable_resource_control(parse_resource_control_flag(value));
+        }
+        "tidb_shard_allocate_step" => {
+            session
+                .domain
+                .set_shard_allocate_step(parse_shard_allocate_step(value)?);
         }
         // Accepted for compatibility; only the session value gates DML.
         "allow_auto_random_explicit_insert" => {}

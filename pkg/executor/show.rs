@@ -584,7 +584,12 @@ fn render_create_table(info: &TableInfo) -> String {
             };
             format!("  PRIMARY KEY ({parts}) /*T![clustered_index] {stored} */")
         } else {
-            format!("  {key} `{}` ({parts})", idx.name.o())
+            let predicate = idx
+                .where_clause
+                .as_ref()
+                .map(|text| format!(" WHERE {text}"))
+                .unwrap_or_default();
+            format!("  {key} `{}` ({parts}){predicate}", idx.name.o())
         });
     }
     // FOREIGN KEY constraints follow the keys (`CONSTRAINT `fk` FOREIGN KEY …`).
@@ -613,6 +618,23 @@ fn render_create_table(info: &TableInfo) -> String {
         info.charset,
         info.collate
     );
+    // TiDB echoes the shard options as a TiDB-only comment at the end.
+    let mut shard_opts = String::new();
+    if info.shard_row_id_bits > 0 {
+        shard_opts.push_str(&format!(
+            "SHARD_ROW_ID_BITS={}",
+            info.shard_row_id_bits
+        ));
+    }
+    if info.pre_split_regions > 0 {
+        if !shard_opts.is_empty() {
+            shard_opts.push(' ');
+        }
+        shard_opts.push_str(&format!("PRE_SPLIT_REGIONS={}", info.pre_split_regions));
+    }
+    if !shard_opts.is_empty() {
+        out.push_str(&format!(" /*T! {shard_opts} */"));
+    }
     if let Some(ttl) = &info.ttl {
         let enable = if ttl.enable { "ON" } else { "OFF" };
         out.push_str(&format!(

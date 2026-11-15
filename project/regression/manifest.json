@@ -2482,7 +2482,7 @@
     {
       "name": "table/tables",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/table/tables.test",
       "result": "r/table/tables.result",
       "has_result": true,

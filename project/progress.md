@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-14（green 72 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-15（green 81 套件；整体进展快照见 [status-report.md](./status-report.md)）  
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -2984,6 +2984,33 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `UUID_TO_BIN`/`BIN_TO_UUID` 的 `swap_flag` 按 MySQL 文档实现，尚无金样校验。
 - **下一步**:
   - `table/tables`。
+
+### 2026-11-15（`table/tables` 转正：`SHARD_ROW_ID_BITS` 分片 + 部分索引）
+
+- **Phase**: R7
+- **完成**:
+  - `SHARD_ROW_ID_BITS = n [PRE_SPLIT_REGIONS = m]` 之前解析即失败。现存入
+    `CreateTableStmt` / `TableInfo`；堆表 `_tidb_rowid` 的高 `n` 位取批次
+    shard 前缀，低 `64 - n` 位保持单调。前缀按
+    `tidb_shard_allocate_step` 行更新（默认整批一个前缀），事务/autocommit
+    语句开始新批次；`SHOW CREATE TABLE` 回显
+    `/*T! SHARD_ROW_ID_BITS=… PRE_SPLIT_REGIONS=… */`。
+  - 部分索引 `UNIQUE KEY idx (c) WHERE b > 2` 之前 1064。sqlparser 没有索引
+    谓词语法，改在 `strip_tidb_create_table_options` 里剥离 `WHERE <expr>`
+    并按索引名记录，lower 时回填 `IndexDef` / `IndexInfo.where_clause`。
+    写/删索引键、DDL 回填、唯一冲突检测都只对满足谓词的行生效，
+    `SHOW CREATE TABLE` 回显谓词。
+  - `bit(32) DEFAULT b'…'` 插入与 `ON DUPLICATE KEY UPDATE` 和部分索引的
+    组合行为对齐金样（谓词不成立的行不参与唯一冲突）。
+- **验证**:
+  - `table/tables`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - green 80→81（TiKV 可跑 80）
+- **阻塞/风险**:
+  - 部分索引只在写入侧过滤；planner 尚未依据查询谓词判断部分索引可用性，
+    查询谓词不蕴含索引谓词时仍可能选择该索引。
+  - `tidb_shard_allocate_step` 为 Domain 全局值，未做 session 级隔离。
+- **下一步**:
+  - 继续 R7 剩余 `in_progress` 套件。
 
 ---
 

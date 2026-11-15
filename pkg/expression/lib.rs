@@ -22,7 +22,7 @@ pub use memquota::{
 pub use evaluator::{
     DEFAULT_WINDOW_CONCURRENCY, DivByZeroMode, allow_auto_increment_in_generated,
     allow_auto_random_explicit_insert, clear_warnings, collation_ci, collation_mode,
-    current_db_name, datum_sql_eq, eval_expr, eval_expr_with_row, eval_filter,
+    current_db_name, datum_sql_eq, eval_expr, eval_expr_with_row, eval_filter, eval_where_text,
     format_timestamp_display, locate_partition_for_row, note_warning, session_local_to_utc,
     set_window_concurrency, sql_mode_flag, take_warnings, time_to_unix_millis, truthy,
     utc_to_session_local, validate_string_cmp_literals, validate_string_cmp_literals_on,

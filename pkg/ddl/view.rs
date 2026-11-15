@@ -488,6 +488,8 @@ pub fn create_view(
         collate: None,
         partition: None,
         ttl: None,
+        shard_row_id_bits: None,
+        pre_split_regions: None,
         refer_table: None,
         select: None,
     };

@@ -38,6 +38,7 @@ pub fn create_index(
             nonclustered: false,
             clustered: false,
             invisible: stmt.invisible,
+            where_clause: None,
         },
         stmt.if_not_exists,
         current_db,
@@ -105,7 +106,8 @@ pub fn add_index(
     let mut built = IndexInfo::new(info.max_idx_id, index.name.clone(), info.name.o(), idx_cols)
         .with_flags(index.unique, index.primary)
         .with_global(index.global)
-        .with_invisible(index.invisible);
+        .with_invisible(index.invisible)
+        .with_where_clause(index.where_clause.clone());
     for state in INDEX_REORG_STATES {
         built.state = state;
         if is_write_reorg(state) {
@@ -212,6 +214,17 @@ pub(crate) fn backfill_index(
                         .unwrap_or(Datum::Null)
                 })
                 .collect();
+            // Partial index: only rows satisfying the predicate are indexed.
+            if let Some(text) = &index.where_clause {
+                let names: Vec<String> = info
+                    .columns
+                    .iter()
+                    .map(|col| col.name.o().to_string())
+                    .collect();
+                if !sealdb_expression::eval_where_text(text, &names, &values) {
+                    continue;
+                }
+            }
             let idx_vals: Vec<Datum> = index
                 .columns
                 .iter()

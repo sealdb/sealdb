@@ -17,6 +17,16 @@ pub(crate) fn index_values(index: &IndexInfo, values: &[Datum]) -> Vec<Datum> {
         .collect()
 }
 
+/// TiDB partial index: only rows satisfying the predicate take a key entry.
+pub(crate) fn index_applies(info: &TableInfo, index: &IndexInfo, values: &[Datum]) -> bool {
+    match &index.where_clause {
+        Some(text) => {
+            sealdb_expression::eval_where_text(text, &crate::update::col_names(info), values)
+        }
+        None => true,
+    }
+}
+
 pub(crate) fn write_index_keys(
     txn: &mut dyn Transaction,
     info: &TableInfo,
@@ -28,6 +38,9 @@ pub(crate) fn write_index_keys(
         // A clustered integer PRIMARY KEY is the row handle: TiDB stores no
         // separate index entry for it (`pk_is_handle`).
         if index.primary && info.pk_is_handle {
+            continue;
+        }
+        if !index_applies(info, index, values) {
             continue;
         }
         let key = encode_index_key(
@@ -74,6 +87,9 @@ pub(crate) fn delete_index_keys(
     for index in &info.indices {
         // Clustered handle PRIMARY KEY rows are removed by the row key.
         if index.primary && info.pk_is_handle {
+            continue;
+        }
+        if !index_applies(info, index, values) {
             continue;
         }
         let key = encode_index_key(

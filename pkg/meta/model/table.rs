@@ -227,6 +227,16 @@ pub struct TableInfo {
     /// `information_schema.attributes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributes: Vec<(String, String)>,
+    /// TiDB `SHARD_ROW_ID_BITS`: how many high bits of a heap table's
+    /// `_tidb_rowid` are randomized per allocation batch.
+    #[serde(default)]
+    pub shard_row_id_bits: u8,
+    /// TiDB `PRE_SPLIT_REGIONS` (echoed by SHOW CREATE TABLE).
+    #[serde(default)]
+    pub pre_split_regions: u8,
+    /// TiDB `AUTO_RANDOM_BASE` / `_tidb_rowid` shard seed, unused here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_random_base: Option<i64>,
 }
 
 /// Persisted TTL metadata (TiDB `TTLInfo`).
@@ -281,6 +291,9 @@ impl TableInfo {
             view: None,
             sequence: None,
             attributes: Vec::new(),
+            shard_row_id_bits: 0,
+            pre_split_regions: 0,
+            auto_random_base: None,
         }
     }
 

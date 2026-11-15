@@ -1029,6 +1029,13 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     let names: Vec<String> = columns.iter().map(|c| c.name.o().to_string()).collect();
     crate::alter::check_generated_order(&names, &columns)?;
     let mut info = TableInfo::new(table_id, stmt.table.name.clone(), columns);
+    // TiDB `SHARD_ROW_ID_BITS` / `PRE_SPLIT_REGIONS` table options.
+    if let Some(bits) = stmt.shard_row_id_bits {
+        info.shard_row_id_bits = bits.min(63) as u8;
+    }
+    if let Some(regions) = stmt.pre_split_regions {
+        info.pre_split_regions = regions as u8;
+    }
     // Table-level `DEFAULT CHARSET` / `COLLATE` (TiDB `TableInfo.Charset/Collate`).
     if let Some(charset) = &stmt.charset {
         info.charset = charset.to_ascii_lowercase();
@@ -1097,7 +1104,8 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             IndexInfo::new(idx_id, index.name.clone(), info.name.o(), idx_cols)
                 .with_flags(index.unique, index.primary)
                 .with_global(index.global)
-                .with_invisible(index.invisible),
+                .with_invisible(index.invisible)
+                .with_where_clause(index.where_clause.clone()),
         );
         info.max_idx_id = info.max_idx_id.max(idx_id);
         for c in &mut info.columns {

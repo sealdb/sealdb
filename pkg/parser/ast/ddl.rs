@@ -315,6 +315,9 @@ pub struct IndexDef {
     /// TiDB `INVISIBLE` index option: the optimizer ignores the index unless a
     /// `USE INDEX` / `FORCE INDEX` hint names it.
     pub invisible: bool,
+    /// TiDB partial index predicate (`UNIQUE KEY idx (c) WHERE <expr>`): only
+    /// rows satisfying it take a key entry.
+    pub where_clause: Option<String>,
 }
 
 /// `FOREIGN KEY (a, b) REFERENCES t (c, d) ON UPDATE … ON DELETE …`.
@@ -374,6 +377,10 @@ impl IndexDef {
         // comment so MySQL clients ignore it.
         if self.global {
             ctx.write_str(" /*T![global_index] GLOBAL */");
+        }
+        if let Some(predicate) = &self.where_clause {
+            ctx.write_str(" WHERE ");
+            ctx.write_str(predicate);
         }
         Ok(())
     }
@@ -527,6 +534,10 @@ pub struct CreateTableStmt {
     pub refer_table: Option<TableName>,
     /// TiDB `Select` (`CREATE TABLE t AS SELECT ...`).
     pub select: Option<Box<SelectStmt>>,
+    /// TiDB `SHARD_ROW_ID_BITS = n` table option.
+    pub shard_row_id_bits: Option<u32>,
+    /// TiDB `PRE_SPLIT_REGIONS = n` table option.
+    pub pre_split_regions: Option<u32>,
 }
 
 impl CreateTableStmt {

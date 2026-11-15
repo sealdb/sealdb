@@ -490,6 +490,16 @@ pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<
     Ok(truthy(&eval_expr_with_row(expr, schema, row)?).unwrap_or(false))
 }
 
+/// Evaluate a stored predicate text (e.g. a partial index `WHERE` clause)
+/// against a row laid out like `schema`. A predicate that fails to parse or
+/// evaluate is treated as satisfied so the index is never silently dropped.
+pub fn eval_where_text(text: &str, schema: &[String], row: &[Datum]) -> bool {
+    let Ok(expr) = sealdb_parser::sqlparser_bridge::parse_expr(text) else {
+        return true;
+    };
+    eval_filter(&expr, schema, row).unwrap_or(true)
+}
+
 /// Reject binary literals that cannot convert to utf8mb4 when compared to a
 /// column (TiDB charset convert), even if the scan yields no rows.
 pub fn validate_string_cmp_literals(expr: &ExprNode) -> Result<()> {

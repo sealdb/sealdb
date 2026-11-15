@@ -37,6 +37,40 @@ use crate::ast::misc::{
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
+
+thread_local! {
+    /// TiDB table options sqlparser rejects (`SHARD_ROW_ID_BITS`,
+    /// `PRE_SPLIT_REGIONS`). `strip_tidb_create_table_options` records them and
+    /// the `CREATE TABLE` lowering consumes them.
+    static PENDING_SHARD_ROW_ID_BITS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    static PENDING_PRE_SPLIT_REGIONS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    /// TiDB partial-index predicates (`UNIQUE KEY idx (c) WHERE b > 2`):
+    /// `strip_tidb_create_table_options` drops the predicate from the SQL text
+    /// sqlparser sees and records it here, keyed by index name.
+    static PENDING_PARTIAL_INDEX_PREDICATES: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take the predicate recorded for `name` (case-insensitive).
+fn take_partial_index_predicate(name: &str) -> Option<String> {
+    PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        let pos = pending
+            .iter()
+            .position(|(index, _)| index.eq_ignore_ascii_case(name))?;
+        Some(pending.remove(pos).1)
+    })
+}
+
+/// Take the TiDB table options seen by the last option-stripping pass.
+fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
+    (
+        PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.replace(None)),
+        PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.replace(None)),
+    )
+}
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
     ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG,
@@ -98,6 +132,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_primary_key_nonclustered(&rewritten);
     // TiDB `CREATE TABLE (... PRIMARY KEY (c) CLUSTERED) pre_split_regions=2`:
     // drop index-option/table-option clauses sqlparser rejects.
+    PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.set(None));
+    PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(None));
+    PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| cell.borrow_mut().clear());
     let rewritten = strip_tidb_create_table_options(&rewritten);
     // MySQL `INSERT … PARTITION (p0, p1) (cols) VALUES` — sqlparser wants the
     // column list first.
@@ -3215,6 +3252,10 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
     let mut in_sq = false;
     let mut in_dq = false;
     let mut in_bt = false;
+    // Partial-index predicates only exist inside a `CREATE TABLE ( … )` body.
+    let partial_ok = lower[start..].trim_start().starts_with("create table");
+    let mut depth = 0i32;
+    let mut item_start: Option<usize> = None;
     while i < bytes.len() {
         let c = bytes[i];
         if in_sq || in_dq || in_bt {
@@ -3230,6 +3271,27 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
             continue;
         }
         match c {
+            b'(' => {
+                if partial_ok && depth == 0 {
+                    item_start = Some(i + 1);
+                }
+                depth += 1;
+                out.push('(');
+                i += 1;
+            }
+            b')' => {
+                if depth == 1 {
+                    item_start = None;
+                }
+                depth = (depth - 1).max(0);
+                out.push(')');
+                i += 1;
+            }
+            b',' if depth == 1 && item_start.is_some() => {
+                item_start = Some(i + 1);
+                out.push(',');
+                i += 1;
+            }
             b'\'' => {
                 in_sq = true;
                 out.push('\'');
@@ -3281,6 +3343,33 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                     i += 1;
                 }
                 let word = lower[word_start..i].to_string();
+                // TiDB partial index: `UNIQUE KEY idx (c) WHERE <predicate>`.
+                // sqlparser has no predicate on an index, so record it and drop
+                // the predicate up to the item separator (`WHERE` inside a
+                // generated-column/default expression never follows a `)` at
+                // table-body depth).
+                if word == "where"
+                    && partial_ok
+                    && depth == 1
+                    && item_start.is_some()
+                    && out.trim_end().ends_with(')')
+                {
+                    let end = scan_partial_predicate_end(sql, i);
+                    let predicate = sql[i..end].trim();
+                    if !predicate.is_empty() {
+                        let item = &sql[item_start.unwrap()..word_start];
+                        if let Some(name) = partial_index_name(item) {
+                            PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| {
+                                cell.borrow_mut().push((name, predicate.to_string()))
+                            });
+                        }
+                    }
+                    while out.ends_with(|ch: char| ch.is_whitespace()) {
+                        out.pop();
+                    }
+                    i = end;
+                    continue;
+                }
                 if GLOBAL.contains(&word.as_str()) {
                     out.push(' ');
                     continue;
@@ -3324,6 +3413,18 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                             j += 1;
                         }
                         if j > num_start {
+                            let value: u32 = String::from_utf8_lossy(&bytes[num_start..j])
+                                .parse()
+                                .unwrap_or(0);
+                            match word.as_str() {
+                                "shard_row_id_bits" => {
+                                    PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.set(Some(value)));
+                                }
+                                "pre_split_regions" => {
+                                    PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(Some(value)));
+                                }
+                                _ => {}
+                            }
                             out.push(' ');
                             i = j;
                             continue;
@@ -3340,6 +3441,125 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
         }
     }
     out
+}
+
+/// End of a partial-index predicate: the next `,` or `)` at the table-body
+/// depth, skipping strings, backticks, and nested parentheses.
+fn scan_partial_predicate_end(sql: &str, from: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = from;
+    let mut depth = 0i32;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    let mut in_bt = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_sq {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_sq = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dq || in_bt {
+            if (in_dq && c == b'"') || (in_bt && c == b'`') {
+                in_dq = false;
+                in_bt = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'`' => in_bt = true,
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Name of the index a table-item text defines, for partial-index bookkeeping:
+/// `unique key testidx (c)` → `testidx`, `key (c)` → `c`, `primary key (c)` →
+/// `PRIMARY`. `None` when the item is not an index definition.
+fn partial_index_name(item: &str) -> Option<String> {
+    let bytes = item.as_bytes();
+    let mut tokens: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'`' {
+            let start = i + 1;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            tokens.push((start, i));
+            i += 1;
+        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            tokens.push((start, i));
+        } else if c == b'(' || c == b')' || c == b',' {
+            tokens.push((i, i + 1));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let text = |t: (usize, usize)| &item[t.0..t.1];
+    // Find the first `KEY` / `INDEX` keyword (a column may legitimately be
+    // named `key`, but an index definition is the only place followed by a
+    // column list or a name + column list).
+    let mut keyword = None;
+    for (n, token) in tokens.iter().enumerate() {
+        let word = text(*token);
+        if word.eq_ignore_ascii_case("key") || word.eq_ignore_ascii_case("index") {
+            keyword = Some(n);
+            break;
+        }
+    }
+    let keyword = keyword?;
+    if keyword > 0 && text(tokens[keyword - 1]).eq_ignore_ascii_case("primary") {
+        return Some("PRIMARY".to_string());
+    }
+    let open = tokens[keyword + 1..].iter().position(|t| text(*t) == "(")?;
+    // `KEY idx (c)` vs `KEY (c)`: anything between the keyword and `(` is the
+    // explicit name.
+    if open > 0 {
+        let name_token = tokens[keyword + 1];
+        return Some(text(name_token).to_string());
+    }
+    // Unnamed index takes its first column name; an expression part is
+    // `expression_index`.
+    let first = tokens.get(keyword + 1 + open + 1)?;
+    let name = text(*first);
+    if name == "(" {
+        Some("expression_index".to_string())
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Skips `!=`, strings, backticks, and MySQL version comments `/*! ... */`.
@@ -10557,6 +10777,7 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                 nonclustered: false,
                 clustered: false,
                 invisible: false,
+                where_clause: None,
             });
         }
     }
@@ -10574,11 +10795,13 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
                     nonclustered: col_pk_nonclustered,
                     clustered: col_pk_clustered && !col_pk_nonclustered,
                     invisible: false,
+                    where_clause: None,
                 },
             );
         }
     }
     let (charset, collate) = lower_table_charset_collate(&create.table_options);
+    let (shard_row_id_bits, pre_split_regions) = take_tidb_table_options();
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
         temporary: create.temporary,
@@ -10596,6 +10819,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         ttl: None,
         refer_table,
         select,
+        shard_row_id_bits,
+        pre_split_regions,
     }))
 }
 
@@ -11965,6 +12190,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     .as_ref()
                     .map(|ident| ident.value.clone())
                     .unwrap_or_else(|| default_index_name(&columns));
+                let where_clause = take_partial_index_predicate(&name);
                 Ok(AlterTableSpec::AddIndex(IndexDef {
                     name,
                     columns,
@@ -11974,6 +12200,7 @@ fn lower_alter_spec(op: &AlterTableOperation) -> Result<AlterTableSpec> {
                     nonclustered: false,
                     clustered: false,
                     invisible: index_def_invisible(&idx.index_options),
+                    where_clause,
                 }))
             }
             TableConstraint::Unique(idx) => Ok(AlterTableSpec::AddIndex(lower_unique_index(idx)?)),
@@ -12013,6 +12240,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     // MySQL/TiDB: `KEY (b)` → index name `b`; an expression
                     // key defaults to `expression_index`.
                     .unwrap_or_else(|| default_index_name(&columns));
+                let where_clause = take_partial_index_predicate(&name);
                 indices.push(IndexDef {
                     name,
                     columns,
@@ -12022,6 +12250,7 @@ fn lower_table_indices(constraints: &[TableConstraint]) -> Result<Vec<IndexDef>>
                     nonclustered: false,
                     clustered: false,
                     invisible: index_def_invisible(&idx.index_options),
+                    where_clause,
                 });
             }
             TableConstraint::Unique(idx) => indices.push(lower_unique_index(idx)?),
@@ -12083,6 +12312,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         .or(idx.name.as_ref())
         .map(|ident| ident.value.clone())
         .unwrap_or_else(|| default_index_name(&columns));
+    let where_clause = take_partial_index_predicate(&name);
     Ok(IndexDef {
         name,
         columns,
@@ -12092,6 +12322,7 @@ fn lower_unique_index(idx: &sqlparser::ast::UniqueConstraint) -> Result<IndexDef
         nonclustered: false,
         clustered: false,
         invisible: index_def_invisible(&idx.index_options),
+        where_clause,
     })
 }
 
@@ -12144,6 +12375,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
         nonclustered,
         clustered,
         invisible: index_def_invisible(&idx.index_options),
+        where_clause: take_partial_index_predicate("PRIMARY"),
     })
 }
 

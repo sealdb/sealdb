@@ -1,4 +1,4 @@
-use crate::index::write_index_keys;
+use crate::index::{index_applies, write_index_keys};
 use crate::internal::exec::Executor;
 use crate::join::apply::SubqueryEvalCtx;
 use crate::table_reader::scan_table;
@@ -1028,6 +1028,10 @@ fn write_row(
             Some(Datum::U64(v)) => *v as i64,
             _ => domain.next_handle(info.id)?,
         }
+    } else if info.shard_row_id_bits > 0 {
+        // TiDB `SHARD_ROW_ID_BITS`: heap-table row ids embed a shard prefix that
+        // changes every `tidb_shard_allocate_step` rows of a batch.
+        domain.next_sharded_handle(info.id, info.shard_row_id_bits)?
     } else {
         domain.next_handle(info.id)?
     };
@@ -1074,7 +1078,7 @@ pub(crate) fn index_conflict(
                 }
             }
         }
-        if all_eq {
+        if all_eq && index_applies(info, index, a) && index_applies(info, index, b) {
             return Some(i);
         }
     }

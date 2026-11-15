@@ -49,6 +49,9 @@ pub struct IndexInfo {
     /// TiDB `INVISIBLE` index: hidden from the optimizer (ALTER INDEX).
     #[serde(default)]
     pub invisible: bool,
+    /// TiDB partial index predicate: only rows satisfying it take a key entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub where_clause: Option<String>,
 }
 
 impl IndexInfo {
@@ -68,6 +71,7 @@ impl IndexInfo {
             primary: false,
             global: false,
             invisible: false,
+            where_clause: None,
         }
     }
 
@@ -86,6 +90,12 @@ impl IndexInfo {
     /// TiDB `INDEX … INVISIBLE` option.
     pub fn with_invisible(mut self, invisible: bool) -> Self {
         self.invisible = invisible;
+        self
+    }
+
+    /// TiDB partial index predicate (`UNIQUE KEY idx (c) WHERE <expr>`).
+    pub fn with_where_clause(mut self, where_clause: Option<String>) -> Self {
+        self.where_clause = where_clause;
         self
     }
 }

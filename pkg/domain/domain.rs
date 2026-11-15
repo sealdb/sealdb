@@ -67,10 +67,28 @@ pub struct Domain {
     connections: Mutex<HashMap<u64, ConnState>>,
     /// Explicit `LOCK TABLES` holds; distinct from short-lived MDL.
     table_locks: Mutex<TableLockTable>,
+    /// `_tidb_rowid` shard state per table for the current allocation batch
+    /// (TiDB `SHARD_ROW_ID_BITS` + `tidb_shard_allocate_step`).
+    shard_allocs: Mutex<HashMap<i64, ShardAlloc>>,
+    /// Bumped whenever a new allocation batch starts (transaction start).
+    handle_batch: AtomicU64,
+    /// Monotonic source of shard prefixes; only distinctness matters.
+    next_shard: AtomicU64,
+    /// `tidb_shard_allocate_step`: rows per shard prefix in one batch.
+    shard_allocate_step: AtomicU64,
     /// `CREATE RESOURCE GROUP` registry (lowercase name → RU_PER_SEC).
     resource_groups: Mutex<HashMap<String, Option<u64>>>,
     /// `tidb_enable_resource_control` (TiDB 7.4+ defaults to ON).
     resource_control: AtomicBool,
+}
+
+/// One shard allocation window: `remaining` row ids may still be drawn from
+/// `shard` before a new prefix is chosen.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShardAlloc {
+    batch: u64,
+    shard: u64,
+    remaining: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -191,6 +209,10 @@ impl Domain {
             shutdown_requested: AtomicBool::new(false),
             connections: Mutex::new(HashMap::new()),
             table_locks: Mutex::new(TableLockTable::default()),
+            shard_allocs: Mutex::new(HashMap::new()),
+            handle_batch: AtomicU64::new(0),
+            next_shard: AtomicU64::new(1),
+            shard_allocate_step: AtomicU64::new(u64::MAX),
             resource_groups: Mutex::new(HashMap::new()),
             resource_control: AtomicBool::new(true),
         })
@@ -204,6 +226,57 @@ impl Domain {
     /// True after a successful `SHUTDOWN` statement.
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// Start a new `_tidb_rowid` shard allocation batch (a transaction).
+    pub fn begin_handle_batch(&self) {
+        self.handle_batch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `tidb_shard_allocate_step`: continuous row ids that share one shard
+    /// prefix (`u64::MAX` — the default — means one prefix per batch).
+    pub fn shard_allocate_step(&self) -> u64 {
+        self.shard_allocate_step.load(Ordering::SeqCst).max(1)
+    }
+
+    pub fn set_shard_allocate_step(&self, step: u64) {
+        self.shard_allocate_step.store(step.max(1), Ordering::SeqCst);
+    }
+
+    /// Allocate the next `_tidb_rowid` of a `SHARD_ROW_ID_BITS` table: the low
+    /// `64 - bits` bits stay monotonic, the high bits come from the batch's
+    /// shard prefix, which changes every `tidb_shard_allocate_step` rows.
+    pub fn next_sharded_handle(&self, table_id: i64, bits: u8) -> Result<i64> {
+        let raw = self.next_handle(table_id)?;
+        let bits = bits.min(63);
+        if bits == 0 {
+            return Ok(raw);
+        }
+        let batch = self.handle_batch.load(Ordering::SeqCst);
+        let step = self.shard_allocate_step();
+        let mut allocs = self
+            .shard_allocs
+            .lock()
+            .expect("domain shard alloc lock");
+        let entry = allocs.entry(table_id).or_default();
+        if entry.batch != batch || entry.remaining == 0 {
+            let shard = self.next_shard.fetch_add(1, Ordering::SeqCst);
+            *entry = ShardAlloc {
+                batch,
+                shard,
+                remaining: step,
+            };
+        }
+        entry.remaining -= 1;
+        let shard = entry.shard;
+        drop(allocs);
+        let shift = 64 - bits as u32;
+        let mask = if shift >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << shift) - 1
+        };
+        Ok((shard.wrapping_shl(shift) | ((raw as u64) & mask)) as i64)
     }
 
     /// `tidb_enable_resource_control`: gates `RESOURCE_GROUP()` hints.

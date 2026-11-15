@@ -503,7 +503,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 104 | `sessiontxn/externals` | pending | 0% | ✓ | — |
 | 105 | `table/cache` | green | 100% | ✓ | ✓ |
 | 106 | `table/index` | pending | 0% | ✓ | — |
-| 107 | `table/tables` | pending | 0% | ✓ | — |
+| 107 | `table/tables` | green | 100% | ✓ | ✓ |
 | 108 | `table/temptable` | green | 100% | ✓ | ✓ |
 | 109 | `tpch` | pending | 0% | ✓ | — |
 | 110 | `util/admin` | green | 100% | ✓ | ✓ |
