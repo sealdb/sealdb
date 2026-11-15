@@ -11509,3 +11509,41 @@ mod expression_index_tests {
         assert_eq!(err.code, 3758, "{err}");
     }
 }
+
+#[cfg(test)]
+mod cte_limit_tests {
+    use super::*;
+
+    fn runner_session() -> Session {
+        let storage: std::sync::Arc<dyn sealdb_kv::Storage> =
+            std::sync::Arc::new(sealdb_kv::MemStorage::new());
+        let domain = std::sync::Arc::new(
+            sealdb_domain::Domain::with_storage_and_grant_table_id_base(storage, 999_000_000_001)
+                .unwrap(),
+        );
+        Session::with_domain(domain)
+    }
+
+    /// `LIMIT` above a CTE root must keep the CTE wrapper: pushing the limit
+    /// into the seed used to return the seed projection when it was not a plain
+    /// scan, so the projection was rebuilt from the outer SELECT and
+    /// `SELECT * FROM cte LIMIT 1` lost the CTE's output names (errno 1054).
+    #[test]
+    fn test_cte_star_projection_under_limit() {
+        for session in [Session::new(), runner_session()] {
+            session.execute_stmt("create database cte_lim").unwrap();
+            session.execute_stmt("use cte_lim").unwrap();
+            session.execute_stmt("create table t1 (a int)").unwrap();
+            session.execute_stmt("insert into t1 values (1)").unwrap();
+            for q in [
+                "with qn as (SELECT 10 as a), qn2 AS (SELECT 3*a AS b FROM qn) SELECT * from qn2 LIMIT 1",
+                "SELECT (WITH qn AS (SELECT 10*a as a FROM t1), qn2 AS (SELECT 3*a AS b FROM qn) SELECT * from qn2 LIMIT 1) FROM t1",
+            ] {
+                let result = session
+                    .execute_stmt(q)
+                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                assert_eq!(result.display_rows(), vec![vec!["30".to_string()]], "{q}");
+            }
+        }
+    }
+}

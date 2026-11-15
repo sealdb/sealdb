@@ -5275,18 +5275,34 @@ fn limit_reader(plan: PhysicalPlan, count: u64) -> std::result::Result<PhysicalP
             limit,
             offset,
         } => {
-            let seed = limit_reader(*seed, count)?;
-            Ok(PhysicalPlan::CTE {
-                name,
-                alias,
-                columns,
-                seed: Box::new(seed),
-                recursive_plan,
-                inline,
-                recursive,
-                limit,
-                offset,
-            })
+            // The seed may not be a plain scan (a projection over another CTE,
+            // an aggregate …). A failed push must return the *whole* CTE: the
+            // caller keeps it as the `Limit` child, and dropping the wrapper
+            // would rebuild the seed projection from the outer SELECT.
+            match limit_reader((*seed).clone(), count) {
+                Ok(seed) => Ok(PhysicalPlan::CTE {
+                    name,
+                    alias,
+                    columns,
+                    seed: Box::new(seed),
+                    recursive_plan,
+                    inline,
+                    recursive,
+                    limit,
+                    offset,
+                }),
+                Err(_) => Err(PhysicalPlan::CTE {
+                    name,
+                    alias,
+                    columns,
+                    seed,
+                    recursive_plan,
+                    inline,
+                    recursive,
+                    limit,
+                    offset,
+                }),
+            }
         }
         other => Err(other),
     }
@@ -17175,6 +17191,19 @@ fn star_join_projection(
     if !is_star_select(select) {
         return plan;
     }
+    // A CTE side is inlined into the join tree, and join reorder may flip the
+    // build/probe sides: `select * from cte, t` would then emit the reordered
+    // side first. TiDB keeps FROM order, so add the explicit star projection
+    // only when the join's leaf order actually differs.
+    let cte_side = select.with.as_ref().is_some_and(|with| {
+        select
+            .join_tables()
+            .iter()
+            .any(|t| with.find(t.resolve_name()).is_some())
+    });
+    if cte_side && join_output_order_differs(&plan, select) {
+        return wrap_star_join_projection(plan, select, is, current_db);
+    }
     let Some(last) = select.joins.last() else {
         return plan;
     };
@@ -17382,6 +17411,92 @@ fn wrap_star_join_projection(
     }
 }
 
+/// Leaf table aliases of a join tree, left to right (the executor's output
+/// column order). `None` for a shape the walker doesn't model.
+fn join_leaf_tables(plan: &PhysicalPlan) -> Option<Vec<String>> {
+    match plan {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        }
+        | PhysicalPlan::MergeJoin {
+            left,
+            right,
+            left_table,
+            right_table,
+            ..
+        } => {
+            let mut out = join_leaf_tables(left).unwrap_or_else(|| vec![left_table.clone()]);
+            out.extend(join_leaf_tables(right).unwrap_or_else(|| vec![right_table.clone()]));
+            Some(out)
+        }
+        PhysicalPlan::Projection { child, .. }
+        | PhysicalPlan::Selection { child, .. }
+        | PhysicalPlan::Limit { child, .. }
+        | PhysicalPlan::Sort { child, .. } => join_leaf_tables(child),
+        PhysicalPlan::CTE { .. } => None,
+        _ => None,
+    }
+}
+
+/// True when the join tree's leaf order (executor output order) is not the
+/// FROM order, i.e. join reorder flipped a side.
+fn join_output_order_differs(plan: &PhysicalPlan, select: &SelectStmt) -> bool {
+    let Some(leaves) = join_leaf_tables(plan) else {
+        return false;
+    };
+    // Join nodes name each leaf by its query name (`FROM t1 dt1` → `dt1`), not
+    // the physical table, so compare against `TableName::name`.
+    let from: Vec<&str> = select
+        .join_tables()
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    if leaves.len() != from.len() {
+        return false;
+    }
+    leaves
+        .iter()
+        .zip(from.iter())
+        .any(|(leaf, want)| !leaf.eq_ignore_ascii_case(want))
+}
+
+/// CTE output column names (`WITH cte (a, b) AS …`, else the seed's names).
+/// A CTE is not a physical table, so the info schema can't answer this.
+fn cte_output_columns(
+    select: &SelectStmt,
+    name: &str,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<Vec<String>> {
+    let with = select.with.as_ref()?;
+    let cte = with.find(name)?;
+    if !cte.col_name_list.is_empty() {
+        return Some(cte.col_name_list.clone());
+    }
+    let seed = with.seed_select(name).ok()?;
+    if !is_star_select(&seed) {
+        return Some(cte_seed_output_names(&seed));
+    }
+    // `WITH cte AS (SELECT * FROM t)`: inherit the star's base columns.
+    if seed.from_item.is_some() || !seed.joins.is_empty() {
+        return None;
+    }
+    let from = seed.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    Some(
+        info.columns
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.name.o().to_string())
+            .collect(),
+    )
+}
+
 /// `select.*` columns in FROM order; USING columns are emitted once from the
 /// leading side. `t1.*, t2.*` keeps every raw column instead.
 fn star_projection_exprs(
@@ -17408,13 +17523,26 @@ fn star_projection_exprs(
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(current_db);
-        let Some(info) = is.and_then(|is| is.table_by_name(schema, table.resolve_name())) else {
-            continue;
-        };
-        for col in info.columns.iter().filter(|c| !c.hidden) {
+        // A CTE shadows a base table of the same name in FROM, so resolve it
+        // first: a CTE reference is not in the info schema, and its declared
+        // output columns are what `select *` must list (FROM order).
+        let names: Vec<String> =
+            match cte_output_columns(select, table.resolve_name(), is, current_db) {
+                Some(cols) => cols,
+                None => match is.and_then(|is| is.table_by_name(schema, table.resolve_name())) {
+                    Some(info) => info
+                        .columns
+                        .iter()
+                        .filter(|c| !c.hidden)
+                        .map(|c| c.name.o().to_string())
+                        .collect(),
+                    None => continue,
+                },
+            };
+        for col in names {
             let key = (
                 table.resolve_name().to_ascii_lowercase(),
-                col.name.o().to_ascii_lowercase(),
+                col.to_ascii_lowercase(),
             );
             if !any_qualified_star && using_drops.contains(&key) {
                 continue; // USING column already emitted from the preserved side
@@ -17423,7 +17551,7 @@ fn star_projection_exprs(
                 "{}.{}.{}",
                 schema_prefix(current_db),
                 table.resolve_name(),
-                col.name.o()
+                col
             ));
         }
     }

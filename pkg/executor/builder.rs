@@ -1898,8 +1898,10 @@ fn expand_projection_fields(
                 }
                 // `from_cols` entries are `alias.column`: keep the qualifier on
                 // the expression so `t left join tt on ... left join t ttt`
-                // resolves each repeated `a` to its own input, while the output
-                // label stays bare (`a	b	a	b	a	b`).
+                // resolves each repeated `a` to its own input. The output label
+                // stays bare (`a	b	a	b	a	b`) because `run` strips the
+                // `alias.` prefix; keeping it in the schema lets an ORDER BY
+                // above the projection bind `t.a` when names repeat.
                 let (table, name) = match col.rsplit_once('.') {
                     Some((table, name)) => (Some(table.to_string()), name.to_string()),
                     None => (None, col.clone()),
@@ -1911,7 +1913,7 @@ fn expand_projection_fields(
                         name: name.clone(),
                     },
                 ));
-                names.push(name);
+                names.push(col.clone());
             }
         } else {
             let expr = match &select.from {
@@ -2140,14 +2142,18 @@ fn select_from_column_names(
         // Visible qualifier: the FROM alias when present (`t dt1` → `dt1.c1`),
         // matching the child plan's schema names.
         let alias = table.name.as_str();
-        let raw: Vec<String> = match is.table_by_name(&schema, &name) {
-            Some(info) => info
-                .columns
-                .iter()
-                .filter(|c| !c.hidden)
-                .map(|c| c.name.o().to_string())
-                .collect(),
-            None => cte_cols(&name),
+        // A CTE shadows a base table of the same name in FROM.
+        let raw: Vec<String> = match cte_cols(&name) {
+            cols if !cols.is_empty() => cols,
+            _ => match is.table_by_name(&schema, &name) {
+                Some(info) => info
+                    .columns
+                    .iter()
+                    .filter(|c| !c.hidden)
+                    .map(|c| c.name.o().to_string())
+                    .collect(),
+                None => Vec::new(),
+            },
         };
         raw.into_iter().map(|c| format!("{alias}.{c}")).collect()
     };
