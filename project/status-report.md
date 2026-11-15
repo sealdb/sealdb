@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **84 个** 登记为 `green`（R1 4 / R2 16 / R3 25 / R5 2 / R6 13 / R7 24），新转绿的 30 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable` / `executor/executor_txn` / `table/cache` / `globalindex/information_schema` / `ddl/db_rename` / `ddl/ddl_error` / `ddl/db_foreign_key` / `planner/core/indexmerge_intersection` / `ddl/db_change` / `executor/compact_table` / `expression/constant_fold` / `executor/kv` / `ddl/resource_group` / `db_integration`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 25/48，R7 完成 24/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `explain_easy` / `explain_generate_column_substitute` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **86 个** 登记为 `green`（R1 4 / R2 16 / R3 27 / R5 2 / R6 13 / R7 24），最近一批转绿的 32 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable` / `executor/executor_txn` / `table/cache` / `globalindex/information_schema` / `ddl/db_rename` / `ddl/ddl_error` / `ddl/db_foreign_key` / `planner/core/indexmerge_intersection` / `ddl/db_change` / `executor/compact_table` / `expression/constant_fold` / `executor/kv` / `ddl/resource_group` / `db_integration` / `globalindex/mem_index_merge` / `globalindex/mem_index_merge_non_unique`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 27/48，R7 完成 24/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `explain_easy` / `explain_generate_column_substitute` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -22,8 +22,8 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **84 个** �
 
 | 状态 | 数量 | 占比 |
 |---|---:|---:|
-| `green` | 84 | 33.1% |
-| `in_progress` | 11 | 4.3% |
+| `green` | 86 | 33.9% |
+| `in_progress` | 9 | 3.5% |
 | `pending` | 149 | 58.7% |
 | `local`（SealDB 冒烟） | 8 | 3.1% |
 | `deferred`（TiFlash/MPP） | 2 | 0.8% |
@@ -36,7 +36,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **84 个** �
 |---|---:|---:|---:|---|
 | R1（select / show / types） | 4 | 0 | 0 | **已收口** |
 | R2（join / subquery / agg / window / cte） | 16 | 5 | 1 | 主波完成 ~73% |
-| R3（point_get / index / partition / explain*） | 25 | 6 | 17 | 当前主攻波 |
+| R3（point_get / index / partition / explain*） | 27 | 4 | 17 | 当前主攻波 |
 | R4（plan cache / 会话） | 0 | 0 | 13 | 未开工 |
 | R5 | 2 | 0 | 10 | `session/txn` / `db_integration` 已绿 |
 | R6 | 13 | 0 | 22 | DDL / infoschema 起步 |
@@ -67,7 +67,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **84 个** �
 → PASS: memory=0 tikv=75 skipped=179
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），84 个 `green` 套件中 83 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），86 个 `green` 套件中 85 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
 
 ---
 
@@ -161,7 +161,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 ## 6. R2 剩余与 R3 队列
 
 - **R2 在研（5）**：`cte`, `explain_cte`, `planner/core/join_reorder2`, `planner/core/join_reorder_through_projection`, `planner/core/casetest/rule/rule_derive_topn_from_window`
-- **R3 在研（6）**：`explain_complex`, `explain_complex_stats`, `explain_indexmerge_stats`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `index_merge`
+- **R3 在研（4）**：`explain_complex`, `explain_complex_stats`, `explain_indexmerge_stats`, `index_merge`
 
 策略：优先吃「同一根因能一次带绿多套」的项——EXPLAIN 节点编号/树形、IndexJoin hint、Point_Get/IndexMerge 统计形状。
 
@@ -169,10 +169,8 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 
 | 套件 | 首差 | 需要的根能力 |
 |---|---|---|
-| `explain_easy` | 仅剩 1 条语句（result 第 504 行）：`COUNT(1)` 外层聚合穿过 `LEFT JOIN` + `UNION ALL` 下推（`firstrow` + 部分 `count`）、`registration_num > 0` 下推到 union 分支并把常量 0 分支折成 `TableDual`、外层 join 转 `IndexJoin`（`TableRangeScan` 探针） | 聚合下推（join/union）+ 谓词穿 union + 列号对齐 |
-| `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效 | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
+| `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效（`globalindex/mem_index_merge*` 已先行转绿：GLOBAL 索引 `_tidb_tid` 投影、保序 union 的 LIMIT 下沉、交叉臂 residual Selection） | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
 | `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表（**已转绿**） |
-| `globalindex/mem_index_merge*` | 同 `index_merge` | 同上 |
 | `explain_complex*` / `explain_indexmerge_stats` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
 | `cte` / `explain_cte` | `cte` 仅余 1 段（sub case-3）：共享非递归物化 CTE 上的 EXISTS 未转 `Apply` 半连接、缺 Non-Recursive CTE producer；`explain_cte` 同族 + 列号基数 | 物化非递归 CTE 的消费/生产渲染 |
 | `join_reorder2` / `join_reorder_through_projection` | MergeJoin 选择与 `Column#N` 编号 | cost 驱动 join 顺序 |
@@ -205,9 +203,9 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 
 ## 9. 下一步（有序队列）
 
-1. `explain_easy`：仅剩 `COUNT(1)` 外层聚合穿过 `LEFT JOIN`/`UNION ALL` 下推与 `TableDual` 折叠一条语句；同一根因可直接带 `explain_complex*` 的聚合下推。
-2. `index_merge` 家族（含 `globalindex/mem_index_merge*`）：IN 子查询去关联成 semi/anti + `use_index_merge` 提示。
-4. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
+1. `index_merge`：IN 子查询去关联成 semi/anti + `use_index_merge` 提示（`globalindex/mem_index_merge*` 已转绿，IndexMerge 侧骨架可直接复用）。
+2. `explain_indexmerge_stats`：统计驱动的交叉臂选择与 sel 估算。
+3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
 5. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
 
 ---
@@ -298,8 +296,8 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 28 | `explain_shard_index` | green | 100% | ✓ | ✓ |
 | 29 | `explain_stats` | green | 100% | ✓ | ✓ |
 | 30 | `expression/explain` | pending | 0% | ✓ | — |
-| 31 | `globalindex/mem_index_merge` | in_progress | 7%（首差 18/254） | ✓ | — |
-| 32 | `globalindex/mem_index_merge_non_unique` | in_progress | 7%（首差 18/254） | ✓ | — |
+| 31 | `globalindex/mem_index_merge` | green | 100% | ✓ | ✓ |
+| 32 | `globalindex/mem_index_merge_non_unique` | green | 100% | ✓ | ✓ |
 | 33 | `globalindex/point_get` | green | 100% | ✓ | ✓ |
 | 34 | `index_merge` | in_progress | 1%（首差 12/969） | ✓ | — |
 | 35 | `partition` | green | 100% | ✓ | ✓ |

@@ -3131,6 +3131,41 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     半连接形态；在 `explain_rows` 为 `recursive: false, inline: false`
     的 CTE 输出 producer 子树，再核 `explain_cte`。
 
+### 2026-11-15（`globalindex/mem_index_merge*` 转正：GLOBAL 索引 IndexMerge 投影 + DNF 伪统计）
+
+- **Phase**: R3（`globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`）
+- **完成**:
+  - 全局索引读出的 `_tidb_tid` 剪枝投影就是**输出投影**：`LIMIT` 下沉后它位于
+    `Limit` 之上（`Projection -> Limit -> UnionScan -> IndexMerge`），而不再
+    直接压在 `UnionScan` 上；干净路径（无 dirty row）时 `Limit` 内嵌进
+    `IndexMerge`（`limit embedded`），投影仍在根。
+  - 保序 union merge 同样下沉 `LIMIT`：根标 `limit embedded(offset,count)`，
+    每个 arm 出一个 cop `Limit(Build)`；上方若有 `UnionScan` 则继续剥掉内嵌
+    `Limit`（回退为显式 `Limit`）。
+  - 交叉（intersection）merge 对“已被另一 arm 消化的合取项”补 residual
+    `Selection(Build)`：仅当本 arm 索引覆盖该列时生成，estRows 取交叉后的
+    行数而非本 arm 范围行数；`_tidb_tid` 过滤单独成行时 access object 为空。
+  - union arm 的 handle 只在 merge 提示显式点名（`primary`）时入选：
+    `use_index_merge(t, uidx_a, uidx_b)` 的 `uidx_b` 列即聚簇 PK 时仍读
+    `uidx_b`，不再退化成 `TableRangeScan`。
+  - 逐 DNF 项的伪统计：整数 handle 不再受 handle-suffix pinning 影响，低界为
+    `MinValue`（`pk < 10`）时走 TiDB 的无符号估算（读 10 行），驱动 union 的
+    `estRows`；common handle 仍回退 `GetRowCountByIndexRanges`。
+  - `IndexMerge` 物理计划新增 `partition_access`，EXPLAIN 根节点渲染
+    `partition:pN`，arm 不再重复该标签。
+- **验证**:
+  - `run-tests.sh -s memory --status in_progress -t globalindex/mem_index_merge`：
+    `PASS: memory=1`；`globalindex/mem_index_merge_non_unique` 同。
+  - TiKV 复跑两套均 `PASS: tikv=1`。
+  - 全量 green+local gate：memory `PASS: memory=94`，tikv `PASS: tikv=92`。
+- **阻塞/风险**:
+  - `index_merge` 本体仍在 `Apply` 里跑 `IN (SELECT …)`（首差 12/969），
+    需要先把 `c3 IN (SELECT …)` 去关联成 semi/anti，再套同一套 IndexMerge
+    形状；`explain_indexmerge_stats` 与它同族。
+- **下一步**:
+  - 去关联 `index_merge` 的 IN 子查询（semi join + marker），再核
+    `explain_indexmerge_stats` 的交叉臂选择与 sel 估算。
+
 ---
 
 ## 5. Gate 证据索引
