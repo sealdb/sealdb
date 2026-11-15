@@ -3298,6 +3298,41 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-15（`expression/vitess_hash` 转正：表达式索引的 Sort/投影与索引宽度代价）
+
+- **Phase**: R7
+- **完成**:
+  - `SELECT customer_id FROM t WHERE (vitess_hash(customer_id) >> 56) = x'd6'
+    ORDER BY id` 之类在表达式索引上带 `ORDER BY` 的查询，输出投影要落在
+    `Sort` 之上（`Projection → Sort → IndexLookUp`）。此前投影挂在 Sort
+    下方，说明器把 `Sort` 顶到了树根。
+  - 当 SELECT 列表丢掉了表达式所依赖的基列时，TiDB 会在 `Sort` 与 reader
+    之间物化索引键的虚拟列：`Projection(id) → Sort(id) →
+    Projection(id, rightshift(vitess_hash(t.customer_id), 56)) →
+    IndexLookUp`；选了基列（`SELECT customer_id`）时该投影被消除。
+  - 派生投影的列号在表达式索引 reader 之后要多算一列（虚拟生成列占一个
+    plan column id），`hex(vitess_hash(1123))->Column#7` 而非 `#6`。
+  - 没有投影列的全索引扫描由索引平均行宽决定：同样的行数下
+    `t_vitess_shard`（单列）便宜于 `PRIMARY(customer_id, id)`（双列），
+    此前按候选顺序取了 PRIMARY。
+  - IndexMerge 分支改为按 arm 自身 range 行数比较（不把索引键外的残余谓词
+    计进 arm），无直方图的索引条目按伪统计 `table_rows / pseudoEqualRate`
+    估值；`IS NULL`/`IS NOT NULL` 用列的 not-null 计数；DNF OR 组只分摊
+    一次；无法由 arm 提供顺序时 LIMIT 不再下沉。
+- **验证**:
+  - `expression/vitess_hash`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - 全量 green gate：Memory `PASS: memory=89`，TiKV
+    `PASS: tikv=20`(R1,R2) + `PASS: tikv=68`(R3,R5,R6,R7) = 88（
+    `executor/adapter` 为 `skip_tikv`）
+  - manifest：`expression/vitess_hash` → `green`，green 87→89（R7 25→27）
+- **阻塞/风险**:
+  - 清空的 `/tmp/sealdb-pd-tikv` 才能跑完 TiKV gate：被中断的 runner 会在
+    PD 里留下 `TxnNotFound` 的 domain meta 事务，重启后启动即失败。
+- **下一步**:
+  - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
+    `explain_cte` / `explain_indexmerge_stats` / `join_reorder2` /
+    `join_reorder_through_projection` / `rule_derive_topn_from_window`。
+
 ## 7. 更新模板
 
 每次更新追加一条：
