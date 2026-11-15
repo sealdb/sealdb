@@ -429,6 +429,22 @@ impl Datum {
                         bytes.resize(len, 0);
                     }
                 }
+                // CHAR/VARCHAR length counts characters, so a value wider than
+                // the declared width is truncated (`char(6) as (concat(a,a))`
+                // stores `aaaaaa`). TEXT/BLOB keep their storage limits.
+                if matches!(
+                    ft.tp,
+                    crate::field_type::TYPE_STRING
+                        | crate::field_type::TYPE_VARCHAR
+                        | crate::field_type::TYPE_VAR_STRING
+                ) && ft.charset != "binary"
+                    && ft.flen > 0
+                {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if text.chars().count() > ft.flen as usize {
+                        bytes = text.chars().take(ft.flen as usize).collect::<String>().into_bytes();
+                    }
+                }
                 // TiDB parses a JSON document into its binary form, where a
                 // decimal number is a float64: the text is renormalized to the
                 // shortest f64 form when the double cannot round-trip it.

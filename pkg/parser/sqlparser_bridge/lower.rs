@@ -11072,12 +11072,33 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 datum: lower_value_from_expr(value)?,
             }))
         }
-        Expr::BinaryOp { left, op, right } => Ok(ExprNode::Binary(BinaryOpExpr {
-            op: lower_binary_op(op)?,
-            left: Box::new(lower_expr(left)?),
-            right: Box::new(lower_expr(right)?),
-            single_cnf_item: false,
-        })),
+        Expr::BinaryOp { left, op, right } => {
+            // MySQL JSON arrow operators: `doc -> path` = `JSON_EXTRACT(doc,
+            // path)` returning JSON, `doc ->> path` additionally unquotes to a
+            // string.
+            if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) {
+                let extract = ExprNode::Func(FuncCallExpr {
+                    name: "json_extract".to_string(),
+                    args: vec![lower_expr(left)?, lower_expr(right)?],
+                    distinct: false,
+                });
+                return Ok(if matches!(op, BinaryOperator::LongArrow) {
+                    ExprNode::Func(FuncCallExpr {
+                        name: "json_unquote".to_string(),
+                        args: vec![extract],
+                        distinct: false,
+                    })
+                } else {
+                    extract
+                });
+            }
+            Ok(ExprNode::Binary(BinaryOpExpr {
+                op: lower_binary_op(op)?,
+                left: Box::new(lower_expr(left)?),
+                right: Box::new(lower_expr(right)?),
+                single_cnf_item: false,
+            }))
+        }
         Expr::UnaryOp { op, expr } => {
             let lowered_op = lower_unary_op(op)?;
             // `HIGH_NOT_PRECEDENCE`: `NOT x BETWEEN a AND b` binds as

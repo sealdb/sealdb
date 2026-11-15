@@ -484,6 +484,25 @@ pub fn substitute_generated_columns(info: &TableInfo, select: &SelectStmt) -> Op
     if columns.is_empty() {
         return None;
     }
+    // `IGNORE INDEX(idx)` on a generated column turns `gcSubstituter` off for
+    // that expression: TiDB keeps the written body in the filter instead of
+    // reading the indexed column back. `IGNORE INDEX()` disables every index.
+    if let Some(from) = select.from.as_ref()
+        && from.ignore_index_hint
+        && (from.ignore_indexes.is_empty()
+            || info.indices.iter().any(|idx| {
+                from.ignore_indexes
+                    .iter()
+                    .any(|name| idx.name.o().eq_ignore_ascii_case(name))
+                    && idx.columns.iter().any(|col| {
+                        columns
+                            .iter()
+                            .any(|(_, generated)| generated.eq_ignore_ascii_case(col.name.o()))
+                    })
+            }))
+    {
+        return None;
+    }
     let mut changed = false;
     let mut rewritten = select.clone();
     for (field, field_out) in select.fields.iter().zip(rewritten.fields.iter_mut()) {

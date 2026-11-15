@@ -83,6 +83,23 @@ pub fn add_index(
         if if_not_exists {
             return Ok(());
         }
+        // An unnamed expression index is called `expression_index`; a second
+        // one renames to `expression_index_2` (`renameIndexes`) instead of
+        // colliding with the first.
+        if index.name.eq_ignore_ascii_case("expression_index") {
+            let fresh = (2..)
+                .map(|i| format!("expression_index_{i}"))
+                .find(|candidate| {
+                    !info
+                        .indices
+                        .iter()
+                        .any(|idx| idx.name.o().eq_ignore_ascii_case(candidate))
+                })
+                .expect("unbounded index name candidates");
+            let mut renamed = index.clone();
+            renamed.name = fresh;
+            return add_index(meta, is, table, &renamed, if_not_exists, current_db, storage);
+        }
         return Err(Error::new(
             ERR_DUP_KEYNAME,
             format!("Duplicate key name '{}'", index.name),

@@ -2073,7 +2073,7 @@ fn dot_op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::CTE { .. } => "CTEFullScan",
         PhysicalPlan::Distinct { .. } => "HashAgg",
         PhysicalPlan::NullAwareAntiJoin { .. } => "HashJoin",
-        PhysicalPlan::RowProjection { .. } => "Projection",
+        PhysicalPlan::RowProjection { .. } | PhysicalPlan::KeyProjection { .. } => "Projection",
         PhysicalPlan::Explain { .. } => "Explain",
         _ => "Operator",
     }
@@ -4410,6 +4410,33 @@ fn emit_cop_children(
                 }
                 let mut probe_depth = depth;
                 let mut probe_spine_locked = false;
+                // `/*+ agg_to_cop() */`: the final aggregation's partial copy
+                // runs in the probe cop task (`HashAgg(Probe)`).
+                let mut probe_agg_pushed = false;
+                if let Some(("HashAgg", _, cop_info, est)) = stream_parent
+                    && !cop_info.is_empty()
+                {
+                    push_explain_row_spine(
+                        rows,
+                        probe_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "HashAgg",
+                            est,
+                            task,
+                            access: String::new(),
+                            info: cop_info.to_string(),
+                        },
+                        &probe_spine,
+                    );
+                    if let Some(last) = rows.last_mut() {
+                        last.id.push_str("(Probe)");
+                    }
+                    probe_depth += 1;
+                    probe_spine.push(false);
+                    probe_agg_pushed = true;
+                }
                 // TiDB pushes a `LIMIT` above a double-read probe as a cop
                 // `Limit` (`Limit(Probe)`), unless it merged it into the reader
                 // (`limit embedded`) or the probe keeps the index order.
@@ -4458,7 +4485,9 @@ fn emit_cop_children(
                         &probe_spine,
                     );
                     if !probe_spine_locked {
-                        if let Some(last) = rows.last_mut() {
+                        // The partial aggregate already carries `(Probe)`; its
+                        // own child selection is a plain cop row.
+                        if !probe_agg_pushed && let Some(last) = rows.last_mut() {
                             last.id.push_str("(Probe)");
                         }
                         probe_spine_locked = true;
@@ -5399,7 +5428,7 @@ fn explain_selection_info_on(table: &str, filter: &sealdb_parser::ast::ExprNode)
                                 format!("{schema}.{table}.{}", c.name)
                             }
                         }
-                        other => other.restore_string(),
+                        other => explain_scalar_expr(other, table),
                     };
                     format!("not(isnull({col}))")
                 } else if let ExprNode::Binary(b) = u.expr.as_ref()
@@ -5789,6 +5818,21 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            // TiDB's `json_unquote` takes a `var_string` argument, so the
+            // `->>` rewrite prints `json_unquote(cast(json_extract(…),
+            // var_string(16777216)))`.
+            if name == "json_unquote"
+                && f.args.len() == 1
+                && matches!(
+                    &f.args[0],
+                    ExprNode::Func(inner) if inner.name.eq_ignore_ascii_case("json_extract")
+                )
+            {
+                return format!(
+                    "json_unquote(cast({}, var_string(16777216)))",
+                    explain_scalar_expr(&f.args[0], table)
+                );
+            }
             format!("{name}({args})")
         }
         ExprNode::InList(list) => {
@@ -5827,6 +5871,11 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
             } else {
                 inner
             }
+        }
+        // `NOT (expr)`: a null-reject filter over a scalar expression
+        // (`not(isnull(minus(t.c_int, 1)))`).
+        ExprNode::Unary(u) if u.op == Op::Not => {
+            format!("not({})", explain_scalar_expr(&u.expr, table))
         }
         other => other.restore_string(),
     }
@@ -6029,7 +6078,9 @@ fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
         PhysicalPlan::NullAwareAntiJoin { probe, build, .. } => {
             vec![build.as_ref(), probe.as_ref()]
         }
-        PhysicalPlan::RowProjection { child, .. } => vec![child.as_ref()],
+        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::KeyProjection { child, .. } => {
+            vec![child.as_ref()]
+        }
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| c.as_ref()).collect(),
         PhysicalPlan::DistinctUnion { child, .. } => vec![child.as_ref()],
         PhysicalPlan::PartitionUnion { children } => children.iter().collect(),
@@ -6316,6 +6367,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         }
         PhysicalPlan::RowProjection { info, .. } => {
             ("Projection".to_string(), String::new(), info.clone())
+        }
+        PhysicalPlan::KeyProjection { exprs, .. } => {
+            ("Projection".to_string(), String::new(), exprs.join(", "))
         }
         PhysicalPlan::MergeJoin {
             left_key,
@@ -7086,8 +7140,9 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         PhysicalPlan::IndexLookUpReader {
             probe_est,
             probe_selection_info: Some(_),
+            row_count,
             ..
-        } if *probe_est > 0.0 => *probe_est,
+        } if *probe_est > 0.0 && *row_count >= *probe_est => *probe_est,
         // Planner-built access range: `row_count` already holds the range ×
         // index-side residual estimate. The probe-side `Selection` (table
         // columns the index cannot encode) does not re-shrink the build side,
@@ -7267,7 +7322,9 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         }
         PhysicalPlan::Union { children, .. } => children.iter().map(|c| est_rows(c)).sum(),
         PhysicalPlan::NullAwareAntiJoin { est_rows: e, .. } => *e,
-        PhysicalPlan::RowProjection { child, .. } => est_rows(child),
+        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::KeyProjection { child, .. } => {
+            est_rows(child)
+        }
         PhysicalPlan::DistinctUnion { est_rows: e, .. } => *e,
         PhysicalPlan::HashAgg { est_rows: e, .. } | PhysicalPlan::StreamAgg { est_rows: e, .. } => {
             *e
@@ -7676,6 +7733,7 @@ fn collect_plan_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<
         }
         P::Projection { child, .. }
         | P::RowProjection { child, .. }
+        | P::KeyProjection { child, .. }
         | P::Selection { child, .. }
         | P::Sort { child, .. }
         | P::TopN { child, .. }
@@ -7706,17 +7764,47 @@ fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
     match on {
-        ExprNode::Binary(bin) if bin.op == Op::Eq => {
-            matches!(
-                (bin.left.as_ref(), bin.right.as_ref()),
-                (ExprNode::Column(_), ExprNode::Column(_))
-            )
-        }
+        ExprNode::Binary(bin) if bin.op == Op::Eq => join_eq_is_key(on),
         ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
             join_on_has_equijoin(&bin.left) || join_on_has_equijoin(&bin.right)
         }
         _ => false,
     }
+}
+
+/// A conjunct usable as a hash key: the two operand expressions each resolve
+/// to one join input (the plain `Column = Column` case, or expressions such
+/// as `t1.a + 1 = t2.a + 1`).
+fn join_eq_is_key(expr: &sealdb_parser::ast::ExprNode) -> bool {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let ExprNode::Binary(bin) = expr else {
+        return false;
+    };
+    if bin.op != Op::Eq {
+        return false;
+    }
+    if matches!(
+        (bin.left.as_ref(), bin.right.as_ref()),
+        (ExprNode::Column(_), ExprNode::Column(_))
+    ) {
+        return true;
+    }
+    let mut qualifiers = std::collections::HashSet::new();
+    for side in [bin.left.as_ref(), bin.right.as_ref()] {
+        let mut columns = Vec::new();
+        side.collect_columns(&mut columns);
+        if columns.is_empty() {
+            return false;
+        }
+        for (table, _) in columns {
+            let Some(table) = table else {
+                return false;
+            };
+            qualifiers.insert(table.to_ascii_lowercase());
+        }
+    }
+    qualifiers.len() >= 2
 }
 
 /// `db.table.column` label used by TiDB join nodes (`left key:` / `equal:[…]`).
@@ -7780,7 +7868,7 @@ fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
         ExprNode::Binary(bin) if bin.op == Op::Eq => {
             let left = match bin.left.as_ref() {
                 ExprNode::Column(c) => explain_join_col(c),
-                other => other.restore_string(),
+                other => explain_scalar_expr(other, "t"),
             };
             let right = match bin.right.as_ref() {
                 ExprNode::Column(c) => explain_join_col(c),
@@ -7790,7 +7878,7 @@ fn explain_join_cond(on: &sealdb_parser::ast::ExprNode) -> String {
                 ExprNode::Value(ValueExpr {
                     datum: Datum::U64(v),
                 }) => v.to_string(),
-                other => other.restore_string(),
+                other => explain_scalar_expr(other, "t"),
             };
             format!("eq({left}, {right})")
         }
@@ -7810,13 +7898,8 @@ fn split_join_conditions(on: &sealdb_parser::ast::ExprNode) -> (Vec<String>, Vec
     let mut others = Vec::new();
     for conjunct in on.split_cnf() {
         match &conjunct {
-            ExprNode::Binary(bin)
-                if bin.op == Op::Eq
-                    && matches!(
-                        (bin.left.as_ref(), bin.right.as_ref()),
-                        (ExprNode::Column(_), ExprNode::Column(_))
-                    ) =>
-            {
+            ExprNode::Binary(bin) if bin.op == Op::Eq && join_eq_is_key(&conjunct) => {
+                let _ = bin;
                 equal_keys.push(explain_join_cond(&conjunct));
             }
             other => others.push(explain_scalar_expr(other, "t")),

@@ -37,7 +37,13 @@ pub fn reorder_hash_join(
     // Prefer the cheaper orientation; on a tie keep building the smaller side
     // on the right (TiDB-style greedy JoinReorder).
     let swap = if (swap_cost - keep_cost).abs() <= f64::EPSILON {
-        left_rows + f64::EPSILON < right_rows
+        // A covering `IndexReader` is the cheaper probe side; TiDB probes the
+        // expression-index scan and builds the table scan.
+        match (is_index_reader(&left), is_index_reader(&right)) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => left_rows + f64::EPSILON < right_rows,
+        }
     } else {
         swap_cost + f64::EPSILON < keep_cost
     };
@@ -62,6 +68,10 @@ pub fn reorder_hash_join(
             on,
         }
     }
+}
+
+fn is_index_reader(plan: &PhysicalPlan) -> bool {
+    matches!(plan, PhysicalPlan::IndexReader { .. })
 }
 
 #[cfg(test)]

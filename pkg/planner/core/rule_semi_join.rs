@@ -249,6 +249,15 @@ fn rewrite_apply(
                     right = dedup_in_right(right, &key, &spec.right_table, current_db, stats);
                     tp = JoinType::Inner;
                 }
+                // The rewritten inner join rejects NULL keys on both sides:
+                // the outer (probe) scan keeps only non-null join keys.
+                if tp == JoinType::Inner
+                    && spec.dedup_in
+                    && let Some(filter) =
+                        nullable_not_isnull_cols(&[spec.on.clone()], &left_table, is, current_db)
+                {
+                    plan = push_isnull_filter(plan, filter);
+                }
                 // TiDB `ExplainInfo` labels an equal-key semi/anti join with the
                 // tables' OrigTblName (`FROM t t1` prints `t`, not `t1`). The
                 // alias→physical scope is only alive while planning, so freeze
@@ -1090,6 +1099,70 @@ fn not_isnull_for_eq(on: &ExprNode, table: &str) -> Option<ExprNode> {
     None
 }
 
+/// Access path for a semi-join inner side from its own WHERE filter.
+/// TiDB plans the subquery like any table reader, so `t2.c_int + 1 = 9`
+/// becomes an `IndexLookUp` over `expression_index(c_int + 1)` instead of a
+/// full scan with a residual `Selection`.
+fn inner_filter_index_plan(
+    query: &SelectStmt,
+    inner: &sealdb_parser::ast::TableName,
+    filter: &ExprNode,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> Option<PhysicalPlan> {
+    let (db, table) = inner.qualified(current_db);
+    let info = is.table_by_name(&db, &table)?;
+    let mut select = query.clone();
+    select.from = Some(inner.clone());
+    select.from_item = None;
+    select.joins.clear();
+    select.group_by.clear();
+    select.having = None;
+    select.order_by.clear();
+    select.limit = None;
+    select.offset = None;
+    select.distinct = false;
+    select.with = None;
+    select.selection = Some(filter.clone());
+    let plan = super::planbuilder::expr_range_plan(
+        &select,
+        inner,
+        info,
+        super::rule_partition_processor::PartitionPruneMode::Static,
+        &[],
+    )
+    .map(|plan| {
+        // The ranger attaches the seek range (and drops the consumed filter)
+        // in the normal predicate-pushdown pass over a reader.
+        super::rule_predicate_push_down::predicate_push_down(
+            plan,
+            filter,
+            Some(is),
+            current_db,
+        )
+    });
+    if std::env::var("SEALDB_DEBUG_SEMI_INDEX").is_ok() {
+        let idx = info
+            .indices
+            .iter()
+            .find(|idx| super::expr_index::has_expression_part(info, idx));
+        eprintln!(
+            "semi inner filter={} eqkey={:?} parts={:?} ranges={:?} plan={:?}",
+            filter.restore_string(),
+            filter.eq_key_const().map(|(k, v)| (k, format!("{v:?}"))),
+            idx.map(|i| super::expr_index::part_keys(info, i)),
+            idx.and_then(|i| super::access_range::index_key_ranges(
+                info,
+                i,
+                &filter.split_cnf()
+            ))
+            .map(|r| r.ranges.len()),
+            plan.as_ref().map(|p| p.explain())
+        );
+    }
+    plan
+}
+
 /// `outer_col IN (SELECT inner_col FROM t [WHERE …])`.
 /// Correlated WHERE preds become `other cond`; ORDER BY is ignored (semi).
 fn from_in(
@@ -1262,13 +1335,20 @@ fn from_in(
         let mut spec = build_spec(
             join_tp,
             inner.name.clone(),
-            inner_filter,
+            inner_filter.clone(),
             equal,
             None,
             // `x IN (SELECT c FROM t)`: TiDB rewrites the semi join into an
             // inner join against the de-duplicated subquery.
             !not,
         );
+        // The inner WHERE filter is a real access predicate: seek an index
+        // (`t2.c_int + 1 = 8 + 1` → `expression_index(c_int + 1)`).
+        if let (Some(filter), Some(is)) = (inner_filter.as_ref(), is)
+            && let Some(plan) = inner_filter_index_plan(query, inner, filter, is, current_db)
+        {
+            spec.right = plan;
+        }
         spec.right_physical = inner_physical.to_string();
         return Some(spec);
     }
@@ -1324,16 +1404,21 @@ fn dedup_in_right(
         name: key.to_string(),
     });
     let qualifier = explain_semi_col(&col, None);
-    let right = push_isnull_filter(
-        right,
-        ExprNode::Unary(UnaryOpExpr {
-            op: Op::Not,
-            expr: Box::new(ExprNode::IsNull(IsNullExpr {
-                expr: Box::new(col),
-                not: false,
-            })),
-        }),
-    );
+    let null_filter = ExprNode::Unary(UnaryOpExpr {
+        op: Op::Not,
+        expr: Box::new(ExprNode::IsNull(IsNullExpr {
+            expr: Box::new(col),
+            not: false,
+        })),
+    });
+    // On an `IndexLookUp` the null rejection filters the probed table rows, so
+    // TiDB keeps it as `Selection(Probe)` under the cop aggregate rather than a
+    // root Selection above the reader.
+    let right = if matches!(right, PhysicalPlan::IndexLookUpReader { .. }) {
+        super::rule_predicate_push_down::predicate_push_down(right, &null_filter, None, "")
+    } else {
+        push_isnull_filter(right, null_filter)
+    };
     // TiDB `buildDistinct` reads the subquery after `ANALYZE`, so the scan
     // carries the real table count; unanalyzed tables keep the 10000 default.
     let table_stats = stats
@@ -1504,6 +1589,55 @@ fn push_isnull_filter(plan: PhysicalPlan, filter: ExprNode) -> PhysicalPlan {
             est_rows: None,
         },
     }
+}
+
+/// Null rejection for the outer side of a rewritten `IN` inner join: TiDB only
+/// keeps `not(isnull(col))` for nullable join-key columns (a `PRIMARY KEY` key
+/// needs no null filter).
+fn nullable_not_isnull_cols(
+    exprs: &[ExprNode],
+    table: &str,
+    is: Option<&sealdb_infoschema::InfoSchema>,
+    current_db: &str,
+) -> Option<ExprNode> {
+    let physical = crate::core::planbuilder::explain_physical_table(table)
+        .unwrap_or_else(|| table.to_string());
+    let info = is?.table_by_name(current_db, &physical)?;
+    let mut seen = Vec::new();
+    let mut filters = Vec::new();
+    for expr in exprs {
+        for (t, name) in expr.referenced_columns() {
+            if !t.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(table)) {
+                continue;
+            }
+            if seen.iter().any(|(tn, cn): &(String, String)| {
+                tn.eq_ignore_ascii_case(table) && cn.eq_ignore_ascii_case(&name)
+            }) {
+                continue;
+            }
+            let nullable = info
+                .columns
+                .iter()
+                .find(|c| c.name.o().eq_ignore_ascii_case(&name))
+                .is_some_and(|c| c.field_type.flag & 1 == 0);
+            if !nullable {
+                continue;
+            }
+            seen.push((table.to_string(), name.clone()));
+            filters.push(ExprNode::Unary(UnaryOpExpr {
+                op: Op::Not,
+                expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                    expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                        schema: None,
+                        table: Some(table.to_string()),
+                        name,
+                    })),
+                    not: false,
+                })),
+            }));
+        }
+    }
+    ExprNode::compose_cnf(filters)
 }
 
 fn not_isnull_cols(exprs: &[ExprNode], table: &str) -> Option<ExprNode> {

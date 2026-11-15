@@ -1266,6 +1266,22 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out))
         }
+        // MySQL `REVERSE(str)`: character-wise reversal (UTF-8 safe).
+        "REVERSE" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "REVERSE requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bytes = value.as_bytes();
+            let text = String::from_utf8_lossy(bytes.as_slice());
+            Ok(Datum::Bytes(text.chars().rev().collect::<String>().into_bytes()))
+        }
         // MySQL `MD5(str)`: lowercase hex digest; NULL in → NULL.
         "MD5" => {
             if func.args.len() != 1 {
@@ -1355,6 +1371,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
+        "JSON_UNQUOTE" => eval_json_unquote(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
         "TIMEDIFF" => eval_time_diff(func, schema, row),
@@ -1430,6 +1447,22 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::F64(v) => Ok(Datum::I64(v.floor() as i64)),
                 Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.floor() as i64)),
                 other => Ok(Datum::I64(other.as_f64()?.floor() as i64)),
+            }
+        }
+        "CEIL" | "CEILING" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 1 argument", func.name.to_uppercase()),
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            match value {
+                Datum::Null => Ok(Datum::Null),
+                Datum::I64(_) | Datum::U64(_) => Ok(value),
+                Datum::F64(v) => Ok(Datum::I64(v.ceil() as i64)),
+                Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.ceil() as i64)),
+                other => Ok(Datum::I64(other.as_f64()?.ceil() as i64)),
             }
         }
         "TIDB_DECODE_BINARY_PLAN" => {
@@ -1588,6 +1621,26 @@ fn eval_json_extract(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> R
         }
     }
     Ok(Datum::Null)
+}
+
+/// MySQL `JSON_UNQUOTE(json_val)`: strips the quotes from a JSON string and
+/// leaves every other document unchanged.
+fn eval_json_unquote(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() != 1 {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "JSON_UNQUOTE requires 1 argument",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let bytes = value.as_bytes();
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::String(s)) => Ok(Datum::Bytes(s.into_bytes())),
+        _ => Ok(value),
+    }
 }
 
 /// Resolve a MySQL JSON path (`$.a.b`, `$[0]`, `$.a[1].b`) against a document.
@@ -2145,9 +2198,11 @@ fn eval_timestamp_add(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
         return Ok(Datum::Null);
     }
     let mut t = datum_as_time(&base)?;
-    // Column TIMESTAMP (UTC storage) → session local before arithmetic.
-    if matches!(base, Datum::Time(_)) {
-        t.tp = TimeType::Timestamp;
+    // Column TIMESTAMP (UTC storage) → session local before arithmetic; DATE
+    // and DATETIME columns are already wall clocks.
+    if let Datum::Time(base_time) = &base
+        && matches!(base_time.tp, TimeType::Timestamp)
+    {
         t = utc_to_session_local(t)?;
         t.tp = TimeType::Timestamp;
     }
@@ -2785,6 +2840,11 @@ fn string_lenient_i64(d: &Datum) -> Result<i64> {
         Datum::Bytes(b) => Ok(numeric_prefix(std::str::from_utf8(b).unwrap_or(""))
             .parse::<i64>()
             .unwrap_or(0)),
+        // TIMESTAMP stores UTC; arithmetic works on the session-local wall
+        // clock, as TiDB's Time.ToNumber does after a tz conversion.
+        Datum::Time(t) if matches!(t.tp, TimeType::Timestamp) => {
+            Ok(utc_to_session_local(*t)?.to_number())
+        }
         other => other.as_i64(),
     }
 }
@@ -2794,6 +2854,9 @@ fn string_lenient_f64(d: &Datum) -> Result<f64> {
         Datum::Bytes(b) => Ok(numeric_prefix(std::str::from_utf8(b).unwrap_or(""))
             .parse::<f64>()
             .unwrap_or(0.0)),
+        Datum::Time(t) if matches!(t.tp, TimeType::Timestamp) => {
+            Datum::Time(utc_to_session_local(*t)?).as_f64()
+        }
         other => other.as_f64(),
     }
 }

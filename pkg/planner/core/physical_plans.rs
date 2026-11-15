@@ -553,6 +553,13 @@ pub enum PhysicalPlan {
         names: Vec<String>,
         child: Box<PhysicalPlan>,
     },
+    /// EXPLAIN-only projection above a join build side: TiDB computes the
+    /// expression join key (`t1.a + 1`) there, while SealDB evaluates the key
+    /// directly from the child row, so execution passes the row through.
+    KeyProjection {
+        exprs: Vec<String>,
+        child: Box<PhysicalPlan>,
+    },
 }
 
 /// Physical join kind. `Cross` is a cartesian product with no equality keys.
@@ -790,6 +797,9 @@ impl PhysicalPlan {
             }
             PhysicalPlan::RowProjection { info, child, .. } => {
                 format!("RowProjection({info}) -> {}", child.explain())
+            }
+            PhysicalPlan::KeyProjection { exprs, child } => {
+                format!("Projection({}) -> {}", exprs.join(", "), child.explain())
             }
         }
     }

@@ -31,6 +31,17 @@ pub enum ExprNode {
     Row(RowExpr),
 }
 
+/// Numeric constant folding helper for [`ExprNode::const_datum`].
+fn const_datum_as_f64(datum: &Datum) -> Option<f64> {
+    match datum {
+        Datum::I64(v) => Some(*v as f64),
+        Datum::U64(v) => Some(*v as f64),
+        Datum::F64(v) => Some(*v),
+        Datum::Decimal(d) => d.to_f64().ok(),
+        _ => None,
+    }
+}
+
 impl ExprNode {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         match self {
@@ -283,6 +294,35 @@ impl ExprNode {
                     Datum::Decimal(d) => Datum::Decimal(d.negated()),
                     _ => return None,
                 })
+            }
+            // Fold constant arithmetic on the right of a range predicate
+            // (`t2.c_int + 1 = 8 + 1` → key `c_int+1`, value `9`), so an
+            // expression index still gets a seek range.
+            ExprNode::Binary(bin)
+                if matches!(bin.op, Op::Plus | Op::Minus | Op::Mul) =>
+            {
+                let left = Self::const_datum(&bin.left)?;
+                let right = Self::const_datum(&bin.right)?;
+                match (left, right) {
+                    (Datum::I64(a), Datum::I64(b)) => Some(Datum::I64(match bin.op {
+                        Op::Plus => a.checked_add(b)?,
+                        Op::Minus => a.checked_sub(b)?,
+                        _ => a.checked_mul(b)?,
+                    })),
+                    (Datum::U64(a), Datum::U64(b)) => Some(Datum::U64(match bin.op {
+                        Op::Plus => a.checked_add(b)?,
+                        Op::Minus => a.checked_sub(b)?,
+                        _ => a.checked_mul(b)?,
+                    })),
+                    (a, b) => {
+                        let (a, b) = (const_datum_as_f64(&a)?, const_datum_as_f64(&b)?);
+                        Some(Datum::F64(match bin.op {
+                            Op::Plus => a + b,
+                            Op::Minus => a - b,
+                            _ => a * b,
+                        }))
+                    }
+                }
             }
             _ => None,
         }

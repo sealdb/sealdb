@@ -1622,6 +1622,25 @@ fn owner_of(
     (owners.len() == 1).then(|| owners[0].clone())
 }
 
+/// The single join input that owns every column of `expr`, or `None` when the
+/// expression is constant, spans inputs, or names an unknown table.
+fn expr_owned_by_side(
+    expr: &ExprNode,
+    map: &std::collections::HashMap<String, Vec<String>>,
+    tables: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let mut owner: Option<String> = None;
+    for (table, name) in expr.referenced_columns() {
+        let table = table?;
+        let current = owner_of(Some(&table), &name, map, tables)?;
+        if owner.as_ref().is_some_and(|seen| seen != &current) {
+            return None;
+        }
+        owner = Some(current);
+    }
+    owner
+}
+
 /// Which join side owns every column of `expr`; `None` when a column belongs
 /// to both sides / is unknown (so the conjunct stays residual or becomes a key).
 /// A cross-table equality can only replace the join filter when both columns
@@ -1704,6 +1723,32 @@ fn qualify_cross_equality(
     };
     if binary.op != sealdb_parser::opcode::Op::Eq {
         return None;
+    }
+    // Row comparisons (`(a, b) = (c, d)`) are not scalar hash keys: they must
+    // stay a residual filter and be evaluated column by column.
+    if matches!(binary.left.as_ref(), ExprNode::Row(_))
+        || matches!(binary.right.as_ref(), ExprNode::Row(_))
+    {
+        return None;
+    }
+    // Expression keys (`t1.a + 1 = t2.a + 1`): each side must resolve wholly
+    // to one join input, and the two expressions to opposite inputs. Their
+    // columns are already qualified, so the predicate can become the hash key
+    // unchanged.
+    if !matches!(
+        (binary.left.as_ref(), binary.right.as_ref()),
+        (ExprNode::Column(_), ExprNode::Column(_))
+    ) {
+        let left_owner = expr_owned_by_side(&binary.left, left_map, left_tables)
+            .or_else(|| expr_owned_by_side(&binary.left, right_map, right_tables))?;
+        let right_owner = expr_owned_by_side(&binary.right, left_map, left_tables)
+            .or_else(|| expr_owned_by_side(&binary.right, right_map, right_tables))?;
+        let cross = (left_tables.contains(&left_owner) && right_tables.contains(&right_owner))
+            || (right_tables.contains(&left_owner) && left_tables.contains(&right_owner));
+        if !cross {
+            return None;
+        }
+        return Some(expr.clone());
     }
     let (ExprNode::Column(l), ExprNode::Column(r)) = (binary.left.as_ref(), binary.right.as_ref())
     else {

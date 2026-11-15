@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-15（green 81 套件；整体进展快照见 [status-report.md](./status-report.md)）  
+> 最后更新：2026-11-15（green 83 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -3011,6 +3011,31 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `tidb_shard_allocate_step` 为 Domain 全局值，未做 session 级隔离。
 - **下一步**:
   - 继续 R7 剩余 `in_progress` 套件。
+
+### 2026-11-15（`explain_generate_column_substitute` 转正：表达式索引 + `agg_to_cop` + cop Projection）
+
+- **Phase**: R3
+- **完成**:
+  - `t2.c_int + 1 = 8 + 1` 右侧常量表达式在 `ExprNode::const_datum` 里折叠，
+    表达式索引 `(c_int + 1)` 得到 seek range `[9,9]`；`IN (SELECT …)` 内表
+    WHERE 通过 `inner_filter_index_plan` 走 `IndexRangeScan` 而不是全表扫描。
+  - `IndexLookUp` 的 expression-index Build 侧恢复按 handle 批量 probe
+    （表行序），`IndexReader` 仍保持索引键序，修掉 `a+1 IN (…)` 的行序差异。
+  - `/*+ agg_to_cop() */` 时去重 `HashAgg` 在 probe cop task 里保留
+    `HashAgg(Probe)`，reader 基数取聚合输出；`not(isnull(join key))` 只对
+    可空外键列下沉，`not(isnull(expr))` 按 TiDB 标量风格渲染。
+  - `IN` 改 inner join 后外层 probe 侧的 NULL reject 与 TiDB 对齐；无统计的
+    `9990` 估算沿用 pseudo `0.999`。
+  - covering `IndexReader` 从 clustered PK handle 取列时输出 cop
+    `Projection`（`index:Projection`），与 `clustered_index` 形状一致。
+- **验证**:
+  - `explain_generate_column_substitute`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - 全量 green+local gate：memory `PASS: memory=91`，tikv `PASS: tikv=89`
+  - green 81→83（TiKV 89 套可跑）
+- **阻塞/风险**:
+  - `explain_complex*` / `explain_easy` / `index_merge*` 仍在 R3 `in_progress`。
+- **下一步**:
+  - 继续 R3 `explain_easy`（UNION ALL 聚合下推 + IndexJoin 左外）。
 
 ---
 

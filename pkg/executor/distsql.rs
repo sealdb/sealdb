@@ -127,6 +127,18 @@ impl Executor for IndexLookUpExecutor {
             .find(|idx| idx.name.o().eq_ignore_ascii_case(&self.index))
             .cloned()
             .ok_or_else(|| Error::unsupported(format!("index {}", self.index)))?;
+        // An expression key part stores the expression's value, not the plain
+        // columns it reads, so a covering read cannot rebuild the row. Fetch
+        // the table rows to evaluate the expression (the EXPLAIN shape remains
+        // a covering `IndexReader`).
+        let expression_index = sealdb_planner::core::expr_index::has_expression_part(&info, &index);
+        // `IndexReader` (index-only plan) keeps the index key order even when
+        // an expression part forces a table fetch to evaluate the expression;
+        // `IndexLookUp` batches its probe and answers in handle order.
+        let index_only = self.covering;
+        if expression_index {
+            self.covering = false;
+        }
         self.schema = info
             .columns
             .iter()
@@ -147,8 +159,12 @@ impl Executor for IndexLookUpExecutor {
         // A dirty table (UnionScan over this txn's own writes) merges the dirty
         // index entries instead and keeps the index key order, so only batch a
         // read with no pending writes under the table.
-        let probe_batched =
-            !self.covering && !self.keep_order && !self.txn_has_writes(&physical);
+        // An expression index also batches the lookup: TiDB's `TableRowIDScan`
+        // probe answers the fetched rows in handle order even when the Build
+        // side scanned an expression index. Index-only reads keep the
+        // expression order (`SELECT a+1` over `KEY ((a+1))` yields 0,1,2…)
+        // because they never probe the table.
+        let probe_batched = !index_only && !self.keep_order && !self.txn_has_writes(&physical);
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
             let mut pending: Vec<(i64, i64)> = Vec::new();

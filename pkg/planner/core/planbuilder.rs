@@ -600,6 +600,9 @@ impl PlanBuilder {
                     current_db,
                     stats,
                 );
+                if select.text.to_ascii_lowercase().contains("agg_to_cop") {
+                    plan = push_agg_to_cop(plan);
+                }
                 // TiDB wraps quantified ALL Apply in a remapping Projection for
                 // `SELECT *` (cte suite: Projection → Apply → StreamAgg/HashAgg).
                 plan = wrap_quantified_all_projection(plan, select, is, current_db);
@@ -3143,6 +3146,111 @@ fn null_reject_on_inner(
     }))
 }
 
+/// Null rejection for an expression join key (`t1.a + 1 = t2.a + 1`):
+/// `not(isnull(t2.a + 1))` on the side that owns the expression, when the
+/// result can be NULL. TiDB plans this above the key projection on the build
+/// side.
+fn inner_join_expr_null_reject(
+    on: &ExprNode,
+    table_alias: &str,
+    physical: &str,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<(ExprNode, ExprNode)> {
+    let info = is.and_then(|is| {
+        is.table_by_name(current_db, physical)
+            .or_else(|| is.table_by_name(current_db, table_alias))
+    })?;
+    let owned = |table: &Option<String>| {
+        table.as_deref().is_some_and(|table| {
+            table.eq_ignore_ascii_case(table_alias) || table.eq_ignore_ascii_case(physical)
+        })
+    };
+    for item in on.split_cnf() {
+        let ExprNode::Binary(bin) = &item else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        for (expr, other) in [
+            (bin.left.as_ref(), bin.right.as_ref()),
+            (bin.right.as_ref(), bin.left.as_ref()),
+        ] {
+            if matches!(expr, ExprNode::Column(_)) {
+                continue;
+            }
+            let columns = expr.referenced_columns();
+            if columns.is_empty() || !columns.iter().all(|(table, _)| owned(table)) {
+                continue;
+            }
+            let other_columns = other.referenced_columns();
+            if other_columns.is_empty() || other_columns.iter().all(|(table, _)| owned(table)) {
+                continue;
+            }
+            let nullable = columns.iter().any(|(_, name)| {
+                info.columns
+                    .iter()
+                    .find(|c| c.name.o().eq_ignore_ascii_case(name))
+                    .is_some_and(|c| c.field_type.flag & 1 == 0)
+            });
+            if !nullable {
+                continue;
+            }
+            let filter = ExprNode::Unary(UnaryOpExpr {
+                op: Op::Not,
+                expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                    expr: Box::new(expr.clone()),
+                    not: false,
+                })),
+            });
+            return Some((expr.clone(), filter));
+        }
+    }
+    None
+}
+
+/// TiDB build-side key projection: the SELECT columns read from this input,
+/// the expression key itself, and the heap table's `_tidb_rowid`.
+fn join_key_projection_exprs(
+    select: &SelectStmt,
+    table_alias: &str,
+    physical: &str,
+    key: &ExprNode,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Vec<String> {
+    let owned = |table: &Option<String>| {
+        table.as_deref().is_some_and(|table| {
+            table.eq_ignore_ascii_case(table_alias) || table.eq_ignore_ascii_case(physical)
+        })
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |text: String| {
+        if !out.iter().any(|have| *have == text) {
+            out.push(text);
+        }
+    };
+    for field in &select.fields {
+        let columns = field.expr.referenced_columns();
+        if !columns.is_empty() && columns.iter().all(|(table, _)| owned(table)) {
+            push(super::explain::explain_scalar_expr(&field.expr, "t"));
+        }
+    }
+    push(super::explain::explain_scalar_expr(key, "t"));
+    if let Some(info) = is.and_then(|is| is.table_by_name(current_db, physical))
+        && !info.pk_is_handle
+        && !info.common_handle
+    {
+        push(format!(
+            "{}.{}._tidb_rowid",
+            schema_prefix(current_db),
+            physical
+        ));
+    }
+    out
+}
+
 /// TiDB inner-join null rejection: `not(isnull(key))` is pushed into both
 /// sides for nullable equality keys (`PhysicalHashJoin` / `rule_predicate_push_down`).
 fn inner_join_null_reject_filters(
@@ -3292,12 +3400,39 @@ fn inject_inner_join_null_reject(
         } => {
             let mut left = inject_inner_join_null_reject(*left, select, is, current_db);
             let mut right = inject_inner_join_null_reject(*right, select, is, current_db);
+            let mut est_rows = est_rows;
             if matches!(tp, JoinType::Inner) {
                 let left_phys = join_side_physical(select, &left_table);
                 let right_phys = join_side_physical(select, &right_table);
                 left = push_inner_null_reject(left, &on, &left_table, &left_phys, is, current_db);
                 right =
                     push_inner_null_reject(right, &on, &right_table, &right_phys, is, current_db);
+                // Expression join keys are evaluated above a build-side
+                // Projection, with the nullable key's `not(isnull(...))`
+                // Selection on top (TiDB `PhysicalHashJoin` build task).
+                if let Some((key, filter)) =
+                    inner_join_expr_null_reject(&on, &right_table, &right_phys, is, current_db)
+                {
+                    let raw_rows = super::explain::est_rows(&right);
+                    let exprs = join_key_projection_exprs(
+                        select,
+                        &right_table,
+                        &right_phys,
+                        &key,
+                        is,
+                        current_db,
+                    );
+                    right = PhysicalPlan::Selection {
+                        child: Box::new(PhysicalPlan::KeyProjection {
+                            exprs,
+                            child: Box::new(right),
+                        }),
+                        filter,
+                        est_rows: Some(raw_rows * 0.8),
+                    };
+                    est_rows =
+                        est_rows.or_else(|| Some(super::explain::est_rows(&left).max(raw_rows)));
+                }
             }
             PhysicalPlan::HashJoin {
                 est_rows,
@@ -3315,6 +3450,12 @@ fn inject_inner_join_null_reject(
                 *child, select, is, current_db,
             )),
             est_rows: None,
+        },
+        PhysicalPlan::KeyProjection { exprs, child } => PhysicalPlan::KeyProjection {
+            exprs,
+            child: Box::new(inject_inner_join_null_reject(
+                *child, select, is, current_db,
+            )),
         },
         PhysicalPlan::Selection {
             child,
@@ -4670,6 +4811,175 @@ fn push_limit_into_cop(plan: PhysicalPlan) -> PhysicalPlan {
                 count,
                 child: Box::new(other),
             },
+        },
+        other => other,
+    }
+}
+
+/// `/*+ agg_to_cop() */`: TiDB may run the final aggregation as a coprocessor
+/// partial `HashAgg` on the probe side of an `IndexLookUp` (`HashAgg(Probe)`).
+/// The subquery rewrite builds the de-duplicating `HashAgg` above the reader,
+/// so mirror the hint by keeping a partial copy in the probe cop task. The
+/// reader's cardinality then reflects the aggregate, not the table rows.
+fn push_agg_to_cop(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::HashAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } => {
+            let mut child = push_agg_to_cop(*child);
+            let mut cop_info = cop_info;
+            if cop_info.is_empty()
+                && let PhysicalPlan::IndexLookUpReader { row_count, .. } = &mut child
+                && let Some(end) = info.find("funcs:")
+            {
+                cop_info = info[..end].to_string();
+                *row_count = est_rows;
+            }
+            PhysicalPlan::HashAgg {
+                child: Box::new(child),
+                info,
+                cop_info,
+                est_rows,
+            }
+        }
+        PhysicalPlan::StreamAgg {
+            child,
+            info,
+            cop_info,
+            est_rows,
+        } => PhysicalPlan::StreamAgg {
+            child: Box::new(push_agg_to_cop(*child)),
+            info,
+            cop_info,
+            est_rows,
+        },
+        PhysicalPlan::HashJoin {
+            tp,
+            est_rows,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } => {
+            let right = push_agg_to_cop(*right);
+            // The build (de-duplicated) side's key is listed first in TiDB's
+            // `ExtractOnCondition` output for this rewrite.
+            let mut on = on;
+            if matches!(&right, PhysicalPlan::HashAgg { .. })
+                && let ExprNode::Binary(bin) = &mut on
+                && bin.op == Op::Eq
+            {
+                std::mem::swap(&mut bin.left, &mut bin.right);
+            }
+            PhysicalPlan::HashJoin {
+                tp,
+                est_rows,
+                left: Box::new(push_agg_to_cop(*left)),
+                right: Box::new(right),
+                left_table,
+                right_table,
+                on,
+            }
+        }
+        PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer,
+            inner,
+        } => PhysicalPlan::IndexJoin {
+            info,
+            est_rows,
+            outer: Box::new(push_agg_to_cop(*outer)),
+            inner: Box::new(push_agg_to_cop(*inner)),
+        },
+        PhysicalPlan::Apply {
+            child,
+            filter,
+            probe,
+            info,
+        } => PhysicalPlan::Apply {
+            child: Box::new(push_agg_to_cop(*child)),
+            filter,
+            probe: probe.map(|p| Box::new(push_agg_to_cop(*p))),
+            info,
+        },
+        PhysicalPlan::Projection {
+            exprs,
+            est_rows,
+            child,
+        } => PhysicalPlan::Projection {
+            exprs,
+            est_rows,
+            child: Box::new(push_agg_to_cop(*child)),
+        },
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            child: Box::new(push_agg_to_cop(*child)),
+            filter,
+            est_rows,
+        },
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+            child: Box::new(push_agg_to_cop(*child)),
+            by_info,
+        },
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
+            child: Box::new(push_agg_to_cop(*child)),
+            by_info,
+            offset,
+            count,
+        },
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
+            child: Box::new(push_agg_to_cop(*child)),
+            offset,
+            count,
+        },
+        PhysicalPlan::SelectLock { child, info } => PhysicalPlan::SelectLock {
+            child: Box::new(push_agg_to_cop(*child)),
+            info,
+        },
+        PhysicalPlan::Union { op, children } => PhysicalPlan::Union {
+            op,
+            children: children
+                .into_iter()
+                .map(|c| Box::new(push_agg_to_cop(*c)))
+                .collect(),
+        },
+        PhysicalPlan::PartitionUnion { children } => PhysicalPlan::PartitionUnion {
+            children: children.into_iter().map(push_agg_to_cop).collect(),
+        },
+        PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child: Box::new(push_agg_to_cop(*child)),
+        },
+        PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::DistinctUnion {
+            info,
+            est_rows,
+            child: Box::new(push_agg_to_cop(*child)),
         },
         other => other,
     }
@@ -7368,21 +7678,11 @@ fn cop_output_projection(
     let prunes = prunes
         && !match plan {
             PhysicalPlan::IndexReader { index_columns, .. } => {
-                let handle = select
-                    .from
-                    .as_ref()
-                    .and_then(|f| {
-                        let (db, table) = f.qualified(current_db);
-                        is.and_then(|is| is.table_by_name(&db, &table))
-                    })
-                    .and_then(|t| t.handle_column())
-                    .map(|c| c.name.o().to_string());
-                let provided = |name: &str| {
-                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(name))
-                        || handle
-                            .as_deref()
-                            .is_some_and(|h| h.eq_ignore_ascii_case(name))
-                };
+                // A row handle (clustered PK) is stored in the index entry but
+                // is not an index key column: TiDB still copies it out through
+                // a cop `Projection` (`index:Projection`).
+                let provided =
+                    |name: &str| index_columns.iter().any(|c| c.eq_ignore_ascii_case(name));
                 filter
                     .referenced_columns()
                     .iter()
@@ -8002,7 +8302,7 @@ fn push_single_side_on(
     ) {
         return (left, right, on, tp);
     }
-    if join_on_has_equijoin_local(&on) {
+    if join_on_has_equijoin_local(&on, left_name, right_name) {
         return (left, right, on, tp);
     }
     // `ON dt2.c1 = 1` / `ON (derived.col)` — push into that side, leave CARTESIAN.
@@ -8208,19 +8508,57 @@ fn push_filter_under_projection(
     }
 }
 
-fn join_on_has_equijoin_local(on: &ExprNode) -> bool {
+fn join_on_has_equijoin_local(on: &ExprNode, left_table: &str, right_table: &str) -> bool {
     match on {
-        ExprNode::Binary(bin) if bin.op == Op::Eq => {
-            matches!(
+        ExprNode::Binary(bin) if bin.op == Op::Eq => match (
+            expr_belongs_to_join_side(&bin.left, left_table, right_table),
+            expr_belongs_to_join_side(&bin.right, left_table, right_table),
+        ) {
+            (Some(left), Some(right)) => left != right,
+            // Keep the historical `Column = Column` handling for unqualified
+            // keys, which cannot be assigned to a side by qualifier alone.
+            _ => matches!(
                 (bin.left.as_ref(), bin.right.as_ref()),
                 (ExprNode::Column(_), ExprNode::Column(_))
-            )
-        }
+            ),
+        },
         ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
-            join_on_has_equijoin_local(&bin.left) || join_on_has_equijoin_local(&bin.right)
+            join_on_has_equijoin_local(&bin.left, left_table, right_table)
+                || join_on_has_equijoin_local(&bin.right, left_table, right_table)
         }
         _ => false,
     }
+}
+
+/// Which join input an expression reads: `Some(true)` for the left table,
+/// `Some(false)` for the right. An expression that mixes both sides (or names
+/// an unknown table) is not a side-local join key.
+fn expr_belongs_to_join_side(
+    expr: &ExprNode,
+    left_table: &str,
+    right_table: &str,
+) -> Option<bool> {
+    let mut columns = Vec::new();
+    expr.collect_columns(&mut columns);
+    if columns.is_empty() {
+        return None;
+    }
+    let mut side = None;
+    for (table, _) in columns {
+        let table = table.as_deref().filter(|table| !table.is_empty())?;
+        let current = if table.eq_ignore_ascii_case(left_table) {
+            true
+        } else if table.eq_ignore_ascii_case(right_table) {
+            false
+        } else {
+            return None;
+        };
+        if side.is_some_and(|seen| seen != current) {
+            return None;
+        }
+        side = Some(current);
+    }
+    side
 }
 
 fn seed_is_dual_projection(plan: &PhysicalPlan) -> bool {
@@ -8567,6 +8905,14 @@ fn expr_index_point_projection(
         }
         exprs
     } else {
+        // A select item written as the indexed expression itself is answered
+        // by the hidden key part, so TiDB keeps no projection above the read
+        // (`SELECT a+1` over `KEY ((a+1))`). A plain column name still needs
+        // its own projection even when a virtual generated column shares the
+        // expression: `SELECT c` over `KEY ((a+1))` projects `t.c`.
+        if select_text_matches_index(info, index_info, select) {
+            return plan;
+        }
         // A re-evaluated expression that an expression key part also stores
         // consumes one intermediate column below the projection, so TiDB's
         // output column id starts one higher (`plus(t.a, 1)->Column#8`); an
@@ -8681,6 +9027,25 @@ fn expr_column_is_integer(info: &sealdb_meta::TableInfo, expr: &ExprNode) -> boo
 }
 
 /// `expr` is exactly one of the index's expression key parts.
+/// Does every select item's written text name the indexed expression itself
+/// (`SELECT a+1` over `KEY ((a+1))`)? Generated-column substitution keeps the
+/// written expression in `as_name`, so the text survives the rewrite to `b`.
+fn select_text_matches_index(
+    info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    select: &SelectStmt,
+) -> bool {
+    !select.fields.is_empty()
+        && select.fields.iter().all(|field| {
+            field
+                .orig_text
+                .as_deref()
+                .or(field.as_name.as_deref())
+                .and_then(|text| sealdb_parser::sqlparser_bridge::parse_expr(text).ok())
+                .is_some_and(|expr| expression_part_matches(info, index, &expr))
+        })
+}
+
 fn expression_part_matches(
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
@@ -11339,6 +11704,174 @@ fn index_equality_rows(
         .or(column_rows)
 }
 
+
+/// A partial index (`... WHERE <predicate>`) is usable only when the query
+/// filter guarantees the predicate, otherwise its keys cover just a subset of
+/// the rows TiDB must return.
+fn partial_index_usable(
+    _info: &sealdb_meta::TableInfo,
+    index: &sealdb_meta::IndexInfo,
+    selection: Option<&ExprNode>,
+) -> bool {
+    let Some(predicate) = index.where_clause.as_deref() else {
+        return true;
+    };
+    let Ok(predicate) = sealdb_parser::sqlparser_bridge::parse_expr(predicate) else {
+        return false;
+    };
+    let Some(selection) = selection else {
+        return false;
+    };
+    predicate_implied_by(&predicate, &selection.split_cnf())
+}
+
+/// `selection` (a CNF list) implies `predicate` when one conjunct alone does.
+fn predicate_implied_by(predicate: &ExprNode, conjuncts: &[ExprNode]) -> bool {
+    conjuncts
+        .iter()
+        .any(|conjunct| conjunct_implies(conjunct, predicate))
+}
+
+fn conjunct_implies(conjunct: &ExprNode, predicate: &ExprNode) -> bool {
+    if conjunct.expr_key() == predicate.expr_key() {
+        return true;
+    }
+    match predicate {
+        ExprNode::Binary(pred) => match pred.op {
+            Op::LogicAnd => predicate
+                .split_cnf()
+                .iter()
+                .all(|part| conjunct_implies(conjunct, part)),
+            Op::LogicOr => predicate
+                .split_dnf()
+                .iter()
+                .any(|arm| conjunct_implies(conjunct, arm)),
+            _ => cmp_implies(conjunct, predicate),
+        },
+        ExprNode::IsNull(is_null) => {
+            is_null.not && comparison_excludes_null(conjunct, &is_null.expr)
+        }
+        ExprNode::Unary(unary) if unary.op == Op::Not => match unary.expr.as_ref() {
+            ExprNode::IsNull(is_null) if !is_null.not => {
+                comparison_excludes_null(conjunct, &is_null.expr)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn comparison_excludes_null(conjunct: &ExprNode, column: &ExprNode) -> bool {
+    if let ExprNode::IsNull(is_null) = conjunct {
+        return is_null.not && is_null.expr.expr_key() == column.expr_key();
+    }
+    query_bounds(conjunct).is_some_and(|(key, lower, upper)| {
+        key == column.expr_key()
+            && (lower.is_some() || upper.is_some())
+            && lower.is_none_or(|(value, _)| !value.is_null())
+            && upper.is_none_or(|(value, _)| !value.is_null())
+    })
+}
+
+/// Query bounds on one key (`col` or an indexed expression): lower/upper
+/// `(value, inclusive)`.
+type QueryBounds = (String, Option<(Datum, bool)>, Option<(Datum, bool)>);
+
+fn query_bounds(conjunct: &ExprNode) -> Option<QueryBounds> {
+    let ExprNode::Binary(bin) = conjunct else {
+        return None;
+    };
+    let one = |expr: &ExprNode, op: Op| -> Option<QueryBounds> {
+        let ExprNode::Binary(bin) = expr else {
+            return None;
+        };
+        if bin.op != op {
+            return None;
+        }
+        let key_of = |expr: &ExprNode| match expr {
+            ExprNode::Column(col) => col.name.clone(),
+            other => other.expr_key(),
+        };
+        let (key, value, op) = if let Some(value) = bin.right.const_datum() {
+            (key_of(&bin.left), value, bin.op)
+        } else if let Some(value) = bin.left.const_datum() {
+            (key_of(&bin.right), value, flip_cmp(bin.op)?)
+        } else {
+            return None;
+        };
+        if value.is_null() {
+            return None;
+        }
+        let (lower, upper) = match op {
+            Op::Eq | Op::NullSafeEq => (Some((value.clone(), true)), Some((value, true))),
+            Op::Gt => (Some((value, false)), None),
+            Op::Ge => (Some((value, true)), None),
+            Op::Lt => (None, Some((value, false))),
+            Op::Le => (None, Some((value, true))),
+            _ => return None,
+        };
+        Some((key, lower, upper))
+    };
+    if let Some(bounds) = one(conjunct, bin.op) {
+        return Some(bounds);
+    }
+    let _ = bin;
+    None
+}
+
+fn flip_cmp(op: Op) -> Option<Op> {
+    match op {
+        Op::Lt => Some(Op::Gt),
+        Op::Le => Some(Op::Ge),
+        Op::Gt => Some(Op::Lt),
+        Op::Ge => Some(Op::Le),
+        Op::Eq | Op::NullSafeEq => Some(op),
+        _ => None,
+    }
+}
+
+fn cmp_implies(conjunct: &ExprNode, predicate: &ExprNode) -> bool {
+    let ExprNode::Binary(pred) = predicate else {
+        return false;
+    };
+    if !matches!(pred.op, Op::Eq | Op::NullSafeEq | Op::Gt | Op::Ge | Op::Lt | Op::Le) {
+        return false;
+    }
+    let Some((pred_key, pred_lower, pred_upper)) = query_bounds(predicate) else {
+        return false;
+    };
+    let Some((query_key, query_lower, query_upper)) = query_bounds(conjunct) else {
+        return false;
+    };
+    if pred_key != query_key {
+        return false;
+    }
+    bound_at_least_as_tight(&query_lower, &pred_lower, true)
+        && bound_at_least_as_tight(&query_upper, &pred_upper, false)
+}
+
+/// Does the query's lower/upper bound stay inside the predicate's? A missing
+/// bound is unbounded, so it cannot imply a bounded side.
+fn bound_at_least_as_tight(
+    query: &Option<(Datum, bool)>,
+    predicate: &Option<(Datum, bool)>,
+    lower: bool,
+) -> bool {
+    match (query, predicate) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(_), None) => true,
+        (Some((query_value, query_inc)), Some((predicate_value, predicate_inc))) => {
+            let order = query_value.compare(predicate_value);
+            if lower {
+                order.is_gt() || (order.is_eq() && (!query_inc || *predicate_inc))
+            } else {
+                order.is_lt() || (order.is_eq() && (!query_inc || *predicate_inc))
+            }
+        }
+    }
+}
+
 fn index_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -11411,7 +11944,7 @@ fn index_plan(
 /// `where tidb_shard(a) = 8` pins `_V$_uk_expr_0`, so the ranger builds
 /// `range:[8,8]` on `uk_expr((tidb_shard(a)), a)` even though no plain column
 /// of the index is named.
-fn expr_range_plan(
+pub(crate) fn expr_range_plan(
     select: &SelectStmt,
     from: &TableName,
     info: &sealdb_meta::TableInfo,
@@ -11822,6 +12355,9 @@ fn index_merge_arm_candidates<'a>(
     let usable = |idx: &&sealdb_meta::IndexInfo| {
         !(idx.primary && info.pk_is_handle)
             && !idx.invisible
+            // Partial indexes are not merge arms: TiDB rejects the whole
+            // `USE_INDEX_MERGE` hint when one listed index carries a predicate.
+            && idx.where_clause.is_none()
             && idx.columns.first().is_some_and(|col| {
                 let key = super::expr_index::part_key(info, col);
                 columns.iter().any(|name| name.eq_ignore_ascii_case(&key))
@@ -11976,6 +12512,10 @@ fn index_merge_intersection_paths(
         let Some(index) = hint_index(info, name) else {
             continue;
         };
+        // Partial indexes cannot take part in a merge (see `index_merge_arm_candidates`).
+        if index.where_clause.is_some() {
+            continue;
+        }
         let built = if index.primary && info.pk_is_clustered() {
             index_merge_handle_arm(info, &remaining, table_rows)
         } else {
@@ -17085,6 +17625,10 @@ fn fill_join_est_rows(
             names,
             child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
         },
+        PhysicalPlan::KeyProjection { exprs, child } => PhysicalPlan::KeyProjection {
+            exprs,
+            child: Box::new(fill_join_est_rows(*child, is, current_db, stats, aliases)),
+        },
         PhysicalPlan::PartitionUnion { children } => PhysicalPlan::PartitionUnion {
             children: children
                 .into_iter()
@@ -17129,6 +17673,78 @@ fn join_eq_pairs(
     out
 }
 
+/// Equi-join expression pairs from an ON condition (`t1.a + 1 = t2.a + 1` as
+/// well as plain columns).
+fn join_eq_expr_pairs(on: &ExprNode) -> Vec<(ExprNode, ExprNode)> {
+    let mut out = Vec::new();
+    for conjunct in on.split_cnf() {
+        let ExprNode::Binary(bin) = conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        if bin.left.referenced_columns().is_empty() || bin.right.referenced_columns().is_empty() {
+            continue;
+        }
+        out.push(((*bin.left).clone(), (*bin.right).clone()));
+    }
+    out
+}
+
+/// NDV of a join key expression on one side. A plain column uses its column
+/// statistics; an expression key (`c_int - 1`) served by an expression index
+/// takes that index's full-scan cardinality, matching TiDB's `9990` estimate.
+fn expr_usable_ndv(
+    stats: Option<&Handle>,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    aliases: &[(String, String)],
+    plan: &PhysicalPlan,
+    expr: &ExprNode,
+    side_rows: f64,
+) -> Option<f64> {
+    if let ExprNode::Column(col) = expr {
+        return column_usable_ndv(stats, is, current_db, aliases, plan, col, side_rows);
+    }
+    let columns = expr.referenced_columns();
+    if columns.is_empty() {
+        return None;
+    }
+    let mut ndv: Option<f64> = None;
+    for (table, name) in &columns {
+        let table = table.as_deref()?;
+        let col = sealdb_parser::ast::expressions::ColumnNameExpr {
+            schema: None,
+            table: Some(table.to_string()),
+            name: name.clone(),
+        };
+        if let Some(value) = column_usable_ndv(stats, is, current_db, aliases, plan, &col, side_rows)
+        {
+            ndv = Some(ndv.map_or(value, |seen: f64| seen.max(value)));
+        }
+    }
+    let first_table = columns.first().and_then(|(table, _)| table.as_deref())?;
+    let physical = aliases
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(first_table))
+        .map(|(_, phys)| phys.as_str())
+        .unwrap_or(first_table);
+    let has_expr_index = is
+        .and_then(|is| is.table_by_name(current_db, physical))
+        .is_some_and(|info| {
+            info.indices.iter().any(|index| {
+                super::expr_index::has_expression_part(info, index)
+                    && expression_part_matches(info, index, expr)
+            })
+        });
+    if has_expr_index {
+        let rows = pseudo_column_rows(plan, first_table).unwrap_or_else(|| side_rows.max(1.0));
+        return Some(rows * 0.999);
+    }
+    ndv.or_else(|| Some(side_rows.max(1.0) * 0.8))
+}
+
 /// Table names a plan reads (aliases and physical names alike).
 fn plan_table_names(plan: &PhysicalPlan, out: &mut Vec<String>) {
     match plan {
@@ -17164,6 +17780,7 @@ fn plan_table_names(plan: &PhysicalPlan, out: &mut Vec<String>) {
         | PhysicalPlan::Limit { child, .. }
         | PhysicalPlan::UnionScan { child, .. }
         | PhysicalPlan::RowProjection { child, .. }
+        | PhysicalPlan::KeyProjection { child, .. }
         | PhysicalPlan::SelectLock { child, .. }
         | PhysicalPlan::HashAgg { child, .. }
         | PhysicalPlan::StreamAgg { child, .. }
@@ -17288,7 +17905,7 @@ fn join_est_by_ndv(
     if !(l > 0.0 && r > 0.0) {
         return None;
     }
-    let pairs = join_eq_pairs(on);
+    let pairs = join_eq_expr_pairs(on);
     if pairs.is_empty() {
         return None;
     }
@@ -17297,17 +17914,17 @@ fn join_est_by_ndv(
     let mut seen_l = false;
     let mut seen_r = false;
     for (lc, rc) in &pairs {
-        if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, left, lc, l) {
+        if let Some(ndv) = expr_usable_ndv(stats, is, current_db, aliases, left, lc, l) {
             ndv_l = ndv_l.max(ndv);
             seen_l = true;
-        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, right, lc, r) {
+        } else if let Some(ndv) = expr_usable_ndv(stats, is, current_db, aliases, right, lc, r) {
             ndv_r = ndv_r.max(ndv);
             seen_r = true;
         }
-        if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, right, rc, r) {
+        if let Some(ndv) = expr_usable_ndv(stats, is, current_db, aliases, right, rc, r) {
             ndv_r = ndv_r.max(ndv);
             seen_r = true;
-        } else if let Some(ndv) = column_usable_ndv(stats, is, current_db, aliases, left, rc, l) {
+        } else if let Some(ndv) = expr_usable_ndv(stats, is, current_db, aliases, left, rc, l) {
             ndv_l = ndv_l.max(ndv);
             seen_l = true;
         }
@@ -17378,9 +17995,9 @@ fn recompute_join_est(
 /// already shrunk the stats the probe side multiplies by.
 fn driver_rows(plan: &PhysicalPlan) -> f64 {
     match plan {
-        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::Projection { child, .. } => {
-            driver_rows(child)
-        }
+        PhysicalPlan::RowProjection { child, .. }
+        | PhysicalPlan::KeyProjection { child, .. }
+        | PhysicalPlan::Projection { child, .. } => driver_rows(child),
         other => super::explain::est_rows(other),
     }
 }
@@ -17394,7 +18011,9 @@ fn est_rows_of(plan: &PhysicalPlan) -> f64 {
             filter_est,
             ..
         } => filter_est.unwrap_or_else(|| row_count.abs()),
-        PhysicalPlan::RowProjection { child, .. } => est_rows_of(child),
+        PhysicalPlan::RowProjection { child, .. } | PhysicalPlan::KeyProjection { child, .. } => {
+            est_rows_of(child)
+        }
         _ => 10_000.0,
     }
 }
@@ -18630,6 +19249,10 @@ fn inl_join_hint_plan(
                 .indices
                 .iter()
                 .filter(|idx| !idx.primary)
+                // A partial index only serves a probe whose join condition
+                // guarantees its predicate; an equality probe on the key
+                // cannot, so TiDB falls back to a hash join.
+                .filter(|idx| idx.where_clause.is_none())
                 .filter(|idx| {
                     idx.columns
                         .first()
@@ -18722,7 +19345,11 @@ fn inl_join_hint_plan(
             .collect();
         probe_info.sort();
         let probe_sel = (!probe_info.is_empty()).then(|| probe_info.join(", "));
-        let outer_rows = est_rows_of(&outer_plan);
+        let outer_rows = super::explain::est_rows(&outer_plan);
+        // The range decided by the outer key is sized before the outer
+        // `Selection` rejects NULL keys, so it uses the raw scan count while
+        // the cop `Selection` and the join apply the filtered count.
+        let outer_raw_rows = table_row_count(stats, outer, current_db);
         let ndv = join_key_ndv(
             stats,
             &inner_db,
@@ -18789,7 +19416,11 @@ fn inl_join_hint_plan(
         );
         let scan_range = super::physical_plans::IndexScanRange {
             text: probe_range,
-            rows: inner_rows * probe_scale,
+            rows: if limited {
+                inner_rows * probe_scale
+            } else {
+                inner_rows * outer_raw_rows / ndv.max(1.0)
+            },
             filter_rows: build_rows * probe_scale,
             pseudo: table_stats.is_none(),
             partial: None,
@@ -21116,6 +21747,167 @@ fn side_join_key_columns(select: &SelectStmt, from: &TableName) -> Vec<String> {
     names
 }
 
+/// Side-local expression join keys from a cross-table WHERE equality
+/// (`t1.c_int - 1 = t2.c_int - 1` → `c_int - 1` for `t1`).
+fn side_join_key_exprs(select: &SelectStmt, from: &TableName) -> Vec<ExprNode> {
+    let Some(selection) = select.selection.as_ref() else {
+        return Vec::new();
+    };
+    if select.join_tables().len() < 2 {
+        return Vec::new();
+    }
+    let owns = |table: &Option<String>| {
+        table.as_deref().is_some_and(|table| {
+            table.eq_ignore_ascii_case(&from.name)
+                || table.eq_ignore_ascii_case(from.resolve_name())
+        })
+    };
+    let mut out = Vec::new();
+    for conjunct in selection.split_cnf() {
+        let ExprNode::Binary(bin) = conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        for (expr, other) in [
+            (bin.left.as_ref(), bin.right.as_ref()),
+            (bin.right.as_ref(), bin.left.as_ref()),
+        ] {
+            let columns = expr.referenced_columns();
+            if columns.is_empty() || !columns.iter().all(|(table, _)| owns(table)) {
+                continue;
+            }
+            let other_columns = other.referenced_columns();
+            if other_columns.is_empty() || other_columns.iter().all(|(table, _)| owns(table)) {
+                continue;
+            }
+            if matches!(expr, ExprNode::Column(_)) {
+                continue;
+            }
+            if !out
+                .iter()
+                .any(|seen: &ExprNode| seen.expr_key() == expr.expr_key())
+            {
+                out.push(expr.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Pick an expression index that answers one of the side's join key
+/// expressions when the side needs no other column from the table.
+fn expr_join_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+    join_key_exprs: &[ExprNode],
+) -> Option<PhysicalPlan> {
+    if join_key_exprs.is_empty() {
+        return None;
+    }
+    let owns = |table: &Option<String>| {
+        table.as_deref().is_none_or(|table| {
+            table.is_empty()
+                || table.eq_ignore_ascii_case(&from.name)
+                || table.eq_ignore_ascii_case(from.resolve_name())
+        })
+    };
+    let index = info.indices.iter().find(|index| {
+        !(index.primary && info.pk_is_clustered())
+            && !index_ignored(from, index.name.o())
+            && super::expr_index::has_expression_part(info, index)
+            && join_key_exprs
+                .iter()
+                .any(|expr| expression_part_matches(info, index, expr))
+    });
+    if std::env::var("SEALDB_DEBUG_EXPRJOIN").is_ok() {
+        eprintln!(
+            "exprjoin table={} exprs={:?} candidates={:?}",
+            from.name,
+            join_key_exprs.iter().map(|e| e.expr_key()).collect::<Vec<_>>(),
+            info.indices
+                .iter()
+                .map(|i| (i.name.o().to_string(), super::expr_index::expression_parts(info, i)))
+                .collect::<Vec<_>>()
+        );
+    }
+    let index = index?;
+    // The access path only has to produce this table's columns plus the join
+    // key expression; other join inputs' columns are read elsewhere.
+    let mut index_select = select.clone();
+    index_select
+        .fields
+        .retain(|field| field.expr.referenced_columns().iter().all(|(table, _)| owns(table)));
+    index_select
+        .order_by
+        .retain(|item| item.expr.referenced_columns().iter().all(|(table, _)| owns(table)));
+    index_select
+        .group_by
+        .retain(|expr| expr.referenced_columns().iter().all(|(table, _)| owns(table)));
+    if index_select.fields.is_empty() {
+        let expr = join_key_exprs
+            .iter()
+            .find(|expr| expression_part_matches(info, index, expr))?
+            .clone();
+        index_select.fields.push(sealdb_parser::ast::SelectField {
+            orig_text: Some(expr.restore_string()),
+            expr,
+            as_name: None,
+        });
+    }
+    let plan = index_plan(&index_select, from, info, index, prune_mode, &[]);
+    if std::env::var("SEALDB_DEBUG_EXPRJOIN").is_ok() {
+        eprintln!(
+            "exprjoin table={} index={} plan={} fields={:?}",
+            from.name,
+            index.name.o(),
+            match &plan {
+                PhysicalPlan::IndexReader { .. } => "IndexReader",
+                PhysicalPlan::IndexLookUpReader { .. } => "IndexLookUp",
+                _ => "other",
+            },
+            index_select
+                .fields
+                .iter()
+                .map(|f| f.expr.restore_string())
+                .collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "exprjoin covers={} needed={:?} parts={:?}",
+            select_covers_index_for(&index_select, Some(&from.name), info, index),
+            select_needed_columns(&index_select, Some(&from.name)),
+            super::expr_index::expression_parts(info, index)
+        );
+    }
+    if !matches!(plan, PhysicalPlan::IndexReader { .. }) {
+        return None;
+    }
+    // A nullable expression key drops its NULL entries when the join rejects
+    // NULLs, so the probe-side index full scan keeps `(1 - 1/1000)` of its
+    // rows (`IndexReader 9990.00` over a pseudo 10000-row table).
+    let mut plan = plan;
+    if let PhysicalPlan::IndexReader { row_count, .. } = &mut plan {
+        let key = join_key_exprs
+            .iter()
+            .find(|expr| expression_part_matches(info, index, expr));
+        let nullable = key.is_some_and(|key| {
+            key.referenced_columns().iter().any(|(_, name)| {
+                info.columns
+                    .iter()
+                    .find(|c| c.name.o().eq_ignore_ascii_case(name))
+                    .is_some_and(|c| c.field_type.flag & 1 == 0)
+            })
+        });
+        if nullable {
+            *row_count *= 0.999;
+        }
+    }
+    Some(plan)
+}
+
 /// Whether `index` covers the statement's needs plus the join keys the side
 /// select no longer mentions.
 fn index_covers_needed(
@@ -21898,14 +22690,15 @@ fn union_scan_over_dirty(
                 .filter(|conjunct| {
                     let cols = conjunct.referenced_columns();
                     !cols.is_empty()
-                        && cols.iter().all(|(qualifier, name)| {
-                            qualifier
-                                .as_deref()
-                                .is_none_or(|q| aliases.iter().any(|a| a.eq_ignore_ascii_case(q)))
-                                || info
-                                    .columns
-                                    .iter()
-                                    .any(|c| c.name.o().eq_ignore_ascii_case(name))
+                        && cols.iter().all(|(qualifier, name)| match qualifier.as_deref() {
+                            // A qualified join key (`t1.c_int - 1 = t2.c_int - 1`)
+                            // belongs to the join, not this table's UnionScan
+                            // filter, so only this table's qualifiers count.
+                            Some(q) => aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                            None => info
+                                .columns
+                                .iter()
+                                .any(|c| c.name.o().eq_ignore_ascii_case(name)),
                         })
                 })
                 .map(|conjunct| {
@@ -21956,6 +22749,7 @@ fn access_plan_inner(
     // reader schema (`Selection not(isnull(e.a))` above the index scan), so an
     // index that leaves the key out is not covering.
     let join_keys = side_join_key_columns(select, from);
+    let join_key_exprs = side_join_key_exprs(select, from);
     let select = side_select.as_ref().unwrap_or(select);
 
     if is_information_schema(from, current_db) || is_mysql_stats_table(from, current_db) {
@@ -22001,6 +22795,28 @@ fn access_plan_inner(
                 &generated_select
             }
             None => select,
+        };
+        // A partial index only answers rows that satisfy its predicate, so
+        // TiDB uses it just when the query filter implies that predicate
+        // (`idx(b) WHERE b > 2` under `b > 1` falls back to a table scan).
+        let usable_info;
+        let info = if info
+            .indices
+            .iter()
+            .any(|idx| !partial_index_usable(info, idx, select.selection.as_ref()))
+        {
+            usable_info = sealdb_meta::TableInfo {
+                indices: info
+                    .indices
+                    .iter()
+                    .filter(|idx| partial_index_usable(info, idx, select.selection.as_ref()))
+                    .cloned()
+                    .collect(),
+                ..info.clone()
+            };
+            &usable_info
+        } else {
+            info
         };
         // USE/FORCE INDEX: prefer the hinted index (TiDB access path selection).
         let eqs = eq_key_consts(select.selection.as_ref());
@@ -22126,6 +22942,14 @@ fn access_plan_inner(
         // An equality or range on an expression key part seeks the index
         // exactly like a plain leading column (`where tidb_shard(a) = 8`).
         if let Some(plan) = expr_range_plan(select, from, info, prune_mode, &join_keys) {
+            return plan;
+        }
+        // A join key expression served by an expression index
+        // (`t1.c_int - 1 = t2.c_int - 1` → `expression_index_2(c_int - 1)`)
+        // reads the index alone when the side needs no other column.
+        if let Some(plan) =
+            expr_join_index_plan(select, from, info, prune_mode, &join_key_exprs)
+        {
             return plan;
         }
         // In a join, the key equality from the join wins over a row IN list:
@@ -22436,17 +23260,84 @@ fn access_plan_inner(
         // only in the average row size TiDB charges them.
         if is_plain_projection(select) {
             let needed = select_needed_columns(select, Some(&from.name));
-            if let Some(index) = info
+            let candidates = info
                 .indices
                 .iter()
                 .filter(|idx| {
                     !(idx.primary && info.pk_is_clustered()) && !index_ignored(from, idx.name.o())
                 })
-                .find(|idx| {
-                    index_covers_needed(idx, select, &join_keys, info, from)
-                        && covering_index_beats_scan(info, idx, &needed)
+                .filter(|idx| {
+                    select_text_matches_index(info, idx, select)
+                        || (index_covers_needed(idx, select, &join_keys, info, from)
+                            && covering_index_beats_scan(info, idx, &needed))
+                });
+            // A select item written as an indexed expression uses that
+            // expression index, even when the virtual generated column
+            // substitution also makes a plain column index cover it.
+            let expression_direct = |idx: &sealdb_meta::IndexInfo| {
+                select_text_matches_index(info, idx, select)
+            };
+            // A plain column available as an index column is the direct read;
+            // only fall back to an expression index that serves a virtual
+            // generated column through its hidden key part.
+            let direct = |idx: &sealdb_meta::IndexInfo| {
+                needed.iter().all(|name| {
+                    idx.columns
+                        .iter()
+                        .any(|part| part.name.o().eq_ignore_ascii_case(name))
                 })
-            {
+            };
+            let chosen = candidates
+                .clone()
+                .find(|idx| expression_direct(idx))
+                .or_else(|| candidates.clone().find(|idx| direct(idx)))
+                .or_else(|| {
+                candidates
+                    .clone()
+                    .find(|idx| {
+                        select
+                            .fields
+                            .iter()
+                            .filter_map(|field| match &field.expr {
+                                ExprNode::Column(col) => Some(col.name.as_str()),
+                                _ => None,
+                            })
+                            .all(|name| {
+                                info.indices.iter().any(|other| {
+                                    other.columns.iter().any(|part| {
+                                        part.name.o().eq_ignore_ascii_case(name)
+                                    })
+                                }) || super::expr_index::part_for_virtual_column(
+                                    info, idx, name,
+                                )
+                                .is_some()
+                            })
+                    })
+                    .or_else(|| candidates.clone().next())
+            });
+            if std::env::var("SEALDB_DEBUG_EXPRPROJ").is_ok() {
+                eprintln!(
+                    "choose table={} orig={:?} expr_direct={:?} direct={:?} chosen={:?}",
+                    from.name,
+                    select
+                        .fields
+                        .iter()
+                        .map(|f| f.orig_text.clone())
+                        .collect::<Vec<_>>(),
+                    candidates
+                        .clone()
+                        .filter(|idx| expression_direct(idx))
+                        .map(|idx| idx.name.o().to_string())
+                        .collect::<Vec<_>>(),
+                    candidates
+                        .clone()
+                        .filter(|idx| direct(idx))
+                        .map(|idx| idx.name.o().to_string())
+                        .collect::<Vec<_>>(),
+                    chosen.as_ref().map(|idx| idx.name.o().to_string()),
+                );
+            }
+            if let Some(index) = chosen {
                 return index_plan(select, from, info, index, prune_mode, &join_keys);
             }
         }

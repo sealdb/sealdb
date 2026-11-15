@@ -871,6 +871,10 @@ impl ExecutorBuilder {
                 names.clone(),
                 Self::build(child, stmt, domain, current_db, txn)?,
             ))),
+            // The join evaluates the expression key from the raw child row.
+            PhysicalPlan::KeyProjection { child, .. } => {
+                Self::build(child, stmt, domain, current_db, txn)
+            }
             PhysicalPlan::NullAwareAntiJoin {
                 left_outer,
                 bool_only,

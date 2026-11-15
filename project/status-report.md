@@ -161,7 +161,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 ## 6. R2 剩余与 R3 队列
 
 - **R2 在研（5）**：`cte`, `explain_cte`, `planner/core/join_reorder2`, `planner/core/join_reorder_through_projection`, `planner/core/casetest/rule/rule_derive_topn_from_window`
-- **R3 在研（8）**：`explain_complex`, `explain_complex_stats`, `explain_easy`, `explain_generate_column_substitute`, `explain_indexmerge_stats`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `index_merge`
+- **R3 在研（7）**：`explain_complex`, `explain_complex_stats`, `explain_easy`, `explain_indexmerge_stats`, `globalindex/mem_index_merge`, `globalindex/mem_index_merge_non_unique`, `index_merge`
 
 策略：优先吃「同一根因能一次带绿多套」的项——EXPLAIN 节点编号/树形、IndexJoin hint、Point_Get/IndexMerge 统计形状。
 
@@ -171,7 +171,6 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 |---|---|---|
 | `explain_easy` | 仅剩 1 条语句（result 第 504 行）：`COUNT(1)` 外层聚合穿过 `LEFT JOIN` + `UNION ALL` 下推（`firstrow` + 部分 `count`）、`registration_num > 0` 下推到 union 分支并把常量 0 分支折成 `TableDual`、外层 join 转 `IndexJoin`（`TableRangeScan` 探针） | 聚合下推（join/union）+ 谓词穿 union + 列号对齐 |
 | `index_merge` | `c3 IN (SELECT …)` 留在 `Apply`、`use_index_merge` 未生效 | 去关联成 semi/anti（含 marker 列）+ IndexMerge 提示 |
-| `explain_generate_column_substitute` | 生成列/虚拟列替换与统计缺失标记 | 生成列访问路径 |
 | `executor/explain` | 视图 `EXPLAIN` 权限（1345/1142）、`explain analyze` 运行时统计、`statements_summary` | 视图权限位 + 运行时统计 + infoschema 表（**已转绿**） |
 | `globalindex/mem_index_merge*` | 同 `index_merge` | 同上 |
 | `explain_complex*` / `explain_indexmerge_stats` | 统计形状 + IndexMerge + 去关联的组合 | 同上 |
@@ -265,7 +264,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 21 | `topn_pushdown` | green | 100% | ✓ | ✓ |
 | 22 | `window_function` | green | 100% | ✓ | ✓ |
 
-### R3 — point_get / index / partition / explain*（48 套，green 22）
+### R3 — point_get / index / partition / explain*（48 套，green 23）
 
 | # | Suite | 状态 | 进度 | 金样 | TiKV |
 |---:|---|---|---:|:--:|:--:|
@@ -293,7 +292,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 22 | `explain_easy` | in_progress | 52%（首差 506/978） | ✓ | — |
 | 23 | `explain_easy_stats` | green | 100% | ✓ | ✓ |
 | 24 | `explain_foreign_key` | green | 100% | ✓ | ✓ |
-| 25 | `explain_generate_column_substitute` | in_progress | 2%（首差 12/708） | ✓ | — |
+| 25 | `explain_generate_column_substitute` | green | 100% | ✓ | ✓ |
 | 26 | `explain_indexmerge_stats` | in_progress | 96%（首差 196/203） | ✓ | — |
 | 27 | `explain_join_stats` | green | 100% | ✓ | ✓ |
 | 28 | `explain_shard_index` | green | 100% | ✓ | ✓ |
@@ -475,7 +474,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 76 | `planner/core/casetest/expression_rewriter` | pending | 0% | ✓ | — |
 | 77 | `planner/core/casetest/hint/hint` | pending | 0% | ✓ | — |
 | 78 | `planner/core/casetest/index/index` | pending | 0% | ✓ | — |
-| 79 | `planner/core/casetest/index/partialindex` | pending | 0% | ✓ | — |
+| 79 | `planner/core/casetest/index/partialindex` | green | 100% | ✓ | ✓ |
 | 80 | `planner/core/casetest/integration` | pending | 0% | ✓ | — |
 | 81 | `planner/core/casetest/predicate_simplification` | pending | 0% | ✓ | — |
 | 82 | `planner/core/casetest/pushdown/push_down` | pending | 0% | ✓ | — |

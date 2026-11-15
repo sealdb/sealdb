@@ -148,7 +148,9 @@ impl Executor for HashJoinV1Exec {
         }
         // CROSS JOIN / non-equality ON (e.g. `ON (sub.col)` truthiness) →
         // cartesian product then filter; no hash keys.
-        if self.join.tp == JoinType::Cross || !join_on_is_equijoin(&self.join.on) {
+        if self.join.tp == JoinType::Cross
+            || !join_on_is_equijoin(&self.join.on, &left_schema, &right_schema)
+        {
             let full_schema: Vec<String> = left_schema
                 .iter()
                 .cloned()
@@ -747,16 +749,18 @@ fn project_using_rows_right(
         .collect()
 }
 
-fn join_on_is_equijoin(on: &ExprNode) -> bool {
+fn join_on_is_equijoin(on: &ExprNode, left_schema: &[String], right_schema: &[String]) -> bool {
     match on {
-        ExprNode::Binary(bin) if bin.op == Op::Eq => {
-            matches!(
-                (bin.left.as_ref(), bin.right.as_ref()),
-                (ExprNode::Column(_), ExprNode::Column(_))
-            )
-        }
+        ExprNode::Binary(bin) if bin.op == Op::Eq => matches!(
+            (
+                side_in_schema(&bin.left, left_schema, right_schema),
+                side_in_schema(&bin.right, left_schema, right_schema),
+            ),
+            (Some(true), Some(false)) | (Some(false), Some(true))
+        ),
         ExprNode::Binary(bin) if bin.op == Op::LogicAnd => {
-            join_on_is_equijoin(&bin.left) || join_on_is_equijoin(&bin.right)
+            join_on_is_equijoin(&bin.left, left_schema, right_schema)
+                || join_on_is_equijoin(&bin.right, left_schema, right_schema)
         }
         _ => false,
     }
@@ -803,15 +807,38 @@ fn split_on_conditions<'a>(
 }
 
 /// `true` = accumulated left side, `false` = the right subtree.
+///
+/// An expression key (`t1.a + 1 = t2.a + 1`) belongs to a side when every
+/// column it references resolves there, so expression equijoins hash like
+/// plain column keys.
 fn side_in_schema(
     expr: &ExprNode,
     left_schema: &[String],
     right_schema: &[String],
 ) -> Option<bool> {
-    let ExprNode::Column(col) = expr else {
+    let mut columns = Vec::new();
+    expr.collect_columns(&mut columns);
+    if columns.is_empty() {
         return None;
-    };
-    if let Some(table) = col.table.as_deref() {
+    }
+    let mut side = None;
+    for (table, name) in columns {
+        let current = side_of_column(table.as_deref(), &name, left_schema, right_schema)?;
+        if side.is_some_and(|seen| seen != current) {
+            return None;
+        }
+        side = Some(current);
+    }
+    side
+}
+
+fn side_of_column(
+    table: Option<&str>,
+    name: &str,
+    left_schema: &[String],
+    right_schema: &[String],
+) -> Option<bool> {
+    if let Some(table) = table.filter(|t| !t.is_empty()) {
         if schema_has_table(right_schema, table) {
             return Some(false);
         }
@@ -824,8 +851,8 @@ fn side_in_schema(
         // user-visible alias refers to.
     }
     // Unqualified `ON b1 = a1`: resolve by which side owns the name.
-    let in_left = schema_has_column(left_schema, &col.name);
-    let in_right = schema_has_column(right_schema, &col.name);
+    let in_left = schema_has_column(left_schema, name);
+    let in_right = schema_has_column(right_schema, name);
     match (in_left, in_right) {
         (true, false) => Some(true),
         (false, true) => Some(false),

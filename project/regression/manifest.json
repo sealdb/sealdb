@@ -14,9 +14,9 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 72,
-      "pending": 159,
-      "in_progress": 13,
+      "green": 83,
+      "pending": 149,
+      "in_progress": 12,
       "deferred": 2,
       "local": 8
     },
@@ -1172,7 +1172,7 @@
     {
       "name": "explain_generate_column_substitute",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_generate_column_substitute.test",
       "result": "r/explain_generate_column_substitute.result",
       "has_result": true,
@@ -1842,7 +1842,7 @@
     {
       "name": "planner/core/casetest/index/partialindex",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/casetest/index/partialindex.test",
       "result": "r/planner/core/casetest/index/partialindex.result",
       "has_result": true,

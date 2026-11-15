@@ -1186,6 +1186,16 @@ impl Session {
             self.txn.lock().expect("session txn lock").commit()?;
             self.domain.mdl_unlock_session(self.session_id);
         }
+        // MySQL/TiDB metadata statements implicitly commit the open transaction
+        // (a `DROP TABLE` after a `BEGIN` commits the pending DML); temporary
+        // tables are session-local and do not.
+        if ddl_implicitly_commits(stmt)
+            && self.txn.lock().expect("session txn lock").is_explicit()
+        {
+            self.apply_pending_schema(true)?;
+            self.txn.lock().expect("session txn lock").commit()?;
+            self.domain.mdl_unlock_session(self.session_id);
+        }
         let current_db = self
             .current_db
             .lock()
@@ -5194,6 +5204,31 @@ fn cte_output_columns(cte: &sealdb_parser::ast::CommonTableExpression) -> Vec<St
             _ => field.expr.name(),
         })
         .collect()
+}
+
+/// Metadata statements that commit an open transaction before they run
+/// (MySQL implicit commit). Session-local temporary tables are excluded, and
+/// `TRUNCATE TABLE` has its own earlier path.
+fn ddl_implicitly_commits(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::CreateDatabase(_)
+        | Statement::DropDatabase(_)
+        | Statement::AlterDatabase(_)
+        | Statement::CreateTable(sealdb_parser::ast::CreateTableStmt {
+            temporary: false, ..
+        })
+        | Statement::CreateView(_)
+        | Statement::CreateSequence(_)
+        | Statement::DropSequence(_)
+        | Statement::AlterSequence(_)
+        | Statement::DropTable(sealdb_parser::ast::DropTableStmt {
+            temporary: false, ..
+        })
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::AlterTable(_) => true,
+        _ => false,
+    }
 }
 
 /// `view_arm_invalid` with CTE/outer sources inherited from enclosing scopes.
