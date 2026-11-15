@@ -1445,9 +1445,10 @@ impl CreatePlacementPolicyStmt {
     }
 }
 
-/// TiDB `CreateResourceGroupStmt` — accepted no-op.
+/// TiDB `CreateResourceGroupStmt`: `CREATE RESOURCE GROUP <name> …`.
 #[derive(Clone, Debug)]
 pub struct CreateResourceGroupStmt {
+    pub name: String,
     pub raw_sql: String,
 }
 
@@ -1458,7 +1459,36 @@ impl CreateResourceGroupStmt {
     }
 }
 
-/// TiDB `SetResourceGroupStmt` — accepted no-op.
+/// TiDB `DropResourceGroupStmt`: `DROP RESOURCE GROUP [IF EXISTS] <name>`.
+#[derive(Clone, Debug)]
+pub struct DropResourceGroupStmt {
+    pub name: String,
+    pub if_exists: bool,
+    pub raw_sql: String,
+}
+
+impl DropResourceGroupStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `AlterResourceGroupStmt`: `ALTER RESOURCE GROUP <name> RU_PER_SEC = …`.
+#[derive(Clone, Debug)]
+pub struct AlterResourceGroupStmt {
+    pub name: String,
+    pub raw_sql: String,
+}
+
+impl AlterResourceGroupStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(&self.raw_sql);
+        Ok(())
+    }
+}
+
+/// TiDB `SetResourceGroupStmt`: `SET RESOURCE GROUP <name>`.
 #[derive(Clone, Debug)]
 pub struct SetResourceGroupStmt {
     pub raw_sql: String,

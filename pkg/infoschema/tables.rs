@@ -15,6 +15,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "key_column_usage" => Ok(key_column_usage(is)),
         "table_constraints" => Ok(table_constraints(is)),
         "partitions" => Ok(partitions(is)),
+        "processlist" => Ok(processlist()),
         "attributes" => Ok(attributes(is)),
         "inspection_rules" => Ok(inspection_rules()),
         "character_sets" => Ok(character_sets()),
@@ -60,6 +61,35 @@ pub fn virtual_columns(table: &str) -> Vec<String> {
     virtual_rows(table, &empty)
         .map(|(columns, _)| columns)
         .unwrap_or_default()
+}
+
+fn processlist() -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec![
+        "ID".to_string(),
+        "USER".to_string(),
+        "HOST".to_string(),
+        "DB".to_string(),
+        "COMMAND".to_string(),
+        "TIME".to_string(),
+        "STATE".to_string(),
+        "INFO".to_string(),
+        "RESOURCE_GROUP".to_string(),
+    ];
+    let mut rows = Vec::new();
+    if let Some(p) = crate::infoschema::thread_process() {
+        rows.push(vec![
+            Datum::U64(p.id),
+            bytes(&p.user),
+            bytes(&p.host),
+            bytes(&p.db),
+            bytes(&p.command),
+            Datum::I64(p.time),
+            bytes(&p.state),
+            bytes(&p.info),
+            bytes(&p.resource_group),
+        ]);
+    }
+    (schema, rows)
 }
 
 fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {

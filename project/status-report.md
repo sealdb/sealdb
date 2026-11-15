@@ -8,7 +8,7 @@
 
 ## 1. 一句话结论
 
-TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **78 个** 登记为 `green`（R1 4 / R2 16 / R3 23 / R5 1 / R6 12 / R7 22），新转绿的 28 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable` / `executor/executor_txn` / `table/cache` / `globalindex/information_schema` / `ddl/db_rename` / `ddl/ddl_error` / `ddl/db_foreign_key` / `planner/core/indexmerge_intersection` / `ddl/db_change` / `executor/compact_table` / `expression/constant_fold` / `executor/kv`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 23/48，R7 完成 20/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
+TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **79 个** 登记为 `green`（R1 4 / R2 16 / R3 23 / R5 1 / R6 13 / R7 22），新转绿的 29 个（`executor/explain` / `infoschema/v2` / `util/admin` / `planner/cardinality/trace` / `globalindex/update` / `executor/ddl` / `ddl/column` / `ddl/column_change` / `ddl/index_modify` / `ddl/column_modify` / `ddl/column_type_change` / `ddl/attributes_sql` / `planner/core/binary_plan` / `planner/core/preprocess` / `executor/inspection_common` / `table/temptable` / `bindinfo/temptable` / `executor/executor_txn` / `table/cache` / `globalindex/information_schema` / `ddl/db_rename` / `ddl/ddl_error` / `ddl/db_foreign_key` / `planner/core/indexmerge_intersection` / `ddl/db_change` / `executor/compact_table` / `expression/constant_fold` / `executor/kv` / `ddl/resource_group`）在 Mem + TiKV 双引擎全绿；R1 已收口，R2 完成 16/22，R3 完成 23/48，R7 完成 20/110，当前主攻 EXPLAIN 形状与基数：`LIMIT` 的 expected count 已按 TiDB `calcChildExpectedCnt` 下推进 join，`topn_push_down` 的 `TIDB_SMJ`/`TIDB_HJ` 左外构建侧、`IN (SELECT … LIMIT 1)` 去关联 `Apply` 与多表 outer-join 的 IndexJoin 重排均已收口，`explain_join_stats` / `explain_easy_stats` / `explain_shard_index` / `executor/point_get` / `executor/index_merge_reader` 均已转绿；架构侧包级对齐登记 178 个 TiDB 文件中 **150 partial / 21 stub / 4 reimplemented / 3 ported**，仍以「先计算层语义与执行计划形状 1:1，再补远端 Coprocessor/存储层」为主线。254 套的逐套状态与进度见 [§11 全量清单](#11-附254-套-suite-全量清单)。
 
 ---
 
@@ -46,7 +46,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **78 个** �
 
 ---
 
-## 3. 已绿 suite 清单（78）
+## 3. 已绿 suite 清单（79）
 
 | Wave | Suite |
 |---|---|
@@ -55,7 +55,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **78 个** �
 | R3 | `access_path_selection`, `clustered_index`, `ddl/exchange_partition_global_index`, `executor/batch_point_get`, `executor/explain`, `executor/index_merge_reader`, `executor/partition/issues`, `executor/partition/partition_boundaries`, `executor/partition/partition_with_expression`, `executor/partition/table`, `executor/partition/write`, `executor/point_get`, `explain`, `explain-non-select-stmt`, `explain_easy_stats`, `explain_foreign_key`, `explain_join_stats`, `explain_shard_index`, `explain_stats`, `globalindex/point_get`, `partition`, `planner/core/casetest/point_get_plan`, `planner/core/point_get_plan` |
 | R5 | `session/txn` |
 | R6 | `ddl/attributes_sql`, `ddl/column`, `ddl/column_change`, `ddl/column_modify`, `ddl/column_type_change`, `ddl/db_change`, `ddl/db_foreign_key`, `ddl/db_rename`, `ddl/ddl_error`, `ddl/fail_db`, `ddl/index_modify`, `infoschema/v2` |
-| R7 | `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/ddl`, `executor/executor_txn`, `expression/enum_set`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `table/cache`, `table/temptable`, `util/admin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv` |
+| R7 | `bindinfo/session_handle`, `bindinfo/temptable`, `executor/adapter`, `executor/ddl`, `executor/executor_txn`, `expression/enum_set`, `globalindex/information_schema`, `globalindex/insert`, `globalindex/mem_index_non_unique`, `globalindex/update`, `parser/integration`, `planner/cardinality/trace`, `executor/inspection_common`, `planner/core/binary_plan`, `planner/core/preprocess`, `table/cache`, `table/temptable`, `util/admin`, `planner/core/indexmerge_intersection`, `executor/compact_table`, `expression/constant_fold`, `executor/kv`, `ddl/resource_group` |
 
 **复验证据**
 
@@ -67,7 +67,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **78 个** �
 → PASS: memory=0 tikv=75 skipped=179
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），78 个 `green` 套件中 77 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），79 个 `green` 套件中 78 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
 
 ---
 
@@ -380,7 +380,7 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 | 21 | `ddl/modify_column` | pending | 0% | ✓ | — |
 | 22 | `ddl/multi_schema_change` | pending | 0% | ✓ | — |
 | 23 | `ddl/primary_key_handle` | pending | 0% | ✓ | — |
-| 24 | `ddl/resource_group` | pending | 0% | ✓ | — |
+| 24 | `ddl/resource_group` | green | 100% | ✓ | ✓ |
 | 25 | `ddl/sequence` | pending | 0% | ✓ | — |
 | 26 | `ddl/serial` | pending | 0% | ✓ | — |
 | 27 | `ddl/table_modify` | pending | 0% | ✓ | — |

@@ -29,6 +29,10 @@ const TEMP_TABLE_SCHEMA: &str = "__sealdb_temporary";
 /// The leading NUL byte cannot appear in a user-written `SAVEPOINT` name.
 const STATEMENT_SAVEPOINT: &str = "\u{0}sealdb_statement";
 
+/// TiDB `ErrResourceGroupExists` / `ErrResourceGroupNotExists`.
+const ERR_RESOURCE_GROUP_EXIST: i32 = 8251;
+const ERR_RESOURCE_GROUP_NOT_EXIST: i32 = 8252;
+
 thread_local! {
     /// `group_concat_max_len` before the current `SET_VAR` hint took effect, so
     /// the statement-scoped override can restore the session value.
@@ -64,6 +68,15 @@ fn next_temp_table_id() -> i64 {
 /// Clears the thread-local temporary table catalog when a statement ends, so
 /// another session running later on the same thread cannot see it.
 struct TempTablesGuard;
+
+/// Clears the thread's processlist snapshot when the statement ends.
+struct ProcessInfoGuard;
+
+impl Drop for ProcessInfoGuard {
+    fn drop(&mut self) {
+        sealdb_infoschema::infoschema::clear_thread_process();
+    }
+}
 
 impl Drop for TempTablesGuard {
     fn drop(&mut self) {
@@ -147,6 +160,9 @@ pub struct Session {
     plan_cache_stmts: Mutex<HashSet<String>>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
+    /// `SET RESOURCE GROUP` / `RESOURCE_GROUP()` hint: the group this session
+    /// currently runs in (TiDB `sessionctx.Context.GetSessionVars().StmtCtx.ResourceGroupName`).
+    resource_group: Mutex<String>,
 }
 
 impl Session {
@@ -206,6 +222,7 @@ impl Session {
             last_plan_from_cache: Mutex::new(false),
             plan_cache_stmts: Mutex::new(HashSet::new()),
             last_warnings: Mutex::new(Vec::new()),
+            resource_group: Mutex::new("default".to_string()),
         }
     }
 
@@ -504,6 +521,72 @@ impl Session {
             sealdb_ddl::clear_table_keys(storage.as_ref(), &info.physical_ids())?;
         }
         Ok(empty_result())
+    }
+
+    /// Resolve the resource group a statement runs in: the last
+    /// `RESOURCE_GROUP(name)` hint, else the session group. Reports TiDB's
+    /// duplicate-hint / feature-disabled / unknown-group warnings.
+    fn resolve_resource_group(&self, stmt: &Statement) -> (String, Vec<(i32, String)>) {
+        let current = self
+            .resource_group
+            .lock()
+            .expect("session resource group lock")
+            .clone();
+        let text = match stmt {
+            Statement::Select(select) => select.text.as_str(),
+            _ => "",
+        };
+        let hints = resource_group_hints(text);
+        let Some(last) = hints.last() else {
+            return (current, Vec::new());
+        };
+        let mut warnings = Vec::new();
+        if hints.len() > 1 {
+            warnings.push((
+                1105,
+                format!(
+                    "RESOURCE_GROUP() is defined more than once, only the last definition takes \
+                     effect: RESOURCE_GROUP({last})"
+                ),
+            ));
+        }
+        let mut group = last.to_ascii_lowercase();
+        if !self.domain.enable_resource_control() {
+            if group != "default" {
+                warnings.push((
+                    8250,
+                    "Resource control feature is disabled. Run `SET GLOBAL \
+                     tidb_enable_resource_control='on'` to enable the feature"
+                        .to_string(),
+                ));
+            }
+            group = "default".to_string();
+        } else if !self.domain.resource_group_exists(&group) {
+            warnings.push((
+                ERR_RESOURCE_GROUP_NOT_EXIST,
+                format!("Resource group '{group}' does not exist"),
+            ));
+            group = "default".to_string();
+        }
+        (group, warnings)
+    }
+
+    /// Publish the `information_schema.processlist` row for the statement about
+    /// to run on this thread.
+    fn publish_process_info(&self, current_db: &str, stmt: &Statement, resource_group: &str) {
+        sealdb_infoschema::infoschema::set_thread_process(
+            sealdb_infoschema::infoschema::ProcessInfo {
+                id: self.session_id,
+                user: self.current_user().username,
+                host: "127.0.0.1:4000".to_string(),
+                db: current_db.to_string(),
+                command: "Query".to_string(),
+                time: 0,
+                state: String::new(),
+                info: restore_sql(stmt),
+                resource_group: resource_group.to_string(),
+            },
+        );
     }
 
     /// Add this session's temporary tables (those in `current_db`) to the
@@ -810,10 +893,42 @@ impl Session {
             | Statement::RecoverTable(_)
             | Statement::DropPlacementPolicy(_)
             | Statement::CreatePlacementPolicy(_)
-            | Statement::CreateResourceGroup(_)
-            | Statement::SetResourceGroup(_)
             | Statement::AddQueryWatch(_)
             | Statement::DropQueryWatch(_) => {
+                return Ok(empty_result());
+            }
+            Statement::CreateResourceGroup(create) => {
+                let ru = parse_ru_per_sec(&create.raw_sql);
+                if !self.domain.create_resource_group(&create.name, ru) {
+                    return Err(Error::new(
+                        ERR_RESOURCE_GROUP_EXIST,
+                        format!("Resource group '{}' already exists", create.name),
+                    ));
+                }
+                return Ok(empty_result());
+            }
+            Statement::AlterResourceGroup(alter) => {
+                let ru = parse_ru_per_sec(&alter.raw_sql);
+                if !self.domain.alter_resource_group(&alter.name, ru) {
+                    return Err(Error::new(
+                        ERR_RESOURCE_GROUP_NOT_EXIST,
+                        format!("Resource group '{}' does not exist", alter.name),
+                    ));
+                }
+                return Ok(empty_result());
+            }
+            Statement::DropResourceGroup(drop) => {
+                if !self.domain.drop_resource_group(&drop.name) && !drop.if_exists {
+                    return Err(Error::new(
+                        ERR_RESOURCE_GROUP_NOT_EXIST,
+                        format!("Resource group '{}' does not exist", drop.name),
+                    ));
+                }
+                return Ok(empty_result());
+            }
+            Statement::SetResourceGroup(set) => {
+                let name = parse_set_resource_group(&set.raw_sql).unwrap_or_else(|| "default".to_string());
+                *self.resource_group.lock().expect("session resource group lock") = name;
                 return Ok(empty_result());
             }
             Statement::DropStats(drop) => {
@@ -1237,6 +1352,12 @@ impl Session {
         if let Some(result) = system_var_result(self, stmt) {
             return Ok(result);
         }
+        // `RESOURCE_GROUP()` hint: resolve the group this statement runs in and
+        // publish the processlist row executors see. Both must happen before the
+        // executor is built — `information_schema` scans materialize eagerly.
+        let (statement_rg, rg_warnings) = self.resolve_resource_group(stmt);
+        self.publish_process_info(&current_db, stmt, &statement_rg);
+        let _process_guard = ProcessInfoGuard;
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         // Prepared EXECUTE may override with the unbound `?` template key.
@@ -1405,7 +1526,7 @@ impl Session {
             .enable_auto_increment_in_generated
             .lock()
             .expect("session auto increment in generated lock");
-        let result = with_clustered_index_mode(clustered_index, || {
+        let mut result = with_clustered_index_mode(clustered_index, || {
             sealdb_expression::with_div_by_zero_mode(div_mode, || {
                 sealdb_expression::with_allow_auto_random_explicit_insert(allow_auto_random, || {
                     sealdb_expression::with_allow_auto_increment_in_generated(
@@ -1459,6 +1580,15 @@ impl Session {
         }
         if result.is_ok() {
             maybe_auto_analyze(self, stmt)?;
+        }
+        // Hint diagnostics precede executor warnings (TiDB reports them while
+        // optimizing, before any execution-time warning).
+        if let Ok(qr) = &mut result {
+            if !rg_warnings.is_empty() {
+                let mut warnings = rg_warnings;
+                warnings.extend(qr.warnings.iter().cloned());
+                qr.warnings = warnings;
+            }
         }
         drop(mdl_guard);
         if let Ok(qr) = &result {
@@ -3353,6 +3483,55 @@ fn div_by_zero_mode(
     }
 }
 
+/// `RESOURCE_GROUP(name)` hint arguments in text order.
+fn resource_group_hints(text: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(idx) = lower[from..].find("resource_group") {
+        let after = from + idx + "resource_group".len();
+        if let Some(args) = text[after..].trim_start().strip_prefix('(')
+            && let Some(end) = args.find(')')
+        {
+            out.push(args[..end].trim().to_string());
+        }
+        from = after;
+    }
+    out
+}
+
+/// `tidb_enable_resource_control` value (`ON`/`OFF`/`DEFAULT`); TiDB defaults ON.
+fn parse_resource_control_flag(value: &str) -> bool {
+    !matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
+}
+
+/// `RU_PER_SEC = <n>` of a `CREATE|ALTER RESOURCE GROUP` statement.
+fn parse_ru_per_sec(raw_sql: &str) -> Option<u64> {
+    let upper = raw_sql.to_ascii_uppercase();
+    let pos = upper.find("RU_PER_SEC")?;
+    let rest = raw_sql[pos + "RU_PER_SEC".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Group name of `SET RESOURCE GROUP <name>`.
+fn parse_set_resource_group(raw_sql: &str) -> Option<String> {
+    let upper = raw_sql.to_ascii_uppercase();
+    let pos = upper.find("RESOURCE")?;
+    let rest = raw_sql[pos + "RESOURCE".len()..].trim_start();
+    let rest = rest
+        .strip_prefix("GROUP")
+        .or_else(|| rest.strip_prefix("group"))?
+        .trim_start();
+    let name: String = rest
+        .trim_start_matches('`')
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name.to_ascii_lowercase())
+}
+
 fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Vec<(i32, String)>> {
     let mut warnings = Vec::new();
     for a in &stmt.assignments {
@@ -3478,6 +3657,12 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .clustered_index
                     .lock()
                     .expect("session clustered index lock") = mode;
+            }
+            "tidb_enable_resource_control" => {
+                // The global flag gates `RESOURCE_GROUP()` hints; the session
+                // value mirrors it (`@@tidb_enable_resource_control`).
+                let on = parse_resource_control_flag(&value);
+                session.domain.set_enable_resource_control(on);
             }
             "tidb_enable_auto_analyze" => {
                 let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -3806,6 +3991,11 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         "tidb_enable_auto_analyze" => {
             let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
             session.domain.set_global_enable_auto_analyze(on);
+        }
+        "tidb_enable_resource_control" => {
+            session
+                .domain
+                .set_enable_resource_control(parse_resource_control_flag(value));
         }
         // Accepted for compatibility; only the session value gates DML.
         "allow_auto_random_explicit_insert" => {}

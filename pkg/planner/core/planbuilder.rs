@@ -815,6 +815,12 @@ impl PlanBuilder {
             Statement::CreateResourceGroup(_) => Ok(PhysicalPlan::Simple {
                 kind: "CreateResourceGroup".to_string(),
             }),
+            Statement::DropResourceGroup(_) => Ok(PhysicalPlan::Simple {
+                kind: "DropResourceGroup".to_string(),
+            }),
+            Statement::AlterResourceGroup(_) => Ok(PhysicalPlan::Simple {
+                kind: "AlterResourceGroup".to_string(),
+            }),
             Statement::SetResourceGroup(_) => Ok(PhysicalPlan::Simple {
                 kind: "SetResourceGroup".to_string(),
             }),

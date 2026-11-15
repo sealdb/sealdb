@@ -20,9 +20,11 @@ use crate::ast::expressions::{
 use crate::ast::misc::{
     AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
     CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt, CreateRoleStmt,
+    AlterResourceGroupStmt, CreateBindingStmt, CreatePlacementPolicyStmt,
+    CreateResourceGroupStmt, CreateRoleStmt,
     CreateUserStmt, DeallocateStmt,
-    DistributeTableStmt, DoStmt, DropStatsStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
+    DistributeTableStmt, DoStmt, DropResourceGroupStmt, DropStatsStmt, DropBindingStmt,
+    DropPlacementPolicyStmt, DropQueryWatchStmt,
     DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
     GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
@@ -2339,6 +2341,24 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
         i += 1;
     }
     (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
+}
+
+/// Resource group name after `CREATE|DROP|ALTER RESOURCE GROUP`, skipping the
+/// optional `IF NOT EXISTS` / `IF EXISTS` prefix.
+fn parse_resource_group_name(bytes: &[u8], mut pos: usize, allow_if_not_exists: bool) -> (String, usize) {
+    pos = skip_ws(bytes, pos);
+    if keyword_at(bytes, pos, "IF") {
+        let after_if = skip_ws(bytes, pos + "IF".len());
+        if allow_if_not_exists && keyword_at(bytes, after_if, "NOT") {
+            let after_not = skip_ws(bytes, after_if + "NOT".len());
+            if keyword_at(bytes, after_not, "EXISTS") {
+                pos = skip_ws(bytes, after_not + "EXISTS".len());
+            }
+        } else if keyword_at(bytes, after_if, "EXISTS") {
+            pos = skip_ws(bytes, after_if + "EXISTS".len());
+        }
+    }
+    read_ident(bytes, pos)
 }
 
 const DESC_COL_MARKER: &str = "__sealdb_desc_col__";
@@ -4747,9 +4767,11 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                 let after_res = skip_ws(bytes, after + "RESOURCE".len());
                 if keyword_at(bytes, after_res, "GROUP") {
                     let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    let (name, _) =
+                        parse_resource_group_name(bytes, after_res + "GROUP".len(), true);
                     out.push_str("SET NAMES '__sealdb_misc__'");
                     ops.push(Some(Statement::CreateResourceGroup(
-                        CreateResourceGroupStmt { raw_sql },
+                        CreateResourceGroupStmt { name, raw_sql },
                     )));
                     i = end;
                     continue;
@@ -4794,9 +4816,47 @@ fn extract_misc_allowlist(sql: &str) -> Result<(String, Vec<Option<Statement>>)>
                     continue;
                 }
             }
+            if keyword_at(bytes, after, "RESOURCE") {
+                let after_res = skip_ws(bytes, after + "RESOURCE".len());
+                if keyword_at(bytes, after_res, "GROUP") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    let mut pos = after_res + "GROUP".len();
+                    let mut if_exists = false;
+                    if keyword_at(bytes, skip_ws(bytes, pos), "IF") {
+                        let after_if = skip_ws(bytes, skip_ws(bytes, pos) + "IF".len());
+                        if keyword_at(bytes, after_if, "EXISTS") {
+                            if_exists = true;
+                            pos = after_if + "EXISTS".len();
+                        }
+                    }
+                    let (name, _) = parse_resource_group_name(bytes, pos, false);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::DropResourceGroup(DropResourceGroupStmt {
+                        name,
+                        if_exists,
+                        raw_sql,
+                    })));
+                    i = end;
+                    continue;
+                }
+            }
         }
         if keyword_at(bytes, i, "ALTER") {
             let after = skip_ws(bytes, i + "ALTER".len());
+            if keyword_at(bytes, after, "RESOURCE") {
+                let after_res = skip_ws(bytes, after + "RESOURCE".len());
+                if keyword_at(bytes, after_res, "GROUP") {
+                    let (raw_sql, end) = capture_raw_stmt(bytes, i);
+                    let (name, _) =
+                        parse_resource_group_name(bytes, after_res + "GROUP".len(), false);
+                    out.push_str("SET NAMES '__sealdb_misc__'");
+                    ops.push(Some(Statement::AlterResourceGroup(
+                        AlterResourceGroupStmt { name, raw_sql },
+                    )));
+                    i = end;
+                    continue;
+                }
+            }
             if keyword_at(bytes, after, "DATABASE") || keyword_at(bytes, after, "SCHEMA") {
                 let kw_len = if keyword_at(bytes, after, "DATABASE") {
                     "DATABASE".len()

@@ -2927,6 +2927,38 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 继续 `ddl/resource_group`（`DROP RESOURCE GROUP` 语法 +
     `information_schema.processlist.RESOURCE_GROUP`）。
 
+### 2026-11-15（`ddl/resource_group` 转正：资源组 DDL + `RESOURCE_GROUP()` 提示 + `processlist`）
+
+- **Phase**: R6
+- **完成**:
+  - `CREATE / ALTER / DROP RESOURCE GROUP` 之前是「解析后 no-op」，`DROP`
+    更是直接 1064。现在三者都有 AST（`Create/Drop/AlterResourceGroupStmt`，
+    带解析出的组名与 `IF EXISTS`），Domain 维护 `name → RU_PER_SEC` 注册表；
+    重复创建报 8251、删改不存在的组报 8252（`IF EXISTS` 时静默）。
+  - `SET GLOBAL tidb_enable_resource_control={on|off|default}` 之前落到
+    `SET GLOBAL <other>` 的 1235。现映射到 Domain 的开关（TiDB 7.4+ 默认 ON），
+    session 级赋值同语义。
+  - `RESOURCE_GROUP(name)` 优化器提示：按语句文本顺序取提示；重复定义报
+    1105（`…only the last definition takes effect: RESOURCE_GROUP(last)`）；
+    特性关闭时按 TiDB 报 8250 并回落 `default`；组不存在报 8252 并回落。
+    提示只对该语句生效，不改变 session 的 `SET RESOURCE GROUP` 值。
+  - `information_schema.processlist` 之前 1146。现为虚拟表（ID / USER /
+    HOST / DB / COMMAND / TIME / STATE / INFO / RESOURCE_GROUP），行来自
+    infoschema 的**线程本地**会话快照；session 在**构建执行器之前**发布
+    （`information_schema` 扫描是 eager 物化的，晚发就看不到），语句结束由
+    guard 清理。
+- **验证**:
+  - `ddl/resource_group`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - `cargo test -p sealdb-parser` 52 passed；`sealdb-session --lib` 111 passed /
+    8 failed，与改动前基线**完全一致**（均为既有 pending 项）
+  - green 78→79（TiKV 可跑 78）
+- **阻塞/风险**:
+  - `processlist` 只暴露当前线程会话（单连接测试模型）；`SHOW PROCESSLIST`、
+    `CONNECTIONS` 等仍走各自路径。
+  - `ALTER USER … RESOURCE GROUP` 仍是 no-op（`ddl/bdr_mode` 需要时再补）。
+- **下一步**:
+  - `db_integration` / `table/tables`。
+
 ---
 
 ## 5. Gate 证据索引

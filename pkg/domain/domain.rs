@@ -67,6 +67,10 @@ pub struct Domain {
     connections: Mutex<HashMap<u64, ConnState>>,
     /// Explicit `LOCK TABLES` holds; distinct from short-lived MDL.
     table_locks: Mutex<TableLockTable>,
+    /// `CREATE RESOURCE GROUP` registry (lowercase name → RU_PER_SEC).
+    resource_groups: Mutex<HashMap<String, Option<u64>>>,
+    /// `tidb_enable_resource_control` (TiDB 7.4+ defaults to ON).
+    resource_control: AtomicBool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -187,6 +191,8 @@ impl Domain {
             shutdown_requested: AtomicBool::new(false),
             connections: Mutex::new(HashMap::new()),
             table_locks: Mutex::new(TableLockTable::default()),
+            resource_groups: Mutex::new(HashMap::new()),
+            resource_control: AtomicBool::new(true),
         })
     }
 
@@ -198,6 +204,58 @@ impl Domain {
     /// True after a successful `SHUTDOWN` statement.
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// `tidb_enable_resource_control`: gates `RESOURCE_GROUP()` hints.
+    pub fn enable_resource_control(&self) -> bool {
+        self.resource_control.load(Ordering::SeqCst)
+    }
+
+    pub fn set_enable_resource_control(&self, on: bool) {
+        self.resource_control.store(on, Ordering::SeqCst);
+    }
+
+    /// Register a `CREATE RESOURCE GROUP`. Returns false when the name is taken.
+    pub fn create_resource_group(&self, name: &str, ru_per_sec: Option<u64>) -> bool {
+        self.resource_groups
+            .lock()
+            .expect("domain resource groups lock")
+            .insert(name.to_ascii_lowercase(), ru_per_sec)
+            .is_none()
+    }
+
+    /// `ALTER RESOURCE GROUP`: false when the group does not exist.
+    pub fn alter_resource_group(&self, name: &str, ru_per_sec: Option<u64>) -> bool {
+        let mut groups = self
+            .resource_groups
+            .lock()
+            .expect("domain resource groups lock");
+        match groups.get_mut(&name.to_ascii_lowercase()) {
+            Some(slot) => {
+                *slot = ru_per_sec;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `DROP RESOURCE GROUP`: false when the group does not exist.
+    pub fn drop_resource_group(&self, name: &str) -> bool {
+        self.resource_groups
+            .lock()
+            .expect("domain resource groups lock")
+            .remove(&name.to_ascii_lowercase())
+            .is_some()
+    }
+
+    pub fn resource_group_exists(&self, name: &str) -> bool {
+        let l = name.to_ascii_lowercase();
+        l == "default"
+            || self
+                .resource_groups
+                .lock()
+                .expect("domain resource groups lock")
+                .contains_key(&l)
     }
 
     /// Register a connection/session id for `KILL`.

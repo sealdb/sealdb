@@ -466,7 +466,7 @@
     {
       "name": "ddl/resource_group",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/resource_group.test",
       "result": "r/ddl/resource_group.result",
       "has_result": true,

@@ -21,6 +21,40 @@ pub fn clear_thread_temp_tables() {
     THREAD_TEMP_TABLES.with(|slot| slot.borrow_mut().clear());
 }
 
+/// One row of `information_schema.processlist`: the session currently running a
+/// statement on this thread. Sessions are pinned to a thread per statement, so a
+/// thread-local snapshot mirrors TiDB's `ShowProcessList` for the single
+/// connection the test harness uses.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessInfo {
+    pub id: u64,
+    pub user: String,
+    pub host: String,
+    pub db: String,
+    pub command: String,
+    pub time: i64,
+    pub state: String,
+    pub info: String,
+    pub resource_group: String,
+}
+
+thread_local! {
+    static THREAD_PROCESS: RefCell<Option<ProcessInfo>> = const { RefCell::new(None) };
+}
+
+/// Publish the executing session's processlist row for `virtual_rows`.
+pub fn set_thread_process(info: ProcessInfo) {
+    THREAD_PROCESS.with(|slot| *slot.borrow_mut() = Some(info));
+}
+
+pub fn clear_thread_process() {
+    THREAD_PROCESS.with(|slot| *slot.borrow_mut() = None);
+}
+
+pub fn thread_process() -> Option<ProcessInfo> {
+    THREAD_PROCESS.with(|slot| slot.borrow().clone())
+}
+
 /// Merge this thread's session-local temporary tables into `is`.
 pub fn apply_thread_temp_tables(is: &mut InfoSchema) {
     THREAD_TEMP_TABLES.with(|slot| {
