@@ -307,6 +307,9 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
         } else {
             ""
         };
+        let table_stats = is.stats().and_then(|h| h.table(db, table.name.o()));
+        let (row_count, avg_row_length, data_length, index_length) =
+            estimate_row_lengths(table, table_stats.as_ref());
         rows.push(vec![
             bytes("def"),
             bytes(db),
@@ -315,11 +318,11 @@ fn tables(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             bytes("InnoDB"),
             Datum::I64(10),
             bytes("Compact"),
+            Datum::I64(row_count as i64),
+            Datum::I64(avg_row_length as i64),
+            Datum::I64(data_length as i64),
             Datum::I64(0),
-            Datum::I64(0),
-            Datum::I64(0),
-            Datum::I64(0),
-            Datum::I64(0),
+            Datum::I64(index_length as i64),
             Datum::I64(0),
             Datum::Null,
             Datum::Null,
@@ -523,7 +526,8 @@ fn tidb_indexes(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     Datum::I64(idx.id),
                     bytes("YES"),
                     bytes(if clustered { "YES" } else { "NO" }),
-                    Datum::I64(0),
+                    // TiDB `IndexInfo.Global`: only a `GLOBAL` index reports 1.
+                    Datum::I64(if idx.global { 1 } else { 0 }),
                     Datum::Null,
                 ]);
             }
@@ -597,17 +601,37 @@ fn table_constraints(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
 }
 
 fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    // TiDB `partitionsCols` (28 columns, SUBPARTITION_* included as NULL —
+    // SealDB has no subpartitioning yet).
     let schema = vec![
         "TABLE_CATALOG".to_string(),
         "TABLE_SCHEMA".to_string(),
         "TABLE_NAME".to_string(),
         "PARTITION_NAME".to_string(),
+        "SUBPARTITION_NAME".to_string(),
         "PARTITION_ORDINAL_POSITION".to_string(),
+        "SUBPARTITION_ORDINAL_POSITION".to_string(),
         "PARTITION_METHOD".to_string(),
+        "SUBPARTITION_METHOD".to_string(),
         "PARTITION_EXPRESSION".to_string(),
+        "SUBPARTITION_EXPRESSION".to_string(),
         "PARTITION_DESCRIPTION".to_string(),
         "TABLE_ROWS".to_string(),
+        "AVG_ROW_LENGTH".to_string(),
+        "DATA_LENGTH".to_string(),
+        "MAX_DATA_LENGTH".to_string(),
+        "INDEX_LENGTH".to_string(),
+        "DATA_FREE".to_string(),
+        "CREATE_TIME".to_string(),
+        "UPDATE_TIME".to_string(),
+        "CHECK_TIME".to_string(),
+        "CHECKSUM".to_string(),
+        "PARTITION_COMMENT".to_string(),
+        "NODEGROUP".to_string(),
+        "TABLESPACE_NAME".to_string(),
         "TIDB_PARTITION_ID".to_string(),
+        "TIDB_PLACEMENT_POLICY_NAME".to_string(),
+        "TIDB_AFFINITY".to_string(),
     ];
     let mut rows = Vec::new();
     for_each_table(is, |db, table| {
@@ -620,6 +644,7 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             PartitionType::List => "LIST",
             PartitionType::Key => "KEY",
         };
+        let table_stats = is.stats().and_then(|h| h.table(db, table.name.o()));
         for (i, def) in part.definitions.iter().enumerate() {
             let desc = if def.in_values.is_empty() {
                 def.less_than.join(",")
@@ -633,25 +658,165 @@ fn partitions(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
                     .collect::<Vec<_>>()
                     .join(",")
             };
+            let (row_count, avg_row_length, data_length, index_length) =
+                estimate_partition_row_lengths(table, table_stats.as_ref(), def.id);
             rows.push(vec![
                 bytes("def"),
                 bytes(db),
                 bytes(table.name.o()),
                 bytes(def.name.o()),
+                Datum::Null,
                 Datum::I64((i + 1) as i64),
+                Datum::Null,
                 bytes(method),
+                Datum::Null,
                 bytes(&part.expr),
+                Datum::Null,
                 if desc.is_empty() {
                     Datum::Null
                 } else {
                     bytes(&desc)
                 },
-                Datum::I64(0),
+                Datum::I64(row_count as i64),
+                Datum::I64(avg_row_length as i64),
+                Datum::I64(data_length as i64),
+                Datum::Null,
+                Datum::I64(index_length as i64),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                bytes(""),
+                Datum::Null,
+                Datum::Null,
                 Datum::I64(def.id),
+                Datum::Null,
+                Datum::Null,
             ]);
         }
     });
     (schema, rows)
+}
+
+/// TiDB `StatsTableRowCache.GetDataAndIndexLength`: fixed-length columns charge
+/// `row_count * StorageLength`, variable-length columns charge the analyzed
+/// `tot_col_size`. Index length sums the key parts' column lengths; a GLOBAL
+/// index is charged at the table level and normal indexes at partition level.
+fn data_and_index_length(
+    info: &TableInfo,
+    stats: Option<&sealdb_statistics::table::Table>,
+    physical_id: i64,
+    row_count: u64,
+) -> (u64, u64) {
+    let partitioned = info.partition.as_ref().is_some_and(|part| part.enable);
+    let mut column_length = Vec::with_capacity(info.columns.len());
+    let mut data_length = 0u64;
+    for col in &info.columns {
+        let length = match col.field_type.storage_length() {
+            Some(len) => row_count.saturating_mul(len),
+            None => match stats.and_then(|s| s.column(col.name.o())) {
+                Some(col_stats) if partitioned && physical_id != info.id => col_stats
+                    .part_tot_col_size
+                    .iter()
+                    .find(|(id, _)| *id == physical_id)
+                    .map(|(_, size)| *size)
+                    .unwrap_or(0),
+                Some(col_stats) => col_stats.tot_col_size,
+                None => 0,
+            },
+        };
+        data_length += length;
+        column_length.push(length);
+    }
+    let mut index_length = 0u64;
+    for index in &info.indices {
+        if partitioned {
+            // TiDB: GLOBAL indexes are charged once at table level, the rest
+            // per partition.
+            if index.global && info.id != physical_id {
+                continue;
+            }
+            if !index.global && info.id == physical_id {
+                continue;
+            }
+        }
+        for part in &index.columns {
+            if let Some(pos) = info
+                .columns
+                .iter()
+                .position(|c| c.name.o().eq_ignore_ascii_case(part.name.o()))
+            {
+                index_length += column_length[pos];
+            }
+        }
+    }
+    (data_length, index_length)
+}
+
+/// TiDB `StatsTableRowCache.EstimateDataLength` for `information_schema.tables`:
+/// a partitioned table's rows and data live under its partitions, while GLOBAL
+/// indexes are charged at the table level.
+fn estimate_row_lengths(
+    info: &TableInfo,
+    stats: Option<&sealdb_statistics::table::Table>,
+) -> (u64, u64, u64, u64) {
+    let mut row_count = stats.map(|s| s.count).unwrap_or(0);
+    let (mut data_length, mut index_length) =
+        data_and_index_length(info, stats, info.id, row_count);
+    if let Some(part) = info.partition.as_ref().filter(|part| part.enable) {
+        row_count = 0;
+        data_length = 0;
+        for def in &part.definitions {
+            let part_rows = stats
+                .and_then(|s| {
+                    s.part_counts
+                        .iter()
+                        .find(|(id, _)| *id == def.id)
+                        .map(|(_, count)| *count)
+                })
+                .unwrap_or(0);
+            let (part_data, part_index) =
+                data_and_index_length(info, stats, def.id, part_rows);
+            row_count += part_rows;
+            data_length += part_data;
+            index_length += part_index;
+        }
+    }
+    if info.is_sequence() {
+        row_count = 1;
+    }
+    let avg_row_length = if row_count == 0 {
+        0
+    } else {
+        data_length / row_count
+    };
+    (row_count, avg_row_length, data_length, index_length)
+}
+
+/// One partition's `TABLE_ROWS` / `AVG_ROW_LENGTH` / `DATA_LENGTH` /
+/// `INDEX_LENGTH` (TiDB `infoschema/tables.go` partition branch).
+fn estimate_partition_row_lengths(
+    info: &TableInfo,
+    stats: Option<&sealdb_statistics::table::Table>,
+    physical_id: i64,
+) -> (u64, u64, u64, u64) {
+    let row_count = stats
+        .and_then(|s| {
+            s.part_counts
+                .iter()
+                .find(|(id, _)| *id == physical_id)
+                .map(|(_, count)| *count)
+        })
+        .unwrap_or(0);
+    let (data_length, index_length) =
+        data_and_index_length(info, stats, physical_id, row_count);
+    let avg_row_length = if row_count == 0 {
+        0
+    } else {
+        data_length / row_count
+    };
+    (row_count, avg_row_length, data_length, index_length)
 }
 
 fn character_sets() -> (Vec<String>, Vec<Vec<Datum>>) {

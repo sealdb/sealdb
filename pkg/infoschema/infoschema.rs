@@ -42,6 +42,10 @@ pub struct InfoSchema {
     /// table name. They never appear in `dbs` / `tables`, so catalog listings
     /// (`SHOW DATABASES` / `information_schema.schemata`) stay unchanged.
     temp_tables: HashMap<(String, String), TableInfo>,
+    /// `mysql.stats_meta` / `mysql.stats_histograms` equivalent, attached by
+    /// `Domain::infoschema()` so `information_schema.tables` / `PARTITIONS` can
+    /// report `TABLE_ROWS` / `DATA_LENGTH` / `INDEX_LENGTH`.
+    stats: Option<std::sync::Arc<sealdb_statistics::handle::Handle>>,
     schema_version: i64,
 }
 
@@ -55,6 +59,7 @@ impl InfoSchema {
             dbs: HashMap::new(),
             tables: HashMap::new(),
             temp_tables: HashMap::new(),
+            stats: None,
             schema_version: meta.get_schema_version()?,
         };
         for db in meta.list_databases()? {
@@ -66,6 +71,18 @@ impl InfoSchema {
             is.dbs.insert(db_l, db);
         }
         Ok(is)
+    }
+
+    /// Attach the domain statistics handle (TiDB infoschema holds
+    /// `TableStats`); `information_schema.tables` reads row/data/index lengths
+    /// from it.
+    pub fn with_stats(mut self, stats: std::sync::Arc<sealdb_statistics::handle::Handle>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    pub fn stats(&self) -> Option<&sealdb_statistics::handle::Handle> {
+        self.stats.as_deref()
     }
 
     pub fn schema_meta_version(&self) -> i64 {

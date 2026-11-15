@@ -486,7 +486,7 @@ impl Domain {
         // Session-local temporary tables are only visible to the statement
         // currently executing on this thread.
         sealdb_infoschema::infoschema::apply_thread_temp_tables(&mut is);
-        is
+        is.with_stats(Arc::clone(&self.stats))
     }
 
     pub fn storage(&self) -> Arc<dyn Storage> {
