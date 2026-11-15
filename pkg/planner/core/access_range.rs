@@ -75,8 +75,14 @@ fn index_key_parts(info: &TableInfo, index: &IndexInfo) -> Option<Vec<KeyPart>> 
                 field_type: column_info.field_type.clone(),
             });
         }
-    } else if let Some(handle) = info.handle_column() {
-        if !covered(&parts, handle.name.o()) {
+    } else if info.pk_is_handle {
+        // Only an integer PRIMARY KEY has a row handle named after a column.
+        // `handle_column()` falls back to the first INT column for legacy
+        // tables, which a heap table must not use: its key carries the hidden
+        // `_tidb_rowid` (so `KEY(name)` + `id > 1` stays a row filter).
+        if let Some(handle) = info.handle_column()
+            && !covered(&parts, handle.name.o())
+        {
             parts.push(KeyPart {
                 column: handle.name.o().to_string(),
                 field_type: handle.field_type.clone(),
