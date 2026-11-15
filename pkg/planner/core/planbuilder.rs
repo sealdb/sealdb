@@ -673,6 +673,19 @@ impl PlanBuilder {
                 }
                 // Optional Cascades identity pass (SEALDB_CASCADES=1); RBO plan kept.
                 let _ = crate::cascades::maybe_optimize("select")?;
+                if std::env::var("SEALDB_DEBUG_PLAN").is_ok() {
+                    eprintln!(
+                        "PLAN[{}]:\n{}",
+                        select.text,
+                        super::explain::plan_outline(&plan)
+                    );
+                    for row in super::explain::explain_rows(&plan) {
+                        eprintln!(
+                            "  {}|{}|{}|{}|{}",
+                            row.id, row.est_rows, row.task, row.access, row.info
+                        );
+                    }
+                }
                 Ok(plan)
             }
             Statement::Insert(insert) => Ok(PhysicalPlan::Insert {

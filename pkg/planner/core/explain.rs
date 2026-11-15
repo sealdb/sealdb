@@ -6249,6 +6249,23 @@ fn join_role_label(
     }
 }
 
+/// Debug helper: indented operator outline (env-gated plan tracing).
+pub fn plan_outline(plan: &PhysicalPlan) -> String {
+    fn go(p: &PhysicalPlan, depth: usize, out: &mut String) {
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
+        out.push_str(dot_op_name(p));
+        out.push('\n');
+        for child in children_of(p) {
+            go(child, depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    go(plan, 0, &mut out);
+    out
+}
+
 fn children_of(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
     match plan {
         PhysicalPlan::Projection { child, .. }
