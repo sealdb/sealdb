@@ -831,7 +831,7 @@ impl Session {
                             "No database selected",
                         ));
                     }
-                    stats.delete(&schema, &name);
+                    stats.soft_delete(&schema, &name);
                 }
                 self.domain.persist_stats()?;
                 return Ok(empty_result());
@@ -2759,6 +2759,7 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
             tables: Vec::new(),
             indexes: Vec::new(),
             bucket_count: None,
+            topn_count: None,
         });
         session.execute_one(&analyze)?;
     }
@@ -2932,7 +2933,15 @@ fn eval_set_subquery(session: &Session, value: &str) -> Result<sealdb_types::Dat
         return Ok(parse_set_literal(value));
     };
     if select.from.is_some() || select.from_item.is_some() || !select.joins.is_empty() {
-        return Ok(parse_set_literal(value));
+        // `SET @a = (SELECT …)`: TiDB evaluates the scalar subquery, so run it
+        // and keep the first cell (no rows → NULL).
+        let result = session.execute_stmt(inner)?;
+        return Ok(result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or(sealdb_types::Datum::Null));
     }
     let [field] = select.fields.as_slice() else {
         return Ok(parse_set_literal(value));

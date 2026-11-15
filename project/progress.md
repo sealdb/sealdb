@@ -2891,6 +2891,42 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `ddl/resource_group`（`DROP RESOURCE GROUP` 语法 +
     `information_schema.processlist.RESOURCE_GROUP`）。
 
+### 2026-11-15（`executor/kv` 转正：`mysql.stats_*` 系统表 + `ANALYZE … WITH n TOPN`）
+
+- **Phase**: R7
+- **完成**:
+  - `mysql.stats_meta` / `stats_histograms` / `stats_buckets` / `stats_top_n`
+    之前都是 1146。现按 `information_schema` 虚拟表的同一机制接入：planner
+    在 FROM 上识别这四个表并生成 `MemTableScan`，行由统计 handle 现场拼装
+    （`stats_meta` 的 modify_count/count、每列 `hist_id`=列序号、桶与 TopN
+    逐条展开），表 id 取自 infoschema 的 `TableInfo.id`（与
+    `TIDB_TABLE_ID` 一致）。
+  - `DROP STATS` 改为 TiDB 的**软删除**：`stats_meta` 的 count/modify_count
+    与 `stats_histograms` 行保留（直方图计数清零），buckets/top_n 行删除。
+    handle 新增 `dropped` 快照，`table()` 只读活跃统计，因此优化器照旧回落
+    到伪统计（`ddl/db_change` 等不受影响）；重新 ANALYZE 会清除该快照。
+  - `ANALYZE TABLE … ALL COLUMNS WITH n TOPN[, m BUCKETS]` 之前 1064。
+    新增 `AnalyzeTableStmt.topn_count`，选项解析支持 TOPN/BUCKETS 任意顺序
+    与逗号组合；analyzer 的 TopN 容量与"TopN 是否已覆盖全部 NDV"判断改用
+    该值（`WITH 2 TOPN` 会让剩余值进直方图，从而产生 bucket）。
+  - `SET @a = (SELECT … FROM …)` 之前只处理无 FROM 的常量子查询，带表时把
+    子查询文本当成字符串存进用户变量。现直接执行该子查询并取首行首列。
+  - `SELECT count(*)>0 …` 之前 1305（聚合函数被当成普通函数求值）：planner
+    的聚合判定改为递归（`expr_contains_agg`），HashAgg 新增
+    `OutputItem::Expr`——嵌套聚合先登记为聚合项，外层表达式在 finish 阶段
+    以聚合结果列为输入求值。
+- **验证**:
+  - `executor/kv`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - 全量 memory：`PASS: memory=85 skipped=169`（77 green + 8 local）
+  - manifest → `green`，green 77→78（TiKV 可跑 77）
+- **阻塞/风险**:
+  - `mysql.stats_*` 的列只是子集（够当前语料），`cm_sketch`、`correlation`
+    等为占位；`SHOW STATS_*` 仍走各自的虚拟 SHOW 路径。
+  - 软删除快照只在内存，不随 `mstats` 持久化。
+- **下一步**:
+  - 继续 `ddl/resource_group`（`DROP RESOURCE GROUP` 语法 +
+    `information_schema.processlist.RESOURCE_GROUP`）。
+
 ---
 
 ## 5. Gate 证据索引

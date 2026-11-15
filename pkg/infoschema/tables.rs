@@ -41,6 +41,12 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
             "EVENT_OBJECT_TABLE",
         ])),
         "routines" => Ok(empty(&["ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE"])),
+        // `mysql.stats_*` (TiDB's statistics system tables), read from the
+        // statistics handle so `select … from mysql.stats_meta` works.
+        "stats_meta" => Ok(stats_meta(is)),
+        "stats_histograms" => Ok(stats_histograms(is)),
+        "stats_buckets" => Ok(stats_buckets(is)),
+        "stats_top_n" => Ok(stats_top_n(is)),
         other => Err(Error::new(
             ERR_NO_SUCH_TABLE,
             format!("Table 'information_schema.{other}' doesn't exist"),
@@ -1195,6 +1201,206 @@ const COLLATIONS: &[Collation] = &[
         is_default: false,
     },
 ];
+
+/// One `mysql.stats_*` row source: the physical table id plus the table's
+/// statistics (live, or the soft-deleted snapshot from `DROP STATS`).
+fn stats_rows(is: &InfoSchema) -> Vec<(i64, sealdb_statistics::table::Table)> {
+    let Some(stats) = is.stats() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for db in is.all_schemas() {
+        let db_name = db.name.l().to_string();
+        if db_name.eq_ignore_ascii_case("information_schema")
+            || db_name.eq_ignore_ascii_case("mysql")
+        {
+            continue;
+        }
+        for table in is.schema_tables(&db_name) {
+            let name = table.name.l().to_string();
+            if let Some(raw) = stats.raw_table(&db_name, &name) {
+                out.push((table.id, raw));
+            }
+        }
+    }
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
+fn stats_meta(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let columns = vec![
+        "table_id".to_string(),
+        "version".to_string(),
+        "modify_count".to_string(),
+        "count".to_string(),
+        "last_stats_histograms_version".to_string(),
+    ];
+    let rows = stats_rows(is)
+        .into_iter()
+        .map(|(id, stats)| {
+            vec![
+                Datum::I64(id),
+                Datum::I64(stats.version as i64),
+                Datum::I64(stats.modify_count as i64),
+                Datum::I64(stats.count as i64),
+                Datum::I64(stats.version as i64),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+fn stats_histograms(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let columns = vec![
+        "table_id".to_string(),
+        "is_index".to_string(),
+        "hist_id".to_string(),
+        "distinct_count".to_string(),
+        "null_count".to_string(),
+        "modify_count".to_string(),
+        "version".to_string(),
+        "cm_sketch".to_string(),
+        "stats_ver".to_string(),
+        "last_analyze_pos".to_string(),
+        "tot_col_size".to_string(),
+        "correlation".to_string(),
+        "last_update_version".to_string(),
+        "flag".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for (id, stats) in stats_rows(is) {
+        for (pos, (_, column)) in stats.columns.iter().enumerate() {
+            rows.push(vec![
+                Datum::I64(id),
+                Datum::I64(0),
+                Datum::I64(pos as i64 + 1),
+                Datum::I64(column.ndv as i64),
+                Datum::I64(column.null_count as i64),
+                Datum::I64(0),
+                Datum::I64(stats.version as i64),
+                Datum::Null,
+                Datum::I64(2),
+                bytes(""),
+                Datum::I64(column.tot_col_size as i64),
+                Datum::I64(0),
+                Datum::I64(stats.version as i64),
+                Datum::I64(0),
+            ]);
+        }
+        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+            rows.push(vec![
+                Datum::I64(id),
+                Datum::I64(1),
+                Datum::I64(pos as i64 + 1),
+                Datum::I64(index.ndv as i64),
+                Datum::I64(index.null_count as i64),
+                Datum::I64(0),
+                Datum::I64(stats.version as i64),
+                Datum::Null,
+                Datum::I64(index.stats_ver as i64),
+                bytes(""),
+                Datum::I64(0),
+                Datum::I64(0),
+                Datum::I64(stats.version as i64),
+                Datum::I64(0),
+            ]);
+        }
+    }
+    (columns, rows)
+}
+
+fn stats_buckets(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let columns = vec![
+        "table_id".to_string(),
+        "is_index".to_string(),
+        "hist_id".to_string(),
+        "bucket_id".to_string(),
+        "count".to_string(),
+        "repeats".to_string(),
+        "upper_bound".to_string(),
+        "lower_bound".to_string(),
+        "ndv".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for (id, stats) in stats_rows(is) {
+        for (pos, (_, column)) in stats.columns.iter().enumerate() {
+            let Some(histogram) = column.histogram.as_ref() else {
+                continue;
+            };
+            for (bucket_id, bucket) in histogram.buckets.iter().enumerate() {
+                rows.push(vec![
+                    Datum::I64(id),
+                    Datum::I64(0),
+                    Datum::I64(pos as i64 + 1),
+                    Datum::I64(bucket_id as i64),
+                    Datum::I64(bucket.count as i64),
+                    Datum::I64(bucket.repeats as i64),
+                    bytes(&bucket.upper),
+                    bytes(&bucket.lower),
+                    Datum::I64(bucket.ndv as i64),
+                ]);
+            }
+        }
+        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+            let Some(histogram) = index.histogram.as_ref() else {
+                continue;
+            };
+            for (bucket_id, bucket) in histogram.buckets.iter().enumerate() {
+                rows.push(vec![
+                    Datum::I64(id),
+                    Datum::I64(1),
+                    Datum::I64(pos as i64 + 1),
+                    Datum::I64(bucket_id as i64),
+                    Datum::I64(bucket.count as i64),
+                    Datum::I64(bucket.repeats as i64),
+                    bytes(&String::from_utf8_lossy(&bucket.upper)),
+                    bytes(&String::from_utf8_lossy(&bucket.lower)),
+                    Datum::I64(bucket.ndv as i64),
+                ]);
+            }
+        }
+    }
+    (columns, rows)
+}
+
+fn stats_top_n(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let columns = vec![
+        "table_id".to_string(),
+        "is_index".to_string(),
+        "hist_id".to_string(),
+        "value".to_string(),
+        "count".to_string(),
+    ];
+    let mut rows = Vec::new();
+    for (id, stats) in stats_rows(is) {
+        for (pos, (_, column)) in stats.columns.iter().enumerate() {
+            let Some(topn) = column.topn.as_ref() else {
+                continue;
+            };
+            for (value, count) in &topn.items {
+                rows.push(vec![
+                    Datum::I64(id),
+                    Datum::I64(0),
+                    Datum::I64(pos as i64 + 1),
+                    bytes(value),
+                    Datum::I64(*count as i64),
+                ]);
+            }
+        }
+        for (pos, (_, index)) in stats.indices.iter().enumerate() {
+            for (value, count) in &index.topn {
+                rows.push(vec![
+                    Datum::I64(id),
+                    Datum::I64(1),
+                    Datum::I64(pos as i64 + 1),
+                    bytes(&String::from_utf8_lossy(value)),
+                    Datum::I64(*count as i64),
+                ]);
+            }
+        }
+    }
+    (columns, rows)
+}
 
 fn bytes(value: &str) -> Datum {
     Datum::Bytes(value.as_bytes().to_vec())

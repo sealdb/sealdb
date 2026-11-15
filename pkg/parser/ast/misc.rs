@@ -417,6 +417,9 @@ pub struct AnalyzeTableStmt {
     pub indexes: Vec<String>,
     /// `WITH n BUCKETS`: histogram bucket count (TiDB default 256).
     pub bucket_count: Option<u64>,
+    /// `WITH n TOPN`: most-frequent-value count kept per histogram (TiDB
+    /// default 20).
+    pub topn_count: Option<u64>,
 }
 
 impl AnalyzeTableStmt {
@@ -448,6 +451,9 @@ impl AnalyzeTableStmt {
                 }
                 ctx.write_name(name);
             }
+        }
+        if let Some(topn) = self.topn_count {
+            ctx.write_str(&format!(" WITH {topn} TOPN"));
         }
         if let Some(buckets) = self.bucket_count {
             ctx.write_str(&format!(" WITH {buckets} BUCKETS"));

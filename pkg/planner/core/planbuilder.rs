@@ -2831,6 +2831,19 @@ fn is_information_schema(from: &TableName, current_db: &str) -> bool {
         .is_some_and(|schema| schema.eq_ignore_ascii_case("information_schema"))
 }
 
+/// `mysql.stats_meta` / `stats_histograms` / `stats_buckets` / `stats_top_n`
+/// are virtual: they read the statistics handle rather than any stored rows.
+fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
+    from.schema
+        .as_deref()
+        .or(Some(current_db))
+        .is_some_and(|schema| schema.eq_ignore_ascii_case("mysql"))
+        && matches!(
+            from.name.to_ascii_lowercase().as_str(),
+            "stats_meta" | "stats_histograms" | "stats_buckets" | "stats_top_n"
+        )
+}
+
 fn named_cte(with: Option<&WithClause>, name: &str) -> bool {
     with.is_some_and(|with| with.find(name).is_some())
 }
@@ -12646,7 +12659,7 @@ fn is_star_select(select: &SelectStmt) -> bool {
 fn needs_hash_agg(select: &SelectStmt) -> bool {
     !select.group_by.is_empty()
         || select.distinct
-        || select.fields.iter().any(|f| is_agg_expr(&f.expr))
+        || select.fields.iter().any(|f| expr_contains_agg(&f.expr))
         // `HAVING sum(c) = 1` without GROUP BY still forms a single group.
         || select.having.as_ref().is_some_and(expr_contains_agg)
 }
@@ -21939,7 +21952,7 @@ fn access_plan_inner(
     let join_keys = side_join_key_columns(select, from);
     let select = side_select.as_ref().unwrap_or(select);
 
-    if is_information_schema(from, current_db) {
+    if is_information_schema(from, current_db) || is_mysql_stats_table(from, current_db) {
         return PhysicalPlan::InfoSchema {
             table: from.name.clone(),
             pushed: None,

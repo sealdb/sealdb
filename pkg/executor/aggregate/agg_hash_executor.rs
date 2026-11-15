@@ -22,6 +22,9 @@ enum OutputItem {
     /// Non-grouped column allowed when sql_mode lacks ONLY_FULL_GROUP_BY
     /// (MySQL "any value" — first row in the group).
     Any(usize),
+    /// Expression over aggregates (`count(*) > 0`): evaluated once the group's
+    /// aggregate results are known, with aggregate calls rewritten to columns.
+    Expr(ExprNode),
 }
 
 pub struct HashAggExec {
@@ -45,6 +48,7 @@ pub struct HashAggExec {
 impl HashAggExec {
     pub fn new(select: &SelectStmt, child: Box<dyn Executor>) -> Result<Self> {
         let mut agg_specs = Vec::new();
+        let mut nested_agg_names: Vec<String> = Vec::new();
         let mut any_exprs = Vec::new();
         let mut outputs = Vec::new();
         let mut schema = Vec::new();
@@ -83,12 +87,33 @@ impl HashAggExec {
                 outputs.push(OutputItem::Group(idx));
                 continue;
             }
+            // `count(*) > 0`: an aggregate nested in a wider expression. Add the
+            // aggregate to the group state and defer the outer expression to
+            // the finish step (`rewrite_having` maps aggregate calls to the
+            // output column names those results are exposed under).
+            let nested = collect_aggs(&field.expr);
+            if !nested.is_empty() {
+                for agg in &nested {
+                    let restored = restore_expr(&ExprNode::Func(agg.clone()));
+                    if agg_specs
+                        .iter()
+                        .any(|existing| restore_expr(&ExprNode::Func(existing.clone())).eq_ignore_ascii_case(&restored))
+                    {
+                        continue;
+                    }
+                    agg_specs.push(agg.clone());
+                    nested_agg_names.push(restored);
+                }
+                outputs.push(OutputItem::Expr(rewrite_having(&field.expr, select)));
+                continue;
+            }
             // Loose sql_mode / session already rejected ONLY_FULL_GROUP_BY violations.
             outputs.push(OutputItem::Any(any_exprs.len()));
             any_exprs.push(field.expr.clone());
         }
         let mut extra_aggs = 0;
         let mut filter_schema = schema.clone();
+        filter_schema.extend(nested_agg_names);
         if let Some(having) = &select.having {
             for agg in collect_aggs(having) {
                 let restored = restore_expr(&ExprNode::Func(agg.clone()));
@@ -345,13 +370,34 @@ impl HashAggExec {
         any_vals: &[Datum],
         aggs: &mut [Box<dyn crate::aggfuncs::AggFunc>],
     ) -> Result<Vec<Datum>> {
+        let finals: Vec<Datum> = aggs
+            .iter_mut()
+            .map(|agg| agg.finalize())
+            .collect::<Result<Vec<_>>>()?;
         self.outputs
             .iter()
             .map(|item| match item {
                 OutputItem::Group(idx) => Ok(keys.get(*idx).cloned().unwrap_or(Datum::Null)),
-                OutputItem::Agg(idx) => aggs[*idx].finalize(),
+                OutputItem::Agg(idx) => Ok(finals
+                    .get(*idx)
+                    .cloned()
+                    .unwrap_or(Datum::Null)),
                 OutputItem::Const(d) => Ok(d.clone()),
                 OutputItem::Any(idx) => Ok(any_vals.get(*idx).cloned().unwrap_or(Datum::Null)),
+                OutputItem::Expr(expr) => {
+                    let mut schema =
+                        Vec::with_capacity(self.group_by.len() + self.agg_specs.len());
+                    let mut row = Vec::with_capacity(schema.capacity());
+                    for (idx, group) in self.group_by.iter().enumerate() {
+                        schema.push(restore_expr(group));
+                        row.push(keys.get(idx).cloned().unwrap_or(Datum::Null));
+                    }
+                    for (idx, spec) in self.agg_specs.iter().enumerate() {
+                        schema.push(restore_expr(&ExprNode::Func(spec.clone())));
+                        row.push(finals.get(idx).cloned().unwrap_or(Datum::Null));
+                    }
+                    eval_expr_with_row(expr, &schema, &row)
+                }
             })
             .collect()
     }

@@ -846,7 +846,7 @@
     {
       "name": "executor/kv",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/kv.test",
       "result": "r/executor/kv.result",
       "has_result": true,

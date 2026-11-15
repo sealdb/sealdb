@@ -43,9 +43,10 @@ impl Executor for AnalyzeExec {
         };
         let indexes = analyze.indexes.clone();
         let buckets = analyze.bucket_count;
+        let topn = analyze.topn_count;
         let tables: Vec<_> = analyze.all_tables().into_iter().cloned().collect();
         for table in &tables {
-            self.analyze_one(table, &indexes, buckets)?;
+            self.analyze_one(table, &indexes, buckets, topn)?;
         }
         Ok(())
     }
@@ -69,6 +70,7 @@ impl AnalyzeExec {
         table: &sealdb_parser::ast::TableName,
         indexes: &[String],
         buckets: Option<u64>,
+        topn_size: Option<u64>,
     ) -> Result<()> {
         let (schema, name) = table.qualified(&self.current_db);
         if schema.is_empty() {
@@ -89,8 +91,8 @@ impl AnalyzeExec {
             &info.physical_ids(),
         )?;
         let index_cols = resolve_index_columns(&info, indexes)?;
-        let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets);
-        let index_stats = collect_index_stats(&info, &rows, buckets);
+        let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets, topn_size);
+        let index_stats = collect_index_stats(&info, &rows, buckets, topn_size);
         // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
         // partition's `DATA_LENGTH` reads its own count, not the table total.
         let part_counts: Vec<(i64, u64)> = if info.partition.is_some() {
@@ -176,6 +178,7 @@ fn collect_index_stats(
     info: &TableInfo,
     rows: &[crate::table_reader::ScannedRow],
     buckets: Option<u64>,
+    topn_size: Option<u64>,
 ) -> Vec<(String, IndexStats)> {
     let max_buckets = buckets
         .map(|n| n as usize)
@@ -229,7 +232,8 @@ fn collect_index_stats(
         let mut counts: Vec<(Vec<u8>, u64)> = freq.into_iter().collect();
         counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let ndv = counts.len() as u64;
-        let (topn, histogram) = if counts.len() <= Table::DEFAULT_TOPN {
+        let topn_max = topn_size.map(|n| n as usize).unwrap_or(Table::DEFAULT_TOPN);
+        let (topn, histogram) = if counts.len() <= topn_max {
             (
                 counts,
                 IndexHistogram {
@@ -238,7 +242,7 @@ fn collect_index_stats(
                 },
             )
         } else {
-            let rest = counts.split_off(Table::DEFAULT_TOPN);
+            let rest = counts.split_off(topn_max);
             let mut keys: Vec<Vec<u8>> = Vec::new();
             for (key, count) in &rest {
                 for _ in 0..*count {
@@ -296,6 +300,7 @@ fn collect_column_stats(
     rows: &[crate::table_reader::ScannedRow],
     index_cols: Option<&HashSet<String>>,
     buckets: Option<u64>,
+    topn_size: Option<u64>,
 ) -> Vec<(String, ColumnStats)> {
     let mut columns = Vec::new();
     for (idx, col) in info.columns.iter().enumerate() {
@@ -347,7 +352,8 @@ fn collect_column_stats(
         // value (`haveAllNDV`) no bucket is built, so the histogram keeps only
         // the NDV/null metadata and every estimate comes from the TopN rows
         // (`analyze table t all columns with 1 buckets` over 4 distinct values).
-        let histogram = Some(if distinct.len() <= Table::DEFAULT_TOPN {
+        let topn_max = topn_size.map(|n| n as usize).unwrap_or(Table::DEFAULT_TOPN);
+        let histogram = Some(if distinct.len() <= topn_max {
             Histogram {
                 ndv: distinct.len() as u64,
                 buckets: Vec::new(),
@@ -355,7 +361,7 @@ fn collect_column_stats(
         } else {
             Histogram::from_sorted(&values, max_buckets)
         });
-        let topn = Some(TopN::from_counts(&counts, Table::DEFAULT_TOPN));
+        let topn = Some(TopN::from_counts(&counts, topn_max));
         // Planner selectivity for partition pruning needs exact counts; keep
         // them only for narrow columns.
         let value_counts = (distinct.len() <= Table::MAX_VALUE_COUNTS).then(|| {

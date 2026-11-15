@@ -246,9 +246,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             prepare.sql = sql;
         }
         if let Statement::AnalyzeTable(analyze) = &mut lowered {
-            if let Some((indexes, tables, buckets)) = analyze_extras.next().flatten() {
+            if let Some((indexes, tables, buckets, topn)) = analyze_extras.next().flatten() {
                 analyze.indexes = indexes;
                 analyze.bucket_count = buckets;
+                analyze.topn_count = topn;
                 if tables.len() > 1 {
                     analyze.tables = tables
                         .into_iter()
@@ -2684,6 +2685,7 @@ fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
         tables: Vec::new(),
         indexes: Vec::new(),
         bucket_count: None,
+        topn_count: None,
     }))
 }
 
@@ -4290,30 +4292,48 @@ fn push_sql_char(out: &mut String, sql: &str, i: usize) -> usize {
 /// sqlparser rejects TiDB `ANALYZE TABLE t INDEX idx [, idx2]` and
 /// `ANALYZE TABLE t1, t2 ALL COLUMNS`. Strip INDEX / ALL COLUMNS / extra
 /// tables and re-attach after lower. Returns `(indexes, table_names)`.
-/// TiDB `WITH <n> BUCKETS` analyze option: returns the position after the
-/// option and the requested histogram bucket count.
-fn read_analyze_buckets(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64>) {
-    let k = skip_ws(bytes, k);
-    if !keyword_at(bytes, k, "WITH") {
-        return (k, None);
+/// TiDB analyze options after the object list: `WITH <n> BUCKETS` and/or
+/// `WITH <n> TOPN` (comma-separated, any order). Returns the position after
+/// the options plus the requested histogram bucket / TopN sizes.
+fn read_analyze_options(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64>, Option<u64>) {
+    let start_pos = skip_ws(bytes, k);
+    if !keyword_at(bytes, start_pos, "WITH") {
+        return (start_pos, None, None);
     }
-    let mut p = skip_ws(bytes, k + "WITH".len());
-    let start = p;
-    while p < bytes.len() && bytes[p].is_ascii_digit() {
-        p += 1;
+    let mut p = skip_ws(bytes, start_pos + "WITH".len());
+    let mut buckets = None;
+    let mut topn = None;
+    loop {
+        let start = p;
+        while p < bytes.len() && bytes[p].is_ascii_digit() {
+            p += 1;
+        }
+        let digits = &sql[start..p];
+        let Ok(count) = digits.parse::<u64>() else {
+            return (start_pos, None, None);
+        };
+        let after = skip_ws(bytes, p);
+        if keyword_at(bytes, after, "BUCKETS") {
+            buckets = Some(count);
+            p = skip_ws(bytes, after + "BUCKETS".len());
+        } else if keyword_at(bytes, after, "TOPN") {
+            topn = Some(count);
+            p = skip_ws(bytes, after + "TOPN".len());
+        } else {
+            return (start_pos, None, None);
+        }
+        if p < bytes.len() && bytes[p] == b',' {
+            p = skip_ws(bytes, p + 1);
+            continue;
+        }
+        break;
     }
-    let digits = &sql[start..p];
-    let after = skip_ws(bytes, p);
-    if digits.is_empty() || !keyword_at(bytes, after, "BUCKETS") {
-        return (k, None);
-    }
-    let count = digits.parse().ok();
-    (skip_ws(bytes, after + "BUCKETS".len()), count)
+    (p, buckets, topn)
 }
 
 fn extract_analyze_index(
     sql: &str,
-) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>, Option<u64>)>>)> {
+) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut extras = Vec::new();
@@ -4377,8 +4397,8 @@ fn extract_analyze_index(
                         break;
                     }
                     out.push_str(&sql[i..first_end]);
-                    let (k, buckets) = read_analyze_buckets(bytes, sql, k);
-                    extras.push(Some((names, table_names, buckets)));
+                    let (k, buckets, topn) = read_analyze_options(bytes, sql, k);
+                    extras.push(Some((names, table_names, buckets, topn)));
                     i = k;
                     continue;
                 }
@@ -4387,19 +4407,19 @@ fn extract_analyze_index(
                     let after_all = skip_ws(bytes, j + "ALL".len());
                     if keyword_at(bytes, after_all, "COLUMNS") {
                         out.push_str(&sql[i..first_end]);
-                        let (k, buckets) = read_analyze_buckets(
+                        let (k, buckets, topn) = read_analyze_options(
                             bytes,
                             sql,
                             skip_ws(bytes, after_all + "COLUMNS".len()),
                         );
-                        extras.push(Some((Vec::new(), table_names, buckets)));
+                        extras.push(Some((Vec::new(), table_names, buckets, topn)));
                         i = k;
                         continue;
                     }
                 }
                 out.push_str(&sql[i..first_end]);
-                let (k, buckets) = read_analyze_buckets(bytes, sql, j);
-                extras.push(Some((Vec::new(), table_names, buckets)));
+                let (k, buckets, topn) = read_analyze_options(bytes, sql, j);
+                extras.push(Some((Vec::new(), table_names, buckets, topn)));
                 i = k;
                 continue;
             }

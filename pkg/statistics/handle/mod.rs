@@ -12,12 +12,17 @@ pub const STATS_STORAGE_KEY: &[u8] = b"mstats";
 
 pub struct Handle {
     inner: Mutex<HashMap<(String, String), Table>>,
+    /// Soft-deleted stats (TiDB `DROP STATS`): `mysql.stats_meta` /
+    /// `stats_histograms` keep their rows with zeroed counters while the
+    /// buckets and TopN are gone. The planner never sees these entries.
+    dropped: Mutex<HashMap<(String, String), Table>>,
 }
 
 impl Handle {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            dropped: Mutex::new(HashMap::new()),
         }
     }
 
@@ -25,13 +30,13 @@ impl Handle {
         let mut stats = stats;
         // ANALYZE refreshes count/histograms and clears the modify delta.
         stats.modify_count = 0;
-        self.inner.lock().expect("stats lock").insert(
-            (
-                db.into().to_ascii_lowercase(),
-                table.into().to_ascii_lowercase(),
-            ),
-            stats,
+        let key = (
+            db.into().to_ascii_lowercase(),
+            table.into().to_ascii_lowercase(),
         );
+        // A fresh ANALYZE revives a soft-deleted (`DROP STATS`) table.
+        self.dropped.lock().expect("stats lock").remove(&key);
+        self.inner.lock().expect("stats lock").insert(key, stats);
     }
 
     pub fn table(&self, db: &str, table: &str) -> Option<Table> {
@@ -57,6 +62,54 @@ impl Handle {
     pub fn delete(&self, db: &str, table: &str) {
         let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
         self.inner.lock().expect("stats lock").remove(&key);
+        self.dropped.lock().expect("stats lock").remove(&key);
+    }
+
+    /// TiDB `DROP STATS` soft delete: zero the histogram metadata but keep the
+    /// `stats_meta` / `stats_histograms` rows, and drop buckets + TopN. The
+    /// planner falls back to pseudo statistics because `table()` skips these.
+    pub fn soft_delete(&self, db: &str, table: &str) {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        let mut inner = self.inner.lock().expect("stats lock");
+        let Some(mut stats) = inner.remove(&key) else {
+            return;
+        };
+        stats.modify_count = 0;
+        for (_, column) in stats.columns.iter_mut() {
+            column.ndv = 0;
+            column.null_count = 0;
+            column.tot_col_size = 0;
+            column.part_tot_col_size.clear();
+            column.histogram = Some(crate::table::Histogram::default());
+            column.topn = None;
+            column.value_counts = None;
+        }
+        for (_, index) in stats.indices.iter_mut() {
+            index.ndv = 0;
+            index.null_count = 0;
+            index.histogram = Some(crate::table::IndexHistogram::default());
+            index.topn.clear();
+            index.cm_sketch = None;
+            index.stats_ver = 0;
+        }
+        self.dropped
+            .lock()
+            .expect("stats lock")
+            .insert(key, stats);
+    }
+
+    /// Stats rows as `mysql.stats_*` reports them: live stats, else the soft
+    /// deleted snapshot of a `DROP STATS` table.
+    pub fn raw_table(&self, db: &str, table: &str) -> Option<Table> {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if let Some(stats) = self.inner.lock().expect("stats lock").get(&key) {
+            return Some(stats.clone());
+        }
+        self.dropped
+            .lock()
+            .expect("stats lock")
+            .get(&key)
+            .cloned()
     }
 
     pub fn needs_auto_analyze(&self, db: &str, table: &str, ratio: f64) -> bool {
