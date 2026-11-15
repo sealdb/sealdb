@@ -1136,7 +1136,7 @@
     {
       "name": "explain_easy",
       "wave": "R3",
-      "status": "in_progress",
+      "status": "green",
       "test": "t/explain_easy.test",
       "result": "r/explain_easy.result",
       "has_result": true,

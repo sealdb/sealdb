@@ -524,6 +524,108 @@ fn push_through_agg(
     }
 }
 
+/// `GROUP BY <join cols> HAVING …` (no aggregate function): TiDB estimates the
+/// aggregate after HAVING has been pushed below it, at one 0.8 NDV step per
+/// group-by operand, from the join's final cardinality.
+fn agg_over_join_est(info: &str, child: &PhysicalPlan) -> Option<f64> {
+    if !matches!(
+        child,
+        PhysicalPlan::HashJoin { .. }
+            | PhysicalPlan::IndexJoin { .. }
+            | PhysicalPlan::MergeJoin { .. }
+    ) {
+        return None;
+    }
+    let groups = info
+        .split("group by:")
+        .nth(1)
+        .and_then(|rest| rest.split(", funcs:").next())
+        .map(|g| g.split(", ").count())
+        .unwrap_or(1) as i32;
+    let mut est = super::explain::est_rows(child);
+    for _ in 0..groups {
+        est *= 0.8;
+    }
+    Some(est)
+}
+
+/// Re-derive the cardinality HAVING pushdown captured before the join/scan
+/// estimates settled (predicate pushdown and the null-reject injection below
+/// the aggregate run after it). Called at the end of the statement build.
+pub fn refresh_having_agg_est(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::HashAgg {
+            info,
+            cop_info,
+            est_rows,
+            child,
+        } => {
+            let child = refresh_having_agg_est(*child);
+            let est_rows = agg_over_join_est(&info, &child).unwrap_or(est_rows);
+            PhysicalPlan::HashAgg {
+                info,
+                cop_info,
+                est_rows,
+                child: Box::new(child),
+            }
+        }
+        PhysicalPlan::StreamAgg {
+            info,
+            cop_info,
+            est_rows,
+            child,
+        } => PhysicalPlan::StreamAgg {
+            info,
+            cop_info,
+            est_rows,
+            child: Box::new(refresh_having_agg_est(*child)),
+        },
+        PhysicalPlan::Selection {
+            filter,
+            child,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            filter,
+            child: Box::new(refresh_having_agg_est(*child)),
+            est_rows,
+        },
+        PhysicalPlan::Projection {
+            exprs,
+            child,
+            est_rows,
+        } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(refresh_having_agg_est(*child)),
+            est_rows,
+        },
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+            child: Box::new(refresh_having_agg_est(*child)),
+            by_info,
+        },
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
+            child: Box::new(refresh_having_agg_est(*child)),
+            by_info,
+            offset,
+            count,
+        },
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
+            child: Box::new(refresh_having_agg_est(*child)),
+            offset,
+            count,
+        },
+        other => other,
+    }
+}
+
 fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
     match plan {
         PhysicalPlan::HashAgg {
@@ -532,29 +634,7 @@ fn set_agg_est(plan: PhysicalPlan, est: f64) -> PhysicalPlan {
             child,
             ..
         } => {
-            // `GROUP BY <join cols> HAVING …` (no aggregate function): TiDB
-            // estimates the aggregate after HAVING has been pushed below it,
-            // at one 0.8 NDV step per group-by operand.
-            let est = if matches!(
-                *child,
-                PhysicalPlan::HashJoin { .. }
-                    | PhysicalPlan::IndexJoin { .. }
-                    | PhysicalPlan::MergeJoin { .. }
-            ) {
-                let groups = info
-                    .split("group by:")
-                    .nth(1)
-                    .and_then(|rest| rest.split(", funcs:").next())
-                    .map(|g| g.split(", ").count())
-                    .unwrap_or(1) as i32;
-                let mut e = super::explain::est_rows(&child);
-                for _ in 0..groups {
-                    e *= 0.8;
-                }
-                e
-            } else {
-                est
-            };
+            let est = agg_over_join_est(&info, &child).unwrap_or(est);
             PhysicalPlan::HashAgg {
                 info,
                 cop_info,

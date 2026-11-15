@@ -3039,6 +3039,54 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 
 ---
 
+### 2026-11-15（`explain_easy` 转正：派生窗口/连接基数/UNION ALL 聚合下推）
+
+- **Phase**: R3
+- **完成**:
+  - `UNION ALL` 聚合下推：`HashAgg(firstrow)` 与 `COUNT` 去重转换按 arm 拆分
+    （`push_dedup_into_arm`），外层聚合穿过 `LEFT JOIN` + `UNION ALL` 下推到
+    各分支，常量分支折成 `TableDual`；`registration_num > 0` 继续下推到分支。
+  - 派生窗口表：`rewrite_derived_window_predicates` 把分区键谓词推到 `Window`
+    之下并改写窗口结果列引用；外层 SELECT 列名按派生窗口输出补齐
+    （`derived_window_prune`），顶层窗口查询仍保留 `Projection(Column#N->Column#M)`。
+  - 连接基数（`join_est_by_ndv`）：外连接两侧过滤等价时按
+    `min(l, r) × 1.25`（仅 pseudo 统计 + 等值连接）；有统计时仍走 key-NDV。
+    `fill_join_est_rows` 的等基数外连接补偿同样限制在等值连接上，
+    避免 CARTESIAN 外连接被压成 `min × 1.25`。
+  - JoinReorder 传入的是两侧**过滤后**基数；仅当过滤确实选择性
+    （`est < 0.9 × 基表行数`）才生效，单个 `not(isnull(key))`（0.999）
+    仍按基表行数参与方向选择，保持 TiDB 的「build 表扫描 / probe 索引」平局规则。
+  - 内连接/右外连接 WHERE 谓词按 join key 镜像到另一侧
+    （`mirrored_inner_where` / `mirrored_preserved_where`），要求两侧 key 列名
+    完全一致，避免 `t1.a = t2.b` 场景误推。
+  - 单侧 ON 谓词拆分（`split_single_side_on`）只在两侧都是基表时执行；派生表
+    侧保留 ON，让派生谓词下推完整改写（`ON (dt.col)` → cop Selection）。
+  - `HAVING` 聚合估算在谓词/连接基数落定后重算
+    （`rule_having_push_down::refresh_having_agg_est`），`HashAgg` 行数改按
+    `join_est × 0.8^group_count`。
+  - 谓词下推去重：同一 `Selection` 上重复合取项按 EXPLAIN 文本去掉
+    （`and_opt` 对比 `explain_pushed_filter`）。
+  - 估算与渲染补充：`IS NULL` pseudo 0.001、`NOT BETWEEN` 的
+    `1 - 1/3 - 0.001`、`ifnull(col,c) OR col IS NULL` 的 0.8、
+    UnionScan 过滤文本（`explain_union_scan_filter`）、`TableDual|rows:` 与
+    `MAXONEROW` marker。
+  - 窗口计划保留 `Sort` 键（即使有序索引可满足），访问路径回退到
+    `TableReader` 时仍能补 `Sort`。
+- **验证**:
+  - `explain_easy`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - `explain_generate_column_substitute` / `select` / `null_rejected` /
+    `window_function` 双端复验通过（连接方向与窗口投影回归修复）
+  - 全量 green+local gate：memory `PASS: memory=92`，tikv `PASS: tikv=90`
+  - green 83→84（`explain_easy` 转正），TiKV 90 套可跑
+- **阻塞/风险**:
+  - TiKV 本地集群跑久后可能残留 meta lock（`sealdb-meta.lock`）或旧事务，
+    需 `run_local_pd_tikv.sh` 重启并清理锁文件。
+  - `explain_complex*` / `explain_cte` / `index_merge*` 仍在 R3 `in_progress`。
+- **下一步**:
+  - 继续 R3 `explain_complex` / `explain_complex_stats` / `explain_cte`。
+
+---
+
 ## 5. Gate 证据索引
 
 | Gate | 报告/命令 | 状态 |

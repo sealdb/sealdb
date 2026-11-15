@@ -189,11 +189,10 @@ fn window_shape(
 
     WindowShape {
         window_info,
-        sort_by: if prefer_index {
-            String::new()
-        } else {
-            sort_keys.join(", ")
-        },
+        // Keep the keys even when an ordered index could satisfy them; if the
+        // access path ends up not being that index (`TableReader` fallback)
+        // the plan still needs the `Sort`.
+        sort_by: sort_keys.join(", "),
         prefer_index,
         keep_order: only_a_part,
     }
@@ -449,7 +448,7 @@ fn index_reader(
     }
 }
 
-fn window_result_column_id(
+pub(crate) fn window_result_column_id(
     select: &SelectStmt,
     is: Option<&InfoSchema>,
     current_db: &str,

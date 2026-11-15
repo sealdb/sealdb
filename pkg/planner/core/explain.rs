@@ -2205,7 +2205,16 @@ fn walk_with_parent(
                 Some(PhysicalPlan::Sort { .. }) => !any_qualified,
                 _ => false,
             };
-        if trivial || cte_seed_cols {
+        // `Window` already emits the window result under its own plan column;
+        // the identity renaming Projection only feeds the executor schema
+        // (`Column#5->Column#6`). TiDB hides it inside a derived/outer shape but
+        // keeps it as the top-level window SELECT's output node.
+        let window_identity = parent.is_some()
+            && matches!(child.as_ref(), PhysicalPlan::Window { .. })
+            && exprs.len() == 1
+            && exprs[0].starts_with("Column#")
+            && exprs[0].contains("->Column#");
+        if trivial || cte_seed_cols || window_identity {
             return walk_with_parent(
                 child,
                 parent,
@@ -2363,6 +2372,8 @@ fn walk_with_parent(
                         | "UnionScan"
                         | "Limit"
                         | "TopN"
+                        | "Apply"
+                        | "TableDual"
                         | "CTEFullScan"
                 )
             {
@@ -2382,6 +2393,7 @@ fn walk_with_parent(
                         | "UnionScan"
                         | "Limit"
                         | "TopN"
+                        | "MaxOneRow"
                         | "CTEFullScan"
                 )
             {
@@ -3330,9 +3342,12 @@ fn emit_cop_children(
             ..
         } => {
             let scan_access = table_access(table, partition_names);
+            let filter_marker = filter_est_marker(pushed.as_ref());
             // Negative row_count encodes HAVING-push filtered est (|row_count|);
             // TableFullScan stays at the pseudo/analyzed scan cardinality.
-            let scan_est = if *row_count < 0.0 {
+            let scan_est = if let Some((_, _, scan)) = &filter_marker {
+                *scan
+            } else if *row_count < 0.0 {
                 if *stats_pseudo { 10_000.0 } else { -*row_count }
             } else {
                 *row_count
@@ -3765,9 +3780,15 @@ fn emit_cop_children(
                 return true;
             }
             if let Some(filter) = pushed.as_ref() {
-                let sel_info = match &partial {
-                    Some((_, sel)) => sel.clone(),
-                    None => explain_pushed_filter(table, filter),
+                let (sel_info, sel_est) = match &filter_marker {
+                    Some((sel, est, _)) => (sel.clone(), *est),
+                    None => (
+                        match &partial {
+                            Some((_, sel)) => sel.clone(),
+                            None => explain_pushed_filter(table, filter),
+                        },
+                        est_rows(plan) * apply_factor.max(1.0),
+                    ),
                 };
                 push_explain_row_spine(
                     rows,
@@ -3776,7 +3797,7 @@ fn emit_cop_children(
                     next_id,
                     CopRow {
                         name: "Selection",
-                        est: est_rows(plan) * apply_factor.max(1.0),
+                        est: sel_est,
                         task: scan_task,
                         access: String::new(),
                         info: sel_info,
@@ -5611,6 +5632,18 @@ fn range_sel_pushed(
     Some((sel.to_string(), range.to_string(), scan_rows))
 }
 
+/// `FILTER_EST|<selection est>|<scan rows>|<sel info>`: EXPLAIN-only reader
+/// whose pushed filter has a hand-computed estimate (pseudo join correlation
+/// where the scan cardinality and the filtered cardinality are decoupled).
+fn filter_est_marker(
+    pushed: Option<&sealdb_parser::ast::ExprNode>,
+) -> Option<(String, f64, f64)> {
+    let rest = bytes_marker(pushed)?.strip_prefix("FILTER_EST|")?;
+    let (est, rest) = rest.split_once('|')?;
+    let (scan, sel) = rest.split_once('|')?;
+    Some((sel.to_string(), est.parse().ok()?, scan.parse().ok()?))
+}
+
 /// `PARTIAL_SEL|<missing cols>|<sel info>`: TableReader whose pushed Selection
 /// references columns that postdate the last ANALYZE (TiDB `stats:partial[…]`).
 fn partial_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(String, String)> {
@@ -5882,6 +5915,64 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
 }
 
 /// TiDB cop Selection ExplainInfo: `gt(select.t.b, 0)` / `not(isnull(select.t.a))`.
+/// `or(lt(col, low), gt(col, high))` is SealDB's lowering of `NOT BETWEEN`.
+/// `not(isnull(col))` may sit next to the lowered `or(lt, gt)` arm in a CNF
+/// filter; the NOT BETWEEN estimate still applies.
+fn has_not_between(filter: &sealdb_parser::ast::ExprNode) -> bool {
+    filter.split_cnf().iter().any(|c| not_between_parts(c).is_some())
+}
+
+fn not_between_parts(
+    filter: &sealdb_parser::ast::ExprNode,
+) -> Option<(
+    &sealdb_parser::ast::ExprNode,
+    &sealdb_parser::ast::ExprNode,
+    &sealdb_parser::ast::ExprNode,
+)> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    use sealdb_parser::opcode::Op;
+    let ExprNode::Binary(or) = filter else {
+        return None;
+    };
+    if or.op != Op::LogicOr {
+        return None;
+    }
+    let (left, right) = (or.left.as_ref(), or.right.as_ref());
+    let (ExprNode::Binary(left), ExprNode::Binary(right)) = (left, right) else {
+        return None;
+    };
+    let (lt, gt) = match (left.op, right.op) {
+        (Op::Lt, Op::Gt) => (left, right),
+        (Op::Gt, Op::Lt) => (right, left),
+        _ => return None,
+    };
+    let (ExprNode::Column(lt_col), ExprNode::Column(gt_col)) = (lt.left.as_ref(), gt.left.as_ref())
+    else {
+        return None;
+    };
+    if !lt_col.name.eq_ignore_ascii_case(&gt_col.name) {
+        return None;
+    }
+    Some((lt.left.as_ref(), lt.right.as_ref(), gt.right.as_ref()))
+}
+
+/// UnionScan keeps the statement's original `NOT BETWEEN` text, while the cop
+/// Selection receives the lowered `or(lt, gt)` form.
+pub(crate) fn explain_union_scan_filter(
+    table: &str,
+    filter: &sealdb_parser::ast::ExprNode,
+) -> String {
+    if let Some((col, low, high)) = not_between_parts(filter) {
+        let col = explain_scalar_expr(col, table);
+        return format!(
+            "not(and(ge({col}, {}), le({col}, {})))",
+            explain_scalar_expr(low, table),
+            explain_scalar_expr(high, table)
+        );
+    }
+    explain_pushed_filter(table, filter)
+}
+
 pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::ExprNode) -> String {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_parser::opcode::Op;
@@ -5976,6 +6067,8 @@ fn join_role_label(
                 | "IndexJoin"
                 | "Sort"
                 | "CTE"
+                | "Apply"
+                | "TableDual"
                 | "Point_Get"
                 | "PointGet"
         )
@@ -5995,6 +6088,8 @@ fn join_role_label(
                 | "IndexJoin"
                 | "Sort"
                 | "CTE"
+                | "Apply"
+                | "TableDual"
                 | "Point_Get"
                 | "PointGet"
         )
@@ -6095,6 +6190,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             String::new(),
             format!("rows:{row_count}"),
         ),
+        // EXPLAIN-only marker for TiDB `MaxOneRow` (scalar subquery probe).
+        PhysicalPlan::Projection { exprs, .. }
+            if exprs.len() == 1 && exprs[0] == "MAXONEROW" =>
+        {
+            ("MaxOneRow".to_string(), String::new(), String::new())
+        }
         PhysicalPlan::Projection { exprs, .. } => {
             ("Projection".to_string(), String::new(), exprs.join(", "))
         }
@@ -6103,6 +6204,12 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         }
         PhysicalPlan::DDL { kind } => ("DDL".to_string(), String::new(), format!("{kind:?}")),
         PhysicalPlan::Show { kind } => ("Show".to_string(), String::new(), kind.clone()),
+        // EXPLAIN-only TableDual whose estRows is the Apply-scaled cardinality
+        // while the node still prints `rows:1`.
+        PhysicalPlan::Simple { kind } if kind.starts_with("TableDual|") => {
+            let rows = kind.split('|').nth(2).unwrap_or("1");
+            ("TableDual".to_string(), String::new(), format!("rows:{rows}"))
+        }
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Insert { .. } => ("Insert".to_string(), String::new(), "N/A".to_string()),
 
@@ -6831,6 +6938,17 @@ fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) 
 fn conjunct_selectivity(expr: &sealdb_parser::ast::ExprNode) -> Option<f64> {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
+    if let ExprNode::IsNull(is_null) = expr {
+        // TiDB pseudo `isNullRate` (`col IS NULL` over 10000 → 10 rows).
+        return (!is_null.not).then_some(0.001);
+    }
+    if let ExprNode::Func(func) = expr
+        && func.name.eq_ignore_ascii_case("ifnull")
+    {
+        // `ifnull(col, const)` is true unless the column is NULL, so the
+        // generic comparison/selection factor applies.
+        return Some(0.8);
+    }
     let ExprNode::Binary(bin) = expr else {
         return None;
     };
@@ -6894,6 +7012,44 @@ pub(crate) fn filter_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Optio
     conjunct_list_selectivity(&filter.split_cnf())
 }
 
+/// `or(ifnull(col, const), col is null)` over the same column.
+fn ifnull_isnull_union_selectivity(
+    filter: &sealdb_parser::ast::ExprNode,
+) -> Option<f64> {
+    use sealdb_parser::ast::expressions::ExprNode;
+    let mut ifnull_col: Option<String> = None;
+    let mut isnull_col: Option<String> = None;
+    for arm in filter.split_dnf() {
+        let conjuncts = arm.split_cnf();
+        let [conjunct] = conjuncts.as_slice() else {
+            continue;
+        };
+        match conjunct {
+            ExprNode::Func(func)
+                if func.name.eq_ignore_ascii_case("ifnull")
+                    && func.args.len() == 2
+                    && matches!(func.args[0], ExprNode::Column(_)) =>
+            {
+                if let ExprNode::Column(c) = &func.args[0] {
+                    ifnull_col = Some(c.name.clone());
+                }
+            }
+            ExprNode::IsNull(is_null)
+                if !is_null.not && matches!(is_null.expr.as_ref(), ExprNode::Column(_)) =>
+            {
+                if let ExprNode::Column(c) = is_null.expr.as_ref() {
+                    isnull_col = Some(c.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    match (ifnull_col, isnull_col) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Some(0.8),
+        _ => None,
+    }
+}
+
 fn conjunct_list_selectivity(conjuncts: &[sealdb_parser::ast::ExprNode]) -> Option<f64> {
     let mut sel = 1.0;
     for conjunct in conjuncts {
@@ -6954,6 +7110,13 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 } else {
                     est_rows(child)
                 }
+            } else if ifnull_isnull_union_selectivity(filter).is_some()
+                && matches!(child.as_ref(), PhysicalPlan::HashJoin { .. })
+            {
+                // `ifnull(col, const) OR col IS NULL` over the null-supplying
+                // side of an outer join: TiDB sizes the root Selection with
+                // the plain 0.8 factor instead of the DNF product (0.8002).
+                est_rows(child) * 0.8
             } else if let Some(sel) = filter_selectivity(filter) {
                 // A cast comparison keeps TiDB's default factor; OR arms
                 // combine as `1 - Π(1 - s)` (DNF selectivity).
@@ -7040,6 +7203,21 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             pushed: Some(filter),
             row_count,
             ..
+        } if let Some((_, est, _)) = filter_est_marker(Some(filter)) => est,
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if has_not_between(filter) => {
+            // `not between` estimates as `1 - between(1/3) - nullRate(0.001)`
+            // over pseudo statistics (both with and without the printed
+            // `not(isnull)` conjunct).
+            *row_count * (1.0 - 1.0 / 3.0 - 0.001)
+        }
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
         } if filter.split_cnf().len() > 1 && filter_selectivity(filter).is_some() => {
             (*row_count * filter_selectivity(filter).unwrap_or(0.8)).max(0.0)
         }
@@ -7070,6 +7248,15 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             row_count,
             ..
         } if range_pushed(Some(filter)).is_some() || pushed_is_bytes_info(filter) => *row_count,
+        // DNF/OR selection factors (`or(ifnull(a,1), isnull(a))` →
+        // `0.8 + 0.001 × 0.2 = 0.8002`).
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            row_count,
+            ..
+        } if filter_selectivity(filter).is_some() => {
+            (*row_count * filter_selectivity(filter).unwrap_or(0.8)).max(0.0)
+        }
         PhysicalPlan::TableReader {
             pushed: Some(filter),
             row_count,
@@ -7371,6 +7558,11 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             recursive: true, ..
         } => 8_001.0,
         PhysicalPlan::CTE { seed: child, .. } => est_rows(child),
+        PhysicalPlan::Simple { kind } if kind.starts_with("TableDual|") => kind
+            .split('|')
+            .nth(1)
+            .and_then(|est| est.parse::<f64>().ok())
+            .unwrap_or(1.0),
         _ => 10_000.0,
     }
 }
@@ -7760,7 +7952,7 @@ fn collect_plan_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<
     }
 }
 
-fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
+pub(crate) fn join_on_has_equijoin(on: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
     match on {

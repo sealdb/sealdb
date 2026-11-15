@@ -133,6 +133,39 @@ fn push_into(
         // probe `Selection`); the UnionScan keeps re-applying them to the
         // uncommitted rows it merges in.
         PhysicalPlan::UnionScan { info, child, .. } => {
+            // TiDB builds `PhysicalUnionScan` *after* predicate pushdown, so
+            // the scan's filter shows the conjuncts pushed into this side
+            // (including the join's `not(isnull(key))` on the null-supplying
+            // build side). Keep the original `NOT BETWEEN` rendering.
+            let mut info = info;
+            let extra: Vec<String> = conjuncts
+                .iter()
+                .filter(|conjunct| {
+                    matches!(
+                        conjunct,
+                        ExprNode::Unary(unary)
+                            if unary.op == Op::Not
+                                && matches!(
+                                    unary.expr.as_ref(),
+                                    ExprNode::IsNull(isnull) if !isnull.not
+                                )
+                    )
+                })
+                .map(|conjunct| super::explain::explain_union_scan_filter("t", conjunct))
+                .collect();
+            if !extra.is_empty() {
+                // `info` is a comma-joined expression list whose items may
+                // themselves contain `, ` (`not(and(ge(col, 1), le(col, 2)))`),
+                // so never split it; append the new conjuncts instead.
+                for filter in extra {
+                    if info.is_empty() {
+                        info = filter;
+                    } else if !info.contains(&filter) {
+                        info.push_str(", ");
+                        info.push_str(&filter);
+                    }
+                }
+            }
             let child = push_into(*child, conjuncts, is, current_db);
             let est_rows = super::explain::est_rows(&child);
             PhysicalPlan::UnionScan {
@@ -1207,7 +1240,28 @@ fn constant_truth(expr: &ExprNode) -> Option<bool> {
 fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> {
     match (left, right) {
         (None, other) | (other, None) => other,
-        (Some(left), Some(right)) => ExprNode::compose_cnf(vec![left, right]),
+        (Some(left), Some(right)) => {
+            // A conjunct can reach the same scan twice (e.g. a WHERE predicate
+            // mirrored through a join key that the child already received).
+            // TiDB keeps a single copy, so drop the duplicates by their
+            // rendered text.
+            let existing: Vec<String> = right
+                .split_cnf()
+                .iter()
+                .map(|c| super::explain::explain_pushed_filter("t", c))
+                .collect();
+            let kept: Vec<ExprNode> = left
+                .split_cnf()
+                .into_iter()
+                .filter(|c| {
+                    !existing.contains(&super::explain::explain_pushed_filter("t", c))
+                })
+                .collect();
+            match ExprNode::compose_cnf(kept) {
+                Some(kept) => ExprNode::compose_cnf(vec![kept, right]),
+                None => Some(right),
+            }
+        }
     }
 }
 
