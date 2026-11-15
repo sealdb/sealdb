@@ -89,6 +89,7 @@ const FUNCS: &[FuncMeta] = &[
     meta("RPAD", FuncCategory::String, 3, 3, true),
     // info
     meta("TIDB_DECODE_BINARY_PLAN", FuncCategory::Info, 1, 1, true),
+    meta("VITESS_HASH", FuncCategory::Miscellaneous, 1, 1, true),
 ];
 
 const fn meta(

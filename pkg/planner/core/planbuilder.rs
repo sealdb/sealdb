@@ -8627,6 +8627,11 @@ fn tidb_scalar_explain(expr: &ExprNode, nil_as_angle: bool) -> String {
         ExprNode::Value(ValueExpr {
             datum: Datum::U64(v),
         }) => v.to_string(),
+        // TiDB `Constant.ExplainInfo` is `Datum.ToString()`: a folded string
+        // constant prints raw (`aaaa->Column#4`, `31B565D41BDF8CA->Column#7`).
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(b) | Datum::Bit(b),
+        }) => String::from_utf8_lossy(b).into_owned(),
         ExprNode::Binary(bin) => {
             let op = match bin.op {
                 Op::Plus => "plus",

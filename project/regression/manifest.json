@@ -1372,7 +1372,7 @@
     {
       "name": "expression/vitess_hash",
       "wave": "R7",
-      "status": "pending",
+      "status": "in_progress",
       "test": "t/expression/vitess_hash.test",
       "result": "r/expression/vitess_hash.result",
       "has_result": true,

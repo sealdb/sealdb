@@ -782,8 +782,14 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
                 return Ok(Datum::Null);
             }
-            // MySQL shifts as unsigned 64-bit integers.
-            let value = left.as_f64()? as i64 as u64;
+            // MySQL shifts as unsigned 64-bit integers; keep the 64-bit bit
+            // pattern exact (an `f64` round-trip loses the low bits of hashes
+            // such as `vitess_hash(x) >> 56`).
+            let value = match &left {
+                Datum::U64(v) => *v,
+                Datum::I64(v) => *v as u64,
+                other => other.as_f64()? as i64 as u64,
+            };
             let shift = right.as_f64()? as i64;
             let out = if !(1..64).contains(&shift) {
                 if shift <= 0 { value } else { 0 }
@@ -1464,6 +1470,28 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::Decimal(d) => Ok(Datum::I64(d.to_f64()?.ceil() as i64)),
                 other => Ok(Datum::I64(other.as_f64()?.ceil() as i64)),
             }
+        }
+        // TiDB `vitess_hash(x)` (`builtinVitessHashSig`): the null-key DES
+        // hash of `uint64(x)`, typed `bigint unsigned`. Vitess shard indexes
+        // are built on it (`INDEX ((vitess_hash(customer_id) >> 56))`).
+        "VITESS_HASH" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "VITESS_HASH requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            // `EvalInt` of an unsigned argument keeps the bit pattern.
+            let bits = match &value {
+                Datum::U64(v) => *v,
+                Datum::I64(v) => *v as u64,
+                other => other.as_i64()? as u64,
+            };
+            Ok(Datum::U64(crate::shard::hash_uint64(bits)))
         }
         "TIDB_DECODE_BINARY_PLAN" => {
             if func.args.len() != 1 {

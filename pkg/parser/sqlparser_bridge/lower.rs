@@ -11136,6 +11136,18 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             expr: Box::new(lower_expr(expr)?),
             target: data_type_name(data_type),
         })),
+        // `CONVERT(expr, type)` is `CAST(expr AS type)` in MySQL; the
+        // `USING charset` form has no CAST equivalent and is not supported.
+        Expr::Convert {
+            is_try: false,
+            expr,
+            data_type: Some(data_type),
+            charset: None,
+            ..
+        } => Ok(ExprNode::Cast(FuncCastExpr {
+            expr: Box::new(lower_expr(expr)?),
+            target: data_type_name(data_type),
+        })),
         Expr::TypedString(ts) => lower_typed_string(ts),
         Expr::Interval(iv) => {
             // Bare INTERVAL is only meaningful inside DATE_ADD/DATE_SUB; keep as

@@ -532,6 +532,18 @@ fn coerce_bound(
             // NULL bound on a NOT NULL column: keep the datum as-is.
             _ => value,
         },
+        // Integer key parts: `x'd6'` is the number 214 in a numeric context.
+        sealdb_types::TYPE_TINY
+        | sealdb_types::TYPE_SHORT
+        | sealdb_types::TYPE_INT24
+        | sealdb_types::TYPE_LONG
+        | sealdb_types::TYPE_LONG_LONG
+        | sealdb_types::TYPE_YEAR => match &value {
+            sealdb_types::Datum::Bit(bytes) => sealdb_types::Datum::U64(
+                bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)),
+            ),
+            _ => value,
+        },
         _ => value,
     };
     Some((value, inclusive))
@@ -556,6 +568,13 @@ fn bounds_fit_column(
                 .iter()
                 .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
             width >= 64 || value >> width == 0
+        }
+        // In a numeric context a hex/bit literal is the number it spells
+        // (`x'd6'` on `bigint` seeks 214), so it always converts.
+        Some((sealdb_types::Datum::Bit(_), _))
+            if matches!(field_type.eval_type(), sealdb_types::field_type::EvalType::Int) =>
+        {
+            true
         }
         // Binary values: string literals, and hex/bit literals (which arrive as
         // `Datum::Bit`) — both need a charset conversion to the column.

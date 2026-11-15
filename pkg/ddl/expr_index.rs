@@ -162,6 +162,8 @@ fn infer(expr: &ExprNode, info: &TableInfo, index_name: &str, text: &str) -> Res
                 Op::Plus | Op::Minus | Op::Mul | Op::IntDiv | Op::Mod | Op::Div => {
                     numeric_result(&left, &right)
                 }
+                // MySQL shifts cast both operands to unsigned 64-bit.
+                Op::LeftShift | Op::RightShift => unsigned_longlong(),
                 _ => FieldType::new_longlong(),
             })
         }
@@ -185,6 +187,13 @@ fn infer(expr: &ExprNode, info: &TableInfo, index_name: &str, text: &str) -> Res
             format!("The used storage engine cannot index the expression '{text}'"),
         )),
     }
+}
+
+/// `bigint unsigned`, the result of `vitess_hash` and of the bit operators.
+fn unsigned_longlong() -> FieldType {
+    let mut ty = FieldType::new_longlong();
+    ty.unsigned = true;
+    ty
 }
 
 /// Integer arithmetic widens to BIGINT; anything floating/decimal keeps the
@@ -261,6 +270,8 @@ fn function_field_type(
     let ty = match lower.as_str() {
         // TiDB `tidb_shard` hashes into a 64-bit signed integer.
         "tidb_shard" => FieldType::new_longlong(),
+        // `vitess_hash` is the null-key DES hash: `bigint unsigned`.
+        "vitess_hash" => unsigned_longlong(),
         "upper" | "ucase" | "lower" | "lcase" | "concat" | "concat_ws" | "substring" | "substr"
         | "trim" | "ltrim" | "rtrim" | "replace" | "left" | "right" | "repeat" | "reverse"
         | "insert" | "format" | "hex" | "to_base64" | "from_base64" => {
