@@ -1320,33 +1320,62 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
     let pinned = plan_reads_pinned_global_index(plan);
     PINNED_PARTITION.with(|c| c.set(pinned));
     walk(plan, 0, true, &mut 1, &mut rows, &mut deferred);
-    // TiDB: recursive CTE producers follow the main plan as `CTE_0` siblings.
-    // A CTE referenced N times is still one shared definition (CTE_0).
+    // TiDB renders one producer block per materialised CTE after the main plan,
+    // in discovery order: the first consumer deferred from the main tree comes
+    // first, then any CTE nested inside that producer's body, and so on. A CTE
+    // referenced N times is still one shared definition.
     let mut producers: Vec<PhysicalPlan> = Vec::new();
-    for p in deferred.into_iter().filter(|p| {
-        matches!(
-            p,
-            PhysicalPlan::CTE {
-                recursive: true,
-                ..
-            }
-        )
-    }) {
-        let seen = producers.iter().any(|seen| match (seen, &p) {
-            (PhysicalPlan::CTE { name: a, .. }, PhysicalPlan::CTE { name: b, .. }) => {
-                a.eq_ignore_ascii_case(b)
-            }
+    let mut index = 0;
+    while index < deferred.len() {
+        let cte = deferred[index].clone();
+        index += 1;
+        let PhysicalPlan::CTE { name, .. } = &cte else {
+            continue;
+        };
+        let seen = producers.iter().any(|seen| match seen {
+            PhysicalPlan::CTE { name: a, .. } => a.eq_ignore_ascii_case(name),
             _ => false,
         });
-        if !seen {
-            producers.push(p);
+        if seen {
+            continue;
         }
-    }
-    for (i, cte) in producers.iter().enumerate() {
-        emit_recursive_cte_producer(cte, i, &mut 1, &mut rows);
+        producers.push(cte.clone());
+        if matches!(cte, PhysicalPlan::CTE { recursive: true, .. }) {
+            emit_recursive_cte_producer(&cte, producers.len() - 1, &mut 1, &mut rows);
+        } else {
+            emit_nonrecursive_cte_producer(&cte, &mut 1, &mut rows, &mut deferred);
+        }
     }
     PINNED_PARTITION.with(|c| c.set(false));
     rows
+}
+
+/// A non-recursive materialised CTE producer block: TiDB prints the `CTE_n`
+/// header, then the seed plan as an ordinary subtree whose root carries the
+/// `(Seed Part)` annotation.
+fn emit_nonrecursive_cte_producer(
+    plan: &PhysicalPlan,
+    next_id: &mut usize,
+    rows: &mut Vec<ExplainRow>,
+    deferred: &mut Vec<PhysicalPlan>,
+) {
+    let PhysicalPlan::CTE { name, seed, .. } = plan else {
+        return;
+    };
+    let idx = super::planbuilder::cte_storage_id(name).unwrap_or(0);
+    rows.push(ExplainRow {
+        // `CTE_4` strips to `CTE` under Gate B; avoid `CTE_4_N` → `CTE_4`.
+        id: format!("CTE_{idx}"),
+        est_rows: format!("{:.2}", est_rows(plan)),
+        task: "root".to_string(),
+        access: String::new(),
+        info: "Non-Recursive CTE".to_string(),
+    });
+    let start = rows.len();
+    walk(seed, 1, true, next_id, rows, deferred);
+    if let Some(row) = rows.get_mut(start) {
+        row.id.push_str("(Seed Part)");
+    }
 }
 
 /// `col IN (SELECT … FROM t WHERE <correlated> ORDER BY … LIMIT n)` keeps an
@@ -2461,27 +2490,20 @@ fn walk_with_parent(
             apply_factor,
         );
     }
-    // Recursive CTE consumer: CTEFullScan in the main plan; producer deferred.
-    if let PhysicalPlan::CTE {
-        recursive: true, ..
-    } = plan
-    {
-        if parent.is_some() {
-            deferred.push(plan.clone());
-            emit_cte_full_scan(
-                plan,
-                parent,
-                depth,
-                last,
-                next_id,
-                rows,
-                spine,
-                apply_factor,
-            );
-            return;
-        }
-        // Bare recursive CTE root — emit producer only.
-        emit_recursive_cte_producer(plan, 0, next_id, rows);
+    // Materialised CTE reference: TiDB keeps only a `CTEFullScan` in the
+    // consumer tree and renders the producer block once after the main plan.
+    if matches!(plan, PhysicalPlan::CTE { inline: false, .. }) {
+        deferred.push(plan.clone());
+        emit_cte_full_scan(
+            plan,
+            parent,
+            depth,
+            last,
+            next_id,
+            rows,
+            spine,
+            apply_factor,
+        );
         return;
     }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
@@ -3133,12 +3155,13 @@ fn emit_cte_full_scan(
         None => format!("CTE:{name}"),
     };
     let est = est_rows(plan) * apply_factor.max(1.0);
+    let storage = super::planbuilder::cte_storage_id(name).unwrap_or(0);
     rows.push(ExplainRow {
         id: format!("{prefix}CTEFullScan_{id}{join_role}"),
         est_rows: format!("{est:.2}"),
         task: "root".to_string(),
         access,
-        info: "data:CTE_0".to_string(),
+        info: format!("data:CTE_{storage}"),
     });
 }
 
@@ -3161,6 +3184,7 @@ fn emit_recursive_cte_producer(
         return;
     };
     let est = est_rows(plan);
+    let storage = super::planbuilder::cte_storage_id(name).unwrap_or(producer_idx);
     let info = match (limit, offset) {
         (Some(count), Some(off)) => {
             format!("Recursive CTE, limit(offset:{off}, count:{count})")
@@ -3171,7 +3195,7 @@ fn emit_recursive_cte_producer(
     };
     rows.push(ExplainRow {
         // `CTE_0` strips to `CTE` under Gate B; avoid `CTE_0_N` → `CTE_0`.
-        id: format!("CTE_{producer_idx}"),
+        id: format!("CTE_{storage}"),
         est_rows: format!("{est:.2}"),
         task: "root".to_string(),
         access: String::new(),
@@ -3191,7 +3215,7 @@ fn emit_recursive_cte_producer(
     let orig_tbl = seed_orig_table(seed_part).unwrap_or_else(|| name.clone());
     emit_cte_seed_part(seed_part, next_id, rows);
     if let Some(rec) = rec_part {
-        emit_cte_recursive_part(rec, name, &orig_tbl, next_id, rows, limit.is_some());
+        emit_cte_recursive_part(rec, name, &orig_tbl, storage, est_rows(seed), next_id, rows);
     }
 }
 
@@ -3203,6 +3227,21 @@ fn seed_orig_table(plan: &PhysicalPlan) -> Option<String> {
         | PhysicalPlan::Sort { child, .. } => seed_orig_table(child),
         _ => None,
     }
+}
+
+
+/// Row count of the recursive working table (TiDB `CTETable`) inside `plan`.
+fn cte_table_rows(plan: &PhysicalPlan, cte_name: &str) -> Option<f64> {
+    if let PhysicalPlan::TableReader {
+        table, row_count, ..
+    } = plan
+        && table.eq_ignore_ascii_case(cte_name)
+    {
+        return Some(*row_count);
+    }
+    children_of(plan)
+        .into_iter()
+        .find_map(|child| cte_table_rows(child, cte_name))
 }
 
 fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<ExplainRow>) {
@@ -3239,20 +3278,36 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
         partition_names,
         stats_pseudo,
         pushed,
+        row_count,
         ..
     } = reader
     else {
-        // Fallback: emit whatever plan we have.
+        // Fallback: emit whatever plan we have. A constant seed is a
+        // `Projection` over `TableDual`, which TiDB keeps as the seed part.
         let id = *next_id;
         *next_id += 1;
         let (name, access, info) = node_meta(plan);
+        let est = est_rows(plan);
         rows.push(ExplainRow {
             id: format!("├─{name}_{id}(Seed Part)"),
-            est_rows: format!("{:.2}", est_rows(plan)),
+            est_rows: format!("{est:.2}"),
             task: "root".to_string(),
             access,
             info,
         });
+        if let PhysicalPlan::Projection { child, .. } = plan
+            && let PhysicalPlan::TableDual { row_count } = child.as_ref()
+        {
+            let dual_id = *next_id;
+            *next_id += 1;
+            rows.push(ExplainRow {
+                id: format!("│ └─TableDual_{dual_id}"),
+                est_rows: format!("{:.2}", *row_count as f64),
+                task: "root".to_string(),
+                access: String::new(),
+                info: format!("rows:{row_count}"),
+            });
+        }
         return;
     };
     let id = *next_id;
@@ -3266,11 +3321,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
     };
     rows.push(ExplainRow {
         id: format!("├─TableReader_{id}(Seed Part)"),
-        est_rows: if proj_exprs.is_some() || selection.is_some() {
-            "10.00".to_string()
-        } else {
-            "10000.00".to_string()
-        },
+        est_rows: format!("{:.2}", est_rows(plan)),
         task: "root".to_string(),
         access: String::new(),
         info: data.to_string(),
@@ -3285,7 +3336,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("│ └─Projection_{proj_id}"),
-            est_rows: "10.00".to_string(),
+            est_rows: format!("{:.2}", est_rows(plan)),
             task: "cop[tikv]".to_string(),
             access: String::new(),
             info: exprs.join(", "),
@@ -3295,7 +3346,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
             *next_id += 1;
             rows.push(ExplainRow {
                 id: format!("│   └─Selection_{sel_id}"),
-                est_rows: "10.00".to_string(),
+                est_rows: format!("{:.2}", est_rows(plan)),
                 task: "cop[tikv]".to_string(),
                 access: String::new(),
                 info: explain_selection_info(filter),
@@ -3304,7 +3355,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
             *next_id += 1;
             rows.push(ExplainRow {
                 id: format!("│     └─TableFullScan_{scan_id}"),
-                est_rows: "10000.00".to_string(),
+                est_rows: format!("{row_count:.2}"),
                 task: "cop[tikv]".to_string(),
                 access: table_access(table, partition_names),
                 info: keep.to_string(),
@@ -3314,7 +3365,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
             *next_id += 1;
             rows.push(ExplainRow {
                 id: format!("│   └─TableFullScan_{scan_id}"),
-                est_rows: "10000.00".to_string(),
+                est_rows: format!("{row_count:.2}"),
                 task: "cop[tikv]".to_string(),
                 access: table_access(table, partition_names),
                 info: keep.to_string(),
@@ -3325,7 +3376,7 @@ fn emit_cte_seed_part(plan: &PhysicalPlan, next_id: &mut usize, rows: &mut Vec<E
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("│ └─Selection_{sel_id}"),
-            est_rows: "10.00".to_string(),
+            est_rows: format!("{:.2}", est_rows(plan)),
             task: "cop[tikv]".to_string(),
             access: String::new(),
             info: explain_selection_info(filter),
@@ -3356,9 +3407,10 @@ fn emit_cte_recursive_part(
     plan: &PhysicalPlan,
     cte_name: &str,
     orig_tbl: &str,
+    storage: usize,
+    seed_est: f64,
     next_id: &mut usize,
     rows: &mut Vec<ExplainRow>,
-    has_limit: bool,
 ) {
     let schema = sealdb_expression::current_db_name();
     let schema = if schema.is_empty() {
@@ -3414,7 +3466,7 @@ fn emit_cte_recursive_part(
                 est_rows: "10000.00".into(),
                 task: "root".into(),
                 access: String::new(),
-                info: "Scan on CTE_0".into(),
+                info: format!("Scan on CTE_{storage}"),
             });
             let lim_id = *next_id;
             *next_id += 1;
@@ -3471,19 +3523,31 @@ fn emit_cte_recursive_part(
             return;
         }
     }
-    let proj_info = recursive_arm_proj_info(plan, &schema, orig_tbl);
-    let filter_info = recursive_arm_filter_info(plan, cte_name, orig_tbl);
-    // TiDB: recursive LIMIT clamps seed/recursive arm est to 10.
-    let (proj_est, sel_est, tbl_est) = if has_limit {
-        ("10.00", "10.00", "10.00")
-    } else {
-        ("8000.00", "8000.00", "10000.00")
+    let proj_info = rewrite_seed_col_names(
+        recursive_arm_proj_info(plan, &schema, orig_tbl, cte_name),
+        cte_name,
+        orig_tbl,
+        &schema,
+    );
+    let filter_info = recursive_arm_filter_info(plan, cte_name, orig_tbl)
+        .map(|f| rewrite_seed_col_names(f, cte_name, orig_tbl, &schema));
+    // The working table reuses the seed statistics (TiDB `SeedStat`), so the
+    // self-scan keeps the seed row count and the filter sizes from it.
+    let tbl_est = cte_table_rows(plan, cte_name).unwrap_or(seed_est);
+    // The working table's `SeedStat` keeps the seed's column NDVs under the
+    // seed schema's unique IDs, so the recursive arm's predicate finds no
+    // statistics for the CTE columns and TiDB falls back to the default
+    // `selectionFactor` (0.8) per conjunct (not the 1/3 pseudo range).
+    let proj_est = match recursive_arm_filter_conjuncts(plan) {
+        0 => tbl_est,
+        n => tbl_est * 0.8_f64.powi(n as i32),
     };
+    let sel_est = proj_est;
     let id = *next_id;
     *next_id += 1;
     rows.push(ExplainRow {
         id: format!("└─Projection_{id}(Recursive Part)"),
-        est_rows: proj_est.to_string(),
+        est_rows: format!("{proj_est:.2}"),
         task: "root".to_string(),
         access: String::new(),
         info: proj_info,
@@ -3493,7 +3557,7 @@ fn emit_cte_recursive_part(
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("  └─Selection_{sel_id}"),
-            est_rows: sel_est.to_string(),
+            est_rows: format!("{sel_est:.2}"),
             task: "root".to_string(),
             access: String::new(),
             info: filt,
@@ -3502,25 +3566,104 @@ fn emit_cte_recursive_part(
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("    └─CTETable_{tbl_id}"),
-            est_rows: tbl_est.to_string(),
+            est_rows: format!("{tbl_est:.2}"),
             task: "root".to_string(),
             access: String::new(),
-            info: "Scan on CTE_0".to_string(),
+            info: format!("Scan on CTE_{storage}"),
         });
     } else {
         let tbl_id = *next_id;
         *next_id += 1;
         rows.push(ExplainRow {
             id: format!("  └─CTETable_{tbl_id}"),
-            est_rows: tbl_est.to_string(),
+            est_rows: format!("{tbl_est:.2}"),
             task: "root".to_string(),
             access: String::new(),
-            info: "Scan on CTE_0".to_string(),
+            info: format!("Scan on CTE_{storage}"),
         });
     }
 }
 
-fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) -> String {
+/// Replace CTE working-column references with the seed's output columns:
+/// TiDB's working table (`getResultCTESchema`) clones the seed schema, so a
+/// `cte(a)` over `select c2 from t1` prints `t1.c2` inside the recursive arm.
+fn rewrite_seed_col_names(info: String, cte_name: &str, orig_tbl: &str, _schema: &str) -> String {
+    let mut info = info;
+    for (alias, tbl, col) in super::planbuilder::cte_working_seed_outputs(cte_name) {
+        if alias.is_empty() || col.is_empty() || alias.eq_ignore_ascii_case(&col) {
+            continue;
+        }
+        let tbl = if tbl.is_empty() {
+            orig_tbl.to_string()
+        } else {
+            tbl
+        };
+        let repl = format!("{tbl}.{col}");
+        for qualifier in [cte_name, orig_tbl, tbl.as_str()] {
+            info = replace_qualified_col(&info, qualifier, &alias, &repl);
+        }
+    }
+    info
+}
+
+/// Replace a bare `prefix` (e.g. `cte1.`) only when it starts a token: a
+/// database name ending in the CTE name (`explain_cte.…`) must not match.
+fn replace_bare_prefix(s: &str, prefix: &str, repl: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    while let Some(pos) = s[cursor..].find(prefix) {
+        let start = cursor + pos;
+        let boundary = if start == 0 {
+            true
+        } else {
+            s[..start]
+                .chars()
+                .next_back()
+                .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        };
+        out.push_str(&s[cursor..start]);
+        if boundary {
+            out.push_str(repl);
+        } else {
+            out.push_str(prefix);
+        }
+        cursor = start + prefix.len();
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+/// Replace `qualifier.alias` only at a token boundary (so `t1.a` does not match
+/// the prefix of `t1.a1`).
+fn replace_qualified_col(s: &str, qualifier: &str, alias: &str, repl: &str) -> String {
+    let needle = format!("{qualifier}.{alias}");
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    while let Some(pos) = s[cursor..].find(&needle) {
+        let start = cursor + pos;
+        let end = start + needle.len();
+        let boundary = s[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+        out.push_str(&s[cursor..start]);
+        if boundary {
+            out.push_str(repl);
+        } else {
+            out.push_str(&s[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+fn recursive_arm_proj_info(
+    plan: &PhysicalPlan,
+    schema: &str,
+    orig_tbl: &str,
+    cte_name: &str,
+) -> String {
     let from_exprs = match plan {
         PhysicalPlan::Projection { exprs, .. } => Some(exprs.as_slice()),
         PhysicalPlan::Selection { child, .. } => match child.as_ref() {
@@ -3530,6 +3673,7 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
         _ => None,
     };
     if let Some(exprs) = from_exprs {
+        let seed_outputs = super::planbuilder::cte_working_seed_outputs(cte_name);
         let parts: Vec<String> = exprs
             .iter()
             .enumerate()
@@ -3537,7 +3681,12 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
             .map(|(i, e)| {
                 let mut s = e.clone();
                 s = s.replace(".t.", &format!(".{orig_tbl}."));
-                s = s.replace("cte1.", &format!("{orig_tbl}."));
+                s = s.replace(&format!(".{cte_name}."), &format!(".{orig_tbl}."));
+                s = replace_bare_prefix(
+                    &s,
+                    &format!("{cte_name}."),
+                    &format!("{orig_tbl}."),
+                );
                 // Apply-shaped: cast(plus(...), int)->schema.tbl.col
                 if s.contains("cast(") && s.contains("->") && !s.contains("Column#") {
                     return s;
@@ -3549,6 +3698,14 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
                     } else {
                         format!("cast({core}, int)")
                     };
+                    // `buildProjection4CTEUnion` gives the arm the seed
+                    // schema, so the output name is the seed's output column.
+                    if let Some((_, tbl, col)) = seed_outputs.get(i)
+                        && !tbl.is_empty()
+                        && !col.is_empty()
+                    {
+                        return format!("{core}->{schema}.{tbl}.{col}");
+                    }
                     let col = right
                         .rsplit('.')
                         .next()
@@ -3566,6 +3723,28 @@ fn recursive_arm_proj_info(plan: &PhysicalPlan, schema: &str, orig_tbl: &str) ->
         }
     }
     format!("cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1")
+}
+
+
+/// Number of conjuncts in the recursive arm's predicate (0 = no filter).
+fn recursive_arm_filter_conjuncts(plan: &PhysicalPlan) -> usize {
+    let filter = match plan {
+        PhysicalPlan::Selection { filter, .. } => Some(filter),
+        PhysicalPlan::Projection { child, .. } => match child.as_ref() {
+            PhysicalPlan::Selection { filter, .. } => Some(filter),
+            PhysicalPlan::TableReader {
+                pushed: Some(filter),
+                ..
+            } => Some(filter),
+            _ => None,
+        },
+        PhysicalPlan::TableReader {
+            pushed: Some(filter),
+            ..
+        } => Some(filter),
+        _ => None,
+    };
+    filter.map_or(0, |f| f.split_cnf().len())
 }
 
 fn recursive_arm_filter_info(
@@ -3589,12 +3768,14 @@ fn recursive_arm_filter_info(
         } => Some(filter),
         _ => None,
     }?;
-    Some(
-        explain_selection_info(filter)
-            .replace(&format!(".{cte_name}."), &format!(".{orig_tbl}."))
-            .replace(".t.", &format!(".{orig_tbl}."))
-            .replace(&format!("{cte_name}."), &format!("{orig_tbl}.")),
-    )
+    let info = explain_selection_info(filter)
+        .replace(&format!(".{cte_name}."), &format!(".{orig_tbl}."))
+        .replace(".t.", &format!(".{orig_tbl}."));
+    Some(replace_bare_prefix(
+        &info,
+        &format!("{cte_name}."),
+        &format!("{orig_tbl}."),
+    ))
 }
 
 /// Synthetic coprocessor subtree under TableReader / IndexReader / IndexLookUp.
@@ -7071,6 +7252,18 @@ fn column_eq_is_cross_table(filter: &sealdb_parser::ast::ExprNode) -> bool {
     }
 }
 
+/// A single-table scan whose columns carry statistics (a real table or index).
+/// The recursive CTE working table (`CTE_0`) is excluded: it holds no column
+/// statistics, so TiDB cannot derive an equal range over it.
+fn table_scan_is_correlatable(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableReader { table, .. } | PhysicalPlan::IndexReader { table, .. } => {
+            !table.starts_with("CTE_")
+        }
+        _ => false,
+    }
+}
+
 fn is_equality_filter(filter: &sealdb_parser::ast::ExprNode) -> bool {
     use sealdb_parser::ast::expressions::ExprNode;
     use sealdb_parser::opcode::Op;
@@ -7614,6 +7807,20 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 // side of an outer join: TiDB sizes the root Selection with
                 // the plain 0.8 factor instead of the DNF product (0.8002).
                 est_rows(child) * 0.8
+            } else if matches!(child.as_ref(), PhysicalPlan::Window { .. }) {
+                // A `Window`'s output carries no column statistics, so TiDB
+                // sizes a Selection above it with the single 0.8
+                // `selectionFactor` (regardless of the conjunct count).
+                est_rows(child) * 0.8
+            } else if table_scan_is_correlatable(child) && column_eq_is_cross_table(filter)
+            {
+                // A correlated equality over a single table's scan (`t2.c2 =
+                // t1.c2` inside a CTE seed / Apply probe) is an equal range on
+                // the column: TiDB's pseudo `pseudoEqualRate` reads one key
+                // per distinct value (`10000 * 1/1000 = 10`). The recursive
+                // working table has no column statistics, so it keeps the 0.8
+                // `selectionFactor` instead.
+                (est_rows(child) * 0.001).max(1.0)
             } else if let Some(sel) = filter_selectivity(filter) {
                 // A cast comparison keeps TiDB's default factor; OR arms
                 // combine as `1 - Π(1 - s)` (DNF selectivity).
@@ -8041,19 +8248,28 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
         | PhysicalPlan::ShuffleReceiver { child }
         | PhysicalPlan::Explain { child, .. }
         | PhysicalPlan::Distinct { child, .. } => est_rows(child),
+        // TiDB `LogicalCTE.DeriveStats`: the recursive working table reuses the
+        // seed statistics (`LogicalCTETable` → `SeedStat`), and the CTE output
+        // is `seed + one recursive pass`. A deduplicating (`UNION`) CTE instead
+        // takes `EstimateColsNDVWithMatchedLen`: the max output NDV, which
+        // pseudo stats size as the seed column's NDV plus the recursive
+        // column's (1, because the working table's NDVs never match).
         PhysicalPlan::CTE {
+            name,
             recursive: true,
-            limit: Some(_),
+            seed,
+            recursive_plan,
             ..
-        } => 20.0,
-        PhysicalPlan::CTE {
-            recursive: true,
-            recursive_plan: Some(rec),
-            ..
-        } if plan_has_selection(rec) => 18_000.0,
-        PhysicalPlan::CTE {
-            recursive: true, ..
-        } => 8_001.0,
+        } => {
+            let seed_est = est_rows(seed);
+            match recursive_plan.as_deref().map(est_rows) {
+                Some(_) if super::planbuilder::cte_recursive_distinct(name) => {
+                    (seed_est * 0.8).max(1.0).round() + 1.0
+                }
+                Some(rec) => seed_est + rec,
+                None => seed_est,
+            }
+        }
         PhysicalPlan::CTE { seed: child, .. } => est_rows(child),
         PhysicalPlan::Simple { kind } if kind.starts_with("TableDual|") => kind
             .split('|')
@@ -8064,21 +8280,6 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
     }
 }
 
-fn plan_has_selection(plan: &PhysicalPlan) -> bool {
-    match plan {
-        PhysicalPlan::Selection { .. } => true,
-        PhysicalPlan::Projection { child, .. }
-        | PhysicalPlan::Sort { child, .. }
-        | PhysicalPlan::Limit { child, .. } => plan_has_selection(child),
-        PhysicalPlan::Apply {
-            child,
-            probe: Some(_),
-            ..
-        } => plan_has_selection(child),
-        PhysicalPlan::Apply { child, .. } => plan_has_selection(child),
-        _ => false,
-    }
-}
 
 /// CTE name + original seed table under a plan (for ExplainInfo qualification).
 fn recursive_cte_qualifier(plan: &PhysicalPlan) -> Option<(String, String)> {

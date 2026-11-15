@@ -457,7 +457,14 @@ fn build_recursive_all_probe(
     } else {
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
-    let rec_plan = build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), schema);
+    let seed_rows = super::explain::est_rows(&seed_plan);
+    let rec_plan = build_recursive_arm_plan(
+        rec,
+        &cte.name,
+        seed_from.name.as_str(),
+        schema,
+        seed_rows,
+    );
     let cte_plan = PhysicalPlan::CTE {
         name: cte.name.clone(),
         alias: None,
@@ -517,6 +524,7 @@ fn build_recursive_arm_plan(
     cte_name: &str,
     orig_tbl: &str,
     schema: &str,
+    seed_rows: f64,
 ) -> PhysicalPlan {
     // Prefer EXPLAIN-shaped Projection(+Selection) over CTETable scan.
     let mut exprs = Vec::new();
@@ -547,11 +555,13 @@ fn build_recursive_arm_plan(
         ));
     }
     let scan = PhysicalPlan::TableReader {
-        table: format!("CTE_0"),
+        table: "CTE_0".to_string(),
         partitions: Vec::new(),
         partition_names: Vec::new(),
         partition_access: String::new(),
-        row_count: 10.0,
+        // `LogicalCTETable` reuses the seed statistics (`SeedStat`), so the
+        // self-scan starts from the seed's row count.
+        row_count: seed_rows.max(1.0),
         stats_pseudo: true,
         data_limit: None,
         filter_est: None,
@@ -674,10 +684,15 @@ fn recursive_exists_cte_apply(
     } else {
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
+    let seed_rows = super::explain::est_rows(&seed_plan);
     let rec_plan = match &cte.recursive {
-        Some((_, rec)) => {
-            build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema)
-        }
+        Some((_, rec)) => build_recursive_arm_plan(
+            rec,
+            &cte.name,
+            seed_from.name.as_str(),
+            &schema,
+            seed_rows,
+        ),
         None => PhysicalPlan::table_reader("CTE_0", Vec::new()),
     };
     let cte_plan = PhysicalPlan::CTE {

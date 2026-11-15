@@ -1695,20 +1695,43 @@ impl PlanBuilder {
         });
         let recursive = cte.is_some_and(|cte| cte.recursive.is_some());
         let recursive_plan = if let Some((_, rec)) = with.recursive_arm(&from.name)? {
-            Some(Box::new(self.build_with_schema(
+            // TiDB `LogicalCTETable` derives its stats from the seed plan
+            // (`SeedStat`), so the self-scan inside the arm starts from the
+            // seed's row count (dual seed → 1 row, not the 10000 default).
+            let seed_rows = super::explain::est_rows(&seed);
+            let origins = cte_seed_output_origins(&seed_select);
+            let named: Vec<(String, String, String)> = columns
+                .iter()
+                .zip(origins)
+                .map(|(alias, (tbl, col))| (alias.clone(), tbl, col))
+                .collect();
+            CTE_SEED_OUTPUTS.with(|cell| {
+                cell.borrow_mut()
+                    .insert(from.name.to_ascii_lowercase(), named)
+            });
+            let saved_rows = RECURSIVE_CTE_SEED_ROWS.with(|cell| {
+                cell.borrow_mut().replace((from.name.clone(), seed_rows))
+            });
+            let built = self.build_with_schema(
                 &Statement::Select(rec),
                 is,
                 current_db,
                 stats,
                 prune_mode,
-            )?))
+            );
+            RECURSIVE_CTE_SEED_ROWS.with(|cell| *cell.borrow_mut() = saved_rows);
+            Some(Box::new(built?))
         } else {
             None
         };
-        let inline = cte.is_some_and(|cte| !cte_materialized(cte, refs))
-            || seed_is_dual_projection(&seed)
-            // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
-            || seed_is_union_of_dual(&seed);
+        // TiDB never inlines `WITH RECURSIVE`: the CTE needs a shared
+        // `CTETableReader`, so even a constant seed (`select 1 union select
+        // a+1 from cte`) stays a materialized `CTEFullScan`.
+        let inline = !recursive
+            && (cte.is_some_and(|cte| !cte_materialized(cte, refs))
+                || seed_is_dual_projection(&seed)
+                // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
+                || seed_is_union_of_dual(&seed));
         // `cte1 AS dt2` → name=cte1, physical=dt2 after join_side remap.
         let alias = from
             .physical
@@ -7058,6 +7081,28 @@ thread_local! {
     /// (TiDB `computeCTEInlineFlag`, see [`with_statement_cte_refs`]).
     static CTE_REF_COUNTS: std::cell::RefCell<Option<std::collections::HashMap<String, usize>>> =
         const { std::cell::RefCell::new(None) };
+    /// CTE name → storage id for the statement just planned (TiDB
+    /// `CTE.IDForStorage`, see [`allocate_statement_cte_ids`]). Kept after the
+    /// build so EXPLAIN can print `data:CTE_n` / the producer `CTE_n` label.
+    static CTE_STORAGE_IDS: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Recursive CTE name → whether its arms are joined by `UNION` (dedup)
+    /// instead of `UNION ALL` (TiDB `CTE.IsDistinct`: the CTE estimate then
+    /// takes the output NDV instead of `seed + recursive` row counts).
+    static CTE_RECURSIVE_DISTINCT: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Working-table statistics of the recursive CTE being built right now
+    /// (TiDB `LogicalCTETable` reuses the seed plan's `SeedStat`): row count
+    /// that the self-reference scan inside the recursive arm reports.
+    static RECURSIVE_CTE_SEED_ROWS: std::cell::RefCell<Option<(String, f64)>> =
+        const { std::cell::RefCell::new(None) };
+    /// Recursive CTE name → seed output column origins (`(`table`, `column`)`).
+    /// TiDB's working table (`getResultCTESchema`) clones the *seed* schema, so
+    /// EXPLAIN prints the seed's `OrigTblName.OrigColName` even when the CTE
+    /// declares `cte(a)`.
+    static CTE_SEED_OUTPUTS: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<(String, String, String)>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
     /// Whether the plan build in progress belongs to an `EXPLAIN` statement.
     static EXPLAIN_BUILD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Whether the current statement runs inside an explicit transaction, where
@@ -7411,12 +7456,165 @@ fn with_statement_cte_refs<T>(stmt: &Statement, f: impl FnOnce() -> T) -> T {
         let mut counts = std::collections::HashMap::new();
         count_statement_table_refs(stmt, &mut counts);
         CTE_REF_COUNTS.with(|cell| *cell.borrow_mut() = Some(counts));
+        CTE_SEED_OUTPUTS.with(|cell| cell.borrow_mut().clear());
+        let mut ids = std::collections::HashMap::new();
+        let mut distinct = std::collections::HashMap::new();
+        let mut next = 0usize;
+        allocate_statement_cte_ids(stmt, &mut ids, &mut distinct, &mut next);
+        CTE_STORAGE_IDS.with(|cell| *cell.borrow_mut() = ids);
+        CTE_RECURSIVE_DISTINCT.with(|cell| *cell.borrow_mut() = distinct);
     }
     let out = f();
     if outermost {
         CTE_REF_COUNTS.with(|cell| *cell.borrow_mut() = None);
     }
     out
+}
+
+/// TiDB `buildWith` numbers every CTE of a WITH clause as it builds its body:
+/// each definition takes the next `allocIDForCTEStorage`, then its body's own
+/// WITH clauses take the following ids (depth-first, definition order). The
+/// number is what EXPLAIN prints as `data:CTE_n` and as the producer's id.
+fn allocate_statement_cte_ids(
+    stmt: &Statement,
+    ids: &mut std::collections::HashMap<String, usize>,
+    distinct: &mut std::collections::HashMap<String, bool>,
+    next: &mut usize,
+) {
+    match stmt {
+        Statement::Select(select) => allocate_select_cte_ids(select, ids, distinct, next),
+        Statement::SetOpr(set) => {
+            if let Some(with) = &set.with {
+                allocate_with_cte_ids(with, ids, distinct, next);
+            }
+            allocate_select_cte_ids(&set.first, ids, distinct, next);
+            for (_, arm) in &set.rest {
+                allocate_select_cte_ids(arm, ids, distinct, next);
+            }
+        }
+        Statement::Explain(explain) => {
+            allocate_statement_cte_ids(&explain.stmt, ids, distinct, next)
+        }
+        _ => {}
+    }
+}
+
+fn allocate_with_cte_ids(
+    with: &WithClause,
+    ids: &mut std::collections::HashMap<String, usize>,
+    distinct: &mut std::collections::HashMap<String, bool>,
+    next: &mut usize,
+) {
+    for cte in &with.ctes {
+        // A flattened derived table (`FROM (SELECT …) x`) is not a WITH entry
+        // in TiDB, so it consumes no storage id.
+        if cte.derived {
+            continue;
+        }
+        if let Some((op, _)) = &cte.recursive {
+            distinct.insert(
+                cte.name.to_ascii_lowercase(),
+                matches!(op, SetOprType::Union),
+            );
+        }
+        ids.insert(cte.name.to_ascii_lowercase(), *next);
+        *next += 1;
+        allocate_select_cte_ids(&cte.query, ids, distinct, next);
+        for (_, arm) in cte.recursive.iter().chain(cte.recursive_rest.iter()) {
+            allocate_select_cte_ids(arm, ids, distinct, next);
+        }
+        for (_, arm) in &cte.set_rest {
+            allocate_select_cte_ids(arm, ids, distinct, next);
+        }
+    }
+}
+
+fn allocate_select_cte_ids(
+    select: &SelectStmt,
+    ids: &mut std::collections::HashMap<String, usize>,
+    distinct: &mut std::collections::HashMap<String, bool>,
+    next: &mut usize,
+) {
+    if let Some(with) = &select.with {
+        allocate_with_cte_ids(with, ids, distinct, next);
+    }
+}
+
+/// TiDB `CTE.IDForStorage` of `name` in the statement just planned.
+pub(crate) fn cte_storage_id(name: &str) -> Option<usize> {
+    CTE_STORAGE_IDS.with(|cell| cell.borrow().get(&name.to_ascii_lowercase()).copied())
+}
+
+/// TiDB `CTE.IsDistinct` of `name` in the statement just planned.
+pub(crate) fn cte_recursive_distinct(name: &str) -> bool {
+    CTE_RECURSIVE_DISTINCT.with(|cell| {
+        cell.borrow()
+            .get(&name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(false)
+    })
+}
+
+/// Seed output column origins of a recursive CTE working table:
+/// `(declared name, OrigTblName, OrigColName)`.
+pub(crate) fn cte_working_seed_outputs(name: &str) -> Vec<(String, String, String)> {
+    CTE_SEED_OUTPUTS.with(|cell| {
+        cell.borrow()
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+/// Output origins of a recursive CTE seed: the table (resolved to its physical
+/// name) and column each seed field projects.
+fn cte_seed_output_origins(seed: &SelectStmt) -> Vec<(String, String)> {
+    let tables = seed.join_tables();
+    let resolve = |qualifier: Option<&str>| -> String {
+        let Some(qualifier) = qualifier else {
+            return if tables.len() == 1 {
+                tables[0].resolve_name().to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+        };
+        tables
+            .iter()
+            .find(|tbl| {
+                qualifier.eq_ignore_ascii_case(&tbl.name)
+                    || qualifier.eq_ignore_ascii_case(tbl.resolve_name())
+            })
+            .map(|tbl| tbl.resolve_name().to_ascii_lowercase())
+            .unwrap_or_else(|| qualifier.to_ascii_lowercase())
+    };
+    seed.fields
+        .iter()
+        .map(|field| {
+            let col = field
+                .as_name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .or_else(|| match &field.expr {
+                    ExprNode::Column(c) => Some(c.name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let table = match &field.expr {
+                ExprNode::Column(c) => resolve(c.table.as_deref()),
+                _ => String::new(),
+            };
+            (table, col)
+        })
+        .collect()
+}
+
+/// Row count of the recursive working table while its arm is being built.
+fn recursive_cte_seed_rows(name: &str) -> Option<f64> {
+    RECURSIVE_CTE_SEED_ROWS.with(|cell| {
+        cell.borrow().as_ref().and_then(|(cte, rows)| {
+            cte.eq_ignore_ascii_case(name).then_some(*rows)
+        })
+    })
 }
 
 /// Whether `select` references the CTE `name` in its FROM (recursive arm
@@ -25218,6 +25416,16 @@ fn access_plan_inner(
     // Unknown physical table (CTE / recursive working set): always TableReader
     // so execute-time `lookup_cte_rows` can resolve. PointGet here would 1146
     // on `FROM cte WHERE col = const` in recursive arms (TiDB cte suite).
+    if let Some(rows) = recursive_cte_seed_rows(&from.name) {
+        return PhysicalPlan::table_reader_parts(
+            from.name.clone(),
+            Vec::new(),
+            Vec::new(),
+            "",
+            rows.max(1.0),
+            true,
+        );
+    }
     PhysicalPlan::table_reader(from.name.clone(), Vec::new())
 }
 
