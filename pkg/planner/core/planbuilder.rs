@@ -8136,6 +8136,113 @@ fn wrap_output_projection(
     {
         return plan;
     }
+    // An ORDER BY over an expression-index scan keeps the output projection
+    // above the Sort: the DataSource emits the hidden generated column, so the
+    // SELECT list is projected after the sort (`Projection → Sort →
+    // IndexLookUp`). A passthrough projection under the Sort (it only renames
+    // the select-list columns) moves up and the sort reads the scan directly; a
+    // projection that computes extra expressions stays below it (`Projection →
+    // Sort → Projection → IndexLookUp`).
+    if let PhysicalPlan::Sort { .. } = &plan
+        && let Some(info) = hidden_table_info(select, is, current_db)
+        && select.joins.is_empty()
+        && select.fields.iter().all(|f| matches!(&f.expr, ExprNode::Column(_)))
+        && sort_scan_reads_expr_index(&plan, info)
+    {
+        let from = select.from.as_ref();
+        if let Some(from) = from {
+            let (db, _) = from.qualified(current_db);
+            let schema = if db.is_empty() { "select" } else { db.as_str() };
+            let table = merge_join_orig_table(select, from);
+            let items: Vec<String> = select
+                .fields
+                .iter()
+                .filter_map(|f| match &f.expr {
+                    ExprNode::Column(col) => Some(format!("{schema}.{table}.{}", col.name)),
+                    _ => None,
+                })
+                .collect();
+            if items.len() == select.fields.len()
+                && let PhysicalPlan::Sort { child, by_info } = plan
+            {
+                // TiDB materialises the expression index's virtual column above
+                // the reader when the SELECT list drops the base column the
+                // expression is computed from (`SELECT id … ORDER BY id` over
+                // `KEY ((f(customer_id)))`), so the extra projection survives
+                // under the Sort. When the SELECT list already carries those
+                // base columns the reader answers the expression itself and the
+                // passthrough projection simply moves above the Sort.
+                let prefix = format!("{schema}.{table}");
+                let parts = expr_index_part_texts(child.as_ref(), info, &from.name);
+                let selected = |name: &str| {
+                    select.fields.iter().any(|f| match &f.expr {
+                        ExprNode::Column(col) => col.name.eq_ignore_ascii_case(name),
+                        _ => false,
+                    })
+                };
+                let materialise = parts.iter().any(|(part, _)| {
+                    part.referenced_columns()
+                        .iter()
+                        .any(|(_, name)| !selected(name))
+                });
+                if materialise {
+                    let mut inner: Vec<String> = items.clone();
+                    for key in by_info.split(", ") {
+                        let col = key.trim_end_matches(":desc");
+                        let name = col.rsplit('.').next().unwrap_or(col);
+                        let item = if col.contains('.') {
+                            col.to_string()
+                        } else {
+                            format!("{prefix}.{name}")
+                        };
+                        if !inner.contains(&item) {
+                            inner.push(item);
+                        }
+                    }
+                    inner.extend(parts.into_iter().map(|(_, text)| text));
+                    let read = match child.as_ref() {
+                        PhysicalPlan::Projection {
+                            child: sort_child, ..
+                        } => sort_child.clone(),
+                        _ => child.clone(),
+                    };
+                    return PhysicalPlan::Projection {
+                        exprs: items,
+                        child: Box::new(PhysicalPlan::Sort {
+                            child: Box::new(PhysicalPlan::Projection {
+                                exprs: inner,
+                                child: read,
+                                est_rows: None,
+                            }),
+                            by_info,
+                        }),
+                        est_rows: None,
+                    };
+                }
+                if let PhysicalPlan::Projection {
+                    exprs: inner,
+                    child: sort_child,
+                    ..
+                } = child.as_ref()
+                    && *inner == items
+                {
+                    return PhysicalPlan::Projection {
+                        exprs: items,
+                        child: Box::new(PhysicalPlan::Sort {
+                            child: sort_child.clone(),
+                            by_info,
+                        }),
+                        est_rows: None,
+                    };
+                }
+                return PhysicalPlan::Projection {
+                    exprs: items,
+                    child: Box::new(PhysicalPlan::Sort { child, by_info }),
+                    est_rows: None,
+                };
+            }
+        }
+    }
     if star_hidden {
         // TiDB pushes the projection into the cop task when the reader is a
         // bare scan and keeps it at the root above any Selection/IndexLookUp.
@@ -8690,6 +8797,54 @@ fn plan_reads_expr_index(plan: &PhysicalPlan, info: &sealdb_meta::model::table::
     }
 }
 
+/// Look through a Sort's child wrappers for the access path that reads an
+/// expression index.
+fn sort_scan_reads_expr_index(
+    plan: &PhysicalPlan,
+    info: &sealdb_meta::model::table::TableInfo,
+) -> bool {
+    match plan {
+        PhysicalPlan::Sort { child, .. } | PhysicalPlan::Projection { child, .. } => {
+            sort_scan_reads_expr_index(child, info)
+        }
+        other => plan_reads_expr_index(other, info),
+    }
+}
+
+/// Expression key parts of the index an expression-index read touches, as
+/// `(parsed expression, EXPLAIN text qualified with `prefix`)`.
+fn expr_index_part_texts(
+    plan: &PhysicalPlan,
+    info: &sealdb_meta::model::table::TableInfo,
+    prefix: &str,
+) -> Vec<(ExprNode, String)> {
+    let index = match plan {
+        PhysicalPlan::IndexReader { index, .. } | PhysicalPlan::IndexLookUpReader { index, .. } => {
+            index.clone()
+        }
+        PhysicalPlan::Sort { child, .. } | PhysicalPlan::Projection { child, .. } => {
+            return expr_index_part_texts(child, info, prefix);
+        }
+        _ => return Vec::new(),
+    };
+    let Some(index_info) = info
+        .indices
+        .iter()
+        .find(|idx| idx.name.o().eq_ignore_ascii_case(&index))
+    else {
+        return Vec::new();
+    };
+    index_info
+        .columns
+        .iter()
+        .filter_map(|part| {
+            let expr = super::expr_index::part_expr(info, part)?;
+            let text = super::explain::explain_pushed_filter(prefix, &expr);
+            Some((expr, text))
+        })
+        .collect()
+}
+
 /// Columns of `alias` (or of every FROM table when `alias` is None) in
 /// definition order, as `(table_name, column_name)`.
 fn star_columns_for_table(
@@ -9237,13 +9392,27 @@ fn projection_column_base(
         } => projection_column_base(seed, table),
         PhysicalPlan::Projection { exprs, .. } => exprs.len() + 1,
         PhysicalPlan::TableDual { .. } => 1,
+        // An index read that carries an expression key part emits the part's
+        // hidden generated column, so the DataSource schema holds one more
+        // column than the table: the first derived column id follows it
+        // (`hex(vitess_hash(1))->Column#7` over `KEY ((f(col) >> 56))`).
+        PhysicalPlan::IndexReader { index, .. }
+        | PhysicalPlan::IndexLookUpReader { index, .. } => table
+            .map(|info| {
+                let parts = info
+                    .indices
+                    .iter()
+                    .find(|idx| idx.name.o().eq_ignore_ascii_case(index))
+                    .map(|idx| super::expr_index::expression_parts(info, idx).len())
+                    .unwrap_or(0);
+                table_column_base(info) + parts
+            })
+            .unwrap_or(6),
         // TiDB allocates one plan column id per DataSource schema column (hidden
         // columns included) plus `_tidb_rowid` when the handle is not a
         // clustered index; the first derived expression column follows.
         PhysicalPlan::TableReader { .. }
         | PhysicalPlan::Selection { .. }
-        | PhysicalPlan::IndexReader { .. }
-        | PhysicalPlan::IndexLookUpReader { .. }
         | PhysicalPlan::PointGet { .. }
         | PhysicalPlan::BatchPointGet { .. } => table.map(table_column_base).unwrap_or(6),
         _ => 1,
@@ -9546,18 +9715,16 @@ fn expr_index_point_projection(
         // A re-evaluated expression that an expression key part also stores
         // consumes one intermediate column below the projection, so TiDB's
         // output column id starts one higher (`plus(t.a, 1)->Column#8`); an
-        // ordered read allocates one more for the sort key (`->Column#9`).
+        // ordered read allocates one more for the sort key (`->Column#9`). An
+        // index read that carries the key part also emits its hidden generated
+        // column, which occupies an id even when no field re-evaluates it
+        // (`hex(vitess_hash(1))->Column#7`).
         let mut next_id: i64 = info.max_col_id
             + 1
-            + i64::from(
-                matches!(
-                    plan,
-                    PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
-                ) && select
-                    .fields
-                    .iter()
-                    .any(|field| expression_part_matches(info, index_info, &field.expr)),
-            )
+            + i64::from(matches!(
+                plan,
+                PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+            ))
             + i64::from(index_read_keeps_order(&plan));
         select
             .fields
@@ -25358,13 +25525,20 @@ fn access_plan_inner(
             };
             // A plain column available as an index column is the direct read;
             // only fall back to an expression index that serves a virtual
-            // generated column through its hidden key part.
+            // generated column through its hidden key part. With no projected
+            // column at all no index is the direct read, so the price tie-break
+            // below picks the narrowest covering index.
+            let has_plain_column = select
+                .fields
+                .iter()
+                .any(|f| matches!(&f.expr, ExprNode::Column(_)));
             let direct = |idx: &sealdb_meta::IndexInfo| {
-                needed.iter().all(|name| {
-                    idx.columns
-                        .iter()
-                        .any(|part| part.name.o().eq_ignore_ascii_case(name))
-                })
+                has_plain_column
+                    && needed.iter().all(|name| {
+                        idx.columns
+                            .iter()
+                            .any(|part| part.name.o().eq_ignore_ascii_case(name))
+                    })
             };
             let chosen = candidates
                 .clone()
@@ -25374,7 +25548,8 @@ fn access_plan_inner(
                 candidates
                     .clone()
                     .find(|idx| {
-                        select
+                        has_plain_column
+                            && select
                             .fields
                             .iter()
                             .filter_map(|field| match &field.expr {
@@ -25392,7 +25567,23 @@ fn access_plan_inner(
                                 .is_some()
                             })
                     })
-                    .or_else(|| candidates.clone().next())
+                    .or_else(|| {
+                        // With no projected column every covering index serves
+                        // the read, so TiDB's task price decides on the average
+                        // row size of the index itself: the narrow expression
+                        // index beats the two-column PRIMARY here.
+                        if needed.is_empty() {
+                            candidates.clone().min_by(|a, b| {
+                                super::plan_cost::index_avg_row_size(a.columns.len(), a.unique)
+                                    .total_cmp(&super::plan_cost::index_avg_row_size(
+                                        b.columns.len(),
+                                        b.unique,
+                                    ))
+                            })
+                        } else {
+                            candidates.clone().next()
+                        }
+                    })
             });
             if std::env::var("SEALDB_DEBUG_EXPRPROJ").is_ok() {
                 eprintln!(
