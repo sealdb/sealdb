@@ -686,6 +686,10 @@ impl Table {
             return None;
         }
         let realtime = self.count as f64;
+        // An analyzed-but-empty table has no rows to distribute over ranges.
+        if realtime < 1.0 {
+            return Some(0.0);
+        }
         let mut total = 0.0;
         for range in ranges {
             total += col.range_row_count(kind, range, realtime)?;

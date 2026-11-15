@@ -1620,7 +1620,9 @@ fn keep_order_pushed(pushed: Option<&ExprNode>) -> bool {
 
 /// The marker is EXPLAIN-only bookkeeping, never a row filter.
 fn keep_order_filter(pushed: &Option<ExprNode>) -> Option<ExprNode> {
-    if keep_order_pushed(pushed.as_ref()) {
+    if keep_order_pushed(pushed.as_ref())
+        || sealdb_planner::core::explain::cop_limit_pushed(pushed.as_ref()).is_some()
+    {
         None
     } else {
         pushed.clone()

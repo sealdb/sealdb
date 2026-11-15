@@ -436,7 +436,18 @@ pub fn index_access_range(
             .map(|rows| rows.max(0.0))
     }) {
         Some(rows) => (rows, false),
-        None => (rows, true),
+        // ANALYZE fills column histograms only, so a plain index range falls
+        // back to its key column's histogram (TiDB's index stats mirror it).
+        None => match table_stats.and_then(|stats| {
+            stats.column_range_estimate(
+                &stats_column,
+                sealdb_statistics::kind_of(&column_info.field_type),
+                &stat_ranges,
+            )
+        }) {
+            Some(rows) => (rows, false),
+            None => (rows, true),
+        },
     };
     // TiDB `stats:partial[…]`: the index histogram is present but the column
     // statistics of the key column is not, so EXPLAIN marks the scan. A hidden

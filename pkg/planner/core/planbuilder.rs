@@ -436,7 +436,17 @@ impl PlanBuilder {
                 plan = lift_point_get_merge_join(plan, select, is, current_db);
                 plan = cast_json_join_keys(plan, select, is, current_db);
                 plan = self_join_star_projection(plan, select, is, current_db);
-                plan = apply_select_lock(plan, select);
+                // TiDB builds the row lock above `ORDER BY` / `LIMIT`
+                // (`SelectLock → Limit → reader`), so a locking SELECT that
+                // sorts or limits finishes those nodes first and locks the
+                // surviving rows afterwards.
+                let defer_lock = !matches!(select.lock, SelectLock::None)
+                    && (!select.order_by.is_empty()
+                        || select.limit.is_some()
+                        || select.offset.is_some());
+                if !defer_lock {
+                    plan = apply_select_lock(plan, select);
+                }
                 let mut stream_keep_order = false;
                 if needs_hash_agg(select) {
                     if needs_window(select) {
@@ -502,9 +512,17 @@ impl PlanBuilder {
                     // order, so the sort is already satisfied. A multi-partition
                     // read returns rows partition by partition, so it is not —
                     // unless the read walks a GLOBAL index, which is one ordered
-                    // index shared by every partition.
+                    // index shared by every partition, or the executor prunes to
+                    // the partitions that can serve the query (dynamic pruning
+                    // still reads them one after another, sorted by index key).
                     let index_order = (!select_spans_multiple_partitions(select, is, current_db)
                         || plan_reads_global_index(&plan, select, is, current_db)
+                        // EXPLAIN parity: TiDB keeps a partitioned index read in
+                        // key order (`keep order:true`) and pushes the LIMIT into
+                        // its cop task (`index:Limit`). The executor still sorts
+                        // across partitions, so the executable plan keeps its
+                        // Sort/TopN.
+                        || (in_explain_build() && plan_reads_all_partitions_dynamic(&plan))
                         // A keep-order merge orders the arms itself, so the
                         // per-partition index order still yields one stream.
                         || inner_merge(&plan)
@@ -601,13 +619,17 @@ impl PlanBuilder {
                                 .unwrap_or_default();
                             (db, table)
                         });
-                        plan = wrap_output_projection(
-                            plan,
-                            select,
-                            qualified.as_ref(),
-                            is,
-                            current_db,
-                        );
+                        // A deferred lock owns the row handle, so the output
+                        // projection is built after the lock is attached.
+                        if !defer_lock {
+                            plan = wrap_output_projection(
+                                plan,
+                                select,
+                                qualified.as_ref(),
+                                is,
+                                current_db,
+                            );
+                        }
                         // A keep-order merge on a rowid table reads `_tidb_rowid`
                         // to keep the arms aligned, so TiDB prunes it with an
                         // extra Projection (`index_merge_reader`:
@@ -634,6 +656,16 @@ impl PlanBuilder {
                 plan = explain_rewrite_pushed(plan, select, is, current_db, stats);
                 // TiDB pushes `LIMIT` into the cop task of a plain table scan.
                 plan = push_limit_into_cop(plan);
+                if defer_lock {
+                    // The lock sits above the limit and the surviving rows are
+                    // projected from the lock's schema (`Projection → SelectLock
+                    // → Limit → reader`).
+                    plan = apply_select_lock(plan, select);
+                    // The locked rows carry the table's handle, so the output
+                    // projection names surviving columns with the table.
+                    let qualified = select.from.as_ref().map(|from| from.qualified(current_db));
+                    plan = wrap_output_projection(plan, select, qualified.as_ref(), is, current_db);
+                }
                 if select.having.is_some() {
                     // The HAVING-pushdown aggregate estimate predates the
                     // final join/scan cardinalities; re-derive it now.
@@ -5273,6 +5305,29 @@ fn limit_reader(plan: PhysicalPlan, count: u64) -> std::result::Result<PhysicalP
             keep_order,
             data_limit: Some((0, count)),
             pushed,
+        }),
+        // TiDB `PushLimitToCop` over a single index read: the limit runs in the
+        // reader's cop task (`Limit → IndexReader(index:Limit) → Limit(cop) →
+        // IndexRangeScan`) and the scan only reads what the limit needs. The
+        // marker is EXPLAIN-only: execution keeps the `Limit` above the reader.
+        PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            range_scan,
+            pushed: None,
+        } => Ok(PhysicalPlan::IndexReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            range_scan,
+            pushed: Some(bytes_info(&format!("COP_LIMIT|0|{count}"))),
         }),
         PhysicalPlan::CTE {
             name,
@@ -25723,6 +25778,25 @@ fn select_spans_multiple_partitions(
     let (db, table) = from.qualified(current_db);
     is.and_then(|schema| schema.table_by_name(&db, &table))
         .is_some_and(|info| partition_read_spans_multiple(info, from))
+}
+
+/// A partitioned read that touches more than one partition (static `all` or a
+/// dynamic prune that resolves the partition list while executing). TiDB labels
+/// it `partition:all` and still treats the index scan as one ordered stream.
+fn plan_reads_all_partitions_dynamic(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::IndexReader {
+            partitions,
+            partition_access,
+            ..
+        }
+        | PhysicalPlan::IndexLookUpReader {
+            partitions,
+            partition_access,
+            ..
+        } => partition_access == "all" || partitions.len() > 1,
+        _ => false,
+    }
 }
 
 /// An ordered index read whose schema is not the SELECT list prints the columns

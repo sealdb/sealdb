@@ -4117,10 +4117,39 @@ fn emit_cop_children(
                 if under_bushy && !cop_spine.is_empty() {
                     scan_spine.push(false);
                 }
-                if let Some(filter) = pushed.as_ref() {
-                    // The reader's own cardinality is what the range plus its
-                    // residual cop Selection keeps; the scan below reports the
-                    // range's cardinality (`filter_rows` falls back to it).
+                if let Some((limit_offset, limit_count)) = cop_limit_pushed(pushed.as_ref()) {
+                    // TiDB `PushLimitToCop` over a single index read: the scan
+                    // only reads what the limit needs (`Limit → IndexRangeScan`).
+                    let limit_est = limit_count as f64;
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Limit",
+                            est: limit_est,
+                            task: "cop[tikv]",
+                            access: String::new(),
+                            info: format!("offset:{limit_offset}, count:{limit_count}"),
+                        },
+                        if under_bushy { cop_spine } else { &[] },
+                    );
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth + 1,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "IndexRangeScan",
+                            est: range.rows.min(limit_est),
+                            task: "cop[tikv]",
+                            access,
+                            info: keep,
+                        },
+                        if under_bushy { &scan_spine } else { &[] },
+                    );
+                } else if let Some(filter) = pushed.as_ref() {
                     let sel_est = if range.filter_rows > 0.0 {
                         range.filter_rows
                     } else {
@@ -4239,6 +4268,44 @@ fn emit_cop_children(
                 .unwrap_or(1.0);
             let cop_owned = bushy_cop_spine(spine, scan_depth, under_bushy, _parent_last);
             let cop_spine = cop_owned.as_slice();
+            if let Some((limit_offset, limit_count)) = cop_limit_pushed(pushed.as_ref()) {
+                // TiDB `PushLimitToCop` over a full index read:
+                // `Limit → IndexFullScan`.
+                let limit_est = limit_count as f64;
+                push_explain_row_spine(
+                    rows,
+                    scan_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Limit",
+                        est: limit_est,
+                        task: scan_task,
+                        access: String::new(),
+                        info: format!("offset:{limit_offset}, count:{limit_count}"),
+                    },
+                    if under_bushy { cop_spine } else { &[] },
+                );
+                let mut leaf_spine = cop_spine.to_vec();
+                if under_bushy && !cop_spine.is_empty() {
+                    leaf_spine.push(false);
+                }
+                push_explain_row_spine(
+                    rows,
+                    scan_depth + 1,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "IndexFullScan",
+                        est: scan_est.min(limit_est),
+                        task: scan_task,
+                        access,
+                        info: scan_info,
+                    },
+                    if under_bushy { &leaf_spine } else { &[] },
+                );
+                return true;
+            }
             if let Some(filter) = pushed.as_ref() {
                 let sel_est = if under_stream_agg {
                     (10_000.0 / 3.0) * limit_scale
@@ -5668,6 +5735,16 @@ fn cop_proj_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<
     Some((proj.to_string(), sel.to_string()))
 }
 
+/// `COP_LIMIT|<offset>|<count>`: the planner pushed a `Limit` into a single
+/// index read's cop task (`Limit → IndexReader(index:Limit) → Limit(cop) →
+/// scan`). EXPLAIN-only: execution keeps the `Limit` above the reader, so the
+/// executor drops the marker instead of filtering with it.
+pub fn cop_limit_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(u64, u64)> {
+    let rest = bytes_marker(pushed)?.strip_prefix("COP_LIMIT|")?;
+    let (offset, count) = rest.split_once('|')?;
+    Some((offset.parse().ok()?, count.parse().ok()?))
+}
+
 /// `KEEP_ORDER` marker: IndexFullScan keeps order for MergeJoin/IndexHashJoin.
 fn keep_order_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> bool {
     matches!(
@@ -6450,7 +6527,9 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else {
                 format!("partition:{partition_access}")
             },
-            if cop_projection_pending().is_some() {
+            if cop_limit_pushed(pushed.as_ref()).is_some() {
+                "index:Limit".to_string()
+            } else if cop_projection_pending().is_some() {
                 "index:Projection".to_string()
             } else if keep_order_sel_pushed(pushed.as_ref()).is_some() {
                 "index:Selection".to_string()

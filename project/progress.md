@@ -3199,6 +3199,36 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 继续 R2/R3 的 in_progress：`cte`（物质化非递归 CTE producer/consumer）
     与 `explain_cte` 的 `CTEFullScan`/`CTE_N` 渲染。
 
+### 2026-11-15（`executor/distsql` 转正：`FOR UPDATE` 上的 `ORDER BY … LIMIT` + `IndexReader(index:Limit)`）
+
+- **Phase**: R7（`executor/distsql`）
+- **完成**:
+  - `SELECT … FOR UPDATE` 的行锁改到 `ORDER BY` / `LIMIT` 之后建
+    （`SelectLock → Limit → reader`），输出 `Projection` 再补到锁之上；
+    TiDB 的锁节点锁的是“排完序、截断后”的行。
+  - `push_limit_into_cop` 支持 `IndexReader`：`Limit → IndexReader` 变成
+    `Limit → IndexReader(index:Limit) → Limit(cop) → IndexRangeScan`，
+    EXPLAIN-only 标记 `COP_LIMIT|off|count`，执行器 `keep_order_filter`
+    丢弃该标记（真实计划仍在 reader 之上保留 `Limit`）。
+  - 多分区索引读在 EXPLAIN 构建期视作有序流（`partition:all` /
+    多物理分区）：TiDB 不插 `Sort`，但执行计划仍保留 `Sort/TopN`
+    以保证跨分区结果顺序正确。
+  - `access_range`：普通索引没有索引直方图时回退到首列直方图
+    （`column_range_estimate`），ANALYZE 后 `stats:pseudo` 正确消失；
+    `column_range_estimate` 对 ANALYZE 过的空表返回 0 行（避免
+    `clamp(1.0, 0.0)` panic）。
+- **验证**:
+  - `run-tests.sh --status pending -t executor/distsql`：Mem / TiKV 各 1 套 `PASS`。
+  - 全量 green+local gate：memory `PASS: memory=95`。
+- **阻塞/风险**:
+  - 多分区 `keep order:true` + cop `Limit` 与 TiDB 同形，但真实执行依赖
+    reader 之上的 `Sort/TopN`；若将来把执行计划也对齐，需先让分区索引
+    读做全局归并。
+- **下一步**:
+  - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
+    `explain_join_stats`（统计等值基数、HashAgg vs StreamAgg 代价、
+    `TIDB_INLJ` 提示的 `IndexJoin` 形状）。
+
 ---
 
 ## 5. Gate 证据索引

@@ -636,7 +636,7 @@
     {
       "name": "executor/distsql",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/distsql.test",
       "result": "r/executor/distsql.result",
       "has_result": true,
