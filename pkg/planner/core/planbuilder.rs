@@ -1765,6 +1765,10 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         let plan = self.build_join_plan_impl(select, is, current_db, stats, prune_mode)?;
         let plan = inject_inner_join_null_reject(plan, select, is, current_db);
+        // TiDB sizes each null-rejecting cop `Selection` from the column's
+        // analyzed null count (an all-NULL column keeps one row), so the join
+        // above has to see the shrunk side.
+        let plan = refine_null_reject_scan_est(plan, current_db, stats);
         // TiDB sizes the join on the pushed-down children (the null-rejecting
         // Selection above each side changes the key NDV).
         let plan = fill_join_est_rows(plan, is, current_db, stats, &query_alias_map(select));
@@ -3580,6 +3584,199 @@ fn push_inner_null_reject(
     predicate_push_down(side, &filter, is, current_db)
 }
 
+/// TiDB sizes a null-rejecting cop filter from the column statistics
+/// (`GetRowCountByColumnRanges`): `count - null_count` rows survive, clamped to
+/// at least one. An all-NULL column keeps its `stats_histograms` row with zero
+/// buckets, so the null count still applies even though no histogram exists.
+///
+/// The scan keeps its own cardinality (`TableFullScan` stays at the table
+/// count); only the `Selection` above it shrinks, which is what the
+/// `FILTER_EST|sel|scan|info` marker encodes.
+fn refine_null_reject_scan_est(
+    plan: PhysicalPlan,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            filter_est,
+            range_scan,
+            keep_order,
+            data_limit,
+            pushed: Some(pushed),
+        } => {
+            let unchanged = |pushed: Option<ExprNode>| PhysicalPlan::TableReader {
+                table: table.clone(),
+                partitions: partitions.clone(),
+                partition_names: partition_names.clone(),
+                partition_access: partition_access.clone(),
+                row_count,
+                stats_pseudo,
+                filter_est,
+                range_scan: range_scan.clone(),
+                keep_order,
+                data_limit,
+                pushed,
+            };
+            if filter_est.is_some() {
+                return unchanged(Some(pushed));
+            }
+            // Every conjunct has to be a null rejection for the column
+            // statistics to own the whole estimate.
+            let Some(columns) = pushed
+                .split_cnf()
+                .iter()
+                .map(not_isnull_column)
+                .collect::<Option<Vec<String>>>()
+            else {
+                return unchanged(Some(pushed));
+            };
+            let Some(table_stats) = stats
+                .and_then(|handle| handle.table(current_db, &table))
+                .filter(|t| super::plan_cost::has_real_stats(t))
+            else {
+                return unchanged(Some(pushed));
+            };
+            let count = table_stats.count as f64;
+            if count <= 0.0 {
+                return unchanged(Some(pushed));
+            }
+            let mut rows = count;
+            for column in &columns {
+                let Some(column_stats) = table_stats.column(column) else {
+                    return unchanged(Some(pushed));
+                };
+                // TiDB multiplies the surviving fraction per rejected-null key.
+                rows *= (count - column_stats.null_count as f64) / count;
+            }
+            let rows = rows.max(1.0);
+            if (rows - row_count).abs() < 1e-9 {
+                return unchanged(Some(pushed));
+            }
+            let info = super::explain::explain_selection_info(&pushed);
+            unchanged(Some(bytes_info(&format!(
+                "FILTER_EST|{rows}|{row_count}|{info}"
+            ))))
+        }
+        PhysicalPlan::Projection {
+            exprs,
+            child,
+            est_rows,
+        } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+            est_rows,
+        },
+        PhysicalPlan::KeyProjection { exprs, child } => PhysicalPlan::KeyProjection {
+            exprs,
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+        },
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+            filter,
+            est_rows,
+        },
+        PhysicalPlan::Sort { child, by_info } => PhysicalPlan::Sort {
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+            by_info,
+        },
+        PhysicalPlan::TopN {
+            child,
+            by_info,
+            offset,
+            count,
+        } => PhysicalPlan::TopN {
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+            by_info,
+            offset,
+            count,
+        },
+        PhysicalPlan::Limit {
+            child,
+            offset,
+            count,
+        } => PhysicalPlan::Limit {
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+            offset,
+            count,
+        },
+        PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child,
+        } => PhysicalPlan::UnionScan {
+            info,
+            est_rows,
+            child: Box::new(refine_null_reject_scan_est(*child, current_db, stats)),
+        },
+        PhysicalPlan::HashJoin {
+            est_rows,
+            tp,
+            left,
+            right,
+            left_table,
+            right_table,
+            on,
+        } => PhysicalPlan::HashJoin {
+            est_rows,
+            tp,
+            left: Box::new(refine_null_reject_scan_est(*left, current_db, stats)),
+            right: Box::new(refine_null_reject_scan_est(*right, current_db, stats)),
+            left_table,
+            right_table,
+            on,
+        },
+        other => other,
+    }
+}
+
+/// Orient every equality conjunct of `on` as `(leftKey, rightKey)`: TiDB
+/// prints `equal:[eq(fromKey, joinKey)]` for outer joins no matter how the ON
+/// clause spelled the equality (`t2 left join t1 on t1.a = t2.a` shows
+/// `eq(t2.a, t1.a)`).
+pub(crate) fn orient_eq_conjuncts(on: &ExprNode, left_table: &str, right_table: &str) -> ExprNode {
+    let oriented: Vec<ExprNode> = on
+        .split_cnf()
+        .into_iter()
+        .map(|conjunct| match &conjunct {
+            ExprNode::Binary(bin) if bin.op == Op::Eq => {
+                match (bin.left.as_ref(), bin.right.as_ref()) {
+                    (ExprNode::Column(l), ExprNode::Column(r)) => {
+                        let lt = l.table.as_deref().unwrap_or("");
+                        let rt = r.table.as_deref().unwrap_or("");
+                        if rt.eq_ignore_ascii_case(left_table)
+                            && lt.eq_ignore_ascii_case(right_table)
+                            && !lt.eq_ignore_ascii_case(rt)
+                        {
+                            ExprNode::Binary(BinaryOpExpr {
+                                op: Op::Eq,
+                                left: Box::new(ExprNode::Column(r.clone())),
+                                right: Box::new(ExprNode::Column(l.clone())),
+                                single_cnf_item: false,
+                            })
+                        } else {
+                            conjunct.clone()
+                        }
+                    }
+                    _ => conjunct.clone(),
+                }
+            }
+            _ => conjunct.clone(),
+        })
+        .collect();
+    ExprNode::compose_cnf(oriented).unwrap_or_else(|| on.clone())
+}
+
 /// Walk a join tree and add TiDB inner-join null rejection to both sides.
 fn inject_inner_join_null_reject(
     plan: PhysicalPlan,
@@ -4038,8 +4235,9 @@ fn refine_right_join_explain(
     let left = match filter_rows {
         // A side predicate (`a > 1`) already lowered the cardinality; the
         // stats-derived not-null count is only an upper bound for the scan.
+        // TiDB never estimates a null-rejecting Selection below one row.
         Some(rows) => {
-            let rows = rows.min(super::explain::est_rows(&left));
+            let rows = rows.max(1.0).min(super::explain::est_rows(&left));
             with_filter_est(*left, rows)
         }
         None => *left,

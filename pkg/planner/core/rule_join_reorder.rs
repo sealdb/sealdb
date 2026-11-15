@@ -21,11 +21,12 @@ pub fn reorder_hash_join(
         return PhysicalPlan::HashJoin {
             est_rows: None,
             tp,
+            // Outer joins keep the (from, join) operand order TiDB prints.
+            on: super::planbuilder::orient_eq_conjuncts(&on, &left_table, &right_table),
             left: Box::new(left),
             right: Box::new(right),
             left_table,
             right_table,
-            on,
         };
     }
     let left_cost = table_scan_cost(left_rows);

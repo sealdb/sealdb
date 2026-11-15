@@ -6061,7 +6061,7 @@ pub(crate) fn mem_table_column_index(table: &str, name: &str) -> Option<usize> {
         .map(|i| i + 1)
 }
 
-fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
+pub(crate) fn explain_selection_info(filter: &sealdb_parser::ast::ExprNode) -> String {
     explain_selection_info_on("t", filter)
 }
 
