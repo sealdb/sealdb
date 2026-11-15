@@ -1292,7 +1292,7 @@
     {
       "name": "expression/format",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/format.test",
       "result": "r/expression/format.result",
       "has_result": true,

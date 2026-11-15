@@ -1341,6 +1341,36 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             Ok(Datum::Bytes(out))
         }
+        // MySQL `FORMAT(x, d[, locale])`: round `x` to `d` decimals and group
+        // the integer part in threes. TiDB only ships the `en_US` locale; any
+        // other locale formats the same way and warns 1649 per row.
+        "FORMAT" => {
+            if !(2..=3).contains(&func.args.len()) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "FORMAT requires 2 or 3 arguments",
+                ));
+            }
+            let num = eval_expr_with_row(&func.args[0], schema, row)?;
+            let dec = eval_expr_with_row(&func.args[1], schema, row)?;
+            let locale = if func.args.len() == 3 {
+                Some(eval_expr_with_row(&func.args[2], schema, row)?)
+            } else {
+                None
+            };
+            if num.is_null() || dec.is_null() || locale.as_ref().is_some_and(Datum::is_null) {
+                return Ok(Datum::Null);
+            }
+            if let Some(locale) = &locale {
+                let name = String::from_utf8_lossy(&locale.as_bytes()).to_string();
+                if !name.eq_ignore_ascii_case("en_US") {
+                    push_warning(1649, format!("Unknown locale: '{name}'"));
+                }
+            }
+            let value = num.as_f64()?;
+            let decimals = dec.as_i64()?.clamp(0, 30) as usize;
+            Ok(Datum::Bytes(format_number(value, decimals).into_bytes()))
+        }
         // MySQL `QUOTE(str)`: single-quoted, with `'` `\` NUL and `0x1a`
         // escaped. Numbers print as their own text (`QUOTE(1.5)` → `'1.5'`).
         "QUOTE" => {
@@ -1767,6 +1797,39 @@ fn json_scalar_datum(value: &serde_json::Value) -> Datum {
 fn weekday_of(t: &Time) -> i64 {
     // 1970-01-01 was a Thursday (WEEKDAY 3).
     (days_from_civil(t.year, t.month, t.day) + 3).rem_euclid(7)
+}
+
+/// MySQL `FORMAT` number rendering: round to `decimals`, then group the
+/// integer part in threes with commas (`1234.5, 2` → `1,234.50`).
+fn format_number(value: f64, decimals: usize) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let scale = 10f64.powi(decimals as i32);
+    // TiDB rounds half away from zero (`math.Round` after scaling).
+    let rounded = (value * scale).round() / scale;
+    let text = format!("{rounded:.decimals$}");
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, Some(frac_part)),
+        None => (body, None),
+    };
+    let mut grouped = String::with_capacity(text.len() + text.len() / 3);
+    grouped.push_str(sign);
+    for (i, ch) in int_part.chars().enumerate() {
+        if i > 0 && (int_part.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    if let Some(frac) = frac_part {
+        grouped.push('.');
+        grouped.push_str(frac);
+    }
+    grouped
 }
 
 /// MySQL `LOWER(str)` / `UPPER(str)` (also `LCASE` / `UCASE`): NULL in → NULL,
@@ -3073,6 +3136,31 @@ mod tests {
         );
         assert_eq!(eval_sql_expr("IF(1, 10, 20)"), Datum::I64(10));
         assert_eq!(eval_sql_expr("IFNULL(NULL, 7)"), Datum::I64(7));
+    }
+
+    #[test]
+    fn test_format_number() {
+        assert_eq!(
+            eval_sql_expr("FORMAT(1.234, 0, 'en_US')"),
+            Datum::Bytes(b"1".to_vec())
+        );
+        assert_eq!(
+            eval_sql_expr("FORMAT(1.234e-2, 4, 'en_US')"),
+            Datum::Bytes(b"0.0123".to_vec())
+        );
+        assert_eq!(
+            eval_sql_expr("FORMAT(-1.234, 4, 'en_US')"),
+            Datum::Bytes(b"-1.2340".to_vec())
+        );
+        assert_eq!(
+            eval_sql_expr("FORMAT(1234.5, 2, 'en_US')"),
+            Datum::Bytes(b"1,234.50".to_vec())
+        );
+        assert_eq!(
+            eval_sql_expr("FORMAT(123456789.00, 0, 'en_US')"),
+            Datum::Bytes(b"123,456,789".to_vec())
+        );
+        assert_eq!(eval_sql_expr("FORMAT(NULL, 2)"), Datum::Null);
     }
 
     #[test]
