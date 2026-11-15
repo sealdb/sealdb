@@ -3333,6 +3333,38 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `explain_cte` / `explain_indexmerge_stats` / `join_reorder2` /
     `join_reorder_through_projection` / `rule_derive_topn_from_window`。
 
+### 2026-11-15（`statistics/integration` 转正：`REPEAT()`、全 NULL 列的 null rejection、outer join 等值键顺序）
+
+- **Phase**: R6
+- **完成**:
+  - 新增字符串函数 `REPEAT(str, count)`（`pkg/expression/funcs.rs` +
+    `evaluator.rs`）：`count <= 0` 或空串返回空串，超出 16MB 上限返回 `NULL`。
+    `statistics/integration` 用 `repeat("a", 65536)` 灌 `longtext`，此前两条
+    `insert` 直接报 `FUNCTION REPEAT does not exist`，导致后续统计断言全偏。
+  - 全 NULL 列的 `not(isnull(col))` 选择率：TiDB 用 `count - null_count`
+    并 clamp 到至少 1 行。这类列在 `stats_histograms` 里仍有行、只是没有
+    bucket，所以不能因为 `histogram.is_none()` 就退回整表行数；新增
+    `refine_null_reject_scan_est` 在 join 计划里按列统计重算 cop
+    `Selection` 行数，用 `FILTER_EST|sel|scan|info` 标记保留
+    `TableFullScan` 的原基数（`TableReader 1.00 / TableFullScan 4.00`）。
+  - `A RIGHT JOIN B` 的内侧过滤同样 clamp 到 1 行（`with_filter_est` 之前
+    会把 `count - null_count = 0` 原样写进 `Selection.est_rows`）。
+  - outer join 的等值条件按 TiDB 打印 `eq(fromKey, joinKey)`：
+    `t2 left join t1 on t1.a = t2.a` → `eq(t2.a, t1.a)`（此前保留 ON 文本顺序）。
+    只在 `reorder_hash_join` 的非 inner 分支改写，inner/DP 重排路径不动。
+- **验证**:
+  - `statistics/integration`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - 全量 green gate：Memory `PASS: memory=97`（90 green + 7 local），
+    TiKV `PASS: tikv=96`（`executor/adapter` 为 `skip_tikv`）
+  - manifest：`statistics/integration` → `green`，green 89→90（R6 13→14）
+- **阻塞/风险**:
+  - `explain_indexmerge_stats` 仍差 `utf8mb4_0900_ai_ci` 的 collation key
+    转义（`\x1c@\x1c>…`）与 `desc` 的算子 id 计数，属独立工作量。
+- **下一步**:
+  - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
+    `explain_cte` / `explain_indexmerge_stats` / `join_reorder2` /
+    `join_reorder_through_projection` / `rule_derive_topn_from_window`。
+
 ## 7. 更新模板
 
 每次更新追加一条：

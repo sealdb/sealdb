@@ -2412,7 +2412,7 @@
     {
       "name": "statistics/integration",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/statistics/integration.test",
       "result": "r/statistics/integration.result",
       "has_result": true,
