@@ -1613,8 +1613,16 @@ fn rewrite_rename_index(sql: &str) -> String {
     while i < bytes.len() {
         if keyword_at(bytes, i, "RENAME") {
             let after_rename = skip_ws(bytes, i + "RENAME".len());
-            if keyword_at(bytes, after_rename, "INDEX") {
-                let after_index = skip_ws(bytes, after_rename + "INDEX".len());
+            // TiDB accepts both `RENAME INDEX` and its `RENAME KEY` synonym.
+            let index_end = if keyword_at(bytes, after_rename, "INDEX") {
+                after_rename + "INDEX".len()
+            } else if keyword_at(bytes, after_rename, "KEY") {
+                after_rename + "KEY".len()
+            } else {
+                after_rename
+            };
+            if index_end != after_rename {
+                let after_index = skip_ws(bytes, index_end);
                 let (old_name, after_old) = read_ident(bytes, after_index);
                 let after_old = skip_ws(bytes, after_old);
                 if keyword_at(bytes, after_old, "TO") {

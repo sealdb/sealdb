@@ -14,6 +14,7 @@ use crate::partition::{add_partitions, drop_partitions, exchange_partition, repa
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
+    ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
     ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
     ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
     ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_NO_SUCH_TABLE,
@@ -2587,6 +2588,14 @@ fn rename_table(
     if schema.eq_ignore_ascii_case(&new_schema) && table.eq_ignore_ascii_case(&new_table) {
         return Ok(());
     }
+    // TiDB `renameTable`: a view may only be renamed inside its own schema
+    // (`ErrForbidSchemaChange`), checked before the target schema exists.
+    if info.is_view() && !schema.eq_ignore_ascii_case(&new_schema) {
+        return Err(Error::new(
+            ERR_FORBID_SCHEMA_CHANGE,
+            format!("Changing schema from '{schema}' to '{new_schema}' is not allowed."),
+        ));
+    }
     if is.table_by_name(&new_schema, &new_table).is_some() {
         return Err(Error::new(
             ERR_TABLE_EXISTS,
@@ -2633,9 +2642,11 @@ fn rename_index(
         .iter()
         .position(|idx| idx.name.o().eq_ignore_ascii_case(old_name))
     else {
+        // TiDB `renameIndex` reports `ErrKeyDoesNotExist`, not the 1091 used
+        // when a DROP names an unknown key.
         return Err(Error::new(
-            ERR_CANT_DROP_FIELD_OR_KEY,
-            format!("Can't DROP '{old_name}'; check that column/key exists"),
+            ERR_KEY_DOES_NOT_EXIST,
+            format!("Key '{old_name}' doesn't exist in table '{table}'"),
         ));
     };
     if !old_name.eq_ignore_ascii_case(new_name)
@@ -2649,7 +2660,33 @@ fn rename_index(
             format!("Duplicate key name '{new_name}'"),
         ));
     }
+    let old_index_name = info.indices[pos].name.o().to_string();
     info.indices[pos].name = CIStr::new(new_name);
+    // TiDB `renameIndex` also renames the generated hidden columns
+    // `_V$_<index>_<pos>` that back expression key parts, so the old name is
+    // free for a later `ADD INDEX`.
+    let old_prefix = format!("_V$_{old_index_name}_");
+    let new_prefix = format!("_V$_{new_name}_");
+    if !old_prefix.eq_ignore_ascii_case(&new_prefix) {
+        let rename = |name: &str| -> Option<String> {
+            let lowered = name.to_ascii_lowercase();
+            lowered
+                .strip_prefix(&old_prefix.to_ascii_lowercase())
+                .map(|suffix| format!("{new_prefix}{suffix}"))
+        };
+        for col in info.columns.iter_mut() {
+            if col.hidden
+                && let Some(renamed) = rename(col.name.o())
+            {
+                col.name = CIStr::new(renamed);
+            }
+        }
+        for ic in info.indices[pos].columns.iter_mut() {
+            if let Some(renamed) = rename(ic.name.o()) {
+                ic.name = CIStr::new(renamed);
+            }
+        }
+    }
     meta.update_table(db.id, &info)?;
     meta.gen_schema_version()?;
     Ok(())

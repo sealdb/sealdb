@@ -49,6 +49,8 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_FIELD_SPECIFIED_TWICE => "ErrFieldSpecifiedTwice",
         errcode::ERR_DUP_KEYNAME => "ErrDupKeyName",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "ErrCantDropFieldOrKey",
+        errcode::ERR_KEY_DOES_NOT_EXIST => "ErrKeyDoesNotExist",
+        errcode::ERR_FORBID_SCHEMA_CHANGE => "ErrForbidSchemaChange",
         errcode::ERR_NO_PARTITION_FOR_GIVEN_VALUE => "ErrNoPartitionForGivenValue",
         errcode::ERR_UNKNOWN_PARTITION => "ErrUnknownPartition",
         errcode::ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET => {
@@ -124,6 +126,8 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_FIELD_NOT_DEFAULT => "HY000",
         errcode::ERR_DUP_KEYNAME => "42000",
         errcode::ERR_CANT_DROP_FIELD_OR_KEY => "42000",
+        errcode::ERR_KEY_DOES_NOT_EXIST => "42000",
+        errcode::ERR_FORBID_SCHEMA_CHANGE => "HY000",
         errcode::ERR_PARSE_ERROR => "42000",
         errcode::ERR_NO_SUCH_TABLE => "42S02",
         errcode::ERR_BAD_FIELD => "42S22",

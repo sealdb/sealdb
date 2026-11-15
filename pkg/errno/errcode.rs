@@ -61,6 +61,12 @@ pub const ERR_DUP_FIELDNAME: i32 = 1060;
 pub const ERR_FIELD_SPECIFIED_TWICE: i32 = 1110;
 pub const ERR_DUP_KEYNAME: i32 = 1061;
 pub const ERR_CANT_DROP_FIELD_OR_KEY: i32 = 1091;
+/// MySQL `ER_KEY_DOES_NOT_EXIST`: `ALTER TABLE … RENAME INDEX` names a key
+/// that is not defined on the table (TiDB `ErrKeyDoesNotExist`).
+pub const ERR_KEY_DOES_NOT_EXIST: i32 = 1176;
+/// MySQL `ER_FORBID_SCHEMA_CHANGE`: a view cannot move to another schema
+/// (TiDB `ErrForbidSchemaChange`, used by `RENAME TABLE`).
+pub const ERR_FORBID_SCHEMA_CHANGE: i32 = 1450;
 pub const ERR_NO_PARTITION_FOR_GIVEN_VALUE: i32 = 1526;
 /// MySQL `ER_UNKNOWN_PARTITION`: named partition does not exist (1735).
 pub const ERR_UNKNOWN_PARTITION: i32 = 1735;
