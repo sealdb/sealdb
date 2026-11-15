@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(a.get(b"k").unwrap(), Some(b"v1".to_vec()));
         a.set(b"k", b"v3").unwrap();
         let err = a.commit().unwrap_err();
-        assert_eq!(err.code, ERR_WRITE_CONFLICT);
+        assert_eq!(err.code, sealdb_errno::ERR_WRITE_CONFLICT);
     }
 
     #[test]
