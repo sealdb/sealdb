@@ -13119,10 +13119,33 @@ fn index_merge_union_arm(
         else {
             continue;
         };
-        let rows = path
-            .range
-            .as_ref()
-            .map_or(table_rows, |range| range.filter_rows);
+        // TiDB's `CountAfterIndex` never applies a residual predicate whose
+        // column is outside the index key, so `(auth_type = 2 and auth_value =
+        // 'x')` compares `auth_value`'s 1.05 range rows against `auth_type`'s
+        // wider point count instead of charging both arms the `auth_value`
+        // filter factor. An index whose histogram holds nothing is sized from
+        // the pseudo model (`table_rows / pseudoEqualRate` per point), which is
+        // what loses the `auth_type` alternative in the same lookup.
+        let rows = path.range.as_ref().map_or(table_rows, |range| range.rows);
+        let rows = if table_stats.is_some_and(|stats| !stats.index_has_data(index.name.o())) {
+            let pinned = path.ranges.iter().all(|(low, high)| {
+                matches!(
+                    (low, high),
+                    (Some((low, true)), Some((high, true)))
+                        if low.compare(high) == std::cmp::Ordering::Equal
+                )
+            });
+            let key_len = super::access_range::index_key_part_count(info, index).unwrap_or(1);
+            sealdb_statistics::pseudo::index_ranges_rows(
+                table_rows,
+                &path.ranges,
+                key_len,
+                usize::from(pinned),
+                index.unique,
+            )
+        } else {
+            rows
+        };
         if std::env::var("SEALDB_DEBUG_IM").is_ok() {
             eprintln!(
                 "IM arm candidate index={} rows={rows} scan_rows={:?} text={:?}",
@@ -13593,22 +13616,24 @@ fn index_merge_residual_rows(
     info: &sealdb_meta::TableInfo,
     table: Option<&super::access_range::TableStats>,
 ) -> f64 {
-    if let [only] = residual
-        && only.split_dnf().len() > 1
-    {
-        let mut selectivity = 0.0;
-        for item in only.split_dnf() {
-            let mut item_sel = 1.0;
-            for cond in item.split_cnf() {
-                item_sel *= conjunct_selectivity(&cond, info, table);
-            }
-            selectivity = selectivity + item_sel - selectivity * item_sel;
-        }
-        return (rows * selectivity).clamp(0.0, rows);
-    }
     let mut selectivity = 1.0;
     for conjunct in residual.iter().flat_map(|conjunct| conjunct.split_cnf()) {
-        selectivity *= conjunct_selectivity(&conjunct, info, table);
+        let items = conjunct.split_dnf();
+        if items.len() > 1 {
+            // An OR group unions its items' selectivities (`1 - Π(1 - sᵢ)`)
+            // instead of charging the `0.8` default for the whole group.
+            let mut union = 0.0;
+            for item in items {
+                let mut item_sel = 1.0;
+                for cond in item.split_cnf() {
+                    item_sel *= conjunct_selectivity(&cond, info, table);
+                }
+                union = union + item_sel - union * item_sel;
+            }
+            selectivity *= union;
+        } else {
+            selectivity *= conjunct_selectivity(&conjunct, info, table);
+        }
     }
     (rows * selectivity).clamp(0.0, rows)
 }
@@ -13627,6 +13652,23 @@ fn conjunct_selectivity(
     info: &sealdb_meta::TableInfo,
     table: Option<&super::access_range::TableStats>,
 ) -> f64 {
+    // `col IS NULL` / `NOT col IS NULL` read the column's null count: an
+    // analyzed column without nulls filters everything away (`probe_topn`
+    // `isnull(deleted_at)` leaves 0.00 rows), while the pseudo factor would
+    // keep 0.8 of the merged row ids.
+    if let Some(table) = table {
+        let count = table.count.max(1) as f64;
+        if let Some(column) = is_null_column(cond)
+            && let Some(not_null) = table.column_not_null_count(column)
+        {
+            return ((count - not_null).max(0.0) / count).clamp(0.0, 1.0);
+        }
+        if let Some(column) = not_isnull_column(cond)
+            && let Some(not_null) = table.column_not_null_count(&column)
+        {
+            return (not_null.max(0.0) / count).clamp(0.0, 1.0);
+        }
+    }
     let Some((name, sets)) = sealdb_statistics::pseudo::conjunct_bound_sets(cond) else {
         return sealdb_statistics::pseudo::SELECTION_FACTOR;
     };
@@ -13745,11 +13787,19 @@ fn index_merge_plan(
             (paths, residual, true, None)
         }
     };
+    // TiDB `RemoveDupExprs`: a conjunct spelled twice in the WHERE (`deleted_at
+    // IS NULL` before and after the OR) reaches the probe filter once.
+    let residual: Vec<ExprNode> = {
+        let mut seen = std::collections::HashSet::new();
+        residual
+            .into_iter()
+            .filter(|conjunct| seen.insert(conjunct.restore_string()))
+            .collect()
+    };
     if std::env::var("SEALDB_DEBUG_IM").is_ok() {
         eprintln!(
             "IM paths={:?} real_stats={}",
-            paths
-                .iter()
+            paths                .iter()
                 .map(|path| (
                     path.index.clone(),
                     path.table_range,
@@ -13844,12 +13894,16 @@ fn index_merge_plan(
             path.desc = *desc;
         }
     }
-    // TiDB `AdjustRowCountForIndexScanByLimit`: LIMIT shrinks the merge's
-    // cardinality and each arm's scan (`expectedCnt / selectivity`).
+    // TiDB `AdjustRowCountForIndexScanByLimit`: a LIMIT that sinks into the
+    // merge shrinks the merge's cardinality and each arm's scan
+    // (`expectedCnt / selectivity`). An ORDER BY the arms cannot answer becomes
+    // a cop `TopN` above the probe instead, leaving the arms unscaled.
+    let sink_limit = select.order_by.is_empty() || keep_order;
     let expected = select
         .limit
         .map(|count| (count + select.offset.unwrap_or(0)) as f64);
     if let Some(expected) = expected
+        && sink_limit
         && rowid_est > 0.0
     {
         let factor = (expected / rowid_est).min(1.0);

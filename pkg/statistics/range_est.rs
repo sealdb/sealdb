@@ -697,6 +697,19 @@ impl Table {
         Some(total.clamp(1.0, realtime))
     }
 
+    /// Whether an index carries real statistics. A `load stats` file may hold
+    /// an index entry with an empty histogram and no TopN (only the legacy CM
+    /// sketch): TiDB then sizes that index from the pseudo model, so an
+    /// index-merge arm has to be compared as `table_rows / pseudoEqualRate`.
+    pub fn index_has_data(&self, index: &str) -> bool {
+        let Some(idx) = self.index(index) else {
+            return false;
+        };
+        idx.histogram
+            .as_ref()
+            .is_some_and(|hist| !hist.buckets.is_empty() || !idx.topn.is_empty())
+    }
+
     /// Index range estimate using the index histogram (TiDB `GetRowCountByIndexRanges`).
     pub fn index_range_estimate(
         &self,
