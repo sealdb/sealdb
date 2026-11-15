@@ -67,7 +67,7 @@ TiDB v8.5.8 集成测试语料已导入 **254** 个 suite，其中 **73 个** �
 → PASS: memory=0 tikv=75 skipped=179
 ```
 
-TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），73 个 `green` 套件中 71 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
+TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目录起跑），73 个 `green` 套件中 72 个在 TiKV 复验通过；`executor/adapter` 标 `skip_tikv`（`local/txn` 同样仅 Mem）。注：`executor/adapter` 的 `timestampdiff(microsecond, @a, now(6)) < 1000000` 依赖语句间累计耗时 <1s；本机多用户负载下会在 TiKV 上稳定超时（干净工作区 `e8b7cce` 同样复现），属环境性抖动，非语义差异。Gate 前建议用 `project/scripts/run_local_pd_tikv.sh stop` 清空 `/tmp/sealdb-pd-tikv` 再起，长期复用的 store 会积出超大可分裂失败 region，使 DDL prewrite 长时间阻塞。
 
 ---
 
