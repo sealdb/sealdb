@@ -953,6 +953,60 @@ fn now_fsp(args: &[ExprNode]) -> i8 {
 
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
+        "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
+        "IS_UUID" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "IS_UUID requires 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let ok = parse_uuid_text(&String::from_utf8_lossy(&v.as_bytes())).is_some();
+            Ok(Datum::I64(i64::from(ok)))
+        }
+        "UUID_TO_BIN" => {
+            if func.args.is_empty() || func.args.len() > 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "UUID_TO_BIN requires 1 or 2 arguments",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let swap = uuid_swap_flag(func, schema, row)?;
+            match parse_uuid_text(&String::from_utf8_lossy(&v.as_bytes())) {
+                Some(bytes) => Ok(Datum::Bytes(swap_uuid_groups(bytes, swap).to_vec())),
+                None => Ok(Datum::Null),
+            }
+        }
+        "BIN_TO_UUID" => {
+            if func.args.is_empty() || func.args.len() > 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "BIN_TO_UUID requires 1 or 2 arguments",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let swap = uuid_swap_flag(func, schema, row)?;
+            let raw = v.as_bytes();
+            if raw.len() != 16 {
+                return Ok(Datum::Null);
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&raw);
+            Ok(Datum::Bytes(
+                format_uuid(swap_uuid_groups(bytes, swap)).into_bytes(),
+            ))
+        }
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" => {
             let (secs, micro) = unix_now_parts();
             let mut now = Time::from_unix_secs(secs, TimeType::Timestamp);
@@ -1393,6 +1447,98 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             format!("FUNCTION {other} does not exist"),
         )),
     }
+}
+
+/// TiDB `UUID()`: a version-1 (time based) UUID; the clock sequence keeps
+/// successive calls on one node distinct.
+fn new_uuid() -> String {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static CLOCK_SEQ: AtomicU16 = AtomicU16::new(0);
+    // Offset of the Gregorian epoch (1582-10-15) in 100 ns intervals.
+    const GREGORIAN_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let timestamp = GREGORIAN_OFFSET.wrapping_add(nanos / 100);
+    let time_low = timestamp as u32;
+    let time_mid = (timestamp >> 32) as u16;
+    let time_hi = (((timestamp >> 48) as u16) & 0x0fff) | 0x1000;
+    let clock_seq = (CLOCK_SEQ.fetch_add(1, Ordering::Relaxed) & 0x3fff) | 0x8000;
+    let node = uuid_node();
+    format!(
+        "{time_low:08x}-{time_mid:04x}-{time_hi:04x}-{clock_seq:04x}-{node:012x}"
+    )
+}
+
+/// 48-bit node id: a per-process random value (TiDB uses the MAC address, which
+/// is not observable here).
+fn uuid_node() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static NODE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish() & 0x0000_ffff_ffff_ffff
+    });
+    *NODE
+}
+
+/// `IS_UUID` / `UUID_TO_BIN` / `BIN_TO_UUID` accepted spellings: the hyphenated
+/// 8-4-4-4-12 form, its 32-hex-digit form, and either wrapped in braces.
+fn parse_uuid_text(text: &str) -> Option<[u8; 16]> {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    if body.contains('-') {
+        let lens: Vec<usize> = body.split('-').map(str::len).collect();
+        if lens != [8, 4, 4, 4, 12] {
+            return None;
+        }
+    }
+    let hex: String = body.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// `UUID_TO_BIN(uuid, 1)` swaps the time-low and time-high groups.
+fn swap_uuid_groups(bytes: [u8; 16], swap: bool) -> [u8; 16] {
+    if swap {
+        let mut swapped = [0u8; 16];
+        swapped[..2].copy_from_slice(&bytes[6..8]);
+        swapped[2..6].copy_from_slice(&bytes[2..6]);
+        swapped[6..8].copy_from_slice(&bytes[..2]);
+        swapped[8..].copy_from_slice(&bytes[8..]);
+        return swapped;
+    }
+    bytes
+}
+
+fn uuid_swap_flag(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<bool> {
+    if func.args.len() < 2 {
+        return Ok(false);
+    }
+    let flag = eval_expr_with_row(&func.args[1], schema, row)?;
+    Ok(truthy(&flag).unwrap_or(false))
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// MySQL `WEEKDAY`: Monday = 0 .. Sunday = 6.

@@ -55,6 +55,99 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
+/// TiDB stores a function-call default as an expression default and prints it
+/// parenthesized in lowercase (`DEFAULT UUID()` → `DEFAULT (uuid())`).
+pub(crate) fn normalize_expression_default(default: &str) -> String {
+    let trimmed = default.trim();
+    // Literals (quoted, numeric, hex/bit) keep their spelling even when their
+    // text contains parentheses.
+    let starts_like_function = trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic());
+    if !starts_like_function || !trimmed.contains('(') {
+        return default.to_string();
+    }
+    // Temporal function defaults stay bare in SHOW CREATE (`DEFAULT
+    // CURRENT_TIMESTAMP`), and their fractional-precision validation (1067)
+    // reads the original spelling.
+    let head: String = trimmed
+        .chars()
+        .take_while(|c| *c != '(')
+        .collect::<String>()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        head.as_str(),
+        "now"
+            | "current_timestamp"
+            | "localtime"
+            | "localtimestamp"
+            | "curdate"
+            | "current_date"
+            | "curtime"
+            | "current_time"
+            | "utc_date"
+            | "utc_time"
+            | "utc_timestamp"
+            | "sysdate"
+    ) {
+        return default.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with('(') {
+        lower
+    } else {
+        format!("({lower})")
+    }
+}
+
+/// Functions TiDB refuses inside a `DEFAULT (…)` expression (1674): the value
+/// would differ on a replica, so it cannot be logged as a statement.
+/// Temporal functions are deliberately absent: `DEFAULT now(…)` is a legal
+/// timestamp default validated separately (fractional precision → 1067).
+const UNSAFE_DEFAULT_FUNCS: &[&str] = &[
+    "uuid",
+    "uuid_short",
+    "rand",
+    "connection_id",
+    "last_insert_id",
+    "current_user",
+    "session_user",
+    "system_user",
+    "user",
+    "version",
+    "database",
+    "schema",
+    "found_rows",
+    "row_count",
+];
+
+/// `DEFAULT (expr)` (parenthesized form only) must not call a function whose
+/// value can change between the primary and a replica (TiDB 1674).
+pub(crate) fn validate_default_expr(default: &str) -> Result<()> {
+    if !default.trim().starts_with('(') {
+        return Ok(());
+    }
+    validate_default_expr_any(default)
+}
+
+/// `ALTER TABLE … ADD COLUMN … DEFAULT …` rejects unsafe functions in either
+/// spelling: TiDB validates every added-column default, parenthesized or not.
+pub(crate) fn validate_default_expr_any(default: &str) -> Result<()> {
+    let lower = default.to_ascii_lowercase();
+    for func in UNSAFE_DEFAULT_FUNCS {
+        if calls_function(&lower, func) {
+            return Err(Error::new(
+                1674,
+                "Statement is unsafe because it uses a system function that may \
+                 return a different value on the slave",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// MySQL stores `TEXT` as a `BLOB` code with a non-binary charset; SealDB keeps
 /// it as a length-less `VAR_STRING`, so both spellings count as LOB here.
 pub(crate) fn is_lob_type(field_type: &FieldType) -> bool {
@@ -900,10 +993,13 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
         }
+        if let Some(default) = col.default.as_deref() {
+            validate_default_expr(default)?;
+        }
         let default = col
             .default
             .as_deref()
-            .map(|default| normalize_default(&info.field_type, default));
+            .map(|default| normalize_expression_default(&normalize_default(&info.field_type, default)));
         info.default_expr = normalize_lob_default(info.name.o(), &info.field_type, default)?;
         info.origin_default_expr = info
             .default_expr

@@ -505,15 +505,23 @@ fn add_column(
         column.name.clone(),
         field_type_from_name(&column.type_name)?,
     );
+    // A parenthesized expression default must be replica-safe (TiDB 1674);
+    // `ALTER TABLE … ADD COLUMN … DEFAULT (uuid())` is rejected before any row
+    // is rewritten.
+    if let Some(default) = column.default.as_deref() {
+        crate::create_table::validate_default_expr_any(default)?;
+    }
     // Normalize a literal default to the column type (TiDB rounds temporal
     // defaults to the column's fractional precision at DDL time).
     new_col.default_expr = crate::create_table::normalize_lob_default(
         &column.name,
         &new_col.field_type,
-        column
-            .default
-            .as_deref()
-            .map(|default| normalize_default(&new_col.field_type, default)),
+        column.default.as_deref().map(|default| {
+            crate::create_table::normalize_expression_default(&normalize_default(
+                &new_col.field_type,
+                default,
+            ))
+        }),
     )?;
     new_col.auto_random = column.auto_random;
     if let Some(generated) = &column.generated {

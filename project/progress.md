@@ -2959,6 +2959,32 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `db_integration` / `table/tables`。
 
+### 2026-11-15（`db_integration` 转正：`UUID()` 家族 + 表达式默认值）
+
+- **Phase**: R5
+- **完成**:
+  - `UUID()` / `UUID_SHORT` 之外，补齐 `UUID()`、`IS_UUID()`、`UUID_TO_BIN()`
+    （可选 `swap_flag` 交换 time-low/time-high 两组）、`BIN_TO_UUID()`；UUID 为
+    v1（时间戳 + 每进程随机 node + 递增 clock sequence），因此同一语句内多行
+    插入也互不相同。函数目录 `funcs.rs` 同步登记。
+  - 表达式默认值：`CREATE TABLE … DEFAULT UUID()` 在 TiDB 中落库为
+    `DEFAULT (uuid())`（小写、加括号），`SHOW CREATE TABLE` 按此回显。新增
+    `normalize_expression_default`，仅对非时间类函数生效——`now(1)` /
+    `current_timestamp(2)` 保持原样，否则会绕过 1067（fsp 校验）。
+  - `ALTER TABLE … ADD COLUMN … DEFAULT (uuid())` / `DEFAULT uuid_to_bin(uuid(),1)`
+    按 TiDB 报 1674（unsafe system function），且**先于**任何默认值求值/回填；
+    CREATE 只在括号形式下校验，`DEFAULT now(…)` 仍走 1067。
+- **验证**:
+  - `db_integration`：memory `PASS: memory=1`，tikv `PASS: tikv=1`
+  - 全量 memory gate：`PASS: memory=87 tikv=85 skipped=169`（80 green + 8 local）
+  - `cargo test -p sealdb-expression -p sealdb-ddl` 全绿
+- **阻塞/风险**:
+  - UUID 的 node id 是进程内随机值（TiDB 取 MAC），跨节点唯一性不保证，仅满足
+    格式/去重语义。
+  - `UUID_TO_BIN`/`BIN_TO_UUID` 的 `swap_flag` 按 MySQL 文档实现，尚无金样校验。
+- **下一步**:
+  - `table/tables`。
+
 ---
 
 ## 5. Gate 证据索引

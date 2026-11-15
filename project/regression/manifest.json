@@ -166,7 +166,7 @@
     {
       "name": "db_integration",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/db_integration.test",
       "result": "r/db_integration.result",
       "has_result": true,

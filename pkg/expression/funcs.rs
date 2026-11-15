@@ -41,6 +41,11 @@ const FUNCS: &[FuncMeta] = &[
     meta("GREATEST", FuncCategory::Common, 2, -1, true),
     meta("LEAST", FuncCategory::Common, 2, -1, true),
     meta("INTERVAL", FuncCategory::Common, 2, -1, false),
+    // encryption / miscellaneous
+    meta("UUID", FuncCategory::Miscellaneous, 0, 0, true),
+    meta("IS_UUID", FuncCategory::Miscellaneous, 1, 1, true),
+    meta("UUID_TO_BIN", FuncCategory::Miscellaneous, 1, 2, true),
+    meta("BIN_TO_UUID", FuncCategory::Miscellaneous, 1, 2, true),
     // control
     meta("IF", FuncCategory::Control, 3, 3, true),
     meta("IFNULL", FuncCategory::Control, 2, 2, true),
