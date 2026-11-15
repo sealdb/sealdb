@@ -83,6 +83,7 @@ const FUNCS: &[FuncMeta] = &[
     meta("CONCAT", FuncCategory::String, 1, -1, true),
     meta("CONCAT_WS", FuncCategory::String, 2, -1, true),
     meta("REPLACE", FuncCategory::String, 3, 3, true),
+    meta("REPEAT", FuncCategory::String, 2, 2, true),
     meta("LEFT", FuncCategory::String, 2, 2, true),
     meta("RIGHT", FuncCategory::String, 2, 2, true),
     meta("LPAD", FuncCategory::String, 3, 3, true),

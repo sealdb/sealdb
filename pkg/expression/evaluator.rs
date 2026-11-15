@@ -1311,6 +1311,36 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "LOWER" | "LCASE" => eval_case_convert(func, schema, row, false),
         "UPPER" | "UCASE" => eval_case_convert(func, schema, row, true),
         "SUBSTRING" | "SUBSTR" | "MID" => eval_substring(func, schema, row),
+        // MySQL `REPEAT(str, count)`: repeat the argument `count` times; a
+        // non-positive count yields the empty string.
+        "REPEAT" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "REPEAT requires 2 arguments",
+                ));
+            }
+            let src = eval_expr_with_row(&func.args[0], schema, row)?;
+            let count = eval_expr_with_row(&func.args[1], schema, row)?;
+            if src.is_null() || count.is_null() {
+                return Ok(Datum::Null);
+            }
+            let bytes = src.as_bytes();
+            let count = count.as_i64()?;
+            if count <= 0 || bytes.is_empty() {
+                return Ok(Datum::Bytes(Vec::new()));
+            }
+            let out_len = bytes.len().saturating_mul(count as usize);
+            if out_len > 16 * 1024 * 1024 {
+                // TiDB truncates oversized results to NULL with a warning.
+                return Ok(Datum::Null);
+            }
+            let mut out = Vec::with_capacity(out_len);
+            for _ in 0..count {
+                out.extend_from_slice(&bytes);
+            }
+            Ok(Datum::Bytes(out))
+        }
         // MySQL `QUOTE(str)`: single-quoted, with `'` `\` NUL and `0x1a`
         // escaped. Numbers print as their own text (`QUOTE(1.5)` → `'1.5'`).
         "QUOTE" => {
