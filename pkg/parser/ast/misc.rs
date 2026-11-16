@@ -490,6 +490,23 @@ pub enum ShowStmtKind {
     Bindings,
     /// `SHOW WARNINGS`
     Warnings,
+    /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE …|WHERE …]`
+    Variables,
+}
+
+/// `SHOW … VARIABLES` scope; TiDB's `SHOW VARIABLES` defaults to the session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShowVarScope {
+    #[default]
+    Session,
+    Global,
+}
+
+/// `SHOW VARIABLES LIKE 'pat'` / `SHOW VARIABLES WHERE <cond>`.
+#[derive(Clone, Debug)]
+pub enum ShowVarFilter {
+    Like(String),
+    Where(crate::ast::expressions::ExprNode),
 }
 
 #[derive(Clone, Debug)]
@@ -504,6 +521,10 @@ pub struct ShowStmt {
     /// `DESC tbl col`: TiDB keeps the column apart from the LIKE pattern and
     /// matches it case-insensitively against `Field`.
     pub column: Option<String>,
+    /// `SHOW … VARIABLES` scope (ignored by the other kinds).
+    pub var_scope: ShowVarScope,
+    /// `SHOW … VARIABLES LIKE|WHERE` filter (ignored by the other kinds).
+    pub var_filter: Option<ShowVarFilter>,
 }
 
 impl ShowStmt {
@@ -567,6 +588,24 @@ impl ShowStmt {
             ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
             ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
             ShowStmtKind::Warnings => ctx.write_str("SHOW WARNINGS"),
+            ShowStmtKind::Variables => {
+                ctx.write_str("SHOW ");
+                if self.var_scope == ShowVarScope::Global {
+                    ctx.write_str("GLOBAL ");
+                }
+                ctx.write_str("VARIABLES");
+                match &self.var_filter {
+                    Some(ShowVarFilter::Like(pattern)) => {
+                        ctx.write_str(" LIKE ");
+                        ctx.write_str(pattern);
+                    }
+                    Some(ShowVarFilter::Where(expr)) => {
+                        ctx.write_str(" WHERE ");
+                        expr.restore(ctx)?;
+                    }
+                    None => {}
+                }
+            }
         }
         Ok(())
     }

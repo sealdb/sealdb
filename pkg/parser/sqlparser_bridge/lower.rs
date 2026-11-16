@@ -18,22 +18,20 @@ use crate::ast::expressions::{
     WindowSpec,
 };
 use crate::ast::misc::{
-    AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
-    CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    AlterResourceGroupStmt, CreateBindingStmt, CreatePlacementPolicyStmt,
-    CreateResourceGroupStmt, CreateRoleStmt,
-    CreateUserStmt, DeallocateStmt,
-    DistributeTableStmt, DoStmt, DropResourceGroupStmt, DropStatsStmt, DropBindingStmt,
-    DropPlacementPolicyStmt, DropQueryWatchStmt,
-    DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
+    AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AnalyzeTableStmt, BRIEStmt,
+    BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt,
+    CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt,
+    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
+    DropPlacementPolicyStmt, DropQueryWatchStmt, DropResourceGroupStmt, DropRoleStmt,
+    DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, FlushStmtType, GrantLevel, GrantLevelType, GrantRoleStmt,
     GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
     LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType,
     RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
     RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt,
     SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt,
-    ShowStmtKind, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType, TraceStmt,
-    UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem,
+    TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -750,45 +748,43 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             names,
             temporary,
             ..
-        } => {
-            match object_type {
-                ObjectType::Database | ObjectType::Schema => {
-                    let name = names
-                        .first()
-                        .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing database name"))?;
-                    Ok(Statement::DropDatabase(DropDatabaseStmt {
-                        if_exists: *if_exists,
-                        name: object_name_last(name)?,
-                    }))
-                }
-                ObjectType::Table => Ok(Statement::DropTable(DropTableStmt {
+        } => match object_type {
+            ObjectType::Database | ObjectType::Schema => {
+                let name = names
+                    .first()
+                    .ok_or_else(|| Error::new(ERR_PARSE_ERROR, "missing database name"))?;
+                Ok(Statement::DropDatabase(DropDatabaseStmt {
                     if_exists: *if_exists,
-                    tables: names
-                        .iter()
-                        .map(object_table_name)
-                        .collect::<Result<Vec<_>>>()?,
-                    is_view: false,
-                    temporary: *temporary,
-                })),
-                ObjectType::View => Ok(Statement::DropTable(DropTableStmt {
-                    if_exists: *if_exists,
-                    tables: names
-                        .iter()
-                        .map(object_table_name)
-                        .collect::<Result<Vec<_>>>()?,
-                    is_view: true,
-                    temporary: false,
-                })),
-                ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
-                    if_exists: *if_exists,
-                    roles: names
-                        .iter()
-                        .map(role_from_object_name)
-                        .collect::<Result<Vec<_>>>()?,
-                })),
-                other => Err(Error::unsupported(format!("DROP {other}"))),
+                    name: object_name_last(name)?,
+                }))
             }
-        }
+            ObjectType::Table => Ok(Statement::DropTable(DropTableStmt {
+                if_exists: *if_exists,
+                tables: names
+                    .iter()
+                    .map(object_table_name)
+                    .collect::<Result<Vec<_>>>()?,
+                is_view: false,
+                temporary: *temporary,
+            })),
+            ObjectType::View => Ok(Statement::DropTable(DropTableStmt {
+                if_exists: *if_exists,
+                tables: names
+                    .iter()
+                    .map(object_table_name)
+                    .collect::<Result<Vec<_>>>()?,
+                is_view: true,
+                temporary: false,
+            })),
+            ObjectType::Role => Ok(Statement::DropRole(DropRoleStmt {
+                if_exists: *if_exists,
+                roles: names
+                    .iter()
+                    .map(role_from_object_name)
+                    .collect::<Result<Vec<_>>>()?,
+            })),
+            other => Err(Error::unsupported(format!("DROP {other}"))),
+        },
         SqlStatement::CreateRole(create) => Ok(Statement::CreateRole(CreateRoleStmt {
             if_not_exists: create.if_not_exists,
             roles: create
@@ -815,6 +811,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     full: false,
                     pattern: None,
                     column: None,
+                    var_scope: ShowVarScope::Session,
+                    var_filter: None,
                 }))
             } else {
                 Ok(Statement::Show(ShowStmt {
@@ -825,6 +823,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     full: false,
                     pattern: None,
                     column: None,
+                    var_scope: ShowVarScope::Session,
+                    var_filter: None,
                 }))
             }
         }
@@ -839,6 +839,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             full: false,
             pattern: None,
             column: None,
+            var_scope: ShowVarScope::Session,
+            var_filter: None,
         })),
         SqlStatement::ShowDatabases { show_options, .. }
         | SqlStatement::ShowSchemas { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -849,6 +851,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             full: false,
             pattern: show_like_pattern(show_options),
             column: None,
+            var_scope: ShowVarScope::Session,
+            var_filter: None,
         })),
         SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Tables,
@@ -863,6 +867,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             full: false,
             pattern: show_like_pattern(show_options),
             column: None,
+            var_scope: ShowVarScope::Session,
+            var_filter: None,
         })),
         SqlStatement::ShowCharset(_) => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Charset,
@@ -872,6 +878,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             full: false,
             pattern: None,
             column: None,
+            var_scope: ShowVarScope::Session,
+            var_filter: None,
         })),
         SqlStatement::ShowCollation { .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Collation,
@@ -881,6 +889,42 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             full: false,
             pattern: None,
             column: None,
+            var_scope: ShowVarScope::Session,
+            var_filter: None,
+        })),
+        SqlStatement::ShowVariables {
+            filter,
+            global,
+            session: _,
+        } => Ok(Statement::Show(ShowStmt {
+            kind: ShowStmtKind::Variables,
+            db_name: None,
+            table: None,
+            user: None,
+            full: false,
+            pattern: None,
+            column: None,
+            var_scope: if *global {
+                ShowVarScope::Global
+            } else {
+                ShowVarScope::Session
+            },
+            var_filter: match filter {
+                Some(ShowStatementFilter::Like(pattern)) => {
+                    Some(ShowVarFilter::Like(pattern.clone()))
+                }
+                Some(ShowStatementFilter::Where(expr)) => {
+                    Some(ShowVarFilter::Where(lower_expr(expr)?))
+                }
+                // `SHOW VARIABLES` with no filter lists everything.
+                None => None,
+                Some(other) => {
+                    return Err(Error::new(
+                        ERR_UNSUPPORTED,
+                        format!("SHOW VARIABLES filter {other} is not supported"),
+                    ));
+                }
+            },
         })),
         SqlStatement::ShowColumns {
             full, show_options, ..
@@ -898,6 +942,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 full: *full,
                 pattern: show_like_pattern(show_options),
                 column: None,
+                var_scope: ShowVarScope::Session,
+                var_filter: None,
             }))
         }
         SqlStatement::ExplainTable { table_name, .. } => {
@@ -911,6 +957,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 full: false,
                 pattern: None,
                 column: None,
+                var_scope: ShowVarScope::Session,
+                var_filter: None,
             }))
         }
         SqlStatement::Insert(insert) => {
@@ -2392,7 +2440,11 @@ fn read_ident(bytes: &[u8], mut i: usize) -> (String, usize) {
 
 /// Resource group name after `CREATE|DROP|ALTER RESOURCE GROUP`, skipping the
 /// optional `IF NOT EXISTS` / `IF EXISTS` prefix.
-fn parse_resource_group_name(bytes: &[u8], mut pos: usize, allow_if_not_exists: bool) -> (String, usize) {
+fn parse_resource_group_name(
+    bytes: &[u8],
+    mut pos: usize,
+    allow_if_not_exists: bool,
+) -> (String, usize) {
     pos = skip_ws(bytes, pos);
     if keyword_at(bytes, pos, "IF") {
         let after_if = skip_ws(bytes, pos + "IF".len());
@@ -3369,9 +3421,8 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                     if !predicate.is_empty() {
                         let item = &sql[item_start.unwrap()..word_start];
                         if let Some(name) = partial_index_name(item) {
-                            PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| {
-                                cell.borrow_mut().push((name, predicate.to_string()))
-                            });
+                            PENDING_PARTIAL_INDEX_PREDICATES
+                                .with(|cell| cell.borrow_mut().push((name, predicate.to_string())));
                         }
                     }
                     while out.ends_with(|ch: char| ch.is_whitespace()) {
@@ -4634,7 +4685,10 @@ fn read_analyze_options(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64
 
 fn extract_analyze_index(
     sql: &str,
-) -> Result<(String, Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>)> {
+) -> Result<(
+    String,
+    Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>,
+)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut extras = Vec::new();
@@ -7061,7 +7115,8 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
                 }
                 // `ALTER TABLE t CACHE` / `NOCACHE` — cached-table toggle,
                 // which sqlparser has no grammar for.
-                if keyword_at(bytes, after_name, "CACHE") || keyword_at(bytes, after_name, "NOCACHE")
+                if keyword_at(bytes, after_name, "CACHE")
+                    || keyword_at(bytes, after_name, "NOCACHE")
                 {
                     let cached = keyword_at(bytes, after_name, "CACHE");
                     let kw_len = if cached {
@@ -10935,39 +10990,39 @@ fn lower_foreign_keys(constraints: &[TableConstraint]) -> Result<Vec<ForeignKeyD
 fn lower_foreign_key_constraint(
     fk: &sqlparser::ast::ForeignKeyConstraint,
 ) -> Result<ForeignKeyDef> {
-        let columns = fk
-            .columns
+    let columns = fk
+        .columns
+        .iter()
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return Err(Error::unsupported("FOREIGN KEY without columns"));
+    }
+    let ref_table = object_table_name(&fk.foreign_table)?;
+    Ok(ForeignKeyDef {
+        name: fk
+            .name
+            .as_ref()
+            .or(fk.index_name.as_ref())
+            .map(|ident| ident.value.clone())
+            .unwrap_or_default(),
+        columns,
+        ref_schema: ref_table.schema.clone(),
+        ref_table: ref_table.name.clone(),
+        ref_columns: fk
+            .referred_columns
             .iter()
             .map(|ident| ident.value.clone())
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
-            return Err(Error::unsupported("FOREIGN KEY without columns"));
-        }
-        let ref_table = object_table_name(&fk.foreign_table)?;
-        Ok(ForeignKeyDef {
-            name: fk
-                .name
-                .as_ref()
-                .or(fk.index_name.as_ref())
-                .map(|ident| ident.value.clone())
-                .unwrap_or_default(),
-            columns,
-            ref_schema: ref_table.schema.clone(),
-            ref_table: ref_table.name.clone(),
-            ref_columns: fk
-                .referred_columns
-                .iter()
-                .map(|ident| ident.value.clone())
-                .collect(),
-            on_update_cascade: matches!(
-                fk.on_update,
-                Some(sqlparser::ast::ReferentialAction::Cascade)
-            ),
-            on_delete_cascade: matches!(
-                fk.on_delete,
-                Some(sqlparser::ast::ReferentialAction::Cascade)
-            ),
-        })
+            .collect(),
+        on_update_cascade: matches!(
+            fk.on_update,
+            Some(sqlparser::ast::ReferentialAction::Cascade)
+        ),
+        on_delete_cascade: matches!(
+            fk.on_delete,
+            Some(sqlparser::ast::ReferentialAction::Cascade)
+        ),
+    })
 }
 
 fn lower_values(values: &Values) -> Result<Vec<Vec<crate::ast::expressions::ExprNode>>> {

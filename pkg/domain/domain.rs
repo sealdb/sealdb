@@ -33,6 +33,10 @@ pub struct GlobalSysVars {
     pub external_ts: u64,
     /// `tidb_enable_external_ts_read`: gate for external-timestamp snapshots.
     pub enable_external_ts_read: bool,
+    /// Raw `SET GLOBAL <name> = <value>` assignments for variables that have no
+    /// typed field (TiDB keeps them in `global_vars` too). `SHOW GLOBAL
+    /// VARIABLES` and `@@GLOBAL.<name>` read this map.
+    pub overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for GlobalSysVars {
@@ -44,6 +48,7 @@ impl Default for GlobalSysVars {
             partition_prune_mode: "dynamic".to_string(),
             external_ts: 0,
             enable_external_ts_read: false,
+            overrides: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -246,7 +251,8 @@ impl Domain {
     }
 
     pub fn set_shard_allocate_step(&self, step: u64) {
-        self.shard_allocate_step.store(step.max(1), Ordering::SeqCst);
+        self.shard_allocate_step
+            .store(step.max(1), Ordering::SeqCst);
     }
 
     /// Allocate the next `_tidb_rowid` of a `SHARD_ROW_ID_BITS` table: the low
@@ -260,10 +266,7 @@ impl Domain {
         }
         let batch = self.handle_batch.load(Ordering::SeqCst);
         let step = self.shard_allocate_step();
-        let mut allocs = self
-            .shard_allocs
-            .lock()
-            .expect("domain shard alloc lock");
+        let mut allocs = self.shard_allocs.lock().expect("domain shard alloc lock");
         let entry = allocs.entry(table_id).or_default();
         if entry.batch != batch || entry.remaining == 0 {
             let shard = self.next_shard.fetch_add(1, Ordering::SeqCst);
@@ -541,6 +544,30 @@ impl Domain {
             .lock()
             .expect("domain global vars lock")
             .clone()
+    }
+
+    /// Read a raw `SET GLOBAL` assignment (variables without a typed field).
+    pub fn global_override(&self, name: &str) -> Option<String> {
+        self.global_vars
+            .lock()
+            .expect("domain global vars lock")
+            .overrides
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+
+    /// Record or clear (`value = None`) a raw `SET GLOBAL` assignment.
+    pub fn set_global_override(&self, name: &str, value: Option<String>) {
+        let mut globals = self.global_vars.lock().expect("domain global vars lock");
+        let key = name.to_ascii_lowercase();
+        match value {
+            Some(value) => {
+                globals.overrides.insert(key, value);
+            }
+            None => {
+                globals.overrides.remove(&key);
+            }
+        }
     }
 
     pub fn set_global_sql_mode(&self, mode: String) {

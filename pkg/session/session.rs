@@ -175,6 +175,17 @@ pub struct Session {
     plan_cache_stmts: Mutex<HashSet<String>>,
     /// Last statement warnings for `SHOW WARNINGS`.
     last_warnings: Mutex<Vec<(i32, String)>>,
+    /// TiDB `last_plan_from_binding`: whether the last statement's plan came
+    /// from a `CREATE BINDING` rewrite.
+    last_plan_from_binding: Mutex<bool>,
+    /// Raw text of the single statement being executed (empty for multi-
+    /// statement input). Binding matching keys on the text the client sent
+    /// (TiDB `parser.Normalize`), not on the restored plan AST.
+    current_stmt_sql: Mutex<String>,
+    /// Raw `SET [@@SESSION.]<name> = <value>` assignments for variables without
+    /// a typed field. `SHOW VARIABLES` / `@@<name>` read this after the typed
+    /// getters so a `SET` is always visible again.
+    sysvar_overrides: Mutex<HashMap<String, String>>,
     /// `SET RESOURCE GROUP` / `RESOURCE_GROUP()` hint: the group this session
     /// currently runs in (TiDB `sessionctx.Context.GetSessionVars().StmtCtx.ResourceGroupName`).
     resource_group: Mutex<String>,
@@ -239,6 +250,9 @@ impl Session {
             last_plan_from_cache: Mutex::new(false),
             plan_cache_stmts: Mutex::new(HashSet::new()),
             last_warnings: Mutex::new(Vec::new()),
+            last_plan_from_binding: Mutex::new(false),
+            current_stmt_sql: Mutex::new(String::new()),
+            sysvar_overrides: Mutex::new(HashMap::new()),
             resource_group: Mutex::new("default".to_string()),
         }
     }
@@ -332,9 +346,15 @@ impl Session {
             ));
         }
         let mut out = Vec::with_capacity(stmts.len());
+        let single_stmt_text = (stmts.len() == 1).then(|| sql.trim().to_string());
         for stmt in stmts {
             // `/*+ SET_VAR(var=value) */` applies to this statement only.
             let previous_sql_mode = self.begin_set_var_hint(sql);
+            *self
+                .current_stmt_sql
+                .lock()
+                .expect("session current stmt sql lock") =
+                single_stmt_text.clone().unwrap_or_default();
             let result = self.execute_one(&stmt);
             self.end_set_var_hint(previous_sql_mode);
             out.push(result?);
@@ -349,7 +369,10 @@ impl Session {
     fn begin_set_var_hint(&self, sql: &str) -> Option<String> {
         SET_VAR_PREV_GCML.with(|c| c.set(Some(sealdb_executor::aggfuncs::group_concat_max_len())));
         if let Some(len) = set_var_hint_value(sql, "group_concat_max_len")
-            && let Ok(len) = len.trim().trim_matches(|c| c == '\'' || c == '"').parse::<usize>()
+            && let Ok(len) = len
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .parse::<usize>()
         {
             sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
         }
@@ -385,10 +408,7 @@ impl Session {
             .clone();
         let (schema, table) = create.table.qualified(&current_db);
         if schema.is_empty() {
-            return Err(Error::new(
-                sealdb_errno::ERR_NO_DB,
-                "No database selected",
-            ));
+            return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
         }
         let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
         if self
@@ -435,10 +455,7 @@ impl Session {
             .clone();
         let (schema, table) = compact.table.qualified(&current_db);
         if schema.is_empty() {
-            return Err(Error::new(
-                sealdb_errno::ERR_NO_DB,
-                "No database selected",
-            ));
+            return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
         }
         let is = self.domain.infoschema();
         let info = is.table_by_name(&schema, &table).ok_or_else(|| {
@@ -502,10 +519,7 @@ impl Session {
                 if drop.if_exists {
                     continue;
                 }
-                return Err(Error::new(
-                    sealdb_errno::ERR_NO_DB,
-                    "No database selected",
-                ));
+                return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
             }
             let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
             match self
@@ -629,10 +643,7 @@ impl Session {
     /// planning catalog under their reserved schema.
     fn overlay_temp_tables(&self, is: &mut InfoSchema, current_db: &str) {
         let db = current_db.to_ascii_lowercase();
-        let temps = self
-            .temp_tables
-            .lock()
-            .expect("session temp tables lock");
+        let temps = self.temp_tables.lock().expect("session temp tables lock");
         for ((schema, _), info) in temps.iter() {
             if *schema == db {
                 is.insert_temp_table(TEMP_TABLE_SCHEMA, info.clone());
@@ -644,10 +655,7 @@ impl Session {
     /// executors consult while the statement runs.
     fn publish_temp_tables(&self, current_db: &str) -> TempTablesGuard {
         let db = current_db.to_ascii_lowercase();
-        let temps = self
-            .temp_tables
-            .lock()
-            .expect("session temp tables lock");
+        let temps = self.temp_tables.lock().expect("session temp tables lock");
         let mut map = HashMap::new();
         for ((schema, name), info) in temps.iter() {
             if *schema == db {
@@ -705,10 +713,7 @@ impl Session {
         if keys.is_empty() {
             return Ok(());
         }
-        let temps = self
-            .temp_tables
-            .lock()
-            .expect("session temp tables lock");
+        let temps = self.temp_tables.lock().expect("session temp tables lock");
         let storage = self.domain.storage();
         for key in keys {
             if let Some(info) = temps.get(&key) {
@@ -718,7 +723,8 @@ impl Session {
         Ok(())
     }
 
-    fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {        // Publish this session's `tidb_window_concurrency` for the planner and
+    fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
+        // Publish this session's `tidb_window_concurrency` for the planner and
         // executor (thread-local), so a suite that changes it cannot leak its
         // value into a later session on the same thread.
         sealdb_expression::set_window_concurrency(
@@ -963,8 +969,12 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::SetResourceGroup(set) => {
-                let name = parse_set_resource_group(&set.raw_sql).unwrap_or_else(|| "default".to_string());
-                *self.resource_group.lock().expect("session resource group lock") = name;
+                let name =
+                    parse_set_resource_group(&set.raw_sql).unwrap_or_else(|| "default".to_string());
+                *self
+                    .resource_group
+                    .lock()
+                    .expect("session resource group lock") = name;
                 return Ok(empty_result());
             }
             Statement::DropStats(drop) => {
@@ -977,10 +987,7 @@ impl Session {
                 for table in &drop.tables {
                     let (schema, name) = table.qualified(&current_db);
                     if schema.is_empty() {
-                        return Err(Error::new(
-                            sealdb_errno::ERR_NO_DB,
-                            "No database selected",
-                        ));
+                        return Err(Error::new(sealdb_errno::ERR_NO_DB, "No database selected"));
                     }
                     stats.soft_delete(&schema, &name);
                 }
@@ -1048,7 +1055,10 @@ impl Session {
                         "`create binding` is unsupported on temporary tables.",
                     ));
                 }
-                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
+                // The binding key is the text the user wrote (TiDB normalizes
+                // the statement text, which keeps `IN (1)` distinct from the
+                // `a = 1` rewrite planning applies later).
+                let key = sealdb_bindinfo::normalize_sql(&create.original_sql);
                 self.domain.bind_handle().create_binding(
                     sealdb_bindinfo::Binding::manual(
                         create.original_sql.clone(),
@@ -1060,8 +1070,8 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::DropBinding(drop) => {
-                let original = self.parser.parse_one_stmt(&drop.original_sql)?;
-                let key = sealdb_bindinfo::normalize_sql(&restore_sql(&original));
+                let _ = self.parser.parse_one_stmt(&drop.original_sql)?;
+                let key = sealdb_bindinfo::normalize_sql(&drop.original_sql);
                 self.domain.bind_handle().drop_binding(&key);
                 return Ok(empty_result());
             }
@@ -1240,8 +1250,7 @@ impl Session {
         // MySQL/TiDB metadata statements implicitly commit the open transaction
         // (a `DROP TABLE` after a `BEGIN` commits the pending DML); temporary
         // tables are session-local and do not.
-        if ddl_implicitly_commits(stmt)
-            && self.txn.lock().expect("session txn lock").is_explicit()
+        if ddl_implicitly_commits(stmt) && self.txn.lock().expect("session txn lock").is_explicit()
         {
             self.apply_pending_schema(true)?;
             self.txn.lock().expect("session txn lock").commit()?;
@@ -1257,12 +1266,10 @@ impl Session {
         // reports `ErrUnsupportedDDLOperation` (8200), a global one reports
         // `ErrCannotAddForeign` (1215).
         if let Statement::AlterTable(alter) = stmt
-            && alter.specs.iter().any(|spec| {
-                matches!(
-                    spec,
-                    sealdb_parser::ast::AlterTableSpec::AddForeignKey(_)
-                )
-            })
+            && alter
+                .specs
+                .iter()
+                .any(|spec| matches!(spec, sealdb_parser::ast::AlterTableSpec::AddForeignKey(_)))
         {
             let (schema, table) = alter.table.qualified(&current_db);
             let key = (schema.to_ascii_lowercase(), table.to_ascii_lowercase());
@@ -1353,7 +1360,13 @@ impl Session {
             _ => None,
         };
         // Apply CREATE BINDING rewrite before plan build (MVB: substitute bind SQL).
-        let rebound = self.apply_sql_binding(stmt)?;
+        let stmt_sql = self
+            .current_stmt_sql
+            .lock()
+            .expect("session current stmt sql lock")
+            .clone();
+        let rebound = self.apply_sql_binding(stmt, Some(&stmt_sql))?;
+        let binding_used = rebound.is_some();
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
         inherit_cte_scope(&mut expanded);
         // Temporary tables shadow permanent ones only for unqualified names;
@@ -1409,10 +1422,25 @@ impl Session {
             drop(mdl_guard);
             return Ok(show_warnings_result(self));
         }
+        if let Statement::Show(show) = stmt
+            && show.kind == sealdb_parser::ast::ShowStmtKind::Variables
+        {
+            // Variable values live in the session/domain state that the
+            // `ShowExec` planner node cannot see, so materialize here.
+            drop(mdl_guard);
+            return Ok(show_variables_result(self, show));
+        }
         check_only_full_group_by(self, stmt)?;
         if let Some(result) = system_var_result(self, stmt) {
             return Ok(result);
         }
+        // `@@last_plan_from_binding` reports whether *this* statement's plan
+        // came from a `CREATE BINDING` rewrite. Pure reads above (a bare
+        // `SELECT @@…`) return early so they do not clear the flag.
+        *self
+            .last_plan_from_binding
+            .lock()
+            .expect("session last plan from binding lock") = binding_used;
         // `RESOURCE_GROUP()` hint: resolve the group this statement runs in and
         // publish the processlist row executors see. Both must happen before the
         // executor is built — `information_schema` scans materialize eagerly.
@@ -3188,8 +3216,11 @@ fn external_ts_snapshot(session: &Session) -> Option<u64> {
     {
         return None;
     }
-    let ts = (*session.external_ts.lock().expect("session external ts lock"))
-        .unwrap_or_else(|| session.domain.global_vars().external_ts);
+    let ts = (*session
+        .external_ts
+        .lock()
+        .expect("session external ts lock"))
+    .unwrap_or_else(|| session.domain.global_vars().external_ts);
     (ts > 0).then_some(ts)
 }
 
@@ -3258,7 +3289,12 @@ fn select_as_of_raw(select: &sealdb_parser::ast::dml::SelectStmt) -> Option<Stri
         .or_else(|| select.selection.as_ref().and_then(expr_as_of_raw))
         .or_else(|| select.group_by.iter().find_map(expr_as_of_raw))
         .or_else(|| select.having.as_ref().and_then(expr_as_of_raw))
-        .or_else(|| select.order_by.iter().find_map(|item| expr_as_of_raw(&item.expr)));
+        .or_else(|| {
+            select
+                .order_by
+                .iter()
+                .find_map(|item| expr_as_of_raw(&item.expr))
+        });
     if expr_raw.is_some() {
         return expr_raw;
     }
@@ -3294,17 +3330,13 @@ fn expr_as_of_raw(expr: &ExprNode) -> Option<String> {
         ExprNode::InSubquery(i) => {
             expr_as_of_raw(&i.expr).or_else(|| resultset_as_of_raw(&i.query))
         }
-        ExprNode::InList(i) => expr_as_of_raw(&i.expr).or_else(|| {
-            i.list
-                .iter()
-                .find_map(expr_as_of_raw)
-        }),
+        ExprNode::InList(i) => {
+            expr_as_of_raw(&i.expr).or_else(|| i.list.iter().find_map(expr_as_of_raw))
+        }
         ExprNode::Between(b) => expr_as_of_raw(&b.expr)
             .or_else(|| expr_as_of_raw(&b.low))
             .or_else(|| expr_as_of_raw(&b.high)),
-        ExprNode::Like(l) => {
-            expr_as_of_raw(&l.expr).or_else(|| expr_as_of_raw(&l.pattern))
-        }
+        ExprNode::Like(l) => expr_as_of_raw(&l.expr).or_else(|| expr_as_of_raw(&l.pattern)),
         ExprNode::IsNull(n) => expr_as_of_raw(&n.expr),
         ExprNode::Case(c) => c
             .operand
@@ -3325,9 +3357,7 @@ fn expr_as_of_raw(expr: &ExprNode) -> Option<String> {
     }
 }
 
-fn resultset_as_of_raw(
-    node: &sealdb_parser::ast::dml::ResultSetNode,
-) -> Option<String> {
+fn resultset_as_of_raw(node: &sealdb_parser::ast::dml::ResultSetNode) -> Option<String> {
     match node {
         sealdb_parser::ast::dml::ResultSetNode::Select(select) => select_as_of_raw(select),
         sealdb_parser::ast::dml::ResultSetNode::SetOpr(_) => None,
@@ -3336,7 +3366,8 @@ fn resultset_as_of_raw(
 
 /// Evaluate the `AS OF TIMESTAMP` operand: user variables and quoted literals
 /// are the forms TiDB accepts in practice.
-fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {    let text = raw.trim();
+fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
+    let text = raw.trim();
     if text.eq_ignore_ascii_case("null") {
         return Err(as_of_null_error());
     }
@@ -3381,9 +3412,15 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {   
 /// an `AS OF TIMESTAMP` operand (`NOW([fsp])`, `CURRENT_TIMESTAMP`, …).
 fn as_of_now_fsp(raw: &str) -> Option<i8> {
     let lowered = raw.to_ascii_lowercase();
-    let rest = ["now", "current_timestamp", "localtime", "localtimestamp", "sysdate"]
-        .iter()
-        .find_map(|name| lowered.strip_prefix(name))?;
+    let rest = [
+        "now",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
+        "sysdate",
+    ]
+    .iter()
+    .find_map(|name| lowered.strip_prefix(name))?;
     if rest.is_empty() {
         return Some(0);
     }
@@ -3838,6 +3875,7 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
         }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
         let value = set_assignment_value(session, &a.value);
+        let record_value = value.clone();
         if a.scope == SetVarScope::Global {
             let mut global_warnings = apply_set_global(session, &name, &value)?;
             warnings.append(&mut global_warnings);
@@ -3851,8 +3889,18 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     "Variable 'tidb_current_ts' is a read only variable",
                 ));
             }
+            // Plan-cache probes report the previous execution's outcome.
+            "last_plan_from_binding" | "last_plan_from_cache" => {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_VAR_CANT_BE_READ,
+                    format!("Variable '{name}' is a read only variable"),
+                ));
+            }
             "tidb_external_ts" => {
-                *session.external_ts.lock().expect("session external ts lock") =
+                *session
+                    .external_ts
+                    .lock()
+                    .expect("session external ts lock") =
                     Some(parse_sysvar_u64("tidb_external_ts", &value)?);
             }
             "tidb_enable_external_ts_read" => {
@@ -4245,10 +4293,12 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
+            other if show_variable_kind(other).is_some() => {}
             other => {
                 return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
             }
         }
+        record_sysvar_override(session, &name, &record_value);
     }
     Ok(warnings)
 }
@@ -4314,10 +4364,12 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
                 .set_global_external_ts(parse_sysvar_u64("tidb_external_ts", value)?);
         }
         "tidb_enable_external_ts_read" => {
-            session.domain.set_global_enable_external_ts_read(parse_sysvar_flag(
-                "tidb_enable_external_ts_read",
-                value,
-            )?);
+            session
+                .domain
+                .set_global_enable_external_ts_read(parse_sysvar_flag(
+                    "tidb_enable_external_ts_read",
+                    value,
+                )?);
         }
         // Accepted for compatibility; only the session value gates DML.
         "allow_auto_random_explicit_insert" => {}
@@ -4348,11 +4400,21 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         | "tidb_ddl_reorg_batch_size"
         | "tidb_ddl_reorg_priority"
         | "tidb_ddl_reorg_max_write_speed" => {}
+        other if show_variable_kind(other).is_some() => {}
         other => {
             return Err(sealdb_errno::Error::unsupported(format!(
                 "SET GLOBAL {other}"
             )));
         }
+    }
+    // Keep the assignment visible to `SHOW GLOBAL VARIABLES` / `@@GLOBAL.*`
+    // even when the variable has no typed domain field.
+    if value.eq_ignore_ascii_case("DEFAULT") {
+        session.domain.set_global_override(name, None);
+    } else if let Some(kind) = show_variable_kind(name) {
+        session
+            .domain
+            .set_global_override(name, Some(normalize_show_variable_value(kind, value)));
     }
     Ok(warnings)
 }
@@ -4483,11 +4545,7 @@ fn select_has_subquery(select: &SelectStmt) -> bool {
             sealdb_parser::ast::FromItem::Table(_) => false,
             sealdb_parser::ast::FromItem::Join {
                 left, right, on, ..
-            } => {
-                from_item_has_subquery(left)
-                    || from_item_has_subquery(right)
-                    || on.has_subquery()
-            }
+            } => from_item_has_subquery(left) || from_item_has_subquery(right) || on.has_subquery(),
         }
     }
     select.fields.iter().any(|f| f.expr.has_subquery())
@@ -4496,7 +4554,10 @@ fn select_has_subquery(select: &SelectStmt) -> bool {
         || select.having.as_ref().is_some_and(|e| e.has_subquery())
         || select.order_by.iter().any(|b| b.expr.has_subquery())
         || select.joins.iter().any(|j| j.on.has_subquery())
-        || select.from_item.as_ref().is_some_and(from_item_has_subquery)
+        || select
+            .from_item
+            .as_ref()
+            .is_some_and(from_item_has_subquery)
         || select
             .with
             .as_ref()
@@ -4504,6 +4565,29 @@ fn select_has_subquery(select: &SelectStmt) -> bool {
 }
 
 fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
+    // Typed getters first: a `SET NAMES` updates the collation field, while a
+    // stale override from an earlier explicit assignment must not shadow it.
+    if let Some(value) = read_session_sysvar_typed(session, name) {
+        return Some(value);
+    }
+    if let Some(value) = session
+        .sysvar_overrides
+        .lock()
+        .expect("session sysvar overrides lock")
+        .get(&name.to_ascii_lowercase())
+    {
+        return Some(value.clone());
+    }
+    // `SELECT @@tidb_unknown` reports the zero value; `SHOW VARIABLES` only
+    // reports variables that actually exist, so keep the fallback here.
+    if name.to_ascii_lowercase().starts_with("tidb_") {
+        return Some("0".into());
+    }
+    None
+}
+
+/// Typed session getters; `None` means the variable has no session-local state.
+fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
     Some(match name {
         "sql_mode" => session
             .sql_mode
@@ -4635,9 +4719,12 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
-        "tidb_external_ts" => (*session.external_ts.lock().expect("session external ts lock"))
-            .unwrap_or_else(|| session.domain.global_vars().external_ts)
-            .to_string(),
+        "tidb_external_ts" => (*session
+            .external_ts
+            .lock()
+            .expect("session external ts lock"))
+        .unwrap_or_else(|| session.domain.global_vars().external_ts)
+        .to_string(),
         "tidb_current_ts" => session
             .txn
             .lock()
@@ -4675,6 +4762,17 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "last_plan_from_binding" => {
+            if *session
+                .last_plan_from_binding
+                .lock()
+                .expect("session last plan from binding lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         // Common TiDB session vars referenced by integrationtest; defaults.
         "tidb_allow_function_for_expression_index" => {
             "json_array, json_array_append, json_array_insert, json_contains, \
@@ -4685,13 +4783,15 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
              tidb_shard, upper, vitess_hash"
                 .into()
         }
-        other if other.starts_with("tidb_") => "0".into(),
         _ => return None,
     })
 }
 
 fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
     let globals = session.domain.global_vars();
+    if let Some(value) = globals.overrides.get(&name.to_ascii_lowercase()) {
+        return Some(value.clone());
+    }
     Some(match name {
         "sql_mode" => globals.sql_mode,
         "tidb_enable_auto_analyze" => {
@@ -4721,9 +4821,373 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
     })
 }
 
-fn restore_sql(stmt: &Statement) -> String {    let mut ctx = sealdb_parser::format::RestoreCtx::new();
+/// Value rendering used by `SHOW VARIABLES` (TiDB keeps the type in the sysvar
+/// table and prints booleans as ON/OFF, everything else verbatim).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VarKind {
+    Flag,
+    Text,
+}
+
+/// Known system variables with their TiDB 8.5 defaults, in name order (TiDB
+/// sorts `SHOW VARIABLES` output by `Variable_name`).
+const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
+    ("allow_auto_random_explicit_insert", "OFF", VarKind::Flag),
+    ("authentication_ldap_sasl_bind_root_pwd", "", VarKind::Text),
+    (
+        "authentication_ldap_simple_bind_root_pwd",
+        "",
+        VarKind::Text,
+    ),
+    ("auto_increment_increment", "1", VarKind::Text),
+    ("auto_increment_offset", "1", VarKind::Text),
+    ("autocommit", "ON", VarKind::Flag),
+    ("character_set_client", "utf8mb4", VarKind::Text),
+    ("character_set_connection", "utf8mb4", VarKind::Text),
+    ("character_set_database", "utf8mb4", VarKind::Text),
+    ("character_set_results", "utf8mb4", VarKind::Text),
+    ("character_set_server", "utf8mb4", VarKind::Text),
+    ("collation_connection", "utf8mb4_bin", VarKind::Text),
+    ("collation_server", "utf8mb4_bin", VarKind::Text),
+    ("cte_max_recursion_depth", "1000", VarKind::Text),
+    (
+        "default_collation_for_utf8mb4",
+        "utf8mb4_0900_ai_ci",
+        VarKind::Text,
+    ),
+    ("group_concat_max_len", "1024", VarKind::Text),
+    ("init_connect", "", VarKind::Text),
+    ("innodb_default_row_format", "dynamic", VarKind::Text),
+    ("innodb_file_format", "Barracuda", VarKind::Text),
+    ("innodb_large_prefix", "ON", VarKind::Flag),
+    ("interactive_timeout", "28800", VarKind::Text),
+    ("language", "", VarKind::Text),
+    ("last_plan_from_binding", "OFF", VarKind::Flag),
+    ("last_plan_from_cache", "OFF", VarKind::Flag),
+    ("license", "Apache License 2.0", VarKind::Text),
+    ("lower_case_table_names", "2", VarKind::Text),
+    ("max_allowed_packet", "67108864", VarKind::Text),
+    ("net_buffer_length", "16384", VarKind::Text),
+    ("net_write_timeout", "60", VarKind::Text),
+    ("password_history", "0", VarKind::Text),
+    ("password_reuse_interval", "0", VarKind::Text),
+    ("query_cache_size", "1048576", VarKind::Text),
+    ("query_cache_type", "OFF", VarKind::Flag),
+    ("sql_mode", "", VarKind::Text),
+    ("system_time_zone", "Asia/Shanghai", VarKind::Text),
+    ("time_zone", "SYSTEM", VarKind::Text),
+    (
+        "tidb_allow_function_for_expression_index",
+        "0",
+        VarKind::Text,
+    ),
+    ("tidb_auto_analyze_ratio", "0.5", VarKind::Text),
+    ("tidb_batch_pending_tiflash_count", "6", VarKind::Text),
+    ("tidb_capture_plan_baselines", "OFF", VarKind::Flag),
+    ("tidb_cost_model_version", "2", VarKind::Text),
+    ("tidb_enable_auto_analyze", "ON", VarKind::Flag),
+    (
+        "tidb_enable_auto_increment_in_generated",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_enable_clustered_index", "ON", VarKind::Text),
+    ("tidb_enable_external_ts_read", "OFF", VarKind::Flag),
+    ("tidb_enable_list_partition", "ON", VarKind::Flag),
+    ("tidb_enable_non_prepared_plan_cache", "OFF", VarKind::Flag),
+    ("tidb_enable_ordered_result_mode", "OFF", VarKind::Flag),
+    ("tidb_enable_table_partition", "ON", VarKind::Flag),
+    ("tidb_enable_window_function", "ON", VarKind::Flag),
+    ("tidb_external_ts", "0", VarKind::Text),
+    ("tidb_hashagg_final_concurrency", "5", VarKind::Text),
+    ("tidb_hashagg_partial_concurrency", "5", VarKind::Text),
+    ("tidb_opt_agg_push_down", "OFF", VarKind::Flag),
+    ("tidb_opt_insubq_to_join_and_agg", "ON", VarKind::Flag),
+    ("tidb_partition_prune_mode", "dynamic", VarKind::Text),
+    ("tidb_snapshot", "", VarKind::Text),
+    ("tidb_sysdate_is_now", "OFF", VarKind::Flag),
+    ("tidb_window_concurrency", "5", VarKind::Text),
+    ("transaction_isolation", "REPEATABLE-READ", VarKind::Text),
+    ("tx_isolation", "REPEATABLE-READ", VarKind::Text),
+    ("wait_timeout", "28800", VarKind::Text),
+];
+
+fn show_variable_kind(name: &str) -> Option<VarKind> {
+    let lname = name.to_ascii_lowercase();
+    SHOW_VARIABLE_DEFAULTS
+        .iter()
+        .find(|(known, _, _)| *known == lname)
+        .map(|(_, _, kind)| *kind)
+}
+
+fn show_variable_default(name: &str) -> Option<&'static str> {
+    let lname = name.to_ascii_lowercase();
+    SHOW_VARIABLE_DEFAULTS
+        .iter()
+        .find(|(known, _, _)| *known == lname)
+        .map(|(_, default, _)| *default)
+}
+
+/// Normalize a `SET` assignment for `SHOW VARIABLES`: booleans render as
+/// ON/OFF like TiDB's sysvar table, numbers/text stay verbatim.
+fn normalize_show_variable_value(kind: VarKind, value: &str) -> String {
+    match kind {
+        VarKind::Flag => {
+            let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+            if on { "ON" } else { "OFF" }.to_string()
+        }
+        VarKind::Text => value.to_string(),
+    }
+}
+
+/// Record a successful `SET <name> = <value>` for `SHOW VARIABLES` / `@@name`.
+fn record_sysvar_override(session: &Session, name: &str, value: &str) {
+    let Some(kind) = show_variable_kind(name) else {
+        return;
+    };
+    let mut overrides = session
+        .sysvar_overrides
+        .lock()
+        .expect("session sysvar overrides lock");
+    if value.eq_ignore_ascii_case("DEFAULT") {
+        overrides.remove(&name.to_ascii_lowercase());
+    } else {
+        overrides.insert(
+            name.to_ascii_lowercase(),
+            normalize_show_variable_value(kind, value),
+        );
+    }
+}
+
+/// Current value of a known system variable in `scope`, or `None` when the
+/// variable is unknown (so `SHOW VARIABLES LIKE` can select nothing).
+fn resolve_show_variable(session: &Session, name: &str, global: bool) -> Option<String> {
+    if global {
+        if let Some(value) = session.domain.global_override(name) {
+            return Some(value);
+        }
+        if let Some(value) = read_global_sysvar(session, name) {
+            return Some(value);
+        }
+    } else {
+        if let Some(value) = read_session_sysvar_typed(session, name) {
+            return Some(value);
+        }
+        if let Some(value) = session
+            .sysvar_overrides
+            .lock()
+            .expect("session sysvar overrides lock")
+            .get(&name.to_ascii_lowercase())
+        {
+            return Some(value.clone());
+        }
+        // Server-scope variables are visible in the session scope too.
+        if let Some(value) = session.domain.global_override(name) {
+            return Some(value);
+        }
+        if let Some(value) = read_global_sysvar(session, name) {
+            return Some(value);
+        }
+    }
+    show_variable_default(name).map(|default| {
+        let kind = show_variable_kind(name).unwrap_or(VarKind::Text);
+        normalize_show_variable_value(kind, default)
+    })
+}
+
+fn show_variables_result(session: &Session, stmt: &sealdb_parser::ast::ShowStmt) -> QueryResult {
+    let global = stmt.var_scope == sealdb_parser::ast::ShowVarScope::Global;
+    let mut rows: Vec<(String, String)> = SHOW_VARIABLE_DEFAULTS
+        .iter()
+        .filter_map(|(name, _, _)| {
+            resolve_show_variable(session, name, global).map(|v| ((*name).to_string(), v))
+        })
+        .collect();
+    match &stmt.var_filter {
+        None => {}
+        Some(sealdb_parser::ast::ShowVarFilter::Like(pattern)) => {
+            rows.retain(|(name, _)| {
+                sealdb_executor::show::show_like_match(name.as_bytes(), pattern.as_bytes())
+            });
+        }
+        Some(sealdb_parser::ast::ShowVarFilter::Where(condition)) => {
+            rows.retain(|(name, value)| {
+                let expr = subst_show_variable_columns(condition, name, value);
+                matches!(
+                    sealdb_expression::eval_expr(&expr),
+                    Ok(sealdb_types::Datum::I64(1)) | Ok(sealdb_types::Datum::U64(1))
+                )
+            });
+        }
+    }
+    QueryResult {
+        columns: vec!["Variable_name".to_string(), "Value".to_string()],
+        rows: rows
+            .into_iter()
+            .map(|(name, value)| {
+                vec![
+                    sealdb_types::Datum::Bytes(name.into_bytes()),
+                    sealdb_types::Datum::Bytes(value.into_bytes()),
+                ]
+            })
+            .collect(),
+        warnings: Vec::new(),
+        affected_rows: 0,
+        info: String::new(),
+    }
+}
+
+/// Replace `Variable_name` / `Value` column references in a
+/// `SHOW VARIABLES WHERE` condition with the candidate row's values.
+fn subst_show_variable_columns(
+    expr: &sealdb_parser::ast::ExprNode,
+    name: &str,
+    value: &str,
+) -> sealdb_parser::ast::ExprNode {
+    use sealdb_parser::ast::ExprNode;
+    use sealdb_parser::ast::expressions::ValueExpr;
+    let subst = |child: &ExprNode| subst_show_variable_columns(child, name, value);
+    match expr {
+        ExprNode::Column(col) => {
+            let column = col.name.to_ascii_lowercase();
+            let text = if column == "variable_name" {
+                Some(name)
+            } else if column == "value" {
+                Some(value)
+            } else {
+                None
+            };
+            match text {
+                Some(text) => ExprNode::Value(ValueExpr {
+                    datum: sealdb_types::Datum::Bytes(text.as_bytes().to_vec()),
+                }),
+                None => expr.clone(),
+            }
+        }
+        ExprNode::Binary(b) => ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+            op: b.op,
+            left: Box::new(subst(&b.left)),
+            right: Box::new(subst(&b.right)),
+            single_cnf_item: false,
+        }),
+        ExprNode::Unary(u) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+            op: u.op,
+            expr: Box::new(subst(&u.expr)),
+        }),
+        ExprNode::Func(f) => {
+            let mut f = f.clone();
+            f.args = f.args.iter().map(subst).collect();
+            ExprNode::Func(f)
+        }
+        ExprNode::Cast(c) => {
+            let mut c = c.clone();
+            c.expr = Box::new(subst(&c.expr));
+            ExprNode::Cast(c)
+        }
+        ExprNode::InList(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(subst(&i.expr));
+            i.list = i.list.iter().map(subst).collect();
+            ExprNode::InList(i)
+        }
+        ExprNode::Between(b) => {
+            let mut b = b.clone();
+            b.expr = Box::new(subst(&b.expr));
+            b.low = Box::new(subst(&b.low));
+            b.high = Box::new(subst(&b.high));
+            ExprNode::Between(b)
+        }
+        ExprNode::Like(l) => {
+            let mut l = l.clone();
+            l.expr = Box::new(subst(&l.expr));
+            l.pattern = Box::new(subst(&l.pattern));
+            ExprNode::Like(l)
+        }
+        ExprNode::IsNull(i) => {
+            let mut i = i.clone();
+            i.expr = Box::new(subst(&i.expr));
+            ExprNode::IsNull(i)
+        }
+        other => other.clone(),
+    }
+}
+
+fn restore_sql(stmt: &Statement) -> String {
+    let mut ctx = sealdb_parser::format::RestoreCtx::new();
     let _ = sealdb_parser::ast::Node::restore(stmt, &mut ctx);
     ctx.into_string()
+}
+
+/// Text of the statement a `DESC`/`DESCRIBE`/`EXPLAIN` wrapper explains, with
+/// any `ANALYZE` / `FORMAT = …` prefix removed. Bindings key on the explained
+/// statement, not on the `EXPLAIN` wrapper.
+fn explain_inner_text(raw: &str) -> Option<String> {
+    let text = raw.trim_start();
+    let mut rest = {
+        let lower = text.to_ascii_lowercase();
+        let mut cut = None;
+        for keyword in ["explain", "describe", "desc"] {
+            if lower.starts_with(keyword) {
+                let after = &text[keyword.len()..];
+                if after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    cut = Some(after);
+                    break;
+                }
+            }
+        }
+        cut?
+    };
+    // `[ANALYZE] [FORMAT [=] <fmt>] [VERBOSE]`
+    loop {
+        let trimmed = rest.trim_start();
+        // Offset just past `keyword` when it is a whole word at the start.
+        let skip_keyword = |keyword: &str| -> Option<usize> {
+            let lower = trimmed.to_ascii_lowercase();
+            let after = lower.strip_prefix(keyword)?;
+            after
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                .then(|| trimmed.len() - after.len())
+        };
+        if let Some(pos) = skip_keyword("analyze") {
+            rest = &trimmed[pos..];
+            continue;
+        }
+        if let Some(pos) = skip_keyword("format") {
+            let mut fmt = trimmed[pos..].trim_start();
+            if let Some(stripped) = fmt.strip_prefix('=') {
+                fmt = stripped.trim_start();
+            }
+            // Skip one format value: a quoted string or a bare word.
+            let value_end = match fmt.chars().next() {
+                Some(quote @ ('\'' | '"')) => {
+                    let mut end = None;
+                    for (idx, ch) in fmt.char_indices().skip(1) {
+                        if ch == quote {
+                            end = Some(idx + ch.len_utf8());
+                            break;
+                        }
+                    }
+                    end?
+                }
+                _ => fmt
+                    .char_indices()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(fmt.len()),
+            };
+            rest = &fmt[value_end..];
+            continue;
+        }
+        break;
+    }
+    let inner = rest.trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 fn bind_sql(sql: &str, params: &[ExprNode]) -> Result<String> {
@@ -4896,7 +5360,8 @@ fn needs_statement_savepoint(stmt: &Statement) -> bool {
     )
 }
 
-fn is_write_stmt(stmt: &Statement) -> bool {    matches!(
+fn is_write_stmt(stmt: &Statement) -> bool {
+    matches!(
         stmt,
         Statement::Insert(_)
             | Statement::Update(_)
@@ -6461,12 +6926,29 @@ impl Session {
         self.session_id
     }
 
-    /// If a Domain binding matches this statement's restored SQL, re-parse the bind SQL.
-    fn apply_sql_binding(&self, stmt: &Statement) -> Result<Option<Statement>> {
+    /// If a Domain binding matches this statement, re-parse the bind SQL.
+    /// `raw_sql` is the text the client sent (available for the top-level
+    /// `raw_sql` is the text the client sent: TiDB keys bindings on the
+    /// normalized statement text, so `a in (1)` — folded to `a = 1` when
+    /// lowering — still matches a binding written as `a in (1,2,3)`. Without raw
+    /// text the restored statement is used.
+    fn apply_sql_binding(
+        &self,
+        stmt: &Statement,
+        raw_sql: Option<&str>,
+    ) -> Result<Option<Statement>> {
         match stmt {
             Statement::Select(_) => {
                 let restored = restore_sql(stmt);
-                if let Some(binding) = self.domain.bind_handle().match_binding(&restored) {
+                let candidate = match raw_sql.map(str::trim) {
+                    Some(raw) if !raw.is_empty() => raw,
+                    _ => restored.as_str(),
+                };
+                if let Some(binding) = self.domain.bind_handle().match_binding(candidate) {
+                    *self
+                        .last_plan_from_binding
+                        .lock()
+                        .expect("session last plan from binding lock") = true;
                     // A binding may carry its own `SET_VAR` hint (`… using select
                     // /*+ SET_VAR(group_concat_max_len = 4) */ …`); TiDB applies it
                     // as part of the replaced statement.
@@ -6482,7 +6964,10 @@ impl Session {
                 }
             }
             Statement::Explain(explain) => {
-                if let Some(inner) = self.apply_sql_binding(&explain.stmt)? {
+                // Bindings key on the explained statement text, not on the
+                // `EXPLAIN …` wrapper, so strip the prefix before matching.
+                let inner_raw = raw_sql.and_then(explain_inner_text);
+                if let Some(inner) = self.apply_sql_binding(&explain.stmt, inner_raw.as_deref())? {
                     let mut explain = explain.clone();
                     explain.stmt = Box::new(inner);
                     return Ok(Some(Statement::Explain(explain)));
@@ -8712,9 +9197,7 @@ mod tests {
             .unwrap();
         for i in 0..500 {
             session
-                .execute_stmt(&format!(
-                    "INSERT INTO db1.big VALUES ({i}, 'k{i:04}', 'x')"
-                ))
+                .execute_stmt(&format!("INSERT INTO db1.big VALUES ({i}, 'k{i:04}', 'x')"))
                 .unwrap();
         }
         session.execute_stmt("ANALYZE TABLE db1.big").unwrap();
@@ -8841,7 +9324,9 @@ mod tests {
             t.display_rows(),
             vec![vec!["1".to_string(), "a".to_string()]]
         );
-        session.execute_stmt("INSERT INTO db1.t2 VALUES (2)").unwrap();
+        session
+            .execute_stmt("INSERT INTO db1.t2 VALUES (2)")
+            .unwrap();
         let t2 = session.execute_stmt("SELECT * FROM db1.t2").unwrap();
         assert_eq!(t2.display_rows(), vec![vec!["2".to_string()]]);
 
@@ -11919,5 +12404,154 @@ mod cte_limit_tests {
                 assert_eq!(result.display_rows(), vec![vec!["30".to_string()]], "{q}");
             }
         }
+    }
+
+    #[test]
+    fn test_last_plan_from_binding_in_list() {
+        let session = Session::new();
+        session.execute_stmt("create database bind_probe").unwrap();
+        session.execute_stmt("use bind_probe").unwrap();
+        session
+            .execute_stmt("create table t (a int, b int, c int, d int)")
+            .unwrap();
+        session
+            .execute_stmt("select a from t where a in (1, 2, 3)")
+            .unwrap();
+        let r = session
+            .execute_stmt("select @@last_plan_from_binding")
+            .unwrap();
+        assert_eq!(r.display_rows()[0][0], "0", "no binding yet");
+        session.execute_stmt("create binding for select a from t where a in (1) using select a from t where a in (1)").unwrap();
+        session
+            .execute_stmt("select a from t where a in (1, 2, 3)")
+            .unwrap();
+        let r = session
+            .execute_stmt("select @@last_plan_from_binding")
+            .unwrap();
+        assert_eq!(r.display_rows()[0][0], "1", "binding should match in-list");
+        // A statement with no matching binding clears the flag again.
+        session
+            .execute_stmt("select b from t where b in (1)")
+            .unwrap();
+        let r = session
+            .execute_stmt("select @@last_plan_from_binding")
+            .unwrap();
+        assert_eq!(
+            r.display_rows()[0][0],
+            "0",
+            "different column does not match"
+        );
+    }
+
+    #[test]
+    fn test_explain_inner_text() {
+        assert_eq!(
+            explain_inner_text("EXPLAIN SELECT 1").as_deref(),
+            Some("SELECT 1")
+        );
+        assert_eq!(
+            explain_inner_text("explain format='brief' SELECT * FROM t").as_deref(),
+            Some("SELECT * FROM t")
+        );
+        assert_eq!(
+            explain_inner_text("DESC WITH cte AS (SELECT 1) SELECT * FROM cte").as_deref(),
+            Some("WITH cte AS (SELECT 1) SELECT * FROM cte")
+        );
+        assert_eq!(
+            explain_inner_text("EXPLAIN ANALYZE FORMAT = row SELECT 1").as_deref(),
+            Some("SELECT 1")
+        );
+        // A statement whose name merely starts with `desc` is not a wrapper.
+        assert_eq!(explain_inner_text("describe_tbl"), None);
+        assert_eq!(explain_inner_text("SELECT 1"), None);
+    }
+
+    /// `SHOW [GLOBAL|SESSION] VARIABLES` renders the sysvar table TiDB    /// exposes: `Variable_name`/`Value`, LIKE and WHERE filters, and the
+    /// session/global values a preceding `SET` installed.
+    #[test]
+    fn test_show_variables() {
+        let session = Session::new();
+        let rows = |sql: &str| -> Vec<(String, String)> {
+            let result = session
+                .execute_stmt(sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(result.columns, vec!["Variable_name", "Value"], "{sql}");
+            result
+                .display_rows()
+                .into_iter()
+                .map(|row| (row[0].clone(), row[1].clone()))
+                .collect()
+        };
+
+        assert_eq!(
+            rows("SHOW VARIABLES LIKE 'innodb_default_row_format'"),
+            vec![(
+                "innodb_default_row_format".to_string(),
+                "dynamic".to_string()
+            )]
+        );
+        assert_eq!(
+            rows("SHOW VARIABLES LIKE 'character_set_server'"),
+            vec![("character_set_server".to_string(), "utf8mb4".to_string())]
+        );
+        // LIKE is case-insensitive and supports `%`/`_`.
+        assert_eq!(
+            rows("SHOW VARIABLES LIKE '%TIDB_SYSDATE_IS_NOW%'"),
+            vec![("tidb_sysdate_is_now".to_string(), "OFF".to_string())]
+        );
+        session
+            .execute_stmt("SET @@tidb_sysdate_is_now = 1")
+            .unwrap();
+        assert_eq!(
+            rows("SHOW VARIABLES LIKE '%tidb_sysdate_is_now%'"),
+            vec![("tidb_sysdate_is_now".to_string(), "ON".to_string())]
+        );
+        // `SET GLOBAL` is visible from both scopes for server variables.
+        session
+            .execute_stmt("SET GLOBAL collation_server = utf8mb4_general_ci")
+            .unwrap();
+        assert_eq!(
+            rows("SHOW GLOBAL VARIABLES LIKE 'collation_server'"),
+            vec![(
+                "collation_server".to_string(),
+                "utf8mb4_general_ci".to_string()
+            )]
+        );
+        assert_eq!(
+            rows("SHOW VARIABLES LIKE 'collation_server'"),
+            vec![(
+                "collation_server".to_string(),
+                "utf8mb4_general_ci".to_string()
+            )]
+        );
+        assert_eq!(
+            rows("SHOW VARIABLES WHERE variable_name LIKE 'tidb_enable_ordered_result_mode'"),
+            vec![(
+                "tidb_enable_ordered_result_mode".to_string(),
+                "OFF".to_string()
+            )]
+        );
+        // Both header spellings work and no row means an empty result.
+        assert_eq!(
+            rows("SHOW VARIABLES WHERE Variable_name = 'language' OR Variable_name = 'license'"),
+            vec![
+                ("language".to_string(), String::new()),
+                ("license".to_string(), "Apache License 2.0".to_string()),
+            ]
+        );
+        assert!(rows("SHOW VARIABLES LIKE 'no_such_variable'").is_empty());
+        assert!(
+            rows("SHOW GLOBAL VARIABLES WHERE Variable_name = 'tidb_batch_pending_tiflash_count' AND Value = '5'")
+                .is_empty()
+        );
+        assert_eq!(
+            rows(
+                "SHOW GLOBAL VARIABLES WHERE Variable_name = 'tidb_batch_pending_tiflash_count' AND Value = '6'"
+            ),
+            vec![(
+                "tidb_batch_pending_tiflash_count".to_string(),
+                "6".to_string()
+            )]
+        );
     }
 }

@@ -390,6 +390,13 @@ impl Executor for ShowExec {
                 ];
                 self.rows = Vec::new();
             }
+            // Variable values live in the session; `Session::execute_one`
+            // materializes `SHOW VARIABLES` before planning. Keep the match
+            // exhaustive with the same column layout.
+            ShowStmtKind::Variables => {
+                self.schema = vec!["Variable_name".to_string(), "Value".to_string()];
+                self.rows = Vec::new();
+            }
         }
         Ok(())
     }
@@ -621,10 +628,7 @@ fn render_create_table(info: &TableInfo) -> String {
     // TiDB echoes the shard options as a TiDB-only comment at the end.
     let mut shard_opts = String::new();
     if info.shard_row_id_bits > 0 {
-        shard_opts.push_str(&format!(
-            "SHARD_ROW_ID_BITS={}",
-            info.shard_row_id_bits
-        ));
+        shard_opts.push_str(&format!("SHARD_ROW_ID_BITS={}", info.shard_row_id_bits));
     }
     if info.pre_split_regions > 0 {
         if !shard_opts.is_empty() {
@@ -759,7 +763,8 @@ fn show_like_ok(name: &str, pattern: Option<&str>) -> bool {
 }
 
 /// MySQL LIKE (`%` / `_`), case-insensitive for identifier SHOW filters.
-fn show_like_match(text: &[u8], pattern: &[u8]) -> bool {
+/// Shared with `SHOW VARIABLES LIKE` (evaluated by the session layer).
+pub fn show_like_match(text: &[u8], pattern: &[u8]) -> bool {
     show_like_at(text, 0, pattern, 0)
 }
 
