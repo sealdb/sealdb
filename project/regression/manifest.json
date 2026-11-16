@@ -1422,7 +1422,7 @@
     {
       "name": "globalindex/expression_index",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/globalindex/expression_index.test",
       "result": "r/globalindex/expression_index.result",
       "has_result": true,

@@ -1009,6 +1009,19 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         info.auto_random = col.auto_random;
         info.comment = col.comment.clone();
         validate_display_width(info.name.o(), &info.field_type)?;
+        // TiDB `CheckDisplayWidth`: MySQL 8 deprecates the integer display width
+        // (`int(11)`); a bare `int` declares none and stays silent.
+        if matches!(
+            info.field_type.tp,
+            TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG
+        ) && parse_len(&col.type_name).is_some()
+        {
+            sealdb_expression::note_warning(
+                1681,
+                "Integer display width is deprecated and will be removed in a future release."
+                    .to_string(),
+            );
+        }
         validate_default_literal(
             info.name.o(),
             &info.field_type,

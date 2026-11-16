@@ -48,6 +48,10 @@ pub struct IndexLookUpExecutor {
     /// The read must return rows in index-key order (`keep order:true`), so the
     /// probe keeps the Build side's handle order instead of batching.
     keep_order: bool,
+    /// The read walks one ordered index whose keys live in *different*
+    /// partition subtrees (a GLOBAL index read across partitions), so the rows
+    /// are merged back into index-key order instead of partition order.
+    merge_order: bool,
     /// Project TiDB's `_tidb_rowid` (the heap table handle) as an extra column.
     with_rowid: bool,
     schema: Vec<String>,
@@ -85,6 +89,7 @@ impl IndexLookUpExecutor {
             pushed,
             covering,
             keep_order,
+            merge_order: false,
             with_rowid,
             schema: Vec::new(),
             rows: Vec::new(),
@@ -165,8 +170,15 @@ impl Executor for IndexLookUpExecutor {
         // expression order (`SELECT a+1` over `KEY ((a+1))` yields 0,1,2…)
         // because they never probe the table.
         let probe_batched = !index_only && !self.keep_order && !self.txn_has_writes(&physical);
+        // A GLOBAL expression index read spans the partitions, so its keys are
+        // stored in one subtree per partition: the scan yields them partition
+        // by partition and must be merged back into key order.
+        self.merge_order =
+            self.keep_order && physical.len() > 1 && (index.global || expression_index);
+        let merge_order = self.merge_order;
         self.rows = self.txn.with_txn(|txn| {
             let mut rows = Vec::new();
+            let mut keyed: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
             let mut pending: Vec<(i64, i64)> = Vec::new();
             for physical_id in physical {
                 for access in &self.access {
@@ -199,7 +211,11 @@ impl Executor for IndexLookUpExecutor {
                                 if expose_rowid {
                                     row.push(Datum::I64(handle));
                                 }
-                                rows.push(row);
+                                if merge_order {
+                                    keyed.push((index_sort_key(&key), row));
+                                } else {
+                                    rows.push(row);
+                                }
                                 continue;
                             }
                             if probe_batched {
@@ -209,11 +225,22 @@ impl Executor for IndexLookUpExecutor {
                             let row_key = encode_row_key_with_handle(physical_id, handle);
                             let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
                             if let Some(raw) = raw {
-                                rows.push(decode_lookup_row(&info, &raw, expose_rowid, handle));
+                                let row = decode_lookup_row(&info, &raw, expose_rowid, handle);
+                                if merge_order {
+                                    keyed.push((index_sort_key(&key), row));
+                                } else {
+                                    rows.push(row);
+                                }
                             }
                         }
                     }
                 }
+            }
+            if merge_order {
+                // Index key order: the key's table/index prefix is the same for
+                // every row, so the encoded key values decide.
+                keyed.sort_by(|left, right| left.0.cmp(&right.0));
+                rows.extend(keyed.into_iter().map(|(_, row)| row));
             }
             if probe_batched {
                 // Key order is the storage order: table id, then the row handle.
@@ -524,10 +551,18 @@ impl Executor for IndexMergeExecutor {
     }
 }
 
+/// Encoded index key values of a stored index key (`t<id>_i<index><values>`),
+/// used to merge a scan that visits several partition subtrees back into index
+/// order.
+fn index_sort_key(key: &[u8]) -> Vec<u8> {
+    key.get(sealdb_tablecodec::PREFIX_LEN + 8..)
+        .unwrap_or(key)
+        .to_vec()
+}
+
 fn merge_access_arms(
     selection: Option<&ExprNode>,
-    info: &TableInfo,
-) -> Result<Vec<(IndexInfo, IndexAccess)>> {
+    info: &TableInfo,) -> Result<Vec<(IndexInfo, IndexAccess)>> {
     let Some(expr) = selection else {
         return Ok(Vec::new());
     };

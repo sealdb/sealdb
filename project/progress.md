@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-15（green 83 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-15（green 92 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -3364,6 +3364,39 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
     `explain_cte` / `explain_indexmerge_stats` / `join_reorder2` /
     `join_reorder_through_projection` / `rule_derive_topn_from_window`。
+
+### 2026-11-15（`globalindex/expression_index` 转正：表达式索引保序、DDL 弃用告警、GLOBAL 分区钉选）
+
+- **Phase**: R7
+- **完成**:
+  - 表达式索引的 `ORDER BY` 保序：`plan_reads_global_index` 现在会穿过表达式
+    索引的输出投影（`Projection → IndexLookUp`），`select * from t use
+    index(idx) where lower(b) > 'c' order by lower(b)` 因此直接读
+    `IndexRangeScan keep order:true`，不再补 `Sort`。`set_index_range_keep_order`
+    新增投影透传，`wrap_index_order_projection` 把 hidden 键合入已有的
+    DataSource 投影（`t.a, t.b, lower(t.b)`），输出层仍只投影 `t.a, t.b`。
+  - 执行器跨分区保序：GLOBAL 表达式索引的键按分区分表存，扫描结果是「分区
+    顺序」。`IndexLookUpExecutor` 新增 `merge_order`，在 `keep order` 且读到
+    多个分区时按索引键值（去掉 `t<id>_i<index>` 前缀）归并，等同于在内存里
+    合并各分区的有序流。
+  - `FROM PARTITION (pN)` + GLOBAL 索引：访问路径确定之后由
+    `pin_global_partition_read` 补 `in(_tidb_tid, tidN)` 的 cop
+    `Selection(Build)`，同时复用既有的 pinned 渲染规则输出 `NULL` 占位
+    （`Projection`/`IndexLookUp` 的 access object / operator info）。
+  - DDL 告警对齐：`CREATE TABLE` 的整型显示宽度（`int(11)`）补 1681，
+    表达式索引创建（`buildIndexInfo`）补 8265 `Auto analyze is not effective
+    for index 'idx', need analyze manually`。
+- **验证**:
+  - `cargo run -q --bin sealdb-itest -- --case globalindex/expression_index
+    --status pending --store both --require-tikv` → `PASS: memory=1 tikv=1`
+  - 全量 green gate（Memory + TiKV）：Memory 100 / TiKV 98
+  - manifest：`globalindex/expression_index` `pending → green`，green 91→92
+    （R7 28→29）
+- **阻塞/风险**:
+  - 无。
+- **下一步**:
+  - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
+    `explain_cte`（物化 CTE 生产/消费节点渲染） / `explain_join_stats`。
 
 ## 7. 更新模板
 

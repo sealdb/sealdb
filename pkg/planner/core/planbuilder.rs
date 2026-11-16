@@ -434,6 +434,19 @@ impl PlanBuilder {
                     plan = star_projection_over_filter(plan, select, is, current_db);
                 }
                 plan = lift_point_get_merge_join(plan, select, is, current_db);
+                // `FROM PARTITION (pN)` over a GLOBAL index: TiDB pins the
+                // reader with `in(_tidb_tid, tidN)`. The planner decides the
+                // access range first, so the pin is attached afterwards.
+                if let Some(from) = select.from.as_ref()
+                    && select.join_tables().len() == 1
+                    && !from.partition_names.is_empty()
+                    && let Some(info) = is.and_then(|schema| {
+                        let (db, table) = from.qualified(current_db);
+                        schema.table_by_name(&db, &table)
+                    })
+                {
+                    plan = pin_global_partition_read(plan, info, &from.partition_names);
+                }
                 plan = cast_json_join_keys(plan, select, is, current_db);
                 plan = self_join_star_projection(plan, select, is, current_db);
                 // TiDB builds the row lock above `ORDER BY` / `LIMIT`
@@ -530,6 +543,7 @@ impl PlanBuilder {
                         && plan_provides_order(select, &plan, is, current_db);
                     if index_order {
                         plan = set_index_range_keep_order(plan);
+                        plan = set_projection_index_keep_order(plan);
                         // The ordered index read's schema may not match the
                         // SELECT list: a GLOBAL index lookup restores each row
                         // through the partition id, and an index over a virtual
@@ -5123,6 +5137,29 @@ fn set_index_range_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
                 probe_est,
                 range_scan,
                 pushed,
+            }
+        }
+        other => other,
+    }
+}
+
+/// `keep order:true` on an expression-index read whose output projection sits
+/// between the lookup and the sort-free ORDER BY.
+fn set_projection_index_keep_order(plan: PhysicalPlan) -> PhysicalPlan {
+    match plan {
+        PhysicalPlan::Projection {
+            exprs,
+            child,
+            est_rows,
+        } if matches!(
+            child.as_ref(),
+            PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+        ) =>
+        {
+            PhysicalPlan::Projection {
+                exprs,
+                child: Box::new(set_index_range_keep_order(*child)),
+                est_rows,
             }
         }
         other => other,
@@ -25160,6 +25197,99 @@ fn partition_global_index_read(plan: &PhysicalPlan, info: &sealdb_meta::TableInf
     }
 }
 
+/// `FROM PARTITION (pN)` on a GLOBAL index read: the index itself spans every
+/// partition, so the cop task filters the scanned keys by partition id
+/// (`Selection(Build) in(_tidb_tid, tidN)`). EXPLAIN also prints `NULL` for the
+/// nodes without an access object while the read is pinned.
+fn pin_global_partition_read(
+    plan: PhysicalPlan,
+    info: &sealdb_meta::TableInfo,
+    partition_names: &[String],
+) -> PhysicalPlan {
+    if partition_names.is_empty() {
+        return plan;
+    }
+    let access = partition_names.join(",");
+    let tid = || match tid_ordinal(info, &partition_names[0]) {
+        Some(ordinal) => format!("in(_tidb_tid, tid{ordinal})"),
+        None => String::new(),
+    };
+    match plan {
+        PhysicalPlan::IndexLookUpReader {
+            table,
+            index,
+            index_columns,
+            partitions,
+            partition_access,
+            row_count,
+            selection_info,
+            probe_selection_info,
+            probe_est,
+            range_scan,
+            pushed,
+        } => {
+            let global = info
+                .indices
+                .iter()
+                .any(|idx| idx.name.o().eq_ignore_ascii_case(&index) && idx.global);
+            let pinned = global
+                && partition_access.eq_ignore_ascii_case(&access)
+                && !selection_info
+                    .as_deref()
+                    .is_some_and(|sel| sel.contains("_tidb_tid"));
+            let selection_info = if pinned {
+                let tid = tid();
+                if tid.is_empty() {
+                    selection_info
+                } else {
+                    Some(match selection_info {
+                        Some(sel) => format!("{sel}, {tid}"),
+                        None => tid,
+                    })
+                }
+            } else {
+                selection_info
+            };
+            PhysicalPlan::IndexLookUpReader {
+                table,
+                index,
+                index_columns,
+                partitions,
+                partition_access,
+                row_count,
+                selection_info,
+                probe_selection_info,
+                probe_est,
+                range_scan,
+                pushed,
+            }
+        }
+        PhysicalPlan::Selection {
+            filter,
+            child,
+            est_rows,
+        } => PhysicalPlan::Selection {
+            filter,
+            child: Box::new(pin_global_partition_read(*child, info, partition_names)),
+            est_rows,
+        },
+        PhysicalPlan::Projection {
+            exprs,
+            child,
+            est_rows,
+        } => PhysicalPlan::Projection {
+            exprs,
+            child: Box::new(pin_global_partition_read(*child, info, partition_names)),
+            est_rows,
+        },
+        PhysicalPlan::Sort { by_info, child } => PhysicalPlan::Sort {
+            by_info,
+            child: Box::new(pin_global_partition_read(*child, info, partition_names)),
+        },
+        other => other,
+    }
+}
+
 /// Names a FROM item answers to: its alias and the physical table.
 fn table_alias_names(from: &TableName) -> Vec<String> {
     let mut out = vec![from.name.to_ascii_lowercase()];
@@ -26522,36 +26652,60 @@ fn wrap_index_order_projection(
         // Projection above the lookup that recomputes every expression index's
         // hidden key from the base columns, then prunes back to `*`. The
         // expression-index projection already present is that inner layer.
-        if matches!(plan, PhysicalPlan::Projection { .. }) {
-            return PhysicalPlan::Projection {
-                exprs,
-                child: Box::new(plan),
-                est_rows: None,
-            };
-        }
-        let mut inner = exprs.clone();
+        let table = from.name.clone();
+        let mut parts = Vec::new();
         for idx in &info.indices {
             for part in &idx.columns {
                 if let Some(expr) = super::expr_index::part_expr(&info, part) {
-                    inner.push(expr_text_with_numeric_cast(&from.name, &info, &expr));
+                    parts.push(expr_text_with_numeric_cast(&table, &info, &expr));
                 }
             }
         }
-        let inner = PhysicalPlan::Projection {
-            exprs: inner,
+        match plan {
+            PhysicalPlan::Projection {
+                exprs: mut inner,
+                child,
+                est_rows,
+            } => {
+                // The DataSource projection lists the read columns; it also has
+                // to materialise the hidden key the ordered scan returns.
+                for part in parts {
+                    if !inner.iter().any(|e| e.eq_ignore_ascii_case(&part)) {
+                        inner.push(part);
+                    }
+                }
+                let inner = PhysicalPlan::Projection {
+                    exprs: inner,
+                    child,
+                    est_rows,
+                };
+                PhysicalPlan::Projection {
+                    exprs,
+                    child: Box::new(inner),
+                    est_rows: None,
+                }
+            }
+            plan => {
+                let mut inner = exprs.clone();
+                inner.extend(parts);
+                let inner = PhysicalPlan::Projection {
+                    exprs: inner,
+                    child: Box::new(plan),
+                    est_rows: None,
+                };
+                PhysicalPlan::Projection {
+                    exprs,
+                    child: Box::new(inner),
+                    est_rows: None,
+                }
+            }
+        }
+    } else {
+        PhysicalPlan::Projection {
+            exprs,
             child: Box::new(plan),
             est_rows: None,
-        };
-        return PhysicalPlan::Projection {
-            exprs,
-            child: Box::new(inner),
-            est_rows: None,
-        };
-    }
-    PhysicalPlan::Projection {
-        exprs,
-        child: Box::new(plan),
-        est_rows: None,
+        }
     }
 }
 
@@ -26563,6 +26717,19 @@ fn plan_reads_global_index(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> bool {
+    // An expression-index read wears a Projection that restores the select list;
+    // the index underneath is still the one being walked.
+    let plan = match plan {
+        PhysicalPlan::Projection { child, .. }
+            if matches!(
+                child.as_ref(),
+                PhysicalPlan::IndexReader { .. } | PhysicalPlan::IndexLookUpReader { .. }
+            ) =>
+        {
+            child.as_ref()
+        }
+        other => other,
+    };
     let index = match plan {
         PhysicalPlan::IndexLookUpReader { index, .. } | PhysicalPlan::IndexReader { index, .. } => {
             index

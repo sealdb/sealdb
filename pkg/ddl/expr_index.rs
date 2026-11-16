@@ -40,6 +40,20 @@ pub(crate) fn resolve_index_parts(
     let mut hidden: Vec<ColumnInfo> = Vec::new();
     let mut columns = Vec::with_capacity(parts.len());
     let mut seen: Vec<String> = Vec::with_capacity(parts.len());
+    // TiDB `buildIndexInfo`: an expression index cannot be auto-analyzed (the
+    // column stats do not cover the expression), so the DDL asks for a manual
+    // ANALYZE.
+    if parts
+        .iter()
+        .any(|part| matches!(part, IndexPart::Expression(_)))
+    {
+        sealdb_expression::note_warning(
+            8265,
+            format!(
+                "Auto analyze is not effective for index '{index_name}', need analyze manually"
+            ),
+        );
+    }
     for (pos, part) in parts.iter().enumerate() {
         // TiDB `buildIndexInfo`: a key may not name the same column twice
         // (comparison is case-insensitive, the message keeps the spelling).
