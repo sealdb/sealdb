@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-15（green 92 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-16（green 93 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -3397,6 +3397,40 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - 继续 R3 的 in_progress：`explain_complex` / `explain_complex_stats` /
     `explain_cte`（物化 CTE 生产/消费节点渲染） / `explain_join_stats`。
+
+### 2026-11-16（`executor/stale_txn` 转正：AS OF TIMESTAMP 事务/子查询、`information_schema.ddl_jobs`）
+
+- **Phase**: R7
+- **完成**:
+  - `START TRANSACTION [READ ONLY] AS OF TIMESTAMP <expr>`：sqlparser 的 MySQL
+    方言不认该语法，`lower.rs` 新增 `extract_begin_as_of` 在进解析器前摘出
+    `AS OF TIMESTAMP <expr>`，挂到 `BeginStmt.as_of_ts`（`restore()` 同步回写）。
+    Session 在 `Statement::Begin` 时解析出毫秒快照，后续语句按该快照读。
+  - 时间戳表达式解析对齐：`now()` / `now(6)` / `current_timestamp` 时钟内建、
+    用户变量 `@a`、带引号字面量统一走 `as_of_datum`；`NULL` 操作数返回
+    TiDB 同款错误 8135 `ErrAsOf`（`invalid as of timestamp: as of timestamp
+    cannot be NULL`），不再落到 1235。
+  - 子查询快照传递：`expr_as_of_raw` / `resultset_as_of_raw` 递归遍历 select
+    字段、WHERE / HAVING / GROUP BY / ORDER BY 里的标量、`IN`、`EXISTS`
+    子查询，`select ... as of timestamp @a where v=(select ... as of timestamp @a ...)`
+    读到的是旧快照而不是最新写入。
+  - `information_schema.ddl_jobs` 虚表：`infoschema` 侧线程局部
+    `THREAD_DDL_JOBS`，语句执行期由 `DdlJobsGuard` 发布/清理 domain 的 DDL
+    作业记录，`select * from information_schema.ddl_jobs as of timestamp now()`
+    字段与行数与 TiDB 金样一致。
+  - errno：新增 `ERR_AS_OF = 8135` 与 `ErrAsOf` 名称映射。
+- **验证**:
+  - `cargo run -q --bin sealdb-itest -- --case executor/stale_txn
+    --status pending --store both --require-tikv` → `PASS: memory=1 tikv=1`
+  - 全量 green gate（Memory + TiKV）：`PASS: memory=101 tikv=99 skipped=155`，
+    `EXIT=0`
+  - manifest：`executor/stale_txn` `pending → green`，green 92→93（R7 29→30）
+- **阻塞/风险**:
+  - 无。
+- **下一步**:
+  - 继续 R3 / R7 剩余 `in_progress` 与 `pending`：`explain_indexmerge_stats`
+    （`utf8mb4_0900_ai_ci` collation key 转义）、`planner/core/rule_result_reorder`、
+    `explain_complex` / `explain_cte`。
 
 ## 7. 更新模板
 

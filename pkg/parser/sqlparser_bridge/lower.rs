@@ -188,6 +188,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, view_checks) = extract_view_check_option(&rewritten);
     // TiDB parses a per-arm `LIMIT` before `UNION` and rejects it with 1221.
     reject_union_arm_limit(&rewritten)?;
+    // TiDB `START TRANSACTION … AS OF TIMESTAMP <expr>` stale-read txn (the
+    // clause has no sqlparser grammar); the operand is resolved by `BEGIN`.
+    let (rewritten, begin_as_of) = extract_begin_as_of(&rewritten);
     // TiDB `FROM t AS OF TIMESTAMP <expr>` stale read (no sqlparser grammar).
     let rewritten = rewrite_as_of_timestamp(&rewritten);
     let stmts = Parser::parse_sql(&dialect(), &rewritten).map_err(|e| {
@@ -210,6 +213,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let mut load_ops = load_ops.into_iter();
     let mut view_checks = view_checks.into_iter();
     let mut explain_formats = explain_formats.into_iter();
+    let mut begin_as_of = begin_as_of.into_iter();
     let mut materialize_hints = materialize_hints;
     let mut out = Vec::new();
     for stmt in &stmts {
@@ -228,6 +232,11 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             && flags.next() == Some(true)
         {
             begin.pessimistic = true;
+        }
+        if let Statement::Begin(begin) = &mut lowered
+            && let Some(Some(raw)) = begin_as_of.next()
+        {
+            begin.as_of_ts = Some(raw);
         }
         if let Statement::Show(show) = &mut lowered {
             decode_show_grants(show);
@@ -996,6 +1005,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 pessimistic: false,
                 isolation: chars.isolation,
                 read_only: chars.read_only,
+                as_of_ts: None,
             }))
         }
         SqlStatement::Set(set) => lower_set(set),
@@ -3991,6 +4001,57 @@ fn scan_comment_end(sql: &str, start: usize) -> usize {
         .find('\n')
         .map(|p| start + p + 1)
         .unwrap_or(bytes.len())
+}
+
+/// TiDB `START TRANSACTION [READ ONLY] AS OF TIMESTAMP <expr>` (stale-read
+/// transaction). sqlparser's MySQL dialect has no `AS OF TIMESTAMP` clause, so
+/// strip it here and hand the raw operand text back for the session's `BEGIN`
+/// handler. The operand is later resolved by `BEGIN`, and a `NULL` operand must
+/// fail with TiDB's `ErrAsOf` (8135).
+fn extract_begin_as_of(sql: &str) -> (String, Vec<Option<String>>) {
+    let bytes = sql.as_bytes();
+    let trim_start = sql.len() - sql.trim_start().len();
+    let begins_txn = keyword_at(bytes, trim_start, "START") && {
+        let after = skip_ws(bytes, trim_start + "START".len());
+        keyword_at(bytes, after, "TRANSACTION") || keyword_at(bytes, after, "TRAN")
+    } || keyword_at(bytes, trim_start, "BEGIN");
+    if !begins_txn {
+        return (sql.to_string(), Vec::new());
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut found: Vec<Option<String>> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+            let end = scan_quoted_end(bytes, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') || bytes[i] == b'#' {
+            let end = scan_comment_end(sql, i);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if keyword_at(bytes, i, "AS") {
+            let of = skip_ws(bytes, i + 2);
+            if keyword_at(bytes, of, "OF") {
+                let ts = skip_ws(bytes, of + 2);
+                if keyword_at(bytes, ts, "TIMESTAMP") {
+                    let expr_start = skip_ws(bytes, ts + "TIMESTAMP".len());
+                    let expr_end = scan_as_of_expr_end(bytes, expr_start);
+                    if expr_end > expr_start {
+                        found.push(Some(sql[expr_start..expr_end].trim().to_string()));
+                        i = expr_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    (out.trim_end().to_string(), found)
 }
 
 /// End (exclusive) of the `AS OF TIMESTAMP` operand. Accepts the shapes TiDB

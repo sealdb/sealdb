@@ -55,6 +55,35 @@ pub fn thread_process() -> Option<ProcessInfo> {
     THREAD_PROCESS.with(|slot| slot.borrow().clone())
 }
 
+/// One row of `information_schema.ddl_jobs` (`ADMIN SHOW DDL JOBS` shape).
+#[derive(Clone, Debug)]
+pub struct DdlJobInfo {
+    pub id: i64,
+    pub db_name: String,
+    pub table_name: String,
+    pub job_type: String,
+    pub schema_state: String,
+    pub state: String,
+}
+
+thread_local! {
+    /// DDL jobs visible to the statement currently executing on this thread.
+    static THREAD_DDL_JOBS: RefCell<Vec<DdlJobInfo>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Publish the domain's DDL jobs for `information_schema.ddl_jobs`.
+pub fn set_thread_ddl_jobs(jobs: Vec<DdlJobInfo>) {
+    THREAD_DDL_JOBS.with(|slot| *slot.borrow_mut() = jobs);
+}
+
+pub fn clear_thread_ddl_jobs() {
+    THREAD_DDL_JOBS.with(|slot| slot.borrow_mut().clear());
+}
+
+pub fn thread_ddl_jobs() -> Vec<DdlJobInfo> {
+    THREAD_DDL_JOBS.with(|slot| slot.borrow().clone())
+}
+
 /// Merge this thread's session-local temporary tables into `is`.
 pub fn apply_thread_temp_tables(is: &mut InfoSchema) {
     THREAD_TEMP_TABLES.with(|slot| {

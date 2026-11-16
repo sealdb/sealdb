@@ -1026,7 +1026,7 @@
     {
       "name": "executor/stale_txn",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/stale_txn.test",
       "result": "r/executor/stale_txn.result",
       "has_result": true,

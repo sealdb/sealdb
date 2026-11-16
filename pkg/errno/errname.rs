@@ -9,6 +9,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_TABLE_EXISTS => "ErrTableExists",
         errcode::ERR_BAD_TABLE => "ErrBadTable",
         errcode::ERR_TTL_UNSUPPORTED_PK_TYPE => "ErrTTLUnsupportedPKType",
+        errcode::ERR_AS_OF => "ErrAsOf",
         errcode::ERR_PARSE_ERROR => "ErrParseError",
         errcode::ERR_UNKNOWN_TABLE => "ErrUnknownTable",
         errcode::ERR_NO_SUCH_TABLE => "ErrNoSuchTable",

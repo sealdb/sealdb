@@ -633,6 +633,9 @@ pub struct BeginStmt {
     pub isolation: Option<IsolationLevel>,
     /// Access mode from `READ ONLY` / `READ WRITE`. `None` inherits the session default.
     pub read_only: Option<bool>,
+    /// `START TRANSACTION [READ ONLY] AS OF TIMESTAMP <expr>`: raw expression
+    /// text for a stale-read transaction (`None` for a normal `BEGIN`).
+    pub as_of_ts: Option<String>,
 }
 
 impl BeginStmt {
@@ -642,6 +645,10 @@ impl BeginStmt {
             ctx.write_str(" PESSIMISTIC");
         }
         restore_txn_chars(ctx, self.isolation, self.read_only)?;
+        if let Some(raw) = &self.as_of_ts {
+            ctx.write_str(" AS OF TIMESTAMP ");
+            ctx.write_str(raw);
+        }
         Ok(())
     }
 }

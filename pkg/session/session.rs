@@ -78,6 +78,16 @@ impl Drop for ProcessInfoGuard {
     }
 }
 
+/// Clears the thread's `information_schema.ddl_jobs` snapshot when the
+/// statement ends.
+struct DdlJobsGuard;
+
+impl Drop for DdlJobsGuard {
+    fn drop(&mut self) {
+        sealdb_infoschema::infoschema::clear_thread_ddl_jobs();
+    }
+}
+
 impl Drop for TempTablesGuard {
     fn drop(&mut self) {
         sealdb_infoschema::infoschema::clear_thread_temp_tables();
@@ -596,6 +606,25 @@ impl Session {
         );
     }
 
+    /// Publish the domain's DDL jobs for `information_schema.ddl_jobs` on this
+    /// thread (the scans materialize eagerly while the statement runs).
+    fn publish_ddl_jobs(&self) {
+        let jobs = self
+            .domain
+            .ddl_jobs()
+            .into_iter()
+            .map(|job| sealdb_infoschema::infoschema::DdlJobInfo {
+                id: job.id,
+                db_name: job.schema_name,
+                table_name: job.table_name,
+                job_type: job.tp,
+                schema_state: job.schema_state.as_str().to_string(),
+                state: job.state.as_str().to_string(),
+            })
+            .collect();
+        sealdb_infoschema::infoschema::set_thread_ddl_jobs(jobs);
+    }
+
     /// Add this session's temporary tables (those in `current_db`) to the
     /// planning catalog under their reserved schema.
     fn overlay_temp_tables(&self, is: &mut InfoSchema, current_db: &str) {
@@ -1084,9 +1113,14 @@ impl Session {
                     .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
                 self.apply_pending_schema(true)?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
-                // `tidb_enable_external_ts_read`: the new transaction's
-                // snapshot is pinned at `tidb_external_ts`.
-                let stale_at = external_ts_snapshot(self);
+                // `START TRANSACTION … AS OF TIMESTAMP <expr>`: the explicit
+                // transaction reads the snapshot at that wall clock.
+                // `tidb_enable_external_ts_read`: otherwise the new
+                // transaction's snapshot is pinned at `tidb_external_ts`.
+                let stale_at = match begin.as_of_ts.as_deref() {
+                    Some(raw) => Some(as_of_raw_millis(self, raw)?),
+                    None => external_ts_snapshot(self),
+                };
                 let mut txn = self.txn.lock().expect("session txn lock");
                 if begin.pessimistic {
                     txn.enter_begin_pessimistic(
@@ -1385,6 +1419,8 @@ impl Session {
         let (statement_rg, rg_warnings) = self.resolve_resource_group(stmt);
         self.publish_process_info(&current_db, stmt, &statement_rg);
         let _process_guard = ProcessInfoGuard;
+        self.publish_ddl_jobs();
+        let _ddl_jobs_guard = DdlJobsGuard;
         let stats = self.domain.stats();
         let schema_ver = is.schema_meta_version();
         // Prepared EXECUTE may override with the unbound `?` template key.
@@ -3166,7 +3202,13 @@ fn stmt_as_of_millis(session: &Session, stmt: &Statement) -> Result<Option<u64>>
     let Some(raw) = select_as_of_raw(select) else {
         return Ok(None);
     };
-    let datum = as_of_datum(session, &raw)?;
+    Ok(Some(as_of_raw_millis(session, &raw)?))
+}
+
+/// Resolve an `AS OF TIMESTAMP <expr>` operand (raw text) to a wall clock in
+/// unix millis.
+fn as_of_raw_millis(session: &Session, raw: &str) -> Result<u64> {
+    let datum = as_of_datum(session, raw)?;
     let time = match datum {
         sealdb_types::Datum::Time(t) => t,
         sealdb_types::Datum::Bytes(bytes) => {
@@ -3179,10 +3221,7 @@ fn stmt_as_of_millis(session: &Session, stmt: &Statement) -> Result<Option<u64>>
             })?
         }
         sealdb_types::Datum::Null => {
-            return Err(Error::new(
-                sealdb_errno::ERR_WRONG_ARGUMENTS,
-                "None of the timestamp is specified for AS OF TIMESTAMP",
-            ));
+            return Err(as_of_null_error());
         }
         other => {
             return Err(Error::unsupported(format!(
@@ -3190,7 +3229,7 @@ fn stmt_as_of_millis(session: &Session, stmt: &Statement) -> Result<Option<u64>>
             )));
         }
     };
-    Ok(Some(sealdb_expression::time_to_unix_millis(&time)?))
+    Ok(sealdb_expression::time_to_unix_millis(&time)?)
 }
 
 /// First `AS OF TIMESTAMP` expression text in the statement's table sources
@@ -3209,6 +3248,19 @@ fn select_as_of_raw(select: &sealdb_parser::ast::dml::SelectStmt) -> Option<Stri
     }
     if let Some(raw) = tables.iter().find_map(|t| t.as_of_ts.clone()) {
         return Some(raw);
+    }
+    // TiDB pins the whole statement's snapshot, so an `AS OF TIMESTAMP` on a
+    // table inside a scalar / `IN` / `EXISTS` subquery still applies.
+    let expr_raw = select
+        .fields
+        .iter()
+        .find_map(|field| expr_as_of_raw(&field.expr))
+        .or_else(|| select.selection.as_ref().and_then(expr_as_of_raw))
+        .or_else(|| select.group_by.iter().find_map(expr_as_of_raw))
+        .or_else(|| select.having.as_ref().and_then(expr_as_of_raw))
+        .or_else(|| select.order_by.iter().find_map(|item| expr_as_of_raw(&item.expr)));
+    if expr_raw.is_some() {
+        return expr_raw;
     }
     let with = select.with.as_ref()?;
     for cte in &with.ctes {
@@ -3230,10 +3282,64 @@ fn select_as_of_raw(select: &sealdb_parser::ast::dml::SelectStmt) -> Option<Stri
     None
 }
 
+/// First `AS OF TIMESTAMP` operand inside an expression's subqueries.
+fn expr_as_of_raw(expr: &ExprNode) -> Option<String> {
+    match expr {
+        ExprNode::Value(_) | ExprNode::Column(_) => None,
+        ExprNode::Binary(b) => expr_as_of_raw(&b.left).or_else(|| expr_as_of_raw(&b.right)),
+        ExprNode::Unary(u) => expr_as_of_raw(&u.expr),
+        ExprNode::Func(f) => f.args.iter().find_map(expr_as_of_raw),
+        ExprNode::Cast(c) => expr_as_of_raw(&c.expr),
+        ExprNode::Exists(e) => resultset_as_of_raw(&e.query),
+        ExprNode::InSubquery(i) => {
+            expr_as_of_raw(&i.expr).or_else(|| resultset_as_of_raw(&i.query))
+        }
+        ExprNode::InList(i) => expr_as_of_raw(&i.expr).or_else(|| {
+            i.list
+                .iter()
+                .find_map(expr_as_of_raw)
+        }),
+        ExprNode::Between(b) => expr_as_of_raw(&b.expr)
+            .or_else(|| expr_as_of_raw(&b.low))
+            .or_else(|| expr_as_of_raw(&b.high)),
+        ExprNode::Like(l) => {
+            expr_as_of_raw(&l.expr).or_else(|| expr_as_of_raw(&l.pattern))
+        }
+        ExprNode::IsNull(n) => expr_as_of_raw(&n.expr),
+        ExprNode::Case(c) => c
+            .operand
+            .as_ref()
+            .and_then(|e| expr_as_of_raw(e))
+            .or_else(|| {
+                c.when_then
+                    .iter()
+                    .find_map(|(w, t)| expr_as_of_raw(w).or_else(|| expr_as_of_raw(t)))
+            })
+            .or_else(|| c.else_expr.as_ref().and_then(|e| expr_as_of_raw(e))),
+        ExprNode::ScalarSubquery(s) => resultset_as_of_raw(&s.query),
+        ExprNode::QuantifiedCmp(q) => {
+            expr_as_of_raw(&q.expr).or_else(|| resultset_as_of_raw(&q.query))
+        }
+        ExprNode::Window(w) => w.args.iter().find_map(expr_as_of_raw),
+        ExprNode::Row(r) => r.exprs.iter().find_map(expr_as_of_raw),
+    }
+}
+
+fn resultset_as_of_raw(
+    node: &sealdb_parser::ast::dml::ResultSetNode,
+) -> Option<String> {
+    match node {
+        sealdb_parser::ast::dml::ResultSetNode::Select(select) => select_as_of_raw(select),
+        sealdb_parser::ast::dml::ResultSetNode::SetOpr(_) => None,
+    }
+}
+
 /// Evaluate the `AS OF TIMESTAMP` operand: user variables and quoted literals
 /// are the forms TiDB accepts in practice.
-fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
-    let text = raw.trim();
+fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {    let text = raw.trim();
+    if text.eq_ignore_ascii_case("null") {
+        return Err(as_of_null_error());
+    }
     if is_user_var_name(text) {
         let key = user_var_key(text);
         let datum = session
@@ -3250,9 +3356,50 @@ fn as_of_datum(session: &Session, raw: &str) -> Result<sealdb_types::Datum> {
         let inner = &text[1..text.len() - 1];
         return Ok(sealdb_types::Datum::Bytes(inner.as_bytes().to_vec()));
     }
+    // TiDB accepts clock functions here: `AS OF TIMESTAMP NOW()` reads the
+    // latest committed data as of this statement.
+    if let Some(fsp) = as_of_now_fsp(text) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs() as i64, d.subsec_micros()))
+            .unwrap_or((0, 0));
+        let mut time = sealdb_types::Time::from_unix_secs(now.0, sealdb_types::TimeType::Timestamp);
+        time.fsp = fsp;
+        if fsp > 0 {
+            time.micro = now.1;
+        }
+        return Ok(sealdb_types::Datum::Time(
+            sealdb_expression::utc_to_session_local(time)?,
+        ));
+    }
     Err(Error::unsupported(format!(
         "AS OF TIMESTAMP with expression {text}"
     )))
+}
+
+/// Fractional-second precision when `raw` is a clock function TiDB accepts as
+/// an `AS OF TIMESTAMP` operand (`NOW([fsp])`, `CURRENT_TIMESTAMP`, …).
+fn as_of_now_fsp(raw: &str) -> Option<i8> {
+    let lowered = raw.to_ascii_lowercase();
+    let rest = ["now", "current_timestamp", "localtime", "localtimestamp", "sysdate"]
+        .iter()
+        .find_map(|name| lowered.strip_prefix(name))?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let args = rest.strip_prefix('(')?.strip_suffix(')')?;
+    if args.trim().is_empty() {
+        return Some(0);
+    }
+    Some(args.trim().parse::<i8>().ok()?.clamp(0, 6))
+}
+
+/// TiDB `ErrAsOf` for a stale read whose timestamp operand is `NULL`.
+fn as_of_null_error() -> Error {
+    Error::new(
+        sealdb_errno::ERR_AS_OF,
+        "invalid as of timestamp: as of timestamp cannot be NULL",
+    )
 }
 
 /// `/*+ SET_VAR(name=value) */` extracted for the statement, honoring quoted

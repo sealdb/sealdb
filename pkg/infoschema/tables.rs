@@ -16,6 +16,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "table_constraints" => Ok(table_constraints(is)),
         "partitions" => Ok(partitions(is)),
         "processlist" => Ok(processlist()),
+        "ddl_jobs" => Ok(ddl_jobs()),
         "attributes" => Ok(attributes(is)),
         "inspection_rules" => Ok(inspection_rules()),
         "character_sets" => Ok(character_sets()),
@@ -92,8 +93,48 @@ fn processlist() -> (Vec<String>, Vec<Vec<Datum>>) {
     (schema, rows)
 }
 
-fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+/// `information_schema.ddl_jobs`: TiDB's `ADMIN SHOW DDL JOBS` catalog. The
+/// executing session publishes the domain's jobs for the statement.
+fn ddl_jobs() -> (Vec<String>, Vec<Vec<Datum>>) {
     let schema = vec![
+        "JOB_ID".to_string(),
+        "DB_NAME".to_string(),
+        "TABLE_NAME".to_string(),
+        "JOB_TYPE".to_string(),
+        "SCHEMA_STATE".to_string(),
+        "SCHEMA_ID".to_string(),
+        "TABLE_ID".to_string(),
+        "ROW_COUNT".to_string(),
+        "CREATE_TIME".to_string(),
+        "START_TIME".to_string(),
+        "END_TIME".to_string(),
+        "STATE".to_string(),
+        "QUERY".to_string(),
+    ];
+    let rows = crate::infoschema::thread_ddl_jobs()
+        .into_iter()
+        .map(|job| {
+            vec![
+                Datum::I64(job.id),
+                bytes(&job.db_name),
+                bytes(&job.table_name),
+                bytes(&job.job_type),
+                bytes(&job.schema_state),
+                Datum::I64(0),
+                Datum::I64(0),
+                Datum::I64(0),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                bytes(&job.state),
+                bytes(&job.job_type),
+            ]
+        })
+        .collect();
+    (schema, rows)
+}
+
+fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {    let schema = vec![
         "CATALOG_NAME".to_string(),
         "SCHEMA_NAME".to_string(),
         "DEFAULT_CHARACTER_SET_NAME".to_string(),

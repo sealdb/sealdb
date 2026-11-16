@@ -6,6 +6,9 @@ pub const ERR_TABLE_EXISTS: i32 = 1050;
 /// TiDB `ErrTTLUnsupportedPKType`: a clustered primary key containing FLOAT /
 /// DOUBLE columns cannot use TTL (8153).
 pub const ERR_TTL_UNSUPPORTED_PK_TYPE: i32 = 8153;
+/// TiDB `ErrAsOf`: a stale read (`AS OF TIMESTAMP`) whose timestamp cannot be
+/// resolved, e.g. an explicit `NULL` operand (8135).
+pub const ERR_AS_OF: i32 = 8135;
 /// MySQL `ER_BAD_TABLE_ERROR`: `DROP TABLE` naming a VIEW (1051).
 pub const ERR_BAD_TABLE: i32 = 1051;
 pub const ERR_PARSE_ERROR: i32 = 1064;
