@@ -14,22 +14,22 @@
   "counts": {
     "total": 254,
     "by_status": {
-      "green": 83,
-      "pending": 149,
-      "in_progress": 12,
       "deferred": 2,
-      "local": 8
+      "green": 93,
+      "in_progress": 9,
+      "local": 8,
+      "pending": 142
     },
     "by_wave": {
-      "R3": 48,
+      "D": 2,
+      "R1": 4,
       "R2": 22,
-      "R7": 110,
+      "R3": 48,
       "R4": 13,
       "R5": 12,
       "R6": 35,
-      "D": 2,
-      "local": 8,
-      "R1": 4
+      "R7": 110,
+      "local": 8
     }
   },
   "suites": [

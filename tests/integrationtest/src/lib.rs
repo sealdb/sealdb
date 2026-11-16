@@ -490,7 +490,8 @@ fn parse_replace_regex(spec: &str) -> Result<Vec<(regex::Regex, String)>> {
         if i < chars.len() {
             i += 1;
         }
-        let re = regex::Regex::new(&pattern).map_err(|e| {
+        let compat = go_regex_compat(&pattern);
+        let re = regex::Regex::new(&compat).map_err(|e| {
             Error::new(
                 sealdb_errno::ERR_UNKNOWN_ERROR,
                 format!("replace_regex pattern {pattern:?}: {e}"),
@@ -499,6 +500,58 @@ fn parse_replace_regex(spec: &str) -> Result<Vec<(regex::Regex, String)>> {
         out.push((re, replacement));
     }
     Ok(out)
+}
+
+/// TiDB applies `--replace_regex` with Go's RE2 syntax, where a `{` that does
+/// not open a repetition (`{n}`, `{n,}`, `{n,m}`) is an ordinary character
+/// (`, scan_detail: {.*}`). The `regex` crate rejects those, so escape them.
+fn go_regex_compat(pattern: &str) -> std::borrow::Cow<'_, str> {
+    let chars: Vec<char> = pattern.chars().collect();
+    if !chars.contains(&'{') {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(next) = chars.get(i + 1) {
+                out.push(*next);
+            }
+            i += 2;
+            continue;
+        }
+        if c == '{' && !starts_repetition(&chars, i + 1) {
+            out.push('\\');
+        }
+        out.push(c);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether `chars[i..]` opens a RE2 repetition: `{n}`, `{n,}`, `{n,m}`.
+fn starts_repetition(chars: &[char], mut i: usize) -> bool {
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < chars.len() && chars[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if !digits(&mut i) {
+        return false;
+    }
+    match chars.get(i) {
+        Some('}') => true,
+        Some(',') => {
+            i += 1;
+            digits(&mut i);
+            chars.get(i) == Some(&'}')
+        }
+        _ => false,
+    }
 }
 
 /// Parse `--replace_column 6 <execution_info> 8 <memory>` into 1-based column

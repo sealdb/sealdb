@@ -649,9 +649,11 @@ fn push_into(
         } => {
             let left_cols = table_columns(is, current_db, &left_table);
             let right_cols = table_columns(is, current_db, &right_table);
+            let left_nulls = matches!(tp, JoinType::RightOuter);
             let mut left_preds = Vec::new();
             let mut right_preds = Vec::new();
             let mut residual = Vec::new();
+            let mut null_supplying = Vec::new();
             for expr in conjuncts {
                 match classify(
                     &expr,
@@ -663,8 +665,32 @@ fn push_into(
                 ) {
                     Side::Left => left_preds.push(expr),
                     Side::Right => right_preds.push(expr),
+                    Side::NullSupplying => null_supplying.push(expr),
                     Side::Residual => residual.push(expr),
                 }
+            }
+            // TiDB `PredicatePushDown`: a null-rejecting predicate on the
+            // null-supplying side of an outer join simplifies it to an inner
+            // join; anything else must stay above the join (pushing it into the
+            // null-padded side would drop matched rows).
+            let mut tp = tp;
+            if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter) && !null_supplying.is_empty() {
+                for expr in std::mem::take(&mut null_supplying) {
+                    if null_rejecting(&expr) {
+                        tp = JoinType::Inner;
+                        if left_nulls {
+                            left_preds.push(expr);
+                        } else {
+                            right_preds.push(expr);
+                        }
+                    } else {
+                        residual.push(expr);
+                    }
+                }
+            } else if !null_supplying.is_empty() {
+                // Not reachable today (only outer joins classify a side this
+                // way); keep the predicates above the join to stay correct.
+                residual.extend(std::mem::take(&mut null_supplying));
             }
             // Comma joins (`FROM a, b WHERE a.x = b.x`) plan as CARTESIAN until
             // the WHERE equality becomes the join key. Split remaining
@@ -697,7 +723,7 @@ fn push_into(
                     ) {
                         Some(Side::Left) => left_preds.push(expr),
                         Some(Side::Right) => right_preds.push(expr),
-                        Some(Side::Residual) | None => {
+                        Some(Side::Residual) | Some(Side::NullSupplying) | None => {
                             if let Some(key) = qualify_cross_equality(
                                 &expr,
                                 &left_map,
@@ -1439,7 +1465,45 @@ fn is_dnf_point_rows(expr: &ExprNode, tuple_columns: &[String]) -> bool {
 enum Side {
     Left,
     Right,
+    /// Predicate on the null-supplying side of an outer join. Only a
+    /// null-rejecting predicate may go there, and TiDB then turns the outer
+    /// join into an inner one.
+    NullSupplying,
     Residual,
+}
+
+/// Whether `expr` rejects a row whose side columns are all `NULL` (TiDB
+/// `outerJoin` predicate simplification): `t.a > 0` yields `NULL` there, while
+/// `t.a IS NULL` yields `TRUE`. Evaluate the predicate with every column
+/// replaced by `NULL`; anything that is not a plain `TRUE` rejects the row.
+fn null_rejecting(expr: &ExprNode) -> bool {
+    if expr.has_subquery() {
+        return false;
+    }
+    fn nullify(expr: &ExprNode) -> ExprNode {
+        match expr {
+            ExprNode::Column(_) => ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
+                datum: Datum::Null,
+            }),
+            ExprNode::Binary(bin) => ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+                op: bin.op,
+                left: Box::new(nullify(&bin.left)),
+                right: Box::new(nullify(&bin.right)),
+                single_cnf_item: bin.single_cnf_item,
+            }),
+            ExprNode::Unary(un) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+                op: un.op,
+                expr: Box::new(nullify(&un.expr)),
+            }),
+            _ => expr.clone(),
+        }
+    }
+    match sealdb_expression::eval_expr(&nullify(expr)) {
+        Ok(datum) => !matches!(datum, Datum::I64(1) | Datum::U64(1)),
+        // Unevaluable predicates stay where they are (residual), which never
+        // changes the result set.
+        Err(_) => false,
+    }
 }
 
 fn classify(
@@ -1473,12 +1537,13 @@ fn classify(
         }
     }
     match (left, right, tp) {
+        (true, false, JoinType::RightOuter) => Side::NullSupplying,
         (true, false, _) => Side::Left,
         (false, true, JoinType::Inner | JoinType::Cross | JoinType::Semi | JoinType::Anti) => {
             Side::Right
         }
         (false, true, JoinType::RightOuter) => Side::Right,
-        (false, true, JoinType::LeftOuter) => Side::Residual,
+        (false, true, JoinType::LeftOuter) => Side::NullSupplying,
         (true, true, _) => Side::Residual,
         (false, false, _) => Side::Residual,
     }
@@ -1582,6 +1647,86 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn col_cmp(table: &str, name: &str, op: Op, value: i64) -> ExprNode {
+        ExprNode::Binary(BinaryOpExpr {
+            op,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(table.to_string()),
+                name: name.to_string(),
+            })),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::I64(value),
+            })),
+            single_cnf_item: false,
+        })
+    }
+
+    fn col_is_null(table: &str, name: &str, not: bool) -> ExprNode {
+        ExprNode::IsNull(sealdb_parser::ast::expressions::IsNullExpr {
+            expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(table.to_string()),
+                name: name.to_string(),
+            })),
+            not,
+        })
+    }
+
+    fn right_join() -> PhysicalPlan {
+        PhysicalPlan::HashJoin {
+            est_rows: None,
+            tp: JoinType::RightOuter,
+            left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
+            right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
+            left_table: "t1".to_string(),
+            right_table: "t2".to_string(),
+            on: col_eq("t1", "id", 1),
+        }
+    }
+
+    #[test]
+    fn test_null_rejecting_on_null_supplying_side_turns_inner() {
+        // `t1 RIGHT JOIN t2 … WHERE t1.id > 0`: `t1` is null-supplying, and the
+        // predicate rejects the padded NULL row, so TiDB simplifies to an inner
+        // join and pushes it into `t1`.
+        let filter = col_cmp("t1", "id", Op::Gt, 0);
+        let plan = predicate_push_down(right_join(), &filter, None, "db1");
+        let PhysicalPlan::HashJoin {
+            tp, left, right, ..
+        } = plan
+        else {
+            panic!("expected hash join, got {plan:?}");
+        };
+        assert!(matches!(tp, JoinType::Inner), "expected inner join, got {tp:?}");
+        assert!(matches!(
+            *left,
+            PhysicalPlan::TableReader {
+                pushed: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            PhysicalPlan::TableReader { pushed: None, .. }
+        ));
+    }
+
+    #[test]
+    fn test_null_accepting_predicate_stays_above_right_join() {
+        // `t1 RIGHT JOIN t2 … WHERE t1.id IS NULL` keeps the padded rows, so
+        // the predicate must stay above the outer join.
+        let filter = col_is_null("t1", "id", false);
+        let plan = predicate_push_down(right_join(), &filter, None, "db1");
+        let PhysicalPlan::Selection { child, .. } = plan else {
+            panic!("expected selection above the join, got {plan:?}");
+        };
+        let PhysicalPlan::HashJoin { tp, .. } = *child else {
+            panic!("expected hash join, got {child:?}");
+        };
+        assert!(matches!(tp, JoinType::RightOuter), "got {tp:?}");
     }
 }
 

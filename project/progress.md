@@ -3432,6 +3432,35 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     （`utf8mb4_0900_ai_ci` collation key 转义）、`planner/core/rule_result_reorder`、
     `explain_complex` / `explain_cte`。
 
+### 2026-11-16（外连接下推空值拒绝简化 + `go_regex_compat` 测试指令）
+
+- **Phase**: R2/R7（正确性修复，未升套件）
+- **完成**:
+  - `PredicatePushDown`：外连接的可空侧谓词此前被无条件下推到扫描，
+    但连接仍保持 outer 语义，导致 `A RIGHT JOIN B … WHERE A.x > 0`
+    把未匹配行（`A.*` 全 NULL）留在结果里。新增 `Side::NullSupplying`
+    与 `null_rejecting()`（把谓词中的列替换成 `NULL` 求值，仅当结果不是
+    纯 `TRUE` 才算拒绝空值），可空侧谓词只在空值拒绝时下推并同时把
+    `LeftOuter`/`RightOuter` 简化为 `Inner`（TiDB `PredicatePushDown`），
+    其余留在连接之上，语义因此与 TiDB 一致。
+  - `--replace_regex` 指令按 Go RE2 语义兼容：`{` 未开启重复
+    （`{n}`/`{n,}`/`{n,m}`）时按字面量处理（`/, scan_detail: {.*}//`），
+    `regex` crate 不再报 "repetition quantifier expects a valid decimal"。
+    该错误原先直接中断 `planner/core/cbo` 等套件。
+- **验证**:
+  - `cargo test -p sealdb-planner rule_predicate_push_down` → 4 passed
+  - 手工探针：`right join … where a >= 0` 转为 inner 并返回空集，
+    `where a is null` 保持 right outer 且保留填充行；left join 同理
+  - 全量 green gate（Memory + TiKV）：`PASS: memory=101 tikv=99 skipped=155`
+- **阻塞/风险**:
+  - `statistics/overflow_calc` 结果集已完全一致，仅剩 EXPLAIN：
+    需要「集群主键双侧有序 → MergeJoin」与直方图估算 `double >= 0` 的
+    行数（49 而非 1/3 选择率）、以及等值键派生谓词要改写成访问区间。
+- **下一步**:
+  - 继续 `statistics/overflow_calc`（MergeJoin 选择 + 直方图区间估算）与
+    `planner/core/join_reorder_through_projection`（同一 MergeJoin 缺失，
+    外加投影 `Column#N` 编号）。
+
 ## 7. 更新模板
 
 每次更新追加一条：
