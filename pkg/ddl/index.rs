@@ -81,6 +81,10 @@ pub fn add_index(
         .any(|idx| idx.name.o().eq_ignore_ascii_case(&index.name))
     {
         if if_not_exists {
+            sealdb_expression::note_message(
+                ERR_DUP_KEYNAME,
+                format!("Duplicate key name '{}'", index.name),
+            );
             return Ok(());
         }
         // An unnamed expression index is called `expression_index`; a second

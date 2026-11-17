@@ -3745,6 +3745,42 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     可复用本次的 `handle_order_desc` 与 `TopN` 路径）。
   - 回到 `explain_complex_stats`（`SHOW STATS_HISTOGRAMS` 仍未实现）。
 
+### 2026-11-18（`table/index` 转绿：唯一前缀索引冲突、`CREATE INDEX IF NOT EXISTS` 1061 Note）
+
+- **Phase**: R7 `table/index` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 唯一二级索引的冲突判定支持前缀索引：`index_conflict` 按
+    `IndexColumn.length` 截断后再比较（`unique index idx_a(a(1))` 下
+    `'qaa'` / `'qbb'` 在 `'q'` 上冲突）。`Datum::Bytes` 按字符截断，
+    非 UTF-8（binary 串）按字节截断，对齐 TiDB `TruncateIndexValue`。
+  - `duplicate_error` 同样用截断后的值拼 key 文本，报
+    `Duplicate entry 'q' for key 't.idx_a'`；INSERT / UPDATE /
+    `UPDATE IGNORE` / REPLACE / ON DUPLICATE 共用该路径，忽略时记警告。
+  - `CREATE INDEX IF NOT EXISTS` 命中同名索引时不再静默返回，追加
+    `Note 1061 Duplicate key name 'idx'`；新增
+    `sealdb_expression::note_message`（`NOTE_WARNING_BASE` 由 session 与
+    expression 共享同一常量），使 `SHOW WARNINGS` 的 Level 输出 `Note`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t table/index --status pending`
+    → `PASS: memory=1 tikv=1 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=99 tikv=98 skipped=156`（`executor/adapter` 为 `skip_tikv`）
+  - `cargo test -p sealdb-executor -p sealdb-ddl -p sealdb-session -p sealdb-expression`
+    → ddl 1 / executor 9 / expression 13 / session 125 passed
+  - manifest：`table/index` → `green`，green 98→99
+    （R7 33→34，pending 137→136）。
+- **阻塞/风险**:
+  - 前缀索引的 KV key 仍编码完整列值，只在冲突判定/错误文本上截断；
+    索引-only 扫描因此不会暴露截断值，但与 TiDB 的物理 key 布局仍有差异。
+    若后续补前缀索引的范围/等值 seek，需要在 codec 与 planner 两侧一起改。
+  - 前缀长度按 `chars().take(n)` 截断，未按列字符集（utf8mb4 / gbk /
+    binary）分别计算 `Maxlen`；当前语料为 ASCII，非 ASCII 前缀索引需复核。
+- **下一步**:
+  - `planner/core/partial_order_topn`（前缀索引部分有序 + TopN 下推，
+    与 `order_index` hint 的 1815 冲突校验）。
+  - `executor/rowid`（`_tidb_rowid` 可写/导出、`tidb_opt_write_row_id`
+    会话变量与 shard_row_id_bits 交互）。
+
 ## 7. 更新模板
 
 每次更新追加一条：

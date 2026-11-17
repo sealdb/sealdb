@@ -1055,8 +1055,27 @@ fn write_row(
     Ok((handle, physical_id))
 }
 
-/// Index columns equal on every column (NULL never conflicts). Returns the
-/// first conflicting unique index, if any.
+/// Value an index part compares with. A prefix part (`col(N)`) only
+/// keeps its first `N` characters, matching TiDB's `TruncateIndexValue`.
+fn indexed_part_value(column: &sealdb_meta::IndexColumn, value: &Datum) -> Datum {
+    if column.length < 0 {
+        return value.clone();
+    }
+    let Datum::Bytes(bytes) = value else {
+        return value.clone();
+    };
+    let length = column.length as usize;
+    let truncated = match std::str::from_utf8(bytes) {
+        Ok(text) => text.chars().take(length).collect::<String>().into_bytes(),
+        // Binary strings count bytes, not characters.
+        Err(_) => bytes[..bytes.len().min(length)].to_vec(),
+    };
+    Datum::Bytes(truncated)
+}
+
+/// Index columns equal on every column (NULL never conflicts). Prefix parts
+/// only compare their stored prefix, so `'qaa'` and `'qbb'` collide on `a(1)`.
+/// Returns the first conflicting unique index, if any.
 pub(crate) fn index_conflict(
     info: &sealdb_meta::TableInfo,
     a: &[Datum],
@@ -1068,8 +1087,12 @@ pub(crate) fn index_conflict(
         }
         let mut all_eq = true;
         for col in &index.columns {
-            let av = a.get(col.offset as usize);
-            let bv = b.get(col.offset as usize);
+            let av = a
+                .get(col.offset as usize)
+                .map(|value| indexed_part_value(col, value));
+            let bv = b
+                .get(col.offset as usize)
+                .map(|value| indexed_part_value(col, value));
             match (av, bv) {
                 (Some(av), Some(bv)) if !av.is_null() && !bv.is_null() && av == bv => {}
                 _ => {
@@ -1111,7 +1134,7 @@ pub(crate) fn duplicate_error(
         .map(|c| {
             values
                 .get(c.offset as usize)
-                .map(|v| v.display())
+                .map(|value| indexed_part_value(c, value).display())
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>()

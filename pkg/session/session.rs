@@ -5934,7 +5934,7 @@ fn resolve_show_variable(session: &Session, name: &str, global: bool) -> Option<
 
 /// Warning codes at or above this base are TiDB *notes*, not warnings
 /// (`SHOW WARNINGS` reports the level from the sign/base of the stored code).
-const NOTE_WARNING_BASE: i32 = 1_000_000;
+const NOTE_WARNING_BASE: i32 = sealdb_expression::NOTE_WARNING_BASE;
 
 /// Column layout of `SHOW BINDINGS` (TiDB `bindinfo.BindRecord`).
 const SHOW_BINDINGS_COLUMNS: [&str; 11] = [

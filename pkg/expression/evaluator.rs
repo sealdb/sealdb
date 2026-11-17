@@ -106,10 +106,19 @@ fn push_warning(code: i32, message: impl Into<String>) {
     WARNINGS.with(|w| w.borrow_mut().push((code, message.into())));
 }
 
+/// Base offset that marks a recorded message as `Note` level in
+/// `SHOW WARNINGS` (pkg/session).
+pub const NOTE_WARNING_BASE: i32 = 1_000_000;
+
 /// Record a statement warning from outside the expression evaluator
 /// (e.g. INSERT ENUM/SET truncation).
 pub fn note_warning(code: i32, message: impl Into<String>) {
     push_warning(code, message);
+}
+
+/// Record a `Note`-level message (e.g. `CREATE INDEX IF NOT EXISTS` 1061).
+pub fn note_message(code: i32, message: impl Into<String>) {
+    push_warning(NOTE_WARNING_BASE + code, message);
 }
 
 pub fn with_collation<T>(mode: CollateMode, f: impl FnOnce() -> T) -> T {

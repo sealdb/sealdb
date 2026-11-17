@@ -2462,7 +2462,7 @@
     {
       "name": "table/index",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/table/index.test",
       "result": "r/table/index.result",
       "has_result": true,
