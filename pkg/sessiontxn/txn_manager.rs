@@ -69,14 +69,7 @@ impl TxnManager {
         read_only: bool,
         stale_at: Option<u64>,
     ) -> Result<()> {
-        self.enter(
-            storage,
-            true,
-            schema_ver,
-            isolation,
-            read_only,
-            stale_at,
-        )
+        self.enter(storage, true, schema_ver, isolation, read_only, stale_at)
     }
 
     fn enter(
@@ -145,7 +138,14 @@ impl TxnManager {
     /// `name` on the KV txn (MySQL SAVEPOINT starts a transaction).
     pub fn savepoint(&mut self, storage: &dyn Storage, schema_ver: i64, name: &str) -> Result<()> {
         if self.handle.is_none() {
-            self.enter(storage, false, schema_ver, self.isolation, self.read_only, None)?;
+            self.enter(
+                storage,
+                false,
+                schema_ver,
+                self.isolation,
+                self.read_only,
+                None,
+            )?;
         }
         self.handle
             .as_ref()
@@ -204,11 +204,7 @@ impl TxnManager {
     /// External-timestamp stale read (`tidb_external_ts`): open a snapshot
     /// pinned at an explicit version. An explicit transaction keeps its own
     /// snapshot, so toggling the feature mid-transaction changes nothing.
-    pub fn ensure_stale_at(
-        &mut self,
-        storage: &dyn Storage,
-        ts: u64,
-    ) -> Result<Arc<TxnHandle>> {
+    pub fn ensure_stale_at(&mut self, storage: &dyn Storage, ts: u64) -> Result<Arc<TxnHandle>> {
         if let Some(handle) = &self.handle {
             return Ok(Arc::clone(handle));
         }

@@ -204,11 +204,7 @@ fn conjunction_key_ranges(
                 if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
                     (name, bounds, true)
                 } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
-                    (
-                        name,
-                        vec![(Some((low, true)), Some((high, false)))],
-                        false,
-                    )
+                    (name, vec![(Some((low, true)), Some((high, false)))], false)
                 } else {
                     continue;
                 };
@@ -364,11 +360,7 @@ pub fn index_access_range(
             if let Some((name, bounds)) = pseudo::conjunct_bound_sets(conjunct) {
                 (name, bounds, true)
             } else if let Some((name, low, high)) = pseudo::like_prefix_bound(conjunct) {
-                (
-                    name,
-                    vec![(Some((low, true)), Some((high, false)))],
-                    false,
-                )
+                (name, vec![(Some((low, true)), Some((high, false)))], false)
             } else {
                 continue;
             };
@@ -578,7 +570,10 @@ fn bounds_fit_column(
         // In a numeric context a hex/bit literal is the number it spells
         // (`x'd6'` on `bigint` seeks 214), so it always converts.
         Some((sealdb_types::Datum::Bit(_), _))
-            if matches!(field_type.eval_type(), sealdb_types::field_type::EvalType::Int) =>
+            if matches!(
+                field_type.eval_type(),
+                sealdb_types::field_type::EvalType::Int
+            ) =>
         {
             true
         }

@@ -92,10 +92,7 @@ impl Handle {
             index.cm_sketch = None;
             index.stats_ver = 0;
         }
-        self.dropped
-            .lock()
-            .expect("stats lock")
-            .insert(key, stats);
+        self.dropped.lock().expect("stats lock").insert(key, stats);
     }
 
     /// Stats rows as `mysql.stats_*` reports them: live stats, else the soft
@@ -105,11 +102,7 @@ impl Handle {
         if let Some(stats) = self.inner.lock().expect("stats lock").get(&key) {
             return Some(stats.clone());
         }
-        self.dropped
-            .lock()
-            .expect("stats lock")
-            .get(&key)
-            .cloned()
+        self.dropped.lock().expect("stats lock").get(&key).cloned()
     }
 
     pub fn needs_auto_analyze(&self, db: &str, table: &str, ratio: f64) -> bool {

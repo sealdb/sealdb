@@ -98,7 +98,15 @@ pub fn add_index(
                 .expect("unbounded index name candidates");
             let mut renamed = index.clone();
             renamed.name = fresh;
-            return add_index(meta, is, table, &renamed, if_not_exists, current_db, storage);
+            return add_index(
+                meta,
+                is,
+                table,
+                &renamed,
+                if_not_exists,
+                current_db,
+                storage,
+            );
         }
         return Err(Error::new(
             ERR_DUP_KEYNAME,

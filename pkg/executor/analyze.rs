@@ -7,7 +7,9 @@ use sealdb_errno::{ERR_NO_DB, ERR_NO_SUCH_TABLE, Error, Result};
 use sealdb_kv::{LockWait, RowLock, TxnHandle};
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::Statement;
-use sealdb_statistics::{ColumnStats, Histogram, IndexHistogram, IndexStats, Table, TopN, datum_key};
+use sealdb_statistics::{
+    ColumnStats, Histogram, IndexHistogram, IndexStats, Table, TopN, datum_key,
+};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
 use std::collections::{HashMap, HashSet};

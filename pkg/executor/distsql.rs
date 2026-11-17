@@ -562,7 +562,8 @@ fn index_sort_key(key: &[u8]) -> Vec<u8> {
 
 fn merge_access_arms(
     selection: Option<&ExprNode>,
-    info: &TableInfo,) -> Result<Vec<(IndexInfo, IndexAccess)>> {
+    info: &TableInfo,
+) -> Result<Vec<(IndexInfo, IndexAccess)>> {
     let Some(expr) = selection else {
         return Ok(Vec::new());
     };

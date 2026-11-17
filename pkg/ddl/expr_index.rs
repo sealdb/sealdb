@@ -70,9 +70,7 @@ pub(crate) fn resolve_index_parts(
             IndexPart::Column(name) | IndexPart::Prefix { name, .. } => {
                 // TiDB `checkIndexPartLength`: a zero-length key part is
                 // `ErrWrongKeyColumn` (1391).
-                if part.prefix_length() == 0
-                    && matches!(part, IndexPart::Prefix { .. })
-                {
+                if part.prefix_length() == 0 && matches!(part, IndexPart::Prefix { .. }) {
                     return Err(Error::new(
                         ERR_WRONG_KEY_COLUMN,
                         format!("Key part '{name}' length cannot be 0"),

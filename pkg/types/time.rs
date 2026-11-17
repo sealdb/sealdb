@@ -243,10 +243,7 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
 /// `20:08:05`, `20200805111307` → `11:13:07`). Eight digits (a bare date) and
 /// 7/9-11 digits (`20200805`, …) have no TIME form.
 pub fn duration_from_numeric(int_digits: &str) -> Option<Time> {
-    let digits: String = int_digits
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let digits: String = int_digits.chars().filter(|c| c.is_ascii_digit()).collect();
     let hms = match digits.len() {
         0 => return None,
         1..=6 => format!("{digits:0>6}"),
@@ -822,4 +819,3 @@ mod parse_tests {
         assert_eq!(t.to_string(), "2024-01-01 14:00:01.000000");
     }
 }
-

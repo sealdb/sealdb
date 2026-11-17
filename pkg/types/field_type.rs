@@ -105,7 +105,11 @@ impl FieldType {
                     };
                 }
                 if self.flen > 0 {
-                    let name = if self.tp == TYPE_STRING { "char" } else { "varchar" };
+                    let name = if self.tp == TYPE_STRING {
+                        "char"
+                    } else {
+                        "varchar"
+                    };
                     return format!("{name}({})", self.flen);
                 }
                 if self.flen < 0 {
@@ -226,9 +230,9 @@ impl FieldType {
             // TiDB `parser/types.FieldType.StorageLength` charges a fixed 8
             // bytes for every numeric/date/enum/set/bit type ("This may not be
             // the accurate length, because we may encode them as varint").
-            TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG
-            | TYPE_DOUBLE | TYPE_FLOAT | TYPE_YEAR | TYPE_DURATION | TYPE_DATE
-            | TYPE_DATETIME | TYPE_TIMESTAMP | TYPE_ENUM | TYPE_SET | TYPE_BIT => Some(8),
+            TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG | TYPE_DOUBLE
+            | TYPE_FLOAT | TYPE_YEAR | TYPE_DURATION | TYPE_DATE | TYPE_DATETIME
+            | TYPE_TIMESTAMP | TYPE_ENUM | TYPE_SET | TYPE_BIT => Some(8),
             TYPE_NEW_DECIMAL | TYPE_DECIMAL => {
                 // TiDB `digitsPerWord`/`wordSize`/`dig2bytes` decimal packing.
                 const DIGITS_PER_WORD: i32 = 9;
