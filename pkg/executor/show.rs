@@ -397,7 +397,76 @@ impl Executor for ShowExec {
                     })
                     .collect();
             }
-            // Handled in session before plan build; keep match exhaustive.
+            ShowStmtKind::StatsLocked => {
+                self.schema = vec![
+                    "Db_name".to_string(),
+                    "Table_name".to_string(),
+                    "Partition_name".to_string(),
+                    "Status".to_string(),
+                ];
+                let stats = self.domain.stats();
+                let locked: std::collections::HashSet<i64> =
+                    stats.locked_ids().into_iter().collect();
+                // TiDB reports the locked table / partition ids in table-id
+                // order; a partitioned table locked as a whole shows up as
+                // `global` under dynamic partition pruning.
+                let mut rows: Vec<(i64, String, String, String)> = Vec::new();
+                for db in is.all_schemas() {
+                    let db_name = db.name.o().to_string();
+                    if db_name.eq_ignore_ascii_case("information_schema")
+                        || db_name.eq_ignore_ascii_case("mysql")
+                    {
+                        continue;
+                    }
+                    for table in is.schema_tables(&db_name) {
+                        let table_name = table.name.o().to_string();
+                        match table.partition.as_ref() {
+                            Some(partition) => {
+                                if locked.contains(&table.id) {
+                                    rows.push((
+                                        table.id,
+                                        db_name.clone(),
+                                        table_name.clone(),
+                                        "global".to_string(),
+                                    ));
+                                }
+                                for definition in &partition.definitions {
+                                    if locked.contains(&definition.id) {
+                                        rows.push((
+                                            definition.id,
+                                            db_name.clone(),
+                                            table_name.clone(),
+                                            definition.name.o().to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            None => {
+                                if locked.contains(&table.id) {
+                                    rows.push((
+                                        table.id,
+                                        db_name.clone(),
+                                        table_name,
+                                        String::new(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                rows.sort_by_key(|(id, _, _, _)| *id);
+                self.rows = rows
+                    .into_iter()
+                    .map(|(_, db, table, partition)| {
+                        vec![
+                            Datum::Bytes(db.into_bytes()),
+                            Datum::Bytes(table.into_bytes()),
+                            Datum::Bytes(partition.into_bytes()),
+                            Datum::Bytes(b"locked".to_vec()),
+                        ]
+                    })
+                    .collect();
+            }
             ShowStmtKind::Warnings => {
                 self.schema = vec![
                     "Level".to_string(),

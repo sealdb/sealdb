@@ -930,6 +930,23 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 }
             },
         })),
+        // sqlparser reads `SHOW STATS_LOCKED` as a bare `SHOW <ident>`; TiDB's
+        // `SHOW STATS_LOCKED` lists the `mysql.stats_table_locked` rows.
+        SqlStatement::ShowVariable { variable }
+            if variable.len() == 1 && variable[0].value.eq_ignore_ascii_case("stats_locked") =>
+        {
+            Ok(Statement::Show(ShowStmt {
+                kind: ShowStmtKind::StatsLocked,
+                db_name: None,
+                table: None,
+                user: None,
+                full: false,
+                pattern: None,
+                column: None,
+                var_scope: ShowVarScope::Session,
+                var_filter: None,
+            }))
+        }
         SqlStatement::ShowColumns {
             full, show_options, ..
         } => {
@@ -3048,7 +3065,20 @@ fn lower_grantees(grantees: &[sqlparser::ast::Grantee]) -> Result<Vec<UserIdenti
                 users.push(UserIdentity::new(user.value.clone(), host.value.clone()));
             }
             Some(GranteeName::ObjectName(name)) => {
-                users.push(UserIdentity::new(object_name_last(name)?, "%"));
+                // MySQL: an unquoted `user@host` is one token (`['myuser'@'%']`
+                // stays a single quoted user name, host `%`).
+                let ident = name
+                    .0
+                    .last()
+                    .and_then(|part| part.as_ident())
+                    .ok_or_else(|| Error::unsupported("GRANT user name"))?;
+                if ident.quote_style.is_none()
+                    && let Some((user, host)) = ident.value.split_once('@')
+                {
+                    users.push(UserIdentity::new(user, host));
+                } else {
+                    users.push(UserIdentity::new(ident.value.clone(), "%"));
+                }
             }
             None => return Err(Error::unsupported("GRANT PUBLIC")),
         }
@@ -12863,5 +12893,52 @@ mod paren_from_tests {
                 "subquery parens were stripped: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod grantee_tests {
+    use super::*;
+
+    fn grant_users(sql: &str) -> Vec<UserIdentity> {
+        match &parse_sql(sql).unwrap()[0] {
+            Statement::Grant(stmt) => stmt.users.clone(),
+            other => panic!("expected GRANT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unquoted_user_host_splits_account() {
+        // MySQL tokenizes `myuser@localhost` as one identifier, but it still
+        // means account `myuser` on host `localhost`.
+        assert_eq!(
+            grant_users("GRANT SELECT ON d.* TO myuser@localhost"),
+            vec![UserIdentity::new("myuser", "localhost")]
+        );
+    }
+
+    #[test]
+    fn quoted_user_host_matches_unquoted() {
+        assert_eq!(
+            grant_users("GRANT SELECT ON d.* TO 'myuser'@'localhost'"),
+            vec![UserIdentity::new("myuser", "localhost")]
+        );
+    }
+
+    #[test]
+    fn quoted_whole_name_stays_username() {
+        // `'myuser@localhost'` is a single user name on the default host.
+        assert_eq!(
+            grant_users("GRANT SELECT ON d.* TO 'myuser@localhost'"),
+            vec![UserIdentity::new("myuser@localhost", "%")]
+        );
+    }
+
+    #[test]
+    fn bare_user_defaults_to_percent_host() {
+        assert_eq!(
+            grant_users("GRANT SELECT ON d.* TO datuser"),
+            vec![UserIdentity::new("datuser", "%")]
+        );
     }
 }

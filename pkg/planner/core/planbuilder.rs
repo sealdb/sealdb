@@ -3081,7 +3081,12 @@ fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
         .is_some_and(|schema| schema.eq_ignore_ascii_case("mysql"))
         && matches!(
             from.name.to_ascii_lowercase().as_str(),
-            "stats_meta" | "stats_histograms" | "stats_buckets" | "stats_top_n" | "bind_info"
+            "stats_meta"
+                | "stats_histograms"
+                | "stats_buckets"
+                | "stats_top_n"
+                | "stats_table_locked"
+                | "bind_info"
         )
 }
 

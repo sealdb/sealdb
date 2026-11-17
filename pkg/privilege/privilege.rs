@@ -168,6 +168,58 @@ impl Manager {
         Ok(())
     }
 
+    /// Resolve the account a login from `client_host` authenticates as (TiDB
+    /// `privilege/privileges` account matching): an exact host account wins,
+    /// then `localhost` for loopback clients, then `%`, then any wildcard
+    /// pattern. Unknown logins keep their client host so host-less users can
+    /// still connect in tests.
+    pub fn resolve_login(&self, username: &str, client_host: &str) -> UserIdentity {
+        let client_host = if client_host.is_empty() {
+            "localhost"
+        } else {
+            client_host
+        };
+        let inner = self.inner.lock().expect("privilege lock");
+        let mut hosts: Vec<&str> = inner
+            .users
+            .keys()
+            .filter(|(user, _)| user.eq_ignore_ascii_case(username))
+            .map(|(_, host)| host.as_str())
+            .collect();
+        let loopback = matches!(
+            client_host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        );
+        if let Some(host) = hosts
+            .iter()
+            .find(|host| host.eq_ignore_ascii_case(client_host))
+            .copied()
+        {
+            return UserIdentity::new(username, host);
+        }
+        if loopback
+            && let Some(host) = hosts
+                .iter()
+                .find(|host| host.eq_ignore_ascii_case("localhost"))
+                .copied()
+        {
+            return UserIdentity::new(username, host);
+        }
+        if let Some(host) = hosts.iter().find(|host| **host == "%").copied() {
+            return UserIdentity::new(username, host);
+        }
+        // Any remaining host is a `%`/`_` pattern: match it like `LIKE`.
+        hosts.sort_unstable();
+        if let Some(host) = hosts
+            .iter()
+            .find(|host| host_pattern_matches(host, client_host))
+            .copied()
+        {
+            return UserIdentity::new(username, host);
+        }
+        UserIdentity::new(username, client_host)
+    }
+
     pub fn create_user(&self, stmt: &CreateUserStmt) -> Result<()> {
         let mut inner = self.inner.lock().expect("privilege lock");
         for spec in &stmt.users {
@@ -528,6 +580,18 @@ impl Manager {
         wanted: PrivilegeType,
         user: &UserIdentity,
     ) -> Error {
+        Self::access_denied_command(db, table, &wanted.names().join("/"), user)
+    }
+
+    /// Same as [`Self::access_denied`] with an explicit command label: TiDB
+    /// reports `SHOW`/`LOCK STATS` privilege failures under the statement's
+    /// own command name rather than the checked privilege.
+    pub fn access_denied_command(
+        db: &str,
+        table: &str,
+        command: &str,
+        user: &UserIdentity,
+    ) -> Error {
         if table.is_empty() {
             Error::new(
                 ERR_DBACCESS_DENIED_ERROR,
@@ -541,10 +605,7 @@ impl Manager {
                 ERR_TABLEACCESS_DENIED_ERROR,
                 format!(
                     "{} command denied to user '{}'@'{}' for table '{}'",
-                    wanted.names().join("/"),
-                    user.username,
-                    user.hostname,
-                    table
+                    command, user.username, user.hostname, table
                 ),
             )
         }
@@ -789,6 +850,21 @@ fn user_key(user: &UserIdentity) -> (String, String) {
         user.username.to_ascii_lowercase(),
         user.hostname.to_ascii_lowercase(),
     )
+}
+
+/// MySQL host-pattern match (`%` any run, `_` one char).
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    fn go(pattern: &[u8], host: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => host.is_empty(),
+            Some((b'%', rest)) => (0..=host.len()).any(|i| go(rest, &host[i..])),
+            Some((b'_', rest)) => !host.is_empty() && go(rest, &host[1..]),
+            Some((c, rest)) => {
+                host.first().is_some_and(|h| h.eq_ignore_ascii_case(c)) && go(rest, &host[1..])
+            }
+        }
+    }
+    go(pattern.as_bytes(), host.as_bytes())
 }
 
 /// mysql_native_password-style auth string used by handshake.

@@ -49,6 +49,7 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "stats_histograms" => Ok(stats_histograms(is)),
         "stats_buckets" => Ok(stats_buckets(is)),
         "stats_top_n" => Ok(stats_top_n(is)),
+        "stats_table_locked" => Ok(stats_table_locked(is)),
         // `mysql.bind_info` rows carry session bindings from the domain; the
         // executor fills them, this exposes the column layout.
         "bind_info" => Ok((
@@ -1481,6 +1482,28 @@ fn stats_top_n(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
             }
         }
     }
+    (columns, rows)
+}
+
+/// `mysql.stats_table_locked`: `LOCK STATS` rows (TiDB stores one row per
+/// locked table / partition id with the stats version it froze).
+fn stats_table_locked(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let columns = vec![
+        "table_id".to_string(),
+        "modify_count".to_string(),
+        "count".to_string(),
+        "version".to_string(),
+    ];
+    let rows = is
+        .stats()
+        .map(|stats| {
+            stats
+                .locked_ids()
+                .into_iter()
+                .map(|id| vec![Datum::I64(id), Datum::I64(0), Datum::I64(0), Datum::I64(0)])
+                .collect()
+        })
+        .unwrap_or_default();
     (columns, rows)
 }
 

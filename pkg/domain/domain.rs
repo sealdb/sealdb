@@ -789,6 +789,16 @@ impl Domain {
             for name in &drop.tables {
                 let (schema, table) = name.qualified(current_db);
                 if !schema.is_empty() {
+                    // `LOCK STATS` rows go away with the table (TiDB drops the
+                    // `mysql.stats_table_locked` entries in the DDL).
+                    let mut ids = Vec::new();
+                    if let Some(info) = snapshot.table_by_name(&schema, &table) {
+                        ids.push(info.id);
+                        if let Some(partition) = info.partition.as_ref() {
+                            ids.extend(partition.definitions.iter().map(|def| def.id));
+                        }
+                    }
+                    self.stats.forget_locks(&ids);
                     self.stats.delete(&schema, &table);
                 }
             }

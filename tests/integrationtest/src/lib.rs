@@ -125,6 +125,9 @@ pub enum SessionDirective {
     /// `connect (name, host, user, pass, db)`
     Connect {
         name: String,
+        /// Client host the session logs in from (TiDB resolves the account by
+        /// host pattern, e.g. `myuser@localhost`).
+        host: String,
         /// Login user; empty keeps the default (root) identity.
         user: String,
         /// Initial database for the new session.
@@ -186,7 +189,7 @@ fn parse_session_directive(line: &str) -> Option<SessionDirective> {
         .trim_end_matches([')', ';'])
         .split(',');
     let _ = parts.next(); // name
-    let _ = parts.next(); // host
+    let host = parts.next().unwrap_or("").trim().trim_matches(['\'', '"']);
     let user = parts.next().unwrap_or("").trim().trim_matches(['\'', '"']);
     let _ = parts.next(); // password
     let db = parts
@@ -197,6 +200,7 @@ fn parse_session_directive(line: &str) -> Option<SessionDirective> {
         .to_string();
     Some(SessionDirective::Connect {
         name,
+        host: host.to_string(),
         user: user.to_string(),
         db,
     })
@@ -795,15 +799,18 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
     for step in &suite.steps {
         if let Some(directive) = &step.directive {
             match directive {
-                SessionDirective::Connect { name, user, db } => {
+                SessionDirective::Connect {
+                    name,
+                    host,
+                    user,
+                    db,
+                } => {
                     sessions.entry(name.clone()).or_insert_with(|| {
                         let session = Session::with_domain(Arc::clone(&domain));
                         init_driver_session(&session);
                         if !user.is_empty() {
-                            session.set_current_user(sealdb_parser::ast::UserIdentity::new(
-                                user.clone(),
-                                "%",
-                            ));
+                            session
+                                .set_current_user(domain.privilege().resolve_login(&user, &host));
                         }
                         if !db.is_empty() {
                             let _ = session.execute_stmt(&format!("USE `{db}`"));

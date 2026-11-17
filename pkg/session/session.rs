@@ -984,6 +984,22 @@ impl Session {
                 self.load_stats_file(&stmt.path)?;
                 return Ok(empty_result());
             }
+            Statement::LockStats(stmt) => {
+                let result = self.set_stats_lock(&stmt.tables, true)?;
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = result.warnings.clone();
+                return Ok(result);
+            }
+            Statement::UnlockStats(stmt) => {
+                let result = self.set_stats_lock(&stmt.tables, false)?;
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = result.warnings.clone();
+                return Ok(result);
+            }
             // `TRACE PLAN TARGET='estimation'` re-plans the inner statement with
             // CE tracing on and returns the collected records (TiDB `TraceExec`).
             Statement::Trace(trace)
@@ -1013,8 +1029,6 @@ impl Session {
             Statement::Binlog(_)
             | Statement::Change(_)
             | Statement::AlterInstance(_)
-            | Statement::LockStats(_)
-            | Statement::UnlockStats(_)
             | Statement::Trace(_)
             | Statement::PlanReplayer(_)
             | Statement::ImportInto(_)
@@ -2035,6 +2049,30 @@ impl Session {
                     return Err(access_denied("", "", PrivilegeType::ALL, &user));
                 }
             }
+            Statement::LockStats(lock) => {
+                check_stats_lock_privilege(&mgr, &user, &roles, &lock.tables, &current_db)?;
+            }
+            Statement::UnlockStats(unlock) => {
+                check_stats_lock_privilege(&mgr, &user, &roles, &unlock.tables, &current_db)?;
+            }
+            // `SHOW STATS_LOCKED` reads `mysql.stats_table_locked`; TiDB asks
+            // for SELECT there but reports the failure as a SHOW denial.
+            Statement::Show(show) if show.kind == sealdb_parser::ast::ShowStmtKind::StatsLocked => {
+                if !mgr.request_verification_with_roles(
+                    &user,
+                    &roles,
+                    "mysql",
+                    "stats_table_locked",
+                    PrivilegeType::SELECT,
+                ) {
+                    return Err(sealdb_privilege::Manager::access_denied_command(
+                        "mysql",
+                        "stats_table_locked",
+                        "SHOW",
+                        &user,
+                    ));
+                }
+            }
             Statement::LockTables(lock) => {
                 for item in &lock.table_locks {
                     require(
@@ -2403,6 +2441,94 @@ impl Session {
         self.domain.persist_stats()?;
         Ok(())
     }
+
+    /// `LOCK STATS` / `UNLOCK STATS` (TiDB `lockstats.AddLockedTables` /
+    /// `RemoveLockedTables`): record the table / partition ids in the
+    /// statistics handle and warn about entries already in that state.
+    fn set_stats_lock(
+        &self,
+        tables: &[sealdb_parser::ast::TableName],
+        lock: bool,
+    ) -> Result<QueryResult> {
+        let current_db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        let is = self.domain.infoschema();
+        let stats = self.domain.stats();
+        let mut ids: Vec<i64> = Vec::new();
+        // Lock id → display name, so a skipped entry can be named in the warning.
+        let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for table in tables {
+            let (db, name) = table.qualified(&current_db);
+            let info = is.table_by_name(&db, &name).ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_NO_SUCH_TABLE,
+                    format!("Table '{db}.{name}' doesn't exist"),
+                )
+            })?;
+            if table.partition_names.is_empty() {
+                ids.push(info.id);
+                names.insert(info.id, format!("{db}.{name}"));
+                continue;
+            }
+            let partition = info.partition.as_ref().ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_UNKNOWN_PARTITION,
+                    format!(
+                        "Unknown partition '{}' in table '{name}'",
+                        table.partition_names[0]
+                    ),
+                )
+            })?;
+            for partition_name in &table.partition_names {
+                let definition = partition
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.name.o().eq_ignore_ascii_case(partition_name))
+                    .ok_or_else(|| {
+                        Error::new(
+                            sealdb_errno::ERR_UNKNOWN_PARTITION,
+                            format!("Unknown partition '{partition_name}' in table '{name}'"),
+                        )
+                    })?;
+                ids.push(definition.id);
+                names.insert(definition.id, format!("{db}.{name}.{partition_name}"));
+            }
+        }
+        let skipped_ids = if lock {
+            stats.lock_stats(&ids)
+        } else {
+            stats.unlock_stats(&ids)
+        };
+        let mut result = empty_result();
+        if !skipped_ids.is_empty() {
+            let mut skipped: Vec<String> = skipped_ids
+                .iter()
+                .map(|id| names.get(id).cloned().unwrap_or_default())
+                .collect();
+            skipped.sort();
+            let (action, status) = if lock {
+                ("locking", "locked")
+            } else {
+                ("unlocking", "unlocked")
+            };
+            let list = skipped.join(", ");
+            let entries = if ids.len() > 1 { "tables" } else { "table" };
+            let message = if ids.len() > skipped.len() {
+                format!(
+                    "skip {action} {status} {entries}: {list}, other {entries} {status} successfully"
+                )
+            } else {
+                format!("skip {action} {status} {entries}: {list}")
+            };
+            result
+                .warnings
+                .push((sealdb_errno::ERR_UNKNOWN_ERROR, message));
+        }
+        Ok(result)
+    }
 }
 
 fn require(
@@ -2427,6 +2553,24 @@ fn access_denied(
     user: &UserIdentity,
 ) -> sealdb_errno::Error {
     sealdb_privilege::Manager::access_denied(db, table, wanted, user)
+}
+
+/// `LOCK STATS` / `UNLOCK STATS` run as `INSERT INTO mysql.stats_table_locked
+/// … SELECT … FROM <t>` in TiDB: they need INSERT and SELECT on each target
+/// table (TiDB `requireInsertAndSelectPriv`), reporting the first missing
+/// privilege under that table's name.
+fn check_stats_lock_privilege(
+    mgr: &sealdb_privilege::Manager,
+    user: &UserIdentity,
+    roles: &[UserIdentity],
+    tables: &[sealdb_parser::ast::TableName],
+    current_db: &str,
+) -> Result<()> {
+    for table in tables {
+        require(mgr, user, roles, table, current_db, PrivilegeType::INSERT)?;
+        require(mgr, user, roles, table, current_db, PrivilegeType::SELECT)?;
+    }
+    Ok(())
 }
 
 fn empty_result() -> QueryResult {

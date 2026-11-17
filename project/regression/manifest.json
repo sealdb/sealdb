@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 96,
+      "green": 97,
       "in_progress": 9,
       "local": 8,
-      "pending": 139
+      "pending": 138
     },
     "by_wave": {
       "D": 2,
@@ -2422,7 +2422,7 @@
     {
       "name": "statistics/lock_table_stats",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/statistics/lock_table_stats.test",
       "result": "r/statistics/lock_table_stats.result",
       "has_result": true,

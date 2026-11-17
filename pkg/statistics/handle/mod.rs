@@ -5,7 +5,7 @@ use crate::table::{
 };
 use sealdb_errno::{ERR_UNKNOWN_ERROR, Error, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 pub const STATS_STORAGE_KEY: &[u8] = b"mstats";
@@ -16,6 +16,11 @@ pub struct Handle {
     /// `stats_histograms` keep their rows with zeroed counters while the
     /// buckets and TopN are gone. The planner never sees these entries.
     dropped: Mutex<HashMap<(String, String), Table>>,
+    /// Locked table / partition ids (TiDB `mysql.stats_table_locked`): `LOCK
+    /// STATS` rows, surfaced through `mysql.stats_table_locked` and
+    /// `SHOW STATS_LOCKED`. Explicit/auto `ANALYZE` does not consult the set
+    /// yet (see the `statistics/lock_table_stats` entry in progress.md).
+    locked: Mutex<HashSet<i64>>,
 }
 
 impl Handle {
@@ -23,6 +28,58 @@ impl Handle {
         Self {
             inner: Mutex::new(HashMap::new()),
             dropped: Mutex::new(HashMap::new()),
+            locked: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Lock statistics collection for `ids`; returns the ids that were already
+    /// locked (TiDB `AddLockedTables` skipped list).
+    pub fn lock_stats(&self, ids: &[i64]) -> Vec<i64> {
+        let mut locked = self.locked.lock().expect("stats lock");
+        let mut skipped = Vec::new();
+        for id in ids {
+            if !locked.insert(*id) {
+                skipped.push(*id);
+            }
+        }
+        skipped
+    }
+
+    /// Unlock statistics collection for `ids`; returns the ids that were not
+    /// locked (TiDB `RemoveLockedTables` skipped list).
+    pub fn unlock_stats(&self, ids: &[i64]) -> Vec<i64> {
+        let mut locked = self.locked.lock().expect("stats lock");
+        let mut skipped = Vec::new();
+        for id in ids {
+            if !locked.remove(id) {
+                skipped.push(*id);
+            }
+        }
+        skipped
+    }
+
+    /// Locked table / partition ids in ascending order.
+    pub fn locked_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .locked
+            .lock()
+            .expect("stats lock")
+            .iter()
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn is_locked(&self, id: i64) -> bool {
+        self.locked.lock().expect("stats lock").contains(&id)
+    }
+
+    /// Drop the lock rows of `ids` (TiDB removes them with the table).
+    pub fn forget_locks(&self, ids: &[i64]) {
+        let mut locked = self.locked.lock().expect("stats lock");
+        for id in ids {
+            locked.remove(id);
         }
     }
 
@@ -356,4 +413,37 @@ struct PersistBucket {
     count: u64,
     repeats: u64,
     ndv: u64,
+}
+
+#[cfg(test)]
+mod locked_stats_tests {
+    use super::*;
+
+    #[test]
+    fn lock_stats_reports_already_locked_ids() {
+        let handle = Handle::new();
+        assert!(handle.lock_stats(&[1, 2]).is_empty());
+        assert_eq!(handle.lock_stats(&[2, 3]), vec![2]);
+        // TiDB keeps locked ids sorted for `mysql.stats_table_locked`.
+        assert_eq!(handle.locked_ids(), vec![1, 2, 3]);
+        assert!(handle.is_locked(1));
+        assert!(!handle.is_locked(4));
+    }
+
+    #[test]
+    fn unlock_stats_reports_not_locked_ids() {
+        let handle = Handle::new();
+        handle.lock_stats(&[1, 2]);
+        assert!(handle.unlock_stats(&[2]).is_empty());
+        assert_eq!(handle.unlock_stats(&[1, 5]), vec![5]);
+        assert!(handle.locked_ids().is_empty());
+    }
+
+    #[test]
+    fn forget_locks_drops_dropped_table_rows() {
+        let handle = Handle::new();
+        handle.lock_stats(&[1, 2, 3]);
+        handle.forget_locks(&[2, 3]);
+        assert_eq!(handle.locked_ids(), vec![1]);
+    }
 }

@@ -488,6 +488,8 @@ pub enum ShowStmtKind {
     DdlJobs,
     /// `SHOW BINDINGS`
     Bindings,
+    /// `SHOW STATS_LOCKED`
+    StatsLocked,
     /// `SHOW WARNINGS`
     Warnings,
     /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE …|WHERE …]`
@@ -588,6 +590,7 @@ impl ShowStmt {
             ShowStmtKind::Collation => ctx.write_str("SHOW COLLATION"),
             ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
             ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
+            ShowStmtKind::StatsLocked => ctx.write_str("SHOW STATS_LOCKED"),
             ShowStmtKind::Warnings => ctx.write_str("SHOW WARNINGS"),
             ShowStmtKind::Variables => {
                 ctx.write_str("SHOW ");

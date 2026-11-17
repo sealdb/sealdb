@@ -3636,6 +3636,57 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     先补 `SHOW STATS_HISTOGRAMS WHERE …`（15 列、分区行、内存占用列）以同时
     解锁 `executor/analyze`、`globalindex/analyze`。
 
+### 2026-11-17（`statistics/lock_table_stats` 转绿：LOCK/UNLOCK STATS、`mysql.stats_table_locked`、SHOW 权限口径）
+
+- **Phase**: R6
+- **完成**:
+  - `statistics/handle` 新增锁集合（TiDB `lockstats.AddLockedTables` /
+    `RemoveLockedTables` 等价）：`lock_stats` / `unlock_stats` 返回已锁 /
+    未锁 id 列表，`locked_ids` 升序输出，`forget_locks` 供 DROP TABLE 清理。
+  - 接线 `LOCK STATS` / `UNLOCK STATS` 执行与存储：表 / 分区 id 落进
+    `mysql.stats_table_locked` 虚拟表（4 列 `table_id/modify_count/count/
+    version`），重复加锁 / 解锁生成 TiDB 同款 1105 警告
+    `skip locking locked tables: ...` / `skip unlocking unlocked tables: ...`
+    （部分成功时追加 `, other tables ... successfully`）。
+  - `SHOW STATS_LOCKED`：`ShowStmtKind::StatsLocked`，按 table id（及分区
+    id）排序输出 `Db_name/Table_name/Partition_name/Status`；非分区表
+    `Partition_name` 为空串，整表锁定的分区表为 `global`。
+  - 权限口径对齐：`LOCK/UNLOCK STATS` 需要目标表 `INSERT` + `SELECT`
+    （先报 INSERT）；`SHOW STATS_LOCKED` 需要 `mysql.stats_table_locked` 的
+    `SELECT`，拒绝时按 TiDB 报 `SHOW command denied ... for table
+    'stats_table_locked'`（`access_denied_command` 支持自定义命令名）。
+  - 登录账号解析：`connect (name, host, user, pass, db)` 携带 host，经
+    `Manager::resolve_login` 精确匹配 `user@localhost` → 回环 `localhost`
+    → `%` → 通配 host，修复 `'myuser'@'%'` 误报。
+  - 解析修正：`GRANT ... TO myuser@localhost` 未加引号时 sqlparser 给出单个
+    `ObjectName("myuser@localhost")`，按 MySQL 语义拆成 `user='myuser'`,
+    `host='localhost'`；整串单引号（`'myuser@localhost'`）仍是单一用户名。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t statistics/lock_table_stats`
+    → `PASS: memory=1 tikv=0`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t statistics/lock_table_stats`
+    → `PASS: memory=0 tikv=1`（本地 PD v8.5.0 + store state=Up）
+  - `./tests/integrationtest/run-tests.sh -s memory`（green+local 全量）
+    → `PASS: memory=105 tikv=0 skipped=149`
+  - `./tests/integrationtest/run-tests.sh -s tikv`（green+local 全量）
+    → `PASS: memory=0 tikv=103 skipped=151`
+  - `cargo test -p sealdb-session --lib` → 125 passed；
+    `sealdb-executor` 9 passed；新增 `grantee_tests` 4 passed、
+    `locked_stats_tests` 3 passed。
+  - manifest：`statistics/lock_table_stats` → `green`，green 96→97
+    （R6 14→15，pending 139→138）。
+- **阻塞/风险**:
+  - 锁集合目前只做簿记与展示：显式/自动 `ANALYZE` 尚未读取 `is_locked`，
+    即 TiDB 的“跳过已锁定表的统计收集”还未生效；语料未覆盖，记为后续项。
+  - `LOCK STATS ... PARTITION p` 记录分区 id 已支持，但分区级自动 analyze
+    跳过同样缺失。
+  - `SHOW GRANTS FOR 'user@host'`（整串单引号）在 marker 解码时按 `@` 切分，
+    会把 host 拼成 `host@%`；TiDB 语料均使用 `'u'@'h'` 形式，暂不修。
+- **下一步**:
+  - 回到 `explain_complex_stats`（仅差 `SHOW STATS_HISTOGRAMS` 与投影裁剪），
+    先补 `SHOW STATS_HISTOGRAMS WHERE …`（15 列、分区行、内存占用列）以同时
+    解锁 `executor/analyze`、`globalindex/analyze`。
+
 ## 7. 更新模板
 
 每次更新追加一条：
