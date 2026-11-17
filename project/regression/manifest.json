@@ -2212,7 +2212,7 @@
     {
       "name": "planner/core/rule_result_reorder",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/planner/core/rule_result_reorder.test",
       "result": "r/planner/core/rule_result_reorder.result",
       "has_result": true,

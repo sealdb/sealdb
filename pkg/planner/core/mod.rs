@@ -22,6 +22,7 @@ pub mod rule_join_reorder_dp;
 pub mod rule_not_null_fold;
 pub mod rule_partition_processor;
 pub mod rule_predicate_push_down;
+pub mod rule_result_reorder;
 pub mod rule_semi_join;
 pub mod union;
 pub mod window;
@@ -38,6 +39,6 @@ pub use planbuilder::{
     merged_star_columns, merged_star_visible_columns, normalize_bit_constants,
     normalize_comparison_literals, normalize_enum_constants, using_dropped_columns,
     with_agg_push_down, with_cost_model_version, with_dirty_tables, with_explicit_txn,
-    with_hashagg_concurrency, with_insubq_to_join_and_agg,
+    with_hashagg_concurrency, with_insubq_to_join_and_agg, with_stable_result_mode,
 };
 pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};

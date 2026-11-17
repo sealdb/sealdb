@@ -194,6 +194,27 @@ fn push_into(
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
             let table_info = statement_table_info(is, current_db, &table);
+            // Every secondary index stores the row handle, so predicates on the
+            // handle (or on a common-handle key column) are evaluated in the
+            // index cop task and do not need the table probe.
+            let handle_cols: Vec<String> = table_info
+                .as_ref()
+                .map(|info| {
+                    if info.pk_is_handle {
+                        info.handle_column()
+                            .map(|c| vec![c.name.o().to_string()])
+                            .unwrap_or_default()
+                    } else if info.common_handle {
+                        info.indices
+                            .iter()
+                            .find(|idx| idx.primary)
+                            .map(|idx| idx.columns.iter().map(|c| c.name.o().to_string()).collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default();
             let pushable: Vec<_> = pushable
                 .into_iter()
                 .filter(|expr| {
@@ -248,12 +269,13 @@ fn push_into(
                 access_range = Some(access.range);
             }
             // A full index scan can only push predicates whose columns live in
-            // the index; the rest filter the probed table rows (Selection(Probe)).
+            // the index (plus the row handle it stores); the rest filter the
+            // probed table rows (Selection(Probe)).
             let on_probe = |expr: &ExprNode| {
-                !expr
-                    .referenced_columns()
-                    .iter()
-                    .all(|(_, col)| index_columns.iter().any(|c| c.eq_ignore_ascii_case(col)))
+                !expr.referenced_columns().iter().all(|(_, col)| {
+                    index_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
+                        || handle_cols.iter().any(|c| c.eq_ignore_ascii_case(col))
+                })
             };
             let (index_side, probe_side): (Vec<_>, Vec<_>) =
                 if pushed.is_some() && access_range.is_none() {
@@ -262,11 +284,15 @@ fn push_into(
                     pushable.into_iter().partition(|expr| !on_probe(expr))
                 };
             // Build-side residual predicates (columns in the index but not
-            // encoded by the range) stay a cop `Selection(Build)`.
-            if access_range.is_some()
+            // encoded by the range) stay a cop `Selection(Build)`. A full index
+            // scan keeps its table cardinality on `IndexFullScan` and only the
+            // Selection shrinks.
+            if (access_range.is_some() || pushed.is_none())
                 && let Some(filter) = ExprNode::compose_cnf(index_side.clone())
             {
-                if let Some(sel) = crate::core::explain::filter_selectivity(&filter) {
+                if access_range.is_some()
+                    && let Some(sel) = crate::core::explain::filter_selectivity(&filter)
+                {
                     row_count *= sel;
                 }
                 selection_info = Some(crate::core::explain::explain_pushed_filter(&table, &filter));

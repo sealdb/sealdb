@@ -4136,13 +4136,21 @@ fn emit_cop_children(
                     format!(
                         "range:{}, keep order:{}, stats:pseudo",
                         shape.text,
-                        if under_merge_join { "true" } else { "false" }
+                        if under_merge_join || *keep_order {
+                            "true"
+                        } else {
+                            "false"
+                        }
                     )
                 } else {
                     format!(
                         "range:{}, keep order:{}",
                         shape.text,
-                        if under_merge_join { "true" } else { "false" }
+                        if under_merge_join || *keep_order {
+                            "true"
+                        } else {
+                            "false"
+                        }
                     )
                 };
                 let mut range_depth = scan_depth;
@@ -5525,8 +5533,9 @@ fn emit_cop_children(
                 } else {
                     "keep order:true".to_string()
                 }
-            } else if probe_selection_info.is_some() {
-                // Probe-side filters display as `Selection(Probe)`, not scan pushdown.
+            } else if probe_selection_info.is_some() || selection_info.is_some() {
+                // Probe-side filters display as `Selection(Probe)`, not scan
+                // pushdown; Build-side filters become `Selection(Build)`.
                 if *row_count >= 9_000.0 {
                     "keep order:false, stats:pseudo".to_string()
                 } else {
@@ -5548,7 +5557,79 @@ fn emit_cop_children(
             } else {
                 scan_est
             };
-            if tid_sel.is_some() {
+            // The index side evaluates the residual Build predicates, so TiDB
+            // can push the TopN above them when the sort keys live there
+            // (index key or the row handle stored with every secondary index).
+            let build_topn = topn_parent.filter(|(by_info, _, _)| {
+                build_side_has_sort_keys(by_info, index_columns, selection_info.as_deref())
+            });
+            let mut build_marked = tid_sel.is_some();
+            if let Some((by_info, offset, count)) = build_topn {
+                push_explain_row_spine(
+                    rows,
+                    build_depth,
+                    false,
+                    next_id,
+                    CopRow {
+                        name: "TopN",
+                        est: count as f64,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: format!("{by_info}, offset:{offset}, count:{count}"),
+                    },
+                    &build_spine,
+                );
+                if let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Build)");
+                }
+                build_marked = true;
+                build_spine.push(true);
+                build_depth += 1;
+            }
+            if tid_sel.is_none()
+                && let Some(sel) = selection_info.as_ref()
+            {
+                // The pushed filter node carries the pseudo selectivity the
+                // planner used for the Build side.
+                let sel_est = pushed
+                    .as_ref()
+                    .and_then(|filter| {
+                        filter_selectivity(filter).or_else(|| {
+                            sealdb_statistics::pseudo::selectivity(
+                                &filter.split_cnf(),
+                                10_000.0,
+                                None,
+                            )
+                        })
+                    })
+                    .map(|sel| scan_est * sel)
+                    .unwrap_or(scan_est);
+                push_explain_row_spine(
+                    rows,
+                    build_depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: "Selection",
+                        est: sel_est,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: sel.clone(),
+                    },
+                    &build_spine,
+                );
+                build_marked = true;
+                // Under a Build TopN the Selection is that node's last child;
+                // otherwise the Probe sibling continues the bar.
+                build_spine.push(build_topn.is_none());
+                build_depth += 1;
+            }
+            // Probe reaches the limit after the Build TopN, so its scan is sized
+            // from the TopN count.
+            let probe_scan_est = build_topn
+                .map(|(_, _, count)| count as f64)
+                .unwrap_or(scan_est);
+            if build_marked {
                 push_explain_row_spine(
                     rows,
                     build_depth,
@@ -5637,7 +5718,7 @@ fn emit_cop_children(
                 next_id,
                 CopRow {
                     name: "TableRowIDScan",
-                    est: scan_est,
+                    est: probe_scan_est,
                     task: "cop[tikv]",
                     access: table_access(table, &[]),
                     info: rowid_info,
@@ -6388,6 +6469,31 @@ fn keep_order_sel_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Optio
     bytes_marker(pushed)?
         .strip_prefix("KEEP_ORDER_SEL|")
         .map(|s| s.to_string())
+}
+
+/// Whether every TopN sort key is available on an `IndexLookUp` build side:
+/// an index key column, or a column the build `Selection` evaluates.
+fn build_side_has_sort_keys(
+    by_info: &str,
+    index_columns: &[String],
+    selection: Option<&str>,
+) -> bool {
+    let mentioned = |name: &str| {
+        index_columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+            || selection.is_some_and(|sel| {
+                sel.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                    .any(|token| token.eq_ignore_ascii_case(name))
+            })
+    };
+    by_info
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .all(|part| {
+            let part = part.strip_suffix(":desc").unwrap_or(part);
+            let name = part.rsplit('.').next().unwrap_or(part).trim();
+            !name.is_empty() && mentioned(name)
+        })
 }
 
 /// `RANGE_SEL|<sel info>|<range>[|<scan rows>]`: index Selection above a

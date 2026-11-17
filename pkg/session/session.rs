@@ -161,6 +161,9 @@ pub struct Session {
     /// TiDB `tidb_opt_agg_push_down` (default OFF): the `AggregationPushDownSolver`
     /// may push a decomposable partial aggregation below an inner join.
     opt_agg_push_down: Mutex<bool>,
+    /// TiDB `tidb_enable_ordered_result_mode` (default OFF): `ResultReorder`
+    /// injects a result sort so equal-valued queries return a stable order.
+    ordered_result_mode: Mutex<bool>,
     /// TiDB `tidb_opt_insubq_to_join_and_agg` (default ON): rewrite a
     /// non-correlated `IN (SELECT …)` into an inner join with a de-duplicating
     /// aggregation on the subquery side.
@@ -252,6 +255,7 @@ impl Session {
             hashagg_partial_concurrency: Mutex::new(5),
             hashagg_final_concurrency: Mutex::new(5),
             opt_agg_push_down: Mutex::new(false),
+            ordered_result_mode: Mutex::new(false),
             opt_insubq_to_join_and_agg: Mutex::new(true),
             non_prepared_plan_cache: Mutex::new(false),
             last_plan_from_cache: Mutex::new(false),
@@ -1662,6 +1666,10 @@ impl Session {
             .opt_insubq_to_join_and_agg
             .lock()
             .expect("session insubq lock");
+        let ordered_result_mode = *self
+            .ordered_result_mode
+            .lock()
+            .expect("session ordered result mode lock");
         // Cost model version changes the chosen access path; keep it in the
         // Domain-shared plan-cache key so sessions cannot cross-read plans.
         let cache_key = if cost_model_version == 2 {
@@ -1680,35 +1688,51 @@ impl Session {
                                 sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
                                     sealdb_planner::with_explicit_txn(explicit_txn, || {
                                         sealdb_planner::with_dirty_tables(dirty_tables, || {
-                                            if use_cache {
-                                                let cache = self.domain.plan_cache();
-                                                // Re-optimize every EXECUTE: the cached plan was built from the
-                                                // first bound SQL, so literal values baked into ranges, pushed
-                                                // cop filters, or pruned partitions would answer a later USING
-                                                // list incorrectly. The cache still accounts a hit so shared
-                                                // plan-cache statistics match TiDB.
-                                                let cached =
-                                                    cache.get(&cache_key, schema_ver).is_some();
-                                                let plan = self.planner.build_with_schema(
-                                                    stmt,
-                                                    Some(&is),
-                                                    &current_db,
-                                                    Some(stats.as_ref()),
-                                                    prune_mode,
-                                                )?;
-                                                if !cached {
-                                                    cache.put(cache_key, schema_ver, plan.clone());
-                                                }
-                                                Ok(plan)
-                                            } else {
-                                                self.planner.build_with_schema(
-                                                    stmt,
-                                                    Some(&is),
-                                                    &current_db,
-                                                    Some(stats.as_ref()),
-                                                    prune_mode,
-                                                )
-                                            }
+                                            sealdb_planner::with_stable_result_mode(
+                                                ordered_result_mode,
+                                                || {
+                                                    if use_cache {
+                                                        let cache = self.domain.plan_cache();
+                                                        // Re-optimize every EXECUTE: the cached plan was built from the
+                                                        // first bound SQL, so literal values baked into ranges, pushed
+                                                        // cop filters, or pruned partitions would answer a later USING
+                                                        // list incorrectly. The cache still accounts a hit so shared
+                                                        // plan-cache statistics match TiDB.
+                                                        let cached = cache
+                                                            .get(&cache_key, schema_ver)
+                                                            .is_some();
+                                                        // TiDB reports the prepared
+                                                        // statement's plan-cache probe
+                                                        // through `@@last_plan_from_cache`.
+                                                        *self.last_plan_from_cache.lock().expect(
+                                                            "session last plan from cache lock",
+                                                        ) = cached;
+                                                        let plan = self.planner.build_with_schema(
+                                                            stmt,
+                                                            Some(&is),
+                                                            &current_db,
+                                                            Some(stats.as_ref()),
+                                                            prune_mode,
+                                                        )?;
+                                                        if !cached {
+                                                            cache.put(
+                                                                cache_key,
+                                                                schema_ver,
+                                                                plan.clone(),
+                                                            );
+                                                        }
+                                                        Ok(plan)
+                                                    } else {
+                                                        self.planner.build_with_schema(
+                                                            stmt,
+                                                            Some(&is),
+                                                            &current_db,
+                                                            Some(stats.as_ref()),
+                                                            prune_mode,
+                                                        )
+                                                    }
+                                                },
+                                            )
                                         })
                                     })
                                 })
@@ -1877,6 +1901,11 @@ impl Session {
     /// inserts a plan, later ones are cache hits. Both paths record
     /// `@@last_plan_from_cache`.
     fn probe_plan_cache(&self, stmt: &Statement) {
+        // A prepared EXECUTE records its hit in the plan-build path; the
+        // non-prepared probe must not overwrite it.
+        if *self.cache_plans.lock().expect("session cache flag lock") {
+            return;
+        }
         let hit = match stmt {
             Statement::Explain(explain) if explain.format == ExplainFormat::PlanCache => {
                 self.probe_explain_plan_cache(explain)
@@ -4651,6 +4680,18 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .lock()
                     .expect("session agg push down lock") = on;
             }
+            // `ResultReorder` gate (TiDB default OFF).
+            "tidb_enable_ordered_result_mode" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .ordered_result_mode
+                    .lock()
+                    .expect("session ordered result mode lock") = on;
+            }
             // `IN (SELECT …)` → inner join + de-duplicating aggregation gate
             // (TiDB default ON).
             "tidb_opt_insubq_to_join_and_agg" => {
@@ -5368,6 +5409,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "tidb_enable_ordered_result_mode" => {
+            if *session
+                .ordered_result_mode
+                .lock()
+                .expect("session ordered result mode lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "tidb_opt_insubq_to_join_and_agg" => {
             if *session
                 .opt_insubq_to_join_and_agg
@@ -5841,16 +5893,22 @@ fn record_sysvar_override(session: &Session, name: &str, value: &str) {
 /// Current value of a known system variable in `scope`, or `None` when the
 /// variable is unknown (so `SHOW VARIABLES LIKE` can select nothing).
 fn resolve_show_variable(session: &Session, name: &str, global: bool) -> Option<String> {
+    // Typed getters expose `1`/`0` for `@@name`; `SHOW VARIABLES` spells flag
+    // variables `ON`/`OFF` (TiDB `SysVar.Visibility`).
+    let normalize = |value: String| {
+        let kind = show_variable_kind(name).unwrap_or(VarKind::Text);
+        normalize_show_variable_value(kind, &value)
+    };
     if global {
         if let Some(value) = session.domain.global_override(name) {
             return Some(value);
         }
         if let Some(value) = read_global_sysvar(session, name) {
-            return Some(value);
+            return Some(normalize(value));
         }
     } else {
         if let Some(value) = read_session_sysvar_typed(session, name) {
-            return Some(value);
+            return Some(normalize(value));
         }
         if let Some(value) = session
             .sysvar_overrides
@@ -5865,7 +5923,7 @@ fn resolve_show_variable(session: &Session, name: &str, global: bool) -> Option<
             return Some(value);
         }
         if let Some(value) = read_global_sysvar(session, name) {
-            return Some(value);
+            return Some(normalize(value));
         }
     }
     show_variable_default(name).map(|default| {

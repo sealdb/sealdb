@@ -147,8 +147,12 @@ impl ExecutorBuilder {
                     Self::build(child, stmt, domain, current_db, txn)?,
                 )))
             }
-            PhysicalPlan::TopN { child, .. } => {
+            PhysicalPlan::TopN { child, by_info, .. } => {
+                // ResultReorder injects keys into the planner's local SELECT
+                // clone, so an EXECUTE (or a plan-cache hit) may build a TopN
+                // whose keys are only recorded in the plan.
                 let by = stmt_order_by(stmt)
+                    .or_else(|| order_by_from_plan_info(by_info))
                     .ok_or_else(|| Error::unsupported("topn without ORDER BY"))?;
                 let (limit, offset) =
                     stmt_limit(stmt).ok_or_else(|| Error::unsupported("topn without LIMIT"))?;
@@ -1270,6 +1274,10 @@ fn order_by_from_plan_info(by_info: &str) -> Option<Vec<ByItem>> {
         if part.is_empty() {
             return None;
         }
+        let (part, desc) = match part.strip_suffix(":desc") {
+            Some(rest) => (rest.trim(), true),
+            None => (part, false),
+        };
         let name = part.rsplit('.').next().unwrap_or(part).trim();
         if name.is_empty() || name.contains('#') || name.contains('(') {
             return None;
@@ -1280,7 +1288,7 @@ fn order_by_from_plan_info(by_info: &str) -> Option<Vec<ByItem>> {
                 table: None,
                 name: name.to_string(),
             }),
-            desc: false,
+            desc,
         });
     }
     if out.is_empty() { None } else { Some(out) }

@@ -73,7 +73,7 @@ fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
     ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG,
-    ERR_TTL_TEMPORARY_TABLE, ERR_UNSUPPORTED, Error, Result,
+    ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -4823,6 +4823,15 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
     while i < bytes.len() {
         if keyword_at(bytes, i, "ANALYZE") {
             let after = skip_ws(bytes, i + "ANALYZE".len());
+            // TiDB v7.5 removed incremental analyze; the parser still accepts
+            // the syntax and fails with 1105 (executor/analyze.test).
+            if keyword_at(bytes, after, "INCREMENTAL") {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    "the incremental analyze feature has already been removed in TiDB v7.5.0, \
+                     so this will have no effect",
+                ));
+            }
             if keyword_at(bytes, after, "TABLE") {
                 let tables_start = skip_ws(bytes, after + "TABLE".len());
                 let mut j = tables_start;
@@ -4862,6 +4871,28 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
                     }
                     k
                 };
+                // TiDB writes `PARTITION p0, p1` without parentheses while
+                // sqlparser expects `PARTITION (p0, p1)`.
+                let mut partitions: Option<Vec<String>> = None;
+                if keyword_at(bytes, j, "PARTITION") {
+                    let mut k = skip_ws(bytes, j + "PARTITION".len());
+                    let mut names = Vec::new();
+                    loop {
+                        let (name, next) = read_quoted_or_ident(bytes, k);
+                        if name.is_empty() {
+                            break;
+                        }
+                        names.push(name);
+                        k = skip_ws(bytes, next);
+                        if k < bytes.len() && bytes[k] == b',' {
+                            k = skip_ws(bytes, k + 1);
+                            continue;
+                        }
+                        break;
+                    }
+                    j = skip_ws(bytes, k);
+                    partitions = Some(names);
+                }
                 if keyword_at(bytes, j, "INDEX") {
                     let mut k = skip_ws(bytes, j + "INDEX".len());
                     let mut names = Vec::new();
@@ -4878,7 +4909,7 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
                         }
                         break;
                     }
-                    out.push_str(&sql[i..first_end]);
+                    push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
                     let (k, buckets, topn) = read_analyze_options(bytes, sql, k);
                     extras.push(Some((names, table_names, buckets, topn)));
                     i = k;
@@ -4888,7 +4919,7 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
                 if keyword_at(bytes, j, "ALL") {
                     let after_all = skip_ws(bytes, j + "ALL".len());
                     if keyword_at(bytes, after_all, "COLUMNS") {
-                        out.push_str(&sql[i..first_end]);
+                        push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
                         let (k, buckets, topn) = read_analyze_options(
                             bytes,
                             sql,
@@ -4899,7 +4930,7 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
                         continue;
                     }
                 }
-                out.push_str(&sql[i..first_end]);
+                push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
                 let (k, buckets, topn) = read_analyze_options(bytes, sql, j);
                 extras.push(Some((Vec::new(), table_names, buckets, topn)));
                 i = k;
@@ -4911,6 +4942,23 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
         i += ch.len_utf8();
     }
     Ok((out, extras))
+}
+
+/// Emit the `ANALYZE TABLE t` head plus an optional TiDB partition list in
+/// the parenthesized form sqlparser accepts.
+fn push_analyze_head(out: &mut String, head: &str, partitions: Option<&[String]>) {
+    out.push_str(head);
+    let Some(names) = partitions.filter(|names| !names.is_empty()) else {
+        return;
+    };
+    out.push_str(" PARTITION (");
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(name);
+    }
+    out.push(')');
 }
 
 /// sqlparser rejects MySQL `CREATE/DROP USER 'u'@'%'`.

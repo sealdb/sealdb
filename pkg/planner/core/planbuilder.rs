@@ -86,6 +86,18 @@ impl PlanBuilder {
     ) -> Result<PhysicalPlan> {
         match stmt {
             Statement::Select(select) => {
+                // ResultReorder: stable result mode sorts the outer block by its
+                // output columns (or row handle). DML source SELECTs are exempt.
+                let reordered;
+                let select = if take_stable_result_mode()
+                    && !in_dml_source()
+                    && let Some(is) = is
+                {
+                    reordered = super::rule_result_reorder::reorder_result(select, is, current_db);
+                    &reordered
+                } else {
+                    select
+                };
                 // Partition pruning evaluates the 1:1 simplified predicate:
                 // `1 = 1 AND a != 1` → `a != 1`, `1 = 0 OR …` keeps a `0`
                 // disjunct. TiDB folds this while building the datasource.
@@ -503,19 +515,15 @@ impl PlanBuilder {
                         && order_by_covered_by_merge_join(select, &plan);
                     // `ORDER BY` the row handle reads the table in handle order:
                     // TiDB drops the Sort and marks the scan `keep order:true`.
+                    // A handle *range* scan keeps handle order too, so a range
+                    // predicate does not reintroduce the Sort.
                     // A backwards handle order with `LIMIT` becomes a cop Limit.
                     // A multi-partition read returns rows partition by partition,
                     // so its output is not globally handle-ordered.
-                    let handle_order_desc =
-                        (matches!(
-                            plan,
-                            PhysicalPlan::TableReader {
-                                range_scan: None,
-                                ..
-                            }
-                        ) && !select_spans_multiple_partitions(select, is, current_db))
-                        .then(|| order_by_handle(select, is, current_db))
-                        .flatten();
+                    let handle_order_desc = (matches!(plan, PhysicalPlan::TableReader { .. })
+                        && !select_spans_multiple_partitions(select, is, current_db))
+                    .then(|| order_by_handle(select, is, current_db))
+                    .flatten();
                     let handle_order =
                         handle_order_desc.is_some_and(|desc| !desc || select.limit.is_some());
                     if handle_order {
@@ -7459,6 +7467,10 @@ thread_local! {
     /// `x IN (SELECT …)` becomes an inner join with a de-duplicating aggregate
     /// on the subquery side instead of a semi join.
     static INSUBQ_TO_JOIN_AND_AGG: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// TiDB `tidb_enable_ordered_result_mode` (default OFF): `ResultReorder`
+    /// injects a result `Sort`. The flag is consumed by the first (outermost)
+    /// `SELECT` so nested subquery blocks keep their own order.
+    static STABLE_RESULT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with the session's `tidb_opt_insubq_to_join_and_agg` visible.
@@ -7485,6 +7497,20 @@ pub fn with_agg_push_down<T>(on: bool, f: impl FnOnce() -> T) -> T {
 /// Session `tidb_opt_agg_push_down` (TiDB default OFF).
 pub fn agg_push_down() -> bool {
     AGG_PUSH_DOWN.with(|c| c.get())
+}
+
+/// Run `f` with the session's `tidb_enable_ordered_result_mode` visible.
+pub fn with_stable_result_mode<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let prev = STABLE_RESULT_MODE.with(|c| c.replace(on));
+    let out = f();
+    STABLE_RESULT_MODE.with(|c| c.set(prev));
+    out
+}
+
+/// Whether this plan build must reorder results; only the outermost query
+/// block applies the rule (TiDB `adjustOptimizationFlags`).
+fn take_stable_result_mode() -> bool {
+    STABLE_RESULT_MODE.with(|c| c.replace(false))
 }
 
 /// Run `f` with the session's hash-aggregate concurrency visible to cost models.

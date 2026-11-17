@@ -3687,6 +3687,64 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     先补 `SHOW STATS_HISTOGRAMS WHERE …`（15 列、分区行、内存占用列）以同时
     解锁 `executor/analyze`、`globalindex/analyze`。
 
+### 2026-11-17（`planner/core/rule_result_reorder` 转绿：有序结果模式、handle 保序与 explain Build 侧）
+
+- **Phase**: R7 `planner/core/rule_result_reorder` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 新增 `pkg/planner/core/rule_result_reorder.rs`（对应 TiDB
+    `rule_result_reorder.go`）：`reorder_result` 在
+    `tidb_enable_ordered_result_mode=ON` 时给外层 `SELECT` 补排序键。
+    `Selection`/`Projection`/`Limit` 视为保序算子直接下沉；已有 `Sort`
+    只追加缺失的输出列，键按「限定符 + 列名」去重。单列整数主键
+    （`pk_is_handle`）且该句柄出现在输出里时只按 handle 排序
+    （TiDB `extractHandleCol`），复合/公共 handle 保留全部输出列。
+  - 会话侧接线：`Session.ordered_result_mode` 支撑
+    `SET [SESSION|GLOBAL] tidb_enable_ordered_result_mode` /
+    `@@tidb_enable_ordered_result_mode`，planner 通过
+    `with_stable_result_mode` 线程局部上下文在
+    `build_with_schema_inner` 里应用规则，plan cache key 不含该开关
+    （与 TiDB 一样按语句重写）。
+  - `handle_order_desc` 识别 `TableReader` 上的 `range_scan`：聚簇主键范围
+    扫描本就按 handle 有序，不再额外插 `Sort`，explain 仍打印
+    `keep order:true`。
+  - 执行层：`PhysicalPlan::TopN` 在 `EXECUTE` / plan-cache 命中时
+    `stmt_order_by` 为空，改为回落到计划里的 `by_info`（含新增 `:desc`
+    解析），修复 `topn without ORDER BY` 报错。
+  - 预处理 plan cache：`EXECUTE` 在 `cache.get()` 处直接写
+    `@@last_plan_from_cache`，非预处理的 `probe_plan_cache` 在
+    `cache_plans` 生效时不再覆盖，第二次 `EXECUTE` 如实返回 1。
+  - `SHOW VARIABLES` 走 typed getter 时把 flag 变量归一为 `ON`/`OFF`
+    （`SELECT @@var` 仍是 `1`/`0`）。
+  - EXPLAIN：`IndexLookUp` Build 侧渲染 `TopN(Build)` / `Selection`，
+    被下推到 Build 侧的谓词按伪统计（`filter_selectivity`）估基数；
+    `rule_predicate_push_down` 允许二级索引在 Build 侧求值 handle 列谓词，
+    避免退回 `Selection(Probe)`。
+  - 同批入库 parser 兼容修正：`ANALYZE ... INCREMENTAL` 按 TiDB 7.5
+    报 1105；`ANALYZE TABLE t PARTITION p0, p1` 归一成 sqlparser 接受的
+    `PARTITION (p0, p1)`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t planner/core/rule_result_reorder`
+    → `PASS: memory=1 tikv=1 skipped=254`
+  - `./tests/integrationtest/run-tests.sh -s both -t globalindex/aggregate`
+    → `PASS: memory=1 tikv=1 skipped=253`（回归确认）
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=98 tikv=97 skipped=157`（`executor/adapter` 为 `skip_tikv`）
+  - `cargo test -p sealdb-planner -p sealdb-session -p sealdb-executor`
+    → 50 / 125 / 9 passed
+  - manifest：`planner/core/rule_result_reorder` → `green`，green 97→98
+    （R7 32→33，pending 138→137）。
+- **阻塞/风险**:
+  - 规则目前按 AST 重写外层 `SELECT`，`UNION`/窗口/聚合的输出列稳定排序
+    仍依赖既有 `Sort` 注入路径；TiDB 的「首个非保序算子」判定没有在逻辑
+    计划层实现，语料未覆盖的组合需后续补。
+  - 有序结果模式的 plan cache key 未带开关位；关闭/开启交替时复用同一
+    逻辑计划，当前按重优化保证正确，后续接物理计划缓存时需补 key。
+- **下一步**:
+  - 继续 R7 长尾：`planner/core/partial_order_topn` 与
+    `planner/core/grouped_ranges_order_by`（均涉及排序键注入/保序判定，
+    可复用本次的 `handle_order_desc` 与 `TopN` 路径）。
+  - 回到 `explain_complex_stats`（`SHOW STATS_HISTOGRAMS` 仍未实现）。
+
 ## 7. 更新模板
 
 每次更新追加一条：
