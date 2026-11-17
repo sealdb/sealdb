@@ -189,6 +189,10 @@ pub struct Session {
     /// a typed field. `SHOW VARIABLES` / `@@<name>` read this after the typed
     /// getters so a `SET` is always visible again.
     sysvar_overrides: Mutex<HashMap<String, String>>,
+    /// Statement-scoped `/*+ SET_VAR(name=value) */` overrides. Consulted before
+    /// the typed getters so `SELECT @@name` sees the hint value for exactly the
+    /// hinted statement; restored when that statement finishes.
+    stmt_sysvar_overrides: Mutex<HashMap<String, String>>,
     /// `SET RESOURCE GROUP` / `RESOURCE_GROUP()` hint: the group this session
     /// currently runs in (TiDB `sessionctx.Context.GetSessionVars().StmtCtx.ResourceGroupName`).
     resource_group: Mutex<String>,
@@ -257,6 +261,7 @@ impl Session {
             binding_note: Mutex::new(None),
             current_stmt_sql: Mutex::new(String::new()),
             sysvar_overrides: Mutex::new(HashMap::new()),
+            stmt_sysvar_overrides: Mutex::new(HashMap::new()),
             resource_group: Mutex::new("default".to_string()),
         }
     }
@@ -395,30 +400,76 @@ impl Session {
     }
 
     /// TiDB `SET_VAR` optimizer hint: apply the listed session variables for a
-    /// single statement. `sql_mode` takes the statement-scoped slot below;
-    /// `group_concat_max_len` rides the executor's thread-local (reset when the
-    /// statement finishes).
-    fn begin_set_var_hint(&self, sql: &str) -> Option<String> {
-        SET_VAR_PREV_GCML.with(|c| c.set(Some(sealdb_executor::aggfuncs::group_concat_max_len())));
-        if let Some(len) = set_var_hint_value(sql, "group_concat_max_len")
-            && let Ok(len) = len
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .parse::<usize>()
-        {
-            sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
+    /// single statement. `sql_mode` also takes the statement-scoped slot below
+    /// (the parser/executor read it directly); `group_concat_max_len` rides the
+    /// executor's thread-local; every other variable lands in
+    /// [`Self::stmt_sysvar_overrides`] so `SELECT @@name` sees it.
+    fn begin_set_var_hint(&self, sql: &str) -> Option<SetVarHintState> {
+        let pairs = set_var_hint_pairs(sql);
+        if pairs.is_empty() {
+            return None;
         }
-        let sql_mode = set_var_hint_sql_mode(sql)?;
-        let mut slot = self.sql_mode.lock().expect("session sql_mode lock");
-        Some(std::mem::replace(&mut *slot, sql_mode))
+        SET_VAR_PREV_GCML.with(|c| c.set(Some(sealdb_executor::aggfuncs::group_concat_max_len())));
+        let mut state = SetVarHintState {
+            previous_sql_mode: None,
+            previous_overrides: Vec::new(),
+        };
+        let mut sql_mode = None;
+        {
+            let mut overrides = self
+                .stmt_sysvar_overrides
+                .lock()
+                .expect("session stmt sysvar overrides lock");
+            for (name, raw) in pairs {
+                let lname = name.trim().to_ascii_lowercase();
+                let value = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+                match lname.as_str() {
+                    "group_concat_max_len" => {
+                        if let Ok(len) = value.parse::<usize>() {
+                            sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
+                        }
+                        continue;
+                    }
+                    "sql_mode" => sql_mode = Some(value.to_string()),
+                    _ => {}
+                }
+                let kind = show_variable_kind(&lname).unwrap_or(VarKind::Text);
+                let shown = normalize_show_variable_value(kind, value);
+                state
+                    .previous_overrides
+                    .push((lname.clone(), overrides.insert(lname, shown)));
+            }
+        }
+        if let Some(mode) = sql_mode {
+            let mut slot = self.sql_mode.lock().expect("session sql_mode lock");
+            state.previous_sql_mode = Some(std::mem::replace(&mut *slot, mode));
+        }
+        Some(state)
     }
 
-    fn end_set_var_hint(&self, previous: Option<String>) {
+    fn end_set_var_hint(&self, state: Option<SetVarHintState>) {
         if let Some(previous) = SET_VAR_PREV_GCML.with(|c| c.take()) {
             sealdb_executor::aggfuncs::set_group_concat_max_len(Some(previous));
         }
-        if let Some(previous) = previous {
+        let Some(state) = state else {
+            return;
+        };
+        if let Some(previous) = state.previous_sql_mode {
             *self.sql_mode.lock().expect("session sql_mode lock") = previous;
+        }
+        let mut overrides = self
+            .stmt_sysvar_overrides
+            .lock()
+            .expect("session stmt sysvar overrides lock");
+        for (name, previous) in state.previous_overrides.into_iter().rev() {
+            match previous {
+                Some(value) => {
+                    overrides.insert(name, value);
+                }
+                None => {
+                    overrides.remove(&name);
+                }
+            }
         }
     }
 
@@ -1803,58 +1854,87 @@ impl Session {
         result
     }
 
-    /// TiDB non-prepared plan cache probe for `EXPLAIN FORMAT='plan_cache'`.
+    /// TiDB non-prepared plan cache probe.
     ///
-    /// The plan shown is always the freshly optimized row plan; this only
-    /// reports whether the statement could enter the cache (warnings) and
-    /// whether the last probe reused an entry (`@@last_plan_from_cache`).
+    /// For `EXPLAIN FORMAT='plan_cache'` the plan shown is always the freshly
+    /// optimized row plan; the probe only reports whether the statement could
+    /// enter the cache (warnings). For ordinary statements it mirrors TiDB's
+    /// non-prepared plan cache: the first execution of a normalized statement
+    /// inserts a plan, later ones are cache hits. Both paths record
+    /// `@@last_plan_from_cache`.
     fn probe_plan_cache(&self, stmt: &Statement) {
-        let format = match stmt {
-            Statement::Explain(explain) => explain.format,
-            _ => ExplainFormat::Row,
+        let hit = match stmt {
+            Statement::Explain(explain) if explain.format == ExplainFormat::PlanCache => {
+                self.probe_explain_plan_cache(explain)
+            }
+            Statement::Select(_) => self.probe_stmt_plan_cache(stmt),
+            _ => false,
         };
-        if format != ExplainFormat::PlanCache {
-            *self
-                .last_plan_from_cache
-                .lock()
-                .expect("session last plan from cache lock") = false;
-            return;
-        }
-        let Statement::Explain(explain) = stmt else {
-            return;
-        };
+        *self
+            .last_plan_from_cache
+            .lock()
+            .expect("session last plan from cache lock") = hit;
+    }
+
+    fn probe_explain_plan_cache(&self, explain: &sealdb_parser::ast::ExplainStmt) -> bool {
         if !*self
             .non_prepared_plan_cache
             .lock()
             .expect("session non prepared plan cache lock")
         {
-            *self
-                .last_plan_from_cache
-                .lock()
-                .expect("session last plan from cache lock") = false;
-            return;
+            return false;
         }
         if let Some(reason) = plan_cache_skip_reason(&explain.stmt) {
             sealdb_expression::note_warning(
                 1105,
                 format!("skip non-prepared plan-cache: {reason}"),
             );
-            *self
-                .last_plan_from_cache
-                .lock()
-                .expect("session last plan from cache lock") = false;
-            return;
+            return false;
         }
         let key = restore_sql(&explain.stmt);
         let mut cached = self
             .plan_cache_stmts
             .lock()
             .expect("session plan cache stmts lock");
-        let hit = !cached.insert(key);
-        *self
-            .last_plan_from_cache
+        !cached.insert(key)
+    }
+
+    /// Cache probe for a plain `SELECT`. A `SET_VAR` hint makes the statement
+    /// uncacheable (the plan depends on the hinted variables), so it is never
+    /// inserted nor matched.
+    fn probe_stmt_plan_cache(&self, stmt: &Statement) -> bool {
+        if !*self
+            .non_prepared_plan_cache
             .lock()
-            .expect("session last plan from cache lock") = hit;
+            .expect("session non prepared plan cache lock")
+        {
+            return false;
+        }
+        if !self
+            .stmt_sysvar_overrides
+            .lock()
+            .expect("session stmt sysvar overrides lock")
+            .is_empty()
+        {
+            return false;
+        }
+        if plan_cache_skip_reason(stmt).is_some() {
+            return false;
+        }
+        let sql = self
+            .current_stmt_sql
+            .lock()
+            .expect("session current stmt sql lock")
+            .clone();
+        if sql.trim().is_empty() {
+            return false;
+        }
+        let key = sealdb_bindinfo::normalize_sql(&sql);
+        let mut cached = self
+            .plan_cache_stmts
+            .lock()
+            .expect("session plan cache stmts lock");
+        !cached.insert(key)
     }
 
     fn acquire_mdl(&self, stmt: &Statement, current_db: &str) -> Result<()> {
@@ -3546,6 +3626,73 @@ fn as_of_null_error() -> Error {
     )
 }
 
+/// State saved while a `/*+ SET_VAR(...) */` hint is active, restored once the
+/// hinted statement finishes.
+struct SetVarHintState {
+    previous_sql_mode: Option<String>,
+    previous_overrides: Vec<(String, Option<String>)>,
+}
+
+/// Every `name = value` pair inside `SET_VAR(...)` hints, in statement order.
+/// Values keep their raw text (quotes stripped) so `sql_mode` lists and
+/// comma-separated enumerations survive.
+fn set_var_hint_pairs(sql: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lower = sql.to_ascii_lowercase();
+    let mut pos = 0;
+    while let Some(found) = lower[pos..].find("set_var") {
+        let after_name = pos + found + "set_var".len();
+        let Some(open) = sql[after_name..].find('(') else {
+            break;
+        };
+        let args_start = after_name + open + 1;
+        let mut quote: Option<char> = None;
+        let mut args_end = None;
+        for (offset, ch) in sql[args_start..].char_indices() {
+            match quote {
+                Some(q) if ch == q => quote = None,
+                Some(_) => {}
+                None if ch == '\'' || ch == '"' => quote = Some(ch),
+                None if ch == ')' => {
+                    args_end = Some(args_start + offset);
+                    break;
+                }
+                None => {}
+            }
+        }
+        let Some(args_end) = args_end else {
+            break;
+        };
+        // Split `name=value` pairs on commas outside quotes.
+        let mut quote: Option<char> = None;
+        let mut start = args_start;
+        let mut pieces = Vec::new();
+        for (offset, ch) in sql[args_start..args_end].char_indices() {
+            match quote {
+                Some(q) if ch == q => quote = None,
+                Some(_) => {}
+                None if ch == '\'' || ch == '"' => quote = Some(ch),
+                None if ch == ',' => {
+                    pieces.push(&sql[start..args_start + offset]);
+                    start = args_start + offset + 1;
+                }
+                None => {}
+            }
+        }
+        pieces.push(&sql[start..args_end]);
+        for piece in pieces {
+            if let Some((name, value)) = piece.split_once('=') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    out.push((name.to_string(), value.trim().to_string()));
+                }
+            }
+        }
+        pos = args_end + 1;
+    }
+    out
+}
+
 /// `/*+ SET_VAR(name=value) */` extracted for the statement, honoring quoted
 /// values so a `sql_mode` list keeps its commas.
 fn set_var_hint_value(sql: &str, wanted: &str) -> Option<String> {
@@ -3581,10 +3728,6 @@ fn set_var_hint_value(sql: &str, wanted: &str) -> Option<String> {
         rest = &rest[after + 1..];
     }
     None
-}
-
-fn set_var_hint_sql_mode(sql: &str) -> Option<String> {
-    set_var_hint_value(sql, "sql_mode")
 }
 
 /// `SET @var = <value>`: TiDB evaluates the right-hand side as an expression
@@ -4953,6 +5096,16 @@ fn select_has_subquery(select: &SelectStmt) -> bool {
 }
 
 fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
+    // `SET_VAR` hints win for the statement that carries them, even over the
+    // typed getters below (e.g. `@@tidb_partition_prune_mode`).
+    if let Some(value) = session
+        .stmt_sysvar_overrides
+        .lock()
+        .expect("session stmt sysvar overrides lock")
+        .get(&name.to_ascii_lowercase())
+    {
+        return Some(value.clone());
+    }
     // Typed getters first: a `SET NAMES` updates the collation field, while a
     // stale override from an earlier explicit assignment must not shadow it.
     if let Some(value) = read_session_sysvar_typed(session, name) {
@@ -4965,6 +5118,11 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
         .get(&name.to_ascii_lowercase())
     {
         return Some(value.clone());
+    }
+    // A variable the session never assigned follows `SET GLOBAL` (TiDB keeps
+    // the session value "unset" for these and reports the global one).
+    if let Some(value) = session.domain.global_override(name) {
+        return Some(value);
     }
     // `SELECT @@tidb_unknown` reports the zero value; `SHOW VARIABLES` only
     // reports variables that actually exist, so keep the fallback here.
@@ -5222,8 +5380,9 @@ enum VarKind {
     Text,
 }
 
-/// Known system variables with their TiDB 8.5 defaults, in name order (TiDB
-/// sorts `SHOW VARIABLES` output by `Variable_name`).
+/// Known system variables with their TiDB 8.5 defaults. Lookups scan the table
+/// linearly, so order is only cosmetic; `SHOW VARIABLES` sorts its output by
+/// `Variable_name` like TiDB.
 const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("allow_auto_random_explicit_insert", "OFF", VarKind::Flag),
     ("authentication_ldap_sasl_bind_root_pwd", "", VarKind::Text),
@@ -5267,7 +5426,11 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("password_reuse_interval", "0", VarKind::Text),
     ("query_cache_size", "1048576", VarKind::Text),
     ("query_cache_type", "OFF", VarKind::Flag),
-    ("sql_mode", "", VarKind::Text),
+    (
+        "sql_mode",
+        "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION",
+        VarKind::Text,
+    ),
     ("system_time_zone", "Asia/Shanghai", VarKind::Text),
     ("time_zone", "SYSTEM", VarKind::Text),
     (
@@ -5315,6 +5478,159 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("transaction_isolation", "REPEATABLE-READ", VarKind::Text),
     ("tx_isolation", "REPEATABLE-READ", VarKind::Text),
     ("wait_timeout", "28800", VarKind::Text),
+    ("max_execution_time", "0", VarKind::Text),
+    ("mpp_version", "UNSPECIFIED", VarKind::Text),
+    ("tidb_allow_batch_cop", "ON", VarKind::Flag),
+    ("tidb_allow_mpp", "ON", VarKind::Flag),
+    (
+        "tidb_broadcast_join_threshold_count",
+        "10240",
+        VarKind::Text,
+    ),
+    (
+        "tidb_broadcast_join_threshold_size",
+        "104857600",
+        VarKind::Text,
+    ),
+    (
+        "tidb_default_string_match_selectivity",
+        "0.8",
+        VarKind::Text,
+    ),
+    ("tidb_distsql_scan_concurrency", "15", VarKind::Text),
+    ("tidb_enable_cache_prepare_stmt", "OFF", VarKind::Flag),
+    ("tidb_enable_cascades_planner", "OFF", VarKind::Flag),
+    ("tidb_enable_extended_stats", "OFF", VarKind::Flag),
+    ("tidb_enable_index_merge", "ON", VarKind::Flag),
+    ("tidb_enable_index_merge_join", "OFF", VarKind::Flag),
+    (
+        "tidb_enable_inl_join_inner_multi_pattern",
+        "ON",
+        VarKind::Flag,
+    ),
+    (
+        "tidb_enable_new_only_full_group_by_check",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_enable_null_aware_anti_join", "ON", VarKind::Flag),
+    ("tidb_enable_outer_join_reorder", "ON", VarKind::Flag),
+    ("tidb_enable_paging", "ON", VarKind::Flag),
+    ("tidb_enable_prepared_plan_cache", "ON", VarKind::Flag),
+    (
+        "tidb_enable_pseudo_for_outdated_stats",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_enable_vectorized_expression", "ON", VarKind::Flag),
+    ("tidb_enforce_mpp", "OFF", VarKind::Flag),
+    ("tidb_executor_concurrency", "5", VarKind::Text),
+    ("tidb_hash_join_version", "legacy", VarKind::Text),
+    ("tidb_index_join_batch_size", "25000", VarKind::Text),
+    (
+        "tidb_index_join_double_read_penalty_cost_rate",
+        "0",
+        VarKind::Text,
+    ),
+    ("tidb_index_lookup_size", "20000", VarKind::Text),
+    (
+        "tidb_index_merge_intersection_concurrency",
+        "-1",
+        VarKind::Text,
+    ),
+    ("tidb_index_serial_scan_concurrency", "1", VarKind::Text),
+    ("tidb_init_chunk_size", "1", VarKind::Text),
+    (
+        "tidb_isolation_read_engines",
+        "tikv,tiflash,tidb",
+        VarKind::Text,
+    ),
+    (
+        "tidb_max_bytes_before_tiflash_external_group_by",
+        "-1",
+        VarKind::Text,
+    ),
+    (
+        "tidb_max_bytes_before_tiflash_external_join",
+        "-1",
+        VarKind::Text,
+    ),
+    (
+        "tidb_max_bytes_before_tiflash_external_sort",
+        "-1",
+        VarKind::Text,
+    ),
+    ("tidb_max_chunk_size", "32", VarKind::Text),
+    ("tidb_max_paging_size", "50000", VarKind::Text),
+    ("tidb_merge_join_concurrency", "1", VarKind::Text),
+    ("tidb_min_paging_size", "128", VarKind::Text),
+    ("tidb_opt_advanced_join_hint", "ON", VarKind::Flag),
+    ("tidb_opt_broadcast_cartesian_join", "ON", VarKind::Flag),
+    ("tidb_opt_concurrency_factor", "3", VarKind::Text),
+    ("tidb_opt_copcpu_factor", "3", VarKind::Text),
+    ("tidb_opt_correlation_exp_factor", "1", VarKind::Text),
+    ("tidb_opt_correlation_threshold", "0.9", VarKind::Text),
+    ("tidb_opt_cpu_factor", "3", VarKind::Text),
+    ("tidb_opt_derive_topn", "OFF", VarKind::Flag),
+    ("tidb_opt_desc_factor", "3", VarKind::Text),
+    ("tidb_opt_disk_factor", "1.5", VarKind::Text),
+    ("tidb_opt_distinct_agg_push_down", "OFF", VarKind::Flag),
+    ("tidb_opt_enable_advanced_join_reorder", "ON", VarKind::Flag),
+    (
+        "tidb_opt_enable_correlation_adjustment",
+        "ON",
+        VarKind::Flag,
+    ),
+    ("tidb_opt_enable_late_materialization", "ON", VarKind::Flag),
+    (
+        "tidb_opt_enable_mpp_shared_cte_execution",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_opt_fix_control", "", VarKind::Text),
+    ("tidb_opt_force_inline_cte", "OFF", VarKind::Flag),
+    ("tidb_opt_join_reorder_threshold", "0", VarKind::Text),
+    ("tidb_opt_limit_push_down_threshold", "100", VarKind::Text),
+    ("tidb_opt_memory_factor", "0.001", VarKind::Text),
+    (
+        "tidb_opt_mpp_outer_join_fixed_build_side",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_opt_network_factor", "1", VarKind::Text),
+    (
+        "tidb_opt_ordering_index_selectivity_ratio",
+        "-1",
+        VarKind::Text,
+    ),
+    (
+        "tidb_opt_ordering_index_selectivity_threshold",
+        "0",
+        VarKind::Text,
+    ),
+    ("tidb_opt_prefer_range_scan", "ON", VarKind::Flag),
+    ("tidb_opt_prefix_index_single_scan", "ON", VarKind::Flag),
+    ("tidb_opt_projection_push_down", "ON", VarKind::Flag),
+    ("tidb_opt_range_max_size", "67108864", VarKind::Text),
+    ("tidb_opt_scan_factor", "1.5", VarKind::Text),
+    ("tidb_opt_seek_factor", "20", VarKind::Text),
+    ("tidb_opt_skew_distinct_agg", "OFF", VarKind::Flag),
+    ("tidb_opt_three_stage_distinct_agg", "ON", VarKind::Flag),
+    ("tidb_opt_tiflash_concurrency_factor", "24", VarKind::Text),
+    ("tidb_opt_use_invisible_indexes", "OFF", VarKind::Flag),
+    ("tidb_opt_write_row_id", "OFF", VarKind::Flag),
+    ("tidb_optimizer_selectivity_level", "0", VarKind::Text),
+    ("tidb_plan_cache_max_plan_size", "2097152", VarKind::Text),
+    (
+        "tidb_prefer_broadcast_join_by_exchange_data_size",
+        "OFF",
+        VarKind::Flag,
+    ),
+    ("tidb_read_consistency", "strict", VarKind::Text),
+    ("tidb_replica_read", "leader", VarKind::Text),
+    ("tidb_runtime_filter_mode", "OFF", VarKind::Text),
+    ("tidb_stats_load_sync_wait", "100", VarKind::Text),
+    ("tidb_store_batch_size", "4", VarKind::Text),
 ];
 
 /// Value of a sysvar when selected through `@@name` (boolean flags render as
@@ -5648,6 +5964,9 @@ fn show_variables_result(session: &Session, stmt: &sealdb_parser::ast::ShowStmt)
             resolve_show_variable(session, name, global).map(|v| ((*name).to_string(), v))
         })
         .collect();
+    // TiDB sorts `SHOW VARIABLES` by `Variable_name`; the table itself is not
+    // required to be ordered, so sort explicitly.
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
     match &stmt.var_filter {
         None => {}
         Some(sealdb_parser::ast::ShowVarFilter::Like(pattern)) => {
@@ -11115,6 +11434,130 @@ mod tests {
                 .unwrap()
                 .display_rows()[0][0],
             "gbk"
+        );
+    }
+
+    /// `/*+ SET_VAR(...) */` applies to exactly the hinted statement, generic
+    /// sysvars included (the hint value is visible through `@@name`), and a
+    /// never-assigned session variable follows `SET GLOBAL`.
+    #[test]
+    fn test_set_var_hint_scopes_sysvars() {
+        let session = Session::new();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@tidb_read_consistency")
+                .unwrap()
+                .display_rows()[0][0],
+            "strict"
+        );
+        assert_eq!(
+            session
+                .execute_stmt(
+                    "SELECT /*+ SET_VAR(tidb_read_consistency=\"weak\") */ @@tidb_read_consistency"
+                )
+                .unwrap()
+                .display_rows()[0][0],
+            "weak"
+        );
+        // Back to the untouched default after the hinted statement.
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@tidb_read_consistency")
+                .unwrap()
+                .display_rows()[0][0],
+            "strict"
+        );
+
+        // Typed session state is shadowed only inside the hinted statement.
+        assert_eq!(
+            session
+                .execute_stmt(
+                    "SELECT /*+ SET_VAR(tidb_partition_prune_mode=\"static\") */ \
+                     @@tidb_partition_prune_mode"
+                )
+                .unwrap()
+                .display_rows()[0][0],
+            "static"
+        );
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@tidb_partition_prune_mode")
+                .unwrap()
+                .display_rows()[0][0],
+            "dynamic"
+        );
+
+        // `SET_GLOBAL` is visible to sessions that never assigned the variable.
+        session
+            .execute_stmt("SET GLOBAL max_execution_time = 1000")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@max_execution_time")
+                .unwrap()
+                .display_rows()[0][0],
+            "1000"
+        );
+        session
+            .execute_stmt("SET SESSION max_execution_time = 2000")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@max_execution_time")
+                .unwrap()
+                .display_rows()[0][0],
+            "2000"
+        );
+    }
+
+    /// Non-prepared plan cache: the second execution of a literal-normalized
+    /// statement is a hit, and a `SET_VAR` hint breaks the cache.
+    #[test]
+    fn test_non_prepared_plan_cache_hint_breaks_cache() {
+        let session = Session::new();
+        session.execute_stmt("CREATE DATABASE pc_db").unwrap();
+        session.execute_stmt("USE pc_db").unwrap();
+        session
+            .execute_stmt("CREATE TABLE pc (a INT, b INT, KEY (b))")
+            .unwrap();
+        session
+            .execute_stmt("SET tidb_enable_non_prepared_plan_cache = true")
+            .unwrap();
+        session
+            .execute_stmt("SELECT * FROM pc WHERE b < 10 AND a = 1")
+            .unwrap();
+        session
+            .execute_stmt("SELECT * FROM pc WHERE b < 5 AND a = 2")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@last_plan_from_cache")
+                .unwrap()
+                .display_rows()[0][0],
+            "1"
+        );
+        session
+            .execute_stmt(
+                "SELECT /*+ SET_VAR(tidb_distsql_scan_concurrency=10) */ * FROM pc \
+                 WHERE b < 5 AND a = 2",
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@last_plan_from_cache")
+                .unwrap()
+                .display_rows()[0][0],
+            "0"
+        );
+        session
+            .execute_stmt("SELECT * FROM pc WHERE b < 5 AND a = 2")
+            .unwrap();
+        assert_eq!(
+            session
+                .execute_stmt("SELECT @@last_plan_from_cache")
+                .unwrap()
+                .display_rows()[0][0],
+            "1"
         );
     }
 

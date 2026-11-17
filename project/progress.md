@@ -3585,6 +3585,57 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 转向 R3 中与代价模型同源的 `planner/core/plan_cost_ver2`，并推进
     `explain_indexmerge_stats`（96%，首差 196/203）。
 
+### 2026-11-17（`sessionctx/setvar` 转绿：SET_VAR 通用作用域、sysvar 默认值补齐、非预处理 plan cache）
+
+- **Phase**: R7 `sessionctx/setvar` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `SET_VAR` hint 从只认 `sql_mode` / `group_concat_max_len` 扩展为通用实现：
+    `set_var_hint_pairs` 按引号感知拆分 `name=value` 列表，值写入
+    `stmt_sysvar_overrides`（语句级 map），`read_session_sysvar` 优先读该 map，
+    因此 `SELECT @@name` 能在被 hint 的语句内看到值（含
+    `tidb_partition_prune_mode` 这类带 typed 字段的变量），语句结束按栈恢复。
+  - `SHOW_VARIABLE_DEFAULTS` 从 60 余项补齐到 141 项，覆盖 TiDB 8.5 的
+    optimizer / executor / plan-cache / paging / TiFlash 成本开关（如
+    `tidb_opt_scan_factor=1.5`、`tidb_index_lookup_size=20000`、
+    `tidb_hash_join_version=legacy`、`mpp_version=UNSPECIFIED`）；布尔项按
+    `VarKind::Flag` 存储，`SELECT @@flag` 输出 `1/0`、`SHOW VARIABLES` 输出
+    `ON/OFF`。`SHOW VARIABLES` 显式按 `Variable_name` 排序。
+  - `sql_mode` 默认值对齐 TiDB 8.5：
+    `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,
+    ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION`
+    （domain 全局默认与 sysvar 表同步）。
+  - 会话变量未显式赋值时回落到 `SET GLOBAL` 的 domain override，
+    使 `SET GLOBAL max_execution_time=1000` 后同会话/新连接读到 `1000`，
+    而 `SET SESSION` 仍优先。
+  - 非预处理 plan cache 落地：开启
+    `tidb_enable_non_prepared_plan_cache` 后，普通 `SELECT` 以
+    `bindinfo::normalize_sql`（字面量归一为 `?`）为 key 做命中探测，
+    `@@last_plan_from_cache` 如实返回 1/0；带 `SET_VAR` hint 的语句视为
+    不可缓存（既不查也不插入），与 TiDB 一致。
+  - 单测新增 `test_set_var_hint_scopes_sysvars`、
+    `test_non_prepared_plan_cache_hint_breaks_cache`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t sessionctx/setvar`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t sessionctx/setvar`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - `cargo test -p sealdb-session` → 125 passed
+  - `./tests/integrationtest/run-tests.sh -s memory`（green+local 全量）
+    → `PASS: memory=103 tikv=0 skipped=151`
+  - `./tests/integrationtest/run-tests.sh -s tikv`（green+local 全量，干净 PD/TiKV）
+    → `PASS: memory=0 tikv=102 skipped=152`
+- **阻塞/风险**:
+  - `SET_VAR` 目前只影响 `@@name` 的读取与 `sql_mode` 语义；成本因子类 hint
+    尚未真正驱动优化器（当前语料只校验取值）。
+  - 非预处理 plan cache 只记录命中/未命中，不缓存/复用物理计划；key 用
+    文本归一化，与 TiDB 的 `PlanCacheKey`（含 schema 版本）还有差距。
+  - `sql_mode` 默认集扩大后 `NO_ZERO_DATE` / `ERROR_FOR_DIVISION_BY_ZERO`
+    在表达式层生效，需关注后续导入的 upsert/时间类语料。
+- **下一步**:
+  - 回到 `explain_complex_stats`（仅差 `SHOW STATS_HISTOGRAMS` 与投影裁剪），
+    先补 `SHOW STATS_HISTOGRAMS WHERE …`（15 列、分区行、内存占用列）以同时
+    解锁 `executor/analyze`、`globalindex/analyze`。
+
 ## 7. 更新模板
 
 每次更新追加一条：
