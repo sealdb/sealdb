@@ -1534,6 +1534,7 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "DATE_ADD" | "ADDDATE" => eval_date_add_sub(func, schema, row, false),
         "DATE_SUB" | "SUBDATE" => eval_date_add_sub(func, schema, row, true),
         "JSON_EXTRACT" | "JSON_EXTRACT_SCALAR" => eval_json_extract(func, schema, row),
+        "JSON_SET" => eval_json_set(func, schema, row),
         "JSON_UNQUOTE" => eval_json_unquote(func, schema, row),
         "TIMESTAMPADD" => eval_timestamp_add(func, schema, row),
         "TIMESTAMPDIFF" => eval_timestamp_diff(func, schema, row),
@@ -1825,6 +1826,156 @@ fn eval_json_unquote(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> R
         Ok(serde_json::Value::String(s)) => Ok(Datum::Bytes(s.into_bytes())),
         _ => Ok(value),
     }
+}
+
+/// MySQL `JSON_SET(doc, path, val[, path, val]…)`: write each value at its
+/// path, creating missing object members, and return the new document text.
+fn eval_json_set(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if func.args.len() < 3 || func.args.len().is_multiple_of(2) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            format!(
+                "Incorrect parameter count in the call to native function '{}'",
+                func.name.to_ascii_lowercase()
+            ),
+        ));
+    }
+    let doc = eval_expr_with_row(&func.args[0], schema, row)?;
+    if doc.is_null() {
+        return Ok(Datum::Null);
+    }
+    let doc_bytes = doc.as_bytes();
+    let mut parsed: serde_json::Value = serde_json::from_slice(&doc_bytes).map_err(|_| {
+        Error::new(
+            sealdb_errno::ERR_INVALID_JSON_TEXT_IN_PARAM,
+            format!(
+                "Invalid JSON text in argument 1 to function {}: \"{}\".",
+                func.name.to_ascii_lowercase(),
+                String::from_utf8_lossy(&doc_bytes)
+            ),
+        )
+    })?;
+    for pair in func.args[1..].chunks(2) {
+        let path = eval_expr_with_row(&pair[0], schema, row)?;
+        let value = eval_expr_with_row(&pair[1], schema, row)?;
+        if path.is_null() {
+            return Ok(Datum::Null);
+        }
+        let path = String::from_utf8_lossy(&path.as_bytes()).to_string();
+        json_path_set(&mut parsed, &path, datum_to_json(&value));
+    }
+    Ok(Datum::Bytes(
+        serde_json::to_vec(&parsed).unwrap_or_else(|_| b"null".to_vec()),
+    ))
+}
+
+/// `Datum` → JSON value, the way TiDB coerces a `JSON_SET` argument.
+fn datum_to_json(datum: &Datum) -> serde_json::Value {
+    match datum {
+        Datum::Null => serde_json::Value::Null,
+        Datum::I64(v) => serde_json::Value::from(*v),
+        Datum::U64(v) => serde_json::Value::from(*v),
+        Datum::F64(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        other => serde_json::Value::String(String::from_utf8_lossy(&other.as_bytes()).to_string()),
+    }
+}
+
+/// One `JSON_SET` path component.
+enum JsonPathPart {
+    Key(String),
+    Index(usize),
+    /// `[*]` / `.*`: only valid for reads, rejected by `JSON_SET`.
+    Invalid,
+}
+
+fn parse_json_path(path: &str) -> Option<Vec<JsonPathPart>> {
+    let rest = path.trim().strip_prefix('$')?;
+    let mut parts = Vec::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '.' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    parts.push(JsonPathPart::Invalid);
+                    continue;
+                }
+                let mut key = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == '.' || c == '[' {
+                        break;
+                    }
+                    key.push(c);
+                    chars.next();
+                }
+                if key.is_empty() {
+                    return None;
+                }
+                parts.push(JsonPathPart::Key(key));
+            }
+            '[' => {
+                let mut num = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c == ']' {
+                        break;
+                    }
+                    num.push(c);
+                    chars.next();
+                }
+                if chars.next() != Some(']') {
+                    return None;
+                }
+                match num.trim() {
+                    "*" => parts.push(JsonPathPart::Invalid),
+                    other => parts.push(JsonPathPart::Index(other.parse().ok()?)),
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(parts)
+}
+
+/// Apply `new` at `parts` inside `value`, materialising missing containers.
+fn json_path_set(value: &mut serde_json::Value, path: &str, new: serde_json::Value) {
+    let Some(parts) = parse_json_path(path) else {
+        return;
+    };
+    fn set_at(target: &mut serde_json::Value, parts: &[JsonPathPart], new: serde_json::Value) {
+        let Some((head, tail)) = parts.split_first() else {
+            *target = new;
+            return;
+        };
+        match head {
+            JsonPathPart::Key(key) => {
+                let slot = match target {
+                    serde_json::Value::Object(map) => map.entry(key.clone()),
+                    other => {
+                        *other = serde_json::Value::Object(serde_json::Map::new());
+                        let serde_json::Value::Object(map) = other else {
+                            return;
+                        };
+                        map.entry(key.clone())
+                    }
+                };
+                let child = slot.or_insert(serde_json::Value::Null);
+                set_at(child, tail, new);
+            }
+            JsonPathPart::Index(idx) => {
+                let serde_json::Value::Array(items) = target else {
+                    return;
+                };
+                while items.len() <= *idx {
+                    items.push(serde_json::Value::Null);
+                }
+                set_at(&mut items[*idx], tail, new);
+            }
+            JsonPathPart::Invalid => {}
+        }
+    }
+    set_at(value, &parts, new);
 }
 
 /// Resolve a MySQL JSON path (`$.a.b`, `$[0]`, `$.a[1].b`) against a document.

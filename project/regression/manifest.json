@@ -2272,7 +2272,7 @@
     {
       "name": "session/bootstrap_upgrade",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/bootstrap_upgrade.test",
       "result": "r/session/bootstrap_upgrade.result",
       "has_result": true,

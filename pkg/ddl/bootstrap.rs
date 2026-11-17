@@ -153,6 +153,57 @@ const SYSTEM_TABLES: &[&str] = &[
     "CREATE TABLE opt_rule_blacklist (\n\
         name CHAR(100) NOT NULL\n\
     )",
+    // TiDB `mysql.tidb_background_subtask`: DDL/lightning background tasks.
+    // Distributing reorg jobs insert `(id, state, checkpoint, summary)` rows
+    // and patch `summary` in place, so every other column needs to be nullable.
+    "CREATE TABLE tidb_background_subtask (\n\
+        id BIGINT NOT NULL AUTO_INCREMENT,\n\
+        step SMALLINT,\n\
+        namespace VARCHAR(256),\n\
+        task_key VARCHAR(256),\n\
+        ddl_physical_tid BIGINT,\n\
+        `type` INT,\n\
+        exec_id VARCHAR(256),\n\
+        exec_expired TIMESTAMP,\n\
+        state SMALLINT,\n\
+        checkpoint LONGBLOB,\n\
+        concurrency SMALLINT,\n\
+        create_time TIMESTAMP,\n\
+        start_time TIMESTAMP,\n\
+        state_update_time TIMESTAMP,\n\
+        end_time TIMESTAMP,\n\
+        meta LONGBLOB,\n\
+        ordinal SMALLINT,\n\
+        `error` LONGBLOB,\n\
+        summary LONGBLOB,\n\
+        PRIMARY KEY (id),\n\
+        KEY task_key (namespace, task_key)\n\
+    )",
+    // TiDB `mysql.tidb_background_subtask_history`: finished-task archive with
+    // the same columns (tests copy rows with `INSERT … SELECT *`).
+    "CREATE TABLE tidb_background_subtask_history (\n\
+        id BIGINT NOT NULL AUTO_INCREMENT,\n\
+        step SMALLINT,\n\
+        namespace VARCHAR(256),\n\
+        task_key VARCHAR(256),\n\
+        ddl_physical_tid BIGINT,\n\
+        `type` INT,\n\
+        exec_id VARCHAR(256),\n\
+        exec_expired TIMESTAMP,\n\
+        state SMALLINT,\n\
+        checkpoint LONGBLOB,\n\
+        concurrency SMALLINT,\n\
+        create_time TIMESTAMP,\n\
+        start_time TIMESTAMP,\n\
+        state_update_time TIMESTAMP,\n\
+        end_time TIMESTAMP,\n\
+        meta LONGBLOB,\n\
+        ordinal SMALLINT,\n\
+        `error` LONGBLOB,\n\
+        summary LONGBLOB,\n\
+        PRIMARY KEY (id),\n\
+        KEY task_key (namespace, task_key)\n\
+    )",
 ];
 
 /// Create the `mysql` schema and its system tables when the cluster has no
@@ -173,15 +224,26 @@ pub fn bootstrap_system_tables(meta: &mut Mutator) -> Result<bool> {
         meta.create_database(&db)?;
         created = true;
     }
-    if has(MYSQL_SCHEMA) {
-        if created {
-            meta.gen_schema_version()?;
+    let db_id = match dbs
+        .iter()
+        .find(|db| db.name.l().eq_ignore_ascii_case(MYSQL_SCHEMA))
+    {
+        Some(db) => db.id,
+        None => {
+            let db_id = meta.gen_global_id()?;
+            let db = DBInfo::new(db_id, MYSQL_SCHEMA);
+            meta.create_database(&db)?;
+            created = true;
+            db_id
         }
-        return Ok(created);
-    }
-    let db_id = meta.gen_global_id()?;
-    let db = DBInfo::new(db_id, MYSQL_SCHEMA);
-    meta.create_database(&db)?;
+    };
+    // Storage created by an older build already has the `mysql` schema, so
+    // upgrade it table by table instead of skipping bootstrap wholesale.
+    let existing: Vec<String> = meta
+        .list_tables(db_id)?
+        .into_iter()
+        .map(|table| table.name.l().to_ascii_lowercase())
+        .collect();
     let parser = Parser::new();
     for sql in SYSTEM_TABLES {
         let stmt = parser.parse_one_stmt(sql)?;
@@ -190,8 +252,17 @@ pub fn bootstrap_system_tables(meta: &mut Mutator) -> Result<bool> {
         };
         let table_id = meta.gen_global_id()?;
         let info = build_table_info(&create, table_id)?;
+        if existing
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(info.name.l()))
+        {
+            continue;
+        }
         meta.create_table_or_view(db_id, &info)?;
+        created = true;
     }
-    meta.gen_schema_version()?;
-    Ok(true)
+    if created {
+        meta.gen_schema_version()?;
+    }
+    Ok(created)
 }

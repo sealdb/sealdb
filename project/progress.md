@@ -3828,6 +3828,37 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     与 `order_index` hint 的 1815 冲突校验）。
   - `planner/core/casetest/expression_rewriter`（表达式重写规则的形状对齐）。
 
+### 2026-11-18（`session/bootstrap_upgrade` 转绿：`mysql.tidb_background_subtask` 实表、可增量 bootstrap、`JSON_SET`）
+
+- **Phase**: R5 `session/bootstrap_upgrade` → green（Mem + TiKV 双通过）
+- **完成**:
+  - bootstrap 新增两张真实系统表 `mysql.tidb_background_subtask` /
+    `..._history`，列序与 TiDB 一致（19 列，除 `id` 外全部可空），
+    支持显式 `id` 插入、`INSERT … SELECT *` 归档、`TRUNCATE`。
+  - `bootstrap_system_tables` 从「mysql schema 已存在就整体跳过」改为
+    逐表幂等补齐：老存储（如复用中的 TiKV store）启动时会补建缺失系统表
+    并 bump schema version。
+  - 表达式新增 `JSON_SET(doc, path, val[, path, val]…)`：复用 JSON 路径
+    解析，支持 `$.a`、`$.a.b`、`$[i]` 写入并自动补建对象/数组；参数个数
+    为偶数或少于 3 时报错，`path` 为 NULL 返回 NULL。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t session/bootstrap_upgrade --status pending`
+    → `PASS: memory=1 tikv=1 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=101 tikv=100 skipped=154`（`executor/adapter` 为 `skip_tikv`）
+  - manifest：`session/bootstrap_upgrade` → `green`，green 100→101
+    （R5 3→4，pending 135→134）。
+- **阻塞/风险**:
+  - 系统表 DDL 里 `type` / `error` 用了反引号，`SHOW CREATE TABLE` 会带上
+    引号；若后续语料比对这两张表的建表语句需要再对齐。
+  - 逐表补齐逻辑每次启动都会读 `mysql` 全部表定义；系统表数量继续增长时
+    可换成按 `bootstrap_version` 记录的一次性升级列表。
+  - `JSON_SET` 未实现 MySQL 的 `JSON_SET` 深路径类型错误（如对标量取子键
+    应报 3149），当前静默忽略非法路径。
+- **下一步**:
+  - `new_character_set_invalid`（非法字符集/校验规则的建表错误口径）。
+  - `common_collation`（`coercibility()` 与字符集推导）。
+
 ## 7. 更新模板
 
 每次更新追加一条：
