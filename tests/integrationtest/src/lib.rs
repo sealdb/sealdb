@@ -383,22 +383,22 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             return Err(Error::unsupported(format!("test directive -- {rest}")));
         }
         // Session directives are standalone lines that emit no rows.
-        if buf.trim().is_empty() {
-            if let Some(directive) = parse_session_directive(trimmed) {
-                steps.push(Step {
-                    sql: String::new(),
-                    expected_error: None,
-                    sorted: false,
-                    show_warnings: false,
-                    echo: None,
-                    log_result: true,
-                    show_info: false,
-                    replace_regex: Vec::new(),
-                    replace_column: Vec::new(),
-                    directive: Some(directive),
-                });
-                continue;
-            }
+        if buf.trim().is_empty()
+            && let Some(directive) = parse_session_directive(trimmed)
+        {
+            steps.push(Step {
+                sql: String::new(),
+                expected_error: None,
+                sorted: false,
+                show_warnings: false,
+                echo: None,
+                log_result: true,
+                show_info: false,
+                replace_regex: Vec::new(),
+                replace_column: Vec::new(),
+                directive: Some(directive),
+            });
+            continue;
         }
         if !buf.is_empty() {
             buf.push('\n');
@@ -945,7 +945,15 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
             if step.show_warnings && !qr.warnings.is_empty() {
                 lines.push("Level\tCode\tMessage".into());
                 for (code, msg) in &qr.warnings {
-                    lines.push(format!("Warning\t{code}\t{msg}"));
+                    // Codes >= 1_000_000 are TiDB notes (e.g. `Using the
+                    // bindSQL: …`); negative codes mark errors.
+                    if *code >= 1_000_000 {
+                        lines.push(format!("Note\t{}\t{msg}", code - 1_000_000));
+                    } else if *code < 0 {
+                        lines.push(format!("Error\t{}\t{msg}", -code));
+                    } else {
+                        lines.push(format!("Warning\t{code}\t{msg}"));
+                    }
                 }
             }
             if step.show_info {

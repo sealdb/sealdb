@@ -204,6 +204,9 @@ impl Storage for TikvStorage {
     }
 }
 
+/// Buffered mutations: key → `Some(value)` for a write, `None` for a delete.
+type WriteOverlay = HashMap<Vec<u8>, Option<Vec<u8>>>;
+
 struct TikvTransaction {
     inner: Option<TikvTxn>,
     client: TransactionClient,
@@ -212,9 +215,9 @@ struct TikvTransaction {
     /// When set (RC after `refresh_snapshot`), plain get/scan read at this TS.
     read_snapshot: Option<Snapshot>,
     /// Own writes so RC snapshot reads still see uncommitted mutations.
-    writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    writes: WriteOverlay,
     /// `SAVEPOINT` markers: name plus a snapshot of the write overlay.
-    savepoints: Vec<(String, HashMap<Vec<u8>, Option<Vec<u8>>>)>,
+    savepoints: Vec<(String, WriteOverlay)>,
 }
 
 impl TikvTransaction {
@@ -290,7 +293,9 @@ impl Transaction for TikvTransaction {
 
     fn start_timestamp(&self) -> Option<u64> {
         use tikv_client::TimestampExt;
-        self.inner.as_ref().map(|txn| txn.start_timestamp().version())
+        self.inner
+            .as_ref()
+            .map(|txn| txn.start_timestamp().version())
     }
 
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -432,7 +437,8 @@ impl Transaction for TikvTransaction {
     fn savepoint(&mut self, name: &str) -> Result<()> {
         self.savepoints
             .retain(|(sp, _)| !sp.eq_ignore_ascii_case(name));
-        self.savepoints.push((name.to_string(), self.writes.clone()));
+        self.savepoints
+            .push((name.to_string(), self.writes.clone()));
         Ok(())
     }
 

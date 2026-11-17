@@ -624,9 +624,7 @@ impl Table {
     /// `count - null_count`. `None` when the column has no histogram.
     pub fn column_not_null_count(&self, column: &str) -> Option<f64> {
         let col = self.column(column)?;
-        if col.histogram.is_none() {
-            return None;
-        }
+        col.histogram.as_ref()?;
         Some(self.count.saturating_sub(col.null_count) as f64)
     }
 
@@ -682,9 +680,7 @@ impl Table {
         ranges: &[StatsRange],
     ) -> Option<f64> {
         let col = self.column(column)?;
-        if col.histogram.is_none() {
-            return None;
-        }
+        col.histogram.as_ref()?;
         let realtime = self.count as f64;
         // An analyzed-but-empty table has no rows to distribute over ranges.
         if realtime < 1.0 {

@@ -253,6 +253,15 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // `SELECT EXISTS (SELECT … WHERE corr LIMIT n) FROM t`: TiDB
+                // decorrelates to a left-outer semi HashJoin (the LIMIT cannot
+                // change existence); `no_decorrelate()` keeps a correlated Apply.
+                if let Some(plan) =
+                    exists_limit_explain_plan(select, is, current_db, stats, prune_mode)
+                {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // `EXISTS (SELECT … HAVING agg = outer)` decorrelates into a
                 // semi HashJoin against a one-row aggregate build side.
                 if let Some(plan) =
@@ -953,6 +962,9 @@ impl PlanBuilder {
             Statement::DropBinding(_) => Ok(PhysicalPlan::Simple {
                 kind: "DropBinding".to_string(),
             }),
+            Statement::SetBinding(_) => Ok(PhysicalPlan::Simple {
+                kind: "SetBinding".to_string(),
+            }),
             Statement::Set(_) => Ok(PhysicalPlan::Simple {
                 kind: "Set".to_string(),
             }),
@@ -1028,6 +1040,7 @@ fn dml_scan_select(
     table: &TableName,
     join: Option<&sealdb_parser::ast::Join>,
     selection: Option<ExprNode>,
+    text: &str,
 ) -> SelectStmt {
     let (join, selection) = match join {
         Some(join) => dml_join_conditions(join, selection),
@@ -1054,7 +1067,9 @@ fn dml_scan_select(
         lock: Default::default(),
         lock_wait: Default::default(),
         with: None,
-        text: String::new(),
+        // Keep the DML statement text (optimizer hints) for the scan plan.
+        text: text.to_string(),
+        synthesized: true,
     }
 }
 
@@ -1143,10 +1158,10 @@ fn dml_join_conditions(
         }
     }
     conjuncts.extend(derived);
-    (
-        Some(join),
-        ExprNode::compose_cnf(conjuncts).or(Some(selection)),
-    )
+    // The promoted key (and any mirrored filters) now live on the join, so the
+    // remaining predicate is exactly the leftover conjuncts — an empty list
+    // must clear the selection instead of restoring the original.
+    (Some(join), ExprNode::compose_cnf(conjuncts))
 }
 
 /// Replace the table qualifier of every column reference in a conjunct.
@@ -1412,8 +1427,8 @@ fn dml_delete_virtual_projection(
     let mut extra: Vec<String> = Vec::new();
     for index in &info.indices {
         for part in &index.columns {
-            if let Some(expr) = super::expr_index::part_expr(&info, part) {
-                let text = expr_text_with_numeric_cast(&table, &info, &expr);
+            if let Some(expr) = super::expr_index::part_expr(info, part) {
+                let text = expr_text_with_numeric_cast(table, info, &expr);
                 if !extra.contains(&text) {
                     extra.push(text);
                 }
@@ -1429,7 +1444,10 @@ fn dml_delete_virtual_projection(
             // generated column; otherwise only the ones a key part stores.
             !extra.is_empty()
                 || info.indices.iter().any(|index| {
-                    index.columns.iter().any(|part| part.name.o() == col.name.o())
+                    index
+                        .columns
+                        .iter()
+                        .any(|part| part.name.o() == col.name.o())
                 })
         })
         .map(|col| format!("{schema}.{table}.{}", col.name.o()))
@@ -1499,9 +1517,15 @@ impl PlanBuilder {
         let Some(select) = insert.select.as_deref() else {
             return Ok(None);
         };
+        let mut select = select.clone();
+        // Hints written before `INSERT` (`INSERT /*+ use_index(t2, idx) */ …`)
+        // belong to the source query the DML reads.
+        if !insert.text.is_empty() {
+            select.text = insert.text.clone();
+        }
         let plan = with_dml_source(|| {
             self.build_with_schema(
-                &Statement::Select(select.clone()),
+                &Statement::Select(select),
                 is,
                 current_db,
                 stats,
@@ -1527,6 +1551,7 @@ impl PlanBuilder {
             &update.table,
             update.join.as_ref(),
             update.selection.clone(),
+            &update.text,
         );
         let plan = self.build_with_schema(
             &Statement::Select(select),
@@ -1557,6 +1582,7 @@ impl PlanBuilder {
             &delete.table,
             delete.join.as_ref(),
             delete.selection.clone(),
+            &delete.text,
         );
         // TiDB's DML children read the row handle only, which lets a covering
         // secondary index serve the scan (`Delete → IndexReader`). For an
@@ -1723,16 +1749,10 @@ impl PlanBuilder {
                 cell.borrow_mut()
                     .insert(from.name.to_ascii_lowercase(), named)
             });
-            let saved_rows = RECURSIVE_CTE_SEED_ROWS.with(|cell| {
-                cell.borrow_mut().replace((from.name.clone(), seed_rows))
-            });
-            let built = self.build_with_schema(
-                &Statement::Select(rec),
-                is,
-                current_db,
-                stats,
-                prune_mode,
-            );
+            let saved_rows = RECURSIVE_CTE_SEED_ROWS
+                .with(|cell| cell.borrow_mut().replace((from.name.clone(), seed_rows)));
+            let built =
+                self.build_with_schema(&Statement::Select(rec), is, current_db, stats, prune_mode);
             RECURSIVE_CTE_SEED_ROWS.with(|cell| *cell.borrow_mut() = saved_rows);
             Some(Box::new(built?))
         } else {
@@ -1741,8 +1761,15 @@ impl PlanBuilder {
         // TiDB never inlines `WITH RECURSIVE`: the CTE needs a shared
         // `CTETableReader`, so even a constant seed (`select 1 union select
         // a+1 from cte`) stays a materialized `CTEFullScan`.
+        // `MERGE()` on the CTE body forces inlining even when the CTE is
+        // referenced more than once (`WITH cte AS (SELECT /*+ MERGE() */ …)`).
+        let merge_hint = {
+            let text = seed_select.text.to_ascii_lowercase();
+            text.contains("/*+ merge(") || text.contains("/*+merge(")
+        };
         let inline = !recursive
-            && (cte.is_some_and(|cte| !cte_materialized(cte, refs))
+            && (merge_hint
+                || cte.is_some_and(|cte| !cte_materialized(cte, refs))
                 || seed_is_dual_projection(&seed)
                 // Derived UNION ALL of duals (topn_pushdown) inlines like a dual CTE.
                 || seed_is_union_of_dual(&seed));
@@ -1898,7 +1925,7 @@ impl PlanBuilder {
                 let (db, name) = inner_side.qualified(current_db);
                 schema.table_by_name(&db, &name)
             })
-            && inner_key_is_nullable(&first.on, inner_side, &info)
+            && inner_key_is_nullable(&first.on, inner_side, info)
         {
             if matches!(first_tp, JoinType::RightOuter) {
                 left = predicate_push_down(left, &filter, is, current_db);
@@ -1913,8 +1940,6 @@ impl PlanBuilder {
         // side through the join key (`nb=nb` ⇒ filtering the preserved `nb`
         // rejects the same inner rows). TiDB does both in predicate pushdown.
         let mut first_on = first.on.clone();
-        let mut left = left;
-        let mut right = right;
         if matches!(first_tp, JoinType::LeftOuter | JoinType::RightOuter)
             && let Some(mirror) = mirrored_preserved_where(
                 select,
@@ -1933,14 +1958,9 @@ impl PlanBuilder {
             }
         }
         if matches!(first_tp, JoinType::Inner) {
-            for (to_left, mirror) in mirrored_inner_where(
-                select,
-                &first.left,
-                &first.right,
-                &first.on,
-                is,
-                current_db,
-            ) {
+            for (to_left, mirror) in
+                mirrored_inner_where(select, &first.left, &first.right, &first.on, is, current_db)
+            {
                 if to_left {
                     left = predicate_push_down(left, &mirror, is, current_db);
                 } else {
@@ -1954,13 +1974,8 @@ impl PlanBuilder {
         let both_base = !table_column_names(is, current_db, &first.left).is_empty()
             && !table_column_names(is, current_db, &first.right).is_empty();
         if both_base && matches!(first_tp, JoinType::RightOuter | JoinType::Inner) {
-            let (remaining, left_side, right_side) = split_single_side_on(
-                &first_on,
-                &first.left,
-                &first.right,
-                is,
-                current_db,
-            );
+            let (remaining, left_side, right_side) =
+                split_single_side_on(&first_on, &first.left, &first.right, is, current_db);
             let tables = [&first.left, &first.right];
             for conjunct in left_side {
                 let conjunct = rewrite_col_tables(&conjunct, &tables);
@@ -2094,6 +2109,11 @@ impl PlanBuilder {
         let first = &select.joins[0];
         let left = self.join_side(select, &first.left, is, current_db, stats, prune_mode)?;
         let right = self.join_side(select, &first.right, is, current_db, stats, prune_mode)?;
+        // A comma join (`FROM t1, t2 WHERE t1.id = t2.id`) keeps the equality
+        // in WHERE; TiDB folds it into the join. Predicate pushdown does that
+        // for HashJoin only, so fold it here before deriving keys and the
+        // null-reject filters.
+        let (first_on, first_tp) = comma_join_effective_on(select, first);
         // children_of lists right(Build) then left(Probe). Keep SQL order so a
         // CTE on the right becomes Build (TiDB CTE MERGE_JOIN goldens).
         let (left_key, right_key) = merge_join_key_labels_for(
@@ -2101,16 +2121,15 @@ impl PlanBuilder {
             current_db,
             &first.left,
             &first.right,
-            &first.on,
+            &first_on,
             &first.using_cols,
             is,
         );
-        let first_tp = map_join_type(first.tp);
         let left = prepare_merge_join_side(
             left,
             select,
             &first.left,
-            &first.on,
+            &first_on,
             &left_key,
             is,
             current_db,
@@ -2126,7 +2145,7 @@ impl PlanBuilder {
             right,
             select,
             &first.right,
-            &first.on,
+            &first_on,
             &right_key,
             is,
             current_db,
@@ -2143,7 +2162,7 @@ impl PlanBuilder {
             &first.right.name,
             &left_key,
             &right_key,
-            &first.on,
+            &first_on,
         );
         let mut plan = PhysicalPlan::MergeJoin {
             est_rows: None,
@@ -2153,9 +2172,9 @@ impl PlanBuilder {
             right_table: first.right.name.clone(),
             left_key,
             right_key,
-            tp: map_join_type(first.tp),
+            tp: first_tp,
             info,
-            on: first.on.clone(),
+            on: first_on,
         };
         for join in select.joins.iter().skip(1) {
             let mut right =
@@ -2417,13 +2436,13 @@ impl PlanBuilder {
         // Both sides must carry statistics; the ordered plan is chosen on cost.
         let Some(left_stats) = stats
             .and_then(|h| h.table(&left_db, &left_name))
-            .filter(|t| super::plan_cost::has_real_stats(t))
+            .filter(super::plan_cost::has_real_stats)
         else {
             return Ok(None);
         };
         let Some(right_stats) = stats
             .and_then(|h| h.table(&right_db, &right_name))
-            .filter(|t| super::plan_cost::has_real_stats(t))
+            .filter(super::plan_cost::has_real_stats)
         else {
             return Ok(None);
         };
@@ -2685,12 +2704,12 @@ impl PlanBuilder {
                 {
                     reordered = converted;
                 }
-                if !reordered && matches!(join_tp, JoinType::LeftOuter | JoinType::RightOuter) {
-                    if let Some(filter) =
+                if !reordered
+                    && matches!(join_tp, JoinType::LeftOuter | JoinType::RightOuter)
+                    && let Some(filter) =
                         null_reject_on_inner(on, &right_table, &right_physical, &[])
-                    {
-                        right_plan = predicate_push_down(right_plan, &filter, is, current_db);
-                    }
+                {
+                    right_plan = predicate_push_down(right_plan, &filter, is, current_db);
                 }
                 let plan = PhysicalPlan::HashJoin {
                     est_rows: None,
@@ -2711,6 +2730,8 @@ impl PlanBuilder {
     }
 
     /// `(t1 ⟕ t2) ⟕ (t3 ⟕ t4) ON …` — TiDB bushy outer-join reorder shapes.
+    // Bushy outer-join reorder threads the join shape, aliases and stats.
+    #[allow(clippy::too_many_arguments)]
     fn try_bushy_quad_outer(
         &self,
         select: &SelectStmt,
@@ -3051,7 +3072,8 @@ fn is_information_schema(from: &TableName, current_db: &str) -> bool {
 }
 
 /// `mysql.stats_meta` / `stats_histograms` / `stats_buckets` / `stats_top_n`
-/// are virtual: they read the statistics handle rather than any stored rows.
+/// and `mysql.bind_info` are virtual: they read the statistics / binding
+/// handles rather than any stored rows.
 fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
     from.schema
         .as_deref()
@@ -3059,7 +3081,7 @@ fn is_mysql_stats_table(from: &TableName, current_db: &str) -> bool {
         .is_some_and(|schema| schema.eq_ignore_ascii_case("mysql"))
         && matches!(
             from.name.to_ascii_lowercase().as_str(),
-            "stats_meta" | "stats_histograms" | "stats_buckets" | "stats_top_n"
+            "stats_meta" | "stats_histograms" | "stats_buckets" | "stats_top_n" | "bind_info"
         )
 }
 
@@ -3444,7 +3466,7 @@ fn join_key_projection_exprs(
     };
     let mut out: Vec<String> = Vec::new();
     let mut push = |text: String| {
-        if !out.iter().any(|have| *have == text) {
+        if !out.contains(&text) {
             out.push(text);
         }
     };
@@ -3577,7 +3599,7 @@ fn push_inner_null_reject(
     let mut seen: Vec<String> = Vec::new();
     filters.retain(|filter| {
         let key = null_reject_key(filter);
-        if existing.iter().any(|e| *e == key) || seen.iter().any(|s| *s == key) {
+        if existing.contains(&key) || seen.contains(&key) {
             return false;
         }
         seen.push(key);
@@ -3653,7 +3675,7 @@ fn refine_null_reject_scan_est(
             };
             let Some(table_stats) = stats
                 .and_then(|handle| handle.table(current_db, &table))
-                .filter(|t| super::plan_cost::has_real_stats(t))
+                .filter(super::plan_cost::has_real_stats)
             else {
                 return unchanged(Some(pushed));
             };
@@ -3811,7 +3833,9 @@ fn inject_inner_join_null_reject(
             let mut left = inject_inner_join_null_reject(*left, select, is, current_db);
             let mut right = inject_inner_join_null_reject(*right, select, is, current_db);
             let mut est_rows = est_rows;
-            if matches!(tp, JoinType::Inner) {
+            if matches!(tp, JoinType::Inner)
+                || (matches!(tp, JoinType::Semi) && !super::explain::semi_join_is_left_outer(&on))
+            {
                 let left_phys = join_side_physical(select, &left_table);
                 let right_phys = join_side_physical(select, &right_table);
                 left = push_inner_null_reject(left, &on, &left_table, &left_phys, is, current_db);
@@ -4097,6 +4121,57 @@ fn merge_join_key_labels_for(
     )
 }
 
+/// TiDB folds the WHERE equality of a comma join (`FROM a, b WHERE a.k =
+/// b.k`) into the join itself. `STRAIGHT_JOIN` / `MERGE_JOIN` builds bypass
+/// predicate pushdown, so the merge-join planner has to pick that equality
+/// out of the selection before deriving keys and null-reject filters.
+fn comma_join_effective_on(
+    select: &SelectStmt,
+    join: &sealdb_parser::ast::Join,
+) -> (ExprNode, JoinType) {
+    let tp = map_join_type(join.tp);
+    let is_stub = matches!(&join.on, ExprNode::Value(value) if value.datum == Datum::I64(1));
+    if tp != JoinType::Cross || !is_stub {
+        return (join.on.clone(), tp);
+    }
+    let Some(filter) = select.selection.as_ref() else {
+        return (join.on.clone(), tp);
+    };
+    let left_names = [
+        join.left.name.to_ascii_lowercase(),
+        join.left.resolve_name().to_ascii_lowercase(),
+    ];
+    let right_names = [
+        join.right.name.to_ascii_lowercase(),
+        join.right.resolve_name().to_ascii_lowercase(),
+    ];
+    let qualified_on = |column: &ColumnNameExpr, names: &[String; 2]| -> bool {
+        column
+            .table
+            .as_deref()
+            .is_some_and(|table| names.iter().any(|name| name == &table.to_ascii_lowercase()))
+    };
+    for conjunct in filter.split_cnf_all() {
+        let ExprNode::Binary(bin) = &conjunct else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        let (ExprNode::Column(lhs), ExprNode::Column(rhs)) =
+            (bin.left.as_ref(), bin.right.as_ref())
+        else {
+            continue;
+        };
+        let same_orientation = qualified_on(lhs, &left_names) && qualified_on(rhs, &right_names);
+        let cross_orientation = qualified_on(lhs, &right_names) && qualified_on(rhs, &left_names);
+        if same_orientation || cross_orientation {
+            return (conjunct, JoinType::Inner);
+        }
+    }
+    (join.on.clone(), tp)
+}
+
 fn merge_join_orig_table(select: &SelectStmt, table: &TableName) -> String {
     if let Some(with) = select.with.as_ref()
         && let Some(cte) = with.find(table.resolve_name())
@@ -4290,7 +4365,9 @@ fn right_join_explain_override(
     let is = is?;
     let join = select.joins.first()?;
     let PhysicalPlan::HashJoin {
-        left: _left_plan, on, ..
+        left: _left_plan,
+        on,
+        ..
     } = plan
     else {
         return None;
@@ -4304,10 +4381,10 @@ fn right_join_explain_override(
     let (left_col, right_col) = join_key_columns(left_info, right_info, on)?;
     let left_stats = stats
         .and_then(|h| h.table(&left_db, &left_name))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(super::plan_cost::has_real_stats)?;
     let right_stats = stats
         .and_then(|h| h.table(&right_db, &right_name))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(super::plan_cost::has_real_stats)?;
     let est = match (
         left_stats.column_ndv(&left_col),
         right_stats.column_ndv(&right_col),
@@ -4595,6 +4672,7 @@ fn merge_info_sides(expr: &ExprNode, right_table: &str) -> (bool, bool) {
     (left, right)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_merge_join_side(
     mut plan: PhysicalPlan,
     select: &SelectStmt,
@@ -4750,7 +4828,7 @@ fn merge_join_ordered_index_side(
             idx.columns.first().is_some_and(|c| {
                 // The scan only keeps order when the key column cannot be NULL;
                 // a nullable key needs the null-reject Selection above it.
-                !nullable_column(&info, c.name.o())
+                !nullable_column(info, c.name.o())
                     && join_on_mentions_col(on, &table.name, &phys, c.name.o())
             })
         })
@@ -4758,7 +4836,7 @@ fn merge_join_ordered_index_side(
     Some(PhysicalPlan::IndexReader {
         table: label.clone(),
         index: index.name.o().to_string(),
-        index_columns: index_key_column_names(&info, index),
+        index_columns: index_key_column_names(info, index),
         partitions: Vec::new(),
         partition_access: String::new(),
         row_count: *row_count,
@@ -5550,6 +5628,8 @@ fn push_agg_to_cop(plan: PhysicalPlan) -> PhysicalPlan {
 
 /// Attach a pushed `LIMIT` to the plain table scan under `plan`, looking
 /// through an inline CTE (a derived table is lowered to one).
+// `Err` carries the plan back so callers can rebuild the reader spine.
+#[allow(clippy::result_large_err)]
 fn limit_reader(plan: PhysicalPlan, count: u64) -> std::result::Result<PhysicalPlan, PhysicalPlan> {
     match plan {
         PhysicalPlan::TableReader {
@@ -6399,10 +6479,10 @@ fn build_set_op_plan(
     };
     // All arms distinct → the dedup HashAgg is the set op root (TiDB keeps a
     // single UnionAll below it; no extra one-child Union wrapper).
-    if all_arms.is_empty() {
-        if let Some(deduped) = deduped {
-            return deduped;
-        }
+    if all_arms.is_empty()
+        && let Some(deduped) = deduped
+    {
+        return deduped;
     }
     let mut children: Vec<Box<PhysicalPlan>> = Vec::with_capacity(all_arms.len() + 1);
     children.extend(deduped.map(Box::new));
@@ -6593,7 +6673,7 @@ fn union_arm_projection_est(
     };
     let table_stats = stats
         .and_then(|handle| handle.table(&schema, &name))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(super::plan_cost::has_real_stats)?;
     let realtime = table_stats.count as f64;
     if realtime <= 0.0 {
         return None;
@@ -6628,6 +6708,11 @@ fn set_op_groups(ops: &[SetOprType]) -> Option<(usize, usize)> {
 /// `[partial values…, group keys…]`. Only the plain single-column index-scan arm
 /// (`select c1 from t`) is materialised: the index emits that column in order,
 /// so the partial aggregation is a `StreamAgg` over the `IndexReader`.
+/// Recursive CTE name → seed output column origins (`(table, column, id)`).
+type CteSeedOutputs = std::collections::HashMap<String, Vec<(String, String, String)>>;
+
+// Boxed children mirror `PhysicalPlan`'s own boxed-children shape.
+#[allow(clippy::vec_box)]
 fn push_dedup_across_union(
     children: &[Box<PhysicalPlan>],
     selects: &[&SelectStmt],
@@ -7243,35 +7328,36 @@ impl<'a> PlanColumnIds<'a> {
         let ops: Vec<SetOprType> = arms.iter().map(|(_, op)| *op).collect();
         let mut ids = SetOpColumnIds::default();
         match set_op_groups(&ops) {
-            Some((distinct_len, all_len)) => {
-                if distinct_len >= 2 {
-                    ids.distinct = self.alloc_width(width);
-                    if all_len > 0 {
-                        ids.outer = self.alloc_width(width);
-                    }
-                    // TiDB allocates the pushed-down partial aggregation's
-                    // columns during logical optimization, i.e. after every
-                    // build-time column id of the statement.
-                    let all_literal_dual = width == 1
-                        && arms.iter().all(|(select, _)| {
-                            select.from.as_ref().is_some_and(|t| {
-                                t.name.eq_ignore_ascii_case("dual")
-                            }) && matches!(
+            Some((distinct_len, all_len)) if distinct_len >= 2 => {
+                ids.distinct = self.alloc_width(width);
+                if all_len > 0 {
+                    ids.outer = self.alloc_width(width);
+                }
+                // TiDB allocates the pushed-down partial aggregation's
+                // columns during logical optimization, i.e. after every
+                // build-time column id of the statement.
+                let all_literal_dual = width == 1
+                    && arms.iter().all(|(select, _)| {
+                        select
+                            .from
+                            .as_ref()
+                            .is_some_and(|t| t.name.eq_ignore_ascii_case("dual"))
+                            && matches!(
                                 select.fields.first().map(|f| &f.expr),
                                 Some(ExprNode::Value(_))
                             )
-                        });
-                    if all_literal_dual {
-                        // The dual arms' constant projections allocate two more
-                        // statement ids before the partial result (`Column#6`
-                        // rather than `Column#4`).
-                        self.alloc_width(width);
-                        self.alloc_width(width);
-                    }
-                    ids.partial = self.alloc_width(width);
-                } else {
-                    ids.outer = self.alloc_width(width);
+                    });
+                if all_literal_dual {
+                    // The dual arms' constant projections allocate two more
+                    // statement ids before the partial result (`Column#6`
+                    // rather than `Column#4`).
+                    self.alloc_width(width);
+                    self.alloc_width(width);
                 }
+                ids.partial = self.alloc_width(width);
+            }
+            Some(_) => {
+                ids.outer = self.alloc_width(width);
             }
             // EXCEPT / INTERSECT: the binary fold allocates once per operator.
             None => {
@@ -7335,9 +7421,8 @@ thread_local! {
     /// TiDB's working table (`getResultCTESchema`) clones the *seed* schema, so
     /// EXPLAIN prints the seed's `OrigTblName.OrigColName` even when the CTE
     /// declares `cte(a)`.
-    static CTE_SEED_OUTPUTS: std::cell::RefCell<
-        std::collections::HashMap<String, Vec<(String, String, String)>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static CTE_SEED_OUTPUTS: std::cell::RefCell<CteSeedOutputs> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     /// Whether the plan build in progress belongs to an `EXPLAIN` statement.
     static EXPLAIN_BUILD_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Whether the current statement runs inside an explicit transaction, where
@@ -7528,7 +7613,7 @@ impl TableDbScope {
                     .or_else(|| (!current_db.is_empty()).then(|| current_db.to_string()));
                 let Some(info) = is.and_then(|is| {
                     let db = db.as_deref()?;
-                    is.table_by_name(db, &table.resolve_name())
+                    is.table_by_name(db, table.resolve_name())
                 }) else {
                     continue;
                 };
@@ -7572,14 +7657,8 @@ impl Drop for TableDbScope {
 }
 
 /// Field type of `table.column` as recorded by [`TableDbScope`].
-pub(crate) fn explain_column_type(
-    table: &str,
-    column: &str,
-) -> Option<sealdb_types::FieldType> {
-    let key = (
-        table.to_ascii_lowercase(),
-        column.to_ascii_lowercase(),
-    );
+pub(crate) fn explain_column_type(table: &str, column: &str) -> Option<sealdb_types::FieldType> {
+    let key = (table.to_ascii_lowercase(), column.to_ascii_lowercase());
     TABLE_COL_TYPE
         .with(|stack| {
             stack
@@ -7846,9 +7925,9 @@ fn cte_seed_output_origins(seed: &SelectStmt) -> Vec<(String, String)> {
 /// Row count of the recursive working table while its arm is being built.
 fn recursive_cte_seed_rows(name: &str) -> Option<f64> {
     RECURSIVE_CTE_SEED_ROWS.with(|cell| {
-        cell.borrow().as_ref().and_then(|(cte, rows)| {
-            cte.eq_ignore_ascii_case(name).then_some(*rows)
-        })
+        cell.borrow()
+            .as_ref()
+            .and_then(|(cte, rows)| cte.eq_ignore_ascii_case(name).then_some(*rows))
     })
 }
 
@@ -8251,7 +8330,7 @@ fn merge_extra_projection(
     // lookup carries the row's partition (`_tidb_tid`) to restore the row;
     // TiDB prunes it with the SELECT list's own Projection, which sits above a
     // sunk `LIMIT` (`Projection -> Limit -> UnionScan -> IndexMerge`).
-    let global = merge(access).is_some_and(|merge| partition_global_index_read(merge, &info));
+    let global = merge(access).is_some_and(|merge| partition_global_index_read(merge, info));
     if merge(access).is_none() || (star && !(rowid && keep_order(access)) && !global) {
         return plan;
     }
@@ -8348,7 +8427,7 @@ fn wrap_output_projection(
     // UPDATE/DELETE scan the target through a synthesized empty-text SELECT;
     // TiDB reads the row handle there and the DML node owns the projection, so
     // the SELECT-list projection belongs to a real query only.
-    if select.text.is_empty() && select.from_item.is_none() {
+    if select.synthesized && select.from_item.is_none() {
         return plan;
     }
     // A table with an expression index carries a hidden generated column in
@@ -8381,7 +8460,10 @@ fn wrap_output_projection(
     if let PhysicalPlan::Sort { .. } = &plan
         && let Some(info) = hidden_table_info(select, is, current_db)
         && select.joins.is_empty()
-        && select.fields.iter().all(|f| matches!(&f.expr, ExprNode::Column(_)))
+        && select
+            .fields
+            .iter()
+            .all(|f| matches!(&f.expr, ExprNode::Column(_)))
         && sort_scan_reads_expr_index(&plan, info)
     {
         let from = select.from.as_ref();
@@ -9305,6 +9387,7 @@ fn cast_target_explain(target: &str) -> String {
 }
 
 /// Push a single-side join ON into that side's Selection; return Cross + true ON.
+#[allow(clippy::too_many_arguments)]
 fn push_single_side_on(
     select: &SelectStmt,
     left: PhysicalPlan,
@@ -9553,11 +9636,7 @@ fn join_on_has_equijoin_local(on: &ExprNode, left_table: &str, right_table: &str
 /// Which join input an expression reads: `Some(true)` for the left table,
 /// `Some(false)` for the right. An expression that mixes both sides (or names
 /// an unknown table) is not a side-local join key.
-fn expr_belongs_to_join_side(
-    expr: &ExprNode,
-    left_table: &str,
-    right_table: &str,
-) -> Option<bool> {
+fn expr_belongs_to_join_side(expr: &ExprNode, left_table: &str, right_table: &str) -> Option<bool> {
     let mut columns = Vec::new();
     expr.collect_columns(&mut columns);
     if columns.is_empty() {
@@ -9631,18 +9710,19 @@ fn projection_column_base(
         // hidden generated column, so the DataSource schema holds one more
         // column than the table: the first derived column id follows it
         // (`hex(vitess_hash(1))->Column#7` over `KEY ((f(col) >> 56))`).
-        PhysicalPlan::IndexReader { index, .. }
-        | PhysicalPlan::IndexLookUpReader { index, .. } => table
-            .map(|info| {
-                let parts = info
-                    .indices
-                    .iter()
-                    .find(|idx| idx.name.o().eq_ignore_ascii_case(index))
-                    .map(|idx| super::expr_index::expression_parts(info, idx).len())
-                    .unwrap_or(0);
-                table_column_base(info) + parts
-            })
-            .unwrap_or(6),
+        PhysicalPlan::IndexReader { index, .. } | PhysicalPlan::IndexLookUpReader { index, .. } => {
+            table
+                .map(|info| {
+                    let parts = info
+                        .indices
+                        .iter()
+                        .find(|idx| idx.name.o().eq_ignore_ascii_case(index))
+                        .map(|idx| super::expr_index::expression_parts(info, idx).len())
+                        .unwrap_or(0);
+                    table_column_base(info) + parts
+                })
+                .unwrap_or(6)
+        }
         // TiDB allocates one plan column id per DataSource schema column (hidden
         // columns included) plus `_tidb_rowid` when the handle is not a
         // clustered index; the first derived expression column follows.
@@ -9897,7 +9977,7 @@ fn expr_index_point_projection(
             select.text
         );
     }
-    if select.text.is_empty() {
+    if select.synthesized {
         return plan;
     }
     let (Some(is), Some(from)) = (is, select.from.as_ref()) else {
@@ -10686,9 +10766,7 @@ fn local_index_point_allowed(
 
 /// Groups IN lists by column and intersects the value sets of every list that
 /// constrains the same column, mirroring TiDB's ranger DNF intersection.
-fn intersect_in_lists(
-    lists: Vec<(String, Vec<Datum>, usize)>,
-) -> Vec<(String, Vec<Datum>, usize)> {
+fn intersect_in_lists(lists: Vec<(String, Vec<Datum>, usize)>) -> Vec<(String, Vec<Datum>, usize)> {
     let mut out: Vec<(String, Vec<Datum>, usize)> = Vec::new();
     for (column, values, total) in lists {
         match out
@@ -11609,12 +11687,11 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                 }
                 // `int_col = <constant>` folds to constant false when the
                 // constant overflows the column's integer type.
-                if bin.op == Op::Eq {
-                    if let Some(folded) = int_eq_out_of_range(&left, &right, info)
+                if bin.op == Op::Eq
+                    && let Some(folded) = int_eq_out_of_range(&left, &right, info)
                         .or_else(|| int_eq_out_of_range(&right, &left, info))
-                    {
-                        return folded;
-                    }
+                {
+                    return folded;
                 }
             }
             // Arithmetic on a string column evaluates as `double` on both sides.
@@ -11640,7 +11717,7 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
             let mut coerced = list.clone();
             coerced.expr = Box::new(coerce_numeric_literals(&list.expr, info));
             match column_class(&coerced.expr, info) {
-                Some(ColumnClass::String) if list.list.iter().all(|item| numeric_literal(item)) => {
+                Some(ColumnClass::String) if list.list.iter().all(numeric_literal) => {
                     coerced.expr = Box::new(cast_double((*coerced.expr).clone()));
                 }
                 Some(ColumnClass::Numeric) => {
@@ -11789,7 +11866,7 @@ fn temporal_literal(expr: &ExprNode, field_type: &sealdb_types::FieldType) -> Op
             })
             .ok()?,
     };
-    time.fsp = field_type.decimal.max(0).min(6) as i8;
+    time.fsp = field_type.decimal.clamp(0, 6) as i8;
     Some(Datum::Time(time))
 }
 
@@ -12352,9 +12429,7 @@ fn stats_cnf_filter_rows(
                 if estimated.iter().any(|e| e.eq_ignore_ascii_case(&column)) {
                     true
                 } else {
-                    let Some(_) = field_type(&column) else {
-                        return None;
-                    };
+                    field_type(&column)?;
                     let rows = column_rows_estimate(table_stats, info, &column, &not_null)?;
                     sel *= rows / count;
                     estimated.push(column);
@@ -12449,7 +12524,7 @@ fn int_handle_range_rows(
     let (db, table) = from.qualified(current_db);
     let table_stats = stats
         .and_then(|h| h.table(&db, &table))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(super::plan_cost::has_real_stats)?;
     if std::env::var("SEALDB_DEBUG_HANDLE_RANGE").is_ok() {
         eprintln!(
             "INTHANDLE {table} has_stats=true count={}",
@@ -12488,7 +12563,7 @@ fn clustered_range_rows(
     let (db, table) = from.qualified(current_db);
     let table_stats = stats
         .and_then(|h| h.table(&db, &table))
-        .filter(|t| super::plan_cost::has_real_stats(t))?;
+        .filter(super::plan_cost::has_real_stats)?;
     let pk = info.indices.iter().find(|idx| idx.primary)?;
     let column = info.clustered_prefix_column()?;
     // A clustered key with prefix parts (`PRIMARY(dt, b(1))`) cannot bound a
@@ -12585,7 +12660,7 @@ fn partitioned_table_reader(
     let (db, table) = from.qualified(current_db);
     let table_stats = stats
         .and_then(|h| h.table(&db, &table))
-        .filter(|t| super::plan_cost::has_real_stats(t));
+        .filter(super::plan_cost::has_real_stats);
     let stats_pseudo = table_stats.is_none();
     // TiDB derives the filtered cardinality from the prune ranges; exact
     // value counts give the same estimate for range-partitioned scans.
@@ -12704,6 +12779,10 @@ fn partitioned_table_reader(
 /// `stats:partial[c2:missing]`: TiDB still reads the index histogram of `c2`
 /// (`GetRowCountByIndexRanges`), so a value the histogram leaves in a bucket gap
 /// estimates zero rows and the cheap index scan wins over the table scan.
+/// `(chosen paths, remaining conjuncts, per-path cop filters)`.
+type IndexMergePlan = (Vec<IndexMergePath>, Vec<ExprNode>, Vec<Vec<ExprNode>>);
+
+#[allow(clippy::too_many_arguments)]
 fn index_equality_rows(
     info: &sealdb_meta::TableInfo,
     index: &sealdb_meta::IndexInfo,
@@ -12717,7 +12796,7 @@ fn index_equality_rows(
     let (db, table) = from.qualified(current_db);
     let table_stats = stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| super::plan_cost::has_real_stats(t));
+        .filter(super::plan_cost::has_real_stats);
     let column_rows = eq_row_count_value(stats, from, current_db, column, value);
     let Some(table_stats) = table_stats else {
         return column_rows;
@@ -12735,7 +12814,6 @@ fn index_equality_rows(
         .map(|access| access.range.filter_rows)
         .or(column_rows)
 }
-
 
 /// A partial index (`... WHERE <predicate>`) is usable only when the query
 /// filter guarantees the predicate, otherwise its keys cover just a subset of
@@ -12826,10 +12904,9 @@ fn query_bounds(conjunct: &ExprNode) -> Option<QueryBounds> {
         };
         let (key, value, op) = if let Some(value) = bin.right.const_datum() {
             (key_of(&bin.left), value, bin.op)
-        } else if let Some(value) = bin.left.const_datum() {
-            (key_of(&bin.right), value, flip_cmp(bin.op)?)
         } else {
-            return None;
+            let value = bin.left.const_datum()?;
+            (key_of(&bin.right), value, flip_cmp(bin.op)?)
         };
         if value.is_null() {
             return None;
@@ -12866,7 +12943,10 @@ fn cmp_implies(conjunct: &ExprNode, predicate: &ExprNode) -> bool {
     let ExprNode::Binary(pred) = predicate else {
         return false;
     };
-    if !matches!(pred.op, Op::Eq | Op::NullSafeEq | Op::Gt | Op::Ge | Op::Lt | Op::Le) {
+    if !matches!(
+        pred.op,
+        Op::Eq | Op::NullSafeEq | Op::Gt | Op::Ge | Op::Lt | Op::Le
+    ) {
         return false;
     }
     let Some((pred_key, pred_lower, pred_upper)) = query_bounds(predicate) else {
@@ -13118,9 +13198,7 @@ fn index_merge_hint(text: &str, target: &str) -> Option<IndexMergeHint> {
     let mut base = 0usize;
     while let Some(found) = lower[base..].find(name) {
         let open = base + found + name.len();
-        let Some(close_rel) = lower[open..].find(')') else {
-            return None;
-        };
+        let close_rel = lower[open..].find(')')?;
         let inside = &text[open..open + close_rel];
         let mut parts = inside.split(',');
         let hint_target = parts.next().unwrap_or("").trim().trim_matches('`');
@@ -13270,13 +13348,8 @@ fn index_merge_index_arm(
     }) {
         let ranges = vec![(Some((Datum::Null, true)), Some((Datum::Null, true)))];
         let width = index_key_column_names(info, index).len().max(1);
-        let rows = sealdb_statistics::pseudo::index_ranges_rows(
-            table_rows,
-            &ranges,
-            width,
-            1,
-            false,
-        );
+        let rows =
+            sealdb_statistics::pseudo::index_ranges_rows(table_rows, &ranges, width, 1, false);
         return Some((
             IndexMergePath {
                 index: index.name.o().to_string(),
@@ -13442,7 +13515,7 @@ fn index_merge_arm_candidates<'a>(
                 columns.iter().any(|name| name.eq_ignore_ascii_case(&key))
             })
     };
-    candidates.into_iter().filter(|idx| usable(&idx)).collect()
+    candidates.into_iter().filter(|idx| usable(idx)).collect()
 }
 
 /// Build one union arm for a DNF item; the handle wins when the item pins it.
@@ -13618,7 +13691,7 @@ fn index_merge_intersection_paths(
     info: &sealdb_meta::TableInfo,
     table_rows: f64,
     table_stats: Option<&super::access_range::TableStats>,
-) -> Option<(Vec<IndexMergePath>, Vec<ExprNode>, Vec<Vec<ExprNode>>)> {
+) -> Option<IndexMergePlan> {
     if hint.indexes.len() < 2 {
         return None;
     }
@@ -13968,13 +14041,11 @@ fn index_merge_dnf_item_rows(
             let keyed: Vec<ExprNode> = conds
                 .iter()
                 .filter(|cond| {
-                    sealdb_statistics::pseudo::conjunct_bound_sets(cond).is_some_and(
-                        |(name, _)| {
-                            index.columns.iter().any(|col| {
-                                super::expr_index::part_key(info, col).eq_ignore_ascii_case(&name)
-                            })
-                        },
-                    )
+                    sealdb_statistics::pseudo::conjunct_bound_sets(cond).is_some_and(|(name, _)| {
+                        index.columns.iter().any(|col| {
+                            super::expr_index::part_key(info, col).eq_ignore_ascii_case(&name)
+                        })
+                    })
                 })
                 .cloned()
                 .collect();
@@ -14124,7 +14195,7 @@ fn index_merge_plan(
             let (db, table) = from.qualified(current_db);
             handle.table(&db, &table)
         })
-        .filter(|table| super::plan_cost::has_real_stats(table));
+        .filter(super::plan_cost::has_real_stats);
     let cnf = selection.split_cnf();
     let or_pos = cnf
         .iter()
@@ -14139,8 +14210,7 @@ fn index_merge_plan(
     }
     let (mut paths, residual, intersection, union_items) = match or_pos {
         Some(_) => {
-            let mut best: Option<(f64, Vec<IndexMergePath>, Vec<ExprNode>, Vec<Vec<ExprNode>>)> =
-                None;
+            let mut best: Option<(f64, IndexMergePlan)> = None;
             for pos in 0..cnf.len() {
                 if cnf[pos].split_dnf().len() < 2 {
                     continue;
@@ -14166,14 +14236,11 @@ fn index_merge_plan(
                 // the a/d arms rather than the wider b/c ones.
                 let rows =
                     index_merge_union_rows(info, &paths, &items, table_rows, table_stats.is_some());
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_rows, _, _, _)| rows < *best_rows)
-                {
-                    best = Some((rows, paths, residual, items));
+                if best.as_ref().is_none_or(|(best_rows, _)| rows < *best_rows) {
+                    best = Some((rows, (paths, residual, items)));
                 }
             }
-            let (_, paths, residual, items) = best?;
+            let (_, (paths, residual, items)) = best?;
             (paths, residual, false, Some(items))
         }
         None => {
@@ -14201,7 +14268,8 @@ fn index_merge_plan(
     if std::env::var("SEALDB_DEBUG_IM").is_ok() {
         eprintln!(
             "IM paths={:?} real_stats={}",
-            paths                .iter()
+            paths
+                .iter()
                 .map(|path| (
                     path.index.clone(),
                     path.table_range,
@@ -14369,9 +14437,10 @@ fn index_merge_plan(
             if path.index.is_empty() {
                 continue;
             }
-            let global = info.indices.iter().any(|index| {
-                index.name.o().eq_ignore_ascii_case(&path.index) && index.global
-            });
+            let global = info
+                .indices
+                .iter()
+                .any(|index| index.name.o().eq_ignore_ascii_case(&path.index) && index.global);
             if global {
                 path.tid_selection = Some(format!(
                     "in({prefix}.{table}._tidb_tid, {ids})",
@@ -14435,10 +14504,14 @@ fn rewrite_derived_window_predicates(
     if !cte.derived || !needs_window(&cte.query) {
         return None;
     }
-    let (win, alias) = cte.query.fields.iter().find_map(|field| match &field.expr {
-        ExprNode::Window(win) => Some((win, field.as_name.clone())),
-        _ => None,
-    })?;
+    let (win, alias) = cte
+        .query
+        .fields
+        .iter()
+        .find_map(|field| match &field.expr {
+            ExprNode::Window(win) => Some((win, field.as_name.clone())),
+            _ => None,
+        })?;
     let alias = alias.filter(|a| !a.is_empty())?;
     let part_cols: Vec<String> = win
         .spec
@@ -14455,7 +14528,14 @@ fn rewrite_derived_window_predicates(
     // `count`/`min`/`max` keep integer types, so no cast is printed.
     let decimal_window = matches!(
         win.name.to_ascii_lowercase().as_str(),
-        "avg" | "sum" | "std" | "stddev" | "stddev_pop" | "stddev_samp" | "variance" | "var_pop"
+        "avg"
+            | "sum"
+            | "std"
+            | "stddev"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "variance"
+            | "var_pop"
             | "var_samp"
     ) && !win.args.is_empty();
     let mut pushed = Vec::new();
@@ -14464,11 +14544,9 @@ fn rewrite_derived_window_predicates(
     for conjunct in selection.split_cnf() {
         let cols = conjunct.referenced_columns();
         let only_partition = !cols.is_empty()
-            && cols.iter().all(|(_, name)| {
-                part_cols
-                    .iter()
-                    .any(|part| part.eq_ignore_ascii_case(name))
-            });
+            && cols
+                .iter()
+                .all(|(_, name)| part_cols.iter().any(|part| part.eq_ignore_ascii_case(name)));
         if only_partition {
             pushed.push(strip_predicate_qualifiers(&conjunct));
             changed = true;
@@ -14570,17 +14648,15 @@ fn rewrite_window_result_refs(
         ExprNode::Binary(bin) => {
             let left = rewrite_window_result_refs(&bin.left, alias, win_col, decimal);
             let right = rewrite_window_result_refs(&bin.right, alias, win_col, decimal);
-            let compare = matches!(
-                bin.op,
-                Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
-            );
-            let (left, right) = if compare && decimal && is_plan_column(&left) && !is_plan_column(&right) {
-                (left, cast_operand(right))
-            } else if compare && decimal && is_plan_column(&right) && !is_plan_column(&left) {
-                (cast_operand(left), right)
-            } else {
-                (left, right)
-            };
+            let compare = matches!(bin.op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge);
+            let (left, right) =
+                if compare && decimal && is_plan_column(&left) && !is_plan_column(&right) {
+                    (left, cast_operand(right))
+                } else if compare && decimal && is_plan_column(&right) && !is_plan_column(&left) {
+                    (cast_operand(left), right)
+                } else {
+                    (left, right)
+                };
             ExprNode::Binary(BinaryOpExpr {
                 op: bin.op,
                 left: Box::new(left),
@@ -14590,10 +14666,17 @@ fn rewrite_window_result_refs(
         }
         ExprNode::Unary(unary) => ExprNode::Unary(UnaryOpExpr {
             op: unary.op,
-            expr: Box::new(rewrite_window_result_refs(&unary.expr, alias, win_col, decimal)),
+            expr: Box::new(rewrite_window_result_refs(
+                &unary.expr,
+                alias,
+                win_col,
+                decimal,
+            )),
         }),
         ExprNode::Cast(cast) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
-            expr: Box::new(rewrite_window_result_refs(&cast.expr, alias, win_col, decimal)),
+            expr: Box::new(rewrite_window_result_refs(
+                &cast.expr, alias, win_col, decimal,
+            )),
             target: cast.target.clone(),
         }),
         ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
@@ -15117,7 +15200,7 @@ fn count_star_unique_join_plan(
 ) -> Option<PhysicalPlan> {
     if select.from_item.is_some()
         || select.joins.len() != 1
-        || select.group_by.len() > 0
+        || !select.group_by.is_empty()
         || select.having.is_some()
         || select.selection.is_some()
         || !select.order_by.is_empty()
@@ -15151,10 +15234,9 @@ fn count_star_unique_join_plan(
     // Inner join key must cover every primary-key / handle column.
     let inner_pk: Vec<String> = if let Some(pk) = inner.indices.iter().find(|i| i.primary) {
         pk.columns.iter().map(|c| c.name.o().to_string()).collect()
-    } else if let Some(handle) = inner.handle_column() {
-        vec![handle.name.o().to_string()]
     } else {
-        return None;
+        let handle = inner.handle_column()?;
+        vec![handle.name.o().to_string()]
     };
     if inner_pk.is_empty() {
         return None;
@@ -16139,7 +16221,7 @@ fn build_agg_plan(
         })
         .unwrap_or_else(|| "count".into());
     let mut root_funcs = vec![format!("funcs:{agg_fn}(Column#{partial_col})->Column#5")];
-    let cop_funcs = vec![format!("{agg_fn}({agg_arg})->Column#{partial_col}")];
+    let cop_funcs = [format!("{agg_fn}({agg_arg})->Column#{partial_col}")];
     // `SELECT <scalar expr over the group key>, MAX(e), QUOTE(i) … GROUP BY i`:
     // TiDB keeps a root `Projection` above the aggregate, so the aggregate only
     // emits the raw function results and re-exposes every referenced group key
@@ -16511,7 +16593,7 @@ fn annotate_partial_stats(
     let db = statement_table_db(table).unwrap_or_else(|| current_db.to_string());
     let Some(table_stats) = stats
         .and_then(|handle| handle.table(&db, table))
-        .filter(|t| super::plan_cost::has_real_stats(t))
+        .filter(super::plan_cost::has_real_stats)
     else {
         return filter;
     };
@@ -16758,9 +16840,9 @@ fn join_agg_push_down(
     // TiDB `makeNewAgg` allocates the final aggregate's output columns first,
     // then the partial aggregate's own outputs (the cop task's in 2-phase mode).
     let n = push_aggs.len();
-    let mut partial_next = out_col + n;
     let mut cop_next = out_col + 2 * n;
-    for func in push_aggs {
+    for (offset, func) in push_aggs.iter().enumerate() {
+        let partial_next = out_col + n + offset;
         let name = func.name.to_ascii_lowercase();
         let arg = func
             .args
@@ -16776,7 +16858,6 @@ fn join_agg_push_down(
         } else {
             root_funcs.push(format!("funcs:{name}({arg})->Column#{partial_next}"));
         }
-        partial_next += 1;
     }
     for (expr, text) in push_gby.iter().zip(group_info.iter()) {
         let _ = expr;
@@ -16863,14 +16944,13 @@ fn join_agg_push_down(
 
     // Final aggregation above the join: it consumes the partial columns.
     let mut final_funcs: Vec<String> = Vec::new();
-    let mut col = out_col + agg_fields.len();
     for (index, func) in agg_fields.iter().enumerate() {
         let name = func.name.to_ascii_lowercase();
+        let col = out_col + agg_fields.len() + index;
         final_funcs.push(format!(
             "funcs:{name}(Column#{col})->Column#{}",
             out_col + index
         ));
-        col += 1;
     }
     for item in &select.group_by {
         let text = join_agg_col_ref(select, current_db, item);
@@ -16934,7 +17014,7 @@ fn pushed_group_est(
             .unwrap_or(table);
         let ndv = stats
             .and_then(|h| h.table(db, physical))
-            .filter(|t| has_real_stats(t))
+            .filter(has_real_stats)
             .and_then(|t| t.column_ndv(&col.name));
         est *= ndv.unwrap_or(rows);
     }
@@ -17924,11 +18004,7 @@ fn relabel_columns(expr: &ExprNode, table: &str) -> ExprNode {
         }),
         ExprNode::Func(f) => ExprNode::Func(sealdb_parser::ast::expressions::FuncCallExpr {
             name: f.name.clone(),
-            args: f
-                .args
-                .iter()
-                .map(|a| relabel_columns(a, table))
-                .collect(),
+            args: f.args.iter().map(|a| relabel_columns(a, table)).collect(),
             distinct: f.distinct,
         }),
         ExprNode::Cast(c) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
@@ -18029,9 +18105,7 @@ fn mirrored_inner_where(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> Vec<(bool, ExprNode)> {
-    let Some((key_left, key_right)) = merge_join_key_pairs(left, right, on)
-        .into_iter()
-        .next()
+    let Some((key_left, key_right)) = merge_join_key_pairs(left, right, on).into_iter().next()
     else {
         return Vec::new();
     };
@@ -18041,14 +18115,12 @@ fn mirrored_inner_where(
         return Vec::new();
     }
     let mut out = Vec::new();
-    if let Some(mirror) = mirror_where_on_key(
-        select, right, left, &key_right, is, current_db, true,
-    ) {
+    if let Some(mirror) = mirror_where_on_key(select, right, left, &key_right, is, current_db, true)
+    {
         out.push((true, mirror));
     }
-    if let Some(mirror) = mirror_where_on_key(
-        select, left, right, &key_left, is, current_db, true,
-    ) {
+    if let Some(mirror) = mirror_where_on_key(select, left, right, &key_left, is, current_db, true)
+    {
         out.push((false, mirror));
     }
     out
@@ -18836,10 +18908,10 @@ fn naaj_plan(
     let inner_q = format!("{schema}.{}", inner_name.to_ascii_lowercase());
     let mut probe = PhysicalPlan::table_reader(outer_tbl.name.clone(), Vec::new());
     let mut build = PhysicalPlan::table_reader(inner_tbl.name.clone(), Vec::new());
-    if let Some(filter) = ExprNode::compose_cnf(inner_only) {
-        if let PhysicalPlan::TableReader { pushed, .. } = &mut build {
-            *pushed = Some(filter);
-        }
+    if let Some(filter) = ExprNode::compose_cnf(inner_only)
+        && let PhysicalPlan::TableReader { pushed, .. } = &mut build
+    {
+        *pushed = Some(filter);
     }
     // Row operands that are not plain columns need TiDB's injected Projection
     // (`injectExtraProjection`); the join still evaluates the expressions.
@@ -19281,7 +19353,7 @@ fn point_get_residual_est(
         .flatten();
     let table_stats = stats
         .and_then(|handle| handle.table(&db, &table_name))
-        .filter(|t| super::plan_cost::has_real_stats(t));
+        .filter(super::plan_cost::has_real_stats);
     let Some(table_stats) = table_stats else {
         // Unanalyzed table: TiDB still scales the point get's single row by the
         // pseudo column ranges (`gt(c2, 1)` keeps 1/3 → 0.33).
@@ -19691,7 +19763,8 @@ fn expr_usable_ndv(
             table: Some(table.to_string()),
             name: name.clone(),
         };
-        if let Some(value) = column_usable_ndv(stats, is, current_db, aliases, plan, &col, side_rows)
+        if let Some(value) =
+            column_usable_ndv(stats, is, current_db, aliases, plan, &col, side_rows)
         {
             ndv = Some(ndv.map_or(value, |seen: f64| seen.max(value)));
         }
@@ -19816,7 +19889,7 @@ fn column_usable_ndv(
     }
     let table_stats = stats
         .and_then(|h| h.table(db, physical))
-        .filter(|t| super::plan_cost::has_real_stats(t));
+        .filter(super::plan_cost::has_real_stats);
     if let Some(t) = table_stats
         && let Some(ndv) = t.column_ndv(&col.name)
     {
@@ -19862,6 +19935,7 @@ fn pseudo_column_rows(plan: &PhysicalPlan, table: &str) -> Option<f64> {
 }
 
 /// TiDB logical-join cardinality for `tp` from the key NDVs.
+#[allow(clippy::too_many_arguments)]
 fn join_est_by_ndv(
     left: &PhysicalPlan,
     right: &PhysicalPlan,
@@ -19949,9 +20023,7 @@ fn join_est_by_ndv(
 fn plan_has_selective_filter(plan: &PhysicalPlan) -> bool {
     let filters = match plan {
         PhysicalPlan::TableReader {
-            pushed,
-            range_scan,
-            ..
+            pushed, range_scan, ..
         } if range_scan.is_some() => return pushed.is_some(),
         PhysicalPlan::TableReader {
             pushed: Some(filter),
@@ -20116,6 +20188,181 @@ fn quantified_cmp_plan(
 /// The subquery is uncorrelated, so TiDB decorrelates it into a CARTESIAN
 /// semi HashJoin that appends a boolean marker column; an enclosing aggregate
 /// reads the marker after a decimal cast (explain_easy / explain_easy_stats).
+/// `SELECT EXISTS (SELECT … FROM inner WHERE outer.k = inner.k LIMIT n) FROM outer`:
+/// TiDB decorrelates to a left-outer semi HashJoin (a LIMIT cannot change whether
+/// a row exists). The `no_decorrelate()` hint keeps a correlated Apply whose
+/// probe is `Limit(count n)` over the inner scan.
+fn exists_limit_explain_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+    prune_mode: PartitionPruneMode,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build()
+        || select.fields.len() != 1
+        || !select.joins.is_empty()
+        || select.selection.is_some()
+        || !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return None;
+    }
+    let outer = select.from.as_ref()?;
+    let ExprNode::Exists(exists) = &select.fields[0].expr else {
+        return None;
+    };
+    if exists.not {
+        return None;
+    }
+    let inner = exists.query.as_select()?;
+    if inner.with.is_some()
+        || !inner.joins.is_empty()
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || inner.distinct
+        || !inner.order_by.is_empty()
+        || inner.offset.is_some()
+    {
+        return None;
+    }
+    let limit = inner.limit?;
+    if limit == 0 {
+        return None;
+    }
+    let inner_from = inner.from.as_ref()?;
+    let selection = inner.selection.as_ref()?;
+    let conjuncts = selection.split_cnf();
+    if conjuncts.len() != 1 {
+        return None;
+    }
+    let (outer_side, inner_side) = cross_table_eq_sides(&conjuncts[0], &inner_from.name)?;
+    let outer_expr = qualify_table(outer_side, &outer.name);
+    let inner_expr = qualify_table(inner_side, &inner_from.name);
+    let outer_q = super::rule_semi_join::explain_semi_pred(&outer_expr);
+    let inner_q = super::rule_semi_join::explain_semi_pred(&inner_expr);
+    let eq = ExprNode::Binary(BinaryOpExpr {
+        op: Op::Eq,
+        left: Box::new(outer_expr),
+        right: Box::new(inner_expr),
+        single_cnf_item: false,
+    });
+    if inner.text.contains("no_decorrelate") {
+        // TiDB keeps `Limit(Probe)` above a cop `Limit` that caps the inner scan.
+        let probe = PhysicalPlan::Limit {
+            child: Box::new(PhysicalPlan::TableReader {
+                table: inner_from.name.clone(),
+                partitions: Vec::new(),
+                partition_names: Vec::new(),
+                partition_access: String::new(),
+                row_count: limit as f64,
+                stats_pseudo: true,
+                filter_est: None,
+                range_scan: None,
+                keep_order: false,
+                data_limit: Some((0, limit)),
+                pushed: Some(ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(
+                        format!(
+                            "DATA_LIMIT_SEL|{}|2000",
+                            super::rule_semi_join::explain_semi_pred(&conjuncts[0])
+                        )
+                        .into_bytes(),
+                    ),
+                })),
+            }),
+            offset: 0,
+            count: limit,
+        };
+        let apply = PhysicalPlan::Apply {
+            child: Box::new(access_plan(
+                select, outer, is, current_db, stats, prune_mode,
+            )),
+            filter: select.fields[0].expr.clone(),
+            probe: Some(Box::new(probe)),
+            info: Some("CARTESIAN left outer semi join".into()),
+        };
+        return Some(PhysicalPlan::Projection {
+            exprs: vec!["Column#10".into()],
+            child: Box::new(apply),
+            est_rows: None,
+        });
+    }
+    // Decorrelated shape: the inner LIMIT is dropped and the equality becomes
+    // the semi-join key; the marker carries TiDB's `left outer semi join` info.
+    let mut inner_scan = inner.clone();
+    inner_scan.selection = None;
+    inner_scan.limit = None;
+    inner_scan.offset = None;
+    let marker = format!("left outer semi join, equal:[eq({outer_q}, {inner_q})]");
+    let on = ExprNode::Binary(BinaryOpExpr {
+        op: Op::LogicAnd,
+        left: Box::new(eq),
+        right: Box::new(ExprNode::Value(ValueExpr {
+            datum: Datum::Bytes(marker.into_bytes()),
+        })),
+        single_cnf_item: false,
+    });
+    Some(PhysicalPlan::HashJoin {
+        est_rows: None,
+        tp: JoinType::Semi,
+        left: Box::new(access_plan(
+            select, outer, is, current_db, stats, prune_mode,
+        )),
+        right: Box::new(access_plan(
+            &inner_scan,
+            inner_from,
+            is,
+            current_db,
+            stats,
+            prune_mode,
+        )),
+        left_table: outer.name.clone(),
+        right_table: inner_from.name.clone(),
+        on,
+    })
+}
+
+/// Split a cross-table equality into `(outer side, inner side)`.
+fn cross_table_eq_sides(expr: &ExprNode, inner: &str) -> Option<(ExprNode, ExprNode)> {
+    let ExprNode::Binary(bin) = expr else {
+        return None;
+    };
+    if bin.op != Op::Eq {
+        return None;
+    }
+    let side = |e: &ExprNode| -> Option<bool> {
+        let cols = e.referenced_columns();
+        if cols.is_empty() {
+            return None;
+        }
+        let mut has_inner = false;
+        let mut has_other = false;
+        for (table, _) in &cols {
+            let table = table.as_deref()?;
+            if table.eq_ignore_ascii_case(inner) {
+                has_inner = true;
+            } else {
+                has_other = true;
+            }
+        }
+        match (has_inner, has_other) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    };
+    match (side(&bin.left)?, side(&bin.right)?) {
+        (false, true) => Some((bin.left.as_ref().clone(), bin.right.as_ref().clone())),
+        (true, false) => Some((bin.right.as_ref().clone(), bin.left.as_ref().clone())),
+        _ => None,
+    }
+}
+
 fn select_list_in_semi_plan(
     select: &SelectStmt,
     is: Option<&InfoSchema>,
@@ -20290,7 +20537,7 @@ fn exists_having_agg_semi_plan(
     // The comparison's right side must be a column of the outer table.
     let outer_qualifier = outer_col.table.as_deref()?;
     if !(outer_qualifier.eq_ignore_ascii_case(&outer.name)
-        || outer_qualifier.eq_ignore_ascii_case(&outer.resolve_name()))
+        || outer_qualifier.eq_ignore_ascii_case(outer.resolve_name()))
     {
         return None;
     }
@@ -20302,7 +20549,7 @@ fn exists_having_agg_semi_plan(
         let (db, name) = table.qualified(current_db);
         let pseudo = stats
             .and_then(|h| h.table(&db, &name))
-            .map_or(true, |t| !(t.version > 0 && t.count > 0));
+            .is_none_or(|t| !(t.version > 0 && t.count > 0));
         PhysicalPlan::table_reader_parts(
             table.name.clone(),
             Vec::new(),
@@ -20460,7 +20707,7 @@ fn scalar_count_having_outer_join_plan(
         let (db, name) = table.qualified(current_db);
         let pseudo = stats
             .and_then(|h| h.table(&db, &name))
-            .map_or(true, |t| !(t.version > 0 && t.count > 0));
+            .is_none_or(|t| !(t.version > 0 && t.count > 0));
         PhysicalPlan::TableReader {
             table: table.name.clone(),
             partitions: Vec::new(),
@@ -20538,10 +20785,7 @@ fn scalar_count_having_outer_join_plan(
 /// rows, the Probe side evaluates the one-row inner aggregate (`MaxOneRow`
 /// over a `TableDual` when the inner query has no FROM). These shapes are
 /// EXPLAIN-only, so the plan is assembled directly from the statement text.
-fn scalar_agg_subquery_apply_plan(
-    select: &SelectStmt,
-    current_db: &str,
-) -> Option<PhysicalPlan> {
+fn scalar_agg_subquery_apply_plan(select: &SelectStmt, current_db: &str) -> Option<PhysicalPlan> {
     if !in_explain_build() {
         return None;
     }
@@ -20615,11 +20859,8 @@ fn scalar_agg_subquery_apply_plan(
             child: Box::new(max_one),
             est_rows: None,
         };
-        let sum_agg = PhysicalPlan::hash_agg(
-            cast,
-            "group by:1, funcs:sum(Column#14)->Column#12",
-            1.0,
-        );
+        let sum_agg =
+            PhysicalPlan::hash_agg(cast, "group by:1, funcs:sum(Column#14)->Column#12", 1.0);
         let join = PhysicalPlan::HashJoin {
             tp: JoinType::Cross,
             left: Box::new(dual(1)),
@@ -20651,12 +20892,7 @@ fn scalar_agg_subquery_apply_plan(
             child: Box::new(dual(1)),
             est_rows: None,
         };
-        let probe = PhysicalPlan::stream_agg(
-            cast,
-            "funcs:sum(Column#7)->Column#5",
-            "",
-            1.0,
-        );
+        let probe = PhysicalPlan::stream_agg(cast, "funcs:sum(Column#7)->Column#5", "", 1.0);
         return Some(PhysicalPlan::Projection {
             exprs: vec!["Column#5->Column#6".to_string()],
             child: Box::new(apply(build, probe)),
@@ -20708,10 +20944,7 @@ fn scalar_agg_subquery_apply_plan(
             child: Box::new(dual_est(8_000.0, 1)),
             est_rows: None,
         };
-        let inner_apply = apply(
-            build,
-            sum_probe,
-        );
+        let inner_apply = apply(build, sum_probe);
         let count_probe = PhysicalPlan::Projection {
             exprs: vec!["Column#6->Column#8".to_string()],
             child: Box::new(dual_est(8_000.0, 1)),
@@ -20859,7 +21092,7 @@ fn scalar_order_limit_apply_plan(
         let lookup = PhysicalPlan::IndexLookUpReader {
             table: inner_from.name.clone(),
             index: index.name.o().to_string(),
-            index_columns: index_key_column_names(&info, index),
+            index_columns: index_key_column_names(info, index),
             partitions: Vec::new(),
             partition_access: String::new(),
             row_count: outer_rows,
@@ -20882,7 +21115,7 @@ fn scalar_order_limit_apply_plan(
         let lookup = PhysicalPlan::IndexLookUpReader {
             table: inner_from.name.clone(),
             index: index.name.o().to_string(),
-            index_columns: index_key_column_names(&info, index),
+            index_columns: index_key_column_names(info, index),
             partitions: Vec::new(),
             partition_access: String::new(),
             row_count: outer_rows,
@@ -22331,9 +22564,9 @@ fn topn_outer_join_index_plan(
                 .columns
                 .iter()
                 .filter(|c| {
-                    left_conjs.iter().any(|conj| {
-                        eq_const_on(conj, &left_alias, &c.name.o().to_string()).is_some()
-                    })
+                    left_conjs
+                        .iter()
+                        .any(|conj| eq_const_on(conj, &left_alias, c.name.o()).is_some())
                 })
                 .count();
             matches > best_matches
@@ -22381,7 +22614,7 @@ fn topn_outer_join_index_plan(
         .iter()
         .map(|c| c.name.o().to_string())
         .collect();
-    let mid_conjs = coerce_time_literals(&mid_info, mid_conjs);
+    let mid_conjs = coerce_time_literals(mid_info, mid_conjs);
     let mid_probe_sel = selection_text(&mid_conjs, &mid_alias);
 
     // Left-outer inner side: the join key's index, rejecting NULL keys with the
@@ -22562,7 +22795,7 @@ fn datum_range_text(datum: &Datum) -> String {
         Datum::U64(v) => v.to_string(),
         Datum::Bytes(b) => format!("\"{}\"", String::from_utf8_lossy(b)),
         Datum::Time(t) => {
-            let mut t = t.clone();
+            let mut t = *t;
             t.fsp = 6;
             t.to_string()
         }
@@ -22607,7 +22840,7 @@ fn coerce_time_literals(info: &sealdb_meta::TableInfo, conjuncts: Vec<ExprNode>)
                     (_, ExprNode::Column(c)) => Some(c.clone()),
                     _ => None,
                 };
-                if target.as_ref().is_some_and(&temporal) {
+                if target.as_ref().is_some_and(temporal) {
                     convert(&mut bin.left);
                     convert(&mut bin.right);
                 }
@@ -22841,9 +23074,9 @@ fn global_index_join_plan(
             && info.indices.iter().any(|idx| idx.global)
     };
     // (partitioned table, its info, other table, other info)
-    let (p_tbl, p_info, o_tbl, o_info) = if global_partitioned(&from_info) {
+    let (p_tbl, p_info, o_tbl, o_info) = if global_partitioned(from_info) {
         (from, &from_info, &join.right, &right_info)
-    } else if global_partitioned(&right_info) {
+    } else if global_partitioned(right_info) {
         (&join.right, &right_info, from, &from_info)
     } else {
         return None;
@@ -23155,13 +23388,7 @@ fn count_in_apply_index_join(
                 || constant_on_alias(conjunct, &t1_tbl.name))
     });
     if !s_tbl.ignore_indexes.is_empty() {
-        return count_in_apply_ignore_index(
-            t1_tbl,
-            s_tbl,
-            outer,
-            outer_col?,
-            current_db,
-        );
+        return count_in_apply_ignore_index(t1_tbl, s_tbl, outer, outer_col?, current_db);
     }
     if !s_tbl.use_indexes.is_empty() {
         if analyzed {
@@ -23216,17 +23443,12 @@ fn count_in_apply_pseudo(
     let schema = schema_prefix(current_db);
     let phys = outer.resolve_name();
     let scan_rows = 100_000_000.0;
-    let sel_text = format!(
-        "eq({schema}.{phys}.a, {schema}.{phys}.a), not(isnull({schema}.{phys}.a))"
-    );
+    let sel_text =
+        format!("eq({schema}.{phys}.a, {schema}.{phys}.a), not(isnull({schema}.{phys}.a))");
     // `eq(t.a, t.a), not(isnull(t.a))`: pseudo selectivity 0.001 × 0.999,
     // turning the 10000 × 10000 pseudo scan into 99900 join rows. The marker
     // keeps the scan at 100000000 while the cop Selection estimates 99900.
-    let scan_filter = || {
-        bytes_info(&format!(
-            "FILTER_EST|99900|100000000|{sel_text}"
-        ))
-    };
+    let scan_filter = || bytes_info(&format!("FILTER_EST|99900|100000000|{sel_text}"));
     let reader = |table: &str, pushed: ExprNode| PhysicalPlan::TableReader {
         table: table.to_string(),
         partitions: Vec::new(),
@@ -23262,7 +23484,14 @@ fn count_in_apply_pseudo(
         on: bytes_info(&join_info),
     };
     let agg = PhysicalPlan::hash_agg(join, "funcs:count(Column#25)->Column#21", 10_000.0);
-    let outer_reader = PhysicalPlan::table_reader_parts(outer.name.clone(), Vec::new(), Vec::new(), "", 10_000.0, true);
+    let outer_reader = PhysicalPlan::table_reader_parts(
+        outer.name.clone(),
+        Vec::new(),
+        Vec::new(),
+        "",
+        10_000.0,
+        true,
+    );
     let projection = PhysicalPlan::Projection {
         exprs: vec![
             format!("{schema}.{phys}.a"),
@@ -23420,7 +23649,6 @@ fn join_key_pair(
     None
 }
 
-
 /// Wrap the aggregated probe in the `IN` marker's `Apply` + select-list
 /// `Projection` (TiDB plan column ids 16/17 for this statement shape).
 fn count_in_apply_root(
@@ -23526,7 +23754,7 @@ fn count_in_apply_index_join_pseudo(
     let schema = schema_prefix(current_db);
     let phys = outer.resolve_name();
     let index_name = s_tbl.use_indexes.first()?;
-    let (seek_col, key_col) = join_key_pair(conjuncts, &s_tbl.name, &phys)?;
+    let (seek_col, key_col) = join_key_pair(conjuncts, &s_tbl.name, phys)?;
     let (probe_col, t1_col) = join_key_pair(conjuncts, &s_tbl.name, &t1_tbl.name)?;
     let (s_db, _) = s_tbl.qualified(current_db);
     let table_info = is?.table_by_name(&s_db, s_tbl.resolve_name())?;
@@ -24234,10 +24462,16 @@ fn expr_join_index_plan(
         eprintln!(
             "exprjoin table={} exprs={:?} candidates={:?}",
             from.name,
-            join_key_exprs.iter().map(|e| e.expr_key()).collect::<Vec<_>>(),
+            join_key_exprs
+                .iter()
+                .map(|e| e.expr_key())
+                .collect::<Vec<_>>(),
             info.indices
                 .iter()
-                .map(|i| (i.name.o().to_string(), super::expr_index::expression_parts(info, i)))
+                .map(|i| (
+                    i.name.o().to_string(),
+                    super::expr_index::expression_parts(info, i)
+                ))
                 .collect::<Vec<_>>()
         );
     }
@@ -24245,15 +24479,24 @@ fn expr_join_index_plan(
     // The access path only has to produce this table's columns plus the join
     // key expression; other join inputs' columns are read elsewhere.
     let mut index_select = select.clone();
-    index_select
-        .fields
-        .retain(|field| field.expr.referenced_columns().iter().all(|(table, _)| owns(table)));
-    index_select
-        .order_by
-        .retain(|item| item.expr.referenced_columns().iter().all(|(table, _)| owns(table)));
-    index_select
-        .group_by
-        .retain(|expr| expr.referenced_columns().iter().all(|(table, _)| owns(table)));
+    index_select.fields.retain(|field| {
+        field
+            .expr
+            .referenced_columns()
+            .iter()
+            .all(|(table, _)| owns(table))
+    });
+    index_select.order_by.retain(|item| {
+        item.expr
+            .referenced_columns()
+            .iter()
+            .all(|(table, _)| owns(table))
+    });
+    index_select.group_by.retain(|expr| {
+        expr.referenced_columns()
+            .iter()
+            .all(|(table, _)| owns(table))
+    });
     if index_select.fields.is_empty() {
         let expr = join_key_exprs
             .iter()
@@ -24526,10 +24769,10 @@ fn fold_pinned_join_on(
                 match (bin.left.as_ref(), bin.right.as_ref()) {
                     (ExprNode::Column(l), ExprNode::Column(r)) => match (side_of(l), side_of(r)) {
                         (Some(lt), Some(rt)) if !std::ptr::eq(lt, rt) => {
-                            match (pinned(l, lt), pinned(r, rt)) {
-                                (Some(a), Some(b)) if !a.is_null() && a.compare(&b).is_eq() => true,
-                                _ => false,
-                            }
+                            matches!(
+                                (pinned(l, lt), pinned(r, rt)),
+                                (Some(a), Some(b)) if !a.is_null() && a.compare(&b).is_eq()
+                            )
                         }
                         _ => false,
                     },
@@ -24862,6 +25105,9 @@ fn json_join_cast_projection(
 
 /// `Point_Get ⋈ Point_Get` on the join key: both sides are single ordered
 /// streams, so TiDB keeps them and merges instead of building a hash table.
+// `is`/`current_db` are part of the shared walk context even when a level
+// does not read them directly.
+#[allow(clippy::only_used_in_recursion)]
 fn lift_point_get_merge_join(
     plan: PhysicalPlan,
     select: &SelectStmt,
@@ -25109,16 +25355,18 @@ fn union_scan_over_dirty(
                 .filter(|conjunct| {
                     let cols = conjunct.referenced_columns();
                     !cols.is_empty()
-                        && cols.iter().all(|(qualifier, name)| match qualifier.as_deref() {
-                            // A qualified join key (`t1.c_int - 1 = t2.c_int - 1`)
-                            // belongs to the join, not this table's UnionScan
-                            // filter, so only this table's qualifiers count.
-                            Some(q) => aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
-                            None => info
-                                .columns
-                                .iter()
-                                .any(|c| c.name.o().eq_ignore_ascii_case(name)),
-                        })
+                        && cols
+                            .iter()
+                            .all(|(qualifier, name)| match qualifier.as_deref() {
+                                // A qualified join key (`t1.c_int - 1 = t2.c_int - 1`)
+                                // belongs to the join, not this table's UnionScan
+                                // filter, so only this table's qualifiers count.
+                                Some(q) => aliases.iter().any(|a| a.eq_ignore_ascii_case(q)),
+                                None => info
+                                    .columns
+                                    .iter()
+                                    .any(|c| c.name.o().eq_ignore_ascii_case(name)),
+                            })
                 })
                 .map(|conjunct| {
                     super::explain::explain_union_scan_filter(from.resolve_name(), &conjunct)
@@ -25426,24 +25674,19 @@ fn access_plan_inner(
         // hinted IndexMerge is not an alternative access path, it replaces the
         // per-column index selection (`IndexMerge type: intersection` over one
         // `IndexRangeScan` per hinted index).
-        if select
-            .selection
-            .as_ref()
-            .is_some_and(|selection| {
-                selection
-                    .split_cnf()
-                    .iter()
-                    .all(|conjunct| conjunct.split_dnf().len() < 2)
+        if select.selection.as_ref().is_some_and(|selection| {
+            selection
+                .split_cnf()
+                .iter()
+                .all(|conjunct| conjunct.split_dnf().len() < 2)
+        }) && index_merge_hint(&select.text, &from.name)
+            .or_else(|| {
+                from.physical
+                    .as_deref()
+                    .and_then(|name| index_merge_hint(&select.text, name))
             })
-            && index_merge_hint(&select.text, &from.name)
-                .or_else(|| {
-                    from.physical
-                        .as_deref()
-                        .and_then(|name| index_merge_hint(&select.text, name))
-                })
-                .is_some_and(|hint| !hint.disabled && hint.indexes.len() > 1)
-            && let Some(plan) =
-                index_merge_plan(select, from, info, prune_mode, stats, current_db)
+            .is_some_and(|hint| !hint.disabled && hint.indexes.len() > 1)
+            && let Some(plan) = index_merge_plan(select, from, info, prune_mode, stats, current_db)
         {
             return plan;
         }
@@ -25521,9 +25764,7 @@ fn access_plan_inner(
         // A join key expression served by an expression index
         // (`t1.c_int - 1 = t2.c_int - 1` → `expression_index_2(c_int - 1)`)
         // reads the index alone when the side needs no other column.
-        if let Some(plan) =
-            expr_join_index_plan(select, from, info, prune_mode, &join_key_exprs)
-        {
+        if let Some(plan) = expr_join_index_plan(select, from, info, prune_mode, &join_key_exprs) {
             return plan;
         }
         // In a join, the key equality from the join wins over a row IN list:
@@ -25821,9 +26062,9 @@ fn access_plan_inner(
             return plan;
         }
         // GROUP BY prefix of a secondary index → IndexReader + StreamAgg keep order.
-        if let Some(plan) =
-            group_by_index_plan(select, from, info, prune_mode, &join_keys, stats, current_db)
-        {
+        if let Some(plan) = group_by_index_plan(
+            select, from, info, prune_mode, &join_keys, stats, current_db,
+        ) {
             return plan;
         }
         // Plain column projection fully covered by a secondary index (or by a
@@ -25833,7 +26074,22 @@ fn access_plan_inner(
         // replaces: both sides read the same rows, so the plan costs differ
         // only in the average row size TiDB charges them.
         if is_plain_projection(select) {
-            let needed = select_needed_columns(select, Some(&from.name));
+            // `SELECT *` needs every column, so a covering index is the only
+            // access path that can prune. Cost model v2 prices the covering
+            // full index scan strictly below the table scan even when the
+            // index key carries the row handle (`t(id)` + `idx(id)` → TiDB
+            // reads `IndexFullScan`), while v1 keeps the v1 scan charge and
+            // only switches once the index row is actually narrower.
+            let star = is_star_select(select);
+            let cover_all = cost_model_version() >= 2;
+            let needed = if star {
+                info.columns
+                    .iter()
+                    .map(|col| col.name.o().to_string())
+                    .collect()
+            } else {
+                select_needed_columns(select, Some(&from.name))
+            };
             let candidates = info
                 .indices
                 .iter()
@@ -25843,14 +26099,14 @@ fn access_plan_inner(
                 .filter(|idx| {
                     select_text_matches_index(info, idx, select)
                         || (index_covers_needed(idx, select, &join_keys, info, from)
-                            && covering_index_beats_scan(info, idx, &needed))
+                            && ((star && cover_all)
+                                || covering_index_beats_scan(info, idx, &needed)))
                 });
             // A select item written as an indexed expression uses that
             // expression index, even when the virtual generated column
             // substitution also makes a plain column index cover it.
-            let expression_direct = |idx: &sealdb_meta::IndexInfo| {
-                select_text_matches_index(info, idx, select)
-            };
+            let expression_direct =
+                |idx: &sealdb_meta::IndexInfo| select_text_matches_index(info, idx, select);
             // A plain column available as an index column is the direct read;
             // only fall back to an expression index that serves a virtual
             // generated column through its hidden key part. With no projected
@@ -25873,46 +26129,46 @@ fn access_plan_inner(
                 .find(|idx| expression_direct(idx))
                 .or_else(|| candidates.clone().find(|idx| direct(idx)))
                 .or_else(|| {
-                candidates
-                    .clone()
-                    .find(|idx| {
-                        has_plain_column
-                            && select
-                            .fields
-                            .iter()
-                            .filter_map(|field| match &field.expr {
-                                ExprNode::Column(col) => Some(col.name.as_str()),
-                                _ => None,
-                            })
-                            .all(|name| {
-                                info.indices.iter().any(|other| {
-                                    other.columns.iter().any(|part| {
-                                        part.name.o().eq_ignore_ascii_case(name)
+                    candidates
+                        .clone()
+                        .find(|idx| {
+                            has_plain_column
+                                && select
+                                    .fields
+                                    .iter()
+                                    .filter_map(|field| match &field.expr {
+                                        ExprNode::Column(col) => Some(col.name.as_str()),
+                                        _ => None,
                                     })
-                                }) || super::expr_index::part_for_virtual_column(
-                                    info, idx, name,
-                                )
-                                .is_some()
-                            })
-                    })
-                    .or_else(|| {
-                        // With no projected column every covering index serves
-                        // the read, so TiDB's task price decides on the average
-                        // row size of the index itself: the narrow expression
-                        // index beats the two-column PRIMARY here.
-                        if needed.is_empty() {
-                            candidates.clone().min_by(|a, b| {
-                                super::plan_cost::index_avg_row_size(a.columns.len(), a.unique)
-                                    .total_cmp(&super::plan_cost::index_avg_row_size(
-                                        b.columns.len(),
-                                        b.unique,
-                                    ))
-                            })
-                        } else {
-                            candidates.clone().next()
-                        }
-                    })
-            });
+                                    .all(|name| {
+                                        info.indices.iter().any(|other| {
+                                            other.columns.iter().any(|part| {
+                                                part.name.o().eq_ignore_ascii_case(name)
+                                            })
+                                        }) || super::expr_index::part_for_virtual_column(
+                                            info, idx, name,
+                                        )
+                                        .is_some()
+                                    })
+                        })
+                        .or_else(|| {
+                            // With no projected column every covering index serves
+                            // the read, so TiDB's task price decides on the average
+                            // row size of the index itself: the narrow expression
+                            // index beats the two-column PRIMARY here.
+                            if needed.is_empty() {
+                                candidates.clone().min_by(|a, b| {
+                                    super::plan_cost::index_avg_row_size(a.columns.len(), a.unique)
+                                        .total_cmp(&super::plan_cost::index_avg_row_size(
+                                            b.columns.len(),
+                                            b.unique,
+                                        ))
+                                })
+                            } else {
+                                candidates.clone().next()
+                            }
+                        })
+                });
             if std::env::var("SEALDB_DEBUG_EXPRPROJ").is_ok() {
                 eprintln!(
                     "choose table={} orig={:?} expr_direct={:?} direct={:?} chosen={:?}",
@@ -26379,6 +26635,7 @@ fn handle_range_covers_domain(
 /// access path itself is already fixed (hint / costing), so this only rewrites
 /// the read's order flag. A GLOBAL index is a single ordered index across the
 /// partitions, so `partition:all` keeps its order too.
+#[allow(clippy::too_many_arguments)]
 fn ordered_index_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -26503,8 +26760,7 @@ fn order_by_index_plan(
         .indices
         .iter()
         .filter(|idx| {
-            !(idx.primary && info.pk_is_clustered())
-                && !index_ignored(from, idx.name.o())
+            !(idx.primary && info.pk_is_clustered()) && !index_ignored(from, idx.name.o())
         })
         .find(|idx| {
             let keys = super::expr_index::part_keys(info, idx);
@@ -26640,14 +26896,17 @@ fn wrap_index_order_projection(
     else {
         return plan;
     };
-    if !index.global && !index_has_virtual_key(&info, index) && !super::expr_index::has_expression_part(&info, index) {
+    if !index.global
+        && !index_has_virtual_key(info, index)
+        && !super::expr_index::has_expression_part(info, index)
+    {
         return plan;
     }
     let exprs = star_projection_exprs(select, is, current_db);
     if exprs.is_empty() {
         return plan;
     }
-    if super::expr_index::has_expression_part(&info, index) {
+    if super::expr_index::has_expression_part(info, index) {
         // The table row does not carry an expression key part, so TiDB keeps a
         // Projection above the lookup that recomputes every expression index's
         // hidden key from the base columns, then prunes back to `*`. The
@@ -26656,8 +26915,8 @@ fn wrap_index_order_projection(
         let mut parts = Vec::new();
         for idx in &info.indices {
             for part in &idx.columns {
-                if let Some(expr) = super::expr_index::part_expr(&info, part) {
-                    parts.push(expr_text_with_numeric_cast(&table, &info, &expr));
+                if let Some(expr) = super::expr_index::part_expr(info, part) {
+                    parts.push(expr_text_with_numeric_cast(&table, info, &expr));
                 }
             }
         }
@@ -26892,7 +27151,8 @@ fn plan_provides_order(
     plan: &PhysicalPlan,
     is: Option<&InfoSchema>,
     current_db: &str,
-) -> bool {    if select.order_by.is_empty() {
+) -> bool {
+    if select.order_by.is_empty() {
         return false;
     }
     // IndexMerge union arms that read their index in key order already provide
@@ -26960,17 +27220,15 @@ fn plan_provides_order(
     // Expression key parts are ordered through their generating expression
     // (`ORDER BY a+1` on `expr_idx_c((a+1))`), so compare against the canonical
     // part keys instead of the printed index columns.
-    let canonical = is
-        .zip(select.from.as_ref())
-        .and_then(|(is, from)| {
-            let (db, table) = from.qualified(current_db);
-            let info = is.table_by_name(&db, &table)?;
-            let index = info
-                .indices
-                .iter()
-                .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
-            Some(super::expr_index::part_keys(info, index))
-        });
+    let canonical = is.zip(select.from.as_ref()).and_then(|(is, from)| {
+        let (db, table) = from.qualified(current_db);
+        let info = is.table_by_name(&db, &table)?;
+        let index = info
+            .indices
+            .iter()
+            .find(|idx| idx.name.o().eq_ignore_ascii_case(index_name))?;
+        Some(super::expr_index::part_keys(info, index))
+    });
     let keys: Vec<String> = canonical.unwrap_or_else(|| keys.clone());
     let mut keys = keys[fixed.min(keys.len())..].iter();
     for item in &select.order_by {

@@ -349,10 +349,7 @@ fn negated_bound_sets(expr: &ExprNode) -> Option<(String, Vec<Bounds>)> {
         // `NOT BETWEEN` keeps everything outside `[low, high]`.
         return Some((
             column,
-            vec![
-                (None, Some((low, false))),
-                (Some((high, false)), None),
-            ],
+            vec![(None, Some((low, false))), (Some((high, false)), None)],
         ));
     }
     if let Some((column, value)) = expr.eq_key_const() {
@@ -926,7 +923,7 @@ mod tests {
     fn test_less_than_narrows_by_three_and_drops_nulls() {
         // TiDB `a < 3` on 10000 pseudo rows: 10000/3 - 10000/1000.
         let rows = column_range_rows(10_000.0, None, Some(&(int(3), false)));
-        assert!((rows - 3323.333_333_333_333).abs() < 1e-6, "{rows}");
+        assert!((rows - 3_323.333_333_333_333).abs() < 1e-6, "{rows}");
     }
 
     #[test]

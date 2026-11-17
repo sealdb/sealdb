@@ -49,6 +49,26 @@ pub fn virtual_rows(table: &str, is: &InfoSchema) -> Result<(Vec<String>, Vec<Ve
         "stats_histograms" => Ok(stats_histograms(is)),
         "stats_buckets" => Ok(stats_buckets(is)),
         "stats_top_n" => Ok(stats_top_n(is)),
+        // `mysql.bind_info` rows carry session bindings from the domain; the
+        // executor fills them, this exposes the column layout.
+        "bind_info" => Ok((
+            vec![
+                "original_sql".to_string(),
+                "normalized_sql".to_string(),
+                "sql_digest".to_string(),
+                "plan_digest".to_string(),
+                "bind_sql".to_string(),
+                "status".to_string(),
+                "create_time".to_string(),
+                "update_time".to_string(),
+                "charset".to_string(),
+                "collation".to_string(),
+                "source".to_string(),
+                "sql_mode".to_string(),
+                "hint".to_string(),
+            ],
+            Vec::new(),
+        )),
         other => Err(Error::new(
             ERR_NO_SUCH_TABLE,
             format!("Table 'information_schema.{other}' doesn't exist"),
@@ -134,7 +154,8 @@ fn ddl_jobs() -> (Vec<String>, Vec<Vec<Datum>>) {
     (schema, rows)
 }
 
-fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {    let schema = vec![
+fn schemata(is: &InfoSchema) -> (Vec<String>, Vec<Vec<Datum>>) {
+    let schema = vec![
         "CATALOG_NAME".to_string(),
         "SCHEMA_NAME".to_string(),
         "DEFAULT_CHARACTER_SET_NAME".to_string(),
@@ -853,8 +874,7 @@ fn estimate_row_lengths(
                         .map(|(_, count)| *count)
                 })
                 .unwrap_or(0);
-            let (part_data, part_index) =
-                data_and_index_length(info, stats, def.id, part_rows);
+            let (part_data, part_index) = data_and_index_length(info, stats, def.id, part_rows);
             row_count += part_rows;
             data_length += part_data;
             index_length += part_index;
@@ -863,11 +883,7 @@ fn estimate_row_lengths(
     if info.is_sequence() {
         row_count = 1;
     }
-    let avg_row_length = if row_count == 0 {
-        0
-    } else {
-        data_length / row_count
-    };
+    let avg_row_length = data_length.checked_div(row_count).unwrap_or(0);
     (row_count, avg_row_length, data_length, index_length)
 }
 
@@ -886,13 +902,8 @@ fn estimate_partition_row_lengths(
                 .map(|(_, count)| *count)
         })
         .unwrap_or(0);
-    let (data_length, index_length) =
-        data_and_index_length(info, stats, physical_id, row_count);
-    let avg_row_length = if row_count == 0 {
-        0
-    } else {
-        data_length / row_count
-    };
+    let (data_length, index_length) = data_and_index_length(info, stats, physical_id, row_count);
+    let avg_row_length = data_length.checked_div(row_count).unwrap_or(0);
     (row_count, avg_row_length, data_length, index_length)
 }
 

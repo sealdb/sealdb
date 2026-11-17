@@ -1,9 +1,9 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_CANNOT_ADD_FOREIGN, ERR_FK_DUP_NAME, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_DUP_FIELDNAME,
-    ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT,
-    ERR_NO_SUCH_TABLE,
-    ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
-    ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error, Result,
+    ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN, ERR_DUP_FIELDNAME,
+    ERR_FK_DUP_NAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC,
+    ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN,
+    ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error,
+    Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -154,9 +154,7 @@ pub(crate) fn is_lob_type(field_type: &FieldType) -> bool {
     matches!(
         field_type.tp,
         TYPE_BLOB | TYPE_TINY_BLOB | TYPE_MEDIUM_BLOB | TYPE_LONG_BLOB | TYPE_JSON
-    ) || (field_type.tp == TYPE_VAR_STRING
-        && field_type.flen < 0
-        && field_type.charset != "binary")
+    ) || (field_type.tp == TYPE_VAR_STRING && field_type.flen < 0 && field_type.charset != "binary")
 }
 
 /// MySQL/TiDB: a literal default on a BLOB/TEXT/JSON column is error 1101 in
@@ -239,7 +237,8 @@ fn check_builtin_arg_counts(expr: &ExprNode) -> Result<()> {
     match expr {
         ExprNode::Value(_) | ExprNode::Column(_) => {}
         ExprNode::Func(func) => {
-            if let Err((_min, _max)) = sealdb_expression::check_arg_count(&func.name, func.args.len())
+            if let Err((_min, _max)) =
+                sealdb_expression::check_arg_count(&func.name, func.args.len())
             {
                 return Err(Error::new(
                     ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT,
@@ -468,15 +467,12 @@ fn integer_bounds(field_type: &FieldType) -> Option<(i128, i128)> {
 fn bit_literal_bits(text: &str) -> Option<&str> {
     let rest = if text.len() >= 3 && (text.starts_with("b'") || text.starts_with("B'")) {
         text.get(2..text.len().saturating_sub(1))?
-    } else if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
-        rest
     } else {
-        return None;
+        text.strip_prefix("0b")
+            .or_else(|| text.strip_prefix("0B"))?
     };
-    if text.starts_with("b'") || text.starts_with("B'") {
-        if !text.ends_with('\'') {
-            return None;
-        }
+    if (text.starts_with("b'") || text.starts_with("B'")) && !text.ends_with('\'') {
+        return None;
     }
     if rest.is_empty() || !rest.bytes().all(|b| b == b'0' || b == b'1') {
         return None;
@@ -510,7 +506,7 @@ pub(crate) fn validate_default_literal(
     if field_type.tp == TYPE_BIT {
         // `b'111'` on `BIT(2)`: the bit-string's value must fit the width.
         if let Some(bits) = bit_literal_bits(trimmed) {
-            let width = field_type.flen.max(1).min(128) as u32;
+            let width = field_type.flen.clamp(1, 128) as u32;
             let mut acc: u128 = 0;
             let mut overflow = false;
             for b in bits.bytes() {
@@ -751,7 +747,7 @@ pub(crate) fn normalize_default(field_type: &FieldType, default: &str) -> String
         TYPE_DATETIME | TYPE_TIMESTAMP => match sealdb_types::parse_datetime_literal(&value)
             .or_else(|_| sealdb_types::parse_datetime_literal(&format!("{value} 00:00:00")))
         {
-            Ok(time) => format!("'{}'", round_time(time, fsp).to_string()),
+            Ok(time) => format!("'{}'", round_time(time, fsp)),
             Err(_) => default.to_string(),
         },
         TYPE_DATE => match sealdb_types::parse_date_literal(&value) {
@@ -791,7 +787,8 @@ pub(crate) fn origin_default_for(field_type: &FieldType, default: &str) -> Optio
     Some(utc.to_string())
 }
 
-fn round_time(mut time: sealdb_types::Time, fsp: i32) -> sealdb_types::Time {    let fsp = fsp.clamp(0, 6) as u32;
+fn round_time(mut time: sealdb_types::Time, fsp: i32) -> sealdb_types::Time {
+    let fsp = fsp.clamp(0, 6) as u32;
     let scale = 10u32.pow(6 - fsp);
     let mut micro = ((time.micro + scale / 2) / scale) * scale;
     if micro >= 1_000_000 {
@@ -996,10 +993,9 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         if let Some(default) = col.default.as_deref() {
             validate_default_expr(default)?;
         }
-        let default = col
-            .default
-            .as_deref()
-            .map(|default| normalize_expression_default(&normalize_default(&info.field_type, default)));
+        let default = col.default.as_deref().map(|default| {
+            normalize_expression_default(&normalize_default(&info.field_type, default))
+        });
         info.default_expr = normalize_lob_default(info.name.o(), &info.field_type, default)?;
         info.origin_default_expr = info
             .default_expr
@@ -1066,11 +1062,9 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         // a primary key (3106).
         if index.primary {
             for ic in &idx_cols {
-                if info
-                    .columns
-                    .iter()
-                    .any(|c| c.offset == ic.offset && c.generated_expr.is_some() && !c.generated_stored)
-                {
+                if info.columns.iter().any(|c| {
+                    c.offset == ic.offset && c.generated_expr.is_some() && !c.generated_stored
+                }) {
                     return Err(crate::alter::unsupported_generated(
                         "Defining a virtual generated column as primary key",
                     ));
@@ -1138,9 +1132,7 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
     // constraint) when no existing index (or the integer row handle) covers it.
     // A temporary table (TiDB `TempTableLocal` or `TempTableGlobal`) cannot own
     // a foreign key (`ErrCannotAddForeign`, 1215).
-    if !stmt.foreign_keys.is_empty()
-        && (stmt.temporary || stmt.on_commit_delete_rows)
-    {
+    if !stmt.foreign_keys.is_empty() && (stmt.temporary || stmt.on_commit_delete_rows) {
         return Err(Error::new(
             ERR_CANNOT_ADD_FOREIGN,
             "Cannot add foreign key constraint",
@@ -1184,10 +1176,7 @@ pub(crate) fn add_foreign_key(
                 .find(|c| c.name.o().eq_ignore_ascii_case(col_name))
                 .map(|c| (c.name.o().to_string(), c.offset))
                 .ok_or_else(|| {
-                    Error::new(
-                        ERR_CANNOT_ADD_FOREIGN,
-                        "Cannot add foreign key constraint",
-                    )
+                    Error::new(ERR_CANNOT_ADD_FOREIGN, "Cannot add foreign key constraint")
                 })
         })
         .collect::<Result<Vec<_>>>()?;

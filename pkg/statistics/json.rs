@@ -159,7 +159,7 @@ fn index_from_json(idx: &Value) -> Result<IndexStats> {
     let stats_ver = idx
         .get("stats_ver")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| if ndv > 0 || null_count > 0 { 1 } else { 0 });
+        .unwrap_or(if ndv > 0 || null_count > 0 { 1 } else { 0 });
     Ok(IndexStats {
         ndv,
         null_count,
@@ -236,10 +236,11 @@ mod tests {
     }
 
     fn decimal_type() -> FieldType {
-        let mut ft = FieldType::default();
-        ft.tp = sealdb_types::field_type::TYPE_NEW_DECIMAL;
-        ft.decimal = 10;
-        ft
+        FieldType {
+            tp: sealdb_types::field_type::TYPE_NEW_DECIMAL,
+            decimal: 10,
+            ..FieldType::default()
+        }
     }
 
     #[test]
@@ -281,9 +282,10 @@ mod tests {
             .index_range_estimate(
                 "idx_1",
                 &{
-                    let mut ft = FieldType::default();
-                    ft.tp = sealdb_types::field_type::TYPE_DATETIME;
-                    ft
+                    FieldType {
+                        tp: sealdb_types::field_type::TYPE_DATETIME,
+                        ..FieldType::default()
+                    }
                 },
                 &[StatsRange {
                     low: Some((sealdb_types::Datum::Time(low), true)),
@@ -298,10 +300,9 @@ mod tests {
     fn test_column_ne_range_matches_tidb() {
         // TiDB `ranger` splits `col <> v` into `(-inf,v), (v,+inf)`; the column
         // histogram sizes the two disjoint ranges.
-        let datetime = || {
-            let mut ft = FieldType::default();
-            ft.tp = sealdb_types::field_type::TYPE_DATETIME;
-            ft
+        let datetime = || FieldType {
+            tp: sealdb_types::field_type::TYPE_DATETIME,
+            ..FieldType::default()
         };
         let ranges = |v: Time| {
             vec![
@@ -324,7 +325,7 @@ mod tests {
         ] {
             let table = load(path);
             let est = table
-                .column_range_estimate("col_3", HistValueKind::Time, &ranges(v.clone()))
+                .column_range_estimate("col_3", HistValueKind::Time, &ranges(v))
                 .expect("estimate");
             println!("{path} col_3 != 1993-12-02 = {est}");
         }

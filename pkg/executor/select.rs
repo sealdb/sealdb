@@ -333,9 +333,7 @@ impl Executor for DistinctExec {
                 } else {
                     row.clone()
                 };
-                let key = if project {
-                    row_key(&out, &(0..out.len()).collect::<Vec<_>>())
-                } else if idxs.is_empty() {
+                let key = if project || idxs.is_empty() {
                     row_key(&out, &(0..out.len()).collect::<Vec<_>>())
                 } else {
                     row_key(&out, &idxs)

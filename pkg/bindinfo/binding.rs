@@ -11,29 +11,64 @@ pub const MANUAL: &str = "manual";
 pub struct Binding {
     /// Original statement text as supplied to `CREATE BINDING FOR`.
     pub original_sql: String,
-    /// Replacement statement text from `USING`.
+    /// TiDB-normalized original (`select * from `db` . `t` where `a` = ?`).
+    pub normalized_sql: String,
+    /// SHA-256 of [`Self::normalized_sql`] (TiDB `BindInfo.SQLDigest`).
+    pub sql_digest: String,
+    /// Digest of the chosen plan; empty for a manually created binding.
+    pub plan_digest: String,
+    /// Replacement statement text from `USING` (executed verbatim).
     pub bind_sql: String,
+    /// `USING` text in TiDB restore form (`SELECT … FROM `db`.`t` …`), shown by
+    /// `SHOW BINDINGS` and stored in `mysql.bind_info`.
+    pub display_bind_sql: String,
     /// Default database when the binding was created (may be empty).
     pub db: String,
     /// Lifecycle status (`enabled`, `disabled`, …).
     pub status: String,
+    /// Creation timestamp text (`YYYY-MM-DD HH:MM:SS`).
+    pub create_time: String,
+    /// Last status update timestamp text.
+    pub update_time: String,
+    /// Charset recorded with the binding (TiDB always `utf8mb4` here).
+    pub charset: String,
+    /// Collation recorded with the binding (`utf8mb4_general_ci`).
+    pub collation: String,
     /// Origin of the binding (`manual`, `capture`, …).
     pub source: String,
+    /// `CREATE GLOBAL BINDING` scope (domain-wide) vs session-local.
+    pub global: bool,
 }
 
 impl Binding {
     /// Build a manual enabled binding for MVB in-memory use.
     pub fn manual(
         original_sql: impl Into<String>,
+        normalized_sql: impl Into<String>,
         bind_sql: impl Into<String>,
+        display_bind_sql: impl Into<String>,
         db: impl Into<String>,
+        global: bool,
+        create_time: impl Into<String>,
     ) -> Self {
+        let normalized_sql = normalized_sql.into();
+        let sql_digest = sql_digest(&normalized_sql);
+        let create_time = create_time.into();
         Self {
             original_sql: original_sql.into(),
+            normalized_sql,
+            sql_digest,
+            plan_digest: String::new(),
             bind_sql: bind_sql.into(),
+            display_bind_sql: display_bind_sql.into(),
             db: db.into(),
             status: ENABLED.to_string(),
+            create_time: create_time.clone(),
+            update_time: create_time,
+            charset: "utf8mb4".to_string(),
+            collation: "utf8mb4_general_ci".to_string(),
             source: MANUAL.to_string(),
+            global,
         }
     }
 
@@ -41,6 +76,198 @@ impl Binding {
     pub fn is_enabled(&self) -> bool {
         self.status.eq_ignore_ascii_case(ENABLED) || self.status.eq_ignore_ascii_case("using")
     }
+}
+
+/// SHA-256 hex digest of normalized binding SQL (TiDB `SQLDigest`).
+pub fn sql_digest(normalized_sql: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(normalized_sql.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// TiDB-normalized statement text for `SHOW BINDINGS` / `mysql.bind_info`
+/// (`select * from `db` . `t` where `a` in ( ... )`). `restored` is the
+/// schema-qualified SQL produced by the parser's binding restore mode.
+pub fn normalize_display(restored: &str) -> String {
+    render_normalized(&tokenize(restored), true)
+}
+
+/// Binding key that keeps literal values (used by `SET BINDING … FOR`):
+/// spacing and keyword case are ignored, but `in (1)` stays distinct from
+/// `in (1,2,3)`.
+pub fn normalize_exact(sql: &str) -> String {
+    let stripped = strip_sql_comments(sql.trim_end_matches(';').trim());
+    render_normalized(&tokenize(&stripped), false)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    Word(String),
+    /// Back-quoted identifier, kept verbatim (`db`).
+    Name(String),
+    /// String/number literal, rendered as `?` in normalized SQL.
+    Literal(String),
+    /// Punctuation / operator token.
+    Punct(String),
+}
+
+/// Split restored SQL into identifier/literal/punctuation tokens. The input is
+/// machine-restored text, so this only has to handle the shapes the restorer
+/// emits (no comments, escaped quotes are still honored).
+fn tokenize(sql: &str) -> Vec<Token> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+            out.push(Token::Name(sql[start..i].to_string()));
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            let (_, end) = scan_quoted(bytes, i);
+            out.push(Token::Literal(sql[i..end].to_string()));
+            i = end;
+            continue;
+        }
+        // `_utf8mb4'…'` charset introducer: literal.
+        if b == b'_' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'\'' {
+                let (_, end) = scan_quoted(bytes, j);
+                out.push(Token::Literal(sql[i..end].to_string()));
+                i = end;
+                continue;
+            }
+        }
+        if b.is_ascii_digit() || (b == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'.'
+                    || bytes[i] == b'x'
+                    || bytes[i] == b'X')
+            {
+                i += 1;
+            }
+            out.push(Token::Literal(sql[start..i].to_string()));
+            continue;
+        }
+        if is_word_byte(b) {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push(Token::Word(sql[start..i].to_string()));
+            continue;
+        }
+        // Operators: keep `<=`, `>=`, `<>`, `!=` as one token.
+        if i + 1 < bytes.len() {
+            let pair = &bytes[i..i + 2];
+            if matches!(pair, b"<=" | b">=" | b"<>" | b"!=" | b"&&" | b"||") {
+                out.push(Token::Punct(pair.iter().map(|b| *b as char).collect()));
+                i += 2;
+                continue;
+            }
+        }
+        out.push(Token::Punct((b as char).to_string()));
+        i += 1;
+    }
+    out
+}
+
+fn scan_quoted(bytes: &[u8], start: usize) -> (usize, usize) {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    (start, i)
+}
+
+/// Join tokens with single spaces. `normalized` replaces literals with `?` and
+/// collapses `in (…)` value lists to `in ( ... )`.
+fn render_normalized(tokens: &[Token], normalized: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Word(word) => {
+                let lower = word.to_ascii_lowercase();
+                let is_in = lower == "in";
+                if normalized
+                    && is_in
+                    && matches!(tokens.get(i + 1), Some(Token::Punct(p)) if p == "(")
+                {
+                    // Consume the balanced list and render it as `( ... )`.
+                    if let Some(end) = matching_token_paren(tokens, i + 1) {
+                        parts.push(lower);
+                        parts.push("(".to_string());
+                        parts.push("...".to_string());
+                        parts.push(")".to_string());
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                parts.push(lower);
+            }
+            Token::Name(name) => parts.push(name.clone()),
+            Token::Literal(literal) => parts.push(if normalized {
+                "?".to_string()
+            } else {
+                literal.clone()
+            }),
+            Token::Punct(punct) => parts.push(punct.clone()),
+        }
+        i += 1;
+    }
+    parts.join(" ")
+}
+
+fn matching_token_paren(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, token) in tokens.iter().enumerate().skip(open) {
+        if let Token::Punct(p) = token {
+            match p.as_str() {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Collapse whitespace and lowercase for MVB exact matching of restored SQL.
@@ -136,7 +363,6 @@ fn tokenize_sql(sql: &str) -> String {
         }
         if ch == b'\'' || ch == b'"' {
             let quote = ch;
-            let start = i;
             i += 1;
             while i < bytes.len() {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
@@ -149,7 +375,8 @@ fn tokenize_sql(sql: &str) -> String {
                 }
                 i += 1;
             }
-            out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+            // TiDB statement digest replaces every string literal with `?`.
+            out.push("?".to_string());
             continue;
         }
         if ch == b'`' {
@@ -169,7 +396,15 @@ fn tokenize_sql(sql: &str) -> String {
             while i < bytes.len() && is_word_byte(bytes[i]) {
                 i += 1;
             }
-            out.push(String::from_utf8_lossy(&bytes[start..i]).to_ascii_lowercase());
+            let word = String::from_utf8_lossy(&bytes[start..i]).into_owned();
+            // TiDB statement digest replaces numeric constants with `?`.
+            if word.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+            {
+                out.push("?".to_string());
+            } else {
+                out.push(word.to_ascii_lowercase());
+            }
             continue;
         }
         // Two-character operators keep their shape (`<=`, `<>`, `!=`, …).
@@ -372,9 +607,6 @@ mod tests {
             normalize_sql("SELECT `a` FROM `t` WHERE `a` = 1")
         );
         // `in` inside a string literal or identifier is untouched.
-        assert_eq!(
-            normalize_sql("select 'in (1)' from t"),
-            "select 'in (1)' from t"
-        );
+        assert_eq!(normalize_sql("select 'in (1)' from t"), "select ? from t");
     }
 }

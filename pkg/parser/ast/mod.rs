@@ -37,8 +37,8 @@ pub use misc::{
     IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt,
     PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType, RecommendIndexStmt, RecoverTableStmt,
     ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt, RevokeRoleStmt, RevokeStmt,
-    RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt, SetResourceGroupStmt, SetRoleKind,
-    SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind, ShowVarFilter,
-    ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType, TraceStmt,
-    UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt, SetPwdStmt, SetResourceGroupStmt,
+    SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt, ShowStmtKind,
+    ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem, TableLockType,
+    TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
 };

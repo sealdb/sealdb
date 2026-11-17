@@ -3,7 +3,7 @@
 //! MVB: one Domain-shared handle backs CREATE / DROP / SHOW BINDING and
 //! SELECT rewrite. Session vs global scope is not split yet.
 
-use crate::binding::{Binding, normalize_sql};
+use crate::binding::Binding;
 use crate::binding_cache::BindingCache;
 use std::sync::Arc;
 
@@ -25,14 +25,21 @@ impl SessionBindingHandle {
         self.cache.set(normalized_original, binding);
     }
 
-    /// Drop the binding whose original SQL normalizes to `normalized_original`.
-    pub fn drop_binding(&self, normalized_original: &str) -> bool {
-        self.cache.remove(normalized_original)
+    /// Drop the binding whose original SQL normalizes to `normalized_original`
+    /// in the requested scope.
+    pub fn drop_binding(&self, normalized_original: &str, global: bool) -> bool {
+        self.cache.remove(normalized_original, global)
     }
 
-    /// Match an enabled binding for restored statement SQL.
-    pub fn match_binding(&self, restored_sql: &str) -> Option<Binding> {
-        self.cache.get_enabled(&normalize_sql(restored_sql))
+    /// Enable or disable an existing binding by its original statement text.
+    pub fn set_binding_enabled(&self, original_sql: &str, enabled: bool) -> bool {
+        self.cache.set_enabled(original_sql, enabled)
+    }
+
+    /// Match an enabled binding for an already-normalized key (the session
+    /// builds it with the current database qualification).
+    pub fn match_binding(&self, normalized_original: &str) -> Option<Binding> {
+        self.cache.get_enabled(normalized_original)
     }
 
     /// All bindings for `SHOW BINDINGS`.

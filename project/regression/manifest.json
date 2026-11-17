@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 93,
+      "green": 95,
       "in_progress": 9,
       "local": 8,
-      "pending": 142
+      "pending": 140
     },
     "by_wave": {
       "D": 2,
@@ -56,7 +56,7 @@
     {
       "name": "bindinfo/bind",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/bindinfo/bind.test",
       "result": "r/bindinfo/bind.result",
       "has_result": true,
@@ -2352,7 +2352,7 @@
     {
       "name": "session/variable",
       "wave": "R5",
-      "status": "pending",
+      "status": "green",
       "test": "t/session/variable.test",
       "result": "r/session/variable.result",
       "has_result": true,

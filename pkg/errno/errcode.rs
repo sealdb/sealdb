@@ -40,8 +40,14 @@ pub const ERR_INVALID_JSON_TEXT: i32 = 3140;
 /// TiDB `ErrInvalidJSONTextInParam`: malformed JSON passed to a function (3141).
 pub const ERR_INVALID_JSON_TEXT_IN_PARAM: i32 = 3141;
 pub const ERR_WRONG_ARGUMENTS: i32 = 1210;
+/// MySQL `ER_WRONG_TYPE_FOR_VAR`: a variable assignment operand has the wrong
+/// type (e.g. a non-numeric `tidb_read_staleness`).
+pub const ERR_WRONG_TYPE_FOR_VAR: i32 = 1232;
 /// MySQL `ER_VAR_CANT_BE_READ`: assignment to a read-only system variable.
 pub const ERR_VAR_CANT_BE_READ: i32 = 1238;
+/// MySQL `ER_GLOBAL_VARIABLE`: a global-only system variable assigned at
+/// session scope (`SET @@session.x = …`).
+pub const ERR_GLOBAL_VARIABLE: i32 = 1229;
 pub const ERR_UNSUPPORTED: i32 = 1235;
 pub const ERR_DIVISION_BY_ZERO: i32 = 1365;
 pub const ERR_INVALID_KEY: i32 = 6100;

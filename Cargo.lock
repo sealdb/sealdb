@@ -2015,6 +2015,9 @@ dependencies = [
 [[package]]
 name = "sealdb-bindinfo"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "sealdb-config"
@@ -2061,6 +2064,7 @@ dependencies = [
  "sealdb-planner",
  "sealdb-privilege",
  "sealdb-statistics",
+ "sealdb-types",
  "thiserror 2.0.21",
 ]
 

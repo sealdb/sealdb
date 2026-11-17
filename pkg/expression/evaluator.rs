@@ -32,6 +32,17 @@ thread_local! {
     static ALLOW_AUTO_RANDOM_EXPLICIT_INSERT: Cell<bool> = const { Cell::new(false) };
     /// Session `@@tidb_enable_auto_increment_in_generated` (default OFF).
     static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
+    /// Session `@@default_week_format` (default 0).
+    static DEFAULT_WEEK_FORMAT: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Publish the session `default_week_format` for `WEEK()` evaluation.
+pub fn set_default_week_format(value: i64) {
+    DEFAULT_WEEK_FORMAT.with(|cell| cell.set(value));
+}
+
+fn default_week_format() -> i64 {
+    DEFAULT_WEEK_FORMAT.with(Cell::get)
 }
 
 /// Run `f` under `@@tidb_enable_auto_increment_in_generated` from the session.
@@ -829,10 +840,11 @@ fn eval_logic(op: Op, left: &Datum, right: &Datum) -> Result<Datum> {
 fn eval_unary(expr: &UnaryOpExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     // sqlparser always binds NOT below BETWEEN/IN/LIKE. Under HIGH_NOT_PRECEDENCE
     // TiDB binds NOT tighter: `NOT x BETWEEN a AND b` → `(NOT x) BETWEEN a AND b`.
-    if matches!(expr.op, Op::Not | Op::Not2) && sql_mode_flag("HIGH_NOT_PRECEDENCE") {
-        if let Some(rewritten) = rewrite_high_not_precedence(expr.op, &expr.expr) {
-            return eval_expr_with_row(&rewritten, schema, row);
-        }
+    if matches!(expr.op, Op::Not | Op::Not2)
+        && sql_mode_flag("HIGH_NOT_PRECEDENCE")
+        && let Some(rewritten) = rewrite_high_not_precedence(expr.op, &expr.expr)
+    {
+        return eval_expr_with_row(&rewritten, schema, row);
     }
     let inner = eval_expr_with_row(&expr.expr, schema, row)?;
     if inner.is_null() {
@@ -1286,7 +1298,9 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             }
             let bytes = value.as_bytes();
             let text = String::from_utf8_lossy(bytes.as_slice());
-            Ok(Datum::Bytes(text.chars().rev().collect::<String>().into_bytes()))
+            Ok(Datum::Bytes(
+                text.chars().rev().collect::<String>().into_bytes(),
+            ))
         }
         // MySQL `MD5(str)`: lowercase hex digest; NULL in → NULL.
         "MD5" => {
@@ -1465,7 +1479,8 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "HOUR" => eval_date_part(func, schema, row, |t| i64::from(t.hour)),
         "MINUTE" => eval_date_part(func, schema, row, |t| i64::from(t.minute)),
         "SECOND" => eval_date_part(func, schema, row, |t| i64::from(t.second)),
-        "WEEKDAY" => eval_date_part(func, schema, row, |t| weekday_of(t)),
+        "WEEKDAY" => eval_date_part(func, schema, row, weekday_of),
+        "WEEK" => eval_week(func, schema, row),
         // MySQL `TO_DAYS`: days since year 0 (1970-01-01 == 719528).
         "TO_DAYS" => eval_date_part(func, schema, row, |t| {
             days_from_civil(t.year, t.month, t.day) + 719528
@@ -1597,9 +1612,7 @@ fn new_uuid() -> String {
     let time_hi = (((timestamp >> 48) as u16) & 0x0fff) | 0x1000;
     let clock_seq = (CLOCK_SEQ.fetch_add(1, Ordering::Relaxed) & 0x3fff) | 0x8000;
     let node = uuid_node();
-    format!(
-        "{time_low:08x}-{time_mid:04x}-{time_hi:04x}-{clock_seq:04x}-{node:012x}"
-    )
+    format!("{time_low:08x}-{time_mid:04x}-{time_hi:04x}-{clock_seq:04x}-{node:012x}")
 }
 
 /// 48-bit node id: a per-process random value (TiDB uses the MAC address, which
@@ -2034,14 +2047,19 @@ fn truncate_decimal(decimal: MyDecimal, scale: i64) -> Result<Datum> {
     let frac: String = if frac_part.len() >= scale {
         frac_part[..scale].to_string()
     } else {
-        format!("{frac_part}{:0>width$}", "", width = scale - frac_part.len())
+        format!(
+            "{frac_part}{:0>width$}",
+            "",
+            width = scale - frac_part.len()
+        )
     };
     Ok(Datum::Decimal(MyDecimal::parse(&format!(
         "{sign}{int_part}.{frac}"
     ))?))
 }
 
-fn eval_date_part(    func: &FuncCallExpr,
+fn eval_date_part(
+    func: &FuncCallExpr,
     schema: &[String],
     row: &[Datum],
     part: impl Fn(&Time) -> i64,
@@ -2062,6 +2080,67 @@ fn eval_date_part(    func: &FuncCallExpr,
         t = utc_to_session_local(t)?;
     }
     Ok(Datum::I64(part(&t)))
+}
+
+/// MySQL `WEEK(date[, mode])`: the week number under one of MySQL's eight
+/// week-numbering modes. Without a mode operand the session
+/// `default_week_format` applies.
+fn eval_week(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    if !(1..=2).contains(&func.args.len()) {
+        return Err(Error::new(
+            sealdb_errno::ERR_WRONG_ARGUMENTS,
+            "WEEK requires 1 or 2 arguments",
+        ));
+    }
+    let value = eval_expr_with_row(&func.args[0], schema, row)?;
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let mode = if func.args.len() == 2 {
+        let mode = eval_expr_with_row(&func.args[1], schema, row)?;
+        if mode.is_null() {
+            return Ok(Datum::Null);
+        }
+        mode.as_i64()?.rem_euclid(8)
+    } else {
+        default_week_format().rem_euclid(8)
+    };
+    let mut t = datum_as_time(&value)?;
+    if matches!(t.tp, TimeType::Timestamp) {
+        t = utc_to_session_local(t)?;
+    }
+    let jan1 = days_from_civil(t.year, 1, 1);
+    let day_of_year = days_from_civil(t.year, t.month, t.day) - jan1; // 0-based
+    let jan1_weekday = (jan1 + 3).rem_euclid(7); // 0 = Monday
+    let monday_based = mode & 1 != 0;
+    let week_start = if monday_based { 0 } else { 6 };
+    // Days from the week start preceding Jan 1 to Jan 1.
+    let jan1_offset = (jan1_weekday - week_start).rem_euclid(7);
+    let first_week_start = if mode >= 4 {
+        // Week 1 is the first week with at least four days in the new year.
+        if jan1_offset <= 3 {
+            -jan1_offset
+        } else {
+            7 - jan1_offset
+        }
+    } else if jan1_offset == 0 {
+        0
+    } else {
+        7 - jan1_offset
+    };
+    let mut week = (day_of_year - first_week_start).div_euclid(7) + 1;
+    if mode >= 4 {
+        return Ok(Datum::I64(week));
+    }
+    if week < 0 {
+        week = 0;
+    }
+    // Modes 2/3 number from 1: dates before the first week belong to the last
+    // week of the previous year (52 or 53).
+    if week == 0 && mode >= 2 {
+        week = 53;
+    }
+    Ok(Datum::I64(week))
 }
 
 /// MySQL `DATE()` / `TIME()` / `TIMESTAMP()`: take the matching temporal part
@@ -2097,9 +2176,11 @@ fn eval_temporal_cast(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
         Datum::Time(t) => i32::from(t.fsp.max(0)),
         _ => 6,
     };
-    let mut ft = FieldType::default();
-    ft.tp = tp;
-    ft.decimal = decimal;
+    let ft = FieldType {
+        tp,
+        decimal,
+        ..FieldType::default()
+    };
     let out = value.cast(&ft)?;
     Ok(match out {
         Datum::Time(mut t) => {
@@ -2526,7 +2607,9 @@ fn eval_time_diff(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Resu
     let diff = micros(&ta) - micros(&tb);
     // `TIME` has no sign slot here; render TiDB's signed duration text so the
     // value still compares equal to itself and prints `-00:00:00.000001`.
-    Ok(Datum::Bytes(format_duration(diff, ta.fsp.max(tb.fsp)).into_bytes()))
+    Ok(Datum::Bytes(
+        format_duration(diff, ta.fsp.max(tb.fsp)).into_bytes(),
+    ))
 }
 
 fn format_duration(micros: i64, fsp: i8) -> String {
@@ -2644,7 +2727,7 @@ fn eval_unix_timestamp(func: &FuncCallExpr, schema: &[String], row: &[Datum]) ->
 pub fn time_to_unix_millis(t: &Time) -> Result<u64> {
     // `Time` datums reach expression evaluation as session-local wall clocks
     // (both literals and `now()`), so only the local -> UTC shift applies.
-    let utc = session_local_to_utc(t.clone())?;
+    let utc = session_local_to_utc(*t)?;
     let secs = wall_secs(&utc);
     if secs < 0 {
         return Err(Error::new(

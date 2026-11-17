@@ -6,21 +6,18 @@ use super::ddl::{
 use super::dml::{DeleteStmt, InsertStmt, LoadDataStmt, SelectStmt, SetOprStmt, UpdateStmt};
 use super::expressions::ExprNode;
 use super::misc::{
-    AddQueryWatchStmt, AlterInstanceStmt, AnalyzeTableStmt, BRIEStmt, BeginStmt, BinlogStmt,
-    CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt, CompactTableStmt,
-    AlterResourceGroupStmt, CreateBindingStmt, CreatePlacementPolicyStmt,
-    CreateResourceGroupStmt, CreateRoleStmt,
-    CreateUserStmt, DeallocateStmt,
-    DistributeTableStmt, DoStmt, DropBindingStmt, DropPlacementPolicyStmt, DropQueryWatchStmt,
-    DropStatsStmt,
-    DropResourceGroupStmt, DropRoleStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt,
-    FlashBackTableStmt,
+    AddQueryWatchStmt, AlterInstanceStmt, AlterResourceGroupStmt, AnalyzeTableStmt, BRIEStmt,
+    BeginStmt, BinlogStmt, CalibrateResourceStmt, ChangeStmt, CleanupTableLockStmt, CommitStmt,
+    CompactTableStmt, CreateBindingStmt, CreatePlacementPolicyStmt, CreateResourceGroupStmt,
+    CreateRoleStmt, CreateUserStmt, DeallocateStmt, DistributeTableStmt, DoStmt, DropBindingStmt,
+    DropPlacementPolicyStmt, DropQueryWatchStmt, DropResourceGroupStmt, DropRoleStmt,
+    DropStatsStmt, DropUserStmt, ExecuteStmt, FlashBackDatabaseStmt, FlashBackTableStmt,
     FlashBackToTimestampStmt, FlushStmt, GrantRoleStmt, GrantStmt, ImportIntoStmt, KillStmt,
     LoadStatsStmt, LockStatsStmt, LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt,
     RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
-    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetPwdStmt, SetResourceGroupStmt,
-    SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, ShutdownStmt, SplitRegionStmt, TraceStmt,
-    UnlockStatsStmt, UseStmt,
+    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetBindingStmt, SetPwdStmt,
+    SetResourceGroupStmt, SetRoleStmt, SetStmt, SetTxnStmt, ShowStmt, ShutdownStmt,
+    SplitRegionStmt, TraceStmt, UnlockStatsStmt, UseStmt,
 };
 use crate::format::RestoreCtx;
 use sealdb_errno::Result;
@@ -117,6 +114,7 @@ pub enum Statement {
     Deallocate(DeallocateStmt),
     CreateBinding(CreateBindingStmt),
     DropBinding(DropBindingStmt),
+    SetBinding(SetBindingStmt),
     Set(SetStmt),
 }
 
@@ -204,6 +202,7 @@ impl Node for Statement {
             Statement::Deallocate(s) => s.restore(ctx),
             Statement::CreateBinding(s) => s.restore(ctx),
             Statement::DropBinding(s) => s.restore(ctx),
+            Statement::SetBinding(s) => s.restore(ctx),
             Statement::Set(s) => s.restore(ctx),
         }
     }
@@ -293,6 +292,7 @@ impl StmtNode for Statement {
             Statement::Deallocate(_) => "DeallocateStmt",
             Statement::CreateBinding(_) => "CreateBindingStmt",
             Statement::DropBinding(_) => "DropBindingStmt",
+            Statement::SetBinding(_) => "SetBindingStmt",
             Statement::Set(_) => "SetStmt",
         }
     }

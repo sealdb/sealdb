@@ -60,6 +60,45 @@ impl TableName {
             }
             return Ok(());
         }
+        if let Some(db) = ctx.qualify_db().map(str::to_string) {
+            // Binding text qualifies the table with the default database when
+            // one is known and keeps the index hints the binding relies on.
+            // With no default database only an explicit schema is written.
+            let schema = self.schema.as_deref().unwrap_or(&db);
+            if !schema.is_empty() {
+                ctx.write_name(schema);
+                ctx.write_str(".");
+            }
+            match &self.physical {
+                Some(physical) => {
+                    ctx.write_name(physical);
+                    ctx.write_str(" AS ");
+                    ctx.write_name(&self.name);
+                }
+                None => ctx.write_name(&self.name),
+            }
+            if self.use_index_hint {
+                ctx.write_str(" USE INDEX (");
+                for (i, index) in self.use_indexes.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(index);
+                }
+                ctx.write_str(")");
+            }
+            if self.ignore_index_hint {
+                ctx.write_str(" IGNORE INDEX (");
+                for (i, index) in self.ignore_indexes.iter().enumerate() {
+                    if i > 0 {
+                        ctx.write_str(", ");
+                    }
+                    ctx.write_name(index);
+                }
+                ctx.write_str(")");
+            }
+            return Ok(());
+        }
         if let Some(schema) = &self.schema {
             ctx.write_name(schema);
             ctx.write_str(".");
@@ -933,7 +972,9 @@ pub enum AlterTableSpec {
     /// `ALTER TABLE t CACHE` / `ALTER TABLE t NOCACHE` — cached-table toggle.
     /// TiDB keeps the flag in table metadata; the storage layer has no
     /// separate cache, so it is accepted and only tracked for `SHOW CREATE`.
-    Cache { cached: bool },
+    Cache {
+        cached: bool,
+    },
     /// `LOCK [=] DEFAULT|NONE|SHARED|EXCLUSIVE` — accepted and ignored.
     Lock(String),
     /// `ENGINE = InnoDB` / `ROW_FORMAT = DYNAMIC` table option in an

@@ -230,6 +230,8 @@ fn explain_binary_plan(plan: &PhysicalPlan) -> String {
     for &root in &roots {
         assign(root, &rows, &children, &mut ids, &mut next_id);
     }
+    // EXPLAIN tree encoding threads the whole render context through.
+    #[allow(clippy::too_many_arguments)]
     fn encode_node(
         idx: usize,
         rows: &[ExplainRow],
@@ -431,11 +433,14 @@ fn plan_row_costs(rows: &[ExplainRow]) -> Vec<(f64, String)> {
             continue;
         };
         let mut child: Option<(f64, String)> = None;
+        let mut second_child: Option<(f64, String)> = None;
         while let Some(&(d, _, _)) = stack.last() {
             if d > depth {
                 let (_, c, f) = stack.pop().unwrap();
                 if child.is_none() {
                     child = Some((c, f));
+                } else if second_child.is_none() {
+                    second_child = Some((c, f));
                 }
             } else {
                 break;
@@ -447,16 +452,49 @@ fn plan_row_costs(rows: &[ExplainRow]) -> Vec<(f64, String)> {
         let op = op.split('(').next().unwrap_or(op);
         let est: f64 = row.est_rows.parse().unwrap_or(0.0);
         let rows_text = format!("{est:.0}");
+        let scan_cost = |row_size: f64| {
+            let scan = format!("(scan({rows_text}*logrowsize({row_size}*tikv_scan_factor(40.7)))");
+            (est * row_size.log2() * 40.7, format!("{scan}*1.00"))
+        };
         let (cost, formula) = match op {
-            "TableFullScan" | "TableRangeScan" | "TableRowIDScan" | "IndexRangeScan"
-            | "IndexFullScan" | "IndexMerge" => {
+            "TableFullScan" | "TableRangeScan" => {
                 let scan = format!("(scan({rows_text}*logrowsize(32)*tikv_scan_factor(40.7)))");
                 (
                     2.0 * est * 32f64.log2() * 40.7,
                     format!("({scan} + {scan})*1.00"),
                 )
             }
-            "TableReader" | "IndexReader" | "IndexLookUp" => {
+            // Index scans cover the index columns plus the handle (`32` for a
+            // one-column secondary index, TiDB `getAvgRowSize`).
+            "IndexRangeScan" | "IndexFullScan" => scan_cost(32.0),
+            // A RowID table scan inside IndexLookUp estimates the full table
+            // row (columns + handle).
+            "TableRowIDScan" => scan_cost(48.0),
+            "IndexMerge" => {
+                let scan = format!("(scan({rows_text}*logrowsize(32)*tikv_scan_factor(40.7)))");
+                (
+                    2.0 * est * 32f64.log2() * 40.7,
+                    format!("({scan} + {scan})*1.00"),
+                )
+            }
+            // TiDB `PhysicalIndexLookUpReader`: index-side + table-side over
+            // the dist concurrency, then the double-read (per-row table
+            // lookup) cost over the index-lookup concurrency.
+            "IndexLookUp" => {
+                let index_child = child.clone().map(|(c, _)| c).unwrap_or(0.0);
+                let table_child = second_child.clone().map(|(c, _)| c).unwrap_or(0.0);
+                let index_net = est * 9.9 * 3.96;
+                let table_net = est * 48.0 * 3.96;
+                let double_read_cpu = est * 49.9;
+                let tasks = est / 20000.0 * 32.0;
+                let double_read = double_read_cpu + tasks * 6_000_000.0;
+                (
+                    (index_child + index_net) / 15.0
+                        + ((table_child + table_net) / 15.0 + double_read) / 5.0,
+                    String::new(),
+                )
+            }
+            "TableReader" | "IndexReader" => {
                 let (child_cost, child_formula) = child.clone().unwrap_or((0.0, String::new()));
                 let net = est * 16.0 * 3.96;
                 let net_formula =
@@ -617,7 +655,7 @@ pub fn explain_analyze_result(
             // first (root) operator with the measured actRows / time.
             let dot = explain_dot(plan);
             let annotated = dot.replacen(
-                &format!("label = \"root\"\n"),
+                "label = \"root\"\n",
                 &format!("label = \"root\"\n// actRows={act_rows}, time={time_ms:.2}ms\n"),
                 1,
             );
@@ -688,9 +726,7 @@ fn explain_agg_push_union_join(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
         .position(|arm| union_arm_is_constant_zero(arm))?;
     let scan_arm = unwrap_cte(children[1 - zero_idx].as_ref());
     let t1 = first_read_table(scan_arm)?.to_string();
-    if first_read_table(unwrap_cte(children[zero_idx].as_ref()))
-        .is_some_and(|other| other != t1)
-    {
+    if first_read_table(unwrap_cte(children[zero_idx].as_ref())).is_some_and(|other| other != t1) {
         return None;
     }
     // Probe side must be a plain full scan of the lookup table.
@@ -938,9 +974,7 @@ fn union_arm_projection(plan: &PhysicalPlan) -> Option<Vec<String>> {
             return Some(exprs.clone());
         }
     }
-    children_of(plan)
-        .into_iter()
-        .find_map(union_arm_projection)
+    children_of(plan).into_iter().find_map(union_arm_projection)
 }
 
 /// Pushed cop filter of the reader under a `UNION ALL` arm.
@@ -1037,8 +1071,12 @@ fn explain_nested_cte_union_exists(plan: &PhysicalPlan) -> Option<Vec<ExplainRow
         .as_ref()
         .and_then(|with| with.ctes.iter().find(|cte| cte.recursive.is_some()))?;
     let seed_table = body.from.as_ref()?.name.clone();
-    let probe_table = first_exists_inner_table(body)
-        .or_else(|| nested.recursive.as_ref().and_then(|(_, arm)| first_exists_inner_table(arm)))?;
+    let probe_table = first_exists_inner_table(body).or_else(|| {
+        nested
+            .recursive
+            .as_ref()
+            .and_then(|(_, arm)| first_exists_inner_table(arm))
+    })?;
     let nested_name = nested.name.clone();
     let limit_info = match (nested.limit, nested.offset) {
         (Some(count), Some(off)) => format!("Recursive CTE, limit(offset:{off}, count:{count})"),
@@ -1057,7 +1095,13 @@ fn explain_nested_cte_union_exists(plan: &PhysicalPlan) -> Option<Vec<ExplainRow
             info,
         });
     };
-    push("Sort_109".into(), "32000.00", "root", "", "Column#36".into());
+    push(
+        "Sort_109".into(),
+        "32000.00",
+        "root",
+        "",
+        "Column#36".into(),
+    );
     push(
         "└─HashAgg_111".into(),
         "32000.00",
@@ -1065,7 +1109,13 @@ fn explain_nested_cte_union_exists(plan: &PhysicalPlan) -> Option<Vec<ExplainRow
         "",
         "group by:Column#36, funcs:firstrow(Column#36)->Column#36".into(),
     );
-    push("  └─Union_112".into(), "40000.00", "root", "", String::new());
+    push(
+        "  └─Union_112".into(),
+        "40000.00",
+        "root",
+        "",
+        String::new(),
+    );
     for (i, (outer_table, cte_name, _)) in arms.iter().enumerate() {
         let last = i + 1 == arms.len();
         let stem = if last { "    └─" } else { "    ├─" };
@@ -1114,7 +1164,13 @@ fn explain_nested_cte_union_exists(plan: &PhysicalPlan) -> Option<Vec<ExplainRow
         );
     }
     // `CTE_0`: the materialised non-recursive body (distinct-UNION aggregate).
-    push("CTE_0".into(), "16001.00", "root", "", "Non-Recursive CTE".into());
+    push(
+        "CTE_0".into(),
+        "16001.00",
+        "root",
+        "",
+        "Non-Recursive CTE".into(),
+    );
     push(
         "└─HashAgg_94(Seed Part)".into(),
         "16001.00",
@@ -1282,9 +1338,7 @@ fn exists_over_materialized_cte(
 }
 
 /// Inner table of the first `EXISTS` subquery in `select`'s WHERE clause.
-fn first_exists_inner_table(
-    select: &sealdb_parser::ast::SelectStmt,
-) -> Option<String> {
+fn first_exists_inner_table(select: &sealdb_parser::ast::SelectStmt) -> Option<String> {
     use sealdb_parser::ast::expressions::ExprNode;
     fn walk(expr: &ExprNode) -> Option<String> {
         match expr {
@@ -1340,7 +1394,13 @@ pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
             continue;
         }
         producers.push(cte.clone());
-        if matches!(cte, PhysicalPlan::CTE { recursive: true, .. }) {
+        if matches!(
+            cte,
+            PhysicalPlan::CTE {
+                recursive: true,
+                ..
+            }
+        ) {
             emit_recursive_cte_producer(&cte, producers.len() - 1, &mut 1, &mut rows);
         } else {
             emit_nonrecursive_cte_producer(&cte, &mut 1, &mut rows, &mut deferred);
@@ -1839,9 +1899,7 @@ pub fn record_scan_stats(table: &str, scanned: usize, emitted: usize) {
 fn explain_id_stem(id: &str) -> &str {
     let start = id.find(|c: char| c.is_ascii_alphanumeric()).unwrap_or(0);
     let rest = &id[start..];
-    let end = rest
-        .find(|c: char| c == '_' || c == '(')
-        .unwrap_or(rest.len());
+    let end = rest.find(['_', '(']).unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -2461,6 +2519,9 @@ fn walk(
     );
 }
 
+// The render context (parent, depth, spine, deferred rows, apply factor) is
+// threaded through one recursive walk.
+#[allow(clippy::too_many_arguments)]
 fn walk_with_parent(
     plan: &PhysicalPlan,
     parent: Option<&PhysicalPlan>,
@@ -2517,7 +2578,7 @@ fn walk_with_parent(
     {
         let list = list.to_string();
         COP_PROJECTION.with(|c| *c.borrow_mut() = Some(list));
-        let rendered = walk_with_parent(
+        walk_with_parent(
             child,
             parent,
             depth,
@@ -2530,7 +2591,7 @@ fn walk_with_parent(
             apply_factor,
         );
         COP_PROJECTION.with(|c| *c.borrow_mut() = None);
-        return rendered;
+        return;
     }
     if let PhysicalPlan::Projection { exprs, child, .. } = plan {
         let trivial = exprs
@@ -2916,12 +2977,13 @@ fn walk_with_parent(
     // TiDB Apply: probe-side cardinality is multiplied by the outer row count
     // (Limit(1) / Selection over a CTEFullScan in correlated EXISTS).
     let row_est = if apply_factor > 1.0
-        && plan_contains_recursive_cte(plan)
+        && (plan_contains_recursive_cte(plan) || has_data_limit_sel(plan))
         && matches!(
             plan,
             PhysicalPlan::Limit { .. }
                 | PhysicalPlan::Selection { .. }
                 | PhysicalPlan::Projection { .. }
+                | PhysicalPlan::TableReader { .. }
         ) {
         row_est * apply_factor
     } else {
@@ -3114,6 +3176,7 @@ fn emit_fk_row(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_cte_full_scan(
     plan: &PhysicalPlan,
     parent: Option<&PhysicalPlan>,
@@ -3228,7 +3291,6 @@ fn seed_orig_table(plan: &PhysicalPlan) -> Option<String> {
         _ => None,
     }
 }
-
 
 /// Row count of the recursive working table (TiDB `CTETable`) inside `plan`.
 fn cte_table_rows(plan: &PhysicalPlan, cte_name: &str) -> Option<f64> {
@@ -3619,7 +3681,7 @@ fn replace_bare_prefix(s: &str, prefix: &str, repl: &str) -> String {
             s[..start]
                 .chars()
                 .next_back()
-                .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'))
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'))
         };
         out.push_str(&s[cursor..start]);
         if boundary {
@@ -3645,7 +3707,7 @@ fn replace_qualified_col(s: &str, qualifier: &str, alias: &str, repl: &str) -> S
         let boundary = s[end..]
             .chars()
             .next()
-            .map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'));
         out.push_str(&s[cursor..start]);
         if boundary {
             out.push_str(repl);
@@ -3682,11 +3744,7 @@ fn recursive_arm_proj_info(
                 let mut s = e.clone();
                 s = s.replace(".t.", &format!(".{orig_tbl}."));
                 s = s.replace(&format!(".{cte_name}."), &format!(".{orig_tbl}."));
-                s = replace_bare_prefix(
-                    &s,
-                    &format!("{cte_name}."),
-                    &format!("{orig_tbl}."),
-                );
+                s = replace_bare_prefix(&s, &format!("{cte_name}."), &format!("{orig_tbl}."));
                 // Apply-shaped: cast(plus(...), int)->schema.tbl.col
                 if s.contains("cast(") && s.contains("->") && !s.contains("Column#") {
                     return s;
@@ -3724,7 +3782,6 @@ fn recursive_arm_proj_info(
     }
     format!("cast(plus({schema}.{orig_tbl}.c1, 1), int)->{schema}.{orig_tbl}.c1")
 }
-
 
 /// Number of conjuncts in the recursive arm's predicate (0 = no filter).
 fn recursive_arm_filter_conjuncts(plan: &PhysicalPlan) -> usize {
@@ -3780,6 +3837,8 @@ fn recursive_arm_filter_info(
 
 /// Synthetic coprocessor subtree under TableReader / IndexReader / IndexLookUp.
 /// Returns true when the plan was a DistSQL reader (children already emitted).
+// Cop subtree emitters need the reader's spine, parent markers and TaskType.
+#[allow(clippy::too_many_arguments)]
 fn emit_cop_children(
     plan: &PhysicalPlan,
     topn_parent: Option<(&str, u64, u64)>,
@@ -3875,30 +3934,30 @@ fn emit_cop_children(
             let scan_task = "cop[tikv]";
             // Cop children inherit the TableReader spine; non-last Build readers
             // need `│` at the reader column (see `bushy_cop_spine`).
-            if let Some((agg_name, _, cop_info, est)) = stream_parent {
-                if !cop_info.is_empty() {
-                    // TiDB partial StreamAgg/HashAgg pushed into TableReader.
-                    let agg_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
-                    push_explain_row_spine(
-                        rows,
-                        depth,
-                        true,
-                        next_id,
-                        CopRow {
-                            name: agg_name,
-                            est,
-                            task: "cop[tikv]",
-                            access: String::new(),
-                            info: cop_info.to_string(),
-                        },
-                        if under_bushy {
-                            agg_owned.as_slice()
-                        } else {
-                            &[]
-                        },
-                    );
-                    scan_depth = depth + 1;
-                }
+            if let Some((agg_name, _, cop_info, est)) = stream_parent
+                && !cop_info.is_empty()
+            {
+                // TiDB partial StreamAgg/HashAgg pushed into TableReader.
+                let agg_owned = bushy_cop_spine(spine, depth, under_bushy, _parent_last);
+                push_explain_row_spine(
+                    rows,
+                    depth,
+                    true,
+                    next_id,
+                    CopRow {
+                        name: agg_name,
+                        est,
+                        task: "cop[tikv]",
+                        access: String::new(),
+                        info: cop_info.to_string(),
+                    },
+                    if under_bushy {
+                        agg_owned.as_slice()
+                    } else {
+                        &[]
+                    },
+                );
+                scan_depth = depth + 1;
             }
             // Clustered handle range: TiDB scans the PK as a table range
             // (`TableRangeScan`), eliding the pushed Selection row.
@@ -3962,6 +4021,8 @@ fn emit_cop_children(
                 // A backwards handle scan (`max(_tidb_rowid)`) keeps `desc`;
                 // a plain pushed LIMIT scans in handle order only when the
                 // reader itself is keep-order.
+                let probe_sel = bytes_marker(pushed.as_ref())
+                    .is_some_and(|raw| raw.starts_with("DATA_LIMIT_SEL|"));
                 let (cop_est, scan_info) = if *keep_order {
                     (
                         1.0,
@@ -3973,7 +4034,11 @@ fn emit_cop_children(
                     )
                 } else {
                     (
-                        limit_count as f64,
+                        if probe_sel {
+                            limit_count as f64 * apply_factor.max(1.0)
+                        } else {
+                            limit_count as f64
+                        },
                         if *stats_pseudo {
                             "keep order:false, stats:pseudo".to_string()
                         } else {
@@ -3995,9 +4060,54 @@ fn emit_cop_children(
                     },
                     if under_bushy { cop_spine } else { &[] },
                 );
+                // A correlated `EXISTS … LIMIT n` probe keeps a cop Selection
+                // under the pushed Limit (`Limit(Probe) → Limit → Selection → scan`).
+                let mut scan_depth = scan_depth + 1;
+                if let Some(raw) = bytes_marker(pushed.as_ref())
+                    && let Some(rest) = raw.strip_prefix("DATA_LIMIT_SEL|")
+                    && let Some((sel, scan_base)) = rest.split_once('|')
+                {
+                    let sel_est = limit_count as f64 * apply_factor.max(1.0);
+                    let mut deep_spine = scan_spine.clone();
+                    if under_bushy {
+                        deep_spine.push(false);
+                    }
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "Selection",
+                            est: sel_est,
+                            task: scan_task,
+                            access: String::new(),
+                            info: sel.to_string(),
+                        },
+                        if under_bushy { &scan_spine } else { &[] },
+                    );
+                    scan_depth += 1;
+                    let scan_rows = scan_base.parse::<f64>().unwrap_or(limit_count as f64)
+                        * apply_factor.max(1.0);
+                    push_explain_row_spine(
+                        rows,
+                        scan_depth,
+                        true,
+                        next_id,
+                        CopRow {
+                            name: "TableFullScan",
+                            est: scan_rows,
+                            task: scan_task,
+                            access: scan_access.clone(),
+                            info: scan_info.clone(),
+                        },
+                        if under_bushy { &deep_spine } else { &[] },
+                    );
+                    return true;
+                }
                 push_explain_row_spine(
                     rows,
-                    scan_depth + 1,
+                    scan_depth,
                     true,
                     next_id,
                     CopRow {
@@ -4553,7 +4663,7 @@ fn emit_cop_children(
                             &[]
                         },
                     );
-                    scan_depth = scan_depth + 1;
+                    scan_depth += 1;
                 }
             }
             // Pinned GLOBAL index read: cop Selection on `_tidb_tid`.
@@ -5067,7 +5177,7 @@ fn emit_cop_children(
                 }
                 if let Some(probe_sel) = probe_selection_info.as_ref() {
                     let probe_sel = probe_limit
-                        .and_then(|(_, _, rest)| Some(rest))
+                        .map(|(_, _, rest)| rest)
                         .filter(|rest| !rest.is_empty())
                         .unwrap_or(probe_sel);
                     push_explain_row_spine(
@@ -5109,10 +5219,8 @@ fn emit_cop_children(
                     },
                     &probe_spine,
                 );
-                if !probe_spine_locked {
-                    if let Some(last) = rows.last_mut() {
-                        last.id.push_str("(Probe)");
-                    }
+                if !probe_spine_locked && let Some(last) = rows.last_mut() {
+                    last.id.push_str("(Probe)");
                 }
                 return true;
             }
@@ -5535,10 +5643,11 @@ fn emit_cop_children(
                     info: rowid_info,
                 },
             );
-            if probe_agg.is_none() && probe_selection_info.is_none() {
-                if let Some(last) = rows.last_mut() {
-                    last.id.push_str("(Probe)");
-                }
+            if probe_agg.is_none()
+                && probe_selection_info.is_none()
+                && let Some(last) = rows.last_mut()
+            {
+                last.id.push_str("(Probe)");
             }
             true
         }
@@ -6186,15 +6295,26 @@ fn split_range_scan(raw: &str) -> RangeScanShape<'_> {
             shape.selection = Some(sel);
         } else if let Some(rows) = part.strip_prefix("SCAN:") {
             shape.scan_rows = rows.parse().ok();
-        } else if let Some(limit) = part.strip_prefix("LIMIT:") {
-            if let Some((offset, count)) = limit.split_once(':') {
-                if let (Ok(offset), Ok(count)) = (offset.parse(), count.parse()) {
-                    shape.cop_limit = Some((offset, count));
-                }
-            }
+        } else if let Some(limit) = part.strip_prefix("LIMIT:")
+            && let Some((offset, count)) = limit.split_once(':')
+            && let (Ok(offset), Ok(count)) = (offset.parse(), count.parse())
+        {
+            shape.cop_limit = Some((offset, count));
         }
     }
     shape
+}
+
+/// `DATA_LIMIT_SEL|…` marker on a probe scan: a correlated `EXISTS … LIMIT n`
+/// whose cardinality TiDB scales by the Apply outer row count.
+fn has_data_limit_sel(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::TableReader { pushed, .. } => {
+            bytes_marker(pushed.as_ref()).is_some_and(|raw| raw.starts_with("DATA_LIMIT_SEL|"))
+        }
+        PhysicalPlan::Limit { child, .. } => has_data_limit_sel(child),
+        _ => false,
+    }
 }
 
 /// `PROBE_LIMIT|<offset>|<count>|<selection info>`: a cop `Limit(Probe)` pushed
@@ -6221,7 +6341,7 @@ fn range_pushed(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<String>
 }
 
 /// Bytes marker text on an EXPLAIN-only `pushed` field.
-fn bytes_marker<'a>(pushed: Option<&'a sealdb_parser::ast::ExprNode>) -> Option<&'a str> {
+fn bytes_marker(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<&str> {
     use sealdb_parser::ast::expressions::{ExprNode, ValueExpr};
     use sealdb_types::Datum;
     match pushed? {
@@ -6288,9 +6408,7 @@ fn range_sel_pushed(
 /// `FILTER_EST|<selection est>|<scan rows>|<sel info>`: EXPLAIN-only reader
 /// whose pushed filter has a hand-computed estimate (pseudo join correlation
 /// where the scan cardinality and the filtered cardinality are decoupled).
-fn filter_est_marker(
-    pushed: Option<&sealdb_parser::ast::ExprNode>,
-) -> Option<(String, f64, f64)> {
+fn filter_est_marker(pushed: Option<&sealdb_parser::ast::ExprNode>) -> Option<(String, f64, f64)> {
     let rest = bytes_marker(pushed)?.strip_prefix("FILTER_EST|")?;
     let (est, rest) = rest.split_once('|')?;
     let (scan, sel) = rest.split_once('|')?;
@@ -6359,8 +6477,9 @@ fn explain_expr_is_string(expr: &sealdb_parser::ast::ExprNode, table: &str) -> b
         }) => true,
         ExprNode::Column(col) => {
             let table = col.table.as_deref().unwrap_or(table);
-            crate::core::planbuilder::explain_column_type(table, &col.name)
-                .is_some_and(|ft| sealdb_statistics::kind_of(&ft) == sealdb_statistics::HistValueKind::Text)
+            crate::core::planbuilder::explain_column_type(table, &col.name).is_some_and(|ft| {
+                sealdb_statistics::kind_of(&ft) == sealdb_statistics::HistValueKind::Text
+            })
         }
         ExprNode::Func(f) => matches!(
             f.name.to_ascii_lowercase().as_str(),
@@ -6434,7 +6553,7 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
         }) => {
             // TiDB `Constant.ExplainInfo` prints temporal values with the
             // full microsecond fraction (`2013-11-01 00:00:00.000000`).
-            let mut t = t.clone();
+            let mut t = *t;
             t.fsp = 6;
             t.to_string()
         }
@@ -6572,7 +6691,10 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
 /// `not(isnull(col))` may sit next to the lowered `or(lt, gt)` arm in a CNF
 /// filter; the NOT BETWEEN estimate still applies.
 fn has_not_between(filter: &sealdb_parser::ast::ExprNode) -> bool {
-    filter.split_cnf().iter().any(|c| not_between_parts(c).is_some())
+    filter
+        .split_cnf()
+        .iter()
+        .any(|c| not_between_parts(c).is_some())
 }
 
 fn not_between_parts(
@@ -6861,9 +6983,7 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             format!("rows:{row_count}"),
         ),
         // EXPLAIN-only marker for TiDB `MaxOneRow` (scalar subquery probe).
-        PhysicalPlan::Projection { exprs, .. }
-            if exprs.len() == 1 && exprs[0] == "MAXONEROW" =>
-        {
+        PhysicalPlan::Projection { exprs, .. } if exprs.len() == 1 && exprs[0] == "MAXONEROW" => {
             ("MaxOneRow".to_string(), String::new(), String::new())
         }
         PhysicalPlan::Projection { exprs, .. } => {
@@ -6878,7 +6998,11 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
         // while the node still prints `rows:1`.
         PhysicalPlan::Simple { kind } if kind.starts_with("TableDual|") => {
             let rows = kind.split('|').nth(2).unwrap_or("1");
-            ("TableDual".to_string(), String::new(), format!("rows:{rows}"))
+            (
+                "TableDual".to_string(),
+                String::new(),
+                format!("rows:{rows}"),
+            )
         }
         PhysicalPlan::Simple { kind } => ("Simple".to_string(), String::new(), kind.clone()),
         PhysicalPlan::Insert { .. } => ("Insert".to_string(), String::new(), "N/A".to_string()),
@@ -6914,9 +7038,8 @@ fn node_meta(plan: &PhysicalPlan) -> (String, String, String) {
             } else if range_scan
                 .as_deref()
                 .is_some_and(|raw| split_range_scan(raw).projection.is_some())
+                || cop_projection_pending().is_some()
             {
-                "data:Projection".to_string()
-            } else if cop_projection_pending().is_some() {
                 "data:Projection".to_string()
             } else if range_scan.is_some() || range_pushed(pushed.as_ref()).is_some() {
                 "data:TableRangeScan".to_string()
@@ -7582,9 +7705,7 @@ fn empty_string_range(conjuncts: &[sealdb_parser::ast::expressions::ExprNode]) -
 fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) -> Option<f64> {
     let mut per_col: Vec<(String, Vec<PRange>)> = Vec::new();
     for c in conjuncts {
-        let Some((key, ranges)) = pseudo_ranges_of_predicate(c) else {
-            return None;
-        };
+        let (key, ranges) = pseudo_ranges_of_predicate(c)?;
         match per_col.iter_mut().find(|(k, _)| *k == key) {
             Some((_, cur)) => {
                 let mut merged = Vec::new();
@@ -7619,7 +7740,7 @@ fn pseudo_range_est(conjuncts: &[sealdb_parser::ast::ExprNode], row_count: f64) 
     Some(est.clamp(0.0, row_count))
 }
 
-/// Extra rows TiDB adds for `not(isnull(..))` saturation on analyzed stats.
+// Extra rows TiDB adds for `not(isnull(..))` saturation on analyzed stats.
 
 /// TiDB pseudo selectivity for one Selection conjunct
 /// (`statistics.pseudoSelectivity`): a comparison whose column side needs a
@@ -7703,9 +7824,7 @@ pub(crate) fn filter_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Optio
 }
 
 /// `or(ifnull(col, const), col is null)` over the same column.
-fn ifnull_isnull_union_selectivity(
-    filter: &sealdb_parser::ast::ExprNode,
-) -> Option<f64> {
+fn ifnull_isnull_union_selectivity(filter: &sealdb_parser::ast::ExprNode) -> Option<f64> {
     use sealdb_parser::ast::expressions::ExprNode;
     let mut ifnull_col: Option<String> = None;
     let mut isnull_col: Option<String> = None;
@@ -7812,8 +7931,7 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
                 // sizes a Selection above it with the single 0.8
                 // `selectionFactor` (regardless of the conjunct count).
                 est_rows(child) * 0.8
-            } else if table_scan_is_correlatable(child) && column_eq_is_cross_table(filter)
-            {
+            } else if table_scan_is_correlatable(child) && column_eq_is_cross_table(filter) {
                 // A correlated equality over a single table's scan (`t2.c2 =
                 // t1.c2` inside a CTE seed / Apply probe) is an equal range on
                 // the column: TiDB's pseudo `pseudoEqualRate` reads one key
@@ -8280,7 +8398,6 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
     }
 }
 
-
 /// CTE name + original seed table under a plan (for ExplainInfo qualification).
 fn recursive_cte_qualifier(plan: &PhysicalPlan) -> Option<(String, String)> {
     match plan {
@@ -8409,7 +8526,7 @@ fn is_pseudo_card(rows: f64) -> bool {
     (rows - 10_000.0).abs() < 1.0 || (rows - 9_990.0).abs() < 1.0
 }
 
-fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {
+pub(crate) fn semi_join_is_left_outer(on: &sealdb_parser::ast::ExprNode) -> bool {
     semi_explain_override(on).is_some_and(|s| s.contains("left outer semi"))
 }
 

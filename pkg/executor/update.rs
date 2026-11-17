@@ -632,10 +632,9 @@ fn collect_truncating(
             if matches!(
                 bin.op,
                 Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::NullSafeEq
-            ) {
-                if let Some(message) = truncating_pair(info, &bin.left, &bin.right) {
-                    out.push(message);
-                }
+            ) && let Some(message) = truncating_pair(info, &bin.left, &bin.right)
+            {
+                out.push(message);
             }
             collect_truncating(info, &bin.left, out);
             collect_truncating(info, &bin.right, out);
@@ -783,7 +782,7 @@ fn bind_outer_assignments(
             out.push(item.clone());
             continue;
         }
-        let bound = bind_outer_refs(&item.expr, &info.name.o(), col_names, values, &[]);
+        let bound = bind_outer_refs(&item.expr, info.name.o(), col_names, values, &[]);
         let expr = pre_evaluate_dml_predicate(&bound, domain, current_db, txn)?;
         out.push(Assignment {
             table: item.table.clone(),

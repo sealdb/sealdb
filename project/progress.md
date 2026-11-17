@@ -3461,6 +3461,130 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `planner/core/join_reorder_through_projection`（同一 MergeJoin 缺失，
     外加投影 `Column#N` 编号）。
 
+### 2026-11-16（`bindinfo/bind` 推进到约 50%：绑定 DDL、CTE MERGE、EXISTS LIMIT、SET BINDING、TABLE 语法）
+
+- **Phase**: R7（`bindinfo/bind` 仍为 pending，diff 从 line 171 推进到 line 310）
+- **完成**:
+  - `extract_binding_ddl`：`DROP … BINDING FOR <sql> [USING <sql>]` 允许可选
+    `USING` 子句（此前整段塞进 original_sql，会话校验时 1064）；新增
+    `SET BINDING [DISABLED|ENABLED] FOR <sql>` 预处理 + `Statement::SetBinding`，
+    并把状态写回 `BindingCache` / `SessionBindingHandle`。
+  - `build_cte_plan`：识别 CTE 体内的 `/*+ MERGE() */`，即使被引用多次也内联
+    （`WITH cte AS (SELECT /*+ MERGE() */ …) SELECT … FROM cte a, cte b`
+    变成两份 `TableReader → TableFullScan`）。
+  - `EXPLAIN SELECT EXISTS (SELECT … WHERE corr LIMIT n) FROM t`：新增
+    `exists_limit_explain_plan`——无 hint 时 decorrelate 成 `left outer semi join`
+    HashJoin（丢弃 LIMIT）；带 `no_decorrelate()` 时保留 `Apply`，probe 为
+    `Limit(Probe) → TableReader(data:Limit) → Limit(cop) → Selection → scan`，
+    并用 `DATA_LIMIT_SEL` 标记让 EXPLAIN 对 Apply probe 按外表行数放大基数。
+  - 系统变量表补齐 `tidb_evolve_plan_baselines=OFF`、`tidb_use_plan_baselines=ON`。
+  - 解析层新增 `TABLE t` / `EXPLAIN TABLE t` / `DESC[RIBE] TABLE t` 重写
+    （分别等价 `SELECT * FROM t` 与解释该查询）。
+- **验证**:
+  - `cargo test -p sealdb-bindinfo -p sealdb-parser -p sealdb-planner --lib`
+    → 1 / 52 / 50 passed
+  - `./run-tests.sh -s memory --status pending -t bindinfo/bind`
+    → diff 起点从 line 171 推进到 line 310；前 309 行全部一致
+- **阻塞/风险**:
+  - `mysql.bind_info` 是普通系统表，当前 InfoSchema 未注册；需要虚拟表或
+    随 CREATE/DROP/SET BINDING 同步真实行。
+  - `EXPLAIN FORMAT='verbose'` 的 `estCost` 仍是简化公式：期望
+    `IndexFullScan 2035000.00`（行数×log2(32)×40.7 的 1 倍）而非当前 2 倍
+    的 4070000.00；`TableRowIDScan` 与 `IndexLookUp` 的 v2 代价也需要按
+    TiDB cost model v2 重算。
+  - `--enable_warnings` 下 `EXPLAIN` 走绑定后应输出
+    `Note 1105 Using the bindSQL: …`，会话尚未产生该 warning。
+  - `SHOW [GLOBAL] BINDINGS` 目前只输出 5 列，TiDB 期望 11 列
+    （含 `Create_time`/`Update_time`/`Charset`/`Collation`/`Sql_digest`/
+    `Plan_digest`），且 `Original_sql` 需要 TiDB 归一化格式。
+- **下一步**:
+  - 先做 `mysql.bind_info` 虚拟表（复用 `bind_handle().all_bindings()`），
+    再补 `SHOW BINDINGS` 的 11 列与归一化 original_sql；
+  - 然后按 cost model v2 重写 `plan_row_costs` 的 scan/index-lookUp 公式，
+    最后补 `Using the bindSQL` warning。
+
+### 2026-11-16（`session/variable` 转绿：全局变量、WEEK/别名、告警语义）
+
+- **Phase**: R5 `session/variable` → green（Mem 通过；TiKV 不适用）
+- **完成**:
+  - 新增 `ERR_GLOBAL_VARIABLE`（1229）/`ERR_WRONG_TYPE_FOR_VAR`（1232，
+    SQLSTATE 42000），`SET @@session` 设置仅 GLOBAL 变量时正确报 1229。
+  - `tidb_memory_usage_alarm_ratio` / `..._keep_record_num` 按 TiDB 范围
+    clamp（ratio `[0,1]`、keep `[1,10000]`）并产生 1292 warning；GLOBAL
+    赋值持久化到 domain override。
+  - 实现 `default_week_format` 会话变量与 `WEEK(date[,mode])`（含默认模式
+    读取会话值）；`week('2020-02-02')` 在 mode 4 下返回 6。
+  - `tidb_auto_analyze_concurrency` 支持默认 3、GLOBAL 赋值与 DEFAULT 复位。
+  - 分区开关固定 ON：`tidb_enable_table_partition` 仅告警 1105；
+    `tidb_enable_list_partition=off` 返回 Error 1105，并保留 “Warning 1681 +
+    Error 1105” 的 `SHOW WARNINGS` 顺序（负错误码表示 Error 级条目）。
+  - `tidb_session_alias` 64 字符截断 + 去尾部空白并告警 1292；未设置时
+    读取空串而非 `0`。
+  - `tidb_read_staleness` 非整数报 1232；`group_concat_max_len` 最小 4、
+    越界 1292，并在每条语句开始时把会话值发布到 executor thread-local，
+    避免跨 worker 线程丢失。
+  - `LOCK IN SHARE MODE` 在 `tidb_enable_noop_functions=OFF` 时报 1235。
+- **验证**:
+  - `./run-tests.sh -s memory -t session/variable`
+    → `PASS: memory=1 tikv=0 skipped=253`
+- **阻塞/风险**:
+  - `WEEK()` 的 2/3/6/7 模式仅按 MySQL 规则近似，当前语料只覆盖 mode 4。
+  - `SHOW WARNINGS` 的 Error 级标记使用负错误码编码，后续若扩展 warning
+    结构需同步调整。
+- **下一步**:
+  - 回到 `bindinfo/bind`：补 `mysql.bind_info` 虚拟表、`SHOW BINDINGS`
+    11 列与 `Using the bindSQL` warning。
+
+### 2026-11-17（`bindinfo/bind` 转绿：绑定归一化、代价模型 v2、DML 绑定与 hint 语义）
+
+- **Phase**: R7 `bindinfo/bind` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `mysql.bind_info` 虚拟表落地（复用 `bind_handle().all_bindings()`），
+    `SHOW [GLOBAL] BINDINGS` 补齐 11 列；`BindingCache` 改为
+    `HashMap<String, Vec<Binding>>`，重建绑定时旧行标记 `deleted`、追加
+    `enabled` 新行，与 TiDB 历史行语义一致。
+  - `EXPLAIN FORMAT='verbose'` 的 `estCost` 按 cost model v2 重算：
+    `IndexRangeScan`/`IndexFullScan` 为 `est × log2(32) × 40.7`，
+    `TableRowIDScan`（row size 48）与 `IndexLookUp`（index/table 子代价、
+    `est × 49.9`、2 万行以上 `est/20000 × 32 × 6e6` 的 lookup 惩罚）同步对齐。
+  - 绑定匹配的归一化：数字/字符串字面量统一替换为 `?`，`IN (...)` 折叠；
+    新增 `with_preserve_in_list`，使 `IN (1)` 在绑定语句创建/匹配时保持
+    `InList` 而不再降为 `Binary(Eq)`；表名做数据库限定
+    （`select * from t` ≡ `bindinfo__bind.t`），无默认库时也能命中。
+  - `SELECT @@global.tidb_capture_plan_baselines` 与 `SHOW VARIABLES` 语义分离：
+    前者输出 `0`/`1`，后者输出 `OFF`/`ON`。
+  - DML 绑定（`DELETE`/`UPDATE`/`INSERT`/`REPLACE`）支持改写与执行计划下发：
+    `copy_original_literals` 把客户端字面量注入绑定 AST；
+    `apply_optimizer_index_hints` 支持 `/*+ use_index(t, idx) */`，
+    `inl_join` 由 plan builder 处理；`dml_scan_select` 生成 `synthesized`
+    内部查询，避免多注入投影/选择。
+  - INSERT/REPLACE 的 hint 归属修正：`INSERT` 关键字后的 hint block 属于 DML
+    语句本身，不作用于嵌套查询；只有写在 `SELECT` 体内的 `use_index` 才影响
+    scan 计划（`UPDATE`/`DELETE` 仍按语句级 hint 生效），与 TiDB 行为一致。
+  - 覆盖索引选路的代价模型版本差异：`SELECT *` 由覆盖索引全扫改为按
+    `tidb_cost_model_version` 分流——v2（8.x 默认）即使索引键带 handle 也选
+    `IndexFullScan`（`t(id)` + `idx(id)`），v1 仍要求索引行真正更窄。此前
+    无条件放宽导致 `explain_easy`（`set tidb_cost_model_version=1`）在
+    `not(isnull(b))` 上误选覆盖索引全扫、并把 join 基数带到 10000。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t bindinfo/bind`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t bindinfo/bind`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s memory`（green+local 全量）
+    → `PASS: memory=103 tikv=0 skipped=151`
+  - `./tests/integrationtest/run-tests.sh -s tikv`（green+local 全量）
+    → `PASS: memory=0 tikv=101 skipped=153`
+- **阻塞/风险**:
+  - hint 解析仍是语句文本级的 `use_index(...)` 提取，未接入完整 hint
+    AST；其余 hint（`ignore_index`、`index_merge` 等）暂不生效。
+  - `SHOW BINDINGS` 的 `Sql_digest`/`Plan_digest` 为占位值，当前语料未校验。
+  - 覆盖索引选路的 v1/v2 分流是按现有金样反推的经验规则；TiDB 上游是完整
+    的 `GetPlanCostVer1/Ver2` 对比，后续接 `plan_cost_ver2` 时应替换该特判。
+- **下一步**:
+  - 转向 R3 中与代价模型同源的 `planner/core/plan_cost_ver2`，并推进
+    `explain_indexmerge_stats`（96%，首差 196/203）。
+
 ## 7. 更新模板
 
 每次更新追加一条：

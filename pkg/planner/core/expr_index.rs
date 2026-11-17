@@ -344,13 +344,9 @@ pub fn shard_index_rewrite(select: &SelectStmt, info: &TableInfo) -> Option<Sele
         }
         acc
     } else {
-        match shard_prefix(&shard_indices, &conds) {
-            Some(prefix) => {
-                changed = true;
-                with_prefix(prefix, conds)?
-            }
-            None => return None,
-        }
+        let prefix = shard_prefix(&shard_indices, &conds)?;
+        changed = true;
+        with_prefix(prefix, conds)?
     };
     if !changed {
         return None;

@@ -178,7 +178,7 @@ fn window_shape(
                 ExprNode::Column(c) => format!("cast({}, decimal(10,0) BINARY)", qual(&c.name)),
                 other => other.restore_string(),
             })
-            .unwrap_or_else(|| String::new());
+            .unwrap_or_else(String::new);
         format!("{fname}({arg})->Column#{win_col} {over}")
     };
 
@@ -274,8 +274,7 @@ fn window_order_covers(
     if keys.is_empty() {
         return false;
     }
-    let mut idx = 0;
-    for item in &select.order_by {
+    for (idx, item) in select.order_by.iter().enumerate() {
         if item.desc {
             return false;
         }
@@ -286,7 +285,6 @@ fn window_order_covers(
         if keys.get(idx) != Some(&label) {
             return false;
         }
-        idx += 1;
     }
     true
 }
@@ -428,7 +426,7 @@ fn maybe_index_for_window(
 
 fn index_reader(
     table: &str,
-    partitions: &Vec<i64>,
+    partitions: &[i64],
     index: &sealdb_meta::model::IndexInfo,
 ) -> PhysicalPlan {
     let index_columns: Vec<String> = index
@@ -440,7 +438,7 @@ fn index_reader(
         table: table.to_string(),
         index: index.name.o().to_string(),
         index_columns,
-        partitions: partitions.clone(),
+        partitions: partitions.to_vec(),
         partition_access: String::new(),
         row_count: 10_000.0,
         pushed: None,

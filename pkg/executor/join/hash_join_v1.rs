@@ -1198,10 +1198,10 @@ fn key_text(value: &Datum) -> String {
     match value {
         Datum::Time(t) => time_key_text(*t),
         Datum::Bytes(b) => {
-            if let Ok(s) = std::str::from_utf8(b) {
-                if let Ok(t) = sealdb_types::time::parse_timestamp_literal(s) {
-                    return time_key_text(t);
-                }
+            if let Ok(s) = std::str::from_utf8(b)
+                && let Ok(t) = sealdb_types::time::parse_timestamp_literal(s)
+            {
+                return time_key_text(t);
             }
             format!("{value:?}")
         }
@@ -1285,10 +1285,10 @@ fn matched_ids(
 }
 
 fn time_key_text(mut t: sealdb_types::time::Time) -> String {
-    if matches!(t.tp, sealdb_types::time::TimeType::Timestamp) {
-        if let Ok(local) = sealdb_expression::utc_to_session_local(t) {
-            t = local;
-        }
+    if matches!(t.tp, sealdb_types::time::TimeType::Timestamp)
+        && let Ok(local) = sealdb_expression::utc_to_session_local(t)
+    {
+        t = local;
     }
     format!(
         "time:{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",

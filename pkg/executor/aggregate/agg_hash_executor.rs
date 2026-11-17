@@ -14,6 +14,8 @@ use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
 use std::collections::BTreeMap;
 
+// `Const` carries a `Datum`; boxing it would slow the hot per-row path.
+#[allow(clippy::large_enum_variant)]
 enum OutputItem {
     Group(usize),
     Agg(usize),
@@ -95,10 +97,10 @@ impl HashAggExec {
             if !nested.is_empty() {
                 for agg in &nested {
                     let restored = restore_expr(&ExprNode::Func(agg.clone()));
-                    if agg_specs
-                        .iter()
-                        .any(|existing| restore_expr(&ExprNode::Func(existing.clone())).eq_ignore_ascii_case(&restored))
-                    {
+                    if agg_specs.iter().any(|existing| {
+                        restore_expr(&ExprNode::Func(existing.clone()))
+                            .eq_ignore_ascii_case(&restored)
+                    }) {
                         continue;
                     }
                     agg_specs.push(agg.clone());
@@ -378,15 +380,11 @@ impl HashAggExec {
             .iter()
             .map(|item| match item {
                 OutputItem::Group(idx) => Ok(keys.get(*idx).cloned().unwrap_or(Datum::Null)),
-                OutputItem::Agg(idx) => Ok(finals
-                    .get(*idx)
-                    .cloned()
-                    .unwrap_or(Datum::Null)),
+                OutputItem::Agg(idx) => Ok(finals.get(*idx).cloned().unwrap_or(Datum::Null)),
                 OutputItem::Const(d) => Ok(d.clone()),
                 OutputItem::Any(idx) => Ok(any_vals.get(*idx).cloned().unwrap_or(Datum::Null)),
                 OutputItem::Expr(expr) => {
-                    let mut schema =
-                        Vec::with_capacity(self.group_by.len() + self.agg_specs.len());
+                    let mut schema = Vec::with_capacity(self.group_by.len() + self.agg_specs.len());
                     let mut row = Vec::with_capacity(schema.capacity());
                     for (idx, group) in self.group_by.iter().enumerate() {
                         schema.push(restore_expr(group));

@@ -28,10 +28,11 @@ use crate::ast::misc::{
     GrantStmt, ImportIntoStmt, IsolationLevel, KillStmt, LoadStatsStmt, LockStatsStmt,
     LockTablesStmt, OptimizeTableStmt, PlanReplayerStmt, PrepareStmt, PrivElem, PrivilegeType,
     RecommendIndexStmt, RecoverTableStmt, ReleaseSavepointStmt, RenameUserStmt, RepairTableStmt,
-    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetPwdStmt,
-    SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope, ShowStmt,
-    ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt, TableLockItem,
-    TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec, UserToUser,
+    RevokeRoleStmt, RevokeStmt, RollbackStmt, SavepointStmt, SetAssignment, SetBindingStmt,
+    SetPwdStmt, SetResourceGroupStmt, SetRoleKind, SetRoleStmt, SetStmt, SetTxnStmt, SetVarScope,
+    ShowStmt, ShowStmtKind, ShowVarFilter, ShowVarScope, ShutdownStmt, SplitRegionStmt,
+    TableLockItem, TableLockType, TraceStmt, UnlockStatsStmt, UseStmt, UserIdentity, UserSpec,
+    UserToUser,
 };
 use crate::ast::{ExplainFormat, ExplainStmt, Node, Statement, StmtNode};
 use crate::opcode::Op;
@@ -152,6 +153,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_show_grants(&rewritten)?;
     let rewritten = rewrite_show_create_database(&rewritten);
     let rewritten = rewrite_show_index(&rewritten);
+    // MySQL `TABLE t` is a synonym for `SELECT * FROM t`; `EXPLAIN|DESC TABLE t`
+    // explain that select.
+    let rewritten = rewrite_table_statements(&rewritten);
     // TiDB `DESC|DESCRIBE|EXPLAIN tbl col` → `SHOW COLUMNS` with a column filter.
     let rewritten = rewrite_describe_column(&rewritten);
     let rewritten = rewrite_admin_show_ddl(&rewritten);
@@ -291,19 +295,19 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         {
             prepare.sql = sql;
         }
-        if let Statement::AnalyzeTable(analyze) = &mut lowered {
-            if let Some((indexes, tables, buckets, topn)) = analyze_extras.next().flatten() {
-                analyze.indexes = indexes;
-                analyze.bucket_count = buckets;
-                analyze.topn_count = topn;
-                if tables.len() > 1 {
-                    analyze.tables = tables
-                        .into_iter()
-                        .map(|n| TableName::new(None, n))
-                        .collect();
-                    if let Some(first) = analyze.tables.first().cloned() {
-                        analyze.table = first;
-                    }
+        if let Statement::AnalyzeTable(analyze) = &mut lowered
+            && let Some((indexes, tables, buckets, topn)) = analyze_extras.next().flatten()
+        {
+            analyze.indexes = indexes;
+            analyze.bucket_count = buckets;
+            analyze.topn_count = topn;
+            if tables.len() > 1 {
+                analyze.tables = tables
+                    .into_iter()
+                    .map(|n| TableName::new(None, n))
+                    .collect();
+                if let Some(first) = analyze.tables.first().cloned() {
+                    analyze.table = first;
                 }
             }
         }
@@ -914,7 +918,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     Some(ShowVarFilter::Like(pattern.clone()))
                 }
                 Some(ShowStatementFilter::Where(expr)) => {
-                    Some(ShowVarFilter::Where(lower_expr(expr)?))
+                    Some(ShowVarFilter::Where(Box::new(lower_expr(expr)?)))
                 }
                 // `SHOW VARIABLES` with no filter lists everything.
                 None => None,
@@ -1014,6 +1018,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 None => Vec::new(),
             };
             Ok(Statement::Insert(InsertStmt {
+                text: insert.to_string(),
                 table,
                 ignore: insert.ignore,
                 replace: insert.replace_into,
@@ -1788,15 +1793,16 @@ fn rewrite_auto_random_option(sql: &str) -> String {
         if keyword_at(bytes, i, "AUTO_RANDOM") {
             let mut j = skip_ws(bytes, i + "AUTO_RANDOM".len());
             let mut bits = DEFAULT_AUTO_RANDOM_SHARD_BITS;
-            if j < bytes.len() && bytes[j] == b'(' {
-                if let Some(close) = matching_paren(bytes, j) {
-                    if let Some(first) = sql[j + 1..close].split(',').next() {
-                        if let Ok(n) = first.trim().parse::<u32>() {
-                            bits = n;
-                        }
-                    }
-                    j = close + 1;
+            if j < bytes.len()
+                && bytes[j] == b'('
+                && let Some(close) = matching_paren(bytes, j)
+            {
+                if let Some(first) = sql[j + 1..close].split(',').next()
+                    && let Ok(n) = first.trim().parse::<u32>()
+                {
+                    bits = n;
                 }
+                j = close + 1;
             }
             out.push_str("COMMENT '");
             out.push_str(AUTO_RANDOM_MARKER_PREFIX);
@@ -2021,6 +2027,57 @@ fn decode_show_ddl_jobs(show: &mut ShowStmt) {
     }
 }
 
+/// `TABLE t` / `EXPLAIN TABLE t` / `DESC[RIBE] TABLE t`: MySQL synonyms for a
+/// `SELECT * FROM t` (the EXPLAIN forms explain that select).
+fn rewrite_table_statements(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0;
+    let mut at_stmt_start = true;
+    while i < bytes.len() {
+        if at_stmt_start {
+            let j = skip_ws(bytes, i);
+            if keyword_at(bytes, j, "EXPLAIN") || keyword_at(bytes, j, "DESCRIBE") {
+                let kw_len = if keyword_at(bytes, j, "EXPLAIN") {
+                    7
+                } else {
+                    8
+                };
+                let after_kw = skip_ws(bytes, j + kw_len);
+                if keyword_at(bytes, after_kw, "TABLE") {
+                    out.push_str("EXPLAIN SELECT * FROM ");
+                    i = skip_ws(bytes, after_kw + "TABLE".len());
+                    at_stmt_start = false;
+                    continue;
+                }
+            } else if keyword_at(bytes, j, "DESC") {
+                let after_kw = skip_ws(bytes, j + 4);
+                if keyword_at(bytes, after_kw, "TABLE") {
+                    out.push_str("EXPLAIN SELECT * FROM ");
+                    i = skip_ws(bytes, after_kw + "TABLE".len());
+                    at_stmt_start = false;
+                    continue;
+                }
+            }
+            if keyword_at(bytes, j, "TABLE") {
+                out.push_str("SELECT * FROM ");
+                i = skip_ws(bytes, j + "TABLE".len());
+                at_stmt_start = false;
+                continue;
+            }
+        }
+        if bytes[i] == b';' {
+            at_stmt_start = true;
+        } else if !bytes[i].is_ascii_whitespace() {
+            at_stmt_start = false;
+        }
+        let ch = sql[i..].chars().next().expect("sql index in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// sqlparser has no `SHOW BINDINGS`; rewrite to SHOW TABLES FROM a marker schema.
 fn rewrite_show_bindings(sql: &str) -> String {
     let bytes = sql.as_bytes();
@@ -2087,19 +2144,20 @@ fn rewrite_alter_add_columns_paren(sql: &str) -> String {
             let after_add = skip_ws(bytes, i + "ADD".len());
             if keyword_at(bytes, after_add, "COLUMN") {
                 let open = skip_ws(bytes, after_add + "COLUMN".len());
-                if open < bytes.len() && bytes[open] == b'(' {
-                    if let Some(close) = matching_paren(bytes, open) {
-                        let parts = split_top_level_commas(&sql[open + 1..close]);
-                        for (pos, part) in parts.iter().enumerate() {
-                            if pos > 0 {
-                                out.push_str(", ");
-                            }
-                            out.push_str("ADD COLUMN ");
-                            out.push_str(part.trim());
+                if open < bytes.len()
+                    && bytes[open] == b'('
+                    && let Some(close) = matching_paren(bytes, open)
+                {
+                    let parts = split_top_level_commas(&sql[open + 1..close]);
+                    for (pos, part) in parts.iter().enumerate() {
+                        if pos > 0 {
+                            out.push_str(", ");
                         }
-                        i = close + 1;
-                        continue;
+                        out.push_str("ADD COLUMN ");
+                        out.push_str(part.trim());
                     }
+                    i = close + 1;
+                    continue;
                 }
             }
         }
@@ -2192,20 +2250,50 @@ fn extract_binding_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     while i < bytes.len() {
         if keyword_at(bytes, i, "CREATE") {
             let after = skip_ws(bytes, i + "CREATE".len());
+            let global = keyword_at(bytes, after, "GLOBAL");
             let after_scope = skip_binding_scope(bytes, after);
             if keyword_at(bytes, after_scope, "BINDING") {
-                let (stmt, end) = parse_create_binding(bytes, after_scope + "BINDING".len())?;
+                let (stmt, end) =
+                    parse_create_binding(bytes, after_scope + "BINDING".len(), global)?;
                 out.push_str("SET NAMES '__sealdb_binding__'");
                 ops.push(Some(stmt));
                 i = end;
                 continue;
             }
         }
+        if keyword_at(bytes, i, "SET") {
+            let after = skip_ws(bytes, i + "SET".len());
+            if keyword_at(bytes, after, "BINDING") {
+                let after_binding = skip_ws(bytes, after + "BINDING".len());
+                let qualified = if keyword_at(bytes, after_binding, "DISABLED") {
+                    Some((false, after_binding + "DISABLED".len()))
+                } else if keyword_at(bytes, after_binding, "ENABLED") {
+                    Some((true, after_binding + "ENABLED".len()))
+                } else {
+                    None
+                };
+                if let Some((enabled, after_kw)) = qualified {
+                    let after_for = skip_ws(bytes, after_kw);
+                    if keyword_at(bytes, after_for, "FOR") {
+                        let (original, end) =
+                            take_sql_until_semicolon(bytes, after_for + "FOR".len());
+                        out.push_str("SET NAMES '__sealdb_binding__'");
+                        ops.push(Some(Statement::SetBinding(SetBindingStmt {
+                            original_sql: original.trim().to_string(),
+                            enabled,
+                        })));
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
         if keyword_at(bytes, i, "DROP") {
             let after = skip_ws(bytes, i + "DROP".len());
+            let global = keyword_at(bytes, after, "GLOBAL");
             let after_scope = skip_binding_scope(bytes, after);
             if keyword_at(bytes, after_scope, "BINDING") {
-                let (stmt, end) = parse_drop_binding(bytes, after_scope + "BINDING".len())?;
+                let (stmt, end) = parse_drop_binding(bytes, after_scope + "BINDING".len(), global)?;
                 out.push_str("SET NAMES '__sealdb_binding__'");
                 ops.push(Some(stmt));
                 i = end;
@@ -2231,7 +2319,7 @@ fn skip_binding_scope(bytes: &[u8], i: usize) -> usize {
     i
 }
 
-fn parse_create_binding(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+fn parse_create_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
     if !keyword_at(bytes, i, "FOR") {
         return Err(Error::unsupported("CREATE BINDING without FOR"));
@@ -2250,24 +2338,36 @@ fn parse_create_binding(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)
         Statement::CreateBinding(CreateBindingStmt {
             original_sql,
             bind_sql,
+            global,
         }),
         end,
     ))
 }
 
-fn parse_drop_binding(bytes: &[u8], mut i: usize) -> Result<(Statement, usize)> {
+fn parse_drop_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
     if !keyword_at(bytes, i, "FOR") {
         return Err(Error::unsupported("DROP BINDING without FOR"));
     }
     i = skip_ws(bytes, i + "FOR".len());
-    let (original, end) = take_sql_until_semicolon(bytes, i);
+    // `DROP … BINDING FOR <sql> [USING <sql>]`: the optional USING clause only
+    // narrows the match by bind SQL, so keep the original SQL and drop the rest.
+    let (original, end) = match take_sql_until_keyword(bytes, i, "USING") {
+        Some((original, using_at)) => {
+            let (_, end) = take_sql_until_semicolon(bytes, using_at + "USING".len());
+            (original, end)
+        }
+        None => take_sql_until_semicolon(bytes, i),
+    };
     let original_sql = original.trim().to_string();
     if original_sql.is_empty() {
         return Err(Error::unsupported("DROP BINDING with empty SQL"));
     }
     Ok((
-        Statement::DropBinding(DropBindingStmt { original_sql }),
+        Statement::DropBinding(DropBindingStmt {
+            original_sql,
+            global,
+        }),
         end,
     ))
 }
@@ -3413,13 +3513,13 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                 if word == "where"
                     && partial_ok
                     && depth == 1
-                    && item_start.is_some()
                     && out.trim_end().ends_with(')')
+                    && let Some(start) = item_start
                 {
                     let end = scan_partial_predicate_end(sql, i);
                     let predicate = sql[i..end].trim();
                     if !predicate.is_empty() {
-                        let item = &sql[item_start.unwrap()..word_start];
+                        let item = &sql[start..word_start];
                         if let Some(name) = partial_index_name(item) {
                             PENDING_PARTIAL_INDEX_PREDICATES
                                 .with(|cell| cell.borrow_mut().push((name, predicate.to_string())));
@@ -4280,15 +4380,13 @@ fn rewrite_mysql_paren_from(sql: &str) -> String {
                         || keyword_at(inner_bytes, start, "WITH")
                         || keyword_at(inner_bytes, start, "VALUES")
                         || keyword_at(inner_bytes, start, "TABLE");
-                    if !derived {
-                        if let Some(body) = cross_join_comma_list(inner) {
-                            out.push_str(&sql[i..after]);
-                            out.push('(');
-                            out.push_str(&body);
-                            out.push(')');
-                            i = close;
-                            continue;
-                        }
+                    if !derived && let Some(body) = cross_join_comma_list(inner) {
+                        out.push_str(&sql[i..after]);
+                        out.push('(');
+                        out.push_str(&body);
+                        out.push(')');
+                        i = close;
+                        continue;
                     }
                 }
             }
@@ -4569,7 +4667,7 @@ fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
         || query.limit_clause.is_some()
         || select.from.len() != 1
         || !select.from[0].joins.is_empty()
-        || !matches!(select.distinct, None)
+        || select.distinct.is_some()
         || !matches!(select.group_by, GroupByExpr::Expressions(ref e, ref m) if e.is_empty() && m.is_empty())
     {
         return None;
@@ -4683,12 +4781,11 @@ fn read_analyze_options(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64
     (p, buckets, topn)
 }
 
-fn extract_analyze_index(
-    sql: &str,
-) -> Result<(
-    String,
-    Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>,
-)> {
+/// `(indexes, tables, buckets, topn)` per `ANALYZE` table target; `None`
+/// mirrors the analyzer list for targets without explicit options.
+type AnalyzeTableExtras = Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>;
+
+fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
     let bytes = sql.as_bytes();
     let mut out = String::new();
     let mut extras = Vec::new();
@@ -7142,13 +7239,13 @@ fn extract_alter_partitions(sql: &str) -> Result<(String, Vec<Option<AlterPartOp
     Ok((out, ops))
 }
 
+/// `(partition, attributes, end offset)` of an `ATTRIBUTES` alter spec.
+type AlterAttributesSpec = (Option<String>, Option<String>, usize);
+
 /// `ALTER TABLE t [PARTITION p] ATTRIBUTES [=] '<key=value, ...>'|DEFAULT`.
-/// Returns `(partition, attributes, end)` or `None` when the spec list does not
-/// start with an attributes change.
-fn parse_alter_attributes_spec(
-    bytes: &[u8],
-    start: usize,
-) -> Result<Option<(Option<String>, Option<String>, usize)>> {
+/// Returns the parsed spec or `None` when the spec list does not start with an
+/// attributes change.
+fn parse_alter_attributes_spec(bytes: &[u8], start: usize) -> Result<Option<AlterAttributesSpec>> {
     let mut p = skip_ws(bytes, start);
     let mut partition = None;
     if keyword_at(bytes, p, "PARTITION") {
@@ -7794,15 +7891,20 @@ fn split_cast_charset(inner: &str) -> Option<(String, String)> {
             .then_some((pos, tail))
     })?;
     let tail_lower = tail.to_ascii_lowercase();
-    let (type_part, rest) = if let Some(k) = find_word(&tail_lower, "charset", 0) {
-        (&tail[..k], &tail[k + "charset".len()..])
-    } else if let Some(k) = find_word(&tail_lower, "character", 0) {
+    // `CHARACTER SET <cs>`: the offset just past the keyword pair.
+    let character_set_end = || {
+        let k = find_word(&tail_lower, "character", 0)?;
         let after = &tail_lower[k + "character".len()..];
         let trimmed = after.trim_start();
-        if !trimmed.starts_with("set") {
-            return None;
-        }
-        let consumed = k + "character".len() + (after.len() - trimmed.len()) + "set".len();
+        trimmed.starts_with("set").then_some(())?;
+        Some((
+            k,
+            k + "character".len() + (after.len() - trimmed.len()) + "set".len(),
+        ))
+    };
+    let (type_part, rest) = if let Some(k) = find_word(&tail_lower, "charset", 0) {
+        (&tail[..k], &tail[k + "charset".len()..])
+    } else if let Some((k, consumed)) = character_set_end() {
         (&tail[..k], &tail[consumed..])
     } else {
         return None;
@@ -8831,6 +8933,7 @@ fn isolate_setopr_group(query: &Query) -> Result<SelectStmt> {
             ctes: vec![cte],
         }),
         text: String::new(),
+        synthesized: false,
     })
 }
 
@@ -8995,6 +9098,7 @@ fn lower_select(
         lock_wait,
         with: with_from_derived(derived),
         text,
+        synthesized: false,
     })
 }
 
@@ -9038,17 +9142,18 @@ fn true_expr() -> ExprNode {
     })
 }
 
-/// Lower FROM into the leftmost table plus a left-deep join chain.
-/// Comma-separated table lists become CROSS JOIN steps.
-/// Derived tables (`FROM (SELECT ...) alias`) flatten into CTEs.
-fn lower_from(
-    from: &[TableWithJoins],
-) -> Result<(
+/// `(leftmost table, left-deep join chain, bushy from item, derived CTEs)`.
+type LoweredFrom = (
     Option<TableName>,
     Vec<Join>,
     Option<crate::ast::FromItem>,
     Vec<CommonTableExpression>,
-)> {
+);
+
+/// Lower FROM into the leftmost table plus a left-deep join chain.
+/// Comma-separated table lists become CROSS JOIN steps.
+/// Derived tables (`FROM (SELECT ...) alias`) flatten into CTEs.
+fn lower_from(from: &[TableWithJoins]) -> Result<LoweredFrom> {
     if from.is_empty() {
         return Ok((None, Vec::new(), None, Vec::new()));
     }
@@ -9195,7 +9300,6 @@ fn lower_table_with_joins_item(
         // by alias (`t t3` → `t3.a`). Rewriting to the physical name collapses
         // identities when two aliases share one table (`t t3 JOIN t t4`).
         let _ = alias_map;
-        let on = on;
         left = crate::ast::FromItem::Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -9840,6 +9944,7 @@ fn lower_update(update: &Update) -> Result<Statement> {
     }
     let ignore = has_dml_ignore_hint(&update.optimizer_hints);
     Ok(Statement::Update(UpdateStmt {
+        text: update.to_string(),
         ignore,
         table,
         join,
@@ -9933,6 +10038,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
     }
     let ignore = has_dml_ignore_hint(&delete.optimizer_hints);
     Ok(Statement::Delete(DeleteStmt {
+        text: delete.to_string(),
         ignore,
         table,
         tables,
@@ -10898,23 +11004,23 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
         }
     }
     // `a int primary key` → synthetic PRIMARY KEY index (TiDB pk_is_handle).
-    if let Some(name) = col_primary {
-        if !indices.iter().any(|i| i.primary) {
-            indices.insert(
-                0,
-                IndexDef {
-                    name: "PRIMARY".into(),
-                    columns: vec![IndexPart::column(name)],
-                    unique: true,
-                    primary: true,
-                    global: false,
-                    nonclustered: col_pk_nonclustered,
-                    clustered: col_pk_clustered && !col_pk_nonclustered,
-                    invisible: false,
-                    where_clause: None,
-                },
-            );
-        }
+    if let Some(name) = col_primary
+        && !indices.iter().any(|i| i.primary)
+    {
+        indices.insert(
+            0,
+            IndexDef {
+                name: "PRIMARY".into(),
+                columns: vec![IndexPart::column(name)],
+                unique: true,
+                primary: true,
+                global: false,
+                nonclustered: col_pk_nonclustered,
+                clustered: col_pk_clustered && !col_pk_nonclustered,
+                invisible: false,
+                where_clause: None,
+            },
+        );
     }
     let (charset, collate) = lower_table_charset_collate(&create.table_options);
     let (shard_row_id_bits, pre_split_regions) = take_tidb_table_options();
@@ -11360,7 +11466,10 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             // TiDB `inToExpression`: a one-element IN list is not kept as IN,
             // it becomes an equality (`a IN (x)` → `a = x`), which also lets
             // partition pruning and range scans see the constant.
-            if list.len() == 1 && matches!(*left, ExprNode::Column(_)) {
+            if list.len() == 1
+                && !crate::parser::preserve_in_list()
+                && matches!(*left, ExprNode::Column(_))
+            {
                 let right = list.into_iter().next().expect("one element");
                 return Ok(ExprNode::Binary(BinaryOpExpr {
                     op: if *negated { Op::Ne } else { Op::Eq },
@@ -11562,37 +11671,35 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
     if matches!(
         upper.as_str(),
         "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE"
-    ) {
-        if let FunctionArguments::List(list) = &func.args
-            && list.args.len() == 2
-            && let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Interval(iv))) = &list.args[1]
-        {
-            let expr = lower_function_arg(&list.args[0])?;
-            let value = lower_expr(&iv.value)?;
-            let unit = iv
-                .leading_field
-                .as_ref()
-                .map(|f| f.to_string())
-                .unwrap_or_else(|| "DAY".to_string());
-            let fname = if upper == "ADDDATE" {
-                "DATE_ADD"
-            } else if upper == "SUBDATE" {
-                "DATE_SUB"
-            } else {
-                upper.as_str()
-            };
-            return Ok(ExprNode::Func(FuncCallExpr {
-                name: fname.to_string(),
-                args: vec![
-                    expr,
-                    value,
-                    ExprNode::Value(ValueExpr {
-                        datum: Datum::Bytes(unit.into_bytes()),
-                    }),
-                ],
-                distinct: false,
-            }));
-        }
+    ) && let FunctionArguments::List(list) = &func.args
+        && list.args.len() == 2
+        && let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Interval(iv))) = &list.args[1]
+    {
+        let expr = lower_function_arg(&list.args[0])?;
+        let value = lower_expr(&iv.value)?;
+        let unit = iv
+            .leading_field
+            .as_ref()
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "DAY".to_string());
+        let fname = if upper == "ADDDATE" {
+            "DATE_ADD"
+        } else if upper == "SUBDATE" {
+            "DATE_SUB"
+        } else {
+            upper.as_str()
+        };
+        return Ok(ExprNode::Func(FuncCallExpr {
+            name: fname.to_string(),
+            args: vec![
+                expr,
+                value,
+                ExprNode::Value(ValueExpr {
+                    datum: Datum::Bytes(unit.into_bytes()),
+                }),
+            ],
+            distinct: false,
+        }));
     }
     let distinct = match &func.args {
         FunctionArguments::List(list) => {
@@ -11982,7 +12089,7 @@ fn bit_literal_bytes(bits: &str) -> Result<Vec<u8>> {
 /// Decode `X'ABCD'` / `0xABCD` hex digits into raw bytes (TiDB binary literal).
 fn decode_hex_literal(hex: &str) -> Result<Vec<u8>> {
     let h = hex.as_bytes();
-    if h.len() % 2 != 0 {
+    if !h.len().is_multiple_of(2) {
         return Err(Error::new(
             ERR_PARSE_ERROR,
             format!("Incorrect hex literal: {hex}"),
@@ -12498,8 +12605,7 @@ fn lower_primary_key(idx: &sqlparser::ast::PrimaryKeyConstraint) -> Result<Index
     }
     let strip_marker = |part: &IndexPart, marker: &str| -> Option<IndexPart> {
         let name = part.column_name()?;
-        name.strip_prefix(marker)
-            .map(|rest| IndexPart::column(rest))
+        name.strip_prefix(marker).map(IndexPart::column)
     };
     let nonclustered = match strip_marker(&columns[0], NONCLUSTERED_MARKER) {
         Some(rest) => {

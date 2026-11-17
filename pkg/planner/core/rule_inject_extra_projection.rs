@@ -98,10 +98,10 @@ pub fn inject_proj_below_sort(
 
 fn next_order_column_id(select: &SelectStmt, is: Option<&InfoSchema>, current_db: &str) -> usize {
     // TiDB AllocPlanColumnID after table cols + handle: t(a,b) → Column#4.
-    if let Some(from) = &select.from {
-        if let Some(n) = table_column_count(from, is, current_db) {
-            return n + 2;
-        }
+    if let Some(from) = &select.from
+        && let Some(n) = table_column_count(from, is, current_db)
+    {
+        return n + 2;
     }
     4
 }

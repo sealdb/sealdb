@@ -120,6 +120,7 @@ fn apply_concurrency() -> usize {
         .unwrap_or(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn filter_outer_rows(
     rows: Vec<Vec<Datum>>,
     filter: &ExprNode,
@@ -186,6 +187,7 @@ fn filter_outer_rows(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn filter_outer_rows_serial(
     rows: Vec<Vec<Datum>>,
     filter: &ExprNode,

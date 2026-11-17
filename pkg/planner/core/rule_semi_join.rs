@@ -253,8 +253,12 @@ fn rewrite_apply(
                 // the outer (probe) scan keeps only non-null join keys.
                 if tp == JoinType::Inner
                     && spec.dedup_in
-                    && let Some(filter) =
-                        nullable_not_isnull_cols(&[spec.on.clone()], &left_table, is, current_db)
+                    && let Some(filter) = nullable_not_isnull_cols(
+                        std::slice::from_ref(&spec.on),
+                        &left_table,
+                        is,
+                        current_db,
+                    )
                 {
                     plan = push_isnull_filter(plan, filter);
                 }
@@ -458,13 +462,8 @@ fn build_recursive_all_probe(
         PhysicalPlan::table_reader(seed_from.name.clone(), Vec::new())
     };
     let seed_rows = super::explain::est_rows(&seed_plan);
-    let rec_plan = build_recursive_arm_plan(
-        rec,
-        &cte.name,
-        seed_from.name.as_str(),
-        schema,
-        seed_rows,
-    );
+    let rec_plan =
+        build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), schema, seed_rows);
     let cte_plan = PhysicalPlan::CTE {
         name: cte.name.clone(),
         alias: None,
@@ -686,13 +685,9 @@ fn recursive_exists_cte_apply(
     };
     let seed_rows = super::explain::est_rows(&seed_plan);
     let rec_plan = match &cte.recursive {
-        Some((_, rec)) => build_recursive_arm_plan(
-            rec,
-            &cte.name,
-            seed_from.name.as_str(),
-            &schema,
-            seed_rows,
-        ),
+        Some((_, rec)) => {
+            build_recursive_arm_plan(rec, &cte.name, seed_from.name.as_str(), &schema, seed_rows)
+        }
         None => PhysicalPlan::table_reader("CTE_0", Vec::new()),
     };
     let cte_plan = PhysicalPlan::CTE {
@@ -849,25 +844,46 @@ fn from_exists(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Opti
     if query_has_aggregation(query) {
         return None;
     }
+    // `/*+ SEMI_JOIN_REWRITE() */` on the subquery: TiDB turns the semi join
+    // into an inner join against a de-duplicated inner side (one distinct key
+    // set). `NOT EXISTS` keeps the semi/anti semantics.
+    if !not && let Some(spec) = from_exists_semi_join_rewrite(query) {
+        return Some(spec);
+    }
     if let Some(inner) = simple_inner(query) {
         let selection = query.selection.as_ref()?;
         if let Some((on, inner_filter)) = split_semi_pred(selection, &inner.name) {
+            // TiDB `ExtractOnCondition`: an equality semi join rejects NULL
+            // keys on both sides, so each input gets `not(isnull(key))` above
+            // its scan. The filter is not part of the ON condition.
+            let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name);
+            let (inner_nulls, outer_nulls) =
+                derive_comparison_null_rejects(&on.split_cnf_all(), &inner.name, inner_physical);
+            let (inner_filter, outer_filter) = if not {
+                (inner_filter, None)
+            } else {
+                (merge_filters(inner_filter, inner_nulls), outer_nulls)
+            };
             // Keep the ON key on the query aliases. `ExplainInfo` maps a join
             // key to its `OrigTblName` when rendering (`from t t2` still prints
             // `equal:[eq(explain_easy.t.b, explain_easy.t.b)]`); rewriting the
             // stored predicate instead would mix the physical table name into
             // the executor's alias-keyed ON and break its side resolution.
-            return Some(
-                build_spec(
-                    if not { JoinType::Anti } else { JoinType::Semi },
-                    inner.name.clone(),
-                    inner_filter,
-                    on,
-                    None,
-                    false,
-                )
-                .with_physical(inner.physical.as_deref().unwrap_or(&inner.name)),
-            );
+            let mut spec = build_spec(
+                if not { JoinType::Anti } else { JoinType::Semi },
+                inner.name.clone(),
+                None,
+                on,
+                outer_filter,
+                false,
+            )
+            .with_physical(inner_physical);
+            // Null rejection belongs in the coprocessor task, below the
+            // `TableReader` (`data:Selection`), not as a root Selection.
+            if let Some(filter) = inner_filter {
+                spec.right = push_isnull_filter(spec.right, filter);
+            }
+            return Some(spec);
         }
         // Correlated predicates without a cross-table equality: TiDB
         // decorrelates to a CARTESIAN semi/anti join with `other cond`.
@@ -1021,6 +1037,95 @@ fn derive_comparison_null_rejects(
     (ExprNode::compose_cnf(inner), ExprNode::compose_cnf(outer))
 }
 
+/// `EXISTS (SELECT /*+ SEMI_JOIN_REWRITE() */ … WHERE outer.k = inner.k)`:
+/// TiDB removes the correlated semi join and joins the outer side against the
+/// distinct inner key set (`HashAgg(firstrow(key))`), with the aggregate
+/// partially pushed into the coprocessor (`data:HashAgg`).
+fn from_exists_semi_join_rewrite(query: &SelectStmt) -> Option<SemiSpec> {
+    if !query
+        .text
+        .to_ascii_lowercase()
+        .contains("semi_join_rewrite")
+    {
+        return None;
+    }
+    let inner = simple_inner(query)?;
+    let selection = query.selection.as_ref()?;
+    let (on, _) = split_semi_pred(selection, &inner.name)?;
+    let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name).to_string();
+    let (inner_nulls, outer_nulls) =
+        derive_comparison_null_rejects(&on.split_cnf_all(), &inner.name, &inner_physical);
+    let mut keys: Vec<String> = Vec::new();
+    for cond in on.split_cnf_all() {
+        let ExprNode::Binary(bin) = cond else {
+            continue;
+        };
+        if bin.op != Op::Eq {
+            continue;
+        }
+        for side in [&bin.left, &bin.right] {
+            let ExprNode::Column(col) = side.as_ref() else {
+                continue;
+            };
+            let on_inner = col.table.as_deref().is_some_and(|table| {
+                table.eq_ignore_ascii_case(&inner.name)
+                    || table.eq_ignore_ascii_case(&inner_physical)
+            });
+            if on_inner && !keys.iter().any(|key| key.eq_ignore_ascii_case(&col.name)) {
+                keys.push(col.name.clone());
+            }
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+    if let Some(filter) = inner_nulls {
+        right = push_isnull_filter(right, filter);
+    }
+    let scan_est = super::explain::est_rows(&right);
+    let qualifier = keys
+        .iter()
+        .map(|key| {
+            let col = ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(inner.name.clone()),
+                name: key.clone(),
+            });
+            explain_semi_col(&col, None)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let funcs = keys
+        .iter()
+        .map(|key| {
+            let col = ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(inner.name.clone()),
+                name: key.clone(),
+            });
+            let qualifier = explain_semi_col(&col, None);
+            format!("firstrow({qualifier})->{qualifier}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right = PhysicalPlan::hash_agg_cop(
+        right,
+        format!("group by:{qualifier}, funcs:{funcs}"),
+        format!("group by:{qualifier}, "),
+        scan_est * 0.8,
+    );
+    Some(SemiSpec {
+        tp: JoinType::Inner,
+        right_table: inner.name.clone(),
+        right,
+        on,
+        outer_filter: outer_nulls,
+        dedup_in: false,
+        right_physical: inner_physical,
+    })
+}
+
 fn from_exists_cte(not: bool, query: &SelectStmt, outer_table: Option<&str>) -> Option<SemiSpec> {
     let with = query.with.as_ref()?;
     if with.ctes.len() != 1 || with.is_recursive {
@@ -1149,12 +1254,7 @@ fn inner_filter_index_plan(
     .map(|plan| {
         // The ranger attaches the seek range (and drops the consumed filter)
         // in the normal predicate-pushdown pass over a reader.
-        super::rule_predicate_push_down::predicate_push_down(
-            plan,
-            filter,
-            Some(is),
-            current_db,
-        )
+        super::rule_predicate_push_down::predicate_push_down(plan, filter, Some(is), current_db)
     });
     if std::env::var("SEALDB_DEBUG_SEMI_INDEX").is_ok() {
         let idx = info
@@ -1166,12 +1266,8 @@ fn inner_filter_index_plan(
             filter.restore_string(),
             filter.eq_key_const().map(|(k, v)| (k, format!("{v:?}"))),
             idx.map(|i| super::expr_index::part_keys(info, i)),
-            idx.and_then(|i| super::access_range::index_key_ranges(
-                info,
-                i,
-                &filter.split_cnf()
-            ))
-            .map(|r| r.ranges.len()),
+            idx.and_then(|i| super::access_range::index_key_ranges(info, i, &filter.split_cnf()))
+                .map(|r| r.ranges.len()),
             plan.as_ref().map(|p| p.explain())
         );
     }
@@ -1919,6 +2015,9 @@ fn plan_table(plan: &PhysicalPlan) -> Option<String> {
 /// TiDB SemiJoinRewriter: DISTINCT the Semi inner (right) side on the join
 /// key so the build side is unique. Keep HashJoin Semi so SELECT * still
 /// emits the left schema (TiDB adds a left projection after Inner+Agg).
+// The rewrite threads the schema/stats context through every level even when a
+// given level only recurses.
+#[allow(clippy::only_used_in_recursion)]
 pub fn rewrite_semi_join_agg(
     plan: PhysicalPlan,
     is: Option<&sealdb_infoschema::InfoSchema>,

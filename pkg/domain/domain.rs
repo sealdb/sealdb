@@ -623,6 +623,54 @@ impl Domain {
         &self.bind_handle
     }
 
+    /// Rows of the virtual `mysql.bind_info` table: the domain's global
+    /// bindings in TiDB `BindInfo` column order.
+    pub fn bind_info_rows(&self) -> (Vec<String>, Vec<Vec<sealdb_types::Datum>>) {
+        let columns: Vec<String> = [
+            "original_sql",
+            "normalized_sql",
+            "sql_digest",
+            "plan_digest",
+            "bind_sql",
+            "status",
+            "create_time",
+            "update_time",
+            "charset",
+            "collation",
+            "source",
+            "sql_mode",
+            "hint",
+        ]
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+        let rows = self
+            .bind_handle
+            .all_bindings()
+            .into_iter()
+            .filter(|binding| binding.global)
+            .map(|binding| {
+                use sealdb_types::Datum;
+                vec![
+                    Datum::Bytes(binding.normalized_sql.clone().into_bytes()),
+                    Datum::Bytes(binding.normalized_sql.into_bytes()),
+                    Datum::Bytes(binding.sql_digest.into_bytes()),
+                    Datum::Bytes(binding.plan_digest.into_bytes()),
+                    Datum::Bytes(binding.display_bind_sql.into_bytes()),
+                    Datum::Bytes(binding.status.into_bytes()),
+                    Datum::Bytes(binding.create_time.into_bytes()),
+                    Datum::Bytes(binding.update_time.into_bytes()),
+                    Datum::Bytes(binding.charset.into_bytes()),
+                    Datum::Bytes(binding.collation.into_bytes()),
+                    Datum::Bytes(binding.source.into_bytes()),
+                    Datum::Bytes(Vec::new()),
+                    Datum::Bytes(Vec::new()),
+                ]
+            })
+            .collect();
+        (columns, rows)
+    }
+
     /// Shared instance plan cache (cross-session hits for same SQL + schema version).
     pub fn plan_cache(&self) -> Arc<InstancePlanCache> {
         Arc::clone(&self.plan_cache)

@@ -148,12 +148,9 @@ impl Executor for NullAwareAntiJoinExec {
                     any_null = true;
                     continue;
                 }
-                match self.other_cond_passes(&full_schema, probe_row, row)? {
-                    true => {
-                        any_true = true;
-                        break;
-                    }
-                    false => {}
+                if self.other_cond_passes(&full_schema, probe_row, row)? {
+                    any_true = true;
+                    break;
                 }
             }
             let not_in = if any_true {

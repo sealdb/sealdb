@@ -178,6 +178,9 @@ pub struct Session {
     /// TiDB `last_plan_from_binding`: whether the last statement's plan came
     /// from a `CREATE BINDING` rewrite.
     last_plan_from_binding: Mutex<bool>,
+    /// Bind SQL used by the current `EXPLAIN`, reported as
+    /// `Note 1105 Using the bindSQL: …` once the statement finishes.
+    binding_note: Mutex<Option<String>>,
     /// Raw text of the single statement being executed (empty for multi-
     /// statement input). Binding matching keys on the text the client sent
     /// (TiDB `parser.Normalize`), not on the restored plan AST.
@@ -251,6 +254,7 @@ impl Session {
             plan_cache_stmts: Mutex::new(HashSet::new()),
             last_warnings: Mutex::new(Vec::new()),
             last_plan_from_binding: Mutex::new(false),
+            binding_note: Mutex::new(None),
             current_stmt_sql: Mutex::new(String::new()),
             sysvar_overrides: Mutex::new(HashMap::new()),
             resource_group: Mutex::new("default".to_string()),
@@ -318,8 +322,36 @@ impl Session {
 
     /// Execute every statement in `sql` and return each result ( multi-resultset).
     pub fn execute_all(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        // `SHOW [GLOBAL|SESSION] BINDINGS [WHERE …]` has no sqlparser node; the
+        // session materializes it from the binding handle so the filter runs
+        // against the live rows.
+        if let Some(result) = self.show_bindings_result(sql) {
+            return Ok(vec![result]);
+        }
         let mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
+        // `LOCK IN SHARE MODE` is only a no-op in TiDB unless noop functions are
+        // explicitly enabled; without the flag the statement is rejected before
+        // planning. (`FOR SHARE` remains a real locking read.)
+        if contains_lock_in_share_mode(sql)
+            && !sysvar_flag_enabled(self, "tidb_enable_noop_functions")
+        {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_UNSUPPORTED,
+                "function LOCK IN SHARE MODE has only noop implementation in tidb now, use tidb_enable_noop_functions to enable these functions",
+            ));
+        }
         reject_create_table_func_call(sql, &mode)?;
+        // `group_concat_max_len` lives in an executor thread-local; publish the
+        // session value at the start of every statement so a following
+        // statement on another worker thread still sees the assignment.
+        let group_concat_len = self
+            .sysvar_overrides
+            .lock()
+            .expect("session sysvar overrides lock")
+            .get("group_concat_max_len")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(sealdb_executor::aggfuncs::func_group_concat::DEFAULT_GROUP_CONCAT_MAX_LEN);
+        sealdb_executor::aggfuncs::set_group_concat_max_len(Some(group_concat_len));
         // sqlparser always applies MySQL backslash escapes. Under
         // NO_BACKSLASH_ESCAPES, double `\` inside quotes so the unescaped
         // value matches TiDB (literal backslash).
@@ -733,6 +765,15 @@ impl Session {
                 .lock()
                 .expect("session window_concurrency lock"),
         );
+        // `WEEK()` without an explicit mode reads `@@default_week_format`.
+        let week_format = self
+            .sysvar_overrides
+            .lock()
+            .expect("session sysvar overrides lock")
+            .get("default_week_format")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        sealdb_expression::set_default_week_format(week_format);
         // Executors that filter by caller (`SHOW DATABASES`) read the identity
         // from a thread-local; sessions are pinned to a thread per statement.
         sealdb_privilege::set_thread_user(Some(self.current_user()));
@@ -1039,8 +1080,10 @@ impl Session {
             Statement::CreateBinding(create) => {
                 // TiDB accepts alias-less derived tables in binding grammar and
                 // reports temporary-table errors before alias semantics.
-                let original = sealdb_parser::with_allow_derived_without_alias(|| {
-                    self.parser.parse_one_stmt(&create.original_sql)
+                let original = sealdb_parser::with_preserve_in_list(|| {
+                    sealdb_parser::with_allow_derived_without_alias(|| {
+                        self.parser.parse_one_stmt(&create.original_sql)
+                    })
                 })?;
                 let db = self
                     .current_db
@@ -1055,24 +1098,60 @@ impl Session {
                         "`create binding` is unsupported on temporary tables.",
                     ));
                 }
-                // The binding key is the text the user wrote (TiDB normalizes
-                // the statement text, which keeps `IN (1)` distinct from the
-                // `a = 1` rewrite planning applies later).
-                let key = sealdb_bindinfo::normalize_sql(&create.original_sql);
+                // TiDB normalizes the original statement with its table
+                // names qualified by the default database; a binding created
+                // for `select * from t` in `db` matches `select * from db.t`.
+                let original_restored = restore_qualified(&original, &db);
+                let key = sealdb_bindinfo::normalize_sql(&original_restored);
+                // TiDB stores the schema-qualified restored text in
+                // `mysql.bind_info` (original and bind SQL).
+                let normalized_sql = sealdb_bindinfo::normalize_display(&original_restored);
+                let exact_original = sealdb_bindinfo::normalize_exact(&original_restored);
+                let bind_parsed = sealdb_parser::with_preserve_in_list(|| {
+                    self.parser.parse_one_stmt(&create.bind_sql)
+                })?;
+                let display_bind_sql = binding_display_sql(&bind_parsed, &db);
                 self.domain.bind_handle().create_binding(
                     sealdb_bindinfo::Binding::manual(
-                        create.original_sql.clone(),
+                        exact_original,
+                        normalized_sql,
                         create.bind_sql.clone(),
+                        display_bind_sql,
                         db,
+                        create.global,
+                        now_datetime_text(),
                     ),
                     &key,
                 );
                 return Ok(empty_result());
             }
             Statement::DropBinding(drop) => {
-                let _ = self.parser.parse_one_stmt(&drop.original_sql)?;
-                let key = sealdb_bindinfo::normalize_sql(&drop.original_sql);
-                self.domain.bind_handle().drop_binding(&key);
+                let original = sealdb_parser::with_preserve_in_list(|| {
+                    self.parser.parse_one_stmt(&drop.original_sql)
+                })?;
+                let db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                let restored = restore_qualified(&original, &db);
+                let key = sealdb_bindinfo::normalize_sql(&restored);
+                self.domain.bind_handle().drop_binding(&key, drop.global);
+                return Ok(empty_result());
+            }
+            Statement::SetBinding(set) => {
+                let original = sealdb_parser::with_preserve_in_list(|| {
+                    self.parser.parse_one_stmt(&set.original_sql)
+                })?;
+                let db = self
+                    .current_db
+                    .lock()
+                    .expect("session current_db lock")
+                    .clone();
+                let restored = restore_qualified(&original, &db);
+                self.domain
+                    .bind_handle()
+                    .set_binding_enabled(&restored, set.enabled);
                 return Ok(empty_result());
             }
             Statement::Execute(exec) => {
@@ -1345,6 +1424,7 @@ impl Session {
                     return None;
                 }
                 Some(InsertStmt {
+                    text: String::new(),
                     table: create.table.clone(),
                     ignore: false,
                     replace: false,
@@ -1368,6 +1448,7 @@ impl Session {
         let rebound = self.apply_sql_binding(stmt, Some(&stmt_sql))?;
         let binding_used = rebound.is_some();
         let mut expanded = rebound.unwrap_or_else(|| stmt.clone());
+        apply_optimizer_index_hints(&mut expanded);
         inherit_cte_scope(&mut expanded);
         // Temporary tables shadow permanent ones only for unqualified names;
         // rewrite them before VIEW expansion so a view body (qualified with its
@@ -1694,6 +1775,22 @@ impl Session {
                 let mut warnings = rg_warnings;
                 warnings.extend(qr.warnings.iter().cloned());
                 qr.warnings = warnings;
+            }
+            let binding_note = self
+                .binding_note
+                .lock()
+                .expect("session binding note lock")
+                .take();
+            if let Some(bind_sql) = binding_note
+                && matches!(stmt, Statement::Explain(_))
+            {
+                qr.warnings.insert(
+                    0,
+                    (
+                        NOTE_WARNING_BASE + sealdb_errno::ERR_UNKNOWN_ERROR,
+                        format!("Using the bindSQL: {bind_sql}"),
+                    ),
+                );
             }
         }
         drop(mdl_guard);
@@ -2331,14 +2428,24 @@ fn show_warnings_result(session: &Session) -> QueryResult {
             .into_iter()
             .map(|(code, msg)| {
                 // TiDB appends `DROP … IF EXISTS` misses as notes (`AppendNote`).
-                let level: &[u8] = if code == sealdb_errno::ERR_BAD_TABLE {
+                // A negative code marks an error-level entry recorded by a
+                // statement that failed after producing a warning.
+                let note = code >= NOTE_WARNING_BASE || code == sealdb_errno::ERR_BAD_TABLE;
+                let code = if code >= NOTE_WARNING_BASE {
+                    code - NOTE_WARNING_BASE
+                } else {
+                    code
+                };
+                let level: &[u8] = if code < 0 {
+                    b"Error"
+                } else if note {
                     b"Note"
                 } else {
                     b"Warning"
                 };
                 vec![
                     sealdb_types::Datum::Bytes(level.to_vec()),
-                    sealdb_types::Datum::I64(code as i64),
+                    sealdb_types::Datum::I64(code.unsigned_abs() as i64),
                     sealdb_types::Datum::Bytes(msg.into_bytes()),
                 ]
             })
@@ -3260,7 +3367,7 @@ fn as_of_raw_millis(session: &Session, raw: &str) -> Result<u64> {
             )));
         }
     };
-    Ok(sealdb_expression::time_to_unix_millis(&time)?)
+    sealdb_expression::time_to_unix_millis(&time)
 }
 
 /// First `AS OF TIMESTAMP` expression text in the statement's table sources
@@ -3452,8 +3559,8 @@ fn set_var_hint_value(sql: &str, wanted: &str) -> Option<String> {
         let args = &rest[after + 1..];
         let mut value = String::new();
         let mut quote: Option<char> = None;
-        let mut chars = args.chars();
-        while let Some(ch) = chars.next() {
+        let chars = args.chars();
+        for ch in chars {
             match quote {
                 Some(q) if ch == q => quote = None,
                 Some(_) => value.push(ch),
@@ -3496,7 +3603,7 @@ fn eval_set_value(session: &Session, text: &str) -> Result<sealdb_types::Datum> 
         return Ok(parse_set_literal(text));
     }
     let expr = subst_user_vars_in_expr(session, &select.fields[0].expr);
-    Ok(sealdb_expression::eval_expr(&expr)?)
+    sealdb_expression::eval_expr(&expr)
 }
 
 fn parse_set_literal(value: &str) -> sealdb_types::Datum {
@@ -3536,10 +3643,7 @@ fn needs_user_var_subst(stmt: &Statement) -> bool {
         return false;
     };
     select.fields.iter().any(|f| expr_has_session_var(&f.expr))
-        || select
-            .selection
-            .as_ref()
-            .is_some_and(|e| expr_has_session_var(e))
+        || select.selection.as_ref().is_some_and(expr_has_session_var)
 }
 
 fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> bool {
@@ -3604,7 +3708,7 @@ fn subst_user_vars_in_stmt(session: &Session, stmt: &Statement) -> Statement {
         .map(|mut field| {
             // Preserve TiDB display names (`@@autocommit`, `@b + "123"`) when
             // substituting vars to Values for evaluation.
-            if field.as_name.as_ref().map_or(true, |s| s.is_empty())
+            if field.as_name.as_ref().is_none_or(|s| s.is_empty())
                 && expr_has_session_var(&field.expr)
             {
                 field.as_name = Some(session_var_field_name(&field.expr));
@@ -3645,7 +3749,9 @@ fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
                 read_session_sysvar(session, &name)
             };
             let datum = match value {
-                Some(v) => sealdb_types::Datum::Bytes(v.into_bytes()),
+                // `SELECT @@flag` reports the typed bit value (`0`/`1`),
+                // while `SHOW VARIABLES` keeps the textual `OFF`/`ON`.
+                Some(v) => sealdb_types::Datum::Bytes(sysvar_select_value(&name, v).into_bytes()),
                 None => sealdb_types::Datum::Null,
             };
             ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr { datum })
@@ -3875,11 +3981,17 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
         }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
         let value = set_assignment_value(session, &a.value);
-        let record_value = value.clone();
+        let mut record_value = value.clone();
         if a.scope == SetVarScope::Global {
             let mut global_warnings = apply_set_global(session, &name, &value)?;
             warnings.append(&mut global_warnings);
             continue;
+        }
+        if is_global_only_var(&name) {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_GLOBAL_VARIABLE,
+                format!("Variable '{name}' is a GLOBAL variable and should be set with SET GLOBAL"),
+            ));
         }
         match name.as_str() {
             // TiDB rejects assignments to the transaction timestamp.
@@ -3902,6 +4014,19 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .lock()
                     .expect("session external ts lock") =
                     Some(parse_sysvar_u64("tidb_external_ts", &value)?);
+            }
+            // Staleness is a signed offset (seconds); an empty value disables it.
+            // Non-integer operands are rejected with TiDB's type error.
+            "tidb_read_staleness" => {
+                if !value.is_empty()
+                    && !value.eq_ignore_ascii_case("DEFAULT")
+                    && value.parse::<i64>().is_err()
+                {
+                    return Err(sealdb_errno::Error::new(
+                        1232,
+                        "Incorrect argument type to variable 'tidb_read_staleness'",
+                    ));
+                }
             }
             "tidb_enable_external_ts_read" => {
                 *session
@@ -4154,19 +4279,37 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 };
                 sealdb_executor::cte::set_cte_max_recursion_depth(depth);
             }
+            "default_week_format" => {
+                if !value.eq_ignore_ascii_case("DEFAULT") {
+                    value.parse::<i64>().map_err(|_| {
+                        sealdb_errno::Error::new(
+                            1232,
+                            "Incorrect argument type to variable 'default_week_format'",
+                        )
+                    })?;
+                }
+            }
             "group_concat_max_len" => {
-                let len = if value.eq_ignore_ascii_case("DEFAULT") {
+                let mut len = if value.eq_ignore_ascii_case("DEFAULT") {
                     sealdb_executor::aggfuncs::func_group_concat::DEFAULT_GROUP_CONCAT_MAX_LEN
                 } else {
                     value.parse::<usize>().map_err(|_| {
                         sealdb_errno::Error::new(
-                            sealdb_errno::ERR_WRONG_ARGUMENTS,
-                            format!(
-                                "Variable 'group_concat_max_len' can't be set to the value of '{value}'"
-                            ),
+                            1232,
+                            "Incorrect argument type to variable 'group_concat_max_len'",
                         )
                     })?
                 };
+                if len < 4 {
+                    warnings.push((
+                        1292,
+                        format!("Truncated incorrect group_concat_max_len value: '{value}'"),
+                    ));
+                    len = 4;
+                }
+                if !value.eq_ignore_ascii_case("DEFAULT") {
+                    record_value = len.to_string();
+                }
                 sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
             }
             // Session time zone (DST / TIMESTAMP display). Value stored for later
@@ -4290,6 +4433,57 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             // Accepted for compatibility; SealDB always keeps intermediate data
             // in memory rather than spilling to local temporary storage.
             "tidb_enable_tmp_storage_on_oom" => {}
+            // Partitioning is always enabled; the old toggle only warns.
+            "tidb_enable_table_partition" => {
+                warnings.push((
+                    1105,
+                    "tidb_enable_table_partition is always turned on. This variable has been deprecated and will be removed in the future releases".to_string(),
+                ));
+            }
+            "tidb_enable_list_partition" => {
+                if set_value_is_off(&value) {
+                    let message =
+                        "tidb_enable_list_partition is now always on, and cannot be turned off";
+                    *session
+                        .last_warnings
+                        .lock()
+                        .expect("session last_warnings lock") = vec![
+                        (
+                            1681,
+                            "tidb_enable_list_partition is deprecated and will be removed in a future release."
+                                .to_string(),
+                        ),
+                        (-1105, message.to_string()),
+                    ];
+                    return Err(sealdb_errno::Error::new(1105, message));
+                }
+                warnings.push((
+                    1681,
+                    "tidb_enable_list_partition is deprecated and will be removed in a future release."
+                        .to_string(),
+                ));
+            }
+            // Session alias: at most 64 characters; trailing whitespace is
+            // trimmed and any normalization warns 1292.
+            "tidb_session_alias" => {
+                let mut overrides = session
+                    .sysvar_overrides
+                    .lock()
+                    .expect("session sysvar overrides lock");
+                if value.eq_ignore_ascii_case("DEFAULT") {
+                    overrides.remove("tidb_session_alias");
+                } else {
+                    let mut alias: String = value.chars().take(64).collect();
+                    alias = alias.trim_end().to_string();
+                    if alias != value {
+                        warnings.push((
+                            1292,
+                            format!("Truncated incorrect tidb_session_alias value: '{value}'"),
+                        ));
+                    }
+                    overrides.insert("tidb_session_alias".to_string(), alias);
+                }
+            }
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
@@ -4298,15 +4492,162 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 return Err(sealdb_errno::Error::unsupported(format!("SET {other}")));
             }
         }
-        record_sysvar_override(session, &name, &record_value);
+        // Partitioning toggles are fixed ON; the session alias is normalized
+        // above. Neither should be recorded from the raw operand.
+        if name != "tidb_enable_table_partition"
+            && name != "tidb_enable_list_partition"
+            && name != "tidb_session_alias"
+        {
+            record_sysvar_override(session, &name, &record_value);
+        }
     }
     Ok(warnings)
+}
+
+/// Variables that TiDB exposes only at `GLOBAL` scope; assigning them through
+/// `SET SESSION` is rejected with `ER_GLOBAL_VARIABLE` (1229).
+fn is_global_only_var(name: &str) -> bool {
+    matches!(
+        name,
+        "tidb_memory_usage_alarm_ratio" | "tidb_memory_usage_alarm_keep_record_num"
+    )
+}
+
+/// Whether a boolean session sysvar is currently ON.
+fn sysvar_flag_enabled(session: &Session, name: &str) -> bool {
+    read_session_sysvar(session, name)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+}
+
+/// Whether a `SET` operand turns a boolean variable off.
+fn set_value_is_off(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
+}
+
+/// Detect `LOCK IN SHARE MODE` outside string literals and comments.
+fn contains_lock_in_share_mode(sql: &str) -> bool {
+    let mut words = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '\'' || ch == '"' || ch == '`' {
+            let quote = ch;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] as char == quote {
+                    if i + 1 < bytes.len() && bytes[i + 1] as char == quote {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            while i < bytes.len() && bytes[i] as char != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] as char == '*' && bytes[i + 1] as char == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] as char == '_')
+            {
+                i += 1;
+            }
+            words.push(sql[start..i].to_ascii_uppercase());
+            continue;
+        }
+        i += 1;
+    }
+    words
+        .windows(4)
+        .any(|w| w == ["LOCK", "IN", "SHARE", "MODE"])
+}
+
+/// Render a clamped floating-point sysvar without a redundant `.0` suffix.
+fn render_sysvar_float(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        let mut text = format!("{value}");
+        while text.ends_with('0') {
+            text.pop();
+        }
+        text.trim_end_matches('.').to_string()
+    }
 }
 
 /// Domain-shared `SET GLOBAL` for the MVB variable set.
 fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i32, String)>> {
     let mut warnings = Vec::new();
     match name {
+        // Memory-usage alarm knobs: validate/clamp like TiDB's sysvar types and
+        // persist the corrected value (the generic tail below would record the
+        // raw out-of-range operand).
+        "tidb_memory_usage_alarm_ratio" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let parsed: f64 = value.trim().parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_memory_usage_alarm_ratio' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                let clamped = parsed.clamp(0.0, 1.0);
+                if clamped != parsed {
+                    warnings.push((
+                        1292,
+                        format!(
+                            "Truncated incorrect tidb_memory_usage_alarm_ratio value: '{value}'"
+                        ),
+                    ));
+                }
+                session
+                    .domain
+                    .set_global_override(name, Some(render_sysvar_float(clamped)));
+                return Ok(warnings);
+            }
+        }
+        "tidb_memory_usage_alarm_keep_record_num" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let parsed: i64 = value.trim().parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_memory_usage_alarm_keep_record_num' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                let clamped = parsed.clamp(1, 10_000);
+                if clamped != parsed {
+                    warnings.push((
+                        1292,
+                        format!(
+                            "Truncated incorrect tidb_memory_usage_alarm_keep_record_num value: '{value}'"
+                        ),
+                    ));
+                }
+                session
+                    .domain
+                    .set_global_override(name, Some(clamped.to_string()));
+                return Ok(warnings);
+            }
+        }
         "tidb_partition_prune_mode" => {
             // `SET GLOBAL … = DEFAULT` resets to TiDB's default (dynamic).
             let raw = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -4346,6 +4687,22 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             let on = matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true");
             session.domain.set_global_enable_auto_analyze(on);
         }
+        "tidb_auto_analyze_concurrency" => {
+            if !value.eq_ignore_ascii_case("DEFAULT") {
+                let concurrency: u64 = value.parse().map_err(|_| {
+                    sealdb_errno::Error::new(
+                        sealdb_errno::ERR_WRONG_ARGUMENTS,
+                        format!(
+                            "Variable 'tidb_auto_analyze_concurrency' can't be set to the value of '{value}'"
+                        ),
+                    )
+                })?;
+                session
+                    .domain
+                    .set_global_override(name, Some(concurrency.to_string()));
+                return Ok(warnings);
+            }
+        }
         "tidb_enable_resource_control" => {
             session
                 .domain
@@ -4376,6 +4733,35 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         // FK feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
         "tidb_enable_foreign_key" => {}
         "tidb_enable_auto_increment_in_generated" => {}
+        "tidb_enable_table_partition" => {
+            warnings.push((
+                1105,
+                "tidb_enable_table_partition is always turned on. This variable has been deprecated and will be removed in the future releases".to_string(),
+            ));
+        }
+        "tidb_enable_list_partition" => {
+            if set_value_is_off(value) {
+                let message =
+                    "tidb_enable_list_partition is now always on, and cannot be turned off";
+                *session
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = vec![
+                    (
+                        1681,
+                        "tidb_enable_list_partition is deprecated and will be removed in a future release."
+                            .to_string(),
+                    ),
+                    (-1105, message.to_string()),
+                ];
+                return Err(sealdb_errno::Error::new(1105, message));
+            }
+            warnings.push((
+                1681,
+                "tidb_enable_list_partition is deprecated and will be removed in a future release."
+                    .to_string(),
+            ));
+        }
         "names" | "character_set_client" | "character_set_connection" | "character_set_results" => {
             if !sealdb_parser::charset::is_supported_charset(value) {
                 return Err(sealdb_errno::Error::new(
@@ -4409,6 +4795,9 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
     }
     // Keep the assignment visible to `SHOW GLOBAL VARIABLES` / `@@GLOBAL.*`
     // even when the variable has no typed domain field.
+    if name == "tidb_enable_table_partition" || name == "tidb_enable_list_partition" {
+        return Ok(warnings);
+    }
     if value.eq_ignore_ascii_case("DEFAULT") {
         session.domain.set_global_override(name, None);
     } else if let Some(kind) = show_variable_kind(name) {
@@ -4451,15 +4840,14 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| {
                         // TIMESTAMP/DATE/TIME literals: TiDB uses field.Text().
-                        if matches!(v.datum, sealdb_types::Datum::Time(_)) {
-                            if let Some(text) = field
+                        if matches!(v.datum, sealdb_types::Datum::Time(_))
+                            && let Some(text) = field
                                 .orig_text
                                 .as_deref()
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
-                            {
-                                return text.to_string();
-                            }
+                        {
+                            return text.to_string();
                         }
                         literal_field_name(&v.datum)
                     });
@@ -4580,6 +4968,9 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
     }
     // `SELECT @@tidb_unknown` reports the zero value; `SHOW VARIABLES` only
     // reports variables that actually exist, so keep the fallback here.
+    if let Some(default) = show_variable_default(&name.to_ascii_lowercase()) {
+        return Some(default.to_string());
+    }
     if name.to_ascii_lowercase().starts_with("tidb_") {
         return Some("0".into());
     }
@@ -4817,7 +5208,9 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
         }
         "allow_auto_random_explicit_insert" => "0".into(),
         "tidb_enable_auto_increment_in_generated" => "0".into(),
-        _ => return None,
+        other => {
+            return show_variable_default(other).map(str::to_string);
+        }
     })
 }
 
@@ -4855,6 +5248,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
         "utf8mb4_0900_ai_ci",
         VarKind::Text,
     ),
+    ("default_week_format", "0", VarKind::Text),
     ("group_concat_max_len", "1024", VarKind::Text),
     ("init_connect", "", VarKind::Text),
     ("innodb_default_row_format", "dynamic", VarKind::Text),
@@ -4882,6 +5276,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
         VarKind::Text,
     ),
     ("tidb_auto_analyze_ratio", "0.5", VarKind::Text),
+    ("tidb_auto_analyze_concurrency", "3", VarKind::Text),
     ("tidb_batch_pending_tiflash_count", "6", VarKind::Text),
     ("tidb_capture_plan_baselines", "OFF", VarKind::Flag),
     ("tidb_cost_model_version", "2", VarKind::Text),
@@ -4895,22 +5290,46 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("tidb_enable_external_ts_read", "OFF", VarKind::Flag),
     ("tidb_enable_list_partition", "ON", VarKind::Flag),
     ("tidb_enable_non_prepared_plan_cache", "OFF", VarKind::Flag),
+    ("tidb_enable_noop_functions", "OFF", VarKind::Flag),
     ("tidb_enable_ordered_result_mode", "OFF", VarKind::Flag),
     ("tidb_enable_table_partition", "ON", VarKind::Flag),
     ("tidb_enable_window_function", "ON", VarKind::Flag),
+    ("tidb_evolve_plan_baselines", "OFF", VarKind::Flag),
     ("tidb_external_ts", "0", VarKind::Text),
     ("tidb_hashagg_final_concurrency", "5", VarKind::Text),
     ("tidb_hashagg_partial_concurrency", "5", VarKind::Text),
+    (
+        "tidb_memory_usage_alarm_keep_record_num",
+        "100",
+        VarKind::Text,
+    ),
+    ("tidb_memory_usage_alarm_ratio", "0.8", VarKind::Text),
     ("tidb_opt_agg_push_down", "OFF", VarKind::Flag),
     ("tidb_opt_insubq_to_join_and_agg", "ON", VarKind::Flag),
     ("tidb_partition_prune_mode", "dynamic", VarKind::Text),
+    ("tidb_session_alias", "", VarKind::Text),
     ("tidb_snapshot", "", VarKind::Text),
     ("tidb_sysdate_is_now", "OFF", VarKind::Flag),
+    ("tidb_use_plan_baselines", "ON", VarKind::Flag),
     ("tidb_window_concurrency", "5", VarKind::Text),
     ("transaction_isolation", "REPEATABLE-READ", VarKind::Text),
     ("tx_isolation", "REPEATABLE-READ", VarKind::Text),
     ("wait_timeout", "28800", VarKind::Text),
 ];
+
+/// Value of a sysvar when selected through `@@name` (boolean flags render as
+/// `0`/`1`, other variables keep their shown text).
+fn sysvar_select_value(name: &str, value: String) -> String {
+    if show_variable_kind(name) == Some(VarKind::Flag) {
+        if value.eq_ignore_ascii_case("on") {
+            return "1".to_string();
+        }
+        if value.eq_ignore_ascii_case("off") {
+            return "0".to_string();
+        }
+    }
+    value
+}
 
 fn show_variable_kind(name: &str) -> Option<VarKind> {
     let lname = name.to_ascii_lowercase();
@@ -4993,6 +5412,232 @@ fn resolve_show_variable(session: &Session, name: &str, global: bool) -> Option<
         let kind = show_variable_kind(name).unwrap_or(VarKind::Text);
         normalize_show_variable_value(kind, default)
     })
+}
+
+/// Warning codes at or above this base are TiDB *notes*, not warnings
+/// (`SHOW WARNINGS` reports the level from the sign/base of the stored code).
+const NOTE_WARNING_BASE: i32 = 1_000_000;
+
+/// Column layout of `SHOW BINDINGS` (TiDB `bindinfo.BindRecord`).
+const SHOW_BINDINGS_COLUMNS: [&str; 11] = [
+    "Original_sql",
+    "Bind_sql",
+    "Default_db",
+    "Status",
+    "Create_time",
+    "Update_time",
+    "Charset",
+    "Collation",
+    "Source",
+    "Sql_digest",
+    "Plan_digest",
+];
+
+/// Parsed tail of `SHOW [GLOBAL|SESSION] BINDINGS [WHERE …]`.
+struct ShowBindingsRequest {
+    global: bool,
+    filters: Vec<BindingFilter>,
+}
+
+struct BindingFilter {
+    column: String,
+    like: Option<String>,
+    equals: Option<String>,
+}
+
+/// Recognize and execute `SHOW [GLOBAL|SESSION] BINDINGS …` from raw SQL.
+/// Returns `None` when the statement is something else.
+impl Session {
+    fn show_bindings_result(&self, sql: &str) -> Option<QueryResult> {
+        let request = parse_show_bindings(sql)?;
+        let mut rows: Vec<Vec<sealdb_types::Datum>> = self
+            .domain
+            .bind_handle()
+            .all_bindings()
+            .into_iter()
+            .filter(|binding| binding.global == request.global && binding.status != "deleted")
+            .map(|binding| {
+                vec![
+                    sealdb_types::Datum::Bytes(binding.normalized_sql.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.display_bind_sql.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.db.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.status.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.create_time.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.update_time.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.charset.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.collation.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.source.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.sql_digest.into_bytes()),
+                    sealdb_types::Datum::Bytes(binding.plan_digest.into_bytes()),
+                ]
+            })
+            .collect();
+        // TiDB restricts global bindings to privileged (root) sessions.
+        if request.global && !self.current_user().username.eq_ignore_ascii_case("root") {
+            rows.clear();
+        }
+        if !request.filters.is_empty() {
+            rows.retain(|row| {
+                request.filters.iter().all(|filter| {
+                    let Some(index) = SHOW_BINDINGS_COLUMNS
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(&filter.column))
+                    else {
+                        return false;
+                    };
+                    let value = String::from_utf8_lossy(match &row[index] {
+                        sealdb_types::Datum::Bytes(bytes) => bytes,
+                        _ => return false,
+                    })
+                    .into_owned();
+                    if let Some(pattern) = &filter.like {
+                        like_match(&value, pattern)
+                    } else if let Some(expected) = &filter.equals {
+                        value.eq_ignore_ascii_case(expected)
+                    } else {
+                        true
+                    }
+                })
+            });
+        }
+        Some(QueryResult {
+            columns: SHOW_BINDINGS_COLUMNS
+                .iter()
+                .map(|column| column.to_string())
+                .collect(),
+            rows,
+            warnings: Vec::new(),
+            affected_rows: 0,
+            info: String::new(),
+        })
+    }
+}
+
+/// `SHOW [GLOBAL|SESSION] BINDINGS [LIKE 'pat' | WHERE <cond> [AND <cond>]]`.
+fn parse_show_bindings(sql: &str) -> Option<ShowBindingsRequest> {
+    let text = sql.trim().trim_end_matches(';').trim();
+    let rest = strip_sql_keyword(text, "show")?;
+    let rest = rest.trim_start();
+    let (global, rest) = match strip_sql_keyword(rest, "global") {
+        Some(rest) => (true, rest),
+        None => match strip_sql_keyword(rest, "session") {
+            Some(rest) => (false, rest),
+            None => (false, rest),
+        },
+    };
+    let rest = strip_sql_keyword(rest.trim_start(), "bindings")?;
+    let rest = rest.trim();
+    let mut filters = Vec::new();
+    if rest.is_empty() {
+        return Some(ShowBindingsRequest { global, filters });
+    }
+    if let Some(pattern) = strip_sql_keyword(rest, "like") {
+        filters.push(BindingFilter {
+            column: "Original_sql".to_string(),
+            like: Some(unquote_sql_string(pattern.trim())?),
+            equals: None,
+        });
+        return Some(ShowBindingsRequest { global, filters });
+    }
+    let conditions = strip_sql_keyword(rest, "where")?;
+    for condition in split_sql_and(conditions) {
+        let lower = condition.to_ascii_lowercase();
+        if let Some(at) = lower.find(" like ") {
+            filters.push(BindingFilter {
+                column: condition[..at].trim().to_string(),
+                like: Some(unquote_sql_string(condition[at + 6..].trim())?),
+                equals: None,
+            });
+        } else {
+            let at = lower.find(" = ")?;
+            filters.push(BindingFilter {
+                column: condition[..at].trim().to_string(),
+                like: None,
+                equals: Some(unquote_sql_string(condition[at + 3..].trim())?),
+            });
+        }
+    }
+    Some(ShowBindingsRequest { global, filters })
+}
+
+/// Case-insensitive keyword prefix match at the start of `text`.
+fn strip_sql_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let head = text.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &text[keyword.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Split a WHERE list on top-level `AND`.
+fn split_sql_and(conditions: &str) -> Vec<String> {
+    let bytes = conditions.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == bytes[i] {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        let rest = &conditions[i..];
+        let lower = rest.to_ascii_lowercase();
+        if lower.starts_with(" and ") && !conditions[..i].trim().is_empty() {
+            out.push(conditions[start..i].trim().to_string());
+            start = i + 5;
+            i += 5;
+            continue;
+        }
+        i += rest.chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    out.push(conditions[start..].trim().to_string());
+    out
+}
+
+fn unquote_sql_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
+    {
+        return Some(value[1..value.len() - 1].replace("''", "'"));
+    }
+    None
+}
+
+/// MySQL `LIKE` (case-insensitive, `%` and `_` wildcards).
+fn like_match(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.to_lowercase().chars().collect();
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    fn go(value: &[char], pattern: &[char]) -> bool {
+        match pattern.split_first() {
+            None => value.is_empty(),
+            Some(('%', rest)) => (0..=value.len()).any(|skip| go(&value[skip..], rest)),
+            Some(('_', rest)) => !value.is_empty() && go(&value[1..], rest),
+            Some((ch, rest)) => value.first() == Some(ch) && go(&value[1..], rest),
+        }
+    }
+    go(&value, &pattern)
 }
 
 fn show_variables_result(session: &Session, stmt: &sealdb_parser::ast::ShowStmt) -> QueryResult {
@@ -5116,6 +5761,31 @@ fn restore_sql(stmt: &Statement) -> String {
     let mut ctx = sealdb_parser::format::RestoreCtx::new();
     let _ = sealdb_parser::ast::Node::restore(stmt, &mut ctx);
     ctx.into_string()
+}
+
+/// Restore a statement with table names qualified by `db` (TiDB binding
+/// `bind_sql` form, `SELECT * FROM `db`.`t` …`).
+fn restore_qualified(stmt: &Statement, db: &str) -> String {
+    // Always use binding mode (star fields, qualified tables, explicit
+    // aliases) so a query with no current database and one with a current
+    // database produce the same binding key shape.
+    let mut ctx = sealdb_parser::format::RestoreCtx::new_qualify(db);
+    let _ = sealdb_parser::ast::Node::restore(stmt, &mut ctx);
+    ctx.into_string()
+}
+
+/// TiDB `BindInfo.BindSQL`: the `USING` statement restored with `db` qualified.
+fn binding_display_sql(stmt: &Statement, db: &str) -> String {
+    restore_qualified(stmt, db)
+}
+
+/// `YYYY-MM-DD HH:MM:SS` for binding `create_time` / `update_time`.
+fn now_datetime_text() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    sealdb_types::Time::from_unix_secs(secs, sealdb_types::TimeType::Datetime).to_string()
 }
 
 /// Text of the statement a `DESC`/`DESCRIBE`/`EXPLAIN` wrapper explains, with
@@ -5526,7 +6196,7 @@ fn inherit_cte_in_result_set(query: &mut sealdb_parser::ast::ResultSetNode, scop
             let merged = match set.with.take() {
                 Some(mut inner) => {
                     let mut outer = scope.clone();
-                    outer.ctes.extend(inner.ctes.drain(..));
+                    outer.ctes.append(&mut inner.ctes);
                     outer.is_recursive |= inner.is_recursive;
                     outer
                 }
@@ -5988,25 +6658,27 @@ fn cte_output_columns(cte: &sealdb_parser::ast::CommonTableExpression) -> Vec<St
 /// (MySQL implicit commit). Session-local temporary tables are excluded, and
 /// `TRUNCATE TABLE` has its own earlier path.
 fn ddl_implicitly_commits(stmt: &Statement) -> bool {
-    match stmt {
+    matches!(
+        stmt,
         Statement::CreateDatabase(_)
-        | Statement::DropDatabase(_)
-        | Statement::AlterDatabase(_)
-        | Statement::CreateTable(sealdb_parser::ast::CreateTableStmt {
-            temporary: false, ..
-        })
-        | Statement::CreateView(_)
-        | Statement::CreateSequence(_)
-        | Statement::DropSequence(_)
-        | Statement::AlterSequence(_)
-        | Statement::DropTable(sealdb_parser::ast::DropTableStmt {
-            temporary: false, ..
-        })
-        | Statement::CreateIndex(_)
-        | Statement::DropIndex(_)
-        | Statement::AlterTable(_) => true,
-        _ => false,
-    }
+            | Statement::DropDatabase(_)
+            | Statement::AlterDatabase(_)
+            | Statement::CreateTable(sealdb_parser::ast::CreateTableStmt {
+                temporary: false,
+                ..
+            })
+            | Statement::CreateView(_)
+            | Statement::CreateSequence(_)
+            | Statement::DropSequence(_)
+            | Statement::AlterSequence(_)
+            | Statement::DropTable(sealdb_parser::ast::DropTableStmt {
+                temporary: false,
+                ..
+            })
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_)
+    )
 }
 
 /// `view_arm_invalid` with CTE/outer sources inherited from enclosing scopes.
@@ -6213,48 +6885,589 @@ fn rewrite_temp_table_refs(
         return rewrite_temp_table_refs(&mut explain.stmt, temps, current_db);
     }
     let mut hit = false;
-    let mut map = |table: &mut TableName| {
-        if rewrite_temp_table_name(table, temps, current_db) {
-            hit = true;
-        }
-    };
+    {
+        let mut map = |table: &mut TableName| {
+            if rewrite_temp_table_name(table, temps, current_db) {
+                hit = true;
+            }
+        };
+        map_statement_tables(stmt, &mut map);
+    }
+    hit
+}
+
+/// Replace the bind SQL's literals with the original statement's values when
+/// both have the same shape. Bindings are matched by digest, so only the hints
+/// differ; using the bind SQL's own constants would change the predicate
+/// (`b = 1` would answer a `b = 2` query).
+fn copy_original_literals(original: &Statement, bound: &mut Statement) {
+    let mut original_values = Vec::new();
+    collect_stmt_literals(original, &mut original_values);
+    let mut bound_values = Vec::new();
+    collect_stmt_literals(bound, &mut bound_values);
+    if original_values.len() != bound_values.len() {
+        return;
+    }
+    let mut next = 0;
+    assign_stmt_literals(bound, &original_values, &mut next);
+}
+
+fn collect_stmt_literals(stmt: &Statement, out: &mut Vec<sealdb_types::Datum>) {
     match stmt {
-        Statement::Select(select) => map_select_with_ctes(select, &mut map),
+        Statement::Select(select) => collect_select_literals(select, out),
         Statement::SetOpr(set) => {
-            map_select_with_ctes(&mut set.first, &mut map);
-            for (_, arm) in &mut set.rest {
-                map_select_with_ctes(arm, &mut map);
+            collect_select_literals(&set.first, out);
+            for (_, arm) in &set.rest {
+                collect_select_literals(arm, out);
             }
         }
         Statement::Insert(insert) => {
-            let cte_names = map_statement_ctes(&mut insert.with, &mut map);
-            map(&mut insert.table);
+            for row in &insert.rows {
+                for expr in row {
+                    collect_expr_literals(expr, out);
+                }
+            }
+            if let Some(select) = &insert.select {
+                collect_select_literals(select, out);
+            }
+            if let Some(set) = &insert.select_set {
+                collect_select_literals(&set.first, out);
+                for (_, arm) in &set.rest {
+                    collect_select_literals(arm, out);
+                }
+            }
+            for item in &insert.on_duplicate {
+                collect_expr_literals(&item.expr, out);
+            }
+        }
+        Statement::Update(update) => {
+            if let Some(join) = &update.join {
+                collect_expr_literals(&join.on, out);
+            }
+            for item in &update.list {
+                collect_expr_literals(&item.expr, out);
+            }
+            if let Some(selection) = &update.selection {
+                collect_expr_literals(selection, out);
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(join) = &delete.join {
+                collect_expr_literals(&join.on, out);
+            }
+            if let Some(selection) = &delete.selection {
+                collect_expr_literals(selection, out);
+            }
+        }
+        Statement::Explain(explain) => collect_stmt_literals(&explain.stmt, out),
+        _ => {}
+    }
+}
+
+fn collect_select_literals(
+    select: &sealdb_parser::ast::SelectStmt,
+    out: &mut Vec<sealdb_types::Datum>,
+) {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            collect_select_literals(&cte.query, out);
+            for (_, arm) in &cte.set_rest {
+                collect_select_literals(arm, out);
+            }
+        }
+    }
+    for field in &select.fields {
+        collect_expr_literals(&field.expr, out);
+    }
+    for join in &select.joins {
+        collect_expr_literals(&join.on, out);
+    }
+    if let Some(item) = &select.from_item {
+        collect_from_item_literals(item, out);
+    }
+    if let Some(selection) = &select.selection {
+        collect_expr_literals(selection, out);
+    }
+    for expr in &select.group_by {
+        collect_expr_literals(expr, out);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_literals(having, out);
+    }
+    for item in &select.order_by {
+        collect_expr_literals(&item.expr, out);
+    }
+}
+
+fn collect_from_item_literals(
+    item: &sealdb_parser::ast::FromItem,
+    out: &mut Vec<sealdb_types::Datum>,
+) {
+    if let sealdb_parser::ast::FromItem::Join {
+        left, right, on, ..
+    } = item
+    {
+        collect_from_item_literals(left, out);
+        collect_from_item_literals(right, out);
+        collect_expr_literals(on, out);
+    }
+}
+
+fn collect_result_set_literals(
+    query: &sealdb_parser::ast::ResultSetNode,
+    out: &mut Vec<sealdb_types::Datum>,
+) {
+    match query {
+        sealdb_parser::ast::ResultSetNode::Select(select) => collect_select_literals(select, out),
+        sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
+            collect_select_literals(&set.first, out);
+            for (_, arm) in &set.rest {
+                collect_select_literals(arm, out);
+            }
+        }
+    }
+}
+
+fn collect_expr_literals(expr: &ExprNode, out: &mut Vec<sealdb_types::Datum>) {
+    use ExprNode::*;
+    match expr {
+        Value(v) => out.push(v.datum.clone()),
+        Column(_) => {}
+        Binary(b) => {
+            collect_expr_literals(&b.left, out);
+            collect_expr_literals(&b.right, out);
+        }
+        Unary(u) => collect_expr_literals(&u.expr, out),
+        Func(f) => {
+            for arg in &f.args {
+                collect_expr_literals(arg, out);
+            }
+        }
+        Cast(c) => collect_expr_literals(&c.expr, out),
+        Exists(e) => collect_result_set_literals(&e.query, out),
+        InSubquery(i) => {
+            collect_expr_literals(&i.expr, out);
+            collect_result_set_literals(&i.query, out);
+        }
+        InList(i) => {
+            collect_expr_literals(&i.expr, out);
+            for item in &i.list {
+                collect_expr_literals(item, out);
+            }
+        }
+        Between(b) => {
+            collect_expr_literals(&b.expr, out);
+            collect_expr_literals(&b.low, out);
+            collect_expr_literals(&b.high, out);
+        }
+        Like(l) => {
+            collect_expr_literals(&l.expr, out);
+            collect_expr_literals(&l.pattern, out);
+        }
+        IsNull(i) => collect_expr_literals(&i.expr, out),
+        Case(c) => {
+            if let Some(operand) = &c.operand {
+                collect_expr_literals(operand, out);
+            }
+            for (when, then) in &c.when_then {
+                collect_expr_literals(when, out);
+                collect_expr_literals(then, out);
+            }
+            if let Some(otherwise) = &c.else_expr {
+                collect_expr_literals(otherwise, out);
+            }
+        }
+        ScalarSubquery(s) => collect_result_set_literals(&s.query, out),
+        QuantifiedCmp(q) => {
+            collect_expr_literals(&q.expr, out);
+            collect_result_set_literals(&q.query, out);
+        }
+        Window(w) => {
+            for arg in &w.args {
+                collect_expr_literals(arg, out);
+            }
+            for expr in &w.spec.partition_by {
+                collect_expr_literals(expr, out);
+            }
+            for item in &w.spec.order_by {
+                collect_expr_literals(&item.expr, out);
+            }
+        }
+        Row(r) => {
+            for item in &r.exprs {
+                collect_expr_literals(item, out);
+            }
+        }
+    }
+}
+
+fn assign_stmt_literals(stmt: &mut Statement, values: &[sealdb_types::Datum], next: &mut usize) {
+    match stmt {
+        Statement::Select(select) => assign_select_literals(select, values, next),
+        Statement::SetOpr(set) => {
+            assign_select_literals(&mut set.first, values, next);
+            for (_, arm) in &mut set.rest {
+                assign_select_literals(arm, values, next);
+            }
+        }
+        Statement::Insert(insert) => {
+            for row in &mut insert.rows {
+                for expr in row {
+                    assign_expr_literals(expr, values, next);
+                }
+            }
             if let Some(select) = insert.select.as_deref_mut() {
-                map_select_tables(select, &cte_names, &mut map);
+                assign_select_literals(select, values, next);
             }
             if let Some(set) = insert.select_set.as_deref_mut() {
-                map_select_tables(&mut set.first, &cte_names, &mut map);
+                assign_select_literals(&mut set.first, values, next);
                 for (_, arm) in &mut set.rest {
-                    map_select_tables(arm, &cte_names, &mut map);
+                    assign_select_literals(arm, values, next);
+                }
+            }
+            for item in &mut insert.on_duplicate {
+                assign_expr_literals(&mut item.expr, values, next);
+            }
+        }
+        Statement::Update(update) => {
+            if let Some(join) = update.join.as_mut() {
+                assign_expr_literals(&mut join.on, values, next);
+            }
+            for item in &mut update.list {
+                assign_expr_literals(&mut item.expr, values, next);
+            }
+            if let Some(selection) = update.selection.as_mut() {
+                assign_expr_literals(selection, values, next);
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(join) = delete.join.as_mut() {
+                assign_expr_literals(&mut join.on, values, next);
+            }
+            if let Some(selection) = delete.selection.as_mut() {
+                assign_expr_literals(selection, values, next);
+            }
+        }
+        Statement::Explain(explain) => assign_stmt_literals(&mut explain.stmt, values, next),
+        _ => {}
+    }
+}
+
+fn assign_select_literals(
+    select: &mut sealdb_parser::ast::SelectStmt,
+    values: &[sealdb_types::Datum],
+    next: &mut usize,
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            assign_select_literals(&mut cte.query, values, next);
+            for (_, arm) in &mut cte.set_rest {
+                assign_select_literals(arm, values, next);
+            }
+        }
+    }
+    for field in &mut select.fields {
+        assign_expr_literals(&mut field.expr, values, next);
+    }
+    for join in &mut select.joins {
+        assign_expr_literals(&mut join.on, values, next);
+    }
+    if let Some(item) = select.from_item.as_mut() {
+        assign_from_item_literals(item, values, next);
+    }
+    if let Some(selection) = select.selection.as_mut() {
+        assign_expr_literals(selection, values, next);
+    }
+    for expr in &mut select.group_by {
+        assign_expr_literals(expr, values, next);
+    }
+    if let Some(having) = select.having.as_mut() {
+        assign_expr_literals(having, values, next);
+    }
+    for item in &mut select.order_by {
+        assign_expr_literals(&mut item.expr, values, next);
+    }
+}
+
+fn assign_from_item_literals(
+    item: &mut sealdb_parser::ast::FromItem,
+    values: &[sealdb_types::Datum],
+    next: &mut usize,
+) {
+    if let sealdb_parser::ast::FromItem::Join {
+        left, right, on, ..
+    } = item
+    {
+        assign_from_item_literals(left, values, next);
+        assign_from_item_literals(right, values, next);
+        assign_expr_literals(on, values, next);
+    }
+}
+
+fn assign_result_set_literals(
+    query: &mut sealdb_parser::ast::ResultSetNode,
+    values: &[sealdb_types::Datum],
+    next: &mut usize,
+) {
+    match query {
+        sealdb_parser::ast::ResultSetNode::Select(select) => {
+            assign_select_literals(select, values, next)
+        }
+        sealdb_parser::ast::ResultSetNode::SetOpr(set) => {
+            assign_select_literals(&mut set.first, values, next);
+            for (_, arm) in &mut set.rest {
+                assign_select_literals(arm, values, next);
+            }
+        }
+    }
+}
+
+fn assign_expr_literals(expr: &mut ExprNode, values: &[sealdb_types::Datum], next: &mut usize) {
+    use ExprNode::*;
+    match expr {
+        Value(v) => {
+            if let Some(datum) = values.get(*next) {
+                v.datum = datum.clone();
+            }
+            *next += 1;
+        }
+        Column(_) => {}
+        Binary(b) => {
+            assign_expr_literals(&mut b.left, values, next);
+            assign_expr_literals(&mut b.right, values, next);
+        }
+        Unary(u) => assign_expr_literals(&mut u.expr, values, next),
+        Func(f) => {
+            for arg in &mut f.args {
+                assign_expr_literals(arg, values, next);
+            }
+        }
+        Cast(c) => assign_expr_literals(&mut c.expr, values, next),
+        Exists(e) => assign_result_set_literals(&mut e.query, values, next),
+        InSubquery(i) => {
+            assign_expr_literals(&mut i.expr, values, next);
+            assign_result_set_literals(&mut i.query, values, next);
+        }
+        InList(i) => {
+            assign_expr_literals(&mut i.expr, values, next);
+            for item in &mut i.list {
+                assign_expr_literals(item, values, next);
+            }
+        }
+        Between(b) => {
+            assign_expr_literals(&mut b.expr, values, next);
+            assign_expr_literals(&mut b.low, values, next);
+            assign_expr_literals(&mut b.high, values, next);
+        }
+        Like(l) => {
+            assign_expr_literals(&mut l.expr, values, next);
+            assign_expr_literals(&mut l.pattern, values, next);
+        }
+        IsNull(i) => assign_expr_literals(&mut i.expr, values, next),
+        Case(c) => {
+            if let Some(operand) = c.operand.as_mut() {
+                assign_expr_literals(operand, values, next);
+            }
+            for (when, then) in &mut c.when_then {
+                assign_expr_literals(when, values, next);
+                assign_expr_literals(then, values, next);
+            }
+            if let Some(otherwise) = c.else_expr.as_mut() {
+                assign_expr_literals(otherwise, values, next);
+            }
+        }
+        ScalarSubquery(s) => assign_result_set_literals(&mut s.query, values, next),
+        QuantifiedCmp(q) => {
+            assign_expr_literals(&mut q.expr, values, next);
+            assign_result_set_literals(&mut q.query, values, next);
+        }
+        Window(w) => {
+            for arg in &mut w.args {
+                assign_expr_literals(arg, values, next);
+            }
+            for expr in &mut w.spec.partition_by {
+                assign_expr_literals(expr, values, next);
+            }
+            for item in &mut w.spec.order_by {
+                assign_expr_literals(&mut item.expr, values, next);
+            }
+        }
+        Row(r) => {
+            for item in &mut r.exprs {
+                assign_expr_literals(item, values, next);
+            }
+        }
+    }
+}
+
+/// Statement text that carries optimizer hints (`select.text`, or the DML
+/// statement text added for `UPDATE` / `DELETE` / `INSERT`).
+fn statement_hint_text(stmt: &Statement) -> &str {
+    match stmt {
+        Statement::Select(select) => &select.text,
+        // TiDB attaches a hint block after `INSERT` / `REPLACE` to the DML
+        // statement itself, not to the nested query; only hints written inside
+        // the `SELECT` body affect the scan plan.  `UPDATE` / `DELETE` build
+        // their plan directly from the statement, so their own hint block does
+        // apply.
+        Statement::Insert(insert) => match (&insert.select, &insert.select_set) {
+            (Some(select), _) => &select.text,
+            (None, Some(set)) => &set.first.text,
+            _ => "",
+        },
+        Statement::Update(update) => &update.text,
+        Statement::Delete(delete) => &delete.text,
+        Statement::Explain(explain) => statement_hint_text(&explain.stmt),
+        _ => "",
+    }
+}
+
+/// Apply `/*+ use_index(table[, index…]) */` hints by forcing the named
+/// indexes on the matching table references (TiDB hint `USE_INDEX`).
+fn apply_optimizer_index_hints(stmt: &mut Statement) {
+    let hints = use_index_optimizer_hints(statement_hint_text(stmt));
+    if hints.is_empty() {
+        return;
+    }
+    map_statement_tables(stmt, &mut |table| {
+        let name = table.resolve_name();
+        if let Some((_, indexes)) = hints.iter().find(|(hint_table, _)| {
+            hint_table.eq_ignore_ascii_case(name) || hint_table.eq_ignore_ascii_case(&table.name)
+        }) {
+            table.use_index_hint = true;
+            table.use_indexes = indexes.clone();
+        }
+    });
+}
+
+/// `use_index(tbl, idx…)` hint arguments from statement text.
+fn use_index_optimizer_hints(text: &str) -> Vec<(String, Vec<String>)> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = lower[from..].find("use_index(") {
+        let start = from + offset + "use_index(".len();
+        let Some(end) = matching_text_paren(text, start - 1) else {
+            break;
+        };
+        let inner = &text[start..end];
+        let mut args = split_top_level_commas(inner)
+            .into_iter()
+            .map(|arg| arg.trim().trim_matches('`').trim_matches('"').to_string())
+            .filter(|arg| !arg.is_empty())
+            .collect::<Vec<_>>();
+        // Optional query-block name (`@sel_1`) comes first.
+        if args.first().is_some_and(|arg| arg.starts_with('@')) {
+            args.remove(0);
+        }
+        if let Some((table, indexes)) = args.split_first()
+            && !indexes.is_empty()
+        {
+            out.push((table.clone(), indexes.to_vec()));
+        }
+        from = end + 1;
+    }
+    out
+}
+
+/// Index of the `)` matching the `(` at `open`.
+fn matching_text_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split on commas that are not inside parentheses or quoted strings.
+fn split_top_level_commas(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'`' | b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && quote != b'`' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                out.push(text[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(text[start..].to_string());
+    out
+}
+
+/// Apply `map` to every table reference of a statement (SELECT / set operation
+/// / INSERT / UPDATE / DELETE, including their CTEs and subqueries).
+fn map_statement_tables(stmt: &mut Statement, map: &mut dyn FnMut(&mut TableName)) {
+    match stmt {
+        Statement::Select(select) => map_select_with_ctes(select, map),
+        Statement::SetOpr(set) => {
+            map_select_with_ctes(&mut set.first, map);
+            for (_, arm) in &mut set.rest {
+                map_select_with_ctes(arm, map);
+            }
+        }
+        Statement::Insert(insert) => {
+            let cte_names = map_statement_ctes(&mut insert.with, map);
+            map(&mut insert.table);
+            if let Some(select) = insert.select.as_deref_mut() {
+                map_select_tables(select, &cte_names, map);
+            }
+            if let Some(set) = insert.select_set.as_deref_mut() {
+                map_select_tables(&mut set.first, &cte_names, map);
+                for (_, arm) in &mut set.rest {
+                    map_select_tables(arm, &cte_names, map);
                 }
             }
         }
         Statement::Update(update) => {
-            let cte_names = map_statement_ctes(&mut update.with, &mut map);
+            let cte_names = map_statement_ctes(&mut update.with, map);
             map(&mut update.table);
             if let Some(join) = update.join.as_mut() {
                 map(&mut join.left);
                 map(&mut join.right);
             }
             for item in &mut update.list {
-                map_tables_in_expr(&mut item.expr, &cte_names, &mut map);
+                map_tables_in_expr(&mut item.expr, &cte_names, map);
             }
             if let Some(sel) = update.selection.as_mut() {
-                map_tables_in_expr(sel, &cte_names, &mut map);
+                map_tables_in_expr(sel, &cte_names, map);
             }
         }
         Statement::Delete(delete) => {
-            let cte_names = map_statement_ctes(&mut delete.with, &mut map);
+            let cte_names = map_statement_ctes(&mut delete.with, map);
             map(&mut delete.table);
             for table in &mut delete.tables {
                 map(table);
@@ -6264,12 +7477,12 @@ fn rewrite_temp_table_refs(
                 map(&mut join.right);
             }
             if let Some(sel) = delete.selection.as_mut() {
-                map_tables_in_expr(sel, &cte_names, &mut map);
+                map_tables_in_expr(sel, &cte_names, map);
             }
         }
+        Statement::Explain(explain) => map_statement_tables(&mut explain.stmt, map),
         _ => {}
     }
-    hit
 }
 
 fn rewrite_temp_table_name(
@@ -6811,6 +8024,7 @@ fn load_data_to_insert(
         rows.push(row);
     }
     Ok(InsertStmt {
+        text: String::new(),
         table: load.table.clone(),
         ignore: false,
         replace: false,
@@ -6926,6 +8140,27 @@ impl Session {
         self.session_id
     }
 
+    /// Binding key for a statement: the restored text with table names
+    /// qualified by the current database (TiDB matches bindings on the
+    /// normalized, schema-qualified statement), so `t` and `db.t` agree when
+    /// `db` is current. When the client's raw text is available it is parsed
+    /// with one-element `IN` lists preserved, matching how the binding was
+    /// created (planning folds `a in (1)` to `a = 1`).
+    fn binding_key(&self, stmt: &Statement, raw_sql: Option<&str>) -> String {
+        let db = self
+            .current_db
+            .lock()
+            .expect("session current_db lock")
+            .clone();
+        if let Some(raw) = raw_sql.map(str::trim).filter(|raw| !raw.is_empty())
+            && let Ok(parsed) =
+                sealdb_parser::with_preserve_in_list(|| self.parser.parse_one_stmt(raw))
+        {
+            return sealdb_bindinfo::normalize_sql(&restore_qualified(&parsed, &db));
+        }
+        sealdb_bindinfo::normalize_sql(&restore_qualified(stmt, &db))
+    }
+
     /// If a Domain binding matches this statement, re-parse the bind SQL.
     /// `raw_sql` is the text the client sent (available for the top-level
     /// `raw_sql` is the text the client sent: TiDB keys bindings on the
@@ -6938,17 +8173,21 @@ impl Session {
         raw_sql: Option<&str>,
     ) -> Result<Option<Statement>> {
         match stmt {
-            Statement::Select(_) => {
-                let restored = restore_sql(stmt);
-                let candidate = match raw_sql.map(str::trim) {
-                    Some(raw) if !raw.is_empty() => raw,
-                    _ => restored.as_str(),
-                };
-                if let Some(binding) = self.domain.bind_handle().match_binding(candidate) {
+            Statement::Select(_)
+            | Statement::SetOpr(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_) => {
+                let key = self.binding_key(stmt, raw_sql);
+                if let Some(binding) = self.domain.bind_handle().match_binding(&key) {
                     *self
                         .last_plan_from_binding
                         .lock()
                         .expect("session last plan from binding lock") = true;
+                    // `EXPLAIN` reports the replaced SQL once the statement
+                    // finishes (TiDB `Note 1105 Using the bindSQL: …`).
+                    *self.binding_note.lock().expect("session binding note lock") =
+                        Some(binding.display_bind_sql.clone());
                     // A binding may carry its own `SET_VAR` hint (`… using select
                     // /*+ SET_VAR(group_concat_max_len = 4) */ …`); TiDB applies it
                     // as part of the replaced statement.
@@ -6960,7 +8199,23 @@ impl Session {
                     {
                         sealdb_executor::aggfuncs::set_group_concat_max_len(Some(len));
                     }
-                    return Ok(Some(self.parser.parse_one_stmt(&binding.bind_sql)?));
+                    // TiDB resolves the bind SQL against the binding's own
+                    // default database, so `select * from t` still works when
+                    // the session has no current database. Qualify the AST
+                    // (rather than using the restored text) to keep optimizer
+                    // hints (`/*+ … */`) that the restorer drops.
+                    let mut bound = self.parser.parse_one_stmt(&binding.bind_sql)?;
+                    // A binding carries the plan hints, not new predicate
+                    // values: keep the original statement's constants (TiDB
+                    // matches SQL by digest, so the shapes line up).
+                    copy_original_literals(stmt, &mut bound);
+                    if !binding.db.is_empty() {
+                        let db = binding.db.clone();
+                        map_statement_tables(&mut bound, &mut |table| {
+                            qualify_table_name(table, &db);
+                        });
+                    }
+                    return Ok(Some(bound));
                 }
             }
             Statement::Explain(explain) => {
@@ -9674,22 +10929,36 @@ mod tests {
                 vec!["2".to_string(), "b".to_string()]
             ]
         );
+        // Bindings are matched per default database (TiDB qualifies the
+        // normalized key with `default_db`), so select one first.
+        session.execute_stmt("USE db1").unwrap();
         session
             .execute_stmt(
-                "CREATE BINDING FOR SELECT * FROM db1.t WHERE id > 0 ORDER BY id USING SELECT * FROM db1.t WHERE id = 1 ORDER BY id",
+                "CREATE BINDING FOR SELECT * FROM db1.t WHERE id > 0 ORDER BY id USING SELECT * FROM db1.t WHERE id > 0 ORDER BY id DESC",
             )
             .unwrap();
         let shown = session.execute_stmt("SHOW BINDINGS").unwrap();
         assert_eq!(shown.columns[0], "Original_sql");
         assert_eq!(shown.display_rows().len(), 1);
-        assert!(shown.display_rows()[0][0].contains("id > 0"));
-        assert!(shown.display_rows()[0][1].contains("id = 1"));
+        // TiDB normalizes to lowercase keywords, back-quoted names and `?`
+        // placeholders in `original_sql`, keeping the bind SQL in the
+        // statement's own (uppercase) shape.
+        assert_eq!(
+            shown.display_rows()[0][0],
+            "select * from `db1` . `t` where `id` > ? order by `id`"
+        );
+        assert!(shown.display_rows()[0][1].contains("ORDER BY `id` DESC"));
+        // The bind SQL's plan (its `ORDER BY … DESC`) replaces the original,
+        // while the predicate constants stay the original statement's.
         let bound = session
             .execute_stmt("SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
             .unwrap();
         assert_eq!(
             bound.display_rows(),
-            vec![vec!["1".to_string(), "a".to_string()]]
+            vec![
+                vec!["2".to_string(), "b".to_string()],
+                vec!["1".to_string(), "a".to_string()]
+            ]
         );
         session
             .execute_stmt("DROP BINDING FOR SELECT * FROM db1.t WHERE id > 0 ORDER BY id")
@@ -9778,17 +11047,25 @@ mod tests {
                 .display_rows()[0][0],
             "STRICT_TRANS_TABLES"
         );
+        // `SELECT @@flag` reports the typed bit value; `SHOW VARIABLES` keeps
+        // the textual `ON`/`OFF` (TiDB `SysVar.ToSelectField`).
         assert_eq!(
             a.execute_stmt("SELECT @@tidb_enable_auto_analyze")
                 .unwrap()
                 .display_rows()[0][0],
+            "0"
+        );
+        assert_eq!(
+            a.execute_stmt("SHOW SESSION VARIABLES LIKE 'tidb_enable_auto_analyze'")
+                .unwrap()
+                .display_rows()[0][1],
             "OFF"
         );
         assert_eq!(
             a.execute_stmt("SELECT @@GLOBAL.tidb_enable_auto_analyze")
                 .unwrap()
                 .display_rows()[0][0],
-            "ON"
+            "1"
         );
 
         a.execute_stmt("SET GLOBAL tidb_enable_auto_analyze = OFF")
@@ -9799,7 +11076,7 @@ mod tests {
             a.execute_stmt("SELECT @@GLOBAL.tidb_enable_auto_analyze")
                 .unwrap()
                 .display_rows()[0][0],
-            "OFF"
+            "0"
         );
         assert_eq!(
             a.execute_stmt("SELECT @@GLOBAL.character_set_connection")
@@ -9831,7 +11108,7 @@ mod tests {
             b.execute_stmt("SELECT @@tidb_enable_auto_analyze")
                 .unwrap()
                 .display_rows()[0][0],
-            "OFF"
+            "0"
         );
         assert_eq!(
             b.execute_stmt("SELECT @@character_set_connection")
@@ -10183,6 +11460,8 @@ mod tests {
             vec![vec!["1".to_string(), "a".to_string()]]
         );
         b.execute_stmt("BEGIN PESSIMISTIC").unwrap();
+        b.execute_stmt("SET @@tidb_enable_noop_functions = 1")
+            .unwrap();
         let share_mode = b
             .execute_stmt("SELECT * FROM db1.t LOCK IN SHARE MODE")
             .unwrap();

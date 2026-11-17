@@ -49,13 +49,20 @@ pub fn shortest_f64(v: f64) -> String {
         return v.to_string();
     }
     if v == 0.0 {
-        return if v.is_sign_negative() { "-0".to_string() } else { "0".to_string() };
+        return if v.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
     }
     for prec in 14..=16usize {
-        if let Some(text) = scientific_to_plain(prec, v) {
-            if text.parse::<f64>().map(|parsed| parsed == v).unwrap_or(false) {
-                return text;
-            }
+        if let Some(text) = scientific_to_plain(prec, v)
+            && text
+                .parse::<f64>()
+                .map(|parsed| parsed == v)
+                .unwrap_or(false)
+        {
+            return text;
         }
     }
     v.to_string()
@@ -442,7 +449,11 @@ impl Datum {
                 {
                     let text = String::from_utf8_lossy(&bytes);
                     if text.chars().count() > ft.flen as usize {
-                        bytes = text.chars().take(ft.flen as usize).collect::<String>().into_bytes();
+                        bytes = text
+                            .chars()
+                            .take(ft.flen as usize)
+                            .collect::<String>()
+                            .into_bytes();
                     }
                 }
                 // TiDB parses a JSON document into its binary form, where a
@@ -459,9 +470,10 @@ impl Datum {
                 // value uses its numeric form (`2020-10-30 08:21:33.455555` →
                 // `20201030082133.455555`), like TiDB's `TimeToDecimal`.
                 let text = match self {
-                    Datum::Bit(bytes) => {
-                        bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)).to_string()
-                    }
+                    Datum::Bit(bytes) => bytes
+                        .iter()
+                        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+                        .to_string(),
                     Datum::Time(t) => time_numeric_text(t),
                     _ => self.display(),
                 };
@@ -639,8 +651,11 @@ impl Datum {
                     if ft.tp != crate::field_type::TYPE_DATE
                         && let Some((_, frac)) = other.display().split_once('.')
                     {
-                        let mut digits: String =
-                            frac.chars().filter(|c| c.is_ascii_digit()).take(6).collect();
+                        let mut digits: String = frac
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .take(6)
+                            .collect();
                         let fsp = digits.len() as i8;
                         while digits.len() < 6 {
                             digits.push('0');
@@ -909,5 +924,3 @@ fn format_float(v: f64) -> String {
     // scale through `Datum::Decimal` instead.
     v.to_string()
 }
-
-

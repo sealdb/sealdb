@@ -358,25 +358,41 @@ impl Executor for ShowExec {
                     .collect();
             }
             ShowStmtKind::Bindings => {
-                self.schema = vec![
-                    "Original_sql".to_string(),
-                    "Bind_sql".to_string(),
-                    "Default_db".to_string(),
-                    "Status".to_string(),
-                    "Source".to_string(),
-                ];
+                self.schema = [
+                    "Original_sql",
+                    "Bind_sql",
+                    "Default_db",
+                    "Status",
+                    "Create_time",
+                    "Update_time",
+                    "Charset",
+                    "Collation",
+                    "Source",
+                    "Sql_digest",
+                    "Plan_digest",
+                ]
+                .iter()
+                .map(|column| column.to_string())
+                .collect();
                 self.rows = self
                     .domain
                     .bind_handle()
                     .all_bindings()
                     .into_iter()
+                    .filter(|b| !b.global && b.status != "deleted")
                     .map(|b| {
                         vec![
-                            Datum::Bytes(b.original_sql.into_bytes()),
-                            Datum::Bytes(b.bind_sql.into_bytes()),
+                            Datum::Bytes(b.normalized_sql.into_bytes()),
+                            Datum::Bytes(b.display_bind_sql.into_bytes()),
                             Datum::Bytes(b.db.into_bytes()),
                             Datum::Bytes(b.status.into_bytes()),
+                            Datum::Bytes(b.create_time.into_bytes()),
+                            Datum::Bytes(b.update_time.into_bytes()),
+                            Datum::Bytes(b.charset.into_bytes()),
+                            Datum::Bytes(b.collation.into_bytes()),
                             Datum::Bytes(b.source.into_bytes()),
+                            Datum::Bytes(b.sql_digest.into_bytes()),
+                            Datum::Bytes(b.plan_digest.into_bytes()),
                         ]
                     })
                     .collect();
@@ -572,7 +588,7 @@ fn render_create_table(info: &TableInfo) -> String {
                                 | sealdb_types::field_type::TYPE_VARCHAR
                                 | sealdb_types::field_type::TYPE_VAR_STRING
                         ) && c.length > 0
-                            && col.field_type.flen as i32 > c.length
+                            && col.field_type.flen > c.length
                     });
                 match prefix {
                     Some(_) => format!("`{}`({})", c.name.o(), c.length),
@@ -692,12 +708,7 @@ fn render_partition_clause(part: &sealdb_meta::PartitionInfo) -> String {
                 .join(",");
             format!("VALUES IN ({vals})")
         } else {
-            let lt = def
-                .less_than
-                .iter()
-                .map(|v| v.clone())
-                .collect::<Vec<_>>()
-                .join(",");
+            let lt = def.less_than.to_vec().join(",");
             format!("VALUES LESS THAN ({lt})")
         };
         defs.push(format!("PARTITION `{}` {bound}", def.name.o()));

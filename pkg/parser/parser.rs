@@ -44,6 +44,25 @@ pub fn with_allow_derived_without_alias<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+thread_local! {
+    /// Display parse: keep one-element `IN` lists as `IN (x)` instead of
+    /// folding them to `= x` (TiDB restores the bind SQL as written).
+    static PRESERVE_IN_LIST: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn preserve_in_list() -> bool {
+    PRESERVE_IN_LIST.with(Cell::get)
+}
+
+/// Parse with `IN (x)` kept verbatim, restoring the previous flag.
+pub fn with_preserve_in_list<T>(f: impl FnOnce() -> T) -> T {
+    let previous = preserve_in_list();
+    PRESERVE_IN_LIST.with(|flag| flag.set(true));
+    let out = f();
+    PRESERVE_IN_LIST.with(|flag| flag.set(previous));
+    out
+}
+
 pub struct Parser;
 
 impl Parser {

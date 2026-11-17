@@ -301,7 +301,7 @@ fn push_into(
                         // pseudo rates (`not(isnull(not_null_col))` is 1.0, not
                         // the `9990/10000` MinNotNull pseudo estimate).
                         let sel = super::planbuilder::stats_filter_selectivity(
-                            table_info.as_deref(),
+                            table_info,
                             super::planbuilder::statement_stats(&table).as_ref(),
                             filter,
                         )
@@ -366,7 +366,6 @@ fn push_into(
             // expression key part (`tidb_shard(a) = 8`) is not cop-pushable but
             // still seeks.
             let mut range_scan = range_scan;
-            let pushed = pushed;
             let mut row_count = row_count;
             let mut pushable = pushable;
             let mut residual = residual;
@@ -640,7 +639,7 @@ fn push_into(
         },
         PhysicalPlan::HashJoin {
             est_rows: _,
-            tp,
+            mut tp,
             left,
             right,
             left_table,
@@ -673,8 +672,9 @@ fn push_into(
             // null-supplying side of an outer join simplifies it to an inner
             // join; anything else must stay above the join (pushing it into the
             // null-padded side would drop matched rows).
-            let mut tp = tp;
-            if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter) && !null_supplying.is_empty() {
+            if matches!(tp, JoinType::LeftOuter | JoinType::RightOuter)
+                && !null_supplying.is_empty()
+            {
                 for expr in std::mem::take(&mut null_supplying) {
                     if null_rejecting(&expr) {
                         tp = JoinType::Inner;
@@ -885,6 +885,67 @@ fn push_into(
                     table,
                     pushed: (!text.is_empty()).then_some(text),
                     ranges,
+                },
+                residual,
+            )
+        }
+        // Inner merge join: the join key already enforces its equality, so a
+        // WHERE copy of that key leaves no `Selection` (TiDB `PredicatePushDown`
+        // folds it into the key). Single-side conjuncts descend when the side is
+        // a base table; everything else stays above the join.
+        PhysicalPlan::MergeJoin {
+            est_rows: _,
+            tp: JoinType::Inner,
+            left,
+            right,
+            left_table,
+            right_table,
+            left_key,
+            right_key,
+            info,
+            on,
+        } => {
+            let key_items: Vec<String> = on
+                .split_cnf_all()
+                .iter()
+                .map(|item| item.restore_string())
+                .collect();
+            let left_cols = table_columns(is, current_db, &left_table);
+            let right_cols = table_columns(is, current_db, &right_table);
+            let left_single = is_single_table_subtree(&left);
+            let right_single = is_single_table_subtree(&right);
+            let mut left_preds = Vec::new();
+            let mut right_preds = Vec::new();
+            let mut residual = Vec::new();
+            for expr in conjuncts {
+                if key_items.iter().any(|key| *key == expr.restore_string()) {
+                    continue;
+                }
+                match classify(
+                    &expr,
+                    &left_table,
+                    &right_table,
+                    &left_cols,
+                    &right_cols,
+                    JoinType::Inner,
+                ) {
+                    Side::Left if left_single => left_preds.push(expr),
+                    Side::Right if right_single => right_preds.push(expr),
+                    _ => residual.push(expr),
+                }
+            }
+            wrap_residual(
+                PhysicalPlan::MergeJoin {
+                    est_rows: None,
+                    tp: JoinType::Inner,
+                    left: Box::new(push_into(*left, left_preds, is, current_db)),
+                    right: Box::new(push_into(*right, right_preds, is, current_db)),
+                    left_table,
+                    right_table,
+                    left_key,
+                    right_key,
+                    info,
+                    on,
                 },
                 residual,
             )
@@ -1281,9 +1342,7 @@ fn and_opt(left: Option<ExprNode>, right: Option<ExprNode>) -> Option<ExprNode> 
             let kept: Vec<ExprNode> = left
                 .split_cnf()
                 .into_iter()
-                .filter(|c| {
-                    !existing.contains(&super::explain::explain_pushed_filter("t", c))
-                })
+                .filter(|c| !existing.contains(&super::explain::explain_pushed_filter("t", c)))
                 .collect();
             match ExprNode::compose_cnf(kept) {
                 Some(kept) => ExprNode::compose_cnf(vec![kept, right]),
@@ -1482,15 +1541,17 @@ fn null_rejecting(expr: &ExprNode) -> bool {
     }
     fn nullify(expr: &ExprNode) -> ExprNode {
         match expr {
-            ExprNode::Column(_) => ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
-                datum: Datum::Null,
-            }),
-            ExprNode::Binary(bin) => ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
-                op: bin.op,
-                left: Box::new(nullify(&bin.left)),
-                right: Box::new(nullify(&bin.right)),
-                single_cnf_item: bin.single_cnf_item,
-            }),
+            ExprNode::Column(_) => {
+                ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr { datum: Datum::Null })
+            }
+            ExprNode::Binary(bin) => {
+                ExprNode::Binary(sealdb_parser::ast::expressions::BinaryOpExpr {
+                    op: bin.op,
+                    left: Box::new(nullify(&bin.left)),
+                    right: Box::new(nullify(&bin.right)),
+                    single_cnf_item: bin.single_cnf_item,
+                })
+            }
             ExprNode::Unary(un) => ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
                 op: un.op,
                 expr: Box::new(nullify(&un.expr)),
@@ -1578,158 +1639,6 @@ fn table_columns(is: Option<&InfoSchema>, current_db: &str, table: &str) -> Vec<
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ValueExpr};
-    use sealdb_parser::opcode::Op;
-
-    fn col_eq(table: &str, name: &str, value: i64) -> ExprNode {
-        ExprNode::Binary(BinaryOpExpr {
-            op: Op::Eq,
-            left: Box::new(ExprNode::Column(ColumnNameExpr {
-                schema: None,
-                table: Some(table.to_string()),
-                name: name.to_string(),
-            })),
-            right: Box::new(ExprNode::Value(ValueExpr {
-                datum: Datum::I64(value),
-            })),
-            single_cnf_item: false,
-        })
-    }
-
-    #[test]
-    fn test_push_into_table_reader() {
-        let plan = predicate_push_down(
-            PhysicalPlan::table_reader("t", Vec::new()),
-            &col_eq("t", "id", 1),
-            None,
-            "db1",
-        );
-        match plan {
-            PhysicalPlan::TableReader {
-                pushed: Some(filter),
-                ..
-            } => assert!(filter.restore_string().contains("id")),
-            other => panic!("expected pushed TableReader, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_inner_join_splits_predicates() {
-        let join = PhysicalPlan::HashJoin {
-            est_rows: None,
-            tp: JoinType::Inner,
-            left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
-            right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
-            left_table: "t1".to_string(),
-            right_table: "t2".to_string(),
-            on: col_eq("t1", "id", 1),
-        };
-        let filter =
-            ExprNode::compose_cnf(vec![col_eq("t1", "id", 1), col_eq("t2", "id", 2)]).expect("and");
-        let plan = predicate_push_down(join, &filter, None, "db1");
-        let PhysicalPlan::HashJoin { left, right, .. } = plan else {
-            panic!("expected hash join, got {plan:?}");
-        };
-        assert!(matches!(
-            *left,
-            PhysicalPlan::TableReader {
-                pushed: Some(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            *right,
-            PhysicalPlan::TableReader {
-                pushed: Some(_),
-                ..
-            }
-        ));
-    }
-
-    fn col_cmp(table: &str, name: &str, op: Op, value: i64) -> ExprNode {
-        ExprNode::Binary(BinaryOpExpr {
-            op,
-            left: Box::new(ExprNode::Column(ColumnNameExpr {
-                schema: None,
-                table: Some(table.to_string()),
-                name: name.to_string(),
-            })),
-            right: Box::new(ExprNode::Value(ValueExpr {
-                datum: Datum::I64(value),
-            })),
-            single_cnf_item: false,
-        })
-    }
-
-    fn col_is_null(table: &str, name: &str, not: bool) -> ExprNode {
-        ExprNode::IsNull(sealdb_parser::ast::expressions::IsNullExpr {
-            expr: Box::new(ExprNode::Column(ColumnNameExpr {
-                schema: None,
-                table: Some(table.to_string()),
-                name: name.to_string(),
-            })),
-            not,
-        })
-    }
-
-    fn right_join() -> PhysicalPlan {
-        PhysicalPlan::HashJoin {
-            est_rows: None,
-            tp: JoinType::RightOuter,
-            left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
-            right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
-            left_table: "t1".to_string(),
-            right_table: "t2".to_string(),
-            on: col_eq("t1", "id", 1),
-        }
-    }
-
-    #[test]
-    fn test_null_rejecting_on_null_supplying_side_turns_inner() {
-        // `t1 RIGHT JOIN t2 … WHERE t1.id > 0`: `t1` is null-supplying, and the
-        // predicate rejects the padded NULL row, so TiDB simplifies to an inner
-        // join and pushes it into `t1`.
-        let filter = col_cmp("t1", "id", Op::Gt, 0);
-        let plan = predicate_push_down(right_join(), &filter, None, "db1");
-        let PhysicalPlan::HashJoin {
-            tp, left, right, ..
-        } = plan
-        else {
-            panic!("expected hash join, got {plan:?}");
-        };
-        assert!(matches!(tp, JoinType::Inner), "expected inner join, got {tp:?}");
-        assert!(matches!(
-            *left,
-            PhysicalPlan::TableReader {
-                pushed: Some(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            *right,
-            PhysicalPlan::TableReader { pushed: None, .. }
-        ));
-    }
-
-    #[test]
-    fn test_null_accepting_predicate_stays_above_right_join() {
-        // `t1 RIGHT JOIN t2 … WHERE t1.id IS NULL` keeps the padded rows, so
-        // the predicate must stay above the outer join.
-        let filter = col_is_null("t1", "id", false);
-        let plan = predicate_push_down(right_join(), &filter, None, "db1");
-        let PhysicalPlan::Selection { child, .. } = plan else {
-            panic!("expected selection above the join, got {plan:?}");
-        };
-        let PhysicalPlan::HashJoin { tp, .. } = *child else {
-            panic!("expected hash join, got {child:?}");
-        };
-        assert!(matches!(tp, JoinType::RightOuter), "got {tp:?}");
-    }
-}
-
 /// Lower-cased table names owned by a join subtree (HashJoin/MergeJoin carry
 /// both sides' table names at every level).
 fn collect_join_tables(plan: &PhysicalPlan, out: &mut std::collections::HashSet<String>) {
@@ -1815,7 +1724,7 @@ fn owner_of(
         // subtree (alias not in the infoschema) leaves `map` empty and relies
         // on the qualifier alone.
         return match map.get(&col.to_ascii_lowercase()) {
-            Some(owners) => owners.iter().any(|owner| *owner == table).then_some(table),
+            Some(owners) => owners.contains(&table).then_some(table),
             None => Some(table),
         };
     }
@@ -1986,6 +1895,7 @@ fn qualify_cross_equality(
 /// `b` (and vice versa), which is why unanalyzed TiDB plans show the same
 /// filter on both sides of a join. The mirrored column is bound to the alias
 /// that owns it inside the target subtree.
+#[allow(clippy::too_many_arguments)]
 fn derive_equal_cond_preds(
     on: &ExprNode,
     left_map: &std::collections::HashMap<String, Vec<String>>,
@@ -2129,4 +2039,159 @@ fn derive_equal_cond_preds(
         }
     }
     (dl, dr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sealdb_parser::ast::expressions::{BinaryOpExpr, ColumnNameExpr, ValueExpr};
+    use sealdb_parser::opcode::Op;
+
+    fn col_eq(table: &str, name: &str, value: i64) -> ExprNode {
+        ExprNode::Binary(BinaryOpExpr {
+            op: Op::Eq,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(table.to_string()),
+                name: name.to_string(),
+            })),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::I64(value),
+            })),
+            single_cnf_item: false,
+        })
+    }
+
+    #[test]
+    fn test_push_into_table_reader() {
+        let plan = predicate_push_down(
+            PhysicalPlan::table_reader("t", Vec::new()),
+            &col_eq("t", "id", 1),
+            None,
+            "db1",
+        );
+        match plan {
+            PhysicalPlan::TableReader {
+                pushed: Some(filter),
+                ..
+            } => assert!(filter.restore_string().contains("id")),
+            other => panic!("expected pushed TableReader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_splits_predicates() {
+        let join = PhysicalPlan::HashJoin {
+            est_rows: None,
+            tp: JoinType::Inner,
+            left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
+            right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
+            left_table: "t1".to_string(),
+            right_table: "t2".to_string(),
+            on: col_eq("t1", "id", 1),
+        };
+        let filter =
+            ExprNode::compose_cnf(vec![col_eq("t1", "id", 1), col_eq("t2", "id", 2)]).expect("and");
+        let plan = predicate_push_down(join, &filter, None, "db1");
+        let PhysicalPlan::HashJoin { left, right, .. } = plan else {
+            panic!("expected hash join, got {plan:?}");
+        };
+        assert!(matches!(
+            *left,
+            PhysicalPlan::TableReader {
+                pushed: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            PhysicalPlan::TableReader {
+                pushed: Some(_),
+                ..
+            }
+        ));
+    }
+
+    fn col_cmp(table: &str, name: &str, op: Op, value: i64) -> ExprNode {
+        ExprNode::Binary(BinaryOpExpr {
+            op,
+            left: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(table.to_string()),
+                name: name.to_string(),
+            })),
+            right: Box::new(ExprNode::Value(ValueExpr {
+                datum: Datum::I64(value),
+            })),
+            single_cnf_item: false,
+        })
+    }
+
+    fn col_is_null(table: &str, name: &str, not: bool) -> ExprNode {
+        ExprNode::IsNull(sealdb_parser::ast::expressions::IsNullExpr {
+            expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(table.to_string()),
+                name: name.to_string(),
+            })),
+            not,
+        })
+    }
+
+    fn right_join() -> PhysicalPlan {
+        PhysicalPlan::HashJoin {
+            est_rows: None,
+            tp: JoinType::RightOuter,
+            left: Box::new(PhysicalPlan::table_reader("t1", Vec::new())),
+            right: Box::new(PhysicalPlan::table_reader("t2", Vec::new())),
+            left_table: "t1".to_string(),
+            right_table: "t2".to_string(),
+            on: col_eq("t1", "id", 1),
+        }
+    }
+
+    #[test]
+    fn test_null_rejecting_on_null_supplying_side_turns_inner() {
+        // `t1 RIGHT JOIN t2 … WHERE t1.id > 0`: `t1` is null-supplying, and the
+        // predicate rejects the padded NULL row, so TiDB simplifies to an inner
+        // join and pushes it into `t1`.
+        let filter = col_cmp("t1", "id", Op::Gt, 0);
+        let plan = predicate_push_down(right_join(), &filter, None, "db1");
+        let PhysicalPlan::HashJoin {
+            tp, left, right, ..
+        } = plan
+        else {
+            panic!("expected hash join, got {plan:?}");
+        };
+        assert!(
+            matches!(tp, JoinType::Inner),
+            "expected inner join, got {tp:?}"
+        );
+        assert!(matches!(
+            *left,
+            PhysicalPlan::TableReader {
+                pushed: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            PhysicalPlan::TableReader { pushed: None, .. }
+        ));
+    }
+
+    #[test]
+    fn test_null_accepting_predicate_stays_above_right_join() {
+        // `t1 RIGHT JOIN t2 … WHERE t1.id IS NULL` keeps the padded rows, so
+        // the predicate must stay above the outer join.
+        let filter = col_is_null("t1", "id", false);
+        let plan = predicate_push_down(right_join(), &filter, None, "db1");
+        let PhysicalPlan::Selection { child, .. } = plan else {
+            panic!("expected selection above the join, got {plan:?}");
+        };
+        let PhysicalPlan::HashJoin { tp, .. } = *child else {
+            panic!("expected hash join, got {child:?}");
+        };
+        assert!(matches!(tp, JoinType::RightOuter), "got {tp:?}");
+    }
 }

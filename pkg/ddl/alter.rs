@@ -4,25 +4,22 @@
 // multi-schema-state jobs.
 use crate::create_table::{
     field_type_from_name, is_temporal_type, normalize_default, referenced_by_foreign_key,
-    requote_default,
-    references_identifier, ttl_column_name, validate_default_fsp, validate_default_literal,
-    validate_display_width, validate_generated_auto_increment, validate_generated_column_refs,
-    validate_generated_expr,
+    references_identifier, requote_default, ttl_column_name, validate_default_fsp,
+    validate_default_literal, validate_display_width, validate_generated_auto_increment,
+    validate_generated_column_refs, validate_generated_expr,
 };
 use crate::index::{add_index, backfill_index, drop_index_keys, remove_index};
 use crate::partition::{add_partitions, drop_partitions, exchange_partition, repartition};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_FIELD, ERR_BLOB_USED_AS_KEY, ERR_CANT_DROP_FIELD_OR_KEY,
-    ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT,
-    ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST, ERR_UNSUPPORTED_DDL_OPERATION,
-    ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
+    ERR_COLUMN_HAS_EXPRESSION_INDEX_DEPENDENT, ERR_COLUMN_WITH_GENERATED_DEPENDENCIES,
     ERR_DEPENDENT_BY_GENERATED_COLUMN, ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL, ERR_DUP_FIELDNAME,
-    ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_NO_SUCH_TABLE,
-    ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
-    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG,
-    ERR_UNKNOWN_PARTITION,
-    ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
+    ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
+    ERR_NO_SUCH_TABLE, ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
+    ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, ERR_UNKNOWN_PARTITION,
+    ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET,
+    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -181,14 +178,7 @@ pub fn alter_table(
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
             }
             AlterTableSpec::Repartition(option) => {
-                repartition(
-                    meta,
-                    &snapshot,
-                    &stmt.table,
-                    option,
-                    current_db,
-                    storage,
-                )?;
+                repartition(meta, &snapshot, &stmt.table, option, current_db, storage)?;
             }
             AlterTableSpec::ExchangePartition {
                 partition,
@@ -464,6 +454,7 @@ fn alter_ttl(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_column(
     meta: &mut Mutator,
     is: &InfoSchema,
@@ -537,14 +528,14 @@ fn add_column(
     if column.not_null {
         new_col.field_type.flag |= sealdb_types::field_type::NOT_NULL_FLAG;
     }
-    validate_display_width(&new_col.name.o().to_string(), &new_col.field_type)?;
+    validate_display_width(new_col.name.o(), &new_col.field_type)?;
     validate_default_literal(
-        &new_col.name.o().to_string(),
+        new_col.name.o(),
         &new_col.field_type,
         new_col.default_expr.as_deref(),
     )?;
     validate_default_fsp(
-        &new_col.name.o().to_string(),
+        new_col.name.o(),
         &new_col.field_type,
         new_col.default_expr.as_deref(),
     )?;
@@ -943,9 +934,9 @@ pub(crate) fn check_generated_order(names: &[String], columns: &[ColumnInfo]) ->
         for (_table, dep) in expr.referenced_columns() {
             // Only references to *generated* columns defined later are refused;
             // a base column may appear after the generated one (admin.check).
-            let dep_generated = columns.iter().any(|c| {
-                c.name.o().eq_ignore_ascii_case(&dep) && c.generated_expr.is_some()
-            });
+            let dep_generated = columns
+                .iter()
+                .any(|c| c.name.o().eq_ignore_ascii_case(&dep) && c.generated_expr.is_some());
             if let Some(dep_pos) = position(&dep)
                 && dep_pos > col_pos
                 && dep_generated
@@ -978,12 +969,7 @@ fn check_type_change_supported(old_ft: &FieldType, new_ft: &FieldType) -> bool {
                 | ft::TYPE_LONG_BLOB
         )
     };
-    let decimalish = |tp: u8| {
-        matches!(
-            tp,
-            ft::TYPE_NEW_DECIMAL | ft::TYPE_FLOAT | ft::TYPE_DOUBLE
-        )
-    };
+    let decimalish = |tp: u8| matches!(tp, ft::TYPE_NEW_DECIMAL | ft::TYPE_FLOAT | ft::TYPE_DOUBLE);
     let old = old_ft.tp;
     let new = new_ft.tp;
     // date/datetime/timestamp/time/year/string/json -> bit
@@ -1008,7 +994,8 @@ fn check_type_change_supported(old_ft: &FieldType, new_ft: &FieldType) -> bool {
         return false;
     }
     // enum/set/bit/decimal/float/double -> date/datetime/timestamp
-    if (matches!(old, ft::TYPE_ENUM | ft::TYPE_SET | ft::TYPE_BIT) || decimalish(old)) && time(new) {
+    if (matches!(old, ft::TYPE_ENUM | ft::TYPE_SET | ft::TYPE_BIT) || decimalish(old)) && time(new)
+    {
         return false;
     }
     // enum/set/bit -> time
@@ -1018,6 +1005,7 @@ fn check_type_change_supported(old_ft: &FieldType, new_ft: &FieldType) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn change_column(
     meta: &mut Mutator,
     is: &InfoSchema,
@@ -1198,14 +1186,7 @@ fn change_column(
     if changed {
         // TiDB `checkModifyColumnWithForeignKeyConstraint`: a type change that
         // makes a FK's referencing/referenced columns disagree is 3780.
-        check_foreign_key_column_change(
-            is,
-            &schema,
-            &info,
-            &info.columns[pos],
-            new_name,
-            &new_ft,
-        )?;
+        check_foreign_key_column_change(is, &schema, &info, &info.columns[pos], new_name, &new_ft)?;
         // A BLOB/TEXT target cannot carry a full-column index key (1170).
         check_blob_index_length(&info, old_name, &new_ft, new_name)?;
     }
@@ -1273,13 +1254,7 @@ fn change_column(
     let not_null_added = new_ft.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
         && info.columns[pos].field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG == 0;
     if changed || not_null_added {
-        rewrite_column_rows(
-            storage,
-            &info,
-            info.columns[pos].id,
-            new_name,
-            &new_ft,
-        )?;
+        rewrite_column_rows(storage, &info, info.columns[pos].id, new_name, &new_ft)?;
     }
     let previous = info.columns[pos].name.o().to_string();
     info.columns[pos].name = CIStr::new(new_name);
@@ -1388,8 +1363,7 @@ fn rewrite_column_rows(
                     }
                     // A NULL left in a column that just became NOT NULL aborts
                     // the reorg job (TiDB reports 1265 for the first row).
-                    if new_ft.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0
-                        && value.is_null()
+                    if new_ft.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0 && value.is_null()
                     {
                         return Err(Error::new(
                             sealdb_errno::ERR_WARN_DATA_TRUNCATED,
@@ -1531,8 +1505,7 @@ fn convert_column_value(
         && let sealdb_types::Datum::Bit(bytes) = value
     {
         let text = String::from_utf8_lossy(bytes).into_owned();
-        let json = serde_json::to_string(&text)
-            .unwrap_or_else(|_| "\"\"".to_string());
+        let json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string());
         return Ok(sealdb_types::Datum::Bytes(json.into_bytes()));
     }
     // A numeric value cast to JSON keeps full DOUBLE precision (a FLOAT column
@@ -1620,7 +1593,9 @@ fn convert_column_value(
         && let sealdb_types::Datum::Time(t) = value
     {
         let utc = sealdb_expression::session_local_to_utc(*t).unwrap_or(*t);
-        let stamp = (utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second);
+        let stamp = (
+            utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+        );
         if stamp <= (1970, 1, 1, 0, 0, 0) || stamp > (2038, 1, 19, 3, 14, 7) {
             let msg = format!("Incorrect timestamp value: '{}'", t);
             // Outside strict mode an out-of-range TIMESTAMP becomes the zero
@@ -1659,10 +1634,7 @@ fn convert_column_value(
     }
     // A value wider than `BINARY(N)` truncates: 1265 in strict mode, a warning
     // otherwise (TiDB reports the reorg, not the INSERT 1406).
-    if ft.tp == sealdb_types::field_type::TYPE_STRING
-        && ft.charset == "binary"
-        && ft.flen > 0
-    {
+    if ft.tp == sealdb_types::field_type::TYPE_STRING && ft.charset == "binary" && ft.flen > 0 {
         let bytes = value.as_bytes();
         if bytes.len() > ft.flen as usize {
             let msg = format!(
@@ -1680,10 +1652,7 @@ fn convert_column_value(
     if ft.tp == sealdb_types::field_type::TYPE_STRING
         && ft.charset != "binary"
         && ft.flen > 0
-        && String::from_utf8_lossy(&value.as_bytes())
-            .chars()
-            .count()
-            > ft.flen as usize
+        && String::from_utf8_lossy(&value.as_bytes()).chars().count() > ft.flen as usize
     {
         return Err(Error::new(
             sealdb_errno::ERR_WARN_DATA_TRUNCATED,
@@ -1721,8 +1690,9 @@ fn convert_column_value(
                 max.push_str(&"9".repeat(scale as usize));
             }
             return Ok(sealdb_types::Datum::Decimal(
-                sealdb_types::mydecimal::MyDecimal::parse(&max)
-                    .map_err(|err| Error::new(sealdb_errno::ERR_DATA_OUT_OF_RANGE, err.to_string()))?,
+                sealdb_types::mydecimal::MyDecimal::parse(&max).map_err(|err| {
+                    Error::new(sealdb_errno::ERR_DATA_OUT_OF_RANGE, err.to_string())
+                })?,
             ));
         }
     }
@@ -1750,10 +1720,7 @@ fn convert_column_value(
             } else {
                 format!("Truncated incorrect DECIMAL value: '{text}'")
             };
-            return Err(Error::new(
-                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
-                message,
-            ));
+            return Err(Error::new(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, message));
         }
     }
     // A DOUBLE target reads a BINARY(N) value as text up to the NUL padding.
@@ -1809,10 +1776,7 @@ fn convert_column_value(
                             sealdb_errno::error_value(&s)
                         );
                         if strict_sql_mode() {
-                            return Err(Error::new(
-                                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
-                                msg,
-                            ));
+                            return Err(Error::new(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, msg));
                         }
                         note_number_warning(reorg_warnings, msg);
                         return Ok(zero_integer_datum(ft));
@@ -2025,10 +1989,7 @@ fn json_temporal_source(bytes: &[u8], ft: &FieldType) -> Result<sealdb_types::Da
 /// TiDB's JSON → numeric conversion: a boolean is 1/0, a number keeps its text,
 /// a string contributes its unquoted content (1292 when it is not a number) and
 /// an object/array/`null` document fails with its raw text.
-fn json_numeric_source(
-    bytes: &[u8],
-    ft: &FieldType,
-) -> Result<sealdb_types::Datum> {
+fn json_numeric_source(bytes: &[u8], ft: &FieldType) -> Result<sealdb_types::Datum> {
     let raw = String::from_utf8_lossy(bytes).into_owned();
     let decimal_target = ft.eval_type() == EvalType::Decimal;
     let invalid_text = |shown: &str| {
@@ -2049,9 +2010,7 @@ fn json_numeric_source(
         Error::new(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, message)
     };
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(serde_json::Value::Bool(b)) => {
-            Ok(sealdb_types::Datum::I64(if b { 1 } else { 0 }))
-        }
+        Ok(serde_json::Value::Bool(b)) => Ok(sealdb_types::Datum::I64(if b { 1 } else { 0 })),
         Ok(serde_json::Value::Number(n)) => {
             Ok(sealdb_types::Datum::Bytes(n.to_string().into_bytes()))
         }
@@ -2108,9 +2067,7 @@ fn integer_digit_count(value: &sealdb_types::Datum) -> Option<u32> {
         sealdb_types::Datum::I64(v) => Some(digits(v.unsigned_abs() as u128)),
         sealdb_types::Datum::U64(v) => Some(digits(*v as u128)),
         sealdb_types::Datum::Bit(bytes) => {
-            let magnitude = bytes
-                .iter()
-                .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            let magnitude = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
             Some(digits(magnitude as u128))
         }
         sealdb_types::Datum::F64(v) => {
@@ -2203,9 +2160,10 @@ fn current_timestamp_value(ft: &FieldType) -> Result<sealdb_types::time::Time> {
     // The substitution behaves like `NOW()`: a session-local wall clock that
     // `convert_column_value` later shifts into UTC storage. Handing it a UTC
     // clock instead would shift it a second time and store `now - offset`.
-    let mut t = sealdb_expression::utc_to_session_local(
-        sealdb_types::time::Time::from_unix_secs(secs, sealdb_types::TimeType::Timestamp),
-    )?;
+    let mut t = sealdb_expression::utc_to_session_local(sealdb_types::time::Time::from_unix_secs(
+        secs,
+        sealdb_types::TimeType::Timestamp,
+    ))?;
     t.tp = sealdb_types::TimeType::Timestamp;
     let fsp = ft.decimal.clamp(0, 6) as i8;
     t.fsp = fsp;
@@ -2216,7 +2174,8 @@ fn current_timestamp_value(ft: &FieldType) -> Result<sealdb_types::time::Time> {
 }
 
 /// The zero value of a temporal target type.
-fn zero_temporal(ft: &FieldType) -> sealdb_types::Datum {    let mut t = sealdb_types::time::Time::new(0, 0, 0, 0, 0, 0);
+fn zero_temporal(ft: &FieldType) -> sealdb_types::Datum {
+    let mut t = sealdb_types::time::Time::new(0, 0, 0, 0, 0, 0);
     t.tp = match ft.tp {
         sealdb_types::field_type::TYPE_DATE => sealdb_types::TimeType::Date,
         sealdb_types::field_type::TYPE_TIMESTAMP => sealdb_types::TimeType::Timestamp,
@@ -2272,10 +2231,7 @@ fn decimal_round_i128(text: &str) -> Option<i128> {
     };
     let (int_part, frac) = rest.split_once('.').unwrap_or((rest, ""));
     let magnitude: i128 = int_part.parse().ok()?;
-    let round_up = frac
-        .bytes()
-        .next()
-        .is_some_and(|digit| digit >= b'5');
+    let round_up = frac.bytes().next().is_some_and(|digit| digit >= b'5');
     let rounded = if round_up { magnitude + 1 } else { magnitude };
     Some(if negative { -rounded } else { rounded })
 }
@@ -2283,9 +2239,7 @@ fn decimal_round_i128(text: &str) -> Option<i128> {
 /// Integer target spelling inside `constant <x> overflows <type>`: TiDB keeps
 /// the signed family name even for `BIGINT UNSIGNED`.
 fn integer_target_name(ft: &FieldType) -> String {
-    ft.type_name()
-        .trim_end_matches(" unsigned")
-        .to_string()
+    ft.type_name().trim_end_matches(" unsigned").to_string()
 }
 
 /// TiDB `constant <x> overflows <type>` payload for a value whose *source* is
@@ -2384,7 +2338,7 @@ fn go_float_string(v: f64) -> String {
     let exponent: i32 = exponent.parse().unwrap_or(0);
     let negative = mantissa.starts_with('-');
     let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let body = if exponent < -4 || exponent >= 6 {
+    let body = if !(-4..6).contains(&exponent) {
         let (head, tail) = digits.split_at(1);
         let mantissa = if tail.is_empty() {
             head.to_string()

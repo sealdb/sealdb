@@ -14,6 +14,16 @@ pub struct RestoreCtx {
     /// CTE names in scope while restoring a view body. References to these are
     /// written unqualified even in view mode (they are not base tables).
     cte_names: Vec<String>,
+    /// Default schema used to qualify table names in *binding* restore mode
+    /// (TiDB `mysql.bind_info.bind_sql`): keywords keep their default case and
+    /// string literals carry no charset introducer, unlike view mode.
+    qualify_db: Option<String>,
+}
+
+impl Default for RestoreCtx {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RestoreCtx {
@@ -23,6 +33,7 @@ impl RestoreCtx {
             view_db: None,
             generated: false,
             cte_names: Vec::new(),
+            qualify_db: None,
         }
     }
 
@@ -34,6 +45,7 @@ impl RestoreCtx {
             view_db: None,
             generated: true,
             cte_names: Vec::new(),
+            qualify_db: None,
         }
     }
 
@@ -44,7 +56,32 @@ impl RestoreCtx {
             view_db: Some(db.to_string()),
             generated: false,
             cte_names: Vec::new(),
+            qualify_db: None,
         }
+    }
+
+    /// Context for binding text (TiDB `bind_sql`): default keyword/identifier
+    /// rendering, with table names qualified by `db`.
+    pub fn new_qualify(db: &str) -> Self {
+        Self {
+            buf: String::new(),
+            view_db: None,
+            generated: false,
+            cte_names: Vec::new(),
+            qualify_db: Some(db.to_string()),
+        }
+    }
+
+    /// Default schema used to qualify table names in binding mode.
+    pub fn qualify_db(&self) -> Option<&str> {
+        self.qualify_db.as_deref()
+    }
+
+    /// Binding restore mode: table names are schema-qualified, keywords keep
+    /// their default rendering (comparisons with spaces, no charset
+    /// introducer), unlike view mode.
+    pub fn in_bind(&self) -> bool {
+        self.qualify_db.is_some()
     }
 
     /// Stored generated-column expression context (see [`Self::new_generated`]).

@@ -147,6 +147,7 @@ pub fn eval_named_cte(
         lock_wait: SelectLockWait::Block,
         with: Some(with.clone()),
         text: String::new(),
+        synthesized: false,
     };
     run_select(&select, domain, current_db, txn)
 }
@@ -414,13 +415,13 @@ fn iterate_recursive(
             let next = with_working_cte(name, schema.clone(), working.clone(), || {
                 run_select(rec, domain, current_db, txn)
             })?;
-            if let Some(row) = next.rows.first() {
-                if row.len() != schema.len() {
-                    return Err(Error::new(
-                        ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-                        "The used SELECT statements have a different number of columns",
-                    ));
-                }
+            if let Some(row) = next.rows.first()
+                && row.len() != schema.len()
+            {
+                return Err(Error::new(
+                    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+                    "The used SELECT statements have a different number of columns",
+                ));
             }
             // `UNION` between recursive arms dedupes those arms' rows.
             let dedupe = distinct || arm_op.is_distinct();

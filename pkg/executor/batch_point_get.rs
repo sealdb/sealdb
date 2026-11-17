@@ -189,7 +189,7 @@ impl Executor for BatchPointGetExec {
 }
 
 fn physical_ids_for_handle(info: &TableInfo, handle: i64, pinned: &[i64]) -> Vec<i64> {
-    let ids = if !pinned.is_empty() {
+    if !pinned.is_empty() {
         pinned.to_vec()
     } else if info.partition.as_ref().is_some_and(|p| {
         p.column()
@@ -201,8 +201,7 @@ fn physical_ids_for_handle(info: &TableInfo, handle: i64, pinned: &[i64]) -> Vec
         }
     } else {
         info.physical_ids()
-    };
-    ids
+    }
 }
 
 fn decode_table_row(info: &TableInfo, raw: &[u8]) -> Vec<Datum> {

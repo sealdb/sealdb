@@ -167,7 +167,7 @@ fn rewrite_isnull(
 }
 
 fn rewrite(expr: &ExprNode, cols: &Columns<'_>, changed: &mut bool) -> ExprNode {
-    let rebuilt = match expr {
+    match expr {
         ExprNode::Func(f) => {
             if let Some(rewritten) = rewrite_ifnull(f, cols) {
                 *changed = true;
@@ -236,8 +236,7 @@ fn rewrite(expr: &ExprNode, cols: &Columns<'_>, changed: &mut bool) -> ExprNode 
                 .map(|e| Box::new(rewrite(e, cols, changed))),
         }),
         other => other.clone(),
-    };
-    rebuilt
+    }
 }
 
 /// Rewrite every expression of the statement; `None` when nothing changed.

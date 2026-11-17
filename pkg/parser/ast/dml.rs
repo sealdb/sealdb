@@ -361,6 +361,9 @@ pub struct SelectStmt {
     pub lock_wait: SelectLockWait,
     pub with: Option<WithClause>,
     pub text: String,
+    /// Synthesized planner scan for an `UPDATE` / `DELETE` child (its `text`
+    /// may carry the DML optimizer hints but it is not a user query block).
+    pub synthesized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -389,6 +392,21 @@ impl SelectStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         if ctx.in_view() {
             return self.restore_view(ctx);
+        }
+        if ctx.in_bind() {
+            // Binding text shares the view renderer's shape (qualified tables,
+            // `*` select fields, inlined derived tables) but keeps default
+            // expression rendering.
+            let before = ctx.cte_name_scope_len();
+            let names: Vec<String> = self
+                .with
+                .as_ref()
+                .map(|with| with.ctes.iter().map(|cte| cte.name.clone()).collect())
+                .unwrap_or_default();
+            ctx.push_cte_names(&names);
+            let restored = self.restore_view_body(ctx);
+            ctx.truncate_cte_names(before);
+            return restored;
         }
         if let Some(with) = &self.with {
             with.restore(ctx)?;
@@ -713,6 +731,8 @@ fn restore_view_from_item(
 
 #[derive(Clone, Debug)]
 pub struct InsertStmt {
+    /// Statement text as restored by the parser (keeps optimizer hints).
+    pub text: String,
     pub table: TableName,
     /// `INSERT IGNORE`: duplicate-key / partition-mismatch errors become warnings.
     pub ignore: bool,
@@ -815,6 +835,8 @@ impl Assignment {
 /// ORDER BY / LIMIT are single-table only (MySQL forbids them on multi-table UPDATE).
 #[derive(Clone, Debug)]
 pub struct UpdateStmt {
+    /// Statement text as restored by the parser (keeps optimizer hints).
+    pub text: String,
     /// MySQL `UPDATE IGNORE`: conflicting rows warn (`1062`) instead of failing.
     pub ignore: bool,
     pub table: TableName,
@@ -912,6 +934,8 @@ impl LoadDataStmt {
 /// empty means delete `table`. `join` is the FROM/USING join.
 #[derive(Clone, Debug)]
 pub struct DeleteStmt {
+    /// Statement text as restored by the parser (keeps optimizer hints).
+    pub text: String,
     /// MySQL `DELETE IGNORE`: truncation warnings replace errors.
     pub ignore: bool,
     pub table: TableName,

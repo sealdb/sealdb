@@ -298,9 +298,7 @@ impl ExprNode {
             // Fold constant arithmetic on the right of a range predicate
             // (`t2.c_int + 1 = 8 + 1` → key `c_int+1`, value `9`), so an
             // expression index still gets a seek range.
-            ExprNode::Binary(bin)
-                if matches!(bin.op, Op::Plus | Op::Minus | Op::Mul) =>
-            {
+            ExprNode::Binary(bin) if matches!(bin.op, Op::Plus | Op::Minus | Op::Mul) => {
                 let left = Self::const_datum(&bin.left)?;
                 let right = Self::const_datum(&bin.right)?;
                 match (left, right) {
@@ -380,12 +378,13 @@ impl ExprNode {
             return None;
         }
         match (bin.left.as_ref(), bin.right.as_ref()) {
-            (left, right) if !matches!(left, ExprNode::Column(_)) => {
-                right.const_datum().map(|value| (left.expr_key(), bin.op, value))
-            }
+            (left, right) if !matches!(left, ExprNode::Column(_)) => right
+                .const_datum()
+                .map(|value| (left.expr_key(), bin.op, value)),
             (left, right) if !matches!(right, ExprNode::Column(_)) => {
                 flip_cmp(bin.op).and_then(|op| {
-                    left.const_datum().map(|value| (right.expr_key(), op, value))
+                    left.const_datum()
+                        .map(|value| (right.expr_key(), op, value))
                 })
             }
             _ => None,
@@ -492,9 +491,7 @@ impl ExprNode {
         };
         let mut values = Vec::new();
         for item in &list.list {
-            let Some(value) = item.const_datum() else {
-                return None;
-            };
+            let value = item.const_datum()?;
             if value.is_null() {
                 continue;
             }

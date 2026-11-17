@@ -400,7 +400,7 @@ impl TableInfo {
         {
             for col in &pk.columns {
                 let name = col.name.o();
-                if !names.iter().any(|have| have.eq_ignore_ascii_case(&name)) {
+                if !names.iter().any(|have| have.eq_ignore_ascii_case(name)) {
                     names.push(name.to_string());
                 }
             }

@@ -65,7 +65,7 @@ impl ExecutorBuilder {
                 // (`Column#8->Column#9`); `WindowExec` already emits the
                 // SELECT-list columns, so re-evaluating the fields would call
                 // window functions outside `WindowExec`.
-                if is_window_plan(&child) && is_identity_projection(exprs) {
+                if is_window_plan(child) && is_identity_projection(exprs) {
                     let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
                     return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
                 }
@@ -74,7 +74,7 @@ impl ExecutorBuilder {
                 // aggregate executor evaluates its arguments against the child
                 // rows, so the projection only passes rows through.
                 if select.having.is_some()
-                    && !is_agg_plan(&child)
+                    && !is_agg_plan(child)
                     && is_explain_only_projection(exprs)
                 {
                     return Ok(child_exec);
@@ -82,7 +82,7 @@ impl ExecutorBuilder {
                 // `SELECT g, count(*) … HAVING …` plans a Projection above the
                 // aggregate purely for EXPLAIN shape; the aggregate executor
                 // already emits the SELECT-list columns in order.
-                if is_agg_plan(&child) && is_agg_rename_projection(select) {
+                if is_agg_plan(child) && is_agg_rename_projection(select) {
                     let names: Vec<String> = select.fields.iter().map(field_output_name).collect();
                     return Ok(Box::new(ProjectionExec::passthrough(names, child_exec)));
                 }
@@ -263,10 +263,13 @@ impl ExecutorBuilder {
                 ranges: pushed_ranges,
                 ..
             } => {
-                let (columns, rows) =
-                    sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?;
+                let (columns, rows) = if table.eq_ignore_ascii_case("bind_info") {
+                    domain.bind_info_rows()
+                } else {
+                    sealdb_infoschema::tables::virtual_rows(table, &domain.infoschema())?
+                };
                 let mut exec = MemTableExec::new(columns, rows);
-                exec.filter_ranges(&pushed_ranges);
+                exec.filter_ranges(pushed_ranges);
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Update { .. } => {
@@ -314,9 +317,7 @@ impl ExecutorBuilder {
                 // into one `BatchGet` (key order) unless the read must keep the
                 // index-key order (`keep order:true`) for an ORDER BY.
                 let keep_order = !covering
-                    && (range_scan
-                        .as_ref()
-                        .is_some_and(|range| range.keep_order)
+                    && (range_scan.as_ref().is_some_and(|range| range.keep_order)
                         || keep_order_pushed(pushed.as_ref()));
                 let select = stmt
                     .as_select()
@@ -575,7 +576,7 @@ impl ExecutorBuilder {
                     let from_cols = select_from_column_names(select, &domain, current_db);
                     schema = expand_projection_fields(select, &from_cols).1;
                 }
-                Ok(Box::new(TableDualExec::new(*row_count as usize, schema)))
+                Ok(Box::new(TableDualExec::new(*row_count, schema)))
             }
             PhysicalPlan::HashAgg { child, info, .. } => {
                 let select = stmt
@@ -983,6 +984,7 @@ impl ExecutorBuilder {
             || select.selection.as_ref().is_some_and(mentions)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_hash_join(
         tp: JoinType,
         left: &PhysicalPlan,
@@ -1052,38 +1054,38 @@ impl ExecutorBuilder {
                 |f| matches!(&f.expr, ExprNode::Column(c) if c.name == "*" && c.table.is_some()),
             )
         });
-        if !using_cols.is_empty() {
-            if let Some(select) = stmt.as_select() {
-                // Restored AST text backticks identifiers (`t2`.`a`), while
-                // schema labels are plain `t2.a`; compare without quoting.
-                let text = select.text.to_ascii_lowercase().replace('`', "");
-                let all_ons = Self::select_on_text(select)
-                    .to_ascii_lowercase()
-                    .replace('`', "");
-                // Columns coalesced away are those of the dropped side: the
-                // left subtree for RIGHT JOIN (the preserved right side owns
-                // the USING column), the right table otherwise.
-                let dropped_tables: Vec<String> = if matches!(tp, JoinType::RightOuter) {
-                    select
-                        .join_tables()
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .filter(|t| !t.eq_ignore_ascii_case(right_table))
-                        .collect()
-                } else {
-                    vec![right_table.to_string()]
-                };
-                for col in &using_cols {
-                    for table in &dropped_tables {
-                        let qual = format!("{table}.{col}").to_ascii_lowercase();
-                        // The parent SELECT or any ON in the statement may need
-                        // the raw value (chained `t1 JOIN t2 USING(a) RIGHT JOIN
-                        // t3 USING(a)` evaluates `t2.a = t3.a` above this join).
-                        if (text.contains(&qual) || all_ons.contains(&qual))
-                            && !hidden_using.iter().any(|h| h.eq_ignore_ascii_case(&qual))
-                        {
-                            hidden_using.push(format!("{table}.{col}"));
-                        }
+        if !using_cols.is_empty()
+            && let Some(select) = stmt.as_select()
+        {
+            // Restored AST text backticks identifiers (`t2`.`a`), while
+            // schema labels are plain `t2.a`; compare without quoting.
+            let text = select.text.to_ascii_lowercase().replace('`', "");
+            let all_ons = Self::select_on_text(select)
+                .to_ascii_lowercase()
+                .replace('`', "");
+            // Columns coalesced away are those of the dropped side: the
+            // left subtree for RIGHT JOIN (the preserved right side owns
+            // the USING column), the right table otherwise.
+            let dropped_tables: Vec<String> = if matches!(tp, JoinType::RightOuter) {
+                select
+                    .join_tables()
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .filter(|t| !t.eq_ignore_ascii_case(right_table))
+                    .collect()
+            } else {
+                vec![right_table.to_string()]
+            };
+            for col in &using_cols {
+                for table in &dropped_tables {
+                    let qual = format!("{table}.{col}").to_ascii_lowercase();
+                    // The parent SELECT or any ON in the statement may need
+                    // the raw value (chained `t1 JOIN t2 USING(a) RIGHT JOIN
+                    // t3 USING(a)` evaluates `t2.a = t3.a` above this join).
+                    if (text.contains(&qual) || all_ons.contains(&qual))
+                        && !hidden_using.iter().any(|h| h.eq_ignore_ascii_case(&qual))
+                    {
+                        hidden_using.push(format!("{table}.{col}"));
                     }
                 }
             }
@@ -1464,7 +1466,7 @@ fn index_lookup_values(
     // 1), …)` de-duplicated to one key): every part then takes the first
     // listed value, like TiDB's `detachCondAndBuildRangeForIndex`.
     for part in &index.columns {
-        let key = sealdb_planner::core::expr_index::part_key(&info, part);
+        let key = sealdb_planner::core::expr_index::part_key(info, part);
         if known
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case(&key))
@@ -1501,7 +1503,7 @@ fn index_lookup_values(
             known.push((key, value));
         }
     }
-    Some(index_key_values(&info, index, &known)?)
+    index_key_values(info, index, &known)
 }
 
 /// Decode raw charset bytes to a UTF-8 string (TiDB `Charset.Decode`).
@@ -1581,12 +1583,11 @@ fn index_key_values(
         // `binary(2)` keys without re-padding (`a = "a"` does not match a
         // stored `'a\0'`), and an out-of-range numeric literal is a value that
         // matches no row rather than a cast error.
-        if column.field_type.tp == sealdb_types::field_type::TYPE_BIT
-            || column.field_type.eval_type() == sealdb_types::field_type::EvalType::Decimal
+        if (column.field_type.tp == sealdb_types::field_type::TYPE_BIT
+            || column.field_type.eval_type() == sealdb_types::field_type::EvalType::Decimal)
+            && let Ok(cast) = values[pos].cast(&column.field_type)
         {
-            if let Ok(cast) = values[pos].cast(&column.field_type) {
-                values[pos] = cast;
-            }
+            values[pos] = cast;
         }
     }
     Some(values)
@@ -1673,9 +1674,7 @@ fn expr_index_read_exprs(
         .into_iter()
         .map(|expr| {
             sealdb_planner::core::expr_index::substitute_index_parts_for_read(
-                &info,
-                index_info,
-                &expr,
+                &info, index_info, &expr,
             )
         })
         .collect()
@@ -1967,7 +1966,7 @@ fn resolve_collation_exprs(
         });
     exprs
         .into_iter()
-        .map(|expr| fold_collation(expr, info.as_deref()))
+        .map(|expr| fold_collation(expr, info))
         .collect()
 }
 
@@ -2049,16 +2048,20 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Str
                 }
             })
             .unwrap_or_else(|| DEFAULT.to_string()),
-        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => {
-            unify_collations(func.args.iter().map(|arg| expr_collation(arg, info)), neutral)
-        }
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => unify_collations(
+            func.args.iter().map(|arg| expr_collation(arg, info)),
+            neutral,
+        ),
         ExprNode::Func(func)
             if matches!(
                 func.name.to_ascii_lowercase().as_str(),
                 "ifnull" | "coalesce" | "if" | "nullif" | "greatest" | "least"
             ) =>
         {
-            unify_collations(func.args.iter().map(|arg| expr_collation(arg, info)), neutral)
+            unify_collations(
+                func.args.iter().map(|arg| expr_collation(arg, info)),
+                neutral,
+            )
         }
         ExprNode::Case(case) => unify_collations(
             case.when_then
@@ -2071,7 +2074,10 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Str
     }
 }
 
-fn unify_collations(collations: impl Iterator<Item = String>, neutral: impl Fn(&str) -> bool) -> String {
+fn unify_collations(
+    collations: impl Iterator<Item = String>,
+    neutral: impl Fn(&str) -> bool,
+) -> String {
     const DEFAULT: &str = "utf8mb4_general_ci";
     let mut out = String::new();
     for coll in collations {
@@ -2084,12 +2090,17 @@ fn unify_collations(collations: impl Iterator<Item = String>, neutral: impl Fn(&
             out = "binary".to_string();
         }
     }
-    if out.is_empty() { DEFAULT.to_string() } else { out }
+    if out.is_empty() {
+        DEFAULT.to_string()
+    } else {
+        out
+    }
 }
 
 /// Attach FROM table name onto bare columns so overflow messages match TiDB
 /// (`db.table.col`).
-fn qualify_expr_table(expr: ExprNode, table: &str) -> ExprNode {    match expr {
+fn qualify_expr_table(expr: ExprNode, table: &str) -> ExprNode {
+    match expr {
         ExprNode::Column(mut c) if c.table.is_none() => {
             c.table = Some(table.to_string());
             ExprNode::Column(c)
@@ -2294,8 +2305,8 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
                 // Trim leading `+(` / whitespace and trailing `)` from original text.
                 let raw = orig_text.unwrap_or("").trim();
                 let trimmed = raw
-                    .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | ' ' | '+' | '('))
-                    .trim_end_matches(|c: char| matches!(c, '\t' | '\n' | ' ' | ')'));
+                    .trim_start_matches(['\t', '\n', ' ', '+', '('])
+                    .trim_end_matches(['\t', '\n', ' ', ')']);
                 if trimmed.is_empty() {
                     tidb_expr_display_name(inner)
                 } else {

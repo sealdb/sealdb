@@ -506,7 +506,8 @@ pub enum ShowVarScope {
 #[derive(Clone, Debug)]
 pub enum ShowVarFilter {
     Like(String),
-    Where(crate::ast::expressions::ExprNode),
+    /// Boxed: `ExprNode` is far larger than the pattern variant.
+    Where(Box<crate::ast::expressions::ExprNode>),
 }
 
 #[derive(Clone, Debug)]
@@ -616,14 +617,39 @@ impl ShowStmt {
 pub struct CreateBindingStmt {
     pub original_sql: String,
     pub bind_sql: String,
+    /// `CREATE GLOBAL BINDING` (domain-wide) vs plain session binding.
+    pub global: bool,
 }
 
 impl CreateBindingStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("CREATE BINDING FOR ");
+        ctx.write_str(if self.global {
+            "CREATE GLOBAL BINDING FOR "
+        } else {
+            "CREATE BINDING FOR "
+        });
         ctx.write_str(&self.original_sql);
         ctx.write_str(" USING ");
         ctx.write_str(&self.bind_sql);
+        Ok(())
+    }
+}
+
+/// `SET BINDING [DISABLED|ENABLED] FOR <original>` (TiDB `SetBindingStmt`).
+#[derive(Clone, Debug)]
+pub struct SetBindingStmt {
+    pub original_sql: String,
+    pub enabled: bool,
+}
+
+impl SetBindingStmt {
+    pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
+        ctx.write_str(if self.enabled {
+            "SET BINDING ENABLED FOR "
+        } else {
+            "SET BINDING DISABLED FOR "
+        });
+        ctx.write_str(&self.original_sql);
         Ok(())
     }
 }
@@ -632,11 +658,17 @@ impl CreateBindingStmt {
 #[derive(Clone, Debug)]
 pub struct DropBindingStmt {
     pub original_sql: String,
+    /// `DROP GLOBAL BINDING` vs plain session binding.
+    pub global: bool,
 }
 
 impl DropBindingStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
-        ctx.write_str("DROP BINDING FOR ");
+        ctx.write_str(if self.global {
+            "DROP GLOBAL BINDING FOR "
+        } else {
+            "DROP BINDING FOR "
+        });
         ctx.write_str(&self.original_sql);
         Ok(())
     }

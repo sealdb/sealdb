@@ -12,6 +12,7 @@ pub mod sqlparser_bridge;
 pub mod terror;
 pub mod types;
 
+pub use parser::with_allow_derived_without_alias;
+pub use parser::with_preserve_in_list;
 pub use parser::{Parser, parse_to_oracle_json};
 pub use parser::{high_not_precedence, set_high_not_precedence};
-pub use parser::{with_allow_derived_without_alias};

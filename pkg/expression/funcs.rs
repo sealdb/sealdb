@@ -31,7 +31,7 @@ pub struct FuncMeta {
 
 /// TiDB-shaped catalog. `implemented` tracks SealDB scalar eval support today.
 pub fn builtin_list() -> &'static [FuncMeta] {
-    &FUNCS
+    FUNCS
 }
 
 const FUNCS: &[FuncMeta] = &[

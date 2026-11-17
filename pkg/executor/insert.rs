@@ -184,7 +184,7 @@ impl Executor for InsertExec {
             // Unique secondary indexes need the same pre-write check TiDB does
             // for every insert row (the KV layer only guards the PK handle).
             let lock = crate::update::dml_row_lock(&self.txn)?;
-            let physical = sealdb_planner::core::prune_partitions(&info, None);
+            let physical = sealdb_planner::core::prune_partitions(info, None);
             let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
             let mut affected = 0u64;
             let mut duplicates = 0u64;
@@ -233,7 +233,7 @@ impl Executor for InsertExec {
         // `ON DUPLICATE KEY UPDATE`: locate conflicts against a snapshot of the
         // table, then update the conflicting row instead of inserting.
         let lock = crate::update::dml_row_lock(&self.txn)?;
-        let physical = sealdb_planner::core::prune_partitions(&info, None);
+        let physical = sealdb_planner::core::prune_partitions(info, None);
         let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
         let names = crate::update::col_names(info);
         self.txn.with_txn(|txn| {

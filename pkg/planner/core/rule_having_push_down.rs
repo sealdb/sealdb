@@ -111,17 +111,16 @@ fn filter_selectivity(expr: &ExprNode) -> f64 {
             std::collections::BTreeMap::new();
         let mut other = 1.0_f64;
         for c in &cnf {
-            if let ExprNode::Binary(b) = c {
-                if is_cmp_op(b.op) {
-                    if let Some(col) = cmp_column_name(b) {
-                        let s = cmp_selectivity(b.op);
-                        col_sel
-                            .entry(col)
-                            .and_modify(|e| *e = e.min(s))
-                            .or_insert(s);
-                        continue;
-                    }
-                }
+            if let ExprNode::Binary(b) = c
+                && is_cmp_op(b.op)
+                && let Some(col) = cmp_column_name(b)
+            {
+                let s = cmp_selectivity(b.op);
+                col_sel
+                    .entry(col)
+                    .and_modify(|e| *e = e.min(s))
+                    .or_insert(s);
+                continue;
             }
             other *= filter_selectivity(c);
         }
@@ -428,13 +427,13 @@ fn inject_avg_group_projection(
         if matches!(&field.expr, ExprNode::Func(f) if is_agg_name(&f.name)) {
             continue;
         }
-        if let ExprNode::Column(col) = &field.expr {
-            if let Some((idx, _)) = select.group_by.iter().enumerate().find(
+        if let ExprNode::Column(col) = &field.expr
+            && let Some((idx, _)) = select.group_by.iter().enumerate().find(
                 |(_, g)| matches!(g, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&col.name)),
-            ) {
-                let id = group_ids[idx];
-                funcs.push(format!("funcs:firstrow(Column#{id})->{}", qual(&col.name)));
-            }
+            )
+        {
+            let id = group_ids[idx];
+            funcs.push(format!("funcs:firstrow(Column#{id})->{}", qual(&col.name)));
         }
     }
     let info = format!("group by:{group_info}, {}", funcs.join(", "));
@@ -783,6 +782,7 @@ fn rewrite_having_agg_refs(expr: ExprNode, select: &SelectStmt) -> ExprNode {
     rewrite_expr(expr, select)
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn rewrite_expr(expr: ExprNode, select: &SelectStmt) -> ExprNode {
     match expr {
         ExprNode::Func(f) if is_agg_name(&f.name) => ExprNode::Column(ColumnNameExpr {

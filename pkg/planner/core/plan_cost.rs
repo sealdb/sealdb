@@ -20,7 +20,7 @@ pub fn table_row_count(stats: Option<&Handle>, from: &TableName, current_db: &st
     // replaces TiDB pseudo cardinality.
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| has_real_stats(t))
+        .filter(has_real_stats)
         .map(|t| t.count as f64)
         .unwrap_or(Table::PSEUDO_ROW_COUNT as f64)
 }
@@ -34,7 +34,7 @@ pub fn eq_row_count(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| has_real_stats(t))
+        .filter(has_real_stats)
         .map(|t| t.eq_row_count(column) as f64)
 }
 
@@ -49,7 +49,7 @@ pub fn eq_row_count_value(
     let (db, table) = from.qualified(current_db);
     stats
         .and_then(|handle| handle.table(&db, &table))
-        .filter(|t| has_real_stats(t))
+        .filter(has_real_stats)
         .map(|t| t.eq_row_count_value(column, value) as f64)
 }
 
@@ -463,9 +463,7 @@ fn disjunction_rows(
     for leaf in &leaves {
         intervals.extend(leaf_intervals(leaf, &mut column)?);
     }
-    let Some(col) = column else {
-        return None;
-    };
+    let col = column?;
     let stats = table.column(&col)?;
     stats.value_counts.as_ref()?;
     Some(
