@@ -57,7 +57,36 @@ impl Executor for UpdateExec {
             return self.update_join(&join);
         }
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
+        // `SET _tidb_rowid = …`: TiDB only accepts an explicit row handle on a
+        // heap table with `tidb_opt_write_row_id`, otherwise 1105 (and a
+        // single-integer PK table has no such column, 1054).
+        if self
+            .stmt
+            .list
+            .iter()
+            .any(|assign| assign.column.eq_ignore_ascii_case("_tidb_rowid"))
+        {
+            crate::insert::check_write_row_id(&info)?;
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_ERROR,
+                "insert, update and replace statements for _tidb_rowid are not supported",
+            ));
+        }
         let col_names = col_names(&info);
+        // A heap / common-handle table exposes `_tidb_rowid` to predicates; the
+        // execute-time filter sees the scanned row's handle as that column.
+        let rowid_eval = !info.pk_is_handle;
+        let mut eval_names = col_names.clone();
+        if rowid_eval {
+            eval_names.push("_tidb_rowid".to_string());
+        }
+        let eval_row = |scanned: &crate::table_reader::ScannedRow| {
+            let mut values = scanned.values.clone();
+            if rowid_eval {
+                values.push(Datum::I64(scanned.handle));
+            }
+            values
+        };
         let lock = dml_row_lock(&self.txn)?;
         let filter = match &self.stmt.selection {
             Some(expr) => Some(pre_evaluate_dml_predicate(
@@ -80,7 +109,7 @@ impl Executor for UpdateExec {
         let mut matched = Vec::new();
         for scanned in &snapshot {
             if let Some(filter) = &filter
-                && !eval_filter(filter, &col_names, &scanned.values)?
+                && !eval_filter(filter, &eval_names, &eval_row(scanned))?
             {
                 continue;
             }

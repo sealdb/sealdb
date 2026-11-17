@@ -6,8 +6,8 @@ use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_BAD_NULL, ERR_DUP_ENTRY, ERR_FIELD_NOT_DEFAULT, ERR_FIELD_SPECIFIED_TWICE,
     ERR_INVALID_AUTO_RANDOM, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_PARTITION,
-    ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_ERROR,
+    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -53,7 +53,7 @@ impl InsertExec {
     fn replace_rows(
         &mut self,
         info: &sealdb_meta::TableInfo,
-        pending: Vec<Vec<Datum>>,
+        pending: Vec<PendingRow>,
         batched: bool,
     ) -> Result<()> {
         let lock = crate::update::dml_row_lock(&self.txn)?;
@@ -63,7 +63,7 @@ impl InsertExec {
         let mut affected = 0u64;
         let mut duplicates = 0u64;
         self.txn.with_txn(|txn| {
-            for values in pending {
+            for PendingRow { values, rowid } in pending {
                 let conflicts: Vec<usize> = existing
                     .iter()
                     .enumerate()
@@ -71,7 +71,7 @@ impl InsertExec {
                     .map(|(i, _)| i)
                     .collect();
                 if conflicts.is_empty() {
-                    let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
+                    let (handle, physical_id) = write_row(txn, &self.domain, info, &values, rowid)?;
                     existing.push(crate::table_reader::ScannedRow {
                         handle,
                         physical_id,
@@ -91,7 +91,7 @@ impl InsertExec {
                     crate::delete::apply_row_delete(txn, info, &row)?;
                     affected += 1;
                 }
-                let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
+                let (handle, physical_id) = write_row(txn, &self.domain, info, &values, rowid)?;
                 existing.push(crate::table_reader::ScannedRow {
                     handle,
                     physical_id,
@@ -143,7 +143,11 @@ impl Executor for InsertExec {
         });
         if self.select.is_some() {
             for (i, row) in source_rows.iter().enumerate() {
-                pending.push(map_insert_row(info, &self.stmt.columns, row, i + 1)?);
+                let rowid = rowid_override(&self.stmt.columns, row)?;
+                pending.push(PendingRow {
+                    values: map_insert_row(info, &self.stmt.columns, row, i + 1)?,
+                    rowid,
+                });
             }
         } else {
             // VALUES may hold scalar/IN/EXISTS subqueries (`INSERT ... VALUES
@@ -155,16 +159,12 @@ impl Executor for InsertExec {
                 Some(table.clone()),
             );
             for (i, row) in self.stmt.rows.iter().enumerate() {
-                pending.push(eval_insert_row(
-                    info,
-                    &self.stmt.columns,
-                    row,
-                    &mut subquery,
-                    i + 1,
-                )?);
+                let (values, rowid) =
+                    eval_insert_row(info, &self.stmt.columns, row, &mut subquery, i + 1)?;
+                pending.push(PendingRow { values, rowid });
             }
         }
-        for values in &mut pending {
+        for PendingRow { values, .. } in &mut pending {
             fill_auto_increment(&self.domain, info, values)?;
             fill_auto_random(&self.domain, info, values)?;
             enforce_not_null_columns(info, values, self.stmt.ignore)?;
@@ -189,7 +189,7 @@ impl Executor for InsertExec {
             let mut affected = 0u64;
             let mut duplicates = 0u64;
             self.txn.with_txn(|txn| {
-                for values in &pending {
+                for PendingRow { values, rowid } in &pending {
                     if let Some(idx) = existing
                         .iter()
                         .find_map(|row| index_conflict(info, &row.values, values))
@@ -202,7 +202,7 @@ impl Executor for InsertExec {
                         }
                         return Err(e);
                     }
-                    match write_row(txn, &self.domain, info, values) {
+                    match write_row(txn, &self.domain, info, values, *rowid) {
                         Ok((handle, physical_id)) => {
                             existing.push(crate::table_reader::ScannedRow {
                                 handle,
@@ -237,7 +237,7 @@ impl Executor for InsertExec {
         let mut existing = scan_table(&self.txn, info, lock, LockWait::Block, &physical)?;
         let names = crate::update::col_names(info);
         self.txn.with_txn(|txn| {
-            for values in pending {
+            for PendingRow { values, rowid } in pending {
                 match find_conflict(info, &existing, None, &values) {
                     Some((idx, _)) => {
                         let mut merged = existing[idx].values.clone();
@@ -259,7 +259,8 @@ impl Executor for InsertExec {
                         existing[idx].values = merged;
                     }
                     None => {
-                        let (handle, physical_id) = write_row(txn, &self.domain, info, &values)?;
+                        let (handle, physical_id) =
+                            write_row(txn, &self.domain, info, &values, rowid)?;
                         existing.push(crate::table_reader::ScannedRow {
                             handle,
                             physical_id,
@@ -303,7 +304,7 @@ fn eval_insert_row(
     row: &[sealdb_parser::ast::ExprNode],
     subquery: &mut SubqueryEvalCtx,
     row_no: usize,
-) -> Result<Vec<Datum>> {
+) -> Result<(Vec<Datum>, Option<i64>)> {
     let mut values = Vec::with_capacity(row.len());
     for (i, expr) in row.iter().enumerate() {
         // `DEFAULT` in VALUES: use the column default (NULL when none). A
@@ -318,7 +319,8 @@ fn eval_insert_row(
         }
         values.push(subquery.eval(expr, &[], &[])?);
     }
-    map_insert_row(info, columns, &values, row_no)
+    let rowid = rowid_override(columns, &values)?;
+    Ok((map_insert_row(info, columns, &values, row_no)?, rowid))
 }
 
 /// Column at VALUES position `i`, honouring an explicit column list.
@@ -338,9 +340,15 @@ fn column_at<'a>(
 
 /// TiDB resolves the explicit column list before touching any row: unknown
 /// names are `1054` and a repeated target is `1110`.
+///
+/// `_tidb_rowid` is a pseudo column of tables whose handle is not a single
+/// integer PRIMARY KEY. Writing it needs `tidb_opt_write_row_id`, and only a
+/// heap table (not a common handle) can actually store an explicit value.
 fn validate_insert_columns(info: &sealdb_meta::TableInfo, columns: &[String]) -> Result<()> {
     for (i, name) in columns.iter().enumerate() {
-        if !info
+        if is_tidb_rowid(name) {
+            check_write_row_id(info)?;
+        } else if !info
             .columns
             .iter()
             .any(|c| c.name.o().eq_ignore_ascii_case(name))
@@ -359,6 +367,30 @@ fn validate_insert_columns(info: &sealdb_meta::TableInfo, columns: &[String]) ->
                 format!("Column '{name}' specified twice"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn is_tidb_rowid(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_tidb_rowid")
+}
+
+/// Reject an explicit `_tidb_rowid` write the way TiDB does:
+/// * a single-integer PRIMARY KEY handle has no such column (`1054`);
+/// * a common handle cannot take one, and a heap table needs
+///   `tidb_opt_write_row_id` (`1105`).
+pub(crate) fn check_write_row_id(info: &sealdb_meta::TableInfo) -> Result<()> {
+    if info.pk_is_handle {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            "Unknown column '_tidb_rowid' in 'field list'",
+        ));
+    }
+    if info.common_handle || !sealdb_expression::allow_write_row_id() {
+        return Err(Error::new(
+            ERR_UNKNOWN_ERROR,
+            "insert, update and replace statements for _tidb_rowid are not supported",
+        ));
     }
     Ok(())
 }
@@ -544,9 +576,9 @@ fn map_insert_row(
 fn filter_target_partitions(
     info: &sealdb_meta::TableInfo,
     names: &[String],
-    pending: Vec<Vec<Datum>>,
+    pending: Vec<PendingRow>,
     ignore: bool,
-) -> Result<Vec<Vec<Datum>>> {
+) -> Result<Vec<PendingRow>> {
     let Some(part) = info.partition.as_ref() else {
         return Ok(pending);
     };
@@ -567,8 +599,8 @@ fn filter_target_partitions(
         targets.extend(matches);
     }
     let mut kept = Vec::with_capacity(pending.len());
-    for values in pending {
-        let target = match locate_partition_for_row(info, &values) {
+    for row in pending {
+        let target = match locate_partition_for_row(info, &row.values) {
             Ok(target) => target,
             Err(e) if ignore && e.code == ERR_NO_PARTITION_FOR_GIVEN_VALUE => {
                 sealdb_expression::note_warning(e.code, e.message);
@@ -577,7 +609,7 @@ fn filter_target_partitions(
             Err(e) => return Err(e),
         };
         if targets.contains(&target) {
-            kept.push(values);
+            kept.push(row);
         } else if ignore {
             sealdb_expression::note_warning(
                 ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
@@ -1005,11 +1037,47 @@ fn invalid_enum_set_value(v: &Datum, col: &str, fallback: Datum) -> Result<Datum
     Ok(fallback)
 }
 
+/// One `INSERT`/`REPLACE` row after column mapping: the values aligned to the
+/// table's column offsets, plus an explicit `_tidb_rowid` when the statement
+/// named one (`tidb_opt_write_row_id`).
+struct PendingRow {
+    values: Vec<Datum>,
+    rowid: Option<i64>,
+}
+
+/// Parse the statement's `_tidb_rowid` value for one row. `NULL` means "let the
+/// allocator pick one" (`1242`-free), the literal `0` does too unless
+/// `NO_AUTO_VALUE_ON_ZERO` is set.
+fn rowid_override(columns: &[String], row: &[Datum]) -> Result<Option<i64>> {
+    let Some(idx) = columns.iter().position(|name| is_tidb_rowid(name)) else {
+        return Ok(None);
+    };
+    let Some(value) = row.get(idx) else {
+        return Ok(None);
+    };
+    match value {
+        Datum::Null => Ok(None),
+        Datum::I64(v) => Ok(Some(*v)),
+        Datum::U64(v) => Ok(Some(*v as i64)),
+        Datum::Year(v) => Ok(Some(*v)),
+        other => {
+            let text = other.display();
+            text.trim().parse::<i64>().map(Some).map_err(|_| {
+                Error::new(
+                    ERR_TRUNCATED_WRONG_VALUE,
+                    format!("Incorrect integer value: '{text}' for column '_tidb_rowid' at row 1"),
+                )
+            })
+        }
+    }
+}
+
 fn write_row(
     txn: &mut dyn sealdb_kv::Transaction,
     domain: &Domain,
     info: &sealdb_meta::TableInfo,
     values: &[Datum],
+    explicit_rowid: Option<i64>,
 ) -> Result<(i64, i64)> {
     let col_ids: Vec<_> = info.columns.iter().map(|c| c.id).collect();
     // Integer primary-key handle only when `pk_is_handle`; otherwise allocate
@@ -1021,7 +1089,29 @@ fn write_row(
         .find(|idx| idx.primary)
         .and_then(|idx| idx.columns.first())
         .map(|c| c.offset as usize);
-    let handle = if info.pk_is_handle {
+    let handle = if let Some(explicit) = explicit_rowid {
+        // `_tidb_rowid` given by the statement (heap table only). `0` still
+        // asks for an allocated id unless `NO_AUTO_VALUE_ON_ZERO` is set.
+        if explicit == 0 && !sealdb_expression::sql_mode_flag("NO_AUTO_VALUE_ON_ZERO") {
+            if info.shard_row_id_bits > 0 {
+                domain.next_sharded_handle(info.id, info.shard_row_id_bits)?
+            } else {
+                domain.next_handle(info.id)?
+            }
+        } else {
+            // Keep the allocator ahead of an explicit id so a later implicit
+            // insert cannot reuse it (TiDB `bumpRowID`). A sharded table only
+            // tracks the low `64 - bits` bits.
+            let bits = info.shard_row_id_bits.min(63) as u32;
+            let bump = if bits == 0 {
+                explicit
+            } else {
+                ((explicit as u64) << bits >> bits) as i64
+            };
+            domain.bump_handle(info.id, bump)?;
+            explicit
+        }
+    } else if info.pk_is_handle {
         match pk_offset.and_then(|off| values.get(off)) {
             Some(Datum::I64(v)) => *v,
             Some(Datum::Year(v)) => *v,

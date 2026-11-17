@@ -109,6 +109,21 @@ impl Mutator {
         self.remove_key(key);
     }
 
+    /// Raise the `_tidb_rowid` allocation counter after an explicit handle was
+    /// written, so a later implicit insert never reuses it.
+    pub fn bump_handle(&mut self, table_id: i64, value: i64) -> Result<()> {
+        let key = encode_string_data_key(format!("NextHandle:{table_id}").as_bytes()).into_bytes();
+        let current = self
+            .get(&key)
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if value > current {
+            self.put(key, value.to_string().into_bytes());
+        }
+        Ok(())
+    }
+
     /// TiDB `AutoIDAllocator` for a table's `AUTO_INCREMENT` column. Explicit
     /// user values above the counter bump it via [`Mutator::bump_auto_id`].
     pub fn alloc_auto_id(&mut self, table_id: i64) -> Result<i64> {

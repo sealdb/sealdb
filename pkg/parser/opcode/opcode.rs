@@ -22,6 +22,10 @@ pub enum Op {
     /// TiDB `opcode.LeftShift` / `RightShift` (`<<`, `>>`).
     LeftShift,
     RightShift,
+    /// TiDB `opcode.BitAnd` / `BitOr` / `BitXor` (`&`, `|`, `^`).
+    BitAnd,
+    BitOr,
+    BitXor,
     Not,
     /// TiDB `opcode.Not2` — MySQL `!` (same truth table as `NOT`).
     Not2,
@@ -50,6 +54,9 @@ impl Op {
             Op::LogicXor => "XOR",
             Op::LeftShift => "<<",
             Op::RightShift => ">>",
+            Op::BitAnd => "&",
+            Op::BitOr => "|",
+            Op::BitXor => "^",
             Op::Not => "NOT",
             Op::Not2 => "!",
             Op::BitNeg => "~",

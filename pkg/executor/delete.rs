@@ -69,6 +69,13 @@ impl Executor for DeleteExec {
         }
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
         let names = col_names(&info);
+        // Heap / common-handle rows expose their handle as `_tidb_rowid` to the
+        // execute-time filter.
+        let rowid_eval = !info.pk_is_handle;
+        let mut eval_names = names.clone();
+        if rowid_eval {
+            eval_names.push("_tidb_rowid".to_string());
+        }
         let lock = dml_row_lock(&self.txn)?;
         let filter = match &self.stmt.selection {
             Some(expr) => Some(pre_evaluate_dml_predicate(
@@ -91,10 +98,14 @@ impl Executor for DeleteExec {
         crate::update::enforce_truncating_comparisons(&info, filter.as_ref(), self.stmt.ignore)?;
         let mut matched = Vec::new();
         for scanned in rows {
-            if let Some(filter) = &filter
-                && !eval_filter(filter, &names, &scanned.values)?
-            {
-                continue;
+            if let Some(filter) = &filter {
+                let mut values = scanned.values.clone();
+                if rowid_eval {
+                    values.push(Datum::I64(scanned.handle));
+                }
+                if !eval_filter(filter, &eval_names, &values)? {
+                    continue;
+                }
             }
             matched.push(scanned);
         }

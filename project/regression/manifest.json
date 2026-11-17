@@ -966,7 +966,7 @@
     {
       "name": "executor/rowid",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/rowid.test",
       "result": "r/executor/rowid.result",
       "has_result": true,

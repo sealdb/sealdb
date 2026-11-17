@@ -145,6 +145,9 @@ pub struct Session {
     autocommit: Mutex<bool>,
     /// TiDB `allow_auto_random_explicit_insert` (default OFF).
     allow_auto_random_explicit_insert: Mutex<bool>,
+    /// TiDB `tidb_opt_write_row_id` (default OFF): INSERT/REPLACE/UPDATE may
+    /// name `_tidb_rowid` explicitly on a heap table.
+    write_row_id: Mutex<bool>,
     /// TiDB `tidb_enable_auto_increment_in_generated` (default OFF).
     enable_auto_increment_in_generated: Mutex<bool>,
     /// TiDB `tidb_enable_external_ts_read` (default OFF): when ON, a new read
@@ -248,6 +251,7 @@ impl Session {
             window_concurrency: Mutex::new(sealdb_expression::DEFAULT_WINDOW_CONCURRENCY),
             autocommit: Mutex::new(true),
             allow_auto_random_explicit_insert: Mutex::new(false),
+            write_row_id: Mutex::new(false),
             enable_auto_increment_in_generated: Mutex::new(false),
             enable_external_ts_read: Mutex::new(globals.enable_external_ts_read),
             external_ts: Mutex::new(None),
@@ -1798,6 +1802,7 @@ impl Session {
             .allow_auto_random_explicit_insert
             .lock()
             .expect("session allow_auto_random lock");
+        let allow_write_row_id = *self.write_row_id.lock().expect("session write row id lock");
         let allow_auto_inc_in_generated = *self
             .enable_auto_increment_in_generated
             .lock()
@@ -1816,7 +1821,10 @@ impl Session {
                                             // TiDB allocates a fresh memory tracker per query.
                                             sealdb_expression::reset_query_mem_usage();
                                             self.probe_plan_cache(stmt);
-                                            ExecutorBuilder::run(exec)
+                                            sealdb_expression::with_allow_write_row_id(
+                                                allow_write_row_id,
+                                                || ExecutorBuilder::run(exec),
+                                            )
                                         })
                                     })
                                 })
@@ -4225,6 +4233,33 @@ fn parse_set_resource_group(raw_sql: &str) -> Option<String> {
     (!name.is_empty()).then_some(name.to_ascii_lowercase())
 }
 
+/// `SET var = (SELECT …)`: TiDB evaluates the parenthesized query and assigns
+/// its first cell — e.g. `SET sql_mode=(SELECT CONCAT(@@sql_mode, ',X'))`.
+fn set_value_from_select(session: &Session, raw: &str) -> Option<Result<String>> {
+    let inner = raw.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let Ok(stmt) = Parser::new().parse_one_stmt(inner) else {
+        return None;
+    };
+    let Statement::Select(select) = stmt else {
+        return None;
+    };
+    if select.from.is_some() || select.from_item.is_some() || !select.joins.is_empty() {
+        return Some(session.execute_stmt(inner).map(|result| {
+            result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .map(|datum| datum.display())
+                .unwrap_or_else(|| "NULL".to_string())
+        }));
+    }
+    let [field] = select.fields.as_slice() else {
+        return None;
+    };
+    let expr = subst_user_vars_in_expr(session, &field.expr);
+    Some(sealdb_expression::eval_expr(&expr).map(|datum| datum.display()))
+}
+
 /// RHS text of a `SET` assignment. `SET GLOBAL tidb_external_ts =
 /// @@tidb_current_ts` evaluates the referenced system variable; everything
 /// else keeps the raw text (stripped of quoting) for the per-variable parsers.
@@ -4296,7 +4331,10 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
             continue;
         }
         let name = a.name.trim_start_matches('@').to_ascii_lowercase();
-        let value = set_assignment_value(session, &a.value);
+        let value = match set_value_from_select(session, &a.value) {
+            Some(value) => value?,
+            None => set_assignment_value(session, &a.value),
+        };
         let mut record_value = value.clone();
         if a.scope == SetVarScope::Global {
             let mut global_warnings = apply_set_global(session, &name, &value)?;
@@ -4556,6 +4594,17 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .allow_auto_random_explicit_insert
                     .lock()
                     .expect("session allow_auto_random lock") = on;
+            }
+            "tidb_opt_write_row_id" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    false
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .write_row_id
+                    .lock()
+                    .expect("session write row id lock") = on;
             }
             "tidb_enable_auto_increment_in_generated" => {
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -5436,6 +5485,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 .allow_auto_random_explicit_insert
                 .lock()
                 .expect("session allow_auto_random lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
+        "tidb_opt_write_row_id" => {
+            if *session
+                .write_row_id
+                .lock()
+                .expect("session write row id lock")
             {
                 "1".into()
             } else {

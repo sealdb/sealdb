@@ -752,6 +752,16 @@ impl Domain {
         Ok(())
     }
 
+    /// Raise the `_tidb_rowid` allocator after an explicitly written handle.
+    pub fn bump_handle(&self, table_id: i64, value: i64) -> Result<()> {
+        let mut inner = self.inner.lock().expect("domain handle lock");
+        inner.meta.bump_handle(table_id, value)?;
+        if !inner.defer_persist {
+            persist_meta(self.storage.as_ref(), &mut inner.meta)?;
+        }
+        Ok(())
+    }
+
     /// Clone Mutator + InfoSchema as they are now, before in-txn DDL.
     pub fn schema_snap(&self) -> SchemaSnap {
         let inner = self.inner.lock().expect("domain schema snap lock");

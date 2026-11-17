@@ -12260,6 +12260,9 @@ fn lower_binary_op(op: &BinaryOperator) -> Result<Op> {
         BinaryOperator::Xor => Op::LogicXor,
         BinaryOperator::PGBitwiseShiftLeft => Op::LeftShift,
         BinaryOperator::PGBitwiseShiftRight => Op::RightShift,
+        BinaryOperator::BitwiseAnd => Op::BitAnd,
+        BinaryOperator::BitwiseOr => Op::BitOr,
+        BinaryOperator::BitwiseXor => Op::BitXor,
         // MySQL/TiDB default (no PIPES_AS_CONCAT): `||` is logical OR.
         // sqlparser exposes it as StringConcat; concat mode is a later sql_mode gap.
         BinaryOperator::StringConcat => Op::LogicOr,

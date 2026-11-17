@@ -3781,6 +3781,53 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `executor/rowid`（`_tidb_rowid` 可写/导出、`tidb_opt_write_row_id`
     会话变量与 shard_row_id_bits 交互）。
 
+### 2026-11-18（`executor/rowid` 转绿：`_tidb_rowid` 显式写入、`tidb_opt_write_row_id`、花式行号运算符）
+
+- **Phase**: R7 `executor/rowid` → green（Mem + TiKV 双通过）
+- **完成**:
+  - INSERT / REPLACE 显式列名允许 `_tidb_rowid`：`PendingRow` 携带
+    可选显式 handle，`write_row` 直接采用该值；`NULL` 与（未设
+    `NO_AUTO_VALUE_ON_ZERO` 时的）`0` 仍走分配器，显式非零值通过新增
+    `Domain::bump_handle` / `Mutator::bump_handle` 抬高 `NextHandle`
+    计数，后续隐式插入不会复用（shard 表只 bump 低 `64-bits` 位）。
+  - 权限/可用性口径：`pk_is_handle`（单整型主键）表没有该列 →
+    `1054 Unknown column '_tidb_rowid' in 'field list'`；common handle
+    表或未开启会话变量 `tidb_opt_write_row_id` →
+    `1105 insert, update and replace statements for _tidb_rowid are not supported`。
+  - 会话变量 `tidb_opt_write_row_id` 落地：session 字段 + `SET`
+    （含 `SET @@tidb_opt_write_row_id = true` / `default`）+ 读回，
+    executor 通过 `sealdb_expression::with_allow_write_row_id` 线程局部开关读取。
+  - UPDATE / DELETE 的执行期谓词把扫描行的 handle 作为 `_tidb_rowid`
+    参与求值（heap 与 common handle 表），`where _tidb_rowid = 2` 不再报 1054；
+    `SET _tidb_rowid = …` 按上一条规则报 1105 / 1054。
+  - 表达式层补齐 `&` / `|` / `^`（`Op::BitAnd/BitOr/BitXor`，sqlparser
+    `BitwiseAnd/BitwiseOr/BitwiseXor`，按无符号 64 位求值）与字符串函数
+    `REPLACE(str, from, to)`（`from` 为空时原样返回）。
+  - `SET var = (SELECT …)` 现在会真正求值子查询（含 `@@sysvar` 替换），
+    使 `SET sql_mode=(SELECT CONCAT(@@sql_mode,',NO_AUTO_VALUE_ON_ZERO'))`
+    生效，也顺带修正 `SET @u = (SELECT @@x)` 一类写法。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t executor/rowid --status pending`
+    → `PASS: memory=1 tikv=1 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=100 tikv=99 skipped=155`（`executor/adapter` 为 `skip_tikv`）
+  - `cargo test -p sealdb-expression -p sealdb-executor -p sealdb-meta -p sealdb-domain`
+    → 全通过
+  - manifest：`executor/rowid` → `green`，green 99→100
+    （R7 34→35，pending 136→135）。
+- **阻塞/风险**:
+  - `UPDATE … SET _tidb_rowid = …`（heap 表 + `tidb_opt_write_row_id=ON`）
+    目前仍返回 1105：改 handle 需要删旧行 + 按新 handle 重写索引项，
+    当前语料未覆盖，先保留显式拒绝，避免静默丢写。
+  - common handle 表（如 `binary` 主键）在存储层仍用独立 rowid 作为行 key，
+    `_tidb_rowid` 只是该 handle 的别名；与 TiDB 的 PK 前缀编码仍有差异。
+  - 位运算按 `f64` 回退转换非整数操作数，未实现 TiDB 的字符串→整型前缀
+    解析告警（`1292`），后续表达式语料若覆盖需补。
+- **下一步**:
+  - `planner/core/partial_order_topn`（前缀索引部分有序 + TopN 下推，
+    与 `order_index` hint 的 1815 冲突校验）。
+  - `planner/core/casetest/expression_rewriter`（表达式重写规则的形状对齐）。
+
 ## 7. 更新模板
 
 每次更新追加一条：

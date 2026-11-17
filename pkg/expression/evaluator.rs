@@ -30,6 +30,9 @@ thread_local! {
     static INDEX_DST_DOUBLE: RefCell<bool> = const { RefCell::new(false) };
     /// Session `@@allow_auto_random_explicit_insert` (default OFF).
     static ALLOW_AUTO_RANDOM_EXPLICIT_INSERT: Cell<bool> = const { Cell::new(false) };
+    /// Session `@@tidb_opt_write_row_id` (default OFF): DML may name
+    /// `_tidb_rowid` as an explicit write target.
+    static ALLOW_WRITE_ROW_ID: Cell<bool> = const { Cell::new(false) };
     /// Session `@@tidb_enable_auto_increment_in_generated` (default OFF).
     static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
     /// Session `@@default_week_format` (default 0).
@@ -73,6 +76,22 @@ pub fn with_allow_auto_random_explicit_insert<T>(allow: bool, f: impl FnOnce() -
 
 pub fn allow_auto_random_explicit_insert() -> bool {
     ALLOW_AUTO_RANDOM_EXPLICIT_INSERT.with(Cell::get)
+}
+
+/// Run `f` under `@@tidb_opt_write_row_id` from the session.
+pub fn with_allow_write_row_id<T>(allow: bool, f: impl FnOnce() -> T) -> T {
+    ALLOW_WRITE_ROW_ID.with(|cell| {
+        let prev = cell.get();
+        cell.set(allow);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+/// Whether DML may write `_tidb_rowid` explicitly.
+pub fn allow_write_row_id() -> bool {
+    ALLOW_WRITE_ROW_ID.with(Cell::get)
 }
 
 /// Run `f` with index-path DST warning doubling (types/time indexed selects).
@@ -820,6 +839,27 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
             };
             Ok(Datum::U64(out))
         }
+        Op::BitAnd | Op::BitOr | Op::BitXor => {
+            if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
+                return Ok(Datum::Null);
+            }
+            // MySQL evaluates bit operators on unsigned 64-bit integers.
+            let l = match &left {
+                Datum::U64(v) => *v,
+                Datum::I64(v) => *v as u64,
+                other => other.as_f64()? as i64 as u64,
+            };
+            let r = match &right {
+                Datum::U64(v) => *v,
+                Datum::I64(v) => *v as u64,
+                other => other.as_f64()? as i64 as u64,
+            };
+            Ok(Datum::U64(match expr.op {
+                Op::BitAnd => l & r,
+                Op::BitOr => l | r,
+                _ => l ^ r,
+            }))
+        }
         _ => Err(Error::unsupported(format!("binary {}", expr.op.restore()))),
     }
 }
@@ -1361,6 +1401,40 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             let mut out = Vec::with_capacity(out_len);
             for _ in 0..count {
                 out.extend_from_slice(&bytes);
+            }
+            Ok(Datum::Bytes(out))
+        }
+        // MySQL `REPLACE(str, from, to)`: replace every occurrence of `from`.
+        // A NULL argument or an empty `from` leaves `str` unchanged (TiDB).
+        "REPLACE" => {
+            if func.args.len() != 3 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "REPLACE requires 3 arguments",
+                ));
+            }
+            let src = eval_expr_with_row(&func.args[0], schema, row)?;
+            let from = eval_expr_with_row(&func.args[1], schema, row)?;
+            let to = eval_expr_with_row(&func.args[2], schema, row)?;
+            if src.is_null() || from.is_null() || to.is_null() {
+                return Ok(Datum::Null);
+            }
+            let src = src.as_bytes();
+            let from = from.as_bytes();
+            if from.is_empty() {
+                return Ok(Datum::Bytes(src));
+            }
+            let to = to.as_bytes();
+            let mut out = Vec::with_capacity(src.len());
+            let mut i = 0;
+            while i < src.len() {
+                if src[i..].starts_with(&from) {
+                    out.extend_from_slice(&to);
+                    i += from.len();
+                } else {
+                    out.push(src[i]);
+                    i += 1;
+                }
             }
             Ok(Datum::Bytes(out))
         }
