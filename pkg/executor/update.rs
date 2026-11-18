@@ -754,7 +754,7 @@ fn fk_failure_body(
 
 /// Child-side FK check for one post-update row (`1452`): every non-NULL FK
 /// value must match a row in the referenced table.
-fn fk_child_violation(
+pub(crate) fn fk_child_violation(
     domain: &Domain,
     txn: &Arc<TxnHandle>,
     db: &str,
@@ -838,7 +838,7 @@ fn fk_child_violation(
 
 /// Parent-side FK check for one updated row (`1451`): if a key column that a
 /// child references changes, no child row may still reference the old value.
-fn fk_parent_violation(
+pub(crate) fn fk_parent_violation(
     domain: &Domain,
     txn: &Arc<TxnHandle>,
     info: &TableInfo,
@@ -933,7 +933,7 @@ fn assigned_columns(assignments: &[Assignment]) -> HashSet<String> {
 /// `UPDATE IGNORE` drops the offending row instead of failing: child-side
 /// violations warn (`1452`), parent-side ones are skipped silently (TiDB does
 /// not surface a warning for the referenced-row check).
-fn apply_fk_outcome(violation: Option<FkViolation>, ignore: bool) -> Result<bool> {
+pub(crate) fn apply_fk_outcome(violation: Option<FkViolation>, ignore: bool) -> Result<bool> {
     let Some((code, message)) = violation else {
         return Ok(false);
     };
@@ -1246,7 +1246,11 @@ fn reject_null_not_null(
     for (col, value) in info.columns.iter().zip(values.iter_mut()) {
         if value.is_null() && col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0 {
             let msg = format!("Column '{}' cannot be null", col.name.o());
-            if ignore {
+            let strict = sealdb_expression::sql_mode_flag("STRICT_TRANS_TABLES")
+                || sealdb_expression::sql_mode_flag("STRICT_ALL_TABLES");
+            if !sealdb_expression::strict_not_null_check() {
+                *value = crate::insert::implicit_zero(&col.field_type);
+            } else if ignore || !strict {
                 sealdb_expression::note_warning(ERR_BAD_NULL, msg);
                 *value = crate::insert::implicit_zero(&col.field_type);
             } else {

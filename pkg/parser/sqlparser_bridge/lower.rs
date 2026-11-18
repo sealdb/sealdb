@@ -71,9 +71,9 @@ fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
     )
 }
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
-    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG,
-    ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result,
+    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_ILLEGAL_VALUE_FOR_TYPE, ERR_INCORRECT_USAGE,
+    ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE,
+    ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -1481,6 +1481,42 @@ fn rewrite_bit_literal_members(list: &str) -> String {
                 continue;
             }
         }
+        // `0x61` / `X'61'`: TiDB treats a hex literal member as its byte
+        // sequence, the same as a bit literal.
+        if !ident_before && bytes[i] == b'0' && matches!(bytes.get(i + 1), Some(b'x') | Some(b'X'))
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end > start
+                && !is_ident_char(bytes.get(end).copied().unwrap_or(b' '))
+                && let Some(literal) = hex_member_bytes(&list[start..end])
+            {
+                out.push_str(&literal);
+                i = end;
+                continue;
+            }
+        }
+        if !ident_before
+            && (bytes[i] == b'x' || bytes[i] == b'X')
+            && bytes.get(i + 1) == Some(&b'\'')
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            if end > start
+                && bytes.get(end) == Some(&b'\'')
+                && let Some(literal) = hex_member_bytes(&list[start..end])
+            {
+                out.push_str(&literal);
+                i = end + 1;
+                continue;
+            }
+        }
         let ch = list[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
@@ -1502,6 +1538,26 @@ fn bit_member_bytes(bits: &str) -> Option<String> {
     let mut out = String::from("'");
     for index in (0..byte_len).rev() {
         let byte = (value >> (index * 8)) as u8;
+        match byte {
+            b'\'' => out.push_str("''"),
+            b'\\' => out.push_str("\\\\"),
+            _ => out.push(byte as char),
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
+/// `0x61` / `X'61'` → a quoted literal holding the hex digits' bytes.
+fn hex_member_bytes(hex: &str) -> Option<String> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = String::from("'");
+    let digits = hex.as_bytes();
+    for pair in digits.chunks(2) {
+        let text = std::str::from_utf8(pair).ok()?;
+        let byte = u8::from_str_radix(text, 16).ok()?;
         match byte {
             b'\'' => out.push_str("''"),
             b'\\' => out.push_str("\\\\"),
@@ -11670,8 +11726,12 @@ fn lower_table_charset_collate(
         };
         let text = text.trim_matches(['\'', '"']).to_string();
         match name.as_str() {
-            "CHARSET" => charset = Some(text.to_ascii_lowercase()),
-            "COLLATE" => collate = Some(text),
+            // `CHARSET` is shorthand for `CHARACTER SET`; a leading `DEFAULT`
+            // is noise in the table options.
+            "CHARSET" | "CHARACTER SET" | "DEFAULT CHARSET" | "DEFAULT CHARACTER SET" => {
+                charset = Some(text.to_ascii_lowercase())
+            }
+            "COLLATE" | "DEFAULT COLLATE" => collate = Some(text),
             _ => {}
         }
     }
@@ -12616,9 +12676,16 @@ fn lower_value(value: &Value) -> Result<Datum> {
             // token text so we must not force i64 when `e`/`E` is present.
             // Integers wider than i64 become u64 then Decimal (precise_types).
             if n.contains('e') || n.contains('E') {
-                n.parse::<f64>()
-                    .map(Datum::F64)
-                    .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
+                let parsed = n
+                    .parse::<f64>()
+                    .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))?;
+                if parsed.is_infinite() {
+                    return Err(Error::new(
+                        ERR_ILLEGAL_VALUE_FOR_TYPE,
+                        format!("Illegal double '{n}' value found during parsing"),
+                    ));
+                }
+                Ok(Datum::F64(parsed))
             } else if n.contains('.') {
                 // TiDB keeps a decimal literal's precision when the double
                 // cannot round-trip it: `20201030082133.455555` stays a DECIMAL
@@ -13319,7 +13386,13 @@ fn data_type_name(tp: &DataType) -> String {
         // MySQL `FLOAT` is float32; `DOUBLE`/`REAL` stay float64.
         DataType::Float(_) => "FLOAT".to_string(),
         DataType::Double(_) | DataType::Real => "DOUBLE".to_string(),
-        DataType::Decimal(_) | DataType::Numeric(_) => "DECIMAL".to_string(),
+        DataType::Decimal(info) | DataType::Numeric(info) => match info {
+            sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                format!("DECIMAL({p},{s})")
+            }
+            sqlparser::ast::ExactNumberInfo::Precision(p) => format!("DECIMAL({p})"),
+            sqlparser::ast::ExactNumberInfo::None => "DECIMAL".to_string(),
+        },
         // `CAST(x AS CHAR(32))` keeps its length: a view column created from
         // it is `varchar(32)`, not a bare `varchar` (TiDB `Flen`/`Decimal`).
         DataType::Char(len) => match len {

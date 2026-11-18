@@ -100,25 +100,83 @@ impl MyDecimal {
             return self.clone();
         }
         let scale = scale as usize;
-        let (int_part, frac) = match self.digits.split_once('.') {
+        let (int_part, mut frac) = match self.digits.split_once('.') {
             Some((i, f)) => (i.to_string(), f.to_string()),
             None => (self.digits.clone(), String::new()),
         };
+        if frac.len() < scale {
+            frac.push_str(&"0".repeat(scale - frac.len()));
+        }
+        // Reducing the scale rounds (MySQL `MyDecimal.Round`, half away from
+        // zero): `cast(999.99 as decimal(5,1))` is `1000.0`.
+        let mut round_up = frac.as_bytes().get(scale).is_some_and(|b| *b >= b'5');
+        let mut whole: Vec<u8> = int_part.bytes().chain(frac.bytes().take(scale)).collect();
+        if round_up {
+            let mut index = whole.len();
+            while index > 0 {
+                index -= 1;
+                if whole[index] == b'9' {
+                    whole[index] = b'0';
+                } else {
+                    whole[index] += 1;
+                    round_up = false;
+                    break;
+                }
+            }
+            if round_up {
+                whole.insert(0, b'1');
+            }
+        }
+        let int_len = whole.len().saturating_sub(scale);
+        let mut int_out = String::from_utf8_lossy(&whole[..int_len]).into_owned();
+        while int_out.len() > 1 && int_out.starts_with('0') {
+            int_out.remove(0);
+        }
+        if int_out.is_empty() {
+            int_out.push('0');
+        }
         let digits = if scale == 0 {
-            int_part
-        } else if frac.len() >= scale {
-            format!("{int_part}.{}", &frac[..scale])
+            int_out
+        } else if int_len == whole.len() {
+            // No fractional digits survived (e.g. the value was an integer).
+            format!("{int_out}.{}", "0".repeat(scale))
         } else {
-            format!(
-                "{int_part}.{frac}{:0>width$}",
-                "",
-                width = scale - frac.len()
-            )
+            format!("{int_out}.{}", String::from_utf8_lossy(&whole[int_len..]))
         };
         Self {
             negative: self.negative,
             digits,
         }
+    }
+
+    /// Saturate to `DECIMAL(precision, scale)`: an integer part wider than
+    /// `precision - scale` becomes all nines (TiDB `MyDecimal.Round` overflow
+    /// path), preserving the sign and the fractional scale.
+    pub fn clamped(&self, precision: i32, scale: i32) -> Self {
+        if precision <= 0 || scale < 0 {
+            return self.clone();
+        }
+        let int_limit = (precision - scale).max(0) as usize;
+        let int_digits = self
+            .digits
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('0')
+            .len();
+        if int_digits <= int_limit {
+            return self.clone();
+        }
+        let mut text = String::new();
+        if self.negative {
+            text.push('-');
+        }
+        text.push_str(&"9".repeat(int_limit));
+        if scale > 0 {
+            text.push('.');
+            text.push_str(&"9".repeat(scale as usize));
+        }
+        Self::parse(&text).unwrap_or_else(|_| Self::from_i64(0))
     }
 
     /// Memcomparable integer encoding of the decimal's integer value.

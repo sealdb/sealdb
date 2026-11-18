@@ -496,6 +496,27 @@ fn add_column(
         column.name.clone(),
         field_type_from_name(&column.type_name)?,
     );
+    // Column charset/collation behave like `CREATE TABLE`: an explicit charset
+    // pins its default collation, otherwise the table's charset is inherited.
+    if let Some(charset) = &column.charset {
+        new_col.field_type.charset = charset.to_ascii_lowercase();
+        new_col.field_type.collate =
+            sealdb_parser::charset::Collation::default_for_charset(charset).name;
+    }
+    if let Some(collate) = &column.collate {
+        let parsed = sealdb_parser::charset::Collation::parse(collate);
+        new_col.field_type.charset = parsed.charset;
+        new_col.field_type.collate = parsed.name;
+    }
+    if column.charset.is_none()
+        && column.collate.is_none()
+        && new_col.field_type.charset != "binary"
+        && new_col.field_type.is_character_type()
+        && !info.charset.is_empty()
+    {
+        new_col.field_type.charset = info.charset.clone();
+        new_col.field_type.collate = info.collate.clone();
+    }
     // A parenthesized expression default must be replica-safe (TiDB 1674);
     // `ALTER TABLE … ADD COLUMN … DEFAULT (uuid())` is rejected before any row
     // is rewritten.
@@ -553,6 +574,12 @@ fn add_column(
     meta.gen_schema_version()?;
     if let Some(value) = default_value {
         backfill_added_column(storage, &info, &old_types, new_id, value)?;
+    } else if info
+        .columns
+        .iter()
+        .any(|c| c.id == new_id && c.generated_expr.is_some())
+    {
+        backfill_generated_columns(storage, &info, &old_types, &[new_id])?;
     }
     Ok(())
 }
@@ -595,6 +622,47 @@ fn backfill_added_column(
         }
     }
     txn.commit()
+}
+
+/// Cast a generated-column value for storage. Generated columns always take
+/// the charset-replacement form (`?`) instead of failing on characters the
+/// column charset cannot represent.
+fn cast_generated_value(
+    value: sealdb_types::Datum,
+    col: &ColumnInfo,
+) -> Result<sealdb_types::Datum> {
+    let out = value.cast(&col.field_type)?;
+    if !col.field_type.is_character_type() {
+        return Ok(out);
+    }
+    let charset = col.field_type.charset.to_ascii_lowercase();
+    if charset == "binary" {
+        return Ok(out);
+    }
+    let sealdb_types::Datum::Bytes(bytes) = &out else {
+        return Ok(out);
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(out);
+    };
+    let converted: String = text
+        .chars()
+        .map(|ch| {
+            let representable = match charset.as_str() {
+                "ascii" => ch.is_ascii(),
+                "utf8" => ch.len_utf8() <= 3,
+                "gbk" => {
+                    ch.is_ascii()
+                        || sealdb_parser::charset::encoding_gbk::UNICODE_GBK_SUBSET
+                            .iter()
+                            .any(|(c, _)| *c == ch)
+                }
+                _ => true,
+            };
+            if representable { ch } else { '?' }
+        })
+        .collect();
+    Ok(sealdb_types::Datum::Bytes(converted.into_bytes()))
 }
 
 /// Backfill newly added expression-index hidden columns.
@@ -661,7 +729,7 @@ pub(crate) fn backfill_generated_columns(
                     continue;
                 }
                 let value = sealdb_expression::eval_expr_with_row(expr, &schema, &values)?;
-                let value = value.cast(&col.field_type)?;
+                let value = cast_generated_value(value, col)?;
                 values[offset_of(*id)] = value.clone();
                 col_ids.push(*id);
                 out.push(value);

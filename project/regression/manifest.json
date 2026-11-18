@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 106,
+      "green": 107,
       "in_progress": 9,
       "local": 8,
-      "pending": 129
+      "pending": 128
     },
     "by_wave": {
       "D": 2,
@@ -796,7 +796,7 @@
     {
       "name": "executor/insert",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/insert.test",
       "result": "r/executor/insert.result",
       "has_result": true,

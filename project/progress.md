@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-18（green 104 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-18（green 107 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -4086,6 +4086,52 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - JSON 规范化在列赋值时重新序列化，大文档有额外解析成本。
 - **下一步**:
   - `executor/insert`（`INSERT IGNORE` / `REPLACE` 与 FK、严格模式共用同一套 cast）。
+
+### 2026-11-18（`executor/insert` 转绿：ODKU 计数 / LAST_INSERT_ID / NOT NULL 开关 / TIMESTAMP 时区）
+
+- **Phase**: R7 `executor/insert` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `ON DUPLICATE KEY UPDATE` 的 OK-packet info：仅批量源（多行 VALUES / INSERT … SELECT）
+    输出 `Records: N  Duplicates: M  Warnings: K`；`Duplicates` 只统计更新后值发生变化的冲突行，
+    affected rows 对每次变化计 2（冲突对象是本语句先前插入的行也按一次更新计）。
+  - `LAST_INSERT_ID()`：INSERT 成功写入的 AUTO_INCREMENT 行把首个生成 id 发布到 session；
+    被 ODKU 改成 UPDATE 的行或显式 AUTO_RANDOM 值不发布。
+  - `DEFAULT(col)` 出现在 VALUES 中时按列名取默认值（与值位置无关）。
+  - 新增 session `tidb_enable_strict_not_null_check`（默认 ON，支持 SET/GET/SHOW）：
+    OFF 时显式 NULL 静默写隐式零值；ON 且非严格 `sql_mode` 时批量源降级为 warning 1048，
+    单行 VALUES 仍报错；`UPDATE ... SET col = NULL` 在非严格模式改为 warning 1048。
+  - TIMESTAMP 写入：`ALLOW_INVALID_DATES` / `NO_ZERO_*` 不再绕过 UTC 转换；
+    非法日期按 1292 归零，`NO_ZERO_DATE` 下的零时间戳补 1292 warning；
+    警告文案按列类型区分 `timestamp` / `datetime`。
+  - 数值 → TIME 的微秒只在目标列声明小数位时保留（`time(6)`），
+    无小数位的 TIME/DDL 改列仍截断，避免 `column_type_change` 回归。
+  - `CAST(... AS UNSIGNED)` 溢出时把 cast 自身的 1292 延后到列赋值 1264 之后，
+    对齐 TiDB warning 顺序。
+  - `SELECT *` 的星号投影补在 join 重排改变叶子顺序时：扁平 `FROM a JOIN b`
+    链（含 `/*+ HASH_JOIN(t) */` 固定构建侧）会翻转 probe/build 输出列序，
+    补 `Projection` 还原 FROM 顺序；自连接与括号分组（bushy `from_item`）内层
+    重排不改变可见列序，不补投影（避免 `explain_easy` / `select` 多出算子）。
+  - 带时区的时间字面量（`'...Z'` / `'...+08:00'`）与时间列比较时先换算到会话时区：
+    `TIMESTAMP` 转 UTC，`DATE`/`DATETIME` 转会话墙钟并截断小数位；
+    `DATETIME` 字面量也接受裸日期与带小数秒的宽松格式。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/insert`
+    → `PASS: memory=1 tikv=0 skipped=245`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t executor/insert`
+    → `PASS: memory=0 tikv=1 skipped=245`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s memory --status green`
+    → `PASS: memory=107 tikv=0 skipped=139`；
+    `-s tikv --status green` → `PASS: memory=0 tikv=106 skipped=140`；
+    `--status local`（Mem+TiKV）→ `PASS: memory=8 tikv=7 skipped=247`。
+  - manifest：`executor/insert` → `green`，green 106→107
+    （R7 39→40，pending 129→128）。
+- **阻塞/风险**:
+  - ODKU 的 `Duplicates` 按「更新值是否变化」逐步累计；同一目标行被多次更新时
+    中间变化也会计数，若后续测试要求只计最终变化需再收敛。
+  - `LAST_INSERT_ID` 目前只在会话执行路径发布，直接调用 executor 的单元测试需自行设置。
+  - 生成列/外键/分区共用的 INSERT 快速路径仍逐行扫描唯一键，未走 KV 唯一约束。
+- **下一步**:
+  - `executor/executor` / `executor/expand` / `executor/issues` 等 R7 长尾 DML 与表达式套件。
 
 ## 7. 更新模板
 

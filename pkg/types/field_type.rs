@@ -47,6 +47,23 @@ impl Default for FieldType {
 }
 
 impl FieldType {
+    /// String-family types that carry a column charset (`ENUM`/`SET` included;
+    /// `JSON` has no character set).
+    pub fn is_character_type(&self) -> bool {
+        matches!(
+            self.tp,
+            TYPE_STRING
+                | TYPE_VAR_STRING
+                | TYPE_VARCHAR
+                | TYPE_BLOB
+                | TYPE_TINY_BLOB
+                | TYPE_MEDIUM_BLOB
+                | TYPE_LONG_BLOB
+                | TYPE_ENUM
+                | TYPE_SET
+        )
+    }
+
     pub fn new_longlong() -> Self {
         Self {
             tp: TYPE_LONG_LONG,

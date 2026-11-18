@@ -1209,6 +1209,8 @@ fn key_text(value: &Datum) -> String {
         // `int 0` with `decimal(4,2) 0.00` must match.
         Datum::I64(v) => format!("num:{v}"),
         Datum::U64(v) => format!("num:{v}"),
+        // YEAR compares (and joins) as its integer value.
+        Datum::Year(v) => format!("num:{v}"),
         Datum::F64(v) if v.is_finite() && v.fract() == 0.0 && v.abs() < 9.0e18 => {
             format!("num:{}", *v as i64)
         }

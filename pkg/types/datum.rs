@@ -111,6 +111,47 @@ fn scientific_to_plain(prec: usize, v: f64) -> Option<String> {
     Some(out)
 }
 
+/// Expands scientific notation (`3.4028234663852886e38`) into plain decimal
+/// text, preserving the digits shown in the mantissa (`MySQL` casts a DOUBLE
+/// to DECIMAL from its textual form, not its exact binary value).
+fn expand_scientific_notation(text: &str) -> Option<String> {
+    let (mantissa, exponent) = text.split_once(['e', 'E'])?;
+    let exponent: i32 = exponent.parse().ok()?;
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let int_len = mantissa
+        .trim_start_matches(['+', '-'])
+        .split('.')
+        .next()
+        .map(|s| s.len() as i32)
+        .unwrap_or(1);
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    let point = int_len + exponent;
+    if point <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-point) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else if (point as usize) >= digits.len() {
+        out.push_str(&digits);
+        for _ in 0..(point as usize - digits.len()) {
+            out.push('0');
+        }
+    } else {
+        out.push_str(&digits[..point as usize]);
+        out.push('.');
+        out.push_str(&digits[point as usize..]);
+    }
+    Some(out)
+}
+
 /// MySQL's string-to-number conversion: the longest leading numeric prefix.
 pub fn mysql_numeric_prefix(text: &str) -> f64 {
     let text = text.trim_start();
@@ -361,22 +402,35 @@ impl Datum {
         }
         // YEAR keeps MySQL's two-digit window (1-69 → 20xx, 70-99 → 19xx).
         if ft.tp == crate::field_type::TYPE_YEAR {
-            let n = match self {
-                Datum::Time(t) => i128::from(t.year),
-                Datum::F64(v) => i128::from(v.round() as i64),
-                Datum::Decimal(d) => i128::from(d.to_f64().unwrap_or(0.0).round() as i64),
-                other => i128::from(other.as_i64()?),
+            let (n, string_zero) = match self {
+                Datum::Time(t) => (i128::from(t.year), false),
+                Datum::F64(v) => (i128::from(v.round() as i64), false),
+                Datum::Decimal(d) => (i128::from(d.to_f64().unwrap_or(0.0).round() as i64), false),
+                Datum::Bytes(b) => {
+                    let text = String::from_utf8_lossy(b);
+                    let trimmed = text.trim();
+                    let v = mysql_numeric_prefix(trimmed);
+                    // YEAR('0'/'00'/'000') is 2000; only the four-digit
+                    // spelling `'0000'` is the zero year.
+                    let zero = v == 0.0 && !trimmed.is_empty() && trimmed != "0000";
+                    (i128::from(v.round() as i64), zero)
+                }
+                other => (i128::from(other.as_i64()?), false),
             };
-            let year = match n {
-                0 => 0,
-                1..=69 => 2000 + n,
-                70..=99 => 1900 + n,
-                1901..=2155 => n,
-                _ => {
-                    return Err(Error::new(
-                        ERR_DATA_OUT_OF_RANGE,
-                        format!("Invalid YEAR value: '{n}'"),
-                    ));
+            let year = if string_zero {
+                2000
+            } else {
+                match n {
+                    0 => 0,
+                    1..=69 => 2000 + n,
+                    70..=99 => 1900 + n,
+                    1901..=2155 => n,
+                    _ => {
+                        return Err(Error::new(
+                            ERR_DATA_OUT_OF_RANGE,
+                            format!("Invalid YEAR value: '{n}'"),
+                        ));
+                    }
                 }
             };
             return Ok(Datum::Year(year as i64));
@@ -479,7 +533,17 @@ impl Datum {
                     Datum::Time(t) => time_numeric_text(t),
                     _ => self.display(),
                 };
-                let d = MyDecimal::parse(&text)?.with_frac(ft.decimal);
+                // A FLOAT/DOUBLE can print in exponent form (`3.4e38`);
+                // DECIMAL has no exponent, so expand it at the target scale.
+                let text = if text.contains('e') || text.contains('E') {
+                    expand_scientific_notation(&text)
+                        .ok_or_else(|| Error::new(ERR_DATA_OUT_OF_RANGE, "decimal overflow"))?
+                } else {
+                    text
+                };
+                let d = MyDecimal::parse(&text)?
+                    .with_frac(ft.decimal)
+                    .clamped(ft.flen, ft.decimal);
                 Ok(Datum::Decimal(d))
             }
             EvalType::Datetime => match self {
@@ -542,7 +606,11 @@ impl Datum {
                             )
                         })?
                     } else {
-                        crate::time::parse_timestamp_literal(&s)
+                        // Mixed date/time separators (`2020-10-22 16.31-15`)
+                        // parse by digit runs; fall back to the stricter regex
+                        // form for long fractional-second forms.
+                        crate::time::parse_datetime_lenient(&s)
+                            .or_else(|_| crate::time::parse_timestamp_literal(&s))
                             .or_else(|_| {
                                 if s.contains(' ') {
                                     crate::time::parse_timestamp_literal(&s)
@@ -568,6 +636,23 @@ impl Datum {
                         t.fsp = 0;
                         t.tp = crate::time::TimeType::Date;
                     } else if ft.tp == crate::field_type::TYPE_DURATION {
+                        // A numeric datetime string keeps its fractional
+                        // seconds when read as TIME (`20070219173709.055870`).
+                        if let Some((_, frac)) = s.trim().split_once('.') {
+                            let digits: String = frac
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .take(6)
+                                .collect();
+                            if !digits.is_empty() {
+                                let fsp = digits.len() as i8;
+                                let padded = format!("{digits:0<6}");
+                                if let Ok(micro) = padded.parse::<u32>() {
+                                    t.micro = micro;
+                                    t.fsp = fsp;
+                                }
+                            }
+                        }
                         t.tp = crate::time::TimeType::Time;
                     } else {
                         t.tp = crate::time::TimeType::Datetime;
@@ -583,6 +668,15 @@ impl Datum {
                     // for a bare date (`20200805` is an "Incorrect time value").
                     if ft.tp == crate::field_type::TYPE_DURATION {
                         let text = other.display();
+                        // A negative number has no TIME form; TiDB reports it
+                        // as written instead of dropping the sign and keeping
+                        // the clock digits.
+                        if text.trim_start().starts_with('-') {
+                            return Err(Error::new(
+                                ERR_TRUNCATED_WRONG_VALUE,
+                                format!("Incorrect time value: '{text}'"),
+                            ));
+                        }
                         // Only the integral part feeds the clock digits; a
                         // FLOAT's shortest form can be scientific notation.
                         let integral = match other {
@@ -600,18 +694,40 @@ impl Datum {
                             }
                             _ => text.split('.').next().unwrap_or("0").to_string(),
                         };
-                        let t = crate::time::duration_from_numeric(&integral).ok_or_else(|| {
-                            // TiDB reads a FLOAT through `ParseDuration`
-                            // (`Incorrect time value`); an integer goes through
-                            // the numeric parser (`Truncated incorrect time value`).
-                            let message = if matches!(other, Datum::F64(_)) {
-                                format!("Incorrect time value: '{text}'")
-                            } else {
-                                format!("Truncated incorrect time value: '{text}'")
-                            };
-                            Error::new(ERR_TRUNCATED_WRONG_VALUE, message)
-                        })?;
-                        return Ok(Datum::Time(t));
+                        let mut t =
+                            crate::time::duration_from_numeric(&integral).ok_or_else(|| {
+                                // TiDB reads a FLOAT through `ParseDuration`
+                                // (`Incorrect time value`); an integer goes through
+                                // the numeric parser (`Truncated incorrect time value`).
+                                let message = if matches!(other, Datum::F64(_)) {
+                                    format!("Incorrect time value: '{text}'")
+                                } else {
+                                    format!("Truncated incorrect time value: '{text}'")
+                                };
+                                Error::new(ERR_TRUNCATED_WRONG_VALUE, message)
+                            })?;
+                        // A numeric datetime keeps its fractional seconds
+                        // (`20070219173709.055870` → `17:37:09.055870`) only
+                        // when the target TIME declares a fractional precision.
+                        if ft.decimal > 0
+                            && let Some((_, frac)) = text.split_once('.')
+                        {
+                            let digits: String = frac
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .take(6)
+                                .collect();
+                            if !digits.is_empty() {
+                                let padded = format!("{digits:0<6}");
+                                if let Ok(micro) = padded.parse::<u32>() {
+                                    t.micro = micro;
+                                }
+                            }
+                        }
+                        return Ok(Datum::Time(crate::time::round_to_fsp(
+                            t,
+                            ft.decimal.clamp(0, 6) as i8,
+                        )));
                     }
                     // UNSIGNED values beyond `i64` still report the invalid
                     // datetime (1292), not an integer overflow.

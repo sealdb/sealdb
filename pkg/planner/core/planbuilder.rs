@@ -11905,6 +11905,38 @@ fn column_field_type<'a>(
         .map(|col| &col.field_type)
 }
 
+/// Temporal literal carrying an explicit zone (`…Z`, `…+08:00`): convert the
+/// instant into the column's session representation. TIMESTAMP compares in UTC;
+/// DATE/DATETIME compare in the session wall clock.
+fn zoned_temporal_literal(text: &str, field_type: &sealdb_types::FieldType) -> Option<Datum> {
+    use sealdb_types::field_type::{TYPE_DATE, TYPE_DATETIME, TYPE_TIMESTAMP};
+    if !matches!(field_type.tp, TYPE_DATE | TYPE_DATETIME | TYPE_TIMESTAMP) {
+        return None;
+    }
+    let (wall, offset) = sealdb_types::time::parse_datetime_with_zone(text).ok()??;
+    let utc = sealdb_expression::shift_time_minutes(wall, -i64::from(offset)).ok()?;
+    let mut time = if field_type.tp == TYPE_TIMESTAMP {
+        utc
+    } else {
+        sealdb_expression::utc_to_session_local(utc).ok()?
+    };
+    time.tp = match field_type.tp {
+        TYPE_DATE => sealdb_types::TimeType::Date,
+        TYPE_TIMESTAMP => sealdb_types::TimeType::Timestamp,
+        _ => sealdb_types::TimeType::Datetime,
+    };
+    if field_type.tp == TYPE_DATE {
+        time.hour = 0;
+        time.minute = 0;
+        time.second = 0;
+        time.micro = 0;
+        time.fsp = 0;
+    } else {
+        time = sealdb_types::time::round_to_fsp(time, field_type.decimal.clamp(0, 6) as i8);
+    }
+    Some(Datum::Time(time))
+}
+
 /// Parse a string literal into the column's temporal type (`fsp` from the
 /// column), returning `None` when the text is not a valid temporal value.
 fn temporal_literal(expr: &ExprNode, field_type: &sealdb_types::FieldType) -> Option<Datum> {
@@ -11915,10 +11947,14 @@ fn temporal_literal(expr: &ExprNode, field_type: &sealdb_types::FieldType) -> Op
         return None;
     };
     let text = String::from_utf8_lossy(bytes);
+    if let Some(datum) = zoned_temporal_literal(&text, field_type) {
+        return Some(datum);
+    }
     let mut time = match field_type.tp {
         sealdb_types::TYPE_DATE => sealdb_types::parse_date_literal(&text).ok()?,
         sealdb_types::TYPE_TIMESTAMP => sealdb_types::parse_timestamp_literal(&text).ok()?,
-        _ => sealdb_types::parse_datetime_literal(&text)
+        _ => sealdb_types::parse_datetime_lenient(&text)
+            .or_else(|_| sealdb_types::parse_datetime_literal(&text))
             .or_else(|_| {
                 // `DATETIME` accepts a bare date (`'1981-09-15'` → 00:00:00).
                 sealdb_types::parse_date_literal(&text).map(|mut t| {
@@ -18350,7 +18386,11 @@ fn star_join_projection(
             .iter()
             .any(|t| with.find(t.resolve_name()).is_some())
     });
-    if cte_side && join_output_order_differs(&plan, select) {
+    // A flat (`FROM a JOIN b`) chain reorders for real, so the projection is
+    // needed. A bushy `from_item` tree (parenthesized join groups) keeps the
+    // preserved-side operand order and TiDB prints no projection there.
+    let flat_chain = select.from_item.is_none();
+    if (flat_chain || cte_side) && join_output_order_differs(&plan, select) {
         return wrap_star_join_projection(plan, select, is, current_db);
     }
     let Some(last) = select.joins.last() else {
@@ -18606,6 +18646,20 @@ fn join_output_order_differs(plan: &PhysicalPlan, select: &SelectStmt) -> bool {
         .collect();
     if leaves.len() != from.len() {
         return false;
+    }
+    // A self-join (`t ta JOIN t tb`) reorders probe/build but both sides carry
+    // the same physical columns, so TiDB does not add a star projection.
+    let mut physical: Vec<&str> = select
+        .join_tables()
+        .iter()
+        .map(|t| t.physical.as_deref().unwrap_or(t.name.as_str()))
+        .collect();
+    if let Some(first) = physical.first().copied() {
+        physical.sort_unstable();
+        physical.dedup();
+        if physical.len() == 1 && physical[0].eq_ignore_ascii_case(first) {
+            return false;
+        }
     }
     leaves
         .iter()
@@ -22417,18 +22471,22 @@ fn coerce_eq_const(info: &sealdb_meta::TableInfo, expr: ExprNode) -> ExprNode {
         return expr;
     }
     let text = text.trim();
-    let parsed = sealdb_types::time::parse_timestamp_literal(text)
-        .or_else(|_| sealdb_types::time::parse_date_literal(text));
-    let Ok(mut time) = parsed else {
-        return expr;
+    let literal = if let Some(datum) = zoned_temporal_literal(text, &column.field_type) {
+        ExprNode::Value(ValueExpr { datum })
+    } else {
+        let parsed = sealdb_types::time::parse_timestamp_literal(text)
+            .or_else(|_| sealdb_types::time::parse_date_literal(text));
+        let Ok(mut time) = parsed else {
+            return expr;
+        };
+        // A string constant compared to a temporal column becomes a DatumTime,
+        // which TiDB always prints as a full datetime.
+        time.tp = sealdb_types::time::TimeType::Datetime;
+        time.fsp = 6;
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Time(time),
+        })
     };
-    // A string constant compared to a temporal column becomes a DatumTime,
-    // which TiDB always prints as a full datetime.
-    time.tp = sealdb_types::time::TimeType::Datetime;
-    time.fsp = 6;
-    let literal = ExprNode::Value(ValueExpr {
-        datum: Datum::Time(time),
-    });
     let (left, right) = if flipped {
         (literal, ExprNode::Column(col.clone()))
     } else {

@@ -229,10 +229,15 @@ impl ExecutorBuilder {
                 )))
             }
             PhysicalPlan::Insert { .. } => {
-                let insert = match stmt {
+                let mut insert = match stmt {
                     Statement::Insert(s) => s.clone(),
                     _ => return Err(Error::unsupported("insert without insert statement")),
                 };
+                // `ON DUPLICATE KEY UPDATE` may reference the source query's
+                // tables. Widen the source projection with those columns so the
+                // executor can evaluate the assignments against the source row.
+                let (source_scope, source_extra) =
+                    widen_insert_source(&mut insert, &domain, current_db);
                 let select = if let Some(set) = insert.select_set.as_ref() {
                     Some(Self::build_set_opr_arm(
                         set,
@@ -260,6 +265,8 @@ impl ExecutorBuilder {
                     current_db.to_string(),
                     txn,
                     select,
+                    source_scope,
+                    source_extra,
                 )))
             }
             PhysicalPlan::InfoSchema {
@@ -2270,6 +2277,214 @@ fn select_from_column_names(
         }
     }
     cols
+}
+
+/// Source-query columns visible to `ON DUPLICATE KEY UPDATE` and the columns
+/// appended to the source projection so the executor can read them.
+///
+/// TiDB resolves assignment columns against the target row and every table in
+/// the `INSERT … SELECT` source. The insert executor only sees the source
+/// projection, so referenced source columns that are not already produced are
+/// appended (in reference order) and reported back with their qualifiers.
+fn widen_insert_source(
+    insert: &mut sealdb_parser::ast::InsertStmt,
+    domain: &Domain,
+    current_db: &str,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    if insert.on_duplicate.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(select) = insert.select.as_mut() else {
+        return (Vec::new(), Vec::new());
+    };
+    let is = domain.infoschema();
+    let (db, name) = insert.table.qualified(current_db);
+    let target_columns: Vec<String> = is
+        .table_by_name(&db, &name)
+        .map(|info| {
+            info.columns
+                .iter()
+                .filter(|c| !c.hidden)
+                .map(|c| c.name.o().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let target_name = insert.table.name.clone();
+    let scope = select_source_scope(select, &is, current_db);
+    let mut needed: Vec<(String, String)> = Vec::new();
+    for item in &insert.on_duplicate {
+        collect_odku_source_refs(
+            &item.expr,
+            &target_name,
+            &target_columns,
+            &scope,
+            &mut needed,
+        );
+    }
+    for (alias, column) in &needed {
+        select.fields.push(sealdb_parser::ast::SelectField {
+            expr: ExprNode::Column(sealdb_parser::ast::expressions::ColumnNameExpr {
+                schema: None,
+                table: Some(alias.clone()),
+                name: column.clone(),
+            }),
+            as_name: None,
+            orig_text: None,
+        });
+    }
+    (scope, needed)
+}
+
+/// Every `alias.column` pair the source query exposes.
+fn select_source_scope(
+    select: &SelectStmt,
+    is: &sealdb_infoschema::InfoSchema,
+    current_db: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for table in select.join_tables() {
+        let alias = table.name.clone();
+        let physical = table.physical.as_deref().unwrap_or(&table.name);
+        if let Some(with) = &select.with
+            && let Some(cte) = with.find(&alias).or_else(|| with.find(physical))
+        {
+            out.extend(
+                cte_output_columns(cte)
+                    .into_iter()
+                    .map(|c| (alias.clone(), c)),
+            );
+            continue;
+        }
+        let (db, name) = table.qualified(current_db);
+        if let Some(info) = is
+            .table_by_name(&db, physical)
+            .or_else(|| is.table_by_name(&db, &name))
+        {
+            out.extend(
+                info.columns
+                    .iter()
+                    .filter(|c| !c.hidden)
+                    .map(|c| (alias.clone(), c.name.o().to_string())),
+            );
+        }
+    }
+    out
+}
+
+fn cte_output_columns(cte: &sealdb_parser::ast::CommonTableExpression) -> Vec<String> {
+    if !cte.col_name_list.is_empty() {
+        return cte.col_name_list.clone();
+    }
+    cte.query
+        .fields
+        .iter()
+        .map(|f| match &f.as_name {
+            Some(name) if !name.is_empty() => name.clone(),
+            _ => field_output_name(f),
+        })
+        .collect()
+}
+
+/// Resolve the source columns an `ON DUPLICATE KEY UPDATE` expression needs.
+fn collect_odku_source_refs(
+    expr: &ExprNode,
+    target_name: &str,
+    target_columns: &[String],
+    scope: &[(String, String)],
+    needed: &mut Vec<(String, String)>,
+) {
+    match expr {
+        ExprNode::Column(col) => {
+            if let Some(table) = &col.table {
+                if table.eq_ignore_ascii_case(target_name)
+                    || table
+                        .rsplit_once('.')
+                        .is_some_and(|(_, t)| t.eq_ignore_ascii_case(target_name))
+                {
+                    return;
+                }
+                if let Some((alias, column)) = scope.iter().find(|(alias, column)| {
+                    alias.eq_ignore_ascii_case(table) && column.eq_ignore_ascii_case(&col.name)
+                }) && !needed.contains(&(alias.clone(), column.clone()))
+                {
+                    needed.push((alias.clone(), column.clone()));
+                }
+            } else if !target_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&col.name))
+            {
+                let mut matches = scope
+                    .iter()
+                    .filter(|(_, column)| column.eq_ignore_ascii_case(&col.name));
+                if let Some((alias, column)) = matches.next()
+                    && matches.next().is_none()
+                    && !needed.contains(&(alias.clone(), column.clone()))
+                {
+                    needed.push((alias.clone(), column.clone()));
+                }
+            }
+        }
+        ExprNode::Func(f) => {
+            // `VALUES(col)` names an inserted target column, not a source one.
+            if f.name.eq_ignore_ascii_case("values") {
+                return;
+            }
+            for arg in &f.args {
+                collect_odku_source_refs(arg, target_name, target_columns, scope, needed);
+            }
+        }
+        ExprNode::Binary(b) => {
+            collect_odku_source_refs(&b.left, target_name, target_columns, scope, needed);
+            collect_odku_source_refs(&b.right, target_name, target_columns, scope, needed);
+        }
+        ExprNode::Unary(u) => {
+            collect_odku_source_refs(&u.expr, target_name, target_columns, scope, needed)
+        }
+        ExprNode::Cast(c) => {
+            collect_odku_source_refs(&c.expr, target_name, target_columns, scope, needed)
+        }
+        ExprNode::InList(i) => {
+            collect_odku_source_refs(&i.expr, target_name, target_columns, scope, needed);
+            for item in &i.list {
+                collect_odku_source_refs(item, target_name, target_columns, scope, needed);
+            }
+        }
+        ExprNode::Between(b) => {
+            collect_odku_source_refs(&b.expr, target_name, target_columns, scope, needed);
+            collect_odku_source_refs(&b.low, target_name, target_columns, scope, needed);
+            collect_odku_source_refs(&b.high, target_name, target_columns, scope, needed);
+        }
+        ExprNode::Like(l) => {
+            collect_odku_source_refs(&l.expr, target_name, target_columns, scope, needed);
+            collect_odku_source_refs(&l.pattern, target_name, target_columns, scope, needed);
+        }
+        ExprNode::IsNull(i) => {
+            collect_odku_source_refs(&i.expr, target_name, target_columns, scope, needed)
+        }
+        ExprNode::Case(c) => {
+            if let Some(operand) = &c.operand {
+                collect_odku_source_refs(operand, target_name, target_columns, scope, needed);
+            }
+            for (when, then) in &c.when_then {
+                collect_odku_source_refs(when, target_name, target_columns, scope, needed);
+                collect_odku_source_refs(then, target_name, target_columns, scope, needed);
+            }
+            if let Some(otherwise) = &c.else_expr {
+                collect_odku_source_refs(otherwise, target_name, target_columns, scope, needed);
+            }
+        }
+        ExprNode::Row(r) => {
+            for item in &r.exprs {
+                collect_odku_source_refs(item, target_name, target_columns, scope, needed);
+            }
+        }
+        ExprNode::Value(_)
+        | ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_)
+        | ExprNode::Window(_) => {}
+    }
 }
 
 /// TiDB projection naming: unwrap unary `+` / parens, then literal rules or `field.Text()`.

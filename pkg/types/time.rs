@@ -735,6 +735,153 @@ pub fn parse_timestamp_literal(s: &str) -> Result<Time> {
     parse_datetime_string(s)
 }
 
+/// Lenient assignment parse for DATE/DATETIME/TIMESTAMP text: MySQL accepts any
+/// non-digit as the date/time separator (`2020-10-22-16`, `2020.10-22:16`,
+/// `2020-10-22T16.31.15`). A trailing `Z`/`±HH[:MM]` is reported separately by
+/// [`parse_datetime_with_zone`].
+pub fn parse_datetime_lenient(s: &str) -> Result<Time> {
+    let s_trim = s.trim();
+    // Digit runs in order, remembering the separator before each run ('.' is
+    // the only candidate for a fractional-seconds marker).
+    let mut groups: Vec<(String, char)> = Vec::new();
+    let mut cur = String::new();
+    let mut last_sep = '\0';
+    for c in s_trim.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else {
+            if !cur.is_empty() {
+                groups.push((std::mem::take(&mut cur), last_sep));
+            }
+            last_sep = c;
+        }
+    }
+    if !cur.is_empty() {
+        groups.push((cur, last_sep));
+    }
+    // A trailing dot-separated run after the clock is fractional seconds.
+    let mut frac = String::new();
+    if groups.len() >= 7 && groups.last().is_some_and(|(_, sep)| *sep == '.') {
+        frac = groups.pop().map(|(digits, _)| digits).unwrap_or_default();
+    }
+    if !(3..=6).contains(&groups.len()) {
+        return Err(incorrect("datetime", s));
+    }
+    let num = |idx: usize| -> Result<u32> {
+        groups
+            .get(idx)
+            .ok_or_else(|| incorrect("datetime", s))?
+            .0
+            .parse()
+            .map_err(|_| incorrect("datetime", s))
+    };
+    let year = num(0)?;
+    let month = num(1)?;
+    let day = num(2)?;
+    let hour = if groups.len() > 3 { num(3)? } else { 0 };
+    let minute = if groups.len() > 4 { num(4)? } else { 0 };
+    let mut second = if groups.len() > 5 { num(5)? } else { 0 };
+    if second > 59 || hour > 23 || minute > 59 {
+        return Err(incorrect("datetime", s));
+    }
+    let mut micro = 0;
+    let mut fsp = 0i8;
+    if !frac.is_empty() {
+        let (m, overflow) = parse_frac(&frac, 6)?;
+        micro = m;
+        fsp = frac.len().min(6) as i8;
+        if overflow {
+            second += 1;
+            micro = 0;
+            if second >= 60 {
+                return Err(incorrect("datetime", s));
+            }
+        }
+    }
+    let year = year as u16;
+    let month = month as u8;
+    let day = day as u8;
+    let zero_date = year == 0 && month == 0 && day == 0;
+    if (!valid_ymd(year, month, day) && !zero_date) || hour > 23 || minute > 59 {
+        return Err(incorrect("datetime", s));
+    }
+    Ok(Time {
+        year,
+        month,
+        day,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        micro,
+        fsp,
+        tp: TimeType::Datetime,
+    })
+}
+
+/// Parse an assignment datetime with an explicit zone (`Z`, `±HH`, `±HHMM`,
+/// `±HH:MM`) and return the wall clock plus minutes east of UTC. The zone is
+/// only recognized after a complete clock (`±` after an hour alone is a
+/// separator: `2024-01-01 14+01:00` is `14:01:00`).
+pub fn parse_datetime_with_zone(s: &str) -> Result<Option<(Time, i32)>> {
+    let s = s.trim();
+    if let Some(prefix) = s.strip_suffix(['Z', 'z']) {
+        let time = parse_datetime_lenient(prefix).or_else(|_| parse_datetime_string(prefix))?;
+        return Ok(Some((time, 0)));
+    }
+    if s.len() < 2 {
+        return Ok(None);
+    }
+    let bytes = s.as_bytes();
+    // Find the last sign that starts an offset suffix.
+    let mut sign = None;
+    for i in (1..bytes.len()).rev() {
+        let b = bytes[i];
+        if !(b == b'+' || b == b'-') {
+            continue;
+        }
+        if i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_digit() {
+            continue;
+        }
+        let rest = &s[i + 1..];
+        if rest.chars().all(|c| c.is_ascii_digit() || c == ':') {
+            sign = Some(i);
+            break;
+        }
+    }
+    let Some(i) = sign else {
+        return Ok(None);
+    };
+    let prefix = &s[..i];
+    // The offset applies only after an explicit complete clock (H:M:S).
+    let Some(time_part) = prefix
+        .split_once(['T', 't'])
+        .map(|(_, tail)| tail)
+        .or_else(|| prefix.rsplit_once(' ').map(|(_, tail)| tail))
+    else {
+        return Ok(None);
+    };
+    let time_groups = time_part
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty());
+    if time_groups.count() < 3 {
+        return Ok(None);
+    }
+    let offset_text = &s[i + 1..];
+    let (hh, mm) = match offset_text.split_once(':') {
+        Some((hh, mm)) => (hh, mm),
+        None if offset_text.len() > 2 => offset_text.split_at(offset_text.len() - 2),
+        None => (offset_text, "0"),
+    };
+    let hh: i32 = hh.parse().map_err(|_| incorrect("datetime", s))?;
+    let mm: i32 = mm.parse().map_err(|_| incorrect("datetime", s))?;
+    if hh > 14 || mm > 59 || (hh == 14 && mm != 0) {
+        return Err(incorrect("datetime", s));
+    }
+    let offset = (hh * 60 + mm) * if bytes[i] == b'-' { -1 } else { 1 };
+    let time = parse_datetime_lenient(prefix).or_else(|_| parse_datetime_string(prefix))?;
+    Ok(Some((time, offset)))
+}
+
 /// Parse `DATE '...'` / `{d '...'}` literal.
 pub fn parse_date_literal(s: &str) -> Result<Time> {
     if !date_pattern_ok(s) {

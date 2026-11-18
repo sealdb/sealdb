@@ -961,10 +961,29 @@ pub(crate) fn validate_ttl(info: &TableInfo) -> Result<()> {
     Ok(())
 }
 
+/// Table-level `DEFAULT CHARSET` / `COLLATE`, also inherited by character
+/// columns without an explicit charset. An explicit `COLLATE` names the
+/// charset it belongs to and wins over a conflicting `CHARSET`.
+fn table_charset_and_collation(stmt: &CreateTableStmt) -> Option<(String, String)> {
+    if let Some(collate) = &stmt.collate {
+        let parsed = sealdb_parser::charset::Collation::parse(collate);
+        return Some((parsed.charset, parsed.name));
+    }
+    stmt.charset.as_ref().map(|charset| {
+        (
+            charset.to_ascii_lowercase(),
+            sealdb_parser::charset::Collation::default_for_charset(charset).name,
+        )
+    })
+}
+
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
     if stmt.cols.is_empty() {
         return Err(Error::unsupported("CREATE TABLE without columns"));
     }
+    // Table-level `DEFAULT CHARSET` / `COLLATE` is the default charset of every
+    // character column that does not name one (MySQL/TiDB semantics).
+    let table_defaults = table_charset_and_collation(stmt);
     let mut columns = Vec::with_capacity(stmt.cols.len());
     for (offset, col) in stmt.cols.iter().enumerate() {
         let mut info = ColumnInfo::new(
@@ -984,6 +1003,17 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             let parsed = sealdb_parser::charset::Collation::parse(collate);
             info.field_type.charset = parsed.charset;
             info.field_type.collate = parsed.name;
+        }
+        // A character column without an explicit charset inherits the table's.
+        // `binary` marks the BINARY/VARBINARY/BLOB family, which has no charset.
+        if col.charset.is_none()
+            && col.collate.is_none()
+            && info.field_type.charset != "binary"
+            && info.field_type.is_character_type()
+            && let Some((charset, collate)) = &table_defaults
+        {
+            info.field_type.charset = charset.clone();
+            info.field_type.collate = collate.clone();
         }
         if let Some(generated) = &col.generated {
             validate_generated_expr(&col.name, &generated.expr)?;
@@ -1046,14 +1076,9 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
         info.pre_split_regions = regions as u8;
     }
     // Table-level `DEFAULT CHARSET` / `COLLATE` (TiDB `TableInfo.Charset/Collate`).
-    if let Some(charset) = &stmt.charset {
-        info.charset = charset.to_ascii_lowercase();
-        info.collate = sealdb_parser::charset::Collation::default_for_charset(charset).name;
-    }
-    if let Some(collate) = &stmt.collate {
-        let parsed = sealdb_parser::charset::Collation::parse(collate);
-        info.charset = parsed.charset;
-        info.collate = parsed.name;
+    if let Some((charset, collate)) = table_defaults {
+        info.charset = charset;
+        info.collate = collate;
     }
     for index in stmt.indices.iter() {
         let (idx_cols, hidden) =
@@ -1899,6 +1924,22 @@ fn parse_flen_decimal(type_name: &str) -> Option<(i32, i32)> {
 #[cfg(test)]
 mod precise_type_tests {
     use super::field_type_from_name;
+
+    #[test]
+    fn table_charset_applies_to_columns() {
+        use sealdb_parser::Parser;
+        use sealdb_parser::ast::Statement;
+        let parsed = Parser::new()
+            .parse_one_stmt("CREATE TABLE t (a VARCHAR(10)) CHARSET ascii")
+            .unwrap();
+        let Statement::CreateTable(stmt) = parsed else {
+            panic!("not a CREATE TABLE");
+        };
+        let info = super::build_table_info(&stmt, 1).unwrap();
+        assert_eq!(info.charset, "ascii");
+        assert_eq!(info.columns[0].field_type.charset, "ascii");
+        assert_eq!(info.columns[0].field_type.collate, "ascii_bin");
+    }
 
     #[test]
     fn bigint_unsigned_and_decimal_scale() {

@@ -46,6 +46,8 @@ const FUNCS: &[FuncMeta] = &[
     meta("IS_UUID", FuncCategory::Miscellaneous, 1, 1, true),
     meta("UUID_TO_BIN", FuncCategory::Miscellaneous, 1, 2, true),
     meta("BIN_TO_UUID", FuncCategory::Miscellaneous, 1, 2, true),
+    meta("AES_ENCRYPT", FuncCategory::Encryption, 2, 3, true),
+    meta("AES_DECRYPT", FuncCategory::Encryption, 2, 3, true),
     // control
     meta("IF", FuncCategory::Control, 3, 3, true),
     meta("IFNULL", FuncCategory::Control, 2, 2, true),

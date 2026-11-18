@@ -18,12 +18,23 @@ use std::cell::{Cell, RefCell};
 // `TzOffset::fix()` comes from the `Offset` trait (chrono-tz offsets).
 use chrono::Offset as _;
 
+/// Default `max_allowed_packet`: function results larger than this fail with
+/// 1301 (`Result of repeat() was larger than max_allowed_packet …`).
+const MAX_ALLOWED_PACKET: usize = 67_108_864;
+/// MySQL DECIMAL precision limit (`DECIMAL_MAX_PRECISION`).
+const DECIMAL_MAX_PRECISION: usize = 65;
+
 thread_local! {
     static COLLATION_MODE: RefCell<CollateMode> = const { RefCell::new(CollateMode::Bin) };
     static SQL_MODE: RefCell<String> = const { RefCell::new(String::new()) };
     static TIME_ZONE: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Session `@@block_encryption_mode` (`aes-128-ecb` when unset).
+    static BLOCK_ENCRYPTION_MODE: RefCell<String> = const { RefCell::new(String::new()) };
     /// Session-scoped warnings accumulated during expression eval (TiDB SHOW WARNINGS).
     static WARNINGS: RefCell<Vec<(i32, String)>> = const { RefCell::new(Vec::new()) };
+    /// Evaluating an `INSERT ... VALUES` row: DECIMAL literals keep their full
+    /// text so the column cast can report precision truncation itself.
+    static INSERT_VALUE_EVAL: Cell<bool> = const { Cell::new(false) };
     /// Dedup flag for inequality DST gap warnings (suite: one warn for </<=/>/>=).
     static DST_GAP_WARNED: RefCell<bool> = const { RefCell::new(false) };
     /// IndexReader/IndexLookUp filter doubles DST warnings (TiDB types/time suite).
@@ -35,6 +46,8 @@ thread_local! {
     static ALLOW_WRITE_ROW_ID: Cell<bool> = const { Cell::new(false) };
     /// Session `@@tidb_enable_auto_increment_in_generated` (default OFF).
     static ALLOW_AUTO_INCREMENT_IN_GENERATED: Cell<bool> = const { Cell::new(false) };
+    /// Session `@@tidb_enable_strict_not_null_check` (default ON).
+    static STRICT_NOT_NULL_CHECK: Cell<bool> = const { Cell::new(true) };
     /// Session `@@default_week_format` (default 0).
     static DEFAULT_WEEK_FORMAT: Cell<i64> = const { Cell::new(0) };
 }
@@ -78,6 +91,22 @@ pub fn allow_auto_random_explicit_insert() -> bool {
     ALLOW_AUTO_RANDOM_EXPLICIT_INSERT.with(Cell::get)
 }
 
+/// Run `f` under `@@tidb_enable_strict_not_null_check` from the session.
+pub fn with_strict_not_null_check<T>(strict: bool, f: impl FnOnce() -> T) -> T {
+    STRICT_NOT_NULL_CHECK.with(|cell| {
+        let prev = cell.get();
+        cell.set(strict);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+/// Whether an explicit NULL in a NOT NULL column aborts the statement.
+pub fn strict_not_null_check() -> bool {
+    STRICT_NOT_NULL_CHECK.with(Cell::get)
+}
+
 /// Run `f` under `@@tidb_opt_write_row_id` from the session.
 pub fn with_allow_write_row_id<T>(allow: bool, f: impl FnOnce() -> T) -> T {
     ALLOW_WRITE_ROW_ID.with(|cell| {
@@ -114,6 +143,19 @@ pub fn clear_warnings() {
 /// Take accumulated warnings `(code, message)`.
 pub fn take_warnings() -> Vec<(i32, String)> {
     WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+/// Remove and return warnings accumulated after the first `start` entries.
+/// Lets a caller defer expression diagnostics until after column assignment.
+pub fn take_warnings_from(start: usize) -> Vec<(i32, String)> {
+    WARNINGS.with(|w| {
+        let mut warnings = w.borrow_mut();
+        if start < warnings.len() {
+            warnings.split_off(start)
+        } else {
+            Vec::new()
+        }
+    })
 }
 
 /// Number of accumulated warnings (used by MySQL OK-packet `Warnings: N`).
@@ -166,6 +208,29 @@ pub fn sql_mode_flag(flag: &str) -> bool {
         cell.borrow()
             .split(',')
             .any(|m| m.trim().eq_ignore_ascii_case(flag))
+    })
+}
+
+/// Current session `block_encryption_mode` (default `aes-128-ecb`).
+pub fn block_encryption_mode() -> crate::encryption::BlockEncryptionMode {
+    BLOCK_ENCRYPTION_MODE.with(|cell| {
+        let mode = cell.borrow();
+        if mode.is_empty() {
+            crate::encryption::BlockEncryptionMode::default()
+        } else {
+            crate::encryption::BlockEncryptionMode::parse(&mode)
+        }
+    })
+}
+
+/// Run `f` under a session `block_encryption_mode` value.
+pub fn with_block_encryption_mode<T>(mode: impl Into<String>, f: impl FnOnce() -> T) -> T {
+    BLOCK_ENCRYPTION_MODE.with(|cell| {
+        let prev = cell.borrow().clone();
+        *cell.borrow_mut() = mode.into();
+        let out = f();
+        *cell.borrow_mut() = prev;
+        out
     })
 }
 
@@ -483,9 +548,52 @@ pub fn eval_expr(expr: &ExprNode) -> Result<Datum> {
     eval_expr_with_row(expr, &[], &[])
 }
 
+/// Marks literal evaluation as part of an `INSERT ... VALUES` row.
+pub fn with_insert_value_eval<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INSERT_VALUE_EVAL.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(INSERT_VALUE_EVAL.with(|flag| flag.replace(true)));
+    f()
+}
+
+/// A decimal literal with more than `DECIMAL_MAX_PRECISION` integer digits is
+/// clamped to the largest DECIMAL (all nines) with warning 1292; TiDB's type
+/// inference applies the same saturation to bare literals in projections.
+fn eval_literal(datum: &Datum) -> Result<Datum> {
+    let Datum::Decimal(d) = datum else {
+        return Ok(datum.clone());
+    };
+    let text = d.to_string();
+    let int_digits = text
+        .trim_start_matches('-')
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('0')
+        .len();
+    if int_digits <= DECIMAL_MAX_PRECISION || INSERT_VALUE_EVAL.with(Cell::get) {
+        return Ok(datum.clone());
+    }
+    note_warning(
+        ERR_TRUNCATED_WRONG_VALUE,
+        format!("Truncated incorrect DECIMAL value: '{text}'"),
+    );
+    let mut clamped = "9".repeat(DECIMAL_MAX_PRECISION);
+    if text.starts_with('-') {
+        clamped.insert(0, '-');
+    }
+    let value =
+        MyDecimal::parse(&clamped).map_err(|e| Error::new(ERR_UNKNOWN_ERROR, e.to_string()))?;
+    Ok(Datum::Decimal(value))
+}
+
 pub fn eval_expr_with_row(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match expr {
-        ExprNode::Value(v) => Ok(v.datum.clone()),
+        ExprNode::Value(v) => eval_literal(&v.datum),
         ExprNode::Column(c) => resolve_column(c, schema, row),
         ExprNode::Binary(b) => eval_binary(b, schema, row),
         ExprNode::Unary(u) => eval_unary(u, schema, row),
@@ -1046,7 +1154,32 @@ fn rewrite_high_not_precedence(op: Op, inner: &ExprNode) -> Option<ExprNode> {
     }
 }
 
+thread_local! {
+    /// `SET timestamp = <secs>`: freezes `NOW()`/`CURRENT_TIMESTAMP` (and
+    /// implicit defaults) for the session, matching MySQL's test hook.
+    static SESSION_TIMESTAMP: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// Value returned by `LAST_INSERT_ID()` for the session.
+    static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the value returned by `LAST_INSERT_ID()`.
+pub fn set_last_insert_id(value: i64) {
+    LAST_INSERT_ID.with(|cell| cell.set(value));
+}
+
+fn last_insert_id() -> i64 {
+    LAST_INSERT_ID.with(std::cell::Cell::get)
+}
+
+/// Freeze (or with `None`, unfreeze) the session clock at `secs` epoch seconds.
+pub fn set_session_timestamp(secs: Option<i64>) {
+    SESSION_TIMESTAMP.with(|cell| cell.set(secs));
+}
+
 fn unix_now_secs() -> i64 {
+    if let Some(secs) = SESSION_TIMESTAMP.with(std::cell::Cell::get) {
+        return secs;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1055,6 +1188,9 @@ fn unix_now_secs() -> i64 {
 
 /// `(seconds, microseconds)` since the Unix epoch.
 fn unix_now_parts() -> (i64, u32) {
+    if let Some(secs) = SESSION_TIMESTAMP.with(std::cell::Cell::get) {
+        return (secs, 0);
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| (d.as_secs() as i64, d.subsec_micros()))
@@ -1073,6 +1209,26 @@ fn now_fsp(args: &[ExprNode]) -> i8 {
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
         "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
+        // `LAST_INSERT_ID()` reads the session value; the one-argument form
+        // sets it and returns the argument (MySQL semantics).
+        "LAST_INSERT_ID" => {
+            if func.args.is_empty() {
+                return Ok(Datum::I64(last_insert_id()));
+            }
+            if func.args.len() > 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "LAST_INSERT_ID requires 0 or 1 argument",
+                ));
+            }
+            let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let id = v.as_i64()?;
+            set_last_insert_id(id);
+            Ok(Datum::I64(id))
+        }
         "IS_UUID" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1393,6 +1549,45 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 text.chars().rev().collect::<String>().into_bytes(),
             ))
         }
+        // MySQL `AES_ENCRYPT(str, key[, iv])` / `AES_DECRYPT(...)`: AES with a
+        // zero-padded key and PKCS#7 padding; `block_encryption_mode` picks the
+        // key length and ECB/CBC/OFB.
+        "AES_ENCRYPT" | "AES_DECRYPT" => {
+            if !(2..=3).contains(&func.args.len()) {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "AES function requires 2 or 3 arguments",
+                ));
+            }
+            let data = eval_expr_with_row(&func.args[0], schema, row)?;
+            let key = eval_expr_with_row(&func.args[1], schema, row)?;
+            let iv = match func.args.get(2) {
+                Some(expr) => eval_expr_with_row(expr, schema, row)?,
+                None => Datum::Null,
+            };
+            if data.is_null() || key.is_null() {
+                return Ok(Datum::Null);
+            }
+            let iv_bytes = if iv.is_null() {
+                Vec::new()
+            } else {
+                iv.as_bytes()
+            };
+            let mode = self::block_encryption_mode();
+            if func.name.eq_ignore_ascii_case("AES_ENCRYPT") {
+                return Ok(Datum::Bytes(crate::encryption::aes_encrypt(
+                    &data.as_bytes(),
+                    &key.as_bytes(),
+                    &iv_bytes,
+                    mode,
+                )));
+            }
+            match crate::encryption::aes_decrypt(&data.as_bytes(), &key.as_bytes(), &iv_bytes, mode)
+            {
+                Some(out) => Ok(Datum::Bytes(out)),
+                None => Ok(Datum::Null),
+            }
+        }
         // MySQL `MD5(str)`: lowercase hex digest; NULL in → NULL.
         "MD5" => {
             if func.args.len() != 1 {
@@ -1436,9 +1631,16 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 return Ok(Datum::Bytes(Vec::new()));
             }
             let out_len = bytes.len().saturating_mul(count as usize);
-            if out_len > 16 * 1024 * 1024 {
-                // TiDB truncates oversized results to NULL with a warning.
-                return Ok(Datum::Null);
+            if out_len > MAX_ALLOWED_PACKET {
+                // TiDB refuses oversized function results (1301); `INSERT
+                // IGNORE` turns this into a warning and stores NULL.
+                return Err(Error::new(
+                    sealdb_errno::ERR_ALLOWED_PACKET_OVERFLOWED,
+                    format!(
+                        "Result of repeat() was larger than max_allowed_packet \
+                         ({MAX_ALLOWED_PACKET}) - truncated"
+                    ),
+                ));
             }
             let mut out = Vec::with_capacity(out_len);
             for _ in 0..count {
@@ -1591,10 +1793,23 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 ));
             }
             let v = eval_expr_with_row(&func.args[0], schema, row)?;
+            // MySQL treats NULL and negative arguments as an invalid sleep:
+            // return 0 and record warning 1210.
             if v.is_null() {
-                return Ok(Datum::Null);
+                push_warning(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "Incorrect arguments to sleep",
+                );
+                return Ok(Datum::I64(0));
             }
-            let secs = v.as_f64()?.max(0.0);
+            let secs = v.as_f64()?;
+            if secs < 0.0 {
+                push_warning(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "Incorrect arguments to sleep",
+                );
+                return Ok(Datum::I64(0));
+            }
             std::thread::sleep(std::time::Duration::from_secs_f64(secs));
             Ok(Datum::I64(0))
         }
@@ -2205,6 +2420,11 @@ fn datum_as_time(d: &Datum) -> Result<Time> {
                 t
             } else if !s.contains(' ') {
                 parse_timestamp_literal(&format!("{s} 00:00:00"))?
+            } else if let Some((date, clock)) = s.split_once(char::is_whitespace)
+                && clock.matches(':').count() == 1
+            {
+                // MySQL accepts a clock without seconds (`HH:MM`).
+                parse_timestamp_literal(&format!("{} {}:00", date.trim(), clock.trim()))?
             } else {
                 parse_timestamp_literal(&s)?
             };
@@ -2808,6 +3028,69 @@ pub fn session_local_to_utc(mut t: Time) -> Result<Time> {
     }
 }
 
+/// Shift a [`Time`] by `minutes`, normalizing the calendar (public wrapper for
+/// time-zone offset application in DML casting).
+pub fn shift_time_minutes(mut t: Time, minutes: i64) -> Result<Time> {
+    shift_minutes(&mut t, minutes)?;
+    Ok(t)
+}
+
+/// Whether `t` is a real wall-clock time in the session time zone. A local
+/// time inside a DST spring-forward gap does not exist (MySQL reports 1292).
+pub fn session_local_time_exists(t: &Time) -> bool {
+    if t.year == 0 && t.month == 0 && t.day == 0 {
+        return true;
+    }
+    let tz = current_time_zone();
+    let Some(zone) = named_zone(&tz) else {
+        return true;
+    };
+    let Some(naive) = naive_of(t) else {
+        return true;
+    };
+    !matches!(
+        chrono::TimeZone::from_local_datetime(&zone, &naive),
+        chrono::LocalResult::None
+    )
+}
+
+/// Session-local wall clock → UTC, moving a nonexistent DST-gap wall clock
+/// forward until it becomes valid (TiDB keeps `03:00` for `'02:00'` in
+/// Europe/Amsterdam on the spring-forward day). Non-gap values behave like
+/// [`session_local_to_utc`].
+pub fn session_local_to_utc_gap_shift(t: Time) -> Result<Time> {
+    if t.year == 0 && t.month == 0 && t.day == 0 {
+        return Ok(t);
+    }
+    let tz = current_time_zone();
+    let Some(zone) = named_zone(&tz) else {
+        return session_local_to_utc(t);
+    };
+    let Some(naive) = naive_of(&t) else {
+        return session_local_to_utc(t);
+    };
+    if !matches!(
+        chrono::TimeZone::from_local_datetime(&zone, &naive),
+        chrono::LocalResult::None
+    ) {
+        return session_local_to_utc(t);
+    }
+    // Walk past the gap (at most a few hours) to the first valid wall clock.
+    for minutes in 1..=180 {
+        let later = naive + chrono::Duration::minutes(minutes);
+        if let chrono::LocalResult::Single(dt) =
+            chrono::TimeZone::from_local_datetime(&zone, &later)
+        {
+            let offset = i64::from(dt.offset().fix().local_minus_utc()).div_euclid(60);
+            let mut shifted = t;
+            shift_minutes(&mut shifted, minutes)?;
+            shift_minutes(&mut shifted, -offset)?;
+            return Ok(shifted);
+        }
+    }
+    Ok(t)
+}
+
 /// Display TIMESTAMP (UTC storage) in the session time zone. The zero
 /// timestamp is not shifted (TiDB prints `0000-00-00 00:00:00` in every zone).
 pub fn format_timestamp_display(t: Time) -> String {
@@ -3239,7 +3522,8 @@ fn bytes_eq(a: u8, b: u8, ci: bool) -> bool {
 
 fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let value = eval_expr_with_row(&cast.expr, schema, row)?;
-    let ft = match cast.target.to_ascii_uppercase().as_str() {
+    let target = cast.target.to_ascii_uppercase();
+    let ft = match target.as_str() {
         "SIGNED" | "SIGNED INTEGER" => FieldType::new_longlong(),
         "UNSIGNED" | "UNSIGNED INTEGER" => {
             let mut ft = FieldType::new_longlong();
@@ -3249,6 +3533,23 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         "DOUBLE" | "REAL" | "FLOAT" => FieldType::new_double(),
         "CHAR" | "BINARY" | "CHARSET" => FieldType::new_string(),
         "DECIMAL" | "NUMERIC" => FieldType::new_newdecimal(),
+        // `CAST(x AS DECIMAL(p,s))` / `CONVERT(x, DECIMAL(p,s))` keeps the
+        // requested precision and scale.
+        _ if target.starts_with("DECIMAL(") || target.starts_with("NUMERIC(") => {
+            let inner = target
+                .split_once('(')
+                .map(|(_, rest)| rest.trim_end_matches(')'))
+                .unwrap_or("");
+            let mut parts = inner.split(',').map(|p| p.trim());
+            let precision = parts.next().and_then(|p| p.parse::<i32>().ok());
+            let scale = parts.next().and_then(|p| p.parse::<i32>().ok());
+            let mut ft = FieldType::new_newdecimal();
+            if let Some(precision) = precision {
+                ft.flen = precision;
+            }
+            ft.decimal = scale.unwrap_or(0);
+            ft
+        }
         "DATE" => FieldType {
             tp: sealdb_types::field_type::TYPE_DATE,
             flen: 10,

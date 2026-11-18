@@ -879,6 +879,9 @@ pub fn run_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Result<
                 format!("connection '{current}' is not open"),
             )
         })?;
+        if std::env::var_os("SEALDB_ITEST_TRACE_STEPS").is_some() {
+            eprintln!("[step] {}", step.sql.lines().next().unwrap_or(""));
+        }
         chunks.push(run_step(session, step)?);
     }
     let mut out = chunks.join("\n");
@@ -1073,12 +1076,15 @@ pub fn compare_suite(suite: &Suite, storage: Arc<dyn sealdb_kv::Storage>) -> Res
             ),
         ));
     }
-    let expected = fs::read_to_string(&suite.result_path).map_err(|e| {
+    // Some imported TiDB goldens contain byte-truncated prefix-index keys that
+    // are not valid UTF-8; compare their lossy form.
+    let expected = String::from_utf8_lossy(&fs::read(&suite.result_path).map_err(|e| {
         Error::new(
             sealdb_errno::ERR_UNKNOWN_ERROR,
             format!("{}: {e}", suite.result_path.display()),
         )
-    })?;
+    })?)
+    .into_owned();
     let expected_n = normalize(&expected);
     let actual_n = normalize(&actual);
     if actual_n != expected_n {

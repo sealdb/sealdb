@@ -182,6 +182,12 @@ fn infer(expr: &ExprNode, info: &TableInfo, index_name: &str, text: &str) -> Res
         ExprNode::Func(f) => function_field_type(&f.name, f, info, index_name, text),
         ExprNode::Cast(c) => {
             let target = c.target.trim();
+            // Multi-valued index part `CAST(json_col AS SIGNED ARRAY)`: the
+            // hidden column stores the array elements, compared element-wise
+            // by the uniqueness check rather than by whole-column equality.
+            if target.to_ascii_uppercase().ends_with("ARRAY") {
+                return Ok(FieldType::new_string());
+            }
             if target.eq_ignore_ascii_case("json") || target.eq_ignore_ascii_case("geometry") {
                 return Err(Error::new(
                     ERR_FUNCTIONAL_INDEX_ON_JSON_OR_GEOMETRY_FUNCTION,

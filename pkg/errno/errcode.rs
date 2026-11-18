@@ -12,6 +12,9 @@ pub const ERR_AS_OF: i32 = 8135;
 /// MySQL `ER_BAD_TABLE_ERROR`: `DROP TABLE` naming a VIEW (1051).
 pub const ERR_BAD_TABLE: i32 = 1051;
 pub const ERR_PARSE_ERROR: i32 = 1064;
+/// MySQL `ER_ILLEGAL_VALUE_FOR_TYPE`: a numeric literal that overflows the
+/// double range (`Illegal double '…' value found during parsing`), 1367.
+pub const ERR_ILLEGAL_VALUE_FOR_TYPE: i32 = 1367;
 pub const ERR_UNKNOWN_TABLE: i32 = 1109;
 pub const ERR_BAD_FIELD: i32 = 1054;
 /// Column name collides across join inputs (`Column 'a' in from clause is ambiguous`).
@@ -31,10 +34,22 @@ pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
+/// MySQL `ER_TRUNCATED_WRONG_VALUE_FOR_FIELD`: a value that cannot be
+/// converted to the column's type (`Incorrect bigint value: '…'`), 1366.
+pub const ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD: i32 = 1366;
 /// MySQL `ER_WARN_DATA_OUT_OF_RANGE`: value outside the target type's range (1264).
 pub const ERR_WARN_DATA_OUT_OF_RANGE: i32 = 1264;
 /// MySQL `ER_WARN_DATA_TRUNCATED`: invalid ENUM/SET member coerced to `''`.
 pub const ERR_WARN_DATA_TRUNCATED: i32 = 1265;
+/// MySQL `ER_DATA_TOO_LONG`: value wider than the column (e.g. `9` into
+/// `BIT(3)`), 1406.
+pub const ERR_DATA_TOO_LONG: i32 = 1406;
+/// MySQL `ER_WARN_ALLOWED_PACKET_OVERFLOWED`: a function result exceeds
+/// `max_allowed_packet` (1301).
+pub const ERR_ALLOWED_PACKET_OVERFLOWED: i32 = 1301;
+/// MySQL `ER_AUTOINC_READ_FAILED` (1467): the auto-increment allocator ran out
+/// of values for the column type.
+pub const ERR_AUTOINC_READ_FAILED: i32 = 1467;
 /// TiDB: timestamp falls in a DST transition gap.
 pub const ERR_TIMESTAMP_IN_DST_TRANSITION: i32 = 8179;
 /// TiDB `ErrMemoryExceedForQuery`: statement exceeded `tidb_mem_quota_query`.

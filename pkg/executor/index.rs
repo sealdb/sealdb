@@ -53,7 +53,7 @@ pub(crate) fn write_index_keys(
         if index.unique && txn.get(key.as_bytes())?.is_some() {
             let value = index_values(index, values)
                 .iter()
-                .map(|v| v.display())
+                .map(crate::insert::duplicate_part_text)
                 .collect::<Vec<_>>()
                 .join("-");
             let name = if index.primary {

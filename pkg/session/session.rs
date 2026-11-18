@@ -150,6 +150,8 @@ pub struct Session {
     write_row_id: Mutex<bool>,
     /// TiDB `tidb_enable_auto_increment_in_generated` (default OFF).
     enable_auto_increment_in_generated: Mutex<bool>,
+    /// TiDB `tidb_enable_strict_not_null_check` (default ON).
+    strict_not_null_check: Mutex<bool>,
     /// TiDB `tidb_enable_external_ts_read` (default OFF): when ON, a new read
     /// snapshot is pinned at `tidb_external_ts`.
     enable_external_ts_read: Mutex<bool>,
@@ -217,6 +219,9 @@ impl Session {
     pub fn with_domain(domain: Arc<Domain>) -> Self {
         let globals = domain.global_vars();
         let session_id = domain.alloc_session_id();
+        // `LAST_INSERT_ID()` is session state even though evaluation keeps it
+        // in a thread-local; a fresh session must not inherit another one.
+        sealdb_expression::set_last_insert_id(0);
         Self {
             parser: Parser::new(),
             planner: PlanBuilder::new(),
@@ -253,6 +258,7 @@ impl Session {
             allow_auto_random_explicit_insert: Mutex::new(false),
             write_row_id: Mutex::new(false),
             enable_auto_increment_in_generated: Mutex::new(false),
+            strict_not_null_check: Mutex::new(true),
             enable_external_ts_read: Mutex::new(globals.enable_external_ts_read),
             external_ts: Mutex::new(None),
             cost_model_version: Mutex::new(2),
@@ -831,6 +837,31 @@ impl Session {
         Ok(())
     }
 
+    /// Global temporary tables start every transaction with a fresh
+    /// `AUTO_INCREMENT` counter (TiDB scopes the allocator to the transaction).
+    fn reset_temp_table_auto_ids(&self) -> Result<()> {
+        let keys: Vec<(String, String)> = self
+            .temp_tables_on_commit_delete
+            .lock()
+            .expect("session temp tables on commit lock")
+            .iter()
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let temps = self.temp_tables.lock().expect("session temp tables lock");
+        for key in keys {
+            if let Some(info) = temps.get(&key) {
+                self.domain.reset_handle(info.id)?;
+                if info.columns.iter().any(|col| col.auto_increment) {
+                    self.domain.reset_auto_id(info.id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn execute_one(&self, stmt: &Statement) -> Result<QueryResult> {
         // Publish this session's `tidb_window_concurrency` for the planner and
         // executor (thread-local), so a suite that changes it cannot leak its
@@ -1316,6 +1347,7 @@ impl Session {
                     .read_only
                     .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
                 self.apply_pending_schema(true)?;
+                self.reset_temp_table_auto_ids()?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
                 // `START TRANSACTION … AS OF TIMESTAMP <expr>`: the explicit
                 // transaction reads the snapshot at that wall clock.
@@ -1628,6 +1660,10 @@ impl Session {
         }
         check_only_full_group_by(self, stmt)?;
         if let Some(result) = system_var_result(self, stmt) {
+            *self
+                .last_warnings
+                .lock()
+                .expect("session last_warnings lock") = result.warnings.clone();
             return Ok(result);
         }
         // `@@last_plan_from_binding` reports whether *this* statement's plan
@@ -1850,6 +1886,10 @@ impl Session {
             .enable_auto_increment_in_generated
             .lock()
             .expect("session auto increment in generated lock");
+        let strict_not_null = *self
+            .strict_not_null_check
+            .lock()
+            .expect("session strict not null lock");
         let mut result = with_clustered_index_mode(clustered_index, || {
             sealdb_expression::with_strict_dml(strict_dml, || {
                 sealdb_expression::with_div_by_zero_mode(div_mode, || {
@@ -1871,10 +1911,15 @@ impl Session {
                                                             // TiDB allocates a fresh memory tracker per query.
                                                             sealdb_expression::reset_query_mem_usage();
                                                             self.probe_plan_cache(stmt);
-                                                            sealdb_expression::with_allow_write_row_id(
-                                                allow_write_row_id,
-                                                || ExecutorBuilder::run(exec),
-                                            )
+                                                            sealdb_expression::with_strict_not_null_check(
+                                                                strict_not_null,
+                                                                || {
+                                                                    sealdb_expression::with_allow_write_row_id(
+                                                                        allow_write_row_id,
+                                                                        || ExecutorBuilder::run(exec),
+                                                                    )
+                                                                },
+                                                            )
                                                         },
                                                     )
                                                 },
@@ -4486,6 +4531,20 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     format!("Variable '{name}' is a read only variable"),
                 ));
             }
+            "timestamp" => {
+                // MySQL's test hook: freeze `NOW()` for the session.
+                if value.eq_ignore_ascii_case("DEFAULT") {
+                    sealdb_expression::set_session_timestamp(None);
+                } else {
+                    let secs = value.trim().parse::<f64>().map_err(|_| {
+                        sealdb_errno::Error::new(
+                            sealdb_errno::ERR_WRONG_ARGUMENTS,
+                            format!("Variable 'timestamp' can't be set to the value of '{value}'"),
+                        )
+                    })?;
+                    sealdb_expression::set_session_timestamp(Some(secs.floor() as i64));
+                }
+            }
             "tidb_external_ts" => {
                 *session
                     .external_ts
@@ -4740,6 +4799,17 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     .enable_auto_increment_in_generated
                     .lock()
                     .expect("session auto increment in generated lock") = on;
+            }
+            "tidb_enable_strict_not_null_check" => {
+                let on = if value.eq_ignore_ascii_case("DEFAULT") {
+                    true
+                } else {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true")
+                };
+                *session
+                    .strict_not_null_check
+                    .lock()
+                    .expect("session strict not null lock") = on;
             }
             "foreign_key_checks" => {
                 let on = if value.eq_ignore_ascii_case("DEFAULT") {
@@ -5259,6 +5329,7 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
         // FK feature gate: SealDB always accepts FK DDL, so the flag is a no-op.
         "tidb_enable_foreign_key" => {}
         "tidb_enable_auto_increment_in_generated" => {}
+        "tidb_enable_strict_not_null_check" => {}
         "tidb_enable_table_partition" => {
             warnings.push((
                 1105,
@@ -5357,9 +5428,11 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     }
     let mut columns = Vec::new();
     let mut row = Vec::new();
+    let mut warnings = Vec::new();
     for field in &select.fields {
         match &field.expr {
             ExprNode::Value(v) => {
+                let mut datum = v.datum.clone();
                 let name = field
                     .as_name
                     .clone()
@@ -5377,8 +5450,41 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
                         }
                         literal_field_name(&v.datum)
                     });
+                // Bare DECIMAL literals wider than DECIMAL(65) saturate to the
+                // largest decimal with warning 1292. The column label keeps the
+                // literal as written.
+                if let sealdb_types::Datum::Decimal(d) = &datum {
+                    let text = d.to_string();
+                    let int_digits = text
+                        .trim_start_matches('-')
+                        .split('.')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches('0')
+                        .len();
+                    if int_digits > 65 {
+                        let sign = if text.starts_with('-') { "-" } else { "" };
+                        let magnitude = text.trim_start_matches('-').replace('.', "");
+                        let shown = if magnitude.len() > 81 {
+                            &magnitude[magnitude.len() - 81..]
+                        } else {
+                            &magnitude[..]
+                        };
+                        warnings.push((
+                            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                            format!("Truncated incorrect DECIMAL value: '{sign}{shown}'"),
+                        ));
+                        let mut clamped = "9".repeat(65);
+                        if text.starts_with('-') {
+                            clamped.insert(0, '-');
+                        }
+                        if let Ok(value) = sealdb_types::MyDecimal::parse(&clamped) {
+                            datum = sealdb_types::Datum::Decimal(value);
+                        }
+                    }
+                }
                 columns.push(name);
-                row.push(v.datum.clone());
+                row.push(datum);
             }
             ExprNode::Column(col) => {
                 columns.push(field.as_name.clone().unwrap_or_else(|| col.name.clone()));
@@ -5417,7 +5523,7 @@ fn system_var_result(session: &Session, stmt: &Statement) -> Option<QueryResult>
     Some(QueryResult {
         columns,
         rows: vec![row],
-        warnings: Vec::new(),
+        warnings,
         affected_rows: 0,
         info: String::new(),
     })
@@ -5521,6 +5627,15 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
 /// Typed session getters; `None` means the variable has no session-local state.
 fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
     Some(match name {
+        // `SELECT @@warning_count` reports the previous statement's warnings
+        // (the buffer is cleared when the current statement starts).
+        "warning_count" => session
+            .last_warnings
+            .lock()
+            .expect("session last_warnings lock")
+            .len()
+            .to_string(),
+        "error_count" => "0".to_string(),
         "sql_mode" => session
             .sql_mode
             .lock()
@@ -5651,6 +5766,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
                 "0".into()
             }
         }
+        "tidb_enable_strict_not_null_check" => {
+            if *session
+                .strict_not_null_check
+                .lock()
+                .expect("session strict not null lock")
+            {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         "tidb_enable_auto_increment_in_generated" => {
             if *session
                 .enable_auto_increment_in_generated
@@ -5771,6 +5897,7 @@ fn read_global_sysvar(session: &Session, name: &str) -> Option<String> {
         }
         "allow_auto_random_explicit_insert" => "0".into(),
         "tidb_enable_auto_increment_in_generated" => "0".into(),
+        "tidb_enable_strict_not_null_check" => "1".into(),
         other => {
             return show_variable_default(other).map(str::to_string);
         }
@@ -5857,6 +5984,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
         "OFF",
         VarKind::Flag,
     ),
+    ("tidb_enable_strict_not_null_check", "ON", VarKind::Flag),
     ("tidb_enable_clustered_index", "ON", VarKind::Text),
     ("tidb_enable_external_ts_read", "OFF", VarKind::Flag),
     ("tidb_enable_list_partition", "ON", VarKind::Flag),
