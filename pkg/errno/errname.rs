@@ -100,6 +100,9 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_FUNCTIONAL_INDEX_ON_AUTO_INCREMENT => "ErrFunctionalIndexOnAutoIncrement",
         errcode::ERR_INVALID_DEFAULT => "ErrInvalidDefault",
         errcode::ERR_UNSUPPORTED_ON_GENERATED_COLUMN => "ErrUnsupportedOnGeneratedColumn",
+        errcode::ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN => {
+            "ErrNonDefaultValueForGeneratedColumn"
+        }
         errcode::ERR_DEPENDENT_BY_GENERATED_COLUMN => "ErrDependentByGeneratedColumn",
         errcode::ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL => "ErrDependentByPartitionFunctional",
         errcode::ERR_TOO_BIG_DISPLAYWIDTH => "ErrTooBigDisplayWidth",
@@ -145,6 +148,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_WRONG_FIELD_WITH_GROUP => "42000",
         errcode::ERR_INVALID_DEFAULT => "42000",
         errcode::ERR_UNSUPPORTED_ON_GENERATED_COLUMN
+        | errcode::ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN
         | errcode::ERR_DEPENDENT_BY_GENERATED_COLUMN
         | errcode::ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL => "HY000",
         errcode::ERR_TOO_BIG_DISPLAYWIDTH => "42000",

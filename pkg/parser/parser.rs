@@ -2290,3 +2290,19 @@ mod orig_text_timestamp {
         );
     }
 }
+
+#[cfg(test)]
+mod tmp_probe_default {
+    use super::*;
+    #[test]
+    fn probe() {
+        for sql in [
+            "update t set b=default",
+            "update t set b=default(a)",
+            "update t set b=6",
+        ] {
+            let stmt = Parser::new().parse_one_stmt(sql).unwrap();
+            eprintln!("{sql} => {:?}", stmt);
+        }
+    }
+}

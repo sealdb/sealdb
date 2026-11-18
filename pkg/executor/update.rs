@@ -11,14 +11,15 @@ use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_BAD_NULL, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION, ERR_VIEW_CHECK_FAILED,
-    Error, Result,
+    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
+    ERR_UNKNOWN_PARTITION, ERR_VIEW_CHECK_FAILED, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, eval_filter, locate_partition_for_row};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
-use sealdb_meta::TableInfo;
+use sealdb_meta::{ColumnInfo, TableInfo};
 use sealdb_parser::ast::ddl::TableName;
-use sealdb_parser::ast::{Assignment, Join, UpdateStmt, WithClause};
+use sealdb_parser::ast::expressions::ValueExpr;
+use sealdb_parser::ast::{Assignment, ExprNode, Join, UpdateStmt, WithClause};
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
@@ -73,6 +74,8 @@ impl Executor for UpdateExec {
             ));
         }
         let col_names = col_names(&info);
+        let assignments =
+            resolve_default_assignments(&self.stmt.list, &[(info.name.o(), &info, 0)], &col_names)?;
         // A heap / common-handle table exposes `_tidb_rowid` to predicates; the
         // execute-time filter sees the scanned row's handle as that column.
         let rowid_eval = !info.pk_is_handle;
@@ -131,7 +134,7 @@ impl Executor for UpdateExec {
             // `SET c = (SELECT … WHERE inner.k = outer.k)`: bind the outer
             // row's columns so the subquery becomes uncorrelated and can run.
             let list = bind_outer_assignments(
-                &self.stmt.list,
+                &assignments,
                 &info,
                 &col_names,
                 &scanned.values,
@@ -243,6 +246,14 @@ impl UpdateExec {
             lock,
         )?;
         let schema = joined_schema(&join.left.name, &left_names, &join.right.name, &right_names);
+        let mut tables: Vec<(&str, &TableInfo, usize)> = Vec::new();
+        if let Some(info) = left_info.as_ref() {
+            tables.push((join.left.name.as_str(), info, 0));
+        }
+        if let Some(info) = right_info.as_ref() {
+            tables.push((join.right.name.as_str(), info, left_names.len()));
+        }
+        let assignments = resolve_default_assignments(&self.stmt.list, &tables, &schema)?;
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
@@ -261,7 +272,7 @@ impl UpdateExec {
             let mut left_new = left_row.map(|r| r.values.clone());
             let mut right_new = right_row.map(|r| r.values.clone());
             apply_assignments(
-                &self.stmt.list,
+                &assignments,
                 &schema,
                 &joined,
                 left_width,
@@ -452,6 +463,119 @@ pub(crate) fn apply_assignments(
         }
     }
     Ok(())
+}
+
+/// `DEFAULT` target of an assignment: `Some(None)` for the bare keyword,
+/// `Some(Some((table, column)))` for `DEFAULT(col)`, `None` for a plain value.
+fn default_target(expr: &ExprNode) -> Option<Option<(Option<String>, String)>> {
+    match expr {
+        ExprNode::Column(c)
+            if c.schema.is_none()
+                && c.table.is_none()
+                && c.name.eq_ignore_ascii_case("default") =>
+        {
+            Some(None)
+        }
+        ExprNode::Func(f) if f.name.eq_ignore_ascii_case("default") && f.args.len() == 1 => {
+            match &f.args[0] {
+                ExprNode::Column(c) => Some(Some((
+                    c.table.clone().or_else(|| c.schema.clone()),
+                    c.name.clone(),
+                ))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve TiDB's `SET c = DEFAULT` / `SET c = DEFAULT(x)` and enforce the
+/// generated-column write guard (3105): a generated column may only be
+/// assigned the bare `DEFAULT` or `DEFAULT(itself)`, both of which mean
+/// "recompute from the base columns".
+fn resolve_default_assignments(
+    list: &[Assignment],
+    tables: &[(&str, &TableInfo, usize)],
+    schema: &[String],
+) -> Result<Vec<Assignment>> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        let idx = find_schema_index(schema, item.table.as_deref(), &item.column)?;
+        let owner = tables
+            .iter()
+            .find(|(_, info, offset)| idx >= *offset && idx < *offset + info.columns.len());
+        let Some((alias, info, offset)) = owner else {
+            out.push(item.clone());
+            continue;
+        };
+        let col = &info.columns[idx - offset];
+        let generated = col.generated_expr.is_some();
+        let target = default_target(&item.expr);
+        let generated_error = || {
+            Error::new(
+                ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
+                format!(
+                    "The value specified for generated column '{}' in table '{}' is not allowed.",
+                    col.name.o(),
+                    info.name.o()
+                ),
+            )
+        };
+        match (generated, target) {
+            (false, Some(None)) => out.push(Assignment {
+                table: item.table.clone(),
+                column: item.column.clone(),
+                expr: ExprNode::Value(ValueExpr {
+                    datum: crate::insert::column_default_value(col)?,
+                }),
+            }),
+            (false, Some(Some((table, name)))) => {
+                let source = find_default_column(info, table.as_deref(), &name)?;
+                out.push(Assignment {
+                    table: item.table.clone(),
+                    column: item.column.clone(),
+                    expr: ExprNode::Value(ValueExpr {
+                        datum: crate::insert::column_default_value(source)?,
+                    }),
+                });
+            }
+            (false, None) => out.push(item.clone()),
+            // `SET gen_col = DEFAULT` / `SET gen_col = DEFAULT(gen_col)`:
+            // drop the assignment so `fill_generated_columns` recomputes it.
+            (true, Some(None)) => {}
+            (true, Some(Some((table, name))))
+                if name.eq_ignore_ascii_case(col.name.o())
+                    && table
+                        .as_deref()
+                        .is_none_or(|t| t.eq_ignore_ascii_case(alias)) => {}
+            (true, _) => return Err(generated_error()),
+        }
+    }
+    Ok(out)
+}
+
+fn find_default_column<'a>(
+    info: &'a TableInfo,
+    table: Option<&str>,
+    name: &str,
+) -> Result<&'a ColumnInfo> {
+    if let Some(table) = table
+        && !table.eq_ignore_ascii_case(info.name.o())
+    {
+        return Err(Error::new(
+            ERR_BAD_FIELD,
+            format!("Unknown column '{name}' in 'field list'"),
+        ));
+    }
+    info.columns
+        .iter()
+        .find(|c| c.name.o().eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            Error::new(
+                ERR_BAD_FIELD,
+                format!("Unknown column '{name}' in 'field list'"),
+            )
+        })
 }
 
 /// Locate `table.column` (or unique unqualified `column`) in a join/table schema.

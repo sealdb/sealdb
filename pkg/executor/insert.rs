@@ -474,7 +474,7 @@ fn implicit_zero(ft: &FieldType) -> Datum {
 }
 
 /// Use the column's `DEFAULT <expr>` body for an inserted row.
-fn column_default_value(col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+pub(crate) fn column_default_value(col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
     // A TIMESTAMP literal default was pinned to UTC at DDL time
     // (`OriginDefaultValue`); use it as-is instead of re-reading the printed
     // default in the current session zone.

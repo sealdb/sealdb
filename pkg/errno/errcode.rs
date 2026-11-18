@@ -136,6 +136,9 @@ pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
+/// TiDB `ErrNonDefaultValueForGeneratedColumn`: `UPDATE t SET gen_col = 6`
+/// (only `DEFAULT` / `DEFAULT(gen_col)` may recompute it).
+pub const ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN: i32 = 3105;
 /// TiDB `ErrUnsupportedOnGeneratedColumn`: an ALTER on a column referenced by
 /// a generated column (`MODIFY a bigint` → 3106).
 pub const ERR_UNSUPPORTED_ON_GENERATED_COLUMN: i32 = 3106;
