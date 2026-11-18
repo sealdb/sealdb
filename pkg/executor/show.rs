@@ -516,6 +516,64 @@ impl Executor for ShowExec {
                     })
                     .collect();
             }
+            ShowStmtKind::StatsTopN => {
+                self.schema = vec![
+                    "Db_name".to_string(),
+                    "Table_name".to_string(),
+                    "Partition_name".to_string(),
+                    "Column_name".to_string(),
+                    "Is_index".to_string(),
+                    "Value".to_string(),
+                    "Count".to_string(),
+                ];
+                let stats = self.domain.stats();
+                let mut rows = Vec::new();
+                for db in is.all_schemas() {
+                    let db_name = db.name.o().to_string();
+                    if db_name.eq_ignore_ascii_case("information_schema")
+                        || db_name.eq_ignore_ascii_case("mysql")
+                    {
+                        continue;
+                    }
+                    for table in is.schema_tables(&db_name) {
+                        let table_name = table.name.o().to_string();
+                        let Some(table_stats) = stats.raw_table(&db_name, &table_name) else {
+                            continue;
+                        };
+                        for (column_name, column) in &table_stats.columns {
+                            let Some(topn) = column.topn.as_ref() else {
+                                continue;
+                            };
+                            for (value, count) in &topn.items {
+                                rows.push(vec![
+                                    Datum::Bytes(db_name.as_bytes().to_vec()),
+                                    Datum::Bytes(table_name.as_bytes().to_vec()),
+                                    Datum::Bytes(Vec::new()),
+                                    Datum::Bytes(column_name.as_bytes().to_vec()),
+                                    Datum::I64(0),
+                                    Datum::Bytes(value.as_bytes().to_vec()),
+                                    Datum::I64(*count as i64),
+                                ]);
+                            }
+                        }
+                        for (index_name, index) in &table_stats.indices {
+                            for (value, count) in &index.topn {
+                                rows.push(vec![
+                                    Datum::Bytes(db_name.as_bytes().to_vec()),
+                                    Datum::Bytes(table_name.as_bytes().to_vec()),
+                                    Datum::Bytes(Vec::new()),
+                                    Datum::Bytes(index_name.as_bytes().to_vec()),
+                                    Datum::I64(1),
+                                    Datum::Bytes(value.clone()),
+                                    Datum::I64(*count as i64),
+                                ]);
+                            }
+                        }
+                    }
+                }
+                self.rows = rows;
+                self.apply_where_filter()?;
+            }
             ShowStmtKind::Warnings => {
                 self.schema = vec![
                     "Level".to_string(),

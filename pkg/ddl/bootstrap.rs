@@ -153,6 +153,26 @@ const SYSTEM_TABLES: &[&str] = &[
     "CREATE TABLE opt_rule_blacklist (\n\
         name CHAR(100) NOT NULL\n\
     )",
+    // TiDB `mysql.analyze_jobs`: one row per finished manual/auto ANALYZE task.
+    // Tests clear it with `DELETE` and read `job_info` back.
+    "CREATE TABLE analyze_jobs (\n\
+        id BIGINT NOT NULL AUTO_INCREMENT,\n\
+        create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+        update_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n\
+        table_schema VARCHAR(64) NOT NULL DEFAULT '',\n\
+        table_name VARCHAR(64) NOT NULL DEFAULT '',\n\
+        partition_name VARCHAR(64) NOT NULL DEFAULT '',\n\
+        job_info VARCHAR(256) NOT NULL DEFAULT '',\n\
+        processed_rows BIGINT NOT NULL DEFAULT 0,\n\
+        start_time TIMESTAMP NULL DEFAULT NULL,\n\
+        end_time TIMESTAMP NULL DEFAULT NULL,\n\
+        state VARCHAR(64) NOT NULL DEFAULT '',\n\
+        fail_reason TEXT,\n\
+        instance VARCHAR(512) NOT NULL DEFAULT '',\n\
+        process_id BIGINT UNSIGNED NOT NULL DEFAULT 0,\n\
+        remarks VARCHAR(256) NOT NULL DEFAULT '',\n\
+        PRIMARY KEY (id)\n\
+    )",
     // TiDB `mysql.tidb_background_subtask`: DDL/lightning background tasks.
     // Distributing reorg jobs insert `(id, state, checkpoint, summary)` rows
     // and patch `summary` in place, so every other column needs to be nullable.

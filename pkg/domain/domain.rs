@@ -93,6 +93,8 @@ pub struct Domain {
     resource_groups: Mutex<HashMap<String, Option<u64>>>,
     /// `tidb_enable_resource_control` (TiDB 7.4+ defaults to ON).
     resource_control: AtomicBool,
+    /// `tidb_analyze_skip_column_types`: column type names ANALYZE ignores.
+    analyze_skip_column_types: Mutex<Vec<String>>,
 }
 
 /// One shard allocation window: `remaining` row ids may still be drawn from
@@ -228,6 +230,7 @@ impl Domain {
             shard_allocate_step: AtomicU64::new(u64::MAX),
             resource_groups: Mutex::new(HashMap::new()),
             resource_control: AtomicBool::new(true),
+            analyze_skip_column_types: Mutex::new(Vec::new()),
         })
     }
 
@@ -704,6 +707,22 @@ impl Domain {
 
     pub fn stats(&self) -> Arc<Handle> {
         Arc::clone(&self.stats)
+    }
+
+    /// Replace the `tidb_analyze_skip_column_types` list (lowercase names).
+    pub fn set_analyze_skip_column_types(&self, types: Vec<String>) {
+        *self
+            .analyze_skip_column_types
+            .lock()
+            .expect("analyze skip column types lock") = types;
+    }
+
+    /// Column type names that manual ANALYZE leaves out.
+    pub fn analyze_skip_column_types(&self) -> Vec<String> {
+        self.analyze_skip_column_types
+            .lock()
+            .expect("analyze skip column types lock")
+            .clone()
     }
 
     pub fn infoschema(&self) -> InfoSchema {

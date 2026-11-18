@@ -413,8 +413,14 @@ pub struct AnalyzeTableStmt {
     pub table: TableName,
     /// Extra tables for `ANALYZE TABLE t1, t2, t3` (TiDB multi-table).
     pub tables: Vec<TableName>,
+    /// `ANALYZE TABLE t PARTITION p0, p1`: restrict the scan to these
+    /// partitions (TiDB keeps per-partition statistics).
+    pub partitions: Vec<String>,
     /// Optional index names for `ANALYZE TABLE t INDEX idx1, idx2`.
     pub indexes: Vec<String>,
+    /// `ANALYZE TABLE t COLUMNS c1, c2`: only collect these columns. Empty
+    /// means every eligible column (`ALL COLUMNS`).
+    pub columns: Vec<String>,
     /// `WITH n BUCKETS`: histogram bucket count (TiDB default 256).
     pub bucket_count: Option<u64>,
     /// `WITH n TOPN`: most-frequent-value count kept per histogram (TiDB
@@ -443,9 +449,27 @@ impl AnalyzeTableStmt {
                 t.restore(ctx)?;
             }
         }
+        if !self.partitions.is_empty() {
+            ctx.write_str(" PARTITION ");
+            for (i, name) in self.partitions.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(name);
+            }
+        }
         if !self.indexes.is_empty() {
             ctx.write_str(" INDEX ");
             for (i, name) in self.indexes.iter().enumerate() {
+                if i > 0 {
+                    ctx.write_str(", ");
+                }
+                ctx.write_name(name);
+            }
+        }
+        if !self.columns.is_empty() {
+            ctx.write_str(" COLUMNS ");
+            for (i, name) in self.columns.iter().enumerate() {
                 if i > 0 {
                     ctx.write_str(", ");
                 }
@@ -490,6 +514,8 @@ pub enum ShowStmtKind {
     Bindings,
     /// `SHOW STATS_LOCKED`
     StatsLocked,
+    /// `SHOW STATS_TOPN [WHERE …]`
+    StatsTopN,
     /// `SHOW WARNINGS`
     Warnings,
     /// `SHOW [GLOBAL|SESSION] VARIABLES [LIKE …|WHERE …]`
@@ -592,6 +618,7 @@ impl ShowStmt {
             ShowStmtKind::DdlJobs => ctx.write_str("ADMIN SHOW DDL JOBS"),
             ShowStmtKind::Bindings => ctx.write_str("SHOW BINDINGS"),
             ShowStmtKind::StatsLocked => ctx.write_str("SHOW STATS_LOCKED"),
+            ShowStmtKind::StatsTopN => ctx.write_str("SHOW STATS_TOPN"),
             ShowStmtKind::Warnings => ctx.write_str("SHOW WARNINGS"),
             ShowStmtKind::Variables => {
                 ctx.write_str("SHOW ");

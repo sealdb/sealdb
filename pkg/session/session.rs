@@ -3386,7 +3386,9 @@ fn maybe_auto_analyze(session: &Session, stmt: &Statement) -> Result<()> {
         let analyze = Statement::AnalyzeTable(sealdb_parser::ast::AnalyzeTableStmt {
             table: sealdb_parser::ast::TableName::new(Some(schema), name),
             tables: Vec::new(),
+            partitions: Vec::new(),
             indexes: Vec::new(),
+            columns: Vec::new(),
             bucket_count: None,
             topn_count: None,
         });
@@ -4886,6 +4888,31 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     overrides.insert("tidb_session_alias".to_string(), alias);
                 }
             }
+            // Fast analyze was removed in TiDB v7.5: the assignment is
+            // accepted but reports the deprecation on every non-default value.
+            "tidb_enable_fast_analyze" => {
+                if !value.eq_ignore_ascii_case("DEFAULT") {
+                    warnings.push((
+                        1105,
+                        "the fast analyze feature has already been removed in TiDB v7.5.0, so this will have no effect".to_string(),
+                    ));
+                }
+            }
+            // `tidb_analyze_skip_column_types`: column types ANALYZE leaves out
+            // of the manual collection (`json,blob,mediumblob,text,mediumtext`).
+            "tidb_analyze_skip_column_types" => {
+                let types: Vec<String> =
+                    if value.eq_ignore_ascii_case("DEFAULT") || value.is_empty() {
+                        Vec::new()
+                    } else {
+                        value
+                            .split(',')
+                            .map(|part| part.trim().to_ascii_lowercase())
+                            .filter(|part| !part.is_empty())
+                            .collect()
+                    };
+                session.domain.set_analyze_skip_column_types(types);
+            }
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
@@ -5721,6 +5748,9 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ),
     ("tidb_auto_analyze_ratio", "0.5", VarKind::Text),
     ("tidb_auto_analyze_concurrency", "3", VarKind::Text),
+    ("tidb_analyze_version", "2", VarKind::Text),
+    ("tidb_analyze_skip_column_types", "", VarKind::Text),
+    ("tidb_enable_fast_analyze", "OFF", VarKind::Flag),
     ("tidb_batch_pending_tiflash_count", "6", VarKind::Text),
     ("tidb_capture_plan_baselines", "OFF", VarKind::Flag),
     ("tidb_cost_model_version", "2", VarKind::Text),

@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 103,
+      "green": 104,
       "in_progress": 9,
       "local": 8,
-      "pending": 132
+      "pending": 131
     },
     "by_wave": {
       "D": 2,
@@ -536,7 +536,7 @@
     {
       "name": "executor/analyze",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/analyze.test",
       "result": "r/executor/analyze.result",
       "has_result": true,

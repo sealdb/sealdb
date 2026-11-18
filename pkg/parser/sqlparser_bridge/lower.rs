@@ -164,6 +164,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_admin_show_ddl(&rewritten);
     let rewritten = rewrite_show_bindings(&rewritten);
     let rewritten = rewrite_show_warnings(&rewritten);
+    let rewritten = rewrite_show_stats_topn(&rewritten);
     // MySQL/TiDB `DROP TABLES …` (plural object keyword).
     let rewritten = rewrite_drop_tables(&rewritten);
     let rewritten = rewrite_alter_add_columns_paren(&rewritten);
@@ -252,6 +253,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             decode_show_ddl_jobs(show);
             decode_show_bindings(show);
             decode_show_warnings(show);
+            decode_show_stats_topn(show);
         }
         if let Statement::CreateTable(create) = &mut lowered {
             create.ttl = ttls.next().flatten();
@@ -301,9 +303,10 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             prepare.sql = sql;
         }
         if let Statement::AnalyzeTable(analyze) = &mut lowered
-            && let Some((indexes, tables, buckets, topn)) = analyze_extras.next().flatten()
+            && let Some((indexes, tables, columns, buckets, topn)) = analyze_extras.next().flatten()
         {
             analyze.indexes = indexes;
+            analyze.columns = columns;
             analyze.bucket_count = buckets;
             analyze.topn_count = topn;
             if tables.len() > 1 {
@@ -1212,6 +1215,7 @@ const SHOW_INDEX_SCHEMA: &str = "__sealdb_index__";
 const SHOW_DDL_JOBS_SCHEMA: &str = "__sealdb_ddl_jobs__";
 const SHOW_BINDINGS_SCHEMA: &str = "__sealdb_bindings__";
 const SHOW_WARNINGS_SCHEMA: &str = "__sealdb_warnings__";
+const SHOW_STATS_TOPN_SCHEMA: &str = "__sealdb_stats_topn__";
 const RENAME_INDEX_MARKER: &str = "__sealdb_rename_index__";
 const RENAME_INDEX_SEP: char = '\u{1f}';
 
@@ -2253,6 +2257,40 @@ fn rewrite_show_warnings(sql: &str) -> String {
     out
 }
 
+/// sqlparser has no `SHOW STATS_TOPN`; rewrite to SHOW TABLES FROM a marker
+/// schema while keeping the `WHERE` clause, then decode it back.
+fn rewrite_show_stats_topn(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 24);
+    let mut i = 0;
+    while i < bytes.len() {
+        if keyword_at(bytes, i, "SHOW") {
+            let after_show = skip_ws(bytes, i + "SHOW".len());
+            if keyword_at(bytes, after_show, "STATS_TOPN") {
+                out.push_str("SHOW TABLES FROM `");
+                out.push_str(SHOW_STATS_TOPN_SCHEMA);
+                out.push('`');
+                i = after_show + "STATS_TOPN".len();
+                continue;
+            }
+        }
+        i = push_sql_char(&mut out, sql, i);
+    }
+    out
+}
+
+fn decode_show_stats_topn(show: &mut ShowStmt) {
+    if show.kind == ShowStmtKind::Tables
+        && show
+            .db_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(SHOW_STATS_TOPN_SCHEMA))
+    {
+        show.kind = ShowStmtKind::StatsTopN;
+        show.db_name = None;
+    }
+}
+
 fn decode_show_warnings(show: &mut ShowStmt) {
     if show.kind == ShowStmtKind::Tables
         && show
@@ -3144,25 +3182,46 @@ fn parse_quoted_or_ident(bytes: &[u8], i: usize) -> Result<(String, usize)> {
 }
 
 fn lower_analyze(analyze: &sqlparser::ast::Analyze) -> Result<Statement> {
-    // gaps: ANALYZE INDEX, PARTITION, named column lists, NOSCAN, COMPUTE STATISTICS.
-    if analyze.partitions.as_ref().is_some_and(|p| !p.is_empty()) {
-        return Err(Error::unsupported("ANALYZE PARTITION"));
-    }
-    // TiDB `ANALYZE TABLE t ALL COLUMNS` sets `for_columns` with an empty list.
-    if !analyze.columns.is_empty() {
-        return Err(Error::unsupported("ANALYZE columns"));
-    }
+    // gaps: ANALYZE NOSCAN, COMPUTE STATISTICS.
     if analyze.noscan || analyze.cache_metadata {
         return Err(Error::unsupported("ANALYZE option"));
+    }
+    // Parenthesized PostgreSQL-style `ANALYZE t (c)` is not TiDB syntax (TiDB
+    // spells it `ANALYZE TABLE t COLUMNS c`, stripped before parsing).
+    if !analyze.columns.is_empty() {
+        return Err(Error::unsupported("ANALYZE columns"));
     }
     let table = analyze
         .table_name
         .as_ref()
         .ok_or_else(|| Error::unsupported("ANALYZE without table"))?;
+    let partitions = analyze
+        .partitions
+        .as_ref()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    Expr::Identifier(ident) => Some(ident.value.clone()),
+                    Expr::Value(value) => match &value.value {
+                        Value::SingleQuotedString(name)
+                        | Value::DoubleQuotedString(name)
+                        | Value::SingleQuotedByteStringLiteral(name)
+                        | Value::DoubleQuotedByteStringLiteral(name) => Some(name.clone()),
+                        Value::Number(name, _) => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Statement::AnalyzeTable(AnalyzeTableStmt {
         table: object_table_name(table)?,
         tables: Vec::new(),
+        partitions,
         indexes: Vec::new(),
+        columns: Vec::new(),
         bucket_count: None,
         topn_count: None,
     }))
@@ -5056,7 +5115,36 @@ fn read_analyze_options(bytes: &[u8], sql: &str, k: usize) -> (usize, Option<u64
 
 /// `(indexes, tables, buckets, topn)` per `ANALYZE` table target; `None`
 /// mirrors the analyzer list for targets without explicit options.
-type AnalyzeTableExtras = Vec<Option<(Vec<String>, Vec<String>, Option<u64>, Option<u64>)>>;
+type AnalyzeTableExtras = Vec<
+    Option<(
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Option<u64>,
+        Option<u64>,
+    )>,
+>;
+
+/// Read a comma-separated identifier list after an `ANALYZE` keyword
+/// (`INDEX idx1, idx2` / `COLUMNS c1, c2`). Returns the names and the offset
+/// after the list.
+fn read_analyze_name_list(bytes: &[u8], mut k: usize) -> (Vec<String>, usize) {
+    let mut names = Vec::new();
+    loop {
+        let (name, next) = read_quoted_or_ident(bytes, k);
+        if name.is_empty() {
+            break;
+        }
+        names.push(name);
+        k = skip_ws(bytes, next);
+        if k < bytes.len() && bytes[k] == b',' {
+            k = skip_ws(bytes, k + 1);
+            continue;
+        }
+        break;
+    }
+    (names, k)
+}
 
 fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
     let bytes = sql.as_bytes();
@@ -5118,64 +5206,41 @@ fn extract_analyze_index(sql: &str) -> Result<(String, AnalyzeTableExtras)> {
                 // sqlparser expects `PARTITION (p0, p1)`.
                 let mut partitions: Option<Vec<String>> = None;
                 if keyword_at(bytes, j, "PARTITION") {
-                    let mut k = skip_ws(bytes, j + "PARTITION".len());
-                    let mut names = Vec::new();
-                    loop {
-                        let (name, next) = read_quoted_or_ident(bytes, k);
-                        if name.is_empty() {
-                            break;
-                        }
-                        names.push(name);
-                        k = skip_ws(bytes, next);
-                        if k < bytes.len() && bytes[k] == b',' {
-                            k = skip_ws(bytes, k + 1);
-                            continue;
-                        }
-                        break;
-                    }
+                    let (names, k) =
+                        read_analyze_name_list(bytes, skip_ws(bytes, j + "PARTITION".len()));
                     j = skip_ws(bytes, k);
                     partitions = Some(names);
                 }
+                let mut indexes = Vec::new();
                 if keyword_at(bytes, j, "INDEX") {
-                    let mut k = skip_ws(bytes, j + "INDEX".len());
-                    let mut names = Vec::new();
-                    loop {
-                        let (name, next) = read_quoted_or_ident(bytes, k);
-                        if name.is_empty() {
-                            break;
-                        }
-                        names.push(name);
-                        k = skip_ws(bytes, next);
-                        if k < bytes.len() && bytes[k] == b',' {
-                            k = skip_ws(bytes, k + 1);
-                            continue;
-                        }
-                        break;
-                    }
-                    push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
-                    let (k, buckets, topn) = read_analyze_options(bytes, sql, k);
-                    extras.push(Some((names, table_names, buckets, topn)));
-                    i = k;
-                    continue;
+                    let (names, k) =
+                        read_analyze_name_list(bytes, skip_ws(bytes, j + "INDEX".len()));
+                    indexes = names;
+                    j = skip_ws(bytes, k);
                 }
                 // TiDB `ANALYZE TABLE t ALL COLUMNS` — strip; full-table analyze.
+                let mut columns: Option<Vec<String>> = None;
                 if keyword_at(bytes, j, "ALL") {
                     let after_all = skip_ws(bytes, j + "ALL".len());
                     if keyword_at(bytes, after_all, "COLUMNS") {
-                        push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
-                        let (k, buckets, topn) = read_analyze_options(
-                            bytes,
-                            sql,
-                            skip_ws(bytes, after_all + "COLUMNS".len()),
-                        );
-                        extras.push(Some((Vec::new(), table_names, buckets, topn)));
-                        i = k;
-                        continue;
+                        j = skip_ws(bytes, after_all + "COLUMNS".len());
+                        columns = Some(Vec::new());
                     }
+                } else if keyword_at(bytes, j, "COLUMNS") {
+                    let (names, k) =
+                        read_analyze_name_list(bytes, skip_ws(bytes, j + "COLUMNS".len()));
+                    columns = Some(names);
+                    j = skip_ws(bytes, k);
                 }
                 push_analyze_head(&mut out, &sql[i..first_end], partitions.as_deref());
                 let (k, buckets, topn) = read_analyze_options(bytes, sql, j);
-                extras.push(Some((Vec::new(), table_names, buckets, topn)));
+                extras.push(Some((
+                    indexes,
+                    table_names,
+                    columns.unwrap_or_default(),
+                    buckets,
+                    topn,
+                )));
                 i = k;
                 continue;
             }

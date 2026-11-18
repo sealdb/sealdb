@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-16（green 93 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-18（green 104 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -3948,6 +3948,56 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `infoschema/infoschema`（R6 同批，`MemTableScan` 范围与信息列口径）。
   - `planner/core/partial_order_topn`（前缀索引部分有序 + TopN 下推）。
+
+### 2026-11-18（`executor/analyze` 转绿：分区/列级 ANALYZE、`mysql.analyze_jobs`、`SHOW STATS_TOPN`）
+
+- **Phase**: R7 `executor/analyze` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `ANALYZE TABLE t PARTITION p0, p1`：`AnalyzeTableStmt` 新增 `partitions`，
+    `AnalyzeExec` 把扫描行限制到指定分区（不存在的分区名报 1735）。
+    分区级 ANALYZE 只更新分区计数，`stats_meta.count` 保持全表行数。
+  - `ANALYZE TABLE t COLUMNS a, e` / `ALL COLUMNS`：新增 `columns` 字段与
+    `COLUMNS` 语法制导；只收集列清单内的列，但索引列始终保留。
+  - 收集过滤：虚拟生成列（`generated_expr` 且非 stored）不采样；
+    `tidb_analyze_skip_column_types`（json/blob/mediumblob/text/mediumtext）
+    跳过非索引列，索引前缀列（`index idx(d(10))`）仍收集。
+  - `mysql.analyze_jobs` 系统表：bootstrap 建表，手动/自动 ANALYZE 完成后
+    写入一行（`job_info` 为 TiDB 文本格式
+    `analyze table all indexes, columns a, b, d with 256 buckets, 100 topn, 1 samplerate`），
+    `DELETE` 与 `LIKE` 查询走普通 DML/扫描路径。
+  - `SHOW STATS_TOPN [WHERE …]`：sqlparser 无该语法，重写为
+    `SHOW TABLES FROM __sealdb_stats_topn__` 后解码回 `ShowStmtKind::StatsTopN`；
+    输出 `Db_name/Table_name/Partition_name/Column_name/Is_index/Value/Count`
+    并复用 SHOW 的 WHERE 行过滤。
+  - 系统变量：`tidb_analyze_version` / `tidb_analyze_skip_column_types` /
+    `tidb_enable_fast_analyze` 进入变量注册表；`SET … tidb_enable_fast_analyze`
+    非 default 值回报 1105「fast analyze feature has already been removed」。
+  - `ANALYZE TABLE t PARTITION p0 INDEX idx` 在统计版本 2 下追加 1105
+    「The version 2 would collect all statistics not only the selected indexes」。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/analyze --status pending`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t executor/analyze --status pending`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - 全量 gate：`./tests/integrationtest/run-tests.sh`
+    → `PASS: memory=112 tikv=110 skipped=144`（gate 首轮因残留
+    `sealdb-itest --store both` 进程持有 `/tmp/sealdb-meta.lock` 报
+    「timed out locking meta persist」，清理后复跑通过）
+  - manifest：`executor/analyze` → `green`，green 103→104
+    （R7 36→37，pending 132→131）。
+- **阻塞/风险**:
+  - `mysql.analyze_jobs` 只写一条汇总行，未实现 TiDB 的异步子任务
+    （分区/索引逐项 task）与 `processed_rows` 实时推进；语料只读 `job_info`。
+  - `SHOW STATS_TOPN` 的索引 TopN 值仍是编码后的 key 文本，
+    表达式索引的 `Value` 列未按 TiDB `decodeIndexValue` 还原；当前语料
+    只覆盖普通列 TopN。
+  - 分区 ANALYZE 不维护独立的分区统计对象（仍复用表级 `Table` 结构 +
+    `part_counts`），`globalindex/analyze` 与 `SHOW STATS_HISTOGRAMS`
+    分区行的口径需要后续补齐。
+- **下一步**:
+  - `SHOW STATS_HISTOGRAMS`（`executor/analyze` 的姊妹语法，
+    `globalindex/analyze` / `explain_complex_stats` 共同依赖）。
+  - `infoschema/infoschema`（R6 同批，`MemTableScan` 范围与信息列口径）。
 
 ## 7. 更新模板
 

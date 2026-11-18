@@ -2033,6 +2033,18 @@ mod tests {
         {
             crate::ast::Statement::AnalyzeTable(analyze) => {
                 assert_eq!(analyze.table.name, "th");
+                assert!(analyze.columns.is_empty());
+            }
+            other => panic!("expected AnalyzeTableStmt, got {other:?}"),
+        }
+        match parser
+            .parse_one_stmt("ANALYZE TABLE t PARTITION p0, p1 INDEX idx COLUMNS a, b")
+            .unwrap()
+        {
+            crate::ast::Statement::AnalyzeTable(analyze) => {
+                assert_eq!(analyze.partitions, vec!["p0", "p1"]);
+                assert_eq!(analyze.indexes, vec!["idx"]);
+                assert_eq!(analyze.columns, vec!["a", "b"]);
             }
             other => panic!("expected AnalyzeTableStmt, got {other:?}"),
         }

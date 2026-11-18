@@ -44,11 +44,13 @@ impl Executor for AnalyzeExec {
             return Ok(());
         };
         let indexes = analyze.indexes.clone();
+        let partitions = analyze.partitions.clone();
+        let columns = analyze.columns.clone();
         let buckets = analyze.bucket_count;
         let topn = analyze.topn_count;
         let tables: Vec<_> = analyze.all_tables().into_iter().cloned().collect();
         for table in &tables {
-            self.analyze_one(table, &indexes, buckets, topn)?;
+            self.analyze_one(table, &indexes, &partitions, &columns, buckets, topn)?;
         }
         Ok(())
     }
@@ -67,10 +69,13 @@ impl Executor for AnalyzeExec {
 }
 
 impl AnalyzeExec {
+    #[allow(clippy::too_many_arguments)]
     fn analyze_one(
         &self,
         table: &sealdb_parser::ast::TableName,
         indexes: &[String],
+        partitions: &[String],
+        requested_columns: &[String],
         buckets: Option<u64>,
         topn_size: Option<u64>,
     ) -> Result<()> {
@@ -85,15 +90,32 @@ impl AnalyzeExec {
                 format!("Table '{schema}.{name}' doesn't exist"),
             )
         })?;
-        let rows = scan_table(
+        let all_rows = scan_table(
             &self.txn,
             &info,
             RowLock::None,
             LockWait::Block,
             &info.physical_ids(),
         )?;
+        let total_count = all_rows.len() as u64;
+        let rows = filter_partition_rows(&info, all_rows, partitions)?;
+        let count = if partitions.is_empty() {
+            rows.len() as u64
+        } else {
+            total_count
+        };
         let index_cols = resolve_index_columns(&info, indexes)?;
-        let columns = collect_column_stats(&info, &rows, index_cols.as_ref(), buckets, topn_size);
+        let skip_types = self.domain.analyze_skip_column_types();
+        let analyzed_columns = collect_column_stats(
+            &info,
+            &rows,
+            index_cols.as_ref(),
+            requested_columns,
+            &skip_types,
+            buckets,
+            topn_size,
+        );
+        let columns = analyzed_columns.clone();
         let index_stats = collect_index_stats(&info, &rows, buckets, topn_size);
         // TiDB keeps a row count per physical table id in `mysql.stats_meta`; a
         // partition's `DATA_LENGTH` reads its own count, not the table total.
@@ -111,7 +133,7 @@ impl AnalyzeExec {
         };
         let stats = if let Some(mut prev) = self.domain.stats().table(&schema, &name) {
             if index_cols.is_some() {
-                prev.count = rows.len() as u64;
+                prev.count = count;
                 prev.version += 1;
                 for (cname, cstats) in columns {
                     if let Some((_, slot)) = prev
@@ -152,7 +174,7 @@ impl AnalyzeExec {
                     }
                 }
                 Table {
-                    count: rows.len() as u64,
+                    count,
                     modify_count: 0,
                     columns,
                     indices,
@@ -162,7 +184,7 @@ impl AnalyzeExec {
             }
         } else {
             Table {
-                count: rows.len() as u64,
+                count,
                 modify_count: 0,
                 columns,
                 indices: index_stats,
@@ -172,8 +194,128 @@ impl AnalyzeExec {
         };
         self.domain.stats().update(&schema, &name, stats);
         self.domain.persist_stats()?;
+        // Statistics version 2 collects every column regardless of the
+        // `INDEX` list, so a partition+index analyze reports it.
+        if !partitions.is_empty() && !indexes.is_empty() {
+            sealdb_expression::note_warning(
+                1105,
+                "The version 2 would collect all statistics not only the selected indexes",
+            );
+        }
+        let job_info = analyze_job_info(&info, &analyzed_columns, buckets, topn_size);
+        let partition_name = match partitions {
+            [one] => one.as_str(),
+            _ => "",
+        };
+        self.record_analyze_job(&schema, &name, partition_name, &job_info, rows.len() as u64)?;
         Ok(())
     }
+
+    /// Insert the finished task into `mysql.analyze_jobs` (TiDB records one
+    /// row per analyzer task; tests read `job_info` back).
+    fn record_analyze_job(
+        &self,
+        schema: &str,
+        table: &str,
+        partition: &str,
+        job_info: &str,
+        processed_rows: u64,
+    ) -> Result<()> {
+        let Some(info) = self
+            .domain
+            .infoschema()
+            .table_by_name("mysql", "analyze_jobs")
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let handle = self.domain.next_handle(info.id)?;
+        let mut values = vec![Datum::Null; info.columns.len()];
+        for (pos, column) in info.columns.iter().enumerate() {
+            values[pos] = match column.name.l() {
+                "id" => Datum::I64(handle),
+                "table_schema" => Datum::Bytes(schema.as_bytes().to_vec()),
+                "table_name" => Datum::Bytes(table.as_bytes().to_vec()),
+                "partition_name" => Datum::Bytes(partition.as_bytes().to_vec()),
+                "job_info" => Datum::Bytes(job_info.as_bytes().to_vec()),
+                "processed_rows" => Datum::I64(processed_rows as i64),
+                "state" => Datum::Bytes(b"finished".to_vec()),
+                "fail_reason" => Datum::Null,
+                "instance" => Datum::Bytes(Vec::new()),
+                "remarks" => Datum::Bytes(Vec::new()),
+                _ => Datum::Null,
+            };
+        }
+        let col_ids: Vec<i64> = info.columns.iter().map(|column| column.id).collect();
+        let key = sealdb_tablecodec::encode_row_key_with_handle(info.id, handle);
+        let row = sealdb_tablecodec::encode_row(&col_ids, &values);
+        self.txn.with_txn(|txn| txn.set(key.as_bytes(), &row))?;
+        Ok(())
+    }
+}
+
+/// TiDB `analyze table` task text stored in `mysql.analyze_jobs.job_info`.
+fn analyze_job_info(
+    info: &TableInfo,
+    analyzed_columns: &[(String, ColumnStats)],
+    buckets: Option<u64>,
+    topn_size: Option<u64>,
+) -> String {
+    let names: Vec<&str> = analyzed_columns
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let buckets = buckets.unwrap_or(256);
+    let topn = topn_size.unwrap_or(100);
+    let mut out = String::from("analyze table ");
+    if !info.indices.is_empty() {
+        out.push_str("all indexes, ");
+    }
+    out.push_str("columns ");
+    out.push_str(&names.join(", "));
+    out.push_str(&format!(
+        " with {buckets} buckets, {topn} topn, 1 samplerate"
+    ));
+    out
+}
+
+/// Restrict scanned rows to the named partitions (`ANALYZE TABLE t PARTITION`).
+fn filter_partition_rows(
+    info: &TableInfo,
+    rows: Vec<crate::table_reader::ScannedRow>,
+    partitions: &[String],
+) -> Result<Vec<crate::table_reader::ScannedRow>> {
+    if partitions.is_empty() {
+        return Ok(rows);
+    }
+    let part = info
+        .partition
+        .as_ref()
+        .filter(|part| part.enable)
+        .ok_or_else(|| {
+            Error::new(
+                sealdb_errno::ERR_UNKNOWN_PARTITION,
+                format!("Table '{}' is not partitioned", info.name.o()),
+            )
+        })?;
+    let mut ids = HashSet::new();
+    for name in partitions {
+        let Some(def) = part
+            .definitions
+            .iter()
+            .find(|def| def.name.o().eq_ignore_ascii_case(name))
+        else {
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_PARTITION,
+                format!("Unknown partition '{name}' in table '{}'", info.name.o()),
+            ));
+        };
+        ids.insert(def.id);
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|row| ids.contains(&row.physical_id))
+        .collect())
 }
 
 fn collect_index_stats(
@@ -301,14 +443,46 @@ fn collect_column_stats(
     info: &TableInfo,
     rows: &[crate::table_reader::ScannedRow],
     index_cols: Option<&HashSet<String>>,
+    requested_columns: &[String],
+    skip_types: &[String],
     buckets: Option<u64>,
     topn_size: Option<u64>,
 ) -> Vec<(String, ColumnStats)> {
+    // Columns backing any index are collected even when their type is on the
+    // skip list (TiDB keeps prefix-index statistics for TEXT columns).
+    let indexed: HashSet<String> = info
+        .indices
+        .iter()
+        .flat_map(|index| index.columns.iter())
+        .map(|part| part.name.o().to_ascii_lowercase())
+        .collect();
+    let requested: HashSet<String> = requested_columns
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     let mut columns = Vec::new();
     for (idx, col) in info.columns.iter().enumerate() {
+        let name = col.name.o().to_ascii_lowercase();
+        // `ANALYZE … COLUMNS`: TiDB still collects index columns.
+        if !requested.is_empty() && !requested.contains(&name) && !indexed.contains(&name) {
+            continue;
+        }
         if let Some(wanted) = index_cols
-            && !wanted.contains(&col.name.o().to_ascii_lowercase())
+            && !wanted.contains(&name)
         {
+            continue;
+        }
+        // Virtual generated columns have no stored values to sample.
+        if col.generated_expr.is_some() && !col.generated_stored {
+            continue;
+        }
+        let type_name = col.field_type.type_name();
+        let base_type = type_name
+            .split('(')
+            .next()
+            .unwrap_or(type_name.as_str())
+            .to_ascii_lowercase();
+        if !indexed.contains(&name) && skip_types.iter().any(|tp| *tp == base_type) {
             continue;
         }
         let mut distinct = HashSet::new();
