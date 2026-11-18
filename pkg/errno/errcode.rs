@@ -21,6 +21,8 @@ pub const ERR_NO_SUCH_TABLE: i32 = 1146;
 /// MySQL `ER_ROW_IS_REFERENCED_2`: deleting a parent row still referenced by a
 /// child foreign key (1451).
 pub const ERR_ROW_IS_REFERENCED_2: i32 = 1451;
+/// MySQL `ER_NO_REFERENCED_ROW_2`: a child row's key has no parent row (1452).
+pub const ERR_NO_REFERENCED_ROW_2: i32 = 1452;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
 /// MySQL `ER_WRONG_VALUE_COUNT_ON_ROW`: VALUES arity differs from the columns.
@@ -136,6 +138,12 @@ pub const ERR_FUNCTIONAL_INDEX_ON_FIELD: i32 = 3758;
 pub const ERR_FUNCTIONAL_INDEX_ON_BLOB: i32 = 3761;
 /// TiDB `ErrFunctionalIndexRowValueIsNotAllowed`: `KEY k (((j, j)))`.
 pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
+/// TiDB `ErrNonUpdatableTable`: the UPDATE/DELETE target is a view, sequence
+/// or derived table (`The target table v of the UPDATE is not updatable`).
+pub const ERR_NON_UPDATABLE_TABLE: i32 = 1288;
+/// TiDB `ErrMultiUpdateKeyConflict`: the same table is updated under two
+/// aliases and one of them assigns the primary key / partition key (1706).
+pub const ERR_MULTI_UPDATE_KEY_CONFLICT: i32 = 1706;
 /// TiDB `ErrNonDefaultValueForGeneratedColumn`: `UPDATE t SET gen_col = 6`
 /// (only `DEFAULT` / `DEFAULT(gen_col)` may recompute it).
 pub const ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN: i32 = 3105;

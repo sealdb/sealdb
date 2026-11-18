@@ -1555,12 +1555,14 @@ impl PlanBuilder {
         if !update.order_by.is_empty() || update.limit.is_some() {
             // TiDB plans ordered/limited UPDATE with Sort/Limit below the root.
         }
-        let select = dml_scan_select(
+        let mut select = dml_scan_select(
             &update.table,
             update.join.as_ref(),
             update.selection.clone(),
             &update.text,
         );
+        // Flattened `t1, t2, t3` / join chain: the child scan sees every side.
+        select.joins.extend(update.additional_joins.iter().cloned());
         let plan = self.build_with_schema(
             &Statement::Select(select),
             is,

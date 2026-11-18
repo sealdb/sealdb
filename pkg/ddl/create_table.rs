@@ -1537,7 +1537,7 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             ..numeric_ft()
         },
         "FLOAT" => {
-            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((12, -1));
+            let (flen, decimal) = parse_flen_decimal_float(type_name).unwrap_or((12, -1));
             // MySQL: `FLOAT(p)` with p > 24 widens to a 8-byte DOUBLE.
             FieldType {
                 tp: if flen > 24 { TYPE_DOUBLE } else { TYPE_FLOAT },
@@ -1547,7 +1547,7 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             }
         }
         "REAL" if sealdb_expression::sql_mode_flag("REAL_AS_FLOAT") => {
-            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((12, -1));
+            let (flen, decimal) = parse_flen_decimal_float(type_name).unwrap_or((12, -1));
             FieldType {
                 tp: TYPE_FLOAT,
                 flen,
@@ -1556,7 +1556,7 @@ pub(crate) fn field_type_from_name(type_name: &str) -> Result<FieldType> {
             }
         }
         "DOUBLE" | "REAL" => {
-            let (flen, decimal) = parse_flen_decimal(type_name).unwrap_or((22, -1));
+            let (flen, decimal) = parse_flen_decimal_float(type_name).unwrap_or((22, -1));
             FieldType {
                 tp: TYPE_DOUBLE,
                 flen,
@@ -1870,6 +1870,17 @@ fn hex_literal_to_string(raw: &str) -> Option<String> {
         i += 2;
     }
     String::from_utf8(bytes).ok()
+}
+
+/// `FLOAT(M)` / `DOUBLE(M)` carry a display width only: without a second
+/// argument the scale stays unspecified (`-1`), so assignments keep their
+/// fractional part instead of rounding to an integer (`FLOAT(M,0)` still
+/// rounds).
+fn parse_flen_decimal_float(type_name: &str) -> Option<(i32, i32)> {
+    let (flen, decimal) = parse_flen_decimal(type_name)?;
+    let close = type_name.find(')')?;
+    let has_scale = type_name[..close].contains(',');
+    Some((flen, if has_scale { decimal } else { -1 }))
 }
 
 /// Parse `TYPE(flen)` / `TYPE(flen, decimal)` — TiDB FieldType Flen/Decimal.

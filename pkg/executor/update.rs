@@ -10,9 +10,11 @@ use crate::sortexec::sort::sort_rows_by;
 use crate::table_reader::{ScannedRow, scan_table};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_BAD_NULL, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
-    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET,
-    ERR_UNKNOWN_PARTITION, ERR_VIEW_CHECK_FAILED, Error, Result,
+    ERR_BAD_FIELD, ERR_BAD_NULL, ERR_MULTI_UPDATE_KEY_CONFLICT, ERR_NO_DB,
+    ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_REFERENCED_ROW_2, ERR_NO_SUCH_TABLE,
+    ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN, ERR_NON_UPDATABLE_TABLE,
+    ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_UNKNOWN_PARTITION, ERR_VIEW_CHECK_FAILED,
+    Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, eval_filter, locate_partition_for_row};
 use sealdb_kv::{LockWait, RowLock, Transaction, TxnHandle};
@@ -23,7 +25,7 @@ use sealdb_parser::ast::{Assignment, ExprNode, Join, UpdateStmt, WithClause};
 use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_util::chunk::Chunk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// `UPDATE` executor: single-table path, or two-table JOIN via `hash_join_pairs`.
@@ -54,8 +56,52 @@ impl UpdateExec {
 
 impl Executor for UpdateExec {
     fn open(&mut self) -> Result<()> {
+        let prev = sealdb_expression::set_current_dml_table(Some(self.stmt.table.name.clone()));
+        let prev_assign = crate::insert::set_update_assignment(true);
+        let out = self.open_stmt();
+        crate::insert::set_update_assignment(prev_assign);
+        sealdb_expression::set_current_dml_table(prev);
+        out
+    }
+
+    fn next(&mut self) -> Result<Option<Chunk>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        Ok(None)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn schema(&self) -> &[String] {
+        &[]
+    }
+}
+
+impl UpdateExec {
+    fn open_stmt(&mut self) -> Result<()> {
         if let Some(join) = self.stmt.join.clone() {
-            return self.update_join(&join);
+            if self.stmt.additional_joins.is_empty() {
+                return self.update_join(&join);
+            }
+            return self.update_join_chain(&join);
+        }
+        if self
+            .stmt
+            .derived_tables
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&self.stmt.table.name))
+        {
+            return Err(Error::new(
+                ERR_NON_UPDATABLE_TABLE,
+                format!(
+                    "The target table {} of the UPDATE is not updatable",
+                    self.stmt.table.name
+                ),
+            ));
         }
         let info = load_table(&self.domain, &self.current_db, &self.stmt.table)?;
         // `SET _tidb_rowid = …`: TiDB only accepts an explicit row handle on a
@@ -150,9 +196,33 @@ impl Executor for UpdateExec {
                 Some(&mut new_values),
                 None,
             )?;
+            cast_assigned_values(&assignments, &info, &col_names, &mut new_values)?;
             crate::insert::fill_generated_columns(&info, &mut new_values)?;
-            reject_null_not_null(&info, &new_values)?;
+            reject_null_not_null(&info, &mut new_values, self.stmt.ignore)?;
             crate::insert::bump_auto_increment(&self.domain, &info, &new_values)?;
+            let assigned = assigned_columns(&assignments);
+            let child = fk_child_violation(
+                &self.domain,
+                &self.txn,
+                &self.current_db,
+                &info,
+                &new_values,
+                &assigned,
+            )?;
+            if apply_fk_outcome(child, self.stmt.ignore)? {
+                continue;
+            }
+            let parent = fk_parent_violation(
+                &self.domain,
+                &self.txn,
+                &info,
+                &scanned.values,
+                &new_values,
+                &assigned,
+            )?;
+            if apply_fk_outcome(parent, self.stmt.ignore)? {
+                continue;
+            }
             if let Some(check) = &self.stmt.check_option_where
                 && !eval_filter(check, &col_names, &new_values)?
             {
@@ -190,16 +260,15 @@ impl Executor for UpdateExec {
                 keep[i] = check_partition_target(&info, new_values, &targets, self.stmt.ignore)?;
             }
         }
-        let mut changed = 0u64;
-        self.txn.with_txn(|txn| {
-            for ((scanned, new_values), keep) in plans.into_iter().zip(keep) {
-                if keep && new_values != scanned.values {
-                    apply_row_update(txn, &info, &scanned, new_values)?;
-                    changed += 1;
-                }
-            }
-            Ok(())
-        })?;
+        let writes: Vec<(ScannedRow, Vec<Datum>)> = plans
+            .into_iter()
+            .zip(keep)
+            .filter(|((scanned, new_values), keep)| *keep && *new_values != scanned.values)
+            .map(|((scanned, new_values), _)| (scanned, new_values))
+            .collect();
+        let changed = writes.len() as u64;
+        self.txn
+            .with_txn(|txn| apply_row_updates(txn, &info, &writes))?;
         crate::internal::note_dml_affected(changed);
         crate::internal::set_dml_info(format!(
             "Rows matched: {matched_count}  Changed: {changed}  Warnings: {}",
@@ -207,22 +276,27 @@ impl Executor for UpdateExec {
         ));
         Ok(())
     }
+}
 
-    fn next(&mut self) -> Result<Option<Chunk>> {
-        if self.done {
-            return Ok(None);
-        }
-        self.done = true;
-        Ok(None)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn schema(&self) -> &[String] {
-        &[]
-    }
+/// Merge one alias's rewritten row into the per-handle accumulator; overrides
+/// are the columns this alias changed versus the scanned base row.
+fn record_join_row(
+    merged: &mut HashMap<(i64, i64, i64), (ScannedRow, Vec<Datum>, Vec<(usize, Datum)>)>,
+    info: &TableInfo,
+    scanned: &ScannedRow,
+    values: &[Datum],
+) {
+    let key = (info.id, scanned.physical_id, scanned.handle);
+    let overrides: Vec<(usize, Datum)> = values
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| scanned.values.get(*i) != Some(*v))
+        .map(|(i, v)| (i, v.clone()))
+        .collect();
+    let entry = merged
+        .entry(key)
+        .or_insert_with(|| (scanned.clone(), scanned.values.clone(), Vec::new()));
+    entry.2.extend(overrides);
 }
 
 impl UpdateExec {
@@ -254,12 +328,17 @@ impl UpdateExec {
             tables.push((join.right.name.as_str(), info, left_names.len()));
         }
         let assignments = resolve_default_assignments(&self.stmt.list, &tables, &schema)?;
+        reject_derived_assignments(&assignments, &tables, &schema, &self.stmt.derived_tables)?;
+        check_multi_update_key(&tables, &assignments, &schema)?;
         let left_values: Vec<Vec<Datum>> = left_rows.iter().map(|r| r.values.clone()).collect();
         let right_values: Vec<Vec<Datum>> = right_rows.iter().map(|r| r.values.clone()).collect();
         let pairs = hash_join_pairs(join, &left_names, &right_names, &left_values, &right_values)?;
         let left_width = left_names.len();
-        let mut left_updates: HashMap<(i64, i64), (ScannedRow, Vec<Datum>)> = HashMap::new();
-        let mut right_updates: HashMap<(i64, i64), (ScannedRow, Vec<Datum>)> = HashMap::new();
+        // A self-join addresses one physical row through both aliases: their
+        // assignments merge (base values plus per-alias column overrides).
+        type JoinRow = (ScannedRow, Vec<Datum>, Vec<(usize, Datum)>);
+        let mut merged: HashMap<(i64, i64, i64), JoinRow> = HashMap::new();
+        let ignore = self.stmt.ignore;
         for (left_i, right_i) in pairs {
             let left_row = left_i.map(|i| &left_rows[i]);
             let right_row = right_i.map(|i| &right_rows[i]);
@@ -279,48 +358,233 @@ impl UpdateExec {
                 left_new.as_deref_mut(),
                 right_new.as_deref_mut(),
             )?;
-            if let (Some(left), Some(values)) = (&left_info, left_new.as_mut()) {
-                crate::insert::fill_generated_columns(left, values)?;
+            cast_joined_assigned_values(
+                &assignments,
+                &schema,
+                left_width,
+                left_info.as_ref(),
+                right_info.as_ref(),
+                &mut left_new,
+                &mut right_new,
+            )?;
+            if let (Some(info), Some(scanned), Some(values)) = (&left_info, left_row, left_new) {
+                record_join_row(&mut merged, info, scanned, &values);
             }
-            if let (Some(right), Some(values)) = (&right_info, right_new.as_mut()) {
-                crate::insert::fill_generated_columns(right, values)?;
-            }
-            if left_info.is_some()
-                && let (Some(scanned), Some(values)) = (left_row, left_new)
-            {
-                left_updates.insert(
-                    (scanned.physical_id, scanned.handle),
-                    (scanned.clone(), values),
-                );
-            }
-            if right_info.is_some()
-                && let (Some(scanned), Some(values)) = (right_row, right_new)
-            {
-                right_updates.insert(
-                    (scanned.physical_id, scanned.handle),
-                    (scanned.clone(), values),
-                );
+            if let (Some(info), Some(scanned), Some(values)) = (&right_info, right_row, right_new) {
+                record_join_row(&mut merged, info, scanned, &values);
             }
         }
-        // Self-join (`UPDATE t t1, t t2 ...`): both aliases address the same
-        // physical rows, so only the left role's rewritten values are applied.
-        let same_table = matches!(
-            (&left_info, &right_info),
-            (Some(left), Some(right)) if left.id == right.id
-        );
+        let mut matched = 0u64;
+        let mut changed = 0u64;
         self.txn.with_txn(|txn| {
-            if let Some(left) = &left_info {
-                for (_, (scanned, values)) in left_updates {
-                    apply_row_update(txn, left, &scanned, values)?;
+            for ((table_id, _, _), (scanned, base, overrides)) in merged {
+                let Some(info) = left_info
+                    .as_ref()
+                    .filter(|info| info.id == table_id)
+                    .or_else(|| right_info.as_ref().filter(|info| info.id == table_id))
+                else {
+                    continue;
+                };
+                // A table that the SET list does not address contributes join
+                // rows but is neither matched nor changed (TiDB counts the
+                // target rows of the updated tables only).
+                if overrides.is_empty() {
+                    continue;
                 }
-            }
-            if let Some(right) = &right_info.filter(|_| !same_table) {
-                for (_, (scanned, values)) in right_updates {
-                    apply_row_update(txn, right, &scanned, values)?;
+                matched += 1;
+                let mut values = base;
+                for (slot, value) in overrides {
+                    values[slot] = value;
+                }
+                if values == scanned.values {
+                    continue;
+                }
+                crate::insert::fill_generated_columns(info, &mut values)?;
+                reject_null_not_null(info, &mut values, ignore)?;
+                if values != scanned.values {
+                    changed += 1;
+                    apply_row_update(txn, info, &scanned, values)?;
                 }
             }
             Ok(())
-        })
+        })?;
+        crate::internal::note_dml_affected(changed);
+        crate::internal::set_dml_info(format!(
+            "Rows matched: {matched}  Changed: {changed}  Warnings: {}",
+            sealdb_expression::warnings_len()
+        ));
+        Ok(())
+    }
+}
+
+impl UpdateExec {
+    /// `UPDATE t1, t2, t3 SET …` / three-table JOIN: same row-by-row apply as
+    /// the two-table path, but over a flat join chain (comma lists become
+    /// `JOIN … ON TRUE`, so the product is filtered by `ON` / `WHERE`).
+    fn update_join_chain(&mut self, join: &Join) -> Result<()> {
+        let lock = dml_row_lock(&self.txn)?;
+        let mut factors: Vec<Join> = vec![join.clone()];
+        factors.extend(self.stmt.additional_joins.iter().cloned());
+        let mut chain_tables = vec![join.left.clone()];
+        chain_tables.extend(factors.iter().map(|factor| factor.right.clone()));
+        let sides = chain_tables.len();
+        let mut names = Vec::with_capacity(sides);
+        let mut rows = Vec::with_capacity(sides);
+        let mut infos: Vec<Option<TableInfo>> = Vec::with_capacity(sides);
+        for table in &chain_tables {
+            let (side_names, side_rows, side_info) = scan_dml_side(
+                &self.domain,
+                &self.current_db,
+                &self.txn,
+                self.stmt.with.as_ref(),
+                table,
+                lock,
+            )?;
+            names.push(side_names);
+            rows.push(side_rows);
+            infos.push(side_info);
+        }
+        let mut offsets = Vec::with_capacity(sides);
+        let mut width = 0usize;
+        for side_names in &names {
+            offsets.push(width);
+            width += side_names.len();
+        }
+        let schema: Vec<String> = chain_tables
+            .iter()
+            .zip(&names)
+            .flat_map(|(table, cols)| cols.iter().map(move |c| format!("{}.{}", table.name, c)))
+            .collect();
+        let tables: Vec<(&str, &TableInfo, usize)> = chain_tables
+            .iter()
+            .zip(infos.iter())
+            .zip(offsets.iter())
+            .filter_map(|((table, info), offset)| {
+                info.as_ref()
+                    .map(|info| (table.name.as_str(), info, *offset))
+            })
+            .collect();
+        let assignments = resolve_default_assignments(&self.stmt.list, &tables, &schema)?;
+        reject_derived_assignments(&assignments, &tables, &schema, &self.stmt.derived_tables)?;
+        check_multi_update_key(&tables, &assignments, &schema)?;
+        // Aliases of one physical table may target the same row; assignments
+        // from every alias merge onto that row (first base values, then each
+        // alias's overrides in SET order).
+        type ChainRow = (ScannedRow, Vec<Datum>, Vec<(usize, Datum)>);
+        let mut merged: HashMap<(i64, i64, i64), ChainRow> = HashMap::new();
+        let ignore = self.stmt.ignore;
+        if rows.iter().any(Vec::is_empty) {
+            return Ok(());
+        }
+        let mut indices = vec![0usize; sides];
+        loop {
+            let mut joined = Vec::with_capacity(width);
+            for (side, &index) in indices.iter().enumerate() {
+                joined.extend(rows[side][index].values.iter().cloned());
+            }
+            let mut matched = true;
+            for factor in &factors {
+                if !matches!(&factor.on, ExprNode::Value(v) if v.datum == Datum::I64(1))
+                    && !eval_filter(&factor.on, &schema, &joined)?
+                {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched
+                && let Some(selection) = &self.stmt.selection
+                && !eval_filter(selection, &schema, &joined)?
+            {
+                matched = false;
+            }
+            if matched {
+                // Overrides are grouped per alias: TiDB applies each alias's
+                // rewritten row in join order, so a later alias wins when two
+                // aliases assign the same column.
+                let mut per_side: Vec<Vec<(usize, Datum)>> = vec![Vec::new(); sides];
+                for item in &assignments {
+                    let idx = find_schema_index(&schema, item.table.as_deref(), &item.column)?;
+                    let Some((side, slot)) = offsets
+                        .iter()
+                        .enumerate()
+                        .find(|(i, start)| idx >= **start && idx < **start + names[*i].len())
+                        .map(|(i, start)| (i, idx - start))
+                    else {
+                        continue;
+                    };
+                    let Some(info) = infos[side].as_ref() else {
+                        continue;
+                    };
+                    let Some(col) = info.columns.get(slot) else {
+                        continue;
+                    };
+                    let value = eval_expr_with_row(&item.expr, &schema, &joined)?;
+                    let value = crate::insert::cast_for_column(&value, col)?;
+                    per_side[side].push((slot, value));
+                }
+                for (side, overrides) in per_side.into_iter().enumerate() {
+                    if overrides.is_empty() {
+                        continue;
+                    }
+                    let Some(info) = infos[side].as_ref() else {
+                        continue;
+                    };
+                    let scanned = &rows[side][indices[side]];
+                    let key = (info.id, scanned.physical_id, scanned.handle);
+                    let entry = merged
+                        .entry(key)
+                        .or_insert_with(|| (scanned.clone(), scanned.values.clone(), Vec::new()));
+                    entry.2.extend(overrides);
+                }
+            }
+            let mut carry = true;
+            for (side, index) in indices.iter_mut().enumerate() {
+                *index += 1;
+                if *index < rows[side].len() {
+                    carry = false;
+                    break;
+                }
+                *index = 0;
+            }
+            if carry {
+                break;
+            }
+        }
+        let mut matched = 0u64;
+        let mut changed = 0u64;
+        self.txn.with_txn(|txn| {
+            for ((table_id, _, _), (scanned, base, overrides)) in merged {
+                let Some(info) = infos
+                    .iter()
+                    .flatten()
+                    .find(|info| info.id == table_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let mut values = base;
+                for (slot, value) in overrides {
+                    values[slot] = value;
+                }
+                matched += 1;
+                if values == scanned.values {
+                    continue;
+                }
+                crate::insert::fill_generated_columns(&info, &mut values)?;
+                reject_null_not_null(&info, &mut values, ignore)?;
+                if values != scanned.values {
+                    changed += 1;
+                    apply_row_update(txn, &info, &scanned, values)?;
+                }
+            }
+            Ok(())
+        })?;
+        crate::internal::note_dml_affected(changed);
+        crate::internal::set_dml_info(format!(
+            "Rows matched: {matched}  Changed: {changed}  Warnings: {}",
+            sealdb_expression::warnings_len()
+        ));
+        Ok(())
     }
 }
 
@@ -460,6 +724,361 @@ pub(crate) fn apply_assignments(
             && let Some(slot) = right.get_mut(idx - left_width)
         {
             *slot = value;
+        }
+    }
+    Ok(())
+}
+
+/// `(db, child table, fk, referenced table)` that blocks this UPDATE.
+type FkViolation = (i32, String);
+
+/// Body TiDB renders for both 1451 and 1452 (`… constaint fails (...)`).
+fn fk_failure_body(
+    db: &str,
+    child: &TableInfo,
+    fk: &sealdb_meta::ForeignKeyInfo,
+    parent: &str,
+) -> String {
+    let columns = fk.cols.join("`, `");
+    let refs = if fk.ref_cols.is_empty() {
+        "id".to_string()
+    } else {
+        fk.ref_cols.join("`, `")
+    };
+    format!(
+        "(`{db}`.`{}`, CONSTRAINT `{}` FOREIGN KEY (`{columns}`) REFERENCES `{parent}` (`{refs}`))",
+        child.name.o(),
+        fk.name
+    )
+}
+
+/// Child-side FK check for one post-update row (`1452`): every non-NULL FK
+/// value must match a row in the referenced table.
+fn fk_child_violation(
+    domain: &Domain,
+    txn: &Arc<TxnHandle>,
+    db: &str,
+    info: &TableInfo,
+    values: &[Datum],
+    assigned: &HashSet<String>,
+) -> Result<Option<FkViolation>> {
+    if !sealdb_planner::core::foreign_key_checks() {
+        return Ok(None);
+    }
+    let names = col_names(info);
+    for fk in &info.foreign_keys {
+        if fk.on_update_cascade {
+            continue;
+        }
+        if !fk
+            .cols
+            .iter()
+            .any(|c| assigned.contains(&c.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        let Some(local): Option<Vec<usize>> = fk
+            .cols
+            .iter()
+            .map(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+            .collect()
+        else {
+            continue;
+        };
+        let key_values: Vec<Datum> = local.iter().map(|&i| values[i].clone()).collect();
+        if key_values.iter().any(Datum::is_null) {
+            continue;
+        }
+        let Some(parent) = domain
+            .infoschema()
+            .table_by_name(db, &fk.ref_table)
+            .cloned()
+        else {
+            continue;
+        };
+        let parent_names = col_names(&parent);
+        let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+            parent
+                .indices
+                .iter()
+                .find(|idx| idx.primary)
+                .map(|idx| idx.columns.iter().map(|c| c.name.o().to_string()).collect())
+                .unwrap_or_default()
+        } else {
+            fk.ref_cols.clone()
+        };
+        let Some(ref_idx): Option<Vec<usize>> = ref_cols
+            .iter()
+            .map(|c| parent_names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+            .collect()
+        else {
+            continue;
+        };
+        let physical = sealdb_planner::core::prune_partitions(&parent, None);
+        let parent_rows = scan_table(txn, &parent, RowLock::None, LockWait::Block, &physical)?;
+        let exists = parent_rows.iter().any(|row| {
+            ref_idx.iter().zip(&key_values).all(|(&i, value)| {
+                !row.values[i].is_null()
+                    && (row.values[i] == *value
+                        || sealdb_expression::datum_sql_eq(&row.values[i], value).unwrap_or(false))
+            })
+        });
+        if !exists {
+            return Ok(Some((
+                ERR_NO_REFERENCED_ROW_2,
+                format!(
+                    "Cannot add or update a child row: a foreign key constraint fails {}",
+                    fk_failure_body(db, info, fk, parent.name.o())
+                ),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Parent-side FK check for one updated row (`1451`): if a key column that a
+/// child references changes, no child row may still reference the old value.
+fn fk_parent_violation(
+    domain: &Domain,
+    txn: &Arc<TxnHandle>,
+    info: &TableInfo,
+    old_values: &[Datum],
+    new_values: &[Datum],
+    assigned: &HashSet<String>,
+) -> Result<Option<FkViolation>> {
+    if !sealdb_planner::core::foreign_key_checks() {
+        return Ok(None);
+    }
+    let is = domain.infoschema();
+    let names = col_names(info);
+    for schema in is.all_schemas() {
+        let db = schema.name.o().to_string();
+        for child in is.schema_tables(&db) {
+            for fk in &child.foreign_keys {
+                if fk.on_update_cascade || !fk.ref_table.eq_ignore_ascii_case(info.name.o()) {
+                    continue;
+                }
+                let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+                    info.indices
+                        .iter()
+                        .find(|idx| idx.primary)
+                        .map(|idx| idx.columns.iter().map(|c| c.name.o().to_string()).collect())
+                        .unwrap_or_default()
+                } else {
+                    fk.ref_cols.clone()
+                };
+                if !ref_cols
+                    .iter()
+                    .any(|c| assigned.contains(&c.to_ascii_lowercase()))
+                {
+                    continue;
+                }
+                let Some(parent_idx): Option<Vec<usize>> = ref_cols
+                    .iter()
+                    .map(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+                    .collect()
+                else {
+                    continue;
+                };
+                let old_key: Vec<Datum> =
+                    parent_idx.iter().map(|&i| old_values[i].clone()).collect();
+                let new_key: Vec<Datum> =
+                    parent_idx.iter().map(|&i| new_values[i].clone()).collect();
+                if old_key.iter().any(Datum::is_null) || old_key == new_key {
+                    continue;
+                }
+                let child_names = col_names(&child);
+                let Some(child_idx): Option<Vec<usize>> = fk
+                    .cols
+                    .iter()
+                    .map(|c| child_names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+                    .collect()
+                else {
+                    continue;
+                };
+                let physical = sealdb_planner::core::prune_partitions(&child, None);
+                let child_rows =
+                    scan_table(txn, &child, RowLock::None, LockWait::Block, &physical)?;
+                let referenced = child_rows.iter().any(|row| {
+                    child_idx.iter().zip(&old_key).all(|(&i, value)| {
+                        !row.values[i].is_null()
+                            && (row.values[i] == *value
+                                || sealdb_expression::datum_sql_eq(&row.values[i], value)
+                                    .unwrap_or(false))
+                    })
+                });
+                if referenced {
+                    return Ok(Some((
+                        sealdb_errno::ERR_ROW_IS_REFERENCED_2,
+                        format!(
+                            "Cannot delete or update a parent row: a foreign key constraint fails {}",
+                            fk_failure_body(&db, &child, fk, info.name.o())
+                        ),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Assigned column names (lower-case) of the UPDATE list.
+fn assigned_columns(assignments: &[Assignment]) -> HashSet<String> {
+    assignments
+        .iter()
+        .map(|item| item.column.to_ascii_lowercase())
+        .collect()
+}
+
+/// `UPDATE IGNORE` drops the offending row instead of failing: child-side
+/// violations warn (`1452`), parent-side ones are skipped silently (TiDB does
+/// not surface a warning for the referenced-row check).
+fn apply_fk_outcome(violation: Option<FkViolation>, ignore: bool) -> Result<bool> {
+    let Some((code, message)) = violation else {
+        return Ok(false);
+    };
+    if !ignore {
+        return Err(Error::new(code, message));
+    }
+    if code == ERR_NO_REFERENCED_ROW_2 {
+        sealdb_expression::note_warning(code, message);
+    }
+    Ok(true)
+}
+
+/// Coerce each assigned value to its target column's type, exactly like an
+/// INSERT would (temporal/enum/float-range checks).
+fn cast_assigned_values(
+    assignments: &[Assignment],
+    info: &TableInfo,
+    schema: &[String],
+    values: &mut [Datum],
+) -> Result<()> {
+    for item in assignments {
+        let idx = find_schema_index(schema, item.table.as_deref(), &item.column)?;
+        if let Some(col) = info.columns.get(idx) {
+            values[idx] = crate::insert::cast_for_column(&values[idx], col)?;
+        }
+    }
+    Ok(())
+}
+
+/// Two-table variant: an assignment's column slot lives on the left or the
+/// right side of the joined schema.
+#[allow(clippy::too_many_arguments)]
+fn cast_joined_assigned_values(
+    assignments: &[Assignment],
+    schema: &[String],
+    left_width: usize,
+    left_info: Option<&TableInfo>,
+    right_info: Option<&TableInfo>,
+    left_values: &mut Option<Vec<Datum>>,
+    right_values: &mut Option<Vec<Datum>>,
+) -> Result<()> {
+    for item in assignments {
+        let idx = find_schema_index(schema, item.table.as_deref(), &item.column)?;
+        if idx < left_width {
+            if let (Some(info), Some(values)) = (left_info, left_values.as_mut())
+                && let Some(col) = info.columns.get(idx)
+            {
+                let casted = crate::insert::cast_for_column(&values[idx], col)?;
+                values[idx] = casted;
+            }
+        } else if let (Some(info), Some(values)) = (right_info, right_values.as_mut()) {
+            let slot = idx - left_width;
+            if let Some(col) = info.columns.get(slot) {
+                let casted = crate::insert::cast_for_column(&values[slot], col)?;
+                values[slot] = casted;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Derived / comma-rewritten sides are readable but not updatable targets:
+/// assigning to one is TiDB 1288 (`The target table b of the UPDATE is not
+/// updatable`).
+fn reject_derived_assignments(
+    assignments: &[Assignment],
+    tables: &[(&str, &TableInfo, usize)],
+    schema: &[String],
+    derived: &[String],
+) -> Result<()> {
+    for item in assignments {
+        let idx = find_schema_index(schema, item.table.as_deref(), &item.column)?;
+        let Some((alias, _, _)) = tables
+            .iter()
+            .find(|(_, info, offset)| idx >= *offset && idx < *offset + info.columns.len())
+        else {
+            continue;
+        };
+        if derived.iter().any(|name| name.eq_ignore_ascii_case(alias)) {
+            return Err(Error::new(
+                ERR_NON_UPDATABLE_TABLE,
+                format!("The target table {alias} of the UPDATE is not updatable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// TiDB `CheckUpdateList` (1706): when one physical table is updated through
+/// several aliases, updating its primary-key or partition-key column through
+/// any of them is rejected, because the aliases address the same rows.
+fn check_multi_update_key(
+    tables: &[(&str, &TableInfo, usize)],
+    assignments: &[Assignment],
+    schema: &[String],
+) -> Result<()> {
+    let mut flags = vec![(false, false, false); tables.len()];
+    for item in assignments {
+        let idx = find_schema_index(schema, item.table.as_deref(), &item.column)?;
+        let Some(pos) = tables
+            .iter()
+            .position(|(_, info, offset)| idx >= *offset && idx < *offset + info.columns.len())
+        else {
+            continue;
+        };
+        let (alias, info, offset) = tables[pos];
+        let col = &info.columns[idx - offset];
+        let name = col.name.o();
+        flags[pos].0 = true;
+        if info.indices.iter().filter(|i| i.primary).any(|i| {
+            i.columns
+                .iter()
+                .any(|c| c.name.o().eq_ignore_ascii_case(name))
+        }) {
+            flags[pos].1 = true;
+        }
+        if let Some(part) = &info.partition
+            && part
+                .columns
+                .iter()
+                .any(|c| c.o().eq_ignore_ascii_case(name))
+        {
+            flags[pos].2 = true;
+        }
+        let _ = alias;
+    }
+    let mut seen: HashMap<i64, (String, bool, bool)> = HashMap::new();
+    for ((alias, info, _), (updated, pk, part)) in tables.iter().zip(flags.iter()) {
+        if !updated {
+            continue;
+        }
+        match seen.get(&info.id) {
+            Some((other, other_pk, other_part)) => {
+                if *other_pk || *pk || *other_part || *part {
+                    return Err(Error::new(
+                        ERR_MULTI_UPDATE_KEY_CONFLICT,
+                        format!(
+                            "Primary key/partition key update is not allowed since the table is updated both as '{other}' and '{alias}'."
+                        ),
+                    ));
+                }
+            }
+            None => {
+                seen.insert(info.id, (alias.to_string(), *pk, *part));
+            }
         }
     }
     Ok(())
@@ -617,14 +1236,22 @@ fn column_matches(schema_name: &str, table: Option<&str>, column: &str) -> bool 
     }
 }
 
-/// `NOT NULL` columns reject an explicit NULL assignment (`1048`).
-fn reject_null_not_null(info: &sealdb_meta::TableInfo, values: &[Datum]) -> Result<()> {
-    for (col, value) in info.columns.iter().zip(values.iter()) {
+/// `NOT NULL` columns reject an explicit NULL assignment (`1048`); under
+/// `UPDATE IGNORE` the row keeps the type's zero value with a warning.
+fn reject_null_not_null(
+    info: &sealdb_meta::TableInfo,
+    values: &mut [Datum],
+    ignore: bool,
+) -> Result<()> {
+    for (col, value) in info.columns.iter().zip(values.iter_mut()) {
         if value.is_null() && col.field_type.flag & sealdb_types::field_type::NOT_NULL_FLAG != 0 {
-            return Err(Error::new(
-                ERR_BAD_NULL,
-                format!("Column '{}' cannot be null", col.name.o()),
-            ));
+            let msg = format!("Column '{}' cannot be null", col.name.o());
+            if ignore {
+                sealdb_expression::note_warning(ERR_BAD_NULL, msg);
+                *value = crate::insert::implicit_zero(&col.field_type);
+            } else {
+                return Err(Error::new(ERR_BAD_NULL, msg));
+            }
         }
     }
     Ok(())
@@ -884,41 +1511,60 @@ pub(crate) fn apply_row_update(
     scanned: &ScannedRow,
     new_values: Vec<Datum>,
 ) -> Result<()> {
+    apply_row_updates(txn, info, &[(scanned.clone(), new_values)])
+}
+
+/// Apply several updates of one table atomically: every old row key and index
+/// entry is removed before any new row is written, so a statement that shifts
+/// primary keys in place (`UPDATE t SET id = id + 1`) cannot overwrite a row
+/// that has not been moved yet.
+pub(crate) fn apply_row_updates(
+    txn: &mut dyn Transaction,
+    info: &TableInfo,
+    rows: &[(ScannedRow, Vec<Datum>)],
+) -> Result<()> {
     let col_ids: Vec<i64> = info.columns.iter().map(|c| c.id).collect();
-    // Only an integer clustered PRIMARY KEY changes the row handle; heap tables
-    // keep their allocated `_tidb_rowid` across updates.
-    let new_handle = if info.pk_is_handle {
-        info.indices
-            .iter()
-            .find(|idx| idx.primary)
-            .and_then(|idx| idx.columns.first())
-            .and_then(|c| new_values.get(c.offset as usize))
-            .and_then(|d| match d {
-                Datum::I64(v) => Some(*v),
-                Datum::Year(v) => Some(*v),
-                Datum::U64(v) => Some(*v as i64),
-                _ => None,
-            })
-            .unwrap_or(scanned.handle)
-    } else {
-        scanned.handle
-    };
-    let new_physical = locate_partition_for_row(info, &new_values)?;
-    delete_index_keys(
-        txn,
-        info,
-        scanned.handle,
-        &scanned.values,
-        scanned.physical_id,
-    )?;
-    if new_handle != scanned.handle || new_physical != scanned.physical_id {
+    let mut planned = Vec::with_capacity(rows.len());
+    for (scanned, new_values) in rows {
+        // Only an integer clustered PRIMARY KEY changes the row handle; heap
+        // tables keep their allocated `_tidb_rowid` across updates.
+        let new_handle = if info.pk_is_handle {
+            info.indices
+                .iter()
+                .find(|idx| idx.primary)
+                .and_then(|idx| idx.columns.first())
+                .and_then(|c| new_values.get(c.offset as usize))
+                .and_then(|d| match d {
+                    Datum::I64(v) => Some(*v),
+                    Datum::Year(v) => Some(*v),
+                    Datum::U64(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(scanned.handle)
+        } else {
+            scanned.handle
+        };
+        let new_physical = locate_partition_for_row(info, new_values)?;
+        planned.push((scanned, new_values, new_handle, new_physical));
+    }
+    for (scanned, _, _, _) in &planned {
+        delete_index_keys(
+            txn,
+            info,
+            scanned.handle,
+            &scanned.values,
+            scanned.physical_id,
+        )?;
         txn.delete(encode_row_key_with_handle(scanned.physical_id, scanned.handle).as_bytes())?;
     }
-    txn.set(
-        encode_row_key_with_handle(new_physical, new_handle).as_bytes(),
-        &encode_row(&col_ids, &new_values),
-    )?;
-    write_index_keys(txn, info, new_handle, &new_values, new_physical)
+    for (_, new_values, new_handle, new_physical) in &planned {
+        txn.set(
+            encode_row_key_with_handle(*new_physical, *new_handle).as_bytes(),
+            &encode_row(&col_ids, new_values),
+        )?;
+        write_index_keys(txn, info, *new_handle, new_values, *new_physical)?;
+    }
+    Ok(())
 }
 
 /// Bind the UPDATE row's columns inside each assignment's subqueries so the

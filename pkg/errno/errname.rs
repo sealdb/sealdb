@@ -103,6 +103,10 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN => {
             "ErrNonDefaultValueForGeneratedColumn"
         }
+        errcode::ERR_MULTI_UPDATE_KEY_CONFLICT => "ErrMultiUpdateKeyConflict",
+        errcode::ERR_NON_UPDATABLE_TABLE => "ErrNonUpdatableTable",
+        errcode::ERR_ROW_IS_REFERENCED_2 => "ErrRowIsReferenced2",
+        errcode::ERR_NO_REFERENCED_ROW_2 => "ErrNoReferencedRow2",
         errcode::ERR_DEPENDENT_BY_GENERATED_COLUMN => "ErrDependentByGeneratedColumn",
         errcode::ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL => "ErrDependentByPartitionFunctional",
         errcode::ERR_TOO_BIG_DISPLAYWIDTH => "ErrTooBigDisplayWidth",
@@ -155,7 +159,9 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT => "42000",
         errcode::ERR_BLOB_CANT_HAVE_DEFAULT => "42000",
         errcode::ERR_IDENTIFIER_TOO_LONG => "42000",
-        errcode::ERR_AMBIGUOUS_COLUMN | errcode::ERR_ROW_IS_REFERENCED_2 => "23000",
+        errcode::ERR_AMBIGUOUS_COLUMN
+        | errcode::ERR_ROW_IS_REFERENCED_2
+        | errcode::ERR_NO_REFERENCED_ROW_2 => "23000",
         errcode::ERR_DUP_ENTRY => "23000",
         errcode::ERR_BAD_NULL => "23000",
         errcode::ERR_DATA_OUT_OF_RANGE => "22003",

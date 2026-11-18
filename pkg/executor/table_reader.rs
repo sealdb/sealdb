@@ -222,6 +222,28 @@ pub(crate) fn scan_table_filtered(
                 )?);
             }
         }
+        // A clustered (common) handle orders rows by the PRIMARY KEY values;
+        // our KV layout stores them under an integer row handle, so sort here
+        // to match TiDB's clustered scan order.
+        if info.common_handle
+            && let Some(pk) = info.indices.iter().find(|idx| idx.primary)
+        {
+            let offsets: Vec<usize> = pk.columns.iter().map(|c| c.offset as usize).collect();
+            rows.sort_by(|a, b| {
+                for &offset in &offsets {
+                    let (Some(left), Some(right)) = (a.values.get(offset), b.values.get(offset))
+                    else {
+                        continue;
+                    };
+                    let ord = sealdb_expression::datum_sql_cmp(left, right)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
         Ok(rows)
     })
 }

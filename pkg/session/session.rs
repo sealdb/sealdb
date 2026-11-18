@@ -6996,15 +6996,14 @@ fn expand_views(
             }
         }
         Statement::Update(update) => {
-            if update.join.is_none() {
-                rewrite_updatable_view_target(
-                    &mut update.table,
-                    &mut update.selection,
-                    &mut update.check_option_where,
-                    &mut update.check_option_view,
-                    is,
-                    current_db,
-                )?;
+            // TiDB has no updatable views: assigning to one is 1288.
+            if update.join.is_none()
+                && let Some(view) = view_target(update.table.name.as_str(), is, current_db)
+            {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_NON_UPDATABLE_TABLE,
+                    format!("The target table {view} of the UPDATE is not updatable"),
+                ));
             }
         }
         Statement::SetOpr(set) => {
@@ -7024,72 +7023,19 @@ fn expand_views(
     Ok(())
 }
 
-/// Simple updatable VIEW: single-table SELECT (no JOIN/GROUP BY). Rewrite the
-/// DML target to the base table and AND the view WHERE into the statement.
-/// When the view has `WITH CHECK OPTION`, stash the predicate for post-update
-/// validation (`check_option_where`).
-fn rewrite_updatable_view_target(
-    table: &mut TableName,
-    selection: &mut Option<ExprNode>,
-    check_option_where: &mut Option<ExprNode>,
-    check_option_view: &mut Option<String>,
-    is: &InfoSchema,
-    current_db: &str,
-) -> Result<()> {
-    use sealdb_parser::ast::expressions::BinaryOpExpr;
-    use sealdb_parser::opcode::Op;
-
-    let (schema, name) = table.qualified(current_db);
+/// Name of the view a single-table DML target resolves to (TiDB 1288).
+fn view_target(name: &str, is: &InfoSchema, current_db: &str) -> Option<String> {
+    let (schema, table) = if let Some((schema, table)) = name.split_once('.') {
+        (schema.to_string(), table.to_string())
+    } else {
+        (current_db.to_string(), name.to_string())
+    };
     if schema.is_empty() {
-        return Ok(());
+        return None;
     }
-    let Some(info) = is.table_by_name(&schema, &name) else {
-        return Ok(());
-    };
-    let Some(view) = &info.view else {
-        return Ok(());
-    };
-    if view.algorithm.eq_ignore_ascii_case("TEMPTABLE") {
-        return Err(sealdb_errno::Error::unsupported(format!(
-            "VIEW `{schema}`.`{name}` ALGORITHM=TEMPTABLE is not updatable"
-        )));
-    }
-    let parsed = Parser::new().parse_one_stmt(&view.select_stmt)?;
-    let Statement::Select(view_select) = parsed else {
-        return Err(sealdb_errno::Error::unsupported(
-            "VIEW definition must be SELECT",
-        ));
-    };
-    if !view_select.joins.is_empty()
-        || view_select.from.is_none()
-        || !view_select.group_by.is_empty()
-        || view_select.having.is_some()
-        || view_select.with.is_some()
-    {
-        return Err(sealdb_errno::Error::unsupported(format!(
-            "VIEW `{schema}`.`{name}` is not updatable"
-        )));
-    }
-    let base = view_select.from.expect("checked above");
-    let enforce_check =
-        !view.check_option.is_empty() && !view.check_option.eq_ignore_ascii_case("NONE");
-    if let Some(view_where) = view_select.selection {
-        if enforce_check {
-            *check_option_where = Some(view_where.clone());
-            *check_option_view = Some(format!("{schema}.{name}"));
-        }
-        *selection = Some(match selection.take() {
-            Some(user_where) => ExprNode::Binary(BinaryOpExpr {
-                op: Op::LogicAnd,
-                left: Box::new(view_where),
-                right: Box::new(user_where),
-                single_cnf_item: false,
-            }),
-            None => view_where,
-        });
-    }
-    *table = base;
-    Ok(())
+    is.table_by_name(&schema, &table)
+        .filter(|info| info.is_view())
+        .map(|_| table)
 }
 
 fn expand_views_in_select(

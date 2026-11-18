@@ -841,6 +841,10 @@ pub struct UpdateStmt {
     pub ignore: bool,
     pub table: TableName,
     pub join: Option<Join>,
+    /// Third and later tables of a flattened `t1, t2, t3` / join chain.
+    pub additional_joins: Vec<Join>,
+    /// Aliases of derived/comma-rewritten sides: assigning to them is 1288.
+    pub derived_tables: Vec<String>,
     pub list: Vec<Assignment>,
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
@@ -862,6 +866,12 @@ impl UpdateStmt {
             ctx.write_str("IGNORE ");
         }
         restore_table_join(ctx, &self.table, self.join.as_ref())?;
+        for join in &self.additional_joins {
+            ctx.write_str(" JOIN ");
+            join.right.restore(ctx)?;
+            ctx.write_str(" ON ");
+            join.on.restore(ctx)?;
+        }
         ctx.write_str(" SET ");
         for (i, item) in self.list.iter().enumerate() {
             if i > 0 {

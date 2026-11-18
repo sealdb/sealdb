@@ -97,6 +97,7 @@ use sqlparser::parser::Parser;
 use std::collections::HashMap;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
+    crate::parser::reset_derived_update_aliases();
     // Capture before rewrite so projection names keep TiDB `field.Text()` spelling
     // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
     let projection_texts = capture_select_projections(sql);
@@ -4928,23 +4929,33 @@ fn rewrite_one_update_comma_join(sql: &str, start: usize) -> Result<Option<(Stri
         }
         k += 1;
     }
-    let [comma] = commas[..] else {
+    if commas.is_empty() {
         return Ok(None);
-    };
-    // The right-hand side is either a simple derived table or a plain table
-    // reference (`UPDATE t1, t2 SET …`); anything else stays unsupported.
-    let right = match rewrite_simple_derived_update_side(&sql[comma + 1..set_pos]) {
-        Some(right) => right,
-        None => match simple_update_table_side(&sql[comma + 1..set_pos]) {
-            Some(right) => right,
-            None => return Ok(None),
-        },
-    };
-    let mut fragment = String::with_capacity(set_pos - start + right.len() + 16);
-    fragment.push_str(&sql[start..comma]);
-    fragment.push_str(" JOIN ");
-    fragment.push_str(&right);
-    fragment.push_str(" ON TRUE ");
+    }
+    let mut fragment = String::with_capacity(set_pos - start + 32);
+    fragment.push_str(&sql[start..commas[0]]);
+    for (pos, &comma) in commas.iter().enumerate() {
+        let end = commas.get(pos + 1).copied().unwrap_or(set_pos);
+        // Each arm is either a simple derived table or a plain table
+        // reference (`UPDATE t1, t2, t3 SET …`); anything else stays
+        // unsupported.
+        let arm = &sql[comma + 1..end];
+        let text = match rewrite_simple_derived_update_side(arm) {
+            Some(right) => {
+                if let Some(alias) = derived_update_alias(arm) {
+                    crate::parser::note_derived_update_alias(&alias);
+                }
+                right
+            }
+            None => match simple_update_table_side(arm) {
+                Some(right) => right,
+                None => return Ok(None),
+            },
+        };
+        fragment.push_str(" JOIN ");
+        fragment.push_str(&text);
+        fragment.push_str(" ON TRUE ");
+    }
     Ok(Some((fragment, set_pos)))
 }
 
@@ -4969,6 +4980,18 @@ fn simple_update_table_side(item: &str) -> Option<String> {
     Some(text.to_string())
 }
 
+/// Alias of a simple derived UPDATE arm: `(SELECT …) [AS] t2` → `t2`.
+fn derived_update_alias(item: &str) -> Option<String> {
+    let text = item.trim();
+    let close = text.rfind(')')?;
+    let mut rest = text[close + 1..].trim();
+    if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case("as") {
+        rest = rest[2..].trim_start();
+    }
+    let alias = rest.trim_matches('`');
+    (!alias.is_empty()).then(|| alias.to_string())
+}
+
 /// `(SELECT a, b FROM t) t2` → `t t2` when the subquery only projects base
 /// columns with no filtering, grouping, ordering, or limit.
 fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
@@ -4978,7 +5001,10 @@ fn rewrite_simple_derived_update_side(item: &str) -> Option<String> {
     if !text[..open].trim().is_empty() {
         return None;
     }
-    let alias = text[close + 1..].trim();
+    let mut alias = text[close + 1..].trim();
+    if alias.len() >= 2 && alias[..2].eq_ignore_ascii_case("as") {
+        alias = alias[2..].trim_start();
+    }
     if alias.is_empty() || alias.split_whitespace().count() != 1 {
         return None;
     }
@@ -10330,7 +10356,10 @@ fn lower_update(update: &Update) -> Result<Statement> {
     if update.from.is_some() || update.returning.is_some() || update.output.is_some() {
         return Err(Error::unsupported("UPDATE FROM / RETURNING"));
     }
-    let (table, join) = lower_dml_table(&update.table)?;
+    let (table, join, additional_joins, join_conds, mut derived_tables, derived_ctes) =
+        lower_update_tables(&update.table)?;
+    derived_tables.extend(crate::parser::take_derived_update_aliases());
+    let with = merge_with_ctes(None, derived_ctes)?;
     let order_by = lower_order_by_exprs(&update.order_by)?;
     let limit = update.limit.as_ref().map(expr_as_u64).transpose()?;
     if join.is_some() && (!order_by.is_empty() || limit.is_some()) {
@@ -10340,20 +10369,129 @@ fn lower_update(update: &Update) -> Result<Statement> {
     if list.is_empty() {
         return Err(Error::unsupported("UPDATE without SET"));
     }
+    let mut selection = update.selection.as_ref().map(lower_expr).transpose()?;
+    for cond in join_conds {
+        selection = Some(match selection {
+            Some(prev) => ExprNode::Binary(crate::ast::expressions::BinaryOpExpr {
+                op: crate::opcode::Op::LogicAnd,
+                left: Box::new(prev),
+                right: Box::new(cond),
+                single_cnf_item: false,
+            }),
+            None => cond,
+        });
+    }
     let ignore = has_dml_ignore_hint(&update.optimizer_hints);
     Ok(Statement::Update(UpdateStmt {
         text: update.to_string(),
         ignore,
         table,
         join,
+        additional_joins,
+        derived_tables,
         list,
-        selection: update.selection.as_ref().map(lower_expr).transpose()?,
+        selection,
         order_by,
         limit,
-        with: None,
+        with,
         check_option_where: None,
         check_option_view: None,
     }))
+}
+
+/// Lower the UPDATE target list, accepting `t1, t2, t3` / `t1 JOIN t2 JOIN t3`
+/// chains. Returns the first table, its join (if any), the remaining joins and
+/// the join conditions that do not fit on the first join.
+fn lower_update_tables(
+    table: &TableWithJoins,
+) -> Result<(
+    TableName,
+    Option<Join>,
+    Vec<Join>,
+    Vec<ExprNode>,
+    Vec<String>,
+    Vec<CommonTableExpression>,
+)> {
+    fn collect(
+        item: &crate::ast::FromItem,
+        names: &mut Vec<TableName>,
+        conds: &mut Vec<ExprNode>,
+    ) -> Result<()> {
+        match item {
+            crate::ast::FromItem::Table(t) => {
+                names.push(t.clone());
+                Ok(())
+            }
+            crate::ast::FromItem::Join {
+                left,
+                right,
+                tp,
+                on,
+                using_cols: _,
+                natural,
+            } => {
+                // `USING (…)` already arrives with a synthesized equality in
+                // `on`; a NATURAL join needs the catalog to find the common
+                // columns, so it stays unsupported here.
+                if *natural {
+                    return Err(Error::unsupported("NATURAL join in UPDATE"));
+                }
+                if !matches!(tp, JoinType::Inner | JoinType::Cross) {
+                    return Err(Error::unsupported("outer join in UPDATE"));
+                }
+                collect(left, names, conds)?;
+                collect(right, names, conds)?;
+                if !matches!(on, ExprNode::Value(v) if v.datum == Datum::I64(1)) {
+                    conds.push(on.clone());
+                }
+                Ok(())
+            }
+        }
+    }
+    let (item, ctes) = lower_table_with_joins_item(table)?;
+    // Derived sides stay readable but are not updatable targets (TiDB 1288).
+    let derived: Vec<String> = ctes.iter().map(|cte| cte.name.clone()).collect();
+    let derived_ctes = ctes;
+    let mut names = Vec::new();
+    let mut conds = Vec::new();
+    collect(&item, &mut names, &mut conds)?;
+    let Some(first) = names.first().cloned() else {
+        return Err(Error::unsupported("UPDATE without table"));
+    };
+    if names.len() < 2 {
+        return Ok((first, None, Vec::new(), conds, derived, derived_ctes));
+    }
+    let mut rest = names.into_iter().skip(1);
+    let head_right = rest.next().expect("len >= 2");
+    let head_on = if conds.is_empty() {
+        true_expr()
+    } else {
+        conds.remove(0)
+    };
+    let head = Join {
+        left: first.clone(),
+        right: head_right.clone(),
+        tp: JoinType::Inner,
+        on: head_on,
+        using_cols: Vec::new(),
+        natural: false,
+        straight: false,
+    };
+    let mut additional = Vec::new();
+    let mut prev = head_right;
+    for right in rest {
+        additional.push(Join {
+            left: prev.clone(),
+            right: right.clone(),
+            tp: JoinType::Inner,
+            on: true_expr(),
+            using_cols: Vec::new(),
+            natural: false,
+            straight: false,
+        });
+        prev = right;
+    }
+    Ok((first, Some(head), additional, conds, derived, derived_ctes))
 }
 
 /// Flatten a right-nested `t1 JOIN (t2 JOIN t3)` chain (sqlparser's shape for

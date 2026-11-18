@@ -456,11 +456,13 @@ impl Datum {
                             .into_bytes();
                     }
                 }
-                // TiDB parses a JSON document into its binary form, where a
-                // decimal number is a float64: the text is renormalized to the
-                // shortest f64 form when the double cannot round-trip it.
+                // TiDB parses a JSON document into its binary form and renders
+                // it back canonically (`{"a":   "\u6d4b"}` → `{"a": "测"}`),
+                // with `, `/`: ` separators. Numbers that do not round-trip a
+                // double fall back to the shortest f64 form.
                 if ft.tp == crate::field_type::TYPE_JSON {
-                    bytes = normalize_json_numbers(&bytes);
+                    bytes = canonical_json_text(&bytes)
+                        .unwrap_or_else(|| normalize_json_numbers(&bytes));
                 }
                 Ok(Datum::Bytes(bytes))
             }
@@ -768,6 +770,115 @@ fn time_numeric_text(t: &crate::time::Time) -> String {
     }
     let frac = format!("{:06}", t.micro);
     format!("{base}.{}", &frac[..fsp])
+}
+
+/// Renders a JSON document the way TiDB's binary JSON text form prints it:
+/// `{"a": 1, "b": [1, 2]}` — insignificant whitespace dropped, `\uXXXX`
+/// escapes decoded, and `, `/`: ` separators. Number tokens keep their literal
+/// text unless the stored double cannot round-trip it. Returns `None` when the
+/// text is not valid JSON (the caller keeps the raw bytes).
+pub fn canonical_json_text(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let raw = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len() + 8);
+    let mut i = 0;
+    let mut in_string = false;
+    while i < raw.len() {
+        let b = raw[i];
+        if in_string {
+            if b == b'\\' {
+                i += 1;
+                if i >= raw.len() {
+                    out.push(b);
+                    break;
+                }
+                let esc = raw[i];
+                if esc == b'u' {
+                    if let Some((ch, used)) = decode_unicode_escape(&raw[i..]) {
+                        push_json_char(ch, &mut out);
+                        i += used;
+                        continue;
+                    }
+                }
+                out.push(b);
+                out.push(esc);
+                i += 1;
+                continue;
+            }
+            out.push(b);
+            i += 1;
+            if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                out.push(b);
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b',' => {
+                out.extend_from_slice(b", ");
+                i += 1;
+            }
+            b':' => {
+                out.extend_from_slice(b": ");
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                let mut end = i + 1;
+                while end < raw.len()
+                    && (raw[end].is_ascii_digit()
+                        || matches!(raw[end], b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    end += 1;
+                }
+                let token = &text[start..end];
+                out.extend_from_slice(json_number_text(token).as_bytes());
+                i = end;
+            }
+            _ => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Decodes `uXXXX` (the `u` is at `raw[0]`), joining surrogate pairs.
+fn decode_unicode_escape(raw: &[u8]) -> Option<(char, usize)> {
+    let hex = |slice: &[u8]| -> Option<u32> {
+        let s = std::str::from_utf8(slice).ok()?;
+        u32::from_str_radix(s, 16).ok()
+    };
+    if raw.len() < 5 {
+        return None;
+    }
+    let first = hex(&raw[1..5])?;
+    let mut used = 5;
+    let mut code = first;
+    if (0xd800..0xdc00).contains(&first) && raw.len() >= 11 && raw[5] == b'\\' && raw[6] == b'u' {
+        let second = hex(&raw[7..11])?;
+        if (0xdc00..0xe000).contains(&second) {
+            code = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+            used = 11;
+        }
+    }
+    char::from_u32(code).map(|ch| (ch, used))
+}
+
+fn push_json_char(ch: char, out: &mut Vec<u8>) {
+    if (ch as u32) < 0x20 {
+        out.extend_from_slice(format!("\\u{:04x}", ch as u32).as_bytes());
+    } else {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
 }
 
 /// Rewrites the decimal numbers of a JSON document to the double form TiDB

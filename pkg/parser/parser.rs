@@ -3,7 +3,7 @@ use crate::format::RestoreCtx;
 use crate::sqlparser_bridge;
 use sealdb_errno::Result;
 use serde::Serialize;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     /// TiDB `HIGH_NOT_PRECEDENCE`: `NOT` binds tighter than `BETWEEN`
@@ -42,6 +42,25 @@ pub fn with_allow_derived_without_alias<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     set_allow_derived_without_alias(previous);
     out
+}
+
+thread_local! {
+    /// Derived tables rewritten into base-table aliases by the comma-UPDATE
+    /// rewrite. TiDB refuses to assign to them (`1288`), so the alias list is
+    /// carried from the text rewrite into the AST lowering of the same parse.
+    static DERIVED_UPDATE_ALIASES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn reset_derived_update_aliases() {
+    DERIVED_UPDATE_ALIASES.with(|aliases| aliases.borrow_mut().clear());
+}
+
+pub(crate) fn note_derived_update_alias(alias: &str) {
+    DERIVED_UPDATE_ALIASES.with(|aliases| aliases.borrow_mut().push(alias.to_string()));
+}
+
+pub fn take_derived_update_aliases() -> Vec<String> {
+    DERIVED_UPDATE_ALIASES.with(|aliases| std::mem::take(&mut *aliases.borrow_mut()))
 }
 
 thread_local! {
@@ -2288,21 +2307,5 @@ mod orig_text_timestamp {
                 .to_ascii_lowercase()
                 .contains("timestamp")
         );
-    }
-}
-
-#[cfg(test)]
-mod tmp_probe_default {
-    use super::*;
-    #[test]
-    fn probe() {
-        for sql in [
-            "update t set b=default",
-            "update t set b=default(a)",
-            "update t set b=6",
-        ] {
-            let stmt = Parser::new().parse_one_stmt(sql).unwrap();
-            eprintln!("{sql} => {:?}", stmt);
-        }
     }
 }

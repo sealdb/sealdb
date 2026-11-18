@@ -265,6 +265,23 @@ pub fn current_db_name() -> String {
     CURRENT_DB.with(|cell| cell.borrow().clone())
 }
 
+thread_local! {
+    /// Target table of the running DML statement, used only to render
+    /// `db.table.column` in overflow error labels (TiDB resolves column
+    /// references against the stored schema).
+    static CURRENT_DML_TABLE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the DML target table, returning the previous value.
+pub fn set_current_dml_table(name: Option<String>) -> Option<String> {
+    CURRENT_DML_TABLE.with(|cell| cell.replace(name))
+}
+
+fn current_dml_table() -> Option<String> {
+    CURRENT_DML_TABLE.with(|cell| cell.borrow().clone())
+}
+
 fn current_db() -> String {
     current_db_name()
 }
@@ -543,6 +560,11 @@ fn eval_row_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Res
 /// SQL `=` on two already-evaluated datums (caller handles NULL operands).
 pub fn datum_sql_eq(left: &Datum, right: &Datum) -> Result<bool> {
     Ok(compare_datums_for_op(left, right, Op::Eq)?.is_eq())
+}
+
+/// SQL ordering of two datums (used to emit clustered-index row order).
+pub fn datum_sql_cmp(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> {
+    compare_datums_for_op(left, right, Op::Lt)
 }
 
 pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
@@ -3300,7 +3322,13 @@ fn num_bin(
     i: impl Fn(i64, i64) -> Result<i64>,
     f: impl Fn(f64, f64) -> Result<f64>,
 ) -> Result<Datum> {
-    if matches!(left, Datum::F64(_)) || matches!(right, Datum::F64(_)) {
+    // A string operand makes MySQL do the arithmetic in real (the points
+    // are kept: `2 + '1.1'` is 3.1). An integer-only parse would truncate.
+    if matches!(left, Datum::F64(_))
+        || matches!(right, Datum::F64(_))
+        || matches!(left, Datum::Bytes(_))
+        || matches!(right, Datum::Bytes(_))
+    {
         Ok(Datum::F64(f(
             string_lenient_f64(left)?,
             string_lenient_f64(right)?,
@@ -3447,7 +3475,13 @@ fn expr_overflow_label(expr: &ExprNode) -> String {
                     format!("{db}.{table}.{}", c.name)
                 }
             }
-            _ => c.name.clone(),
+            _ => match current_dml_table() {
+                Some(table) if !current_db().is_empty() => {
+                    format!("{}.{table}.{}", current_db(), c.name)
+                }
+                Some(table) => format!("{table}.{}", c.name),
+                None => c.name.clone(),
+            },
         },
         other => other.restore_string(),
     }

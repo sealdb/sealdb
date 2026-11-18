@@ -27,7 +27,7 @@ pub mod rule_semi_join;
 pub mod union;
 pub mod window;
 
-pub use foreign_key::with_foreign_key_checks;
+pub use foreign_key::{foreign_key_checks, with_foreign_key_checks};
 pub use natural_join::{expand_natural_joins, stmt_has_natural_join};
 pub use physical_plans::{DdlKind, JoinType, PhysicalPlan};
 pub use plan_cache::PlanCacheValue;

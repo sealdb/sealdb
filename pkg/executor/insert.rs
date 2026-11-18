@@ -7,7 +7,8 @@ use sealdb_errno::{
     ERR_BAD_FIELD, ERR_BAD_NULL, ERR_DUP_ENTRY, ERR_FIELD_NOT_DEFAULT, ERR_FIELD_SPECIFIED_TWICE,
     ERR_INVALID_AUTO_RANDOM, ERR_NO_DB, ERR_NO_PARTITION_FOR_GIVEN_VALUE, ERR_NO_SUCH_TABLE,
     ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET, ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_ERROR,
-    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_TRUNCATED, ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
+    ERR_UNKNOWN_PARTITION, ERR_WARN_DATA_OUT_OF_RANGE, ERR_WARN_DATA_TRUNCATED,
+    ERR_WRONG_VALUE_COUNT_ON_ROW, Error, Result,
 };
 use sealdb_expression::{eval_expr_with_row, locate_partition_for_row};
 use sealdb_kv::{LockWait, TxnHandle};
@@ -16,7 +17,9 @@ use sealdb_tablecodec::{encode_row, encode_row_key_with_handle};
 use sealdb_types::Datum;
 use sealdb_types::EnumValue;
 use sealdb_types::field_type::{
-    FieldType, TYPE_DATE, TYPE_DATETIME, TYPE_ENUM, TYPE_SET, TYPE_TIMESTAMP,
+    FieldType, TYPE_DATE, TYPE_DATETIME, TYPE_DECIMAL, TYPE_DOUBLE, TYPE_ENUM, TYPE_FLOAT,
+    TYPE_INT24, TYPE_LONG, TYPE_LONG_LONG, TYPE_NEW_DECIMAL, TYPE_SET, TYPE_SHORT, TYPE_TIMESTAMP,
+    TYPE_TINY,
 };
 use sealdb_util::chunk::Chunk;
 use std::sync::Arc;
@@ -436,7 +439,7 @@ fn enforce_not_null_columns(
 }
 
 /// The type's zero value, used when a NOT NULL column gets no value.
-fn implicit_zero(ft: &FieldType) -> Datum {
+pub(crate) fn implicit_zero(ft: &FieldType) -> Datum {
     use sealdb_types::field_type::*;
     match ft.tp {
         TYPE_YEAR => Datum::Year(0),
@@ -757,7 +760,7 @@ pub(crate) fn fill_generated_columns(
     Ok(())
 }
 
-fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+pub(crate) fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
     if matches!(col.field_type.tp, TYPE_ENUM | TYPE_SET) {
         return cast_enum_set(v, &col.field_type, col.name.o());
     }
@@ -770,9 +773,26 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
     {
         return Ok(Datum::Time(t));
     }
+    if is_integer_type(col.field_type.tp)
+        && !v.is_null()
+        && let Some(n) = raw_int_assignment(v)
+    {
+        return checked_int(n, col);
+    }
     let mut out = match v.cast(&col.field_type) {
         Ok(out) => out,
-        Err(err) => return Err(temporal_column_error(v, col, err)),
+        Err(err) => {
+            let err = temporal_column_error(v, col, err);
+            // Non-strict mode stores the zero date/time with warning 1292.
+            if is_temporal(col.field_type.tp)
+                && err.code == ERR_TRUNCATED_WRONG_VALUE
+                && !strict_sql_mode()
+            {
+                sealdb_expression::note_warning(err.code, err.message.clone());
+                return Ok(implicit_zero(&col.field_type));
+            }
+            return Err(err);
+        }
     };
     // TIMESTAMP columns store UTC; session wall clock → UTC on write. A wall
     // clock outside 1970-01-01 00:00:01 .. 2038-01-19 03:14:07 becomes the zero
@@ -802,7 +822,154 @@ fn cast_for_column(v: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
         t.tp = sealdb_types::TimeType::Timestamp;
         out = Datum::Time(t);
     }
-    Ok(out)
+    check_decimal_scale(v, col)?;
+    check_numeric_range(v, out, col)
+}
+
+/// TiDB `CastColumnValue`: assigning a value with more fractional digits than
+/// the column scale truncates and reports 1292 (`Truncated incorrect DECIMAL
+/// value: '…'`), as a warning outside strict mode and an error inside it.
+fn check_decimal_scale(raw: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<()> {
+    let ft = &col.field_type;
+    if !matches!(ft.tp, TYPE_DECIMAL | TYPE_NEW_DECIMAL) || ft.decimal < 0 || raw.is_null() {
+        return Ok(());
+    }
+    let text = match raw {
+        Datum::Decimal(d) => d.to_string(),
+        Datum::F64(v) => format!("{v}"),
+        Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => return Ok(()),
+    };
+    let frac_digits = text
+        .split_once('.')
+        .map(|(_, frac)| frac.chars().take_while(|c| c.is_ascii_digit()).count())
+        .unwrap_or(0);
+    if frac_digits <= ft.decimal.max(0) as usize {
+        return Ok(());
+    }
+    // Scale truncation itself is not an out-of-range assignment: TiDB keeps
+    // the truncated value and reports 1292 even in strict mode.
+    let msg = format!("Truncated incorrect DECIMAL value: '{text}'");
+    sealdb_expression::note_warning(ERR_TRUNCATED_WRONG_VALUE, msg);
+    Ok(())
+}
+
+/// `FLOAT(M,D)` / `DOUBLE(M,D)` and integer range checks, mirroring TiDB's
+/// `ProduceFloat64` / `ProduceInteger`: an out-of-range assignment is clamped
+/// with warning 1264 outside strict mode and fails with 1264 inside it.
+fn check_numeric_range(raw: &Datum, out: Datum, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    let ft = &col.field_type;
+    let msg = || format!("Out of range value for column '{}' at row 1", col.name.o());
+    if is_integer_type(ft.tp)
+        && let Some(v) = raw_int_assignment(raw)
+    {
+        return checked_int(v, col);
+    }
+    if !matches!(ft.tp, TYPE_FLOAT | TYPE_DOUBLE) || ft.flen <= 0 || ft.decimal < 0 {
+        return Ok(out);
+    }
+    let Datum::F64(v) = out else {
+        return Ok(out);
+    };
+    if !v.is_finite() {
+        return Ok(out);
+    }
+    let m = i32::from(ft.flen);
+    let d = i32::from(ft.decimal.clamp(0, 30));
+    if d > m {
+        return Ok(out);
+    }
+    let max = if d == 0 {
+        10f64.powi(m) - 1.0
+    } else {
+        10f64.powi(m - d) - 10f64.powi(-d)
+    };
+    let rounded = if d == 0 {
+        v.round()
+    } else {
+        let scale = 10f64.powi(d);
+        (v * scale).round() / scale
+    };
+    if rounded.abs() <= max + f64::EPSILON {
+        return Ok(Datum::F64(rounded));
+    }
+    if strict_sql_mode() {
+        return Err(Error::new(ERR_WARN_DATA_OUT_OF_RANGE, msg()));
+    }
+    sealdb_expression::note_warning(ERR_WARN_DATA_OUT_OF_RANGE, msg());
+    Ok(Datum::F64(if v < 0.0 { -max } else { max }))
+}
+
+fn is_integer_type(tp: u8) -> bool {
+    matches!(
+        tp,
+        TYPE_TINY | TYPE_SHORT | TYPE_INT24 | TYPE_LONG | TYPE_LONG_LONG
+    )
+}
+
+/// Numeric value of an assignment to an integer column. MySQL rounds a
+/// fractional number (away from zero: `5.5` → 6) and parses the leading
+/// numeric prefix of a string.
+fn raw_int_assignment(d: &Datum) -> Option<i128> {
+    match d {
+        Datum::I64(v) => Some(i128::from(*v)),
+        Datum::U64(v) => Some(i128::from(*v)),
+        Datum::Year(v) => Some(i128::from(*v)),
+        Datum::F64(v) if v.is_finite() => Some(v.round() as i128),
+        Datum::Decimal(d) => d.to_f64().ok().map(|v| v.round() as i128),
+        Datum::Bytes(b) => {
+            let text = String::from_utf8_lossy(b);
+            let text = text.trim();
+            let mut end = 0;
+            for (i, c) in text.char_indices() {
+                let ok = c.is_ascii_digit() || (c == '.' && i > 0) || (c == '-' && i == 0);
+                if !ok {
+                    break;
+                }
+                end = i + c.len_utf8();
+            }
+            text[..end].parse::<f64>().ok().map(|v| v.round() as i128)
+        }
+        _ => None,
+    }
+}
+
+/// Apply TiDB's integer range clamp (`1264` strict error; clamp + warning
+/// outside strict mode).
+fn checked_int(v: i128, col: &sealdb_meta::ColumnInfo) -> Result<Datum> {
+    let ft = &col.field_type;
+    let bits = match ft.tp {
+        TYPE_TINY => 8,
+        TYPE_SHORT => 16,
+        TYPE_INT24 => 24,
+        TYPE_LONG => 32,
+        TYPE_LONG_LONG => 64,
+        _ => return Ok(Datum::I64(v as i64)),
+    };
+    let unsigned = ft.is_unsigned();
+    let (min, max): (i128, i128) = if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    };
+    if v >= min && v <= max {
+        return Ok(if unsigned {
+            Datum::U64(v as u64)
+        } else {
+            Datum::I64(v as i64)
+        });
+    }
+    let msg = format!("Out of range value for column '{}' at row 1", col.name.o());
+    if strict_sql_mode() {
+        return Err(Error::new(ERR_WARN_DATA_OUT_OF_RANGE, msg));
+    }
+    sealdb_expression::note_warning(ERR_WARN_DATA_OUT_OF_RANGE, msg);
+    let clamped = v.clamp(min, max);
+    Ok(if unsigned {
+        Datum::U64(clamped as u64)
+    } else {
+        Datum::I64(clamped as i64)
+    })
 }
 
 /// TiDB `sql_mode` strictness for DML value coercion.
@@ -1026,9 +1193,31 @@ fn truncated_error(_v: &Datum, col: &str) -> Error {
     )
 }
 
-fn invalid_enum_set_value(v: &Datum, col: &str, fallback: Datum) -> Result<Datum> {
+thread_local! {
+    /// `UPDATE`'s assignment cast builds TiDB's `ErrTruncated` without format
+    /// arguments, so the placeholders reach the client verbatim
+    /// (`Data truncated for column '%s' at row %d`); `INSERT` formats them.
+    static UPDATE_ASSIGNMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the surrounding cast as an `UPDATE` assignment; returns the previous
+/// state so the caller can restore it.
+pub(crate) fn set_update_assignment(on: bool) -> bool {
+    UPDATE_ASSIGNMENT.with(|flag| flag.replace(on))
+}
+
+fn truncated_error_message(col: &str) -> Error {
+    let message = if UPDATE_ASSIGNMENT.with(std::cell::Cell::get) {
+        "Data truncated for column '%s' at row %d".to_string()
+    } else {
+        format!("Data truncated for column '{col}' at row 1")
+    };
+    Error::new(ERR_WARN_DATA_TRUNCATED, message)
+}
+
+fn invalid_enum_set_value(_v: &Datum, col: &str, fallback: Datum) -> Result<Datum> {
     if strict_sql_mode() {
-        return Err(truncated_error(v, col));
+        return Err(truncated_error_message(col));
     }
     sealdb_expression::note_warning(
         ERR_WARN_DATA_TRUNCATED,

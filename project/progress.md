@@ -4043,6 +4043,50 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `executor/update`（同一批 DML 语义，别名 / 严格模式 / 外键检查可复用）。
   - `executor/insert`（`INSERT IGNORE` / `REPLACE` 与 FK 约束路径）。
 
+### 2026-11-18（`executor/update` 转绿：类型范围/小数截断、外键 1451/1452、聚簇扫描序、联表影响行数）
+
+- **Phase**: R7 `executor/update` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 数值范围：`cast_for_column` 增加 `check_numeric_range` / `checked_int`，
+    `FLOAT(M,D)`、`TINYINT…BIGINT` 越界在严格模式报 1264，非严格截断并 warning 1264。
+  - 小数标度：`decimal(20,0) := 202.23` 只截断为 `202` 并 warning 1292（TiDB 的
+    `CastDecimalAsDecimal` 在严格模式也不报错），`UPDATE` 的 info 正确带 `Warnings: 1`。
+  - 外键：新增 `ERR_NO_REFERENCED_ROW_2`（1452/`23000`）与 `fk_child_violation` /
+    `fk_parent_violation`，UPDATE 子表引用缺失报 1452、更新父表被引用旧值报 1451；
+    `UPDATE IGNORE` 下降级为 warning 1451 / 跳过 1452。
+  - 字符串算术：`n + '2.2'` 按实数运算（`num_bin` 对 `Datum::Bytes` 走 f64 提升），
+    `id + '1.1'` 不再把字符串截成整数。
+  - 主键位移：`UPDATE t SET id = id + 1` 改为「批量删旧键→批量写新键」两阶段，
+    避免与尚未读取的旧行冲突。
+  - 自连接/多表 JOIN：按物理行合并各别名赋值（`record_join_row`），
+    `UPDATE t t1, t t2 SET t1.a=4, t2.b=5` 两侧都落到同一行；派生表 CTE 同步进
+    `UpdateStmt.with`。
+  - 影响行数：单表与联表 UPDATE 均输出 `Rows matched / Changed / Warnings`，
+    联表按「被赋值的物理行」计数（未被 SET 引用的表不计入）。
+  - 聚簇表扫描序：`common_handle` 表在 `scan_table_filtered` 内按主键值排序，
+    对齐 TiDB 聚簇索引的扫描顺序（`varchar` 主键 `abc` 在 `bbb` 前）。
+  - JSON 列赋值按 TiDB 二进 JSON 规范化：去多余空白、解码 `\uXXXX`、
+    `, `/`: ` 分隔，`UPDATE` 值与旧值相同则 `Changed: 0`。
+  - ENUM/SET 严格模式截断错误沿用 TiDB 的未格式化文案
+    `Data truncated for column '%s' at row %d`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/update --status pending`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t executor/update --status pending -k`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=114 tikv=112 skipped=142`（含 8 套 `local` 冒烟；
+    `executor/adapter` / `local/txn` 按 manifest 跳过 TiKV）
+  - manifest：`executor/update` → `green`，green 105→106
+    （R7 38→39，pending 130→129）。
+- **阻塞/风险**:
+  - 聚簇表排序在扫描结果集上做 `sort_by`，大表扫全表会多一次 O(n log n)；
+    KV 层按聚簇键编码后可直接省掉。
+  - 外键检查仍逐子表扫描，未利用外键列索引。
+  - JSON 规范化在列赋值时重新序列化，大文档有额外解析成本。
+- **下一步**:
+  - `executor/insert`（`INSERT IGNORE` / `REPLACE` 与 FK、严格模式共用同一套 cast）。
+
 ## 7. 更新模板
 
 每次更新追加一条：
