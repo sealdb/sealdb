@@ -404,6 +404,33 @@ pub fn parse_test(src: &str) -> Result<Vec<Step>> {
             });
             continue;
         }
+        // A few upstream tests omit the semicolon after a standalone `SET` /
+        // `USE` line; flush it so the following statement is not glued into
+        // the same parse (`SET ...\nDELETE ...` is not valid SQL).
+        if !buf.is_empty() && !buf.contains(';') {
+            let first = buf
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(first.as_str(), "set" | "use") {
+                steps.push(Step {
+                    sql: buf.trim().to_string(),
+                    expected_error,
+                    sorted,
+                    show_warnings: warnings_enabled,
+                    echo: None,
+                    log_result: result_log,
+                    show_info: info_enabled,
+                    replace_regex: std::mem::take(&mut replace_regex),
+                    replace_column: std::mem::take(&mut replace_column),
+                    directive: None,
+                });
+                buf.clear();
+                expected_error = None;
+                sorted = false;
+            }
+        }
         if !buf.is_empty() {
             buf.push('\n');
         }
@@ -594,7 +621,16 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn parse_error_code(raw: &str) -> Result<Option<i32>> {
-    let first = raw.split([',', ' ']).find(|s| !s.is_empty()).unwrap_or(raw);
+    let codes: Vec<&str> = raw.split([',', ' ']).filter(|s| !s.is_empty()).collect();
+    if codes.len() > 1 {
+        for code in &codes {
+            code.parse::<i32>().map_err(|_| {
+                Error::new(sealdb_errno::ERR_PARSE_ERROR, format!("bad --error {raw}"))
+            })?;
+        }
+        return Ok(Some(-1));
+    }
+    let first = codes.first().copied().unwrap_or(raw);
     first
         .parse::<i32>()
         .map(Some)
@@ -898,24 +934,7 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
         }
     }
     match (result, step.expected_error) {
-        (Ok(_), Some(code)) => {
-            if std::env::var_os("SEALDB_ITEST_LENIENT_ERRORS").is_some() {
-                Ok(format!("[missing error {code}] {}", step.sql))
-            } else {
-                Err(Error::new(
-                    sealdb_errno::ERR_UNKNOWN_ERROR,
-                    format!("expected error {code} for {}", step.sql),
-                ))
-            }
-        }
-        (Err(err), Some(code)) if err.code != code => Err(Error::new(
-            sealdb_errno::ERR_UNKNOWN_ERROR,
-            format!(
-                "expected error {code} for {}, got {} ({})",
-                step.sql, err.code, err.message
-            ),
-        )),
-        (Ok(qr), None) => {
+        (Ok(qr), Some(-1) | None) => {
             if !step.log_result {
                 return Ok(step.sql.clone());
             }
@@ -977,6 +996,24 @@ fn run_step(session: &Session, step: &Step) -> Result<String> {
             }
             Ok(out)
         }
+        (Ok(_), Some(code)) => {
+            if std::env::var_os("SEALDB_ITEST_LENIENT_ERRORS").is_some() {
+                Ok(format!("[missing error {code}] {}", step.sql))
+            } else {
+                Err(Error::new(
+                    sealdb_errno::ERR_UNKNOWN_ERROR,
+                    format!("expected error {code} for {}", step.sql),
+                ))
+            }
+        }
+        (Err(_), Some(-1)) => Ok(format!("{}\nGot one of the listed errors", step.sql)),
+        (Err(err), Some(code)) if err.code != code => Err(Error::new(
+            sealdb_errno::ERR_UNKNOWN_ERROR,
+            format!(
+                "expected error {code} for {}, got {} ({})",
+                step.sql, err.code, err.message
+            ),
+        )),
         (Err(err), _) => {
             let mut out = format!(
                 "{}\nError {} ({}): {}",

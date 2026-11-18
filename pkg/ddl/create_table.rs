@@ -1153,7 +1153,7 @@ pub(crate) fn add_foreign_key(
     position: usize,
 ) -> Result<()> {
     let name = if fk.name.is_empty() {
-        format!("{}_ibfk_{}", info.name.o(), position + 1)
+        format!("fk_{}", position + 1)
     } else {
         fk.name.clone()
     };

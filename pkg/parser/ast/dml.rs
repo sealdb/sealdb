@@ -941,6 +941,8 @@ pub struct DeleteStmt {
     pub table: TableName,
     pub tables: Vec<TableName>,
     pub join: Option<Join>,
+    /// Third and later tables of a flattened `t1 JOIN t2 JOIN t3` chain.
+    pub additional_joins: Vec<Join>,
     pub selection: Option<ExprNode>,
     pub order_by: Vec<ByItem>,
     pub limit: Option<u64>,
@@ -965,6 +967,12 @@ impl DeleteStmt {
             }
             ctx.write_str(" FROM ");
             restore_table_join(ctx, &self.table, self.join.as_ref())?;
+            for join in &self.additional_joins {
+                ctx.write_str(" JOIN ");
+                join.right.restore(ctx)?;
+                ctx.write_str(" ON ");
+                join.on.restore(ctx)?;
+            }
         }
         if let Some(selection) = &self.selection {
             ctx.write_str(" WHERE ");

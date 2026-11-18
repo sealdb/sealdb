@@ -30,7 +30,7 @@ pub use evaluator::{
     validate_string_cmp_literals_on, warnings_len, window_concurrency,
     with_allow_auto_increment_in_generated, with_allow_auto_random_explicit_insert,
     with_allow_write_row_id, with_collation, with_collation_ci, with_current_db,
-    with_div_by_zero_mode, with_index_dst_double, with_sql_mode, with_time_zone,
+    with_div_by_zero_mode, with_index_dst_double, with_sql_mode, with_strict_dml, with_time_zone,
 };
 pub use funcs::{FuncCategory, FuncMeta, builtin_list, check_arg_count, implemented_names, lookup};
 pub use sealdb_util::collate::CollateMode;

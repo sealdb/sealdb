@@ -18,6 +18,9 @@ pub const ERR_BAD_FIELD: i32 = 1054;
 pub const ERR_AMBIGUOUS_COLUMN: i32 = 1052;
 pub const ERR_WRONG_FIELD_WITH_GROUP: i32 = 1055;
 pub const ERR_NO_SUCH_TABLE: i32 = 1146;
+/// MySQL `ER_ROW_IS_REFERENCED_2`: deleting a parent row still referenced by a
+/// child foreign key (1451).
+pub const ERR_ROW_IS_REFERENCED_2: i32 = 1451;
 pub const ERR_UNKNOWN_ERROR: i32 = 1105;
 pub const ERR_WRONG_VALUE_COUNT: i32 = 1058;
 /// MySQL `ER_WRONG_VALUE_COUNT_ON_ROW`: VALUES arity differs from the columns.

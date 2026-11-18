@@ -1586,12 +1586,32 @@ impl PlanBuilder {
         stats: Option<&Handle>,
         prune_mode: PartitionPruneMode,
     ) -> Result<Option<Box<PhysicalPlan>>> {
+        // TiDB refuses DML on views and sequences with a per-kind 1105.
+        if let Some(is) = is {
+            let (db, name) = delete.table.qualified(current_db);
+            if let Some(info) = is.table_by_name(&db, &name) {
+                if info.is_view() {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_UNKNOWN_ERROR,
+                        format!("delete view {} is not supported now", delete.table.name),
+                    ));
+                }
+                if info.is_sequence() {
+                    return Err(Error::new(
+                        sealdb_errno::ERR_UNKNOWN_ERROR,
+                        format!("delete sequence {} is not supported now", delete.table.name),
+                    ));
+                }
+            }
+        }
         let mut select = dml_scan_select(
             &delete.table,
             delete.join.as_ref(),
             delete.selection.clone(),
             &delete.text,
         );
+        // Flattened `t1 JOIN t2 JOIN t3` chain: the child scan sees every side.
+        select.joins.extend(delete.additional_joins.iter().cloned());
         // TiDB's DML children read the row handle only, which lets a covering
         // secondary index serve the scan (`Delete → IndexReader`). For an
         // integer PK the handle is the PK column itself.

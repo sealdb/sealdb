@@ -192,6 +192,26 @@ pub fn with_div_by_zero_mode<T>(mode: DivByZeroMode, f: impl FnOnce() -> T) -> T
     })
 }
 
+thread_local! {
+    /// Statement error context: strict DML turns numeric overflow into 1690
+    /// instead of clamping with a 1292 warning (TiDB `errctx`).
+    static STRICT_DML: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn with_strict_dml<T>(strict: bool, f: impl FnOnce() -> T) -> T {
+    STRICT_DML.with(|cell| {
+        let prev = cell.get();
+        cell.set(strict);
+        let out = f();
+        cell.set(prev);
+        out
+    })
+}
+
+pub fn strict_dml() -> bool {
+    STRICT_DML.with(Cell::get)
+}
+
 /// Run `f` under the session `time_zone` (TiDB TIMESTAMP/DST).
 pub fn with_time_zone<T>(tz: impl Into<String>, f: impl FnOnce() -> T) -> T {
     TIME_ZONE.with(|cell| {
@@ -3221,6 +3241,30 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         },
         _ => FieldType::new_string(),
     };
+    // Unsigned integer overflow clamps to u64::MAX (1292 warning), but strict
+    // DML raises 1690 (`cast('18446744073709551616' as unsigned)`).
+    if ft.unsigned
+        && let Datum::Bytes(bytes) = &value
+    {
+        let text = String::from_utf8_lossy(bytes);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return match trimmed.parse::<u64>() {
+                Ok(v) => Ok(Datum::U64(v)),
+                Err(_) if strict_dml() => Err(Error::new(
+                    ERR_DATA_OUT_OF_RANGE,
+                    format!("BIGINT UNSIGNED value is out of range in '{trimmed}'"),
+                )),
+                Err(_) => {
+                    push_warning(
+                        ERR_TRUNCATED_WRONG_VALUE,
+                        format!("Truncated incorrect INTEGER value: '{trimmed}'"),
+                    );
+                    Ok(Datum::U64(u64::MAX))
+                }
+            };
+        }
+    }
     // MySQL casts a string to a number by its longest numeric prefix
     // (`cast('10ab' as double)` is `10`).
     if ft.tp == sealdb_types::TYPE_DOUBLE

@@ -10356,6 +10356,63 @@ fn lower_update(update: &Update) -> Result<Statement> {
     }))
 }
 
+/// Flatten a right-nested `t1 JOIN (t2 JOIN t3)` chain (sqlparser's shape for
+/// three or more tables) into a left-deep list. Only comma-style inner joins
+/// with conditions in `WHERE` are accepted; `ON`/`USING` need re-association.
+fn lower_delete_join_chain(table: &TableWithJoins) -> Result<(TableName, Option<Join>, Vec<Join>)> {
+    fn collect(item: &crate::ast::FromItem, out: &mut Vec<TableName>) -> Result<()> {
+        match item {
+            crate::ast::FromItem::Table(t) => {
+                out.push(t.clone());
+                Ok(())
+            }
+            crate::ast::FromItem::Join {
+                left,
+                right,
+                tp,
+                on,
+                using_cols,
+                natural,
+            } => {
+                let is_true = matches!(on, ExprNode::Value(v) if v.datum == Datum::I64(1));
+                if !is_true
+                    || !using_cols.is_empty()
+                    || *natural
+                    || !matches!(tp, JoinType::Inner | JoinType::Cross)
+                {
+                    return Err(Error::unsupported("nested join with ON in DELETE"));
+                }
+                collect(left, out)?;
+                collect(right, out)?;
+                Ok(())
+            }
+        }
+    }
+    let (item, _ctes) = lower_table_with_joins_item(table)?;
+    let mut names = Vec::new();
+    collect(&item, &mut names)?;
+    let Some(first) = names.first().cloned() else {
+        return Err(Error::unsupported("DELETE without table"));
+    };
+    let mut joins = Vec::new();
+    let mut prev = first.clone();
+    for right in names.into_iter().skip(1) {
+        joins.push(Join {
+            left: prev.clone(),
+            right: right.clone(),
+            tp: JoinType::Inner,
+            on: true_expr(),
+            using_cols: Vec::new(),
+            natural: false,
+            straight: false,
+        });
+        prev = right;
+    }
+    let head = joins.first().cloned();
+    let extra = joins.into_iter().skip(1).collect();
+    Ok((first, head, extra))
+}
+
 /// Lower DELETE, including `DELETE t1 FROM t1 JOIN t2` and `USING`. RETURNING stays rejected.
 fn lower_delete(delete: &Delete) -> Result<Statement> {
     // two-table DELETE. TiDB v8.5.8 has no DELETE RETURNING.
@@ -10365,11 +10422,11 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
     let from = match &delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
-    let ((table, join), tables) = if let Some(using) = &delete.using {
+    let ((table, join, additional_joins), tables) = if let Some(using) = &delete.using {
         if using.len() != 1 {
             return Err(Error::unsupported("comma joins"));
         }
-        let rel = lower_dml_table(&using[0])?;
+        let (rel_table, rel_join) = lower_dml_table(&using[0])?;
         let tables = if !delete.tables.is_empty() {
             delete
                 .tables
@@ -10390,7 +10447,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        (rel, tables)
+        ((rel_table, rel_join, Vec::new()), tables)
     } else if from.len() == 2 && crate::parser::allow_derived_without_alias() {
         // Binding grammar (`CREATE BINDING ... DELETE t1 FROM t1, t2`) parses
         // the comma list; ordinary statements keep reporting it unsupported.
@@ -10413,18 +10470,22 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
             .iter()
             .map(object_table_name)
             .collect::<Result<Vec<_>>>()?;
-        ((left, Some(join)), tables)
+        ((left, Some(join), Vec::new()), tables)
     } else {
         if from.len() != 1 {
             return Err(Error::unsupported("multi-table DELETE"));
         }
-        let rel = lower_dml_table(&from[0])?;
+        let (rel_table, rel_join, extra) = match lower_dml_table(&from[0]) {
+            Ok((table, join)) => (table, join, Vec::new()),
+            Err(e) if e.message.contains("nested join") => lower_delete_join_chain(&from[0])?,
+            Err(e) => return Err(e),
+        };
         let tables = delete
             .tables
             .iter()
             .map(object_table_name)
             .collect::<Result<Vec<_>>>()?;
-        (rel, tables)
+        ((rel_table, rel_join, extra), tables)
     };
     let order_by = lower_order_by_exprs(&delete.order_by)?;
     let limit = delete.limit.as_ref().map(expr_as_u64).transpose()?;
@@ -10441,6 +10502,7 @@ fn lower_delete(delete: &Delete) -> Result<Statement> {
         table,
         tables,
         join,
+        additional_joins,
         selection: delete.selection.as_ref().map(lower_expr).transpose()?,
         order_by,
         limit,

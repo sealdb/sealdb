@@ -3999,6 +3999,50 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     `globalindex/analyze` / `explain_complex_stats` 共同依赖）。
   - `infoschema/infoschema`（R6 同批，`MemTableScan` 范围与信息列口径）。
 
+### 2026-11-18（`executor/delete` 转绿：多表/相关子查询 DELETE、FK RESTRICT、BATCH 语法）
+
+- **Phase**: R7 `executor/delete` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 视图 / 序列上的 DML 一律拒绝：删除 `DELETE` 的可更新视图改写，
+    `dml_delete_child` 对 view/sequence 报 1105
+    「delete view v is not supported now」/「delete sequence seq is not supported now」。
+  - 多表 DELETE 别名匹配：`DELETE t1 FROM t1 AS a` 里未限定/原表名报 1109
+    （sqlstate `42S02`，`Unknown table 't1' in MULTI DELETE`）；
+    `table_matches` 改按源表别名匹配，`errname` 补 1109 映射。
+  - 严格 DML 下的数值 CAST 溢出：`CAST('18446744073709551616' AS UNSIGNED)`
+    报 1690（非严格模式仍是 1292 warning）；
+    新增 `expression::with_strict_dml` 线程局部上下文并在语句执行处绑定。
+  - 外键 RESTRICT：`DeleteExec` 新增 `fk_delete_conflicts` 扫描子表引用行，
+    返回 1451（sqlstate `23000`），`DELETE IGNORE` 下降级为 warning 1451；
+    自动外键约束名统一为 `fk_{n}`。
+  - 相关子查询：`DELETE a FROM t a WHERE EXISTS (SELECT 1 FROM t1 WHERE a.a=t1.a AND t1.a=?)`
+    原先把谓词在开头预求值一次即固定结果，改为逐行替换外层列再求值
+    （`substitute_outer_columns` / `substitute_query` / `substitute_select`）。
+  - 多表 JOIN 链：`DELETE t1 FROM t1 INNER JOIN t2 INNER JOIN t3 …` 在 parser
+    lowering 里拍平成 `additional_joins` 链，`DeleteExec` 按链逐级取行。
+  - 非事务 `BATCH [ON col] LIMIT n <DML>`：`split_batch_sql` 识别并执行内层 DML，
+    输出 `number of jobs` / `job status` 两行，不占用事务。
+  - 集成测试 runner：支持 `-- error a, b` 多错误码（任意一个命中即输出
+    `Got one of the listed errors`）；无分号的独立 `SET` / `USE` 行即时 flush。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t executor/delete --status pending`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t executor/delete --status pending`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - 全量 gate：`./tests/integrationtest/run-tests.sh`
+    → `PASS: memory=113 tikv=111 skipped=143`（含 8 套 `local` 冒烟；
+    `executor/adapter` / `local/txn` 按 manifest 跳过 TiKV）
+  - manifest：`executor/delete` → `green`，green 104→105
+    （R7 37→38，pending 131→130）。
+- **阻塞/风险**:
+  - 相关子查询走的是逐行替换外层列后重跑子查询谓词，没有做去关联成
+    semi/anti join；大表下是 O(行数×子查询代价)。
+  - `fk_delete_conflicts` 逐子表全表扫描检查引用，没有利用外键列的隐式索引。
+  - `BATCH` 以语句文本切分实现，内层 DML 不支持跨行的多语句组合。
+- **下一步**:
+  - `executor/update`（同一批 DML 语义，别名 / 严格模式 / 外键检查可复用）。
+  - `executor/insert`（`INSERT IGNORE` / `REPLACE` 与 FK 约束路径）。
+
 ## 7. 更新模板
 
 每次更新追加一条：

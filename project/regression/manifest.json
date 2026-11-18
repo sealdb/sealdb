@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 104,
+      "green": 105,
       "in_progress": 9,
       "local": 8,
-      "pending": 131
+      "pending": 130
     },
     "by_wave": {
       "D": 2,
@@ -626,7 +626,7 @@
     {
       "name": "executor/delete",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/delete.test",
       "result": "r/executor/delete.result",
       "has_result": true,

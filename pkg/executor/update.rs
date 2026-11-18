@@ -385,10 +385,14 @@ pub(crate) fn dml_row_lock(txn: &TxnHandle) -> Result<RowLock> {
 }
 
 /// Case-insensitive schema+name equality after applying `current_db`.
-pub(crate) fn table_matches(name: &TableName, wanted: &TableName, current_db: &str) -> bool {
-    let (s1, t1) = name.qualified(current_db);
-    let (s2, t2) = wanted.qualified(current_db);
-    s1.eq_ignore_ascii_case(&s2) && t1.eq_ignore_ascii_case(&t2)
+/// Match a multi-table DELETE target list entry against a FROM/JOIN factor.
+/// An aliased factor is only addressable by its alias (`DELETE t1 FROM t1 AS a`
+/// is an unknown table in TiDB).
+pub(crate) fn table_matches(target: &TableName, source: &TableName, current_db: &str) -> bool {
+    let (target_schema, target_name) = target.qualified(current_db);
+    let source_schema = source.schema.as_deref().unwrap_or(current_db);
+    source_schema.eq_ignore_ascii_case(&target_schema)
+        && source.name.eq_ignore_ascii_case(&target_name)
 }
 
 /// Concatenate `t.col` names so join filters and SET exprs can resolve both sides.
