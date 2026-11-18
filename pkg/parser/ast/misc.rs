@@ -504,7 +504,7 @@ pub enum ShowVarScope {
     Global,
 }
 
-/// `SHOW VARIABLES LIKE 'pat'` / `SHOW VARIABLES WHERE <cond>`.
+/// `SHOW … LIKE 'pat'` / `SHOW … WHERE <cond>` filter.
 #[derive(Clone, Debug)]
 pub enum ShowVarFilter {
     Like(String),
@@ -526,8 +526,9 @@ pub struct ShowStmt {
     pub column: Option<String>,
     /// `SHOW … VARIABLES` scope (ignored by the other kinds).
     pub var_scope: ShowVarScope,
-    /// `SHOW … VARIABLES LIKE|WHERE` filter (ignored by the other kinds).
-    pub var_filter: Option<ShowVarFilter>,
+    /// `SHOW … [VARIABLES] LIKE|WHERE` filter (`SHOW COLUMNS|TABLES … WHERE`
+    /// stores its row condition here too).
+    pub filter: Option<ShowVarFilter>,
 }
 
 impl ShowStmt {
@@ -598,7 +599,7 @@ impl ShowStmt {
                     ctx.write_str("GLOBAL ");
                 }
                 ctx.write_str("VARIABLES");
-                match &self.var_filter {
+                match &self.filter {
                     Some(ShowVarFilter::Like(pattern)) => {
                         ctx.write_str(" LIKE ");
                         ctx.write_str(pattern);
@@ -616,21 +617,32 @@ impl ShowStmt {
 }
 
 /// `CREATE [GLOBAL|SESSION] BINDING FOR <original> USING <bind>` (TiDB `CreateBindingStmt`).
+///
+/// TiDB also accepts `CREATE … BINDING FROM HISTORY USING PLAN DIGEST '<d>'`,
+/// which rebuilds a binding from a plan recorded in the statement summary.
 #[derive(Clone, Debug)]
 pub struct CreateBindingStmt {
     pub original_sql: String,
     pub bind_sql: String,
     /// `CREATE GLOBAL BINDING` (domain-wide) vs plain session binding.
     pub global: bool,
+    /// Plan digest of the `FROM HISTORY` form.
+    pub plan_digest: Option<String>,
 }
 
 impl CreateBindingStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str(if self.global {
-            "CREATE GLOBAL BINDING FOR "
+            "CREATE GLOBAL BINDING "
         } else {
-            "CREATE BINDING FOR "
+            "CREATE BINDING "
         });
+        if let Some(digest) = &self.plan_digest {
+            ctx.write_str("FROM HISTORY USING PLAN DIGEST ");
+            ctx.write_str(digest);
+            return Ok(());
+        }
+        ctx.write_str("FOR ");
         ctx.write_str(&self.original_sql);
         ctx.write_str(" USING ");
         ctx.write_str(&self.bind_sql);
@@ -661,6 +673,8 @@ impl SetBindingStmt {
 #[derive(Clone, Debug)]
 pub struct DropBindingStmt {
     pub original_sql: String,
+    /// `DROP … BINDING FOR SQL DIGEST '<d>'` form.
+    pub sql_digest: Option<String>,
     /// `DROP GLOBAL BINDING` vs plain session binding.
     pub global: bool,
 }
@@ -668,10 +682,16 @@ pub struct DropBindingStmt {
 impl DropBindingStmt {
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
         ctx.write_str(if self.global {
-            "DROP GLOBAL BINDING FOR "
+            "DROP GLOBAL BINDING "
         } else {
-            "DROP BINDING FOR "
+            "DROP BINDING "
         });
+        if let Some(digest) = &self.sql_digest {
+            ctx.write_str("FOR SQL DIGEST ");
+            ctx.write_str(digest);
+            return Ok(());
+        }
+        ctx.write_str("FOR ");
         ctx.write_str(&self.original_sql);
         Ok(())
     }

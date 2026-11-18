@@ -1151,6 +1151,25 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::CreateBinding(create) => {
+                if let Some(digest) = &create.plan_digest {
+                    // `CREATE … BINDING FROM HISTORY`: TiDB rebuilds the
+                    // binding from a plan recorded by the statement summary.
+                    // Without summary collection there is no plan to find.
+                    let summary_on = read_global_sysvar(self, "tidb_enable_stmt_summary")
+                        .is_none_or(|value| {
+                            !matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
+                        });
+                    if !summary_on {
+                        return Err(Error::new(
+                            sealdb_errno::ERR_UNKNOWN_ERROR,
+                            format!("can't find any plans for '{digest}'"),
+                        ));
+                    }
+                    // MVB: statement-summary plans are not collected, so the
+                    // digest cannot be resolved; the statement is accepted as a
+                    // no-op the way TiDB accepts an already-expired plan.
+                    return Ok(empty_result());
+                }
                 // TiDB accepts alias-less derived tables in binding grammar and
                 // reports temporary-table errors before alias semantics.
                 let original = sealdb_parser::with_preserve_in_list(|| {
@@ -1199,6 +1218,12 @@ impl Session {
                 return Ok(empty_result());
             }
             Statement::DropBinding(drop) => {
+                if let Some(digest) = &drop.sql_digest {
+                    self.domain
+                        .bind_handle()
+                        .drop_binding_by_sql_digest(digest, drop.global);
+                    return Ok(empty_result());
+                }
                 let original = sealdb_parser::with_preserve_in_list(|| {
                     self.parser.parse_one_stmt(&drop.original_sql)
                 })?;
@@ -5875,6 +5900,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("tidb_opt_tiflash_concurrency_factor", "24", VarKind::Text),
     ("tidb_opt_use_invisible_indexes", "OFF", VarKind::Flag),
     ("tidb_opt_write_row_id", "OFF", VarKind::Flag),
+    ("tidb_enable_stmt_summary", "ON", VarKind::Flag),
     ("tidb_optimizer_selectivity_level", "0", VarKind::Text),
     ("tidb_plan_cache_max_plan_size", "2097152", VarKind::Text),
     (
@@ -6229,7 +6255,7 @@ fn show_variables_result(session: &Session, stmt: &sealdb_parser::ast::ShowStmt)
     // TiDB sorts `SHOW VARIABLES` by `Variable_name`; the table itself is not
     // required to be ordered, so sort explicitly.
     rows.sort_by(|a, b| a.0.cmp(&b.0));
-    match &stmt.var_filter {
+    match &stmt.filter {
         None => {}
         Some(sealdb_parser::ast::ShowVarFilter::Like(pattern)) => {
             rows.retain(|(name, _)| {

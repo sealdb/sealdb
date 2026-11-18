@@ -27,6 +27,33 @@ impl ShowExec {
             emitted: false,
         }
     }
+
+    /// `SHOW COLUMNS|TABLES … WHERE <cond>`: TiDB builds the SHOW result rows
+    /// and then filters them, comparing strings under the result's
+    /// case-insensitive collation.
+    fn apply_where_filter(&mut self) -> Result<()> {
+        let Some(sealdb_parser::ast::ShowVarFilter::Where(expr)) = &self.stmt.filter else {
+            return Ok(());
+        };
+        let mut schema = self.schema.clone();
+        if self.stmt.kind == ShowStmtKind::Tables
+            && let Some(first) = schema.first_mut()
+            && let Some(pos) = first.find(" (")
+        {
+            first.truncate(pos);
+        }
+        let mut kept = Vec::with_capacity(self.rows.len());
+        for row in self.rows.drain(..) {
+            let pass = sealdb_expression::with_collation_ci(true, || {
+                sealdb_expression::eval_filter(expr, &schema, &row)
+            })?;
+            if pass {
+                kept.push(row);
+            }
+        }
+        self.rows = kept;
+        Ok(())
+    }
 }
 
 impl Executor for ShowExec {
@@ -77,17 +104,38 @@ impl Executor for ShowExec {
                 if is.schema_by_name(&db).is_none() {
                     return Err(Error::new(ERR_BAD_DB, format!("Unknown database '{db}'")));
                 }
-                self.schema = vec![show_column_header(
-                    &format!("Tables_in_{db}"),
-                    self.stmt.pattern.as_deref(),
-                )];
+                self.schema = if self.stmt.full {
+                    vec![
+                        show_column_header(
+                            &format!("Tables_in_{db}"),
+                            self.stmt.pattern.as_deref(),
+                        ),
+                        "Table_type".to_string(),
+                    ]
+                } else {
+                    vec![show_column_header(
+                        &format!("Tables_in_{db}"),
+                        self.stmt.pattern.as_deref(),
+                    )]
+                };
                 self.rows = is
                     .schema_tables(&db)
                     .into_iter()
-                    .map(|t| t.name.o().to_string())
-                    .filter(|name| show_like_ok(name, self.stmt.pattern.as_deref()))
-                    .map(|name| vec![Datum::Bytes(name.into_bytes())])
+                    .filter(|t| show_like_ok(t.name.o(), self.stmt.pattern.as_deref()))
+                    .map(|t| {
+                        let name = t.name.o().to_string();
+                        if self.stmt.full {
+                            let table_type = if t.is_view() { "VIEW" } else { "BASE TABLE" };
+                            vec![
+                                Datum::Bytes(name.into_bytes()),
+                                Datum::Bytes(table_type.as_bytes().to_vec()),
+                            ]
+                        } else {
+                            vec![Datum::Bytes(name.into_bytes())]
+                        }
+                    })
                     .collect();
+                self.apply_where_filter()?;
             }
             ShowStmtKind::Grants => {
                 let user = self
@@ -240,6 +288,7 @@ impl Executor for ShowExec {
                     .filter(|col| show_column_visible(col.name.o(), column, pattern))
                     .map(|col| column_row(info, col, full))
                     .collect();
+                self.apply_where_filter()?;
             }
             ShowStmtKind::Index => {
                 let table = self
@@ -858,6 +907,14 @@ fn show_like_at(text: &[u8], ti: usize, pattern: &[u8], pi: usize) -> bool {
                 || (ti < text.len() && show_like_at(text, ti + 1, pattern, pi))
         }
         b'_' => ti < text.len() && show_like_at(text, ti + 1, pattern, pi + 1),
+        // MySQL pattern escapes: `\%`, `\_` and `\\` stand for the character
+        // itself (the string-literal layer keeps them intact for LIKE).
+        b'\\' if pi + 1 < pattern.len() => {
+            let ch = pattern[pi + 1];
+            ti < text.len()
+                && text[ti].eq_ignore_ascii_case(&ch)
+                && show_like_at(text, ti + 1, pattern, pi + 2)
+        }
         ch => {
             ti < text.len()
                 && text[ti].eq_ignore_ascii_case(&ch)

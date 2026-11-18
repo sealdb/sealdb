@@ -8154,6 +8154,15 @@ fn using_output_table(select: &SelectStmt, name: &str) -> Option<String> {
 
 pub(crate) fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
     let table = select.from.as_ref().map(|t| t.name.as_str());
+    // `FROM information_schema.cluster_slow_query` keeps its own schema in the
+    // ORDER BY label (`information_schema.cluster_slow_query.time`), not the
+    // session database.
+    let from_schema = select
+        .from
+        .as_ref()
+        .and_then(|t| t.schema.as_deref())
+        .filter(|schema| schema.eq_ignore_ascii_case("information_schema"))
+        .unwrap_or(current_db);
     let from_derived_union = select.with.as_ref().is_some_and(|w| {
         table.is_some_and(|t| w.find(t).is_some_and(|cte| !cte.set_rest.is_empty()))
     });
@@ -8173,7 +8182,7 @@ pub(crate) fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
                         .or_else(|| col.table.clone())
                         .or_else(|| table.map(|t| t.to_string()));
                     match owner {
-                        Some(t) => format!("{}.{t}.{}", schema_prefix(current_db), col.name),
+                        Some(t) => format!("{}.{t}.{}", schema_prefix(from_schema), col.name),
                         None => item.expr.restore_string(),
                     }
                 }
@@ -8198,7 +8207,7 @@ pub(crate) fn topn_by_info(select: &SelectStmt, current_db: &str) -> String {
                             match (&f.expr, table) {
                                 (ExprNode::Column(c), Some(t)) if !from_cte => Some(format!(
                                     "{}.{}.{}",
-                                    schema_prefix(current_db),
+                                    schema_prefix(from_schema),
                                     c.table.as_deref().unwrap_or(t),
                                     c.name
                                 )),

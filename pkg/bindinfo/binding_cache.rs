@@ -48,6 +48,32 @@ impl BindingCache {
         removed
     }
 
+    /// Remove every binding whose SQL digest matches (`DROP BINDING … FOR SQL
+    /// DIGEST '<d>'`). Returns true if anything was removed.
+    pub fn remove_by_sql_digest(&self, digest: &str, global: bool) -> bool {
+        let mut inner = self.inner.lock().expect("binding cache lock");
+        let mut removed = false;
+        let keys: Vec<String> = inner.keys().cloned().collect();
+        for key in keys {
+            let Some(rows) = inner.get_mut(&key) else {
+                continue;
+            };
+            let before = rows.len();
+            rows.retain(|binding| {
+                !(binding.global == global
+                    && binding.status != "deleted"
+                    && binding.sql_digest.eq_ignore_ascii_case(digest))
+            });
+            if rows.len() != before {
+                removed = true;
+            }
+            if rows.is_empty() {
+                inner.remove(&key);
+            }
+        }
+        removed
+    }
+
     /// Enable/disable the binding whose *original* SQL (values kept) matches
     /// `original_sql`. TiDB's `SET BINDING` keys on the statement text, so
     /// `a in (1)` does not toggle a binding created for `a in (1,2,3)` even

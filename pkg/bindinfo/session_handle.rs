@@ -31,6 +31,11 @@ impl SessionBindingHandle {
         self.cache.remove(normalized_original, global)
     }
 
+    /// Drop every binding whose SQL digest matches.
+    pub fn drop_binding_by_sql_digest(&self, digest: &str, global: bool) -> bool {
+        self.cache.remove_by_sql_digest(digest, global)
+    }
+
     /// Enable or disable an existing binding by its original statement text.
     pub fn set_binding_enabled(&self, original_sql: &str, enabled: bool) -> bool {
         self.cache.set_enabled(original_sql, enabled)

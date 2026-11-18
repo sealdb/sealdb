@@ -876,7 +876,7 @@ fn push_into(
                     {
                         ranges.extend(values.into_iter().map(|v| (column.clone(), v)));
                     }
-                    _ => residual.push(conjunct),
+                    _ => residual.push(mark_mem_table_like_ci(conjunct, &columns)),
                 }
             }
             ranges.sort();
@@ -1154,6 +1154,31 @@ fn mem_table_value(value: Datum) -> Option<String> {
         _ => return None,
     };
     Some(text.to_lowercase())
+}
+
+/// Infoschema string columns carry a case-insensitive collation
+/// (`utf8mb4_general_ci`), but the residual `LIKE` stays above the
+/// `MemTableScan`. Mark those predicates so evaluation matches TiDB
+/// (`column_name LIKE 'I%'` finds `id`).
+fn mark_mem_table_like_ci(mut expr: ExprNode, columns: &[String]) -> ExprNode {
+    match &mut expr {
+        ExprNode::Like(like) => {
+            if let ExprNode::Column(col) = like.expr.as_ref()
+                && columns.iter().any(|c| c.eq_ignore_ascii_case(&col.name))
+            {
+                like.ci = true;
+            }
+        }
+        ExprNode::Binary(bin) if matches!(bin.op, Op::LogicAnd | Op::LogicOr | Op::LogicXor) => {
+            bin.left = Box::new(mark_mem_table_like_ci((*bin.left).clone(), columns));
+            bin.right = Box::new(mark_mem_table_like_ci((*bin.right).clone(), columns));
+        }
+        ExprNode::Unary(unary) if matches!(unary.op, Op::Not) => {
+            unary.expr = Box::new(mark_mem_table_like_ci((*unary.expr).clone(), columns));
+        }
+        _ => {}
+    }
+    expr
 }
 
 fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {

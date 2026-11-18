@@ -2567,6 +2567,23 @@ fn walk_with_parent(
         );
         return;
     }
+    // Cluster memtables are planned as a TiDB cop task: TiDB wraps the scan in
+    // a `TableReader` and pushes a slow-log `ORDER BY time LIMIT n` down as a
+    // cop `Limit` (pingcap/tidb#51723). The time range predicate becomes scan
+    // ranges, so only the other predicates print as a cop `Selection`.
+    if let PhysicalPlan::Selection { filter, child, .. } = plan
+        && let PhysicalPlan::InfoSchema { table, .. } = child.as_ref()
+        && is_cluster_mem_table(table)
+    {
+        emit_cluster_mem_table(rows, depth, last, next_id, spine, parent, Some(filter));
+        return;
+    }
+    if let PhysicalPlan::InfoSchema { table, .. } = plan
+        && is_cluster_mem_table(table)
+    {
+        emit_cluster_mem_table(rows, depth, last, next_id, spine, parent, None);
+        return;
+    }
     // TiDB brief/row often elides a trivial Projection above TopN/Limit.
     // Keep remapping projections (`Column#5->Column#6`) used after StreamAgg+ORDER BY.
     // Also elide CTE seed column-name projections (`SELECT c1`) so MergeJoin
@@ -7671,6 +7688,207 @@ fn pseudo_ranges_of_predicate(
     }
 }
 
+/// Is `table` the cluster memtable TiDB plans as a `cop[tidb]` scan?
+/// Only `CLUSTER_SLOW_QUERY` takes this path: its `time` column is the scan
+/// handle, so a time range becomes access ranges and `ORDER BY time LIMIT n`
+/// pushes a cop Limit (pingcap/tidb#51723).
+fn is_cluster_mem_table(table: &str) -> bool {
+    table.eq_ignore_ascii_case("cluster_slow_query")
+}
+
+/// Pseudo statistics of one conjunct list over the cluster memtable: TiDB
+/// sizes the scan from its `time` handle ranges and the residual `Selection`
+/// from the pseudo column ranges (`column_range_rows`). Returns the scanned
+/// row count, the residual selectivity, and the residual conjuncts.
+fn cluster_mem_table_est(
+    filter: Option<&sealdb_parser::ast::ExprNode>,
+) -> (f64, f64, Vec<sealdb_parser::ast::ExprNode>) {
+    const TABLE_ROWS: f64 = 10_000.0;
+    let conjuncts = filter.map(|f| f.split_cnf()).unwrap_or_default();
+    let mut time_conjuncts = Vec::new();
+    let mut residual = Vec::new();
+    for conjunct in conjuncts {
+        let on_time = conjunct
+            .column_cmp_const()
+            .map(|(column, _, _)| column.eq_ignore_ascii_case("time"))
+            .or_else(|| {
+                conjunct
+                    .between_column_const()
+                    .map(|(column, _, _)| column.eq_ignore_ascii_case("time"))
+            })
+            .unwrap_or(false);
+        if on_time {
+            time_conjuncts.push(conjunct);
+        } else {
+            residual.push(conjunct);
+        }
+    }
+    let scan_sel = if time_conjuncts.is_empty() {
+        1.0
+    } else {
+        sealdb_statistics::pseudo::selectivity(&time_conjuncts, TABLE_ROWS, Some("time"))
+            .unwrap_or(1.0)
+    };
+    let residual_sel = if residual.is_empty() {
+        1.0
+    } else {
+        sealdb_statistics::pseudo::selectivity(&residual, TABLE_ROWS, Some("time")).unwrap_or(0.8)
+    };
+    (TABLE_ROWS * scan_sel, residual_sel, residual)
+}
+
+/// Does a `TopN`'s `by_info` hold exactly the slow log's `time` column (the
+/// only shape TiDB pushes a cop Limit for)?
+fn slow_log_order_by_time(by_info: &str) -> bool {
+    if by_info.contains(',') {
+        return false;
+    }
+    let item = by_info.trim();
+    let column = item.strip_suffix(":desc").unwrap_or(item).trim();
+    column.eq_ignore_ascii_case("time") || column.to_ascii_lowercase().ends_with(".time")
+}
+
+/// Explain rows of a cluster memtable scan. TiDB renders
+/// `TableReader → [Limit] → [Selection] → MemTableScan`, all but the reader in
+/// the `cop[tidb]` task.
+#[allow(clippy::too_many_arguments)]
+fn emit_cluster_mem_table(
+    rows: &mut Vec<ExplainRow>,
+    depth: usize,
+    last: bool,
+    next_id: &mut usize,
+    spine: &[bool],
+    parent: Option<&PhysicalPlan>,
+    filter: Option<&sealdb_parser::ast::ExprNode>,
+) {
+    let (scan_est, residual_sel, residual) = cluster_mem_table_est(filter);
+    let ds_est = scan_est * residual_sel;
+    // A `TopN` over the scan (slow-log `ORDER BY time LIMIT n`) pushes its
+    // limit into the cop task as `Limit(offset, count)`; TiDB only does this
+    // when the single sort key is the scan's `time` handle.
+    let limit = match parent {
+        Some(PhysicalPlan::TopN { count, by_info, .. }) if slow_log_order_by_time(by_info) => {
+            Some(*count)
+        }
+        _ => None,
+    };
+    let residual_info = residual
+        .iter()
+        .map(|conjunct| explain_selection_info_on("cluster_slow_query", conjunct))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut chain: Vec<bool> = spine.to_vec();
+    let scan_access = "table:CLUSTER_SLOW_QUERY".to_string();
+    // (name, est, task, access object, operator info)
+    let mut specs: Vec<(&str, f64, &str, String, String)> = Vec::new();
+    match limit {
+        Some(count) => {
+            let count = count as f64;
+            specs.push((
+                "TableReader",
+                count,
+                "root",
+                String::new(),
+                "data:Limit".to_string(),
+            ));
+            specs.push((
+                "Limit",
+                count,
+                "cop[tidb]",
+                String::new(),
+                format!("offset:0, count:{}", count as i64),
+            ));
+            if residual.is_empty() {
+                specs.push((
+                    "MemTableScan",
+                    count,
+                    "cop[tidb]",
+                    scan_access,
+                    String::new(),
+                ));
+            } else {
+                specs.push((
+                    "Selection",
+                    count,
+                    "cop[tidb]",
+                    String::new(),
+                    residual_info,
+                ));
+                // The cop Limit scales its child to the limit count, then the
+                // scan is widened back by the Selection's selectivity
+                // (`1 / (166.42 / 250)` → 1.50).
+                let scan_rows = if residual_sel > 0.0 {
+                    count / residual_sel
+                } else {
+                    count
+                };
+                specs.push((
+                    "MemTableScan",
+                    scan_rows,
+                    "cop[tidb]",
+                    scan_access,
+                    String::new(),
+                ));
+            }
+        }
+        None => {
+            let access = if residual.is_empty() {
+                "data:MemTableScan"
+            } else {
+                "data:Selection"
+            };
+            specs.push((
+                "TableReader",
+                ds_est,
+                "root",
+                String::new(),
+                access.to_string(),
+            ));
+            if residual.is_empty() {
+                specs.push((
+                    "MemTableScan",
+                    scan_est,
+                    "cop[tidb]",
+                    scan_access,
+                    String::new(),
+                ));
+            } else {
+                specs.push((
+                    "Selection",
+                    ds_est,
+                    "cop[tidb]",
+                    String::new(),
+                    residual_info,
+                ));
+                specs.push((
+                    "MemTableScan",
+                    scan_est,
+                    "cop[tidb]",
+                    scan_access,
+                    String::new(),
+                ));
+            }
+        }
+    }
+    for (index, (name, est, task, access, info)) in specs.into_iter().enumerate() {
+        let id = *next_id;
+        *next_id += 1;
+        let prefix = if index == 0 {
+            tree_prefix_with_spine(spine, depth, last)
+        } else {
+            tree_prefix_with_spine(&chain, depth + index, true)
+        };
+        rows.push(ExplainRow {
+            id: format!("{prefix}{name}_{id}"),
+            est_rows: format!("{est:.2}"),
+            task: task.to_string(),
+            access,
+            info,
+        });
+        chain.push(if index == 0 { !last } else { false });
+    }
+}
+
 /// Integer constant of an expression, folding a leading unary minus
 /// (`-9223372036854775808` parses as `-(9223372036854775808)`).
 fn expr_to_i128_const(expr: &sealdb_parser::ast::ExprNode) -> Option<i128> {
@@ -7984,6 +8202,16 @@ pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {
             filter,
             est_rows: built_est,
         } => {
+            // Cluster memtables keep pseudo statistics: the `time` handle range
+            // sizes the scan and the other predicates scale the output
+            // (`time BETWEEN … AND query != 'x'` → 10000 × 0.025 × 0.66567).
+            if matches!(
+                child.as_ref(),
+                PhysicalPlan::InfoSchema { table, .. } if is_cluster_mem_table(table)
+            ) {
+                let (scan_est, residual_sel, _) = cluster_mem_table_est(Some(filter));
+                return scan_est * residual_sel;
+            }
             // Stats-derived cardinality from plan build (`cardinality.Selectivity`).
             if let Some(est) = built_est {
                 return *est;

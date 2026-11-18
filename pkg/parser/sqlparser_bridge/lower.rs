@@ -100,6 +100,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // Capture before rewrite so projection names keep TiDB `field.Text()` spelling
     // (spaces around unary ops, `!` not `__sealdb_bang`, etc.).
     let projection_texts = capture_select_projections(sql);
+    // `DESCRIBE tbl <literal|garbage>` must be rejected on the original text:
+    // the `SHOW COLUMNS` rewrite below would otherwise consume the token.
+    reject_describe_column_syntax(sql)?;
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
     // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
     // comments are expanded (the "T" comment is otherwise an ordinary comment).
@@ -190,6 +193,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let (rewritten, view_checks) = extract_view_check_option(&rewritten);
     // TiDB parses a per-arm `LIMIT` before `UNION` and rejects it with 1221.
     reject_union_arm_limit(&rewritten)?;
+    // `SHOW … LIKE <identifier>` resolves the identifier as a column (1054).
+    reject_show_like_identifier(&rewritten)?;
     // TiDB `START TRANSACTION … AS OF TIMESTAMP <expr>` stale-read txn (the
     // clause has no sqlparser grammar); the operand is resolved by `BEGIN`.
     let (rewritten, begin_as_of) = extract_begin_as_of(&rewritten);
@@ -816,7 +821,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     pattern: None,
                     column: None,
                     var_scope: ShowVarScope::Session,
-                    var_filter: None,
+                    filter: None,
                 }))
             } else {
                 Ok(Statement::Show(ShowStmt {
@@ -828,7 +833,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                     pattern: None,
                     column: None,
                     var_scope: ShowVarScope::Session,
-                    var_filter: None,
+                    filter: None,
                 }))
             }
         }
@@ -844,7 +849,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             pattern: None,
             column: None,
             var_scope: ShowVarScope::Session,
-            var_filter: None,
+            filter: None,
         })),
         SqlStatement::ShowDatabases { show_options, .. }
         | SqlStatement::ShowSchemas { show_options, .. } => Ok(Statement::Show(ShowStmt {
@@ -856,9 +861,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             pattern: show_like_pattern(show_options),
             column: None,
             var_scope: ShowVarScope::Session,
-            var_filter: None,
+            filter: None,
         })),
-        SqlStatement::ShowTables { show_options, .. } => Ok(Statement::Show(ShowStmt {
+        SqlStatement::ShowTables {
+            full, show_options, ..
+        } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Tables,
             db_name: show_options
                 .show_in
@@ -868,11 +875,11 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 .transpose()?,
             table: None,
             user: None,
-            full: false,
+            full: *full,
             pattern: show_like_pattern(show_options),
             column: None,
             var_scope: ShowVarScope::Session,
-            var_filter: None,
+            filter: show_where_filter(show_options)?,
         })),
         SqlStatement::ShowCharset(_) => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Charset,
@@ -883,7 +890,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             pattern: None,
             column: None,
             var_scope: ShowVarScope::Session,
-            var_filter: None,
+            filter: None,
         })),
         SqlStatement::ShowCollation { .. } => Ok(Statement::Show(ShowStmt {
             kind: ShowStmtKind::Collation,
@@ -894,7 +901,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             pattern: None,
             column: None,
             var_scope: ShowVarScope::Session,
-            var_filter: None,
+            filter: None,
         })),
         SqlStatement::ShowVariables {
             filter,
@@ -913,7 +920,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
             } else {
                 ShowVarScope::Session
             },
-            var_filter: match filter {
+            filter: match filter {
                 Some(ShowStatementFilter::Like(pattern)) => {
                     Some(ShowVarFilter::Like(pattern.clone()))
                 }
@@ -944,7 +951,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 pattern: None,
                 column: None,
                 var_scope: ShowVarScope::Session,
-                var_filter: None,
+                filter: None,
             }))
         }
         SqlStatement::ShowColumns {
@@ -964,7 +971,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 pattern: show_like_pattern(show_options),
                 column: None,
                 var_scope: ShowVarScope::Session,
-                var_filter: None,
+                filter: show_where_filter(show_options)?,
             }))
         }
         SqlStatement::ExplainTable { table_name, .. } => {
@@ -979,7 +986,7 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
                 pattern: None,
                 column: None,
                 var_scope: ShowVarScope::Session,
-                var_filter: None,
+                filter: None,
             }))
         }
         SqlStatement::Insert(insert) => {
@@ -2258,6 +2265,168 @@ fn decode_show_warnings(show: &mut ShowStmt) {
     }
 }
 
+/// TiDB accepts a bare (or backticked) identifier after `LIKE` in
+/// `SHOW COLUMNS|FIELDS|TABLES`, treats it as a column reference, and fails
+/// resolving it with 1054. sqlparser requires a string literal there, so the
+/// identifier is rejected before parsing with TiDB's error.
+fn reject_show_like_identifier(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let mut i = skip_ws_and_comments(bytes, 0);
+    if !keyword_at(bytes, i, "SHOW") {
+        return Ok(());
+    }
+    i = skip_ws_and_comments(bytes, i + "SHOW".len());
+    if keyword_at(bytes, i, "FULL") {
+        i = skip_ws_and_comments(bytes, i + "FULL".len());
+    }
+    let mut show_target = false;
+    for keyword in ["COLUMNS", "FIELDS", "TABLES"] {
+        if keyword_at(bytes, i, keyword) {
+            i += keyword.len();
+            show_target = true;
+            break;
+        }
+    }
+    if !show_target {
+        return Ok(());
+    }
+    while i < bytes.len() {
+        i = skip_ws_and_comments(bytes, i);
+        let Some(&byte) = bytes.get(i) else {
+            break;
+        };
+        if byte == b';' {
+            break;
+        }
+        if byte == b'\'' || byte == b'"' {
+            i = skip_quoted(bytes, i);
+            continue;
+        }
+        if keyword_at(bytes, i, "LIKE") {
+            let value = skip_ws_and_comments(bytes, i + "LIKE".len());
+            let unknown = |name: &str| {
+                Error::new(
+                    ERR_BAD_FIELD,
+                    format!("Unknown column '{name}' in 'where clause'"),
+                )
+            };
+            match bytes.get(value) {
+                Some(b'\'') | Some(b'"') => return Ok(()),
+                Some(b'`') => {
+                    let end = skip_quoted(bytes, value);
+                    let name = String::from_utf8_lossy(&bytes[value + 1..end.saturating_sub(1)])
+                        .to_ascii_lowercase();
+                    return Err(unknown(&name));
+                }
+                Some(&first) if is_ident_byte(first) => {
+                    let mut end = value;
+                    while end < bytes.len() && is_ident_byte(bytes[end]) {
+                        end += 1;
+                    }
+                    let name = String::from_utf8_lossy(&bytes[value..end]).to_ascii_lowercase();
+                    return Err(unknown(&name));
+                }
+                _ => return Ok(()),
+            }
+        }
+        if is_ident_byte(byte) {
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// TiDB's `DESCRIBE tbl [col]` grammar takes only an identifier (bare or
+/// backticked) after the table. A string literal (`DESCRIBE t 'I%'`) or a
+/// stray character glued to the column (`DESCRIBE t I%`) is a MySQL syntax
+/// error at that token; sqlparser would otherwise accept the literal as a
+/// column or report its own message.
+fn reject_describe_column_syntax(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let mut i = skip_ws_and_comments(bytes, 0);
+    let kw_len = if keyword_at(bytes, i, "DESCRIBE") {
+        "DESCRIBE".len()
+    } else if keyword_at(bytes, i, "DESC") {
+        "DESC".len()
+    } else {
+        return Ok(());
+    };
+    i = skip_ws_and_comments(bytes, i + kw_len);
+    // `DESC TABLE t` / `DESC SELECT …` are not column descriptions.
+    if keyword_at(bytes, i, "TABLE") {
+        return Ok(());
+    }
+    let (table, end) = read_ident(bytes, i);
+    if table.is_empty() || table.as_bytes()[0].is_ascii_digit() || starts_statement(&table) {
+        return Ok(());
+    }
+    let mut i = end;
+    let after_first = skip_ws_and_comments(bytes, i);
+    if after_first < bytes.len() && bytes[after_first] == b'.' {
+        let (second, second_end) = read_ident(bytes, skip_ws_and_comments(bytes, after_first + 1));
+        if second.is_empty() {
+            return Ok(());
+        }
+        i = second_end;
+    }
+    let token = skip_ws_and_comments(bytes, i);
+    let Some(&first) = bytes.get(token) else {
+        return Ok(());
+    };
+    if first == b';' {
+        return Ok(());
+    }
+    // `DESC FORMAT='brief' …` / `DESC ANALYZE …`: the leading word is an
+    // EXPLAIN modifier, not a table.
+    if first == b'=' {
+        return Ok(());
+    }
+    // The offending token and its 0-based end offset.
+    let (error_at, token_end) = match first {
+        b'\'' | b'"' => (token, skip_quoted(bytes, token)),
+        b'`' => {
+            // Backtick-quoted column: valid, but `DESC t `c`x` is not.
+            let col_end = skip_quoted(bytes, token);
+            let after = skip_ws_and_comments(bytes, col_end);
+            match bytes.get(after) {
+                None | Some(b';') | Some(b'=') => return Ok(()),
+                Some(_) => (after, after + 1),
+            }
+        }
+        byte if is_ident_byte(byte) => {
+            let mut ident_end = token;
+            while ident_end < bytes.len() && is_ident_byte(bytes[ident_end]) {
+                ident_end += 1;
+            }
+            match bytes.get(ident_end) {
+                // `DESC FORMAT='brief' …` / `DESC ANALYZE …` are EXPLAIN forms,
+                // not a table followed by a column.
+                None | Some(b';') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+                | Some(b'=') => {
+                    return Ok(());
+                }
+                Some(_) => (ident_end, ident_end + 1),
+            }
+        }
+        _ => (token, token + 1),
+    };
+    let near = sql[error_at..].trim_end();
+    let near = near.trim_end_matches(';').trim_end();
+    // TiDB (MySQL) reports the 1-based column of the token's last byte.
+    let col = token_end;
+    Err(Error::new(
+        ERR_PARSE_ERROR,
+        format!(
+            // TiDB's mysql err message keeps a trailing space after the quote.
+            "You have an error in your SQL syntax; check the manual that corresponds to your TiDB version for the right syntax to use line 1 column {col} near \"{near};\" "
+        ),
+    ))
+}
+
 /// sqlparser rejects TiDB `CREATE/DROP BINDING`; replace with `SET NAMES` placeholders.
 fn extract_binding_ddl(sql: &str) -> Result<(String, Vec<Option<Statement>>)> {
     let bytes = sql.as_bytes();
@@ -2338,6 +2507,43 @@ fn skip_binding_scope(bytes: &[u8], i: usize) -> usize {
 
 fn parse_create_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
+    if keyword_at(bytes, i, "FROM") {
+        // `CREATE … BINDING FROM HISTORY USING PLAN DIGEST '<digest>'`.
+        i = skip_ws(bytes, i + "FROM".len());
+        if !keyword_at(bytes, i, "HISTORY") {
+            return Err(Error::unsupported("CREATE BINDING FROM without HISTORY"));
+        }
+        i = skip_ws(bytes, i + "HISTORY".len());
+        if !keyword_at(bytes, i, "USING") {
+            return Err(Error::unsupported(
+                "CREATE BINDING FROM HISTORY without USING",
+            ));
+        }
+        i = skip_ws(bytes, i + "USING".len());
+        if !keyword_at(bytes, i, "PLAN") {
+            return Err(Error::unsupported(
+                "CREATE BINDING FROM HISTORY without PLAN",
+            ));
+        }
+        i = skip_ws(bytes, i + "PLAN".len());
+        if !keyword_at(bytes, i, "DIGEST") {
+            return Err(Error::unsupported(
+                "CREATE BINDING FROM HISTORY without DIGEST",
+            ));
+        }
+        i = skip_ws(bytes, i + "DIGEST".len());
+        let (digest, end) = take_string_literal(bytes, i)
+            .ok_or_else(|| Error::unsupported("CREATE BINDING FROM HISTORY digest"))?;
+        return Ok((
+            Statement::CreateBinding(CreateBindingStmt {
+                original_sql: String::new(),
+                bind_sql: String::new(),
+                global,
+                plan_digest: Some(digest),
+            }),
+            end,
+        ));
+    }
     if !keyword_at(bytes, i, "FOR") {
         return Err(Error::unsupported("CREATE BINDING without FOR"));
     }
@@ -2356,17 +2562,53 @@ fn parse_create_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(Sta
             original_sql,
             bind_sql,
             global,
+            plan_digest: None,
         }),
         end,
     ))
 }
 
+/// Parse a single- or double-quoted string literal starting at `i`.
+fn take_string_literal(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
+    i = skip_ws(bytes, i);
+    let quote = *bytes.get(i)?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let end = skip_quoted(bytes, i);
+    let text = String::from_utf8_lossy(&bytes[i + 1..end.saturating_sub(1)]).into_owned();
+    let end = skip_ws(bytes, end);
+    let end = if bytes.get(end) == Some(&b';') {
+        end + 1
+    } else {
+        end
+    };
+    Some((text, end))
+}
+
 fn parse_drop_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(Statement, usize)> {
     i = skip_ws(bytes, i);
-    if !keyword_at(bytes, i, "FOR") {
-        return Err(Error::unsupported("DROP BINDING without FOR"));
+    if keyword_at(bytes, i, "FOR") {
+        i = skip_ws(bytes, i + "FOR".len());
     }
-    i = skip_ws(bytes, i + "FOR".len());
+    if keyword_at(bytes, i, "SQL") {
+        // `DROP … BINDING FOR SQL DIGEST '<digest>'`.
+        i = skip_ws(bytes, i + "SQL".len());
+        if !keyword_at(bytes, i, "DIGEST") {
+            return Err(Error::unsupported("DROP BINDING FOR SQL without DIGEST"));
+        }
+        i = skip_ws(bytes, i + "DIGEST".len());
+        let (digest, end) = take_string_literal(bytes, i)
+            .ok_or_else(|| Error::unsupported("DROP BINDING digest"))?;
+        return Ok((
+            Statement::DropBinding(DropBindingStmt {
+                original_sql: String::new(),
+                sql_digest: Some(digest),
+                global,
+            }),
+            end,
+        ));
+    }
     // `DROP … BINDING FOR <sql> [USING <sql>]`: the optional USING clause only
     // narrows the match by bind SQL, so keep the original SQL and drop the rest.
     let (original, end) = match take_sql_until_keyword(bytes, i, "USING") {
@@ -2383,6 +2625,7 @@ fn parse_drop_binding(bytes: &[u8], mut i: usize, global: bool) -> Result<(State
     Ok((
         Statement::DropBinding(DropBindingStmt {
             original_sql,
+            sql_digest: None,
             global,
         }),
         end,
@@ -9626,6 +9869,18 @@ fn show_like_pattern(opts: &ShowStatementOptions) -> Option<String> {
             | ShowStatementFilterPosition::Suffix(ShowStatementFilter::ILike(p)),
         ) => Some(p.clone()),
         _ => None,
+    }
+}
+
+/// `SHOW COLUMNS|TABLES … WHERE <cond>`: TiDB's ShowStmt keeps a generic
+/// `Where` filter, applied to the produced result rows.
+fn show_where_filter(opts: &ShowStatementOptions) -> Result<Option<ShowVarFilter>> {
+    match &opts.filter_position {
+        Some(
+            ShowStatementFilterPosition::Infix(ShowStatementFilter::Where(expr))
+            | ShowStatementFilterPosition::Suffix(ShowStatementFilter::Where(expr)),
+        ) => Ok(Some(ShowVarFilter::Where(Box::new(lower_expr(expr)?)))),
+        _ => Ok(None),
     }
 }
 

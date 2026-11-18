@@ -3859,6 +3859,96 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - `new_character_set_invalid`（非法字符集/校验规则的建表错误口径）。
   - `common_collation`（`coercibility()` 与字符集推导）。
 
+### 2026-11-18（`infoschema/cluster_tables` 转绿：cluster memtable 的 `cop[tidb]` 形状）
+
+- **Phase**: R6 `infoschema/cluster_tables` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `CLUSTER_SLOW_QUERY` 按 TiDB #51723 的计划形状渲染：`time` 是 cluster
+    memtable 的 handle，`ORDER BY time` 走
+    `TableReader(root) → MemTableScan(cop[tidb])`；`ORDER BY time LIMIT n`
+    把 `Limit` 下推进 cop，得到
+    `TableReader(root) → Limit(cop) → MemTableScan(cop)`。下推只对
+    单一排序列 `time` 生效（`by_info` 校验），与 TiDB
+    `pushLimitDownToTiDBCop` 的前置条件一致。
+  - cluster memtable 的伪统计：`time` 上的范围谓词折算成扫描 range
+    （`between` → `10000 / pseudoBetweenRate(40) = 250`），其余谓词保留为
+    cop `Selection`，按 `getPseudoRowCountByColumnRanges` 计算
+    （`query != 'x'` 拆成两段 range → 6656.67/10000）。`Limit` 下推后
+    子节点按期望 count 缩放，扫描行数回推 `count / 选择率`
+    （`1.00 / 0.66567 = 1.50`），与 TiDB `selSelectivity` 公式一致。
+  - `ORDER BY` 的列限定符改为取 `FROM` 的真实 schema：跨库
+    `information_schema.cluster_slow_query` 打印
+    `information_schema.cluster_slow_query.time`，不再误用会话默认库名
+    （`infoschema__cluster_tables.…`）。
+  - suite 前半段的 `tidb_enable_stmt_summary` 与
+    `CREATE … BINDING FROM HISTORY USING PLAN DIGEST` /
+    `DROP BINDING FOR SQL DIGEST` 语义在本轮一并复验通过。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t infoschema/cluster_tables --status green`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t infoschema/cluster_tables --status green`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=102 tikv=101 skipped=153`（`executor/adapter` 为 `skip_tikv`）
+  - `cargo test -q -p sealdb-planner` → 50 passed
+  - manifest：`infoschema/cluster_tables` → `green`，green 101→102
+    （R6 15→16，pending 134→133）。
+- **阻塞/风险**:
+  - cop `Limit` 下推与 cluster 伪统计只对 `CLUSTER_SLOW_QUERY` 生效
+    （TiDB 也只对 slow log 的 `time` 排序做该改写）；后续语料若覆盖
+    `CLUSTER_STATEMENTS_SUMMARY` 等 cluster 表的时间范围/limit 需扩展。
+  - `data:Limit` / `data:Selection` 属于 `TableReader` 的 operator info 列，
+    access object 列留空；与 TiKV 存储层实际 cop 请求无关，仅为 EXPLAIN
+    形状对齐。
+  - 伪统计依赖 `column_range_rows` 的固定比率；表有真实统计时不走该分支。
+- **下一步**:
+  - `infoschema/infoschema`（R6 同批，`MemTableScan` 范围与信息列口径）。
+  - `planner/core/partial_order_topn`（前缀索引部分有序 + TopN 下推）。
+
+### 2026-11-18（`planner/core/memtable_predicate_extractor` 转绿：information_schema 大小写不敏感 + SHOW 过滤）
+
+- **Phase**: R7 `planner/core/memtable_predicate_extractor` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `information_schema` 字符串列按 `utf8mb4_general_ci` 语义比较：
+    `table_schema = 'UPPER'` 继续走 MemTableScan 等值 range（值已小写化），
+    无法下推的 `column_name LIKE 'I%'` / `'ID'` 在 `PredicatePushDown`
+    阶段标记 `Like.ci`，从而匹配 `id`。修复了大小写不匹配返回空集的问题。
+  - `SHOW COLUMNS|FIELDS ... WHERE field LIKE|EQUAL ...`：sqlparser 的
+    `ShowStatementFilter::Where` 之前被丢弃。`ShowStmt` 的过滤字段改为通用
+    `filter`，列/表 SHOW 用 `with_collation_ci` 对结果行求值；
+    `SHOW TABLES ... WHERE` 同时支持。
+  - `SHOW FULL TABLES`：保留 sqlparser 的 `full` 标志，补第二列 `Table_type`
+    （`BASE TABLE` / `VIEW`）。
+  - `SHOW ... LIKE` 的 pattern 转义：`LIKE` 匹配器识别 `\%`、`\_`、`\\`，
+    `SHOW TABLES LIKE '\_%'` 只命中 `_bar`。
+  - `DESCRIBE tbl col` 语法：在重写为 `SHOW COLUMNS` 之前校验原 SQL，
+    `DESCRIBE t 'I%'`（字符串字面量）与 `DESCRIBE t I%`（列名后粘连 `%`）
+    返回 TiDB 逐字的 1064 文案（`line 1 column 15/13 near ...`）；
+    `DESC FORMAT='brief' …` 等 EXPLAIN 形式不受影响。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t planner/core/memtable_predicate_extractor --status green`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t planner/core/memtable_predicate_extractor --status green`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - 全量 green gate（清空 `/tmp/sealdb-pd-tikv` 后重起 PD/TiKV）：
+    `./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=103 tikv=102 skipped=152`（`executor/adapter` 为 `skip_tikv`）
+  - manifest：`planner/core/memtable_predicate_extractor` → `green`，
+    green 102→103（R7 35→36，pending 133→132）。
+- **阻塞/风险**:
+  - `Like.ci` 标记只对 information_schema 的残留谓词生效；普通用户表的
+    `LIKE` 仍按列 collation（默认 binary）求值，若后续语料覆盖
+    `utf8mb4_general_ci` 用户列需把 collation 传进表达式层。
+  - `SHOW … WHERE` 过滤在结果行上求值（TiDB 同样如此），但引用未知列时报
+    1054 的 `'where clause'` 文案依赖 `eval_filter` 的默认错误；
+    `SHOW TABLES WHERE` 的列名按去掉 ` (pattern)` 后的基名解析。
+  - 长期复用的 TiKV store 会残留大量 schema/超大 region，使每套之间的
+    `reset_tikv_schemas` DDL 阻塞；gate 前须 `run_local_pd_tikv.sh stop`
+    并清空数据目录重起（本轮已据此完成验证）。
+- **下一步**:
+  - `infoschema/infoschema`（R6 同批，`MemTableScan` 范围与信息列口径）。
+  - `planner/core/partial_order_topn`（前缀索引部分有序 + TopN 下推）。
+
 ## 7. 更新模板
 
 每次更新追加一条：
