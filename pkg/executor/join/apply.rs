@@ -327,6 +327,7 @@ fn materialize(
         ExprNode::Cast(cast) => Ok(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(materialize(&cast.expr, ctx, cache)?),
             target: cast.target.clone(),
+            json: cast.json,
         })),
         ExprNode::InList(list) => Ok(ExprNode::InList(InListExpr {
             expr: Box::new(materialize(&list.expr, ctx, cache)?),
@@ -789,6 +790,7 @@ fn bind_expr(
         ExprNode::Cast(cast) => ExprNode::Cast(FuncCastExpr {
             expr: Box::new(bind_expr(&cast.expr, ctx, inner_tables, inner_cols)),
             target: cast.target.clone(),
+            json: cast.json,
         }),
         ExprNode::InList(list) => ExprNode::InList(InListExpr {
             expr: Box::new(bind_expr(&list.expr, ctx, inner_tables, inner_cols)),

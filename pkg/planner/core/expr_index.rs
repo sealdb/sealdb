@@ -604,6 +604,7 @@ fn substitute_expr_impl(
         ExprNode::Cast(cast) => ExprNode::Cast(FuncCastExpr {
             expr: Box::new(substitute(&cast.expr, changed)),
             target: cast.target.clone(),
+            json: cast.json,
         }),
         ExprNode::InList(list) => ExprNode::InList(InListExpr {
             expr: Box::new(substitute(&list.expr, changed)),

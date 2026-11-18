@@ -41,6 +41,16 @@ impl Time {
         }
     }
 
+    /// Current UTC-year, used where MySQL treats a bare clock value as
+    /// "today's `YEAR`" (`CAST(CAST('14:15' AS TIME) AS YEAR)`).
+    pub fn current_year() -> i32 {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self::from_unix_secs(secs, TimeType::Date).year as i32
+    }
+
     /// Build a `Time` from Unix seconds interpreted as a UTC wall clock.
     pub fn from_unix_secs(secs: i64, tp: TimeType) -> Self {
         let days = secs.div_euclid(86_400);
@@ -143,22 +153,13 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
     if n < 0 {
         return None;
     }
-    let digits = n.to_string();
-    // A number with fewer than six digits is right-aligned into `YYMMDD`
-    // (`1111` → `001111` → `2000-11-11`, `11111` → `2001-11-11`).
-    if digits.len() < 6 {
-        let padded = format!("{digits:0>6}");
-        let yy: i64 = padded[0..2].parse().ok()?;
-        let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
-        let month: i64 = padded[2..4].parse().ok()?;
-        let day: i64 = padded[4..6].parse().ok()?;
-        if !valid_ymd(year as u16, month as u8, day as u8) {
-            return None;
-        }
+    // TiDB `parseDateTimeFromNum` (MySQL `number_to_datetime`): the packed
+    // number is widened to `YYYYMMDDHHMMSS` by the shape of its digits.
+    if n == 0 {
         return Some(Time {
-            year: year as u16,
-            month: month as u8,
-            day: day as u8,
+            year: 0,
+            month: 0,
+            day: 0,
             hour: 0,
             minute: 0,
             second: 0,
@@ -167,62 +168,123 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
             tp,
         });
     }
-    let (year, month, day, hour, minute, second): (i64, i64, i64, i64, i64, i64) =
-        match digits.len() {
-            14 | 12 => {
-                let offset = digits.len() - 14;
-                let year = if offset == 0 {
-                    digits[0..4].parse::<i64>().ok()?
-                } else {
-                    let yy: i64 = digits[0..2].parse().ok()?;
-                    if yy < 70 { 2000 + yy } else { 1900 + yy }
-                };
-                let rest = if offset == 0 {
-                    &digits[4..]
-                } else {
-                    &digits[2..]
-                };
-                (
-                    year,
-                    rest[0..2].parse().ok()?,
-                    rest[2..4].parse().ok()?,
-                    rest[4..6].parse().ok()?,
-                    rest[6..8].parse().ok()?,
-                    rest[8..10].parse().ok()?,
-                )
-            }
-            8 | 6 => {
-                let (year, rest) = if digits.len() == 8 {
-                    (digits[0..4].parse::<i64>().ok()?, &digits[4..])
-                } else {
-                    let yy: i64 = digits[0..2].parse().ok()?;
-                    (if yy < 70 { 2000 + yy } else { 1900 + yy }, &digits[2..])
-                };
-                (
-                    year,
-                    rest[0..2].parse().ok()?,
-                    rest[2..4].parse().ok()?,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            // A stray digit past YYMMDD (`2008261`) still reads as the YYMMDD
-            // date part (TiDB `ParseTimeFromNum`).
-            7 => {
-                let yy: i64 = digits[0..2].parse().ok()?;
-                (
-                    if yy < 70 { 2000 + yy } else { 1900 + yy },
-                    digits[2..4].parse().ok()?,
-                    digits[4..6].parse().ok()?,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            _ => return None,
-        };
-    if !valid_ymd(year as u16, month as u8, day as u8) || hour > 23 || minute > 59 || second > 59 {
+    let packed = if n >= 10_000_101_000_000 {
+        n
+    } else if n < 101 {
+        return None;
+    } else if n <= 69 * 10_000 + 1_231 {
+        (n + 20_000_000) * 1_000_000
+    } else if n < 70 * 10_000 + 101 {
+        return None;
+    } else if n <= 991_231 {
+        (n + 19_000_000) * 1_000_000
+    } else if n <= 99_991_231 {
+        // `1121212` is `MMDD` no more: the whole number is read as
+        // `YYYYMMDD` (`0112-12-12`).
+        n * 1_000_000
+    } else if n < 101_000_000 {
+        return None;
+    } else if n <= 69_123_123_5959 {
+        n + 20_000_000_000_000
+    } else if n < 70_101_000_000 {
+        return None;
+    } else if n <= 991_231_235_959 {
+        n + 19_000_000_000_000
+    } else {
+        n
+    };
+    datetime_from_packed(packed, tp)
+}
+
+/// A packed `YYYYMMDDHHMMSS` number into a validated `Time` (TiDB `getTime`).
+fn datetime_from_packed(packed: i64, tp: TimeType) -> Option<Time> {
+    if packed < 0 {
+        return None;
+    }
+    let second = packed % 100;
+    let minute = packed / 100 % 100;
+    let hour = packed / 10_000 % 100;
+    let day = packed / 1_000_000 % 100;
+    let month = packed / 100_000_000 % 100;
+    let year = packed / 10_000_000_000;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let zero_date = year == 0 && month == 0 && day == 0;
+    if !zero_date && !valid_ymd(year as u16, month as u8, day as u8) {
+        return None;
+    }
+    Some(Time {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        micro: 0,
+        fsp: 0,
+        tp,
+    })
+}
+
+/// TiDB `types.ParseTime` for an all-digit string literal: unlike a numeric
+/// value the digit width fixes the shape (`'2008261'` is `YYMMDDH` =
+/// 2020-08-26 01:00, while the number `1121212` reads as `YYYYMMDD`).
+pub fn datetime_from_numeric_string(digits: &str, tp: TimeType) -> Option<Time> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let d = |start: usize, end: usize| -> Option<i64> { digits[start..end].parse().ok() };
+    let yy = |start: usize, end: usize| -> Option<i64> {
+        let y = d(start, end)?;
+        Some(if y < 70 { 2000 + y } else { 1900 + y })
+    };
+    let len = digits.len();
+    let (year, month, day, hour, minute, second) = match len {
+        // YYYYMMDDHHMMSS
+        14 => (
+            d(0, 4)?,
+            d(4, 6)?,
+            d(6, 8)?,
+            d(8, 10)?,
+            d(10, 12)?,
+            d(12, 14)?,
+        ),
+        // YYMMDDHHMMSS
+        12 => (
+            yy(0, 2)?,
+            d(2, 4)?,
+            d(4, 6)?,
+            d(6, 8)?,
+            d(8, 10)?,
+            d(10, 12)?,
+        ),
+        // YYMMDDHHMMS
+        11 => (
+            yy(0, 2)?,
+            d(2, 4)?,
+            d(4, 6)?,
+            d(6, 8)?,
+            d(8, 10)?,
+            d(10, 11)?,
+        ),
+        // YYMMDDHHMM
+        10 => (yy(0, 2)?, d(2, 4)?, d(4, 6)?, d(6, 8)?, d(8, 10)?, 0),
+        // YYMMDDHHM
+        9 => (yy(0, 2)?, d(2, 4)?, d(4, 6)?, d(6, 7)?, d(7, 9)?, 0),
+        // YYYYMMDD
+        8 => (d(0, 4)?, d(4, 6)?, d(6, 8)?, 0, 0, 0),
+        // YYMMDDH
+        7 => (yy(0, 2)?, d(2, 4)?, d(4, 6)?, d(6, 7)?, 0, 0),
+        // YYMMDD and YYMMD
+        6 | 5 => (yy(0, 2)?, d(2, 4)?, d(4, len)?, 0, 0, 0),
+        _ => return None,
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let zero_date = year == 0 && month == 0 && day == 0;
+    if !zero_date && !valid_ymd(year as u16, month as u8, day as u8) {
         return None;
     }
     Some(Time {
@@ -281,12 +343,15 @@ pub fn parse_duration_string(s: &str) -> Option<Time> {
         None => (body, None),
     };
     let parts: Vec<&str> = hms.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let mut hour: i64 = parts[0].trim().parse().ok()?;
-    let minute: u8 = parts[1].trim().parse().ok()?;
-    let second: u8 = parts[2].trim().parse().ok()?;
+    // TiDB `matchHHMMSSDelimited`: `'14:15'` is `14:15:00`.
+    let (hour_text, minute_text, second_text) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        2 => (parts[0], parts[1], "0"),
+        _ => return None,
+    };
+    let mut hour: i64 = hour_text.trim().parse().ok()?;
+    let minute: u8 = minute_text.trim().parse().ok()?;
+    let second: u8 = second_text.trim().parse().ok()?;
     if negative {
         hour = -hour;
     }
@@ -816,6 +881,22 @@ pub fn parse_datetime_lenient(s: &str) -> Result<Time> {
         fsp,
         tp: TimeType::Datetime,
     })
+}
+
+/// Parse the leading datetime of `s`, dropping trailing junk after a complete
+/// datetime with fractional seconds (`'2020-01-01 12:00:00.123456 +0600 PST'`
+/// keeps the date and `.123456`, ignoring the tail).
+pub fn parse_datetime_prefix(s: &str) -> Result<Time> {
+    let trimmed = s.trim();
+    if let Some(dot) = trimmed.find('.') {
+        let rest = &trimmed[dot + 1..];
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let end = dot + 1 + digits;
+        if digits > 0 && trimmed[end..].chars().any(|c| !c.is_whitespace()) {
+            return parse_datetime_lenient(&trimmed[..end]);
+        }
+    }
+    Err(incorrect("datetime", s))
 }
 
 /// Parse an assignment datetime with an explicit zone (`Z`, `±HH`, `±HHMM`,

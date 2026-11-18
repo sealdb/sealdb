@@ -1642,17 +1642,17 @@ fn convert_column_value(
             | sealdb_types::field_type::TYPE_DATETIME
             | sealdb_types::field_type::TYPE_TIMESTAMP
     ) && zero_number(value)
-        && !strict_sql_mode()
     {
         let kind = match ft.tp {
             sealdb_types::field_type::TYPE_DATE => "date",
             sealdb_types::field_type::TYPE_TIMESTAMP => "timestamp",
             _ => "datetime",
         };
-        reorg_warnings.push((
-            sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
-            format!("Incorrect {kind} value: '{}'", datum_text(value)),
-        ));
+        let msg = format!("Incorrect {kind} value: '{}'", datum_text(value));
+        if strict_sql_mode() {
+            return Err(Error::new(sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, msg));
+        }
+        reorg_warnings.push((sealdb_errno::ERR_TRUNCATED_WRONG_VALUE, msg));
         return Ok(zero_temporal(ft));
     }
     // TIMESTAMP only holds 1970-01-01 00:00:01 .. 2038-01-19 03:14:07 UTC

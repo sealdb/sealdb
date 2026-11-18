@@ -482,6 +482,7 @@ fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
         ExprNode::Cast(cast) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
             expr: Box::new(rewrite_having(&cast.expr, select)),
             target: cast.target.clone(),
+            json: cast.json,
         }),
         ExprNode::InList(list) => ExprNode::InList(sealdb_parser::ast::expressions::InListExpr {
             expr: Box::new(rewrite_having(&list.expr, select)),

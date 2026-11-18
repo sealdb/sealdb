@@ -119,6 +119,16 @@ impl PlanBuilder {
                     }
                     None => select,
                 };
+                // `CAST(json_col AS TIME/DATETIME/…)` sees JSON semantics:
+                // only a JSON string converts, a JSON number is NULL.
+                let json_cast_select;
+                let select = match mark_json_temporal_casts(select, is, current_db) {
+                    Some(marked) => {
+                        json_cast_select = marked;
+                        &json_cast_select
+                    }
+                    None => select,
+                };
                 // `ENUM`/`SET` columns compare with numbers by member index, so
                 // `a = 1` must look up the label `'a'`.
                 let enum_select;
@@ -9132,6 +9142,7 @@ pub(crate) fn substitute_eq_columns(expr: &ExprNode, pins: &[(String, Datum)]) -
         ExprNode::Cast(cast) => Some(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(substitute_eq_columns(&cast.expr, pins)?),
             target: cast.target.clone(),
+            json: cast.json,
         })),
         _ => None,
     }
@@ -9852,6 +9863,118 @@ fn bit_padded_bytes(value: &Datum, width: usize) -> Option<Vec<u8>> {
 
 /// Normalize BIT column constants to the column's big-endian byte width so
 /// `0x39` / `0x0039` / `b'111001'` all compare equal to the stored value.
+/// Mark `CAST(<json column> AS TIME/DATETIME/DATE/TIMESTAMP)` so evaluation
+/// follows TiDB's `castJSONAsTime`: only a JSON string has a temporal form and
+/// a JSON number/bool/null renders NULL.
+fn json_column_names(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<std::collections::HashSet<String>> {
+    if select.from_item.is_some() || !select.joins.is_empty() {
+        return None;
+    }
+    let from = select.from.as_ref()?;
+    let (db, table) = from.qualified(current_db);
+    let info = is?.table_by_name(&db, &table)?;
+    let json_cols: std::collections::HashSet<String> = info
+        .columns
+        .iter()
+        .filter(|c| c.field_type.tp == sealdb_types::field_type::TYPE_JSON)
+        .map(|c| c.name.o().to_ascii_lowercase())
+        .collect();
+    (!json_cols.is_empty()).then_some(json_cols)
+}
+
+/// Mark `CAST(<json column> AS TIME/DATETIME/…)` in a list of already-built
+/// projection expressions. The executor rebuilds the SELECT list from the
+/// original statement, so it has to mark them again with the table's types.
+pub fn mark_json_temporal_cast_fields(
+    exprs: &mut [ExprNode],
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) {
+    let Some(json_cols) = json_column_names(select, is, current_db) else {
+        return;
+    };
+    for expr in exprs {
+        mark_json_cast(expr, &json_cols);
+    }
+}
+
+fn mark_json_temporal_casts(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+) -> Option<SelectStmt> {
+    let json_cols = json_column_names(select, is, current_db)?;
+    let mut out = select.clone();
+    let mut changed = false;
+    for field in &mut out.fields {
+        changed |= mark_json_cast(&mut field.expr, &json_cols);
+    }
+    changed.then_some(out)
+}
+
+fn temporal_cast_target(target: &str) -> bool {
+    let upper = target.trim().to_ascii_uppercase();
+    let base = upper.split('(').next().unwrap_or("").trim();
+    matches!(base, "DATE" | "DATETIME" | "TIME" | "TIMESTAMP")
+}
+
+fn mark_json_cast(expr: &mut ExprNode, json_cols: &std::collections::HashSet<String>) -> bool {
+    match expr {
+        ExprNode::Cast(cast) => {
+            let mut changed = mark_json_cast(&mut cast.expr, json_cols);
+            if !cast.json
+                && temporal_cast_target(&cast.target)
+                && let ExprNode::Column(col) = cast.expr.as_ref()
+                && json_cols.contains(&col.name.to_ascii_lowercase())
+            {
+                cast.json = true;
+                changed = true;
+            }
+            changed
+        }
+        ExprNode::Binary(bin) => {
+            let left = mark_json_cast(&mut bin.left, json_cols);
+            let right = mark_json_cast(&mut bin.right, json_cols);
+            left || right
+        }
+        ExprNode::Unary(unary) => mark_json_cast(&mut unary.expr, json_cols),
+        ExprNode::IsNull(is_null) => mark_json_cast(&mut is_null.expr, json_cols),
+        ExprNode::Between(between) => {
+            let low = mark_json_cast(&mut between.expr, json_cols);
+            let low2 = mark_json_cast(&mut between.low, json_cols);
+            let high = mark_json_cast(&mut between.high, json_cols);
+            low || low2 || high
+        }
+        ExprNode::Func(func) => {
+            let mut changed = false;
+            for arg in &mut func.args {
+                changed |= mark_json_cast(arg, json_cols);
+            }
+            changed
+        }
+        ExprNode::InList(list) => {
+            let mut changed = mark_json_cast(&mut list.expr, json_cols);
+            for item in &mut list.list {
+                changed |= mark_json_cast(item, json_cols);
+            }
+            changed
+        }
+        ExprNode::Row(row) => {
+            let mut changed = false;
+            for item in &mut row.exprs {
+                changed |= mark_json_cast(item, json_cols);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 fn normalize_bit_selection(
     select: &SelectStmt,
     is: Option<&InfoSchema>,
@@ -12101,6 +12224,7 @@ fn cast_double(expr: ExprNode) -> ExprNode {
     ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
         expr: Box::new(expr),
         target: "DOUBLE".to_string(),
+        json: false,
     })
 }
 
@@ -14699,6 +14823,7 @@ fn strip_predicate_qualifiers(expr: &ExprNode) -> ExprNode {
         ExprNode::Cast(cast) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
             expr: Box::new(strip_predicate_qualifiers(&cast.expr)),
             target: cast.target.clone(),
+            json: cast.json,
         }),
         ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
             name: func.name.clone(),
@@ -14733,6 +14858,7 @@ fn rewrite_window_result_refs(
         ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
             expr: Box::new(expr),
             target: "decimal(10,0)".to_string(),
+            json: false,
         })
     };
     match expr {
@@ -14776,6 +14902,7 @@ fn rewrite_window_result_refs(
                 &cast.expr, alias, win_col, decimal,
             )),
             target: cast.target.clone(),
+            json: cast.json,
         }),
         ExprNode::Func(func) => ExprNode::Func(FuncCallExpr {
             name: func.name.clone(),
@@ -18108,6 +18235,7 @@ fn relabel_columns(expr: &ExprNode, table: &str) -> ExprNode {
         ExprNode::Cast(c) => ExprNode::Cast(sealdb_parser::ast::expressions::FuncCastExpr {
             expr: Box::new(relabel_columns(&c.expr, table)),
             target: c.target.clone(),
+            json: c.json,
         }),
         ExprNode::IsNull(n) => ExprNode::IsNull(IsNullExpr {
             expr: Box::new(relabel_columns(&n.expr, table)),

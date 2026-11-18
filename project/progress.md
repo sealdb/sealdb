@@ -4133,6 +4133,56 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `executor/executor` / `executor/expand` / `executor/issues` 等 R7 长尾 DML 与表达式套件。
 
+### 2026-11-19（`expression/cast` 转绿：数值/字符串 → 时间、DECIMAL 前缀、JSON 时间转换、GBK 排序；strict DML 溢出）
+
+- **Phase**: R7 `expression/cast` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 数值 → 时间按 TiDB `parseDateTimeFromNum` 分段：7 位数字加宽为 `YYYYMMDD`
+    （`1121212` → `0112-12-12`）、`YYMMDDHHMMSS` / `YYYYMMDDHHMMSS` 的边界与溢出；
+    字符串字面量改走按位数定形的 `datetime_from_numeric_string`
+    （`'2008261'` → `2020-08-26 01:00:00`，`'200826112'` → `2020-08-26 01:00:00`）。
+  - 宽松时间前缀：完整日期时间与小数秒后的时区文本/垃圾被丢弃
+    （`'2020-01-01 12:00:00.123456 +0600 PST'` → `12:00:00.123`）。
+  - `CAST` 语义补齐：
+    - 字符串 → `DECIMAL` 保留数字前缀（`'61qw'` → 61），查询为 warning 1292、
+      strict DML（`UPDATE` 赋值）为 error 1292；
+    - `'14:15'` → `14:15:00`（`HH:MM` 分隔的 TIME 文本）；
+    - `CAST(... AS CHAR CHARACTER SET gbk)` 输出 GBK 字节，`ORDER BY` 按 GBK 排序
+      （`张三` / `李四`）；
+    - JSON 列的 `date/time` 仅转换 JSON 字符串（`"1"` → `00:00:01`），
+      JSON 数字/布尔/null → `NULL`（`FuncCastExpr.json` 由 plan builder 标记）。
+  - `EXPLAIN select null as a union all select 'a' as a`：`UnionAll` 下常量投影折叠
+    （`<nil>->Column#3` / `a->Column#3`）。
+  - `COERCIBILITY(expr)` 按表达式来源推导（列/字面量/函数/CAST 目标）。
+  - strict DDL：整数 `0` 经 `ALTER TABLE ... MODIFY COLUMN` 变为
+    `DATE`/`DATETIME`/`TIMESTAMP` 时报 1292（非 strict 仍是零值 + warning），
+    修复 `ddl/column_type_change` 回归。
+  - strict DML 数值溢出：`CAST('18446744073709551616' AS UNSIGNED)` 在查询中
+    按界饱和 + warning 1292，strict DML 中报 1690
+    `BIGINT UNSIGNED value is out of range in '...'`；`SIGNED` 溢出报
+    `BIGINT value is out of range`。`executor/delete` / `executor/insert` 的
+    `TestNonStrictDeleteUpdateOverflowExpression` 收口，且非 strict 下
+    `1264` 列越界 warning 排在 `1292` 之前（对齐 TiDB 顺序）。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s both -t expression/cast` → 双引擎 PASS
+  - `./tests/integrationtest/run-tests.sh -s memory -t ddl/column_type_change`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s memory --status green`
+    → `PASS: memory=108 tikv=0 skipped=146`；
+    `-s tikv --status green -k` → `PASS: memory=0 tikv=107 skipped=147`。
+  - green + local 全量 gate：`./tests/integrationtest/run-tests.sh`
+    → `PASS: memory=116 tikv=114 skipped=140`。
+  - manifest：`expression/cast` → `green`，green 107→108
+    （R7 40→41，pending 128→127）。
+- **阻塞/风险**:
+  - `CAST('-1' AS UNSIGNED)` 的负数环绕（TiDB 得 `u64::MAX`）仍按 `0` 处理，
+    本套件未覆盖，留待后续收口。
+  - GBK 编码表仅补了测试用到的汉字子集，不是全量 GBK/GB18030 映射。
+  - `time_from_number` 的零值现在会产出零日期，凡依赖「数值 0 → NULL」的旧断言
+    需按 strict 上下文重新核对。
+- **下一步**:
+  - `expression/builtin` / `expression/issues` 等 R7 表达式长尾套件。
+
 ## 7. 更新模板
 
 每次更新追加一条：

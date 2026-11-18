@@ -118,6 +118,16 @@ impl ExecutorBuilder {
                         });
                     expand_projection_fields(substituted.as_ref().unwrap_or(select), &from_cols)
                 };
+                // `CAST(json_col AS TIME/DATETIME/…)`: the executor rebuilds the
+                // list from the original statement, so mark JSON arguments here
+                // (only a JSON string has a temporal form).
+                let mut exprs = exprs;
+                sealdb_planner::mark_json_temporal_cast_fields(
+                    &mut exprs,
+                    select,
+                    Some(&domain.infoschema()),
+                    current_db,
+                );
                 // `COLLATION(expr)` reports the *static* collation of its
                 // argument, so fold it here where the table types are known.
                 // The output names were derived from the original fields, so

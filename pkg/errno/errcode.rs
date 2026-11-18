@@ -174,6 +174,12 @@ pub const ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL: i32 = 3855;
 /// TiDB `ErrTooBigDisplayWidth`: `BIT(65)` / `INT(0)` — the declared display
 /// width is outside `[1, type max]`.
 pub const ERR_TOO_BIG_DISPLAYWIDTH: i32 = 1439;
+/// MySQL `ER_TOO_BIG_PRECISION`: `CAST(x AS TIME(31))` — temporal fractional
+/// precision above 6.
+pub const ERR_TOO_BIG_PRECISION: i32 = 1426;
+/// TiDB `ErrCannotConvertString`: binary bytes that are not valid utf8mb4
+/// (`CAST(0xFFFFFF AS CHAR)`).
+pub const ERR_CANNOT_CONVERT_STRING: i32 = 3854;
 /// TiDB `ErrInvalidDefault`: a column default that is invalid for the column
 /// type/precision (e.g. `TIMESTAMP` default `NOW(1)` for fsp 0).
 pub const ERR_INVALID_DEFAULT: i32 = 1067;

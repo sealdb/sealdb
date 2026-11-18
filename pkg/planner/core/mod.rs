@@ -36,9 +36,10 @@ pub use plan_cache_lru::LRUPlanCache;
 pub use plan_cache_param::normalize_prep_cache_key;
 pub use planbuilder::{
     PlanBuilder, agg_push_down, cost_model_version, hashagg_cpu_amortized, insubq_to_join_and_agg,
-    merged_star_columns, merged_star_visible_columns, normalize_bit_constants,
-    normalize_comparison_literals, normalize_enum_constants, using_dropped_columns,
-    with_agg_push_down, with_cost_model_version, with_dirty_tables, with_explicit_txn,
-    with_hashagg_concurrency, with_insubq_to_join_and_agg, with_stable_result_mode,
+    mark_json_temporal_cast_fields, merged_star_columns, merged_star_visible_columns,
+    normalize_bit_constants, normalize_comparison_literals, normalize_enum_constants,
+    using_dropped_columns, with_agg_push_down, with_cost_model_version, with_dirty_tables,
+    with_explicit_txn, with_hashagg_concurrency, with_insubq_to_join_and_agg,
+    with_stable_result_mode,
 };
 pub use rule_partition_processor::{PartitionPruneMode, prune_partitions};

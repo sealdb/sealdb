@@ -143,6 +143,7 @@ fn rewrite_ifnull(func: &FuncCallExpr, cols: &Columns<'_>) -> Option<ExprNode> {
     Some(ExprNode::Cast(FuncCastExpr {
         expr: Box::new(func.args[0].clone()),
         target: target.to_string(),
+        json: false,
     }))
 }
 
@@ -202,6 +203,7 @@ fn rewrite(expr: &ExprNode, cols: &Columns<'_>, changed: &mut bool) -> ExprNode 
         ExprNode::Cast(c) => ExprNode::Cast(FuncCastExpr {
             expr: Box::new(rewrite(&c.expr, cols, changed)),
             target: c.target.clone(),
+            json: c.json,
         }),
         ExprNode::Between(b) => ExprNode::Between(sealdb_parser::ast::expressions::BetweenExpr {
             expr: Box::new(rewrite(&b.expr, cols, changed)),

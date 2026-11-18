@@ -1032,6 +1032,9 @@ pub fn is_truth_suffix(name: &str) -> Option<&'static str> {
 pub struct FuncCastExpr {
     pub expr: Box<ExprNode>,
     pub target: String,
+    /// The argument is a JSON column: TiDB's `castJSONAsTime`/`AsDuration`
+    /// only converts a JSON *string*, so a JSON number/bool/null becomes NULL.
+    pub json: bool,
 }
 
 impl FuncCastExpr {

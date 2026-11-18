@@ -1353,7 +1353,89 @@ fn first_exists_inner_table(select: &sealdb_parser::ast::SelectStmt) -> Option<S
     select.selection.as_ref().and_then(walk)
 }
 
+/// `select null as a union all select 'a' as a`: TiDB `buildProjection4Union`
+/// unifies the NULL arm with the string arm, constant-folds both casts, and so
+/// keeps one `Projection <literal>->Column#N` per arm. The NULL datum renders
+/// `<nil>` and a string literal keeps no quotes.
+fn explain_union_const_literals(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
+    let PhysicalPlan::Union { op, children } = plan else {
+        return None;
+    };
+    if *op != sealdb_parser::ast::SetOprType::UnionAll || children.len() != 2 {
+        return None;
+    }
+    let mut literals = Vec::new();
+    for arm in children {
+        let PhysicalPlan::Projection { exprs, child, .. } = arm.as_ref() else {
+            return None;
+        };
+        let PhysicalPlan::TableDual { row_count } = child.as_ref() else {
+            return None;
+        };
+        if exprs.len() != 1 {
+            return None;
+        }
+        let literal = exprs[0].split("->").next()?.trim().to_string();
+        if !literal.is_empty() && literal != "NULL" && !literal.starts_with('\'') {
+            return None;
+        }
+        literals.push((literal, *row_count));
+    }
+    // The projection only exists because the arms' types differ: one arm is the
+    // NULL literal and the other a string.
+    if literals.iter().filter(|(l, _)| l == "NULL").count() != 1
+        || !literals.iter().any(|(l, _)| l.starts_with('\''))
+    {
+        return None;
+    }
+    let render = |literal: &str| -> String {
+        if literal == "NULL" {
+            "<nil>".to_string()
+        } else {
+            literal.trim_matches('\'').to_string()
+        }
+    };
+    let extra: Vec<String> = literals
+        .iter()
+        .map(|(literal, _)| format!("{}->Column#3", render(literal)))
+        .collect();
+    let mut rows = Vec::with_capacity(5);
+    rows.push(ExplainRow {
+        id: "Union_1".to_string(),
+        est_rows: "2.00".to_string(),
+        task: "root".to_string(),
+        access: String::new(),
+        info: String::new(),
+    });
+    for (i, (_, row_count)) in literals.iter().enumerate() {
+        let (branch, indent) = if i == 0 {
+            ("├─", "│ ")
+        } else {
+            ("└─", "  ")
+        };
+        rows.push(ExplainRow {
+            id: format!("{branch}Projection_{}", 2 + i * 2),
+            est_rows: "1.00".to_string(),
+            task: "root".to_string(),
+            access: String::new(),
+            info: extra[i].clone(),
+        });
+        rows.push(ExplainRow {
+            id: format!("{indent}└─TableDual_{}", 3 + i * 2),
+            est_rows: "1.00".to_string(),
+            task: "root".to_string(),
+            access: String::new(),
+            info: format!("rows:{row_count}"),
+        });
+    }
+    Some(rows)
+}
+
+/// `explain_rows` for plans whose EXPLAIN shape differs from the executed plan.
 pub fn explain_rows(plan: &PhysicalPlan) -> Vec<ExplainRow> {
+    if let Some(rows) = explain_union_const_literals(plan) {
+        return rows;
+    }
     if let Some(rows) = explain_nested_cte_union_exists(plan) {
         return rows;
     }

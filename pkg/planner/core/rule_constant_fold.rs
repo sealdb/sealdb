@@ -209,6 +209,7 @@ fn fold_children(expr: &ExprNode, changed: &mut bool) -> ExprNode {
         ExprNode::Cast(c) => ExprNode::Cast(ast::FuncCastExpr {
             expr: Box::new(fold(&c.expr, changed)),
             target: c.target.clone(),
+            json: c.json,
         }),
         ExprNode::InList(i) => ExprNode::InList(ast::InListExpr {
             expr: Box::new(fold(&i.expr, changed)),

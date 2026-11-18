@@ -72,8 +72,9 @@ fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
 }
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_ILLEGAL_VALUE_FOR_TYPE, ERR_INCORRECT_USAGE,
-    ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TTL_MULTI_SCHEMA_CHANGE,
-    ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, Error, Result,
+    ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TOO_BIG_PRECISION,
+    ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR,
+    ERR_UNSUPPORTED, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -12012,10 +12013,14 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         Expr::Nested(inner) => lower_expr(inner),
         Expr::Cast {
             expr, data_type, ..
-        } => Ok(ExprNode::Cast(FuncCastExpr {
-            expr: Box::new(lower_expr(expr)?),
-            target: data_type_name(data_type),
-        })),
+        } => {
+            check_cast_temporal_precision(data_type)?;
+            Ok(ExprNode::Cast(FuncCastExpr {
+                expr: Box::new(lower_expr(expr)?),
+                target: data_type_name(data_type),
+                json: false,
+            }))
+        }
         // `CONVERT(expr, type)` is `CAST(expr AS type)` in MySQL; the
         // `USING charset` form has no CAST equivalent and is not supported.
         Expr::Convert {
@@ -12027,6 +12032,7 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         } => Ok(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(lower_expr(expr)?),
             target: data_type_name(data_type),
+            json: false,
         })),
         Expr::TypedString(ts) => lower_typed_string(ts),
         Expr::Interval(iv) => {
@@ -12410,6 +12416,7 @@ fn lower_function(func: &Function) -> Result<ExprNode> {
         return Ok(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(expr),
             target: format!("char charset {charset}"),
+            json: false,
         }));
     }
     let args = if name.eq_ignore_ascii_case("COUNT")
@@ -13370,6 +13377,26 @@ fn character_length(len: &sqlparser::ast::CharacterLength) -> String {
         sqlparser::ast::CharacterLength::IntegerLength { length, .. } => length.to_string(),
         sqlparser::ast::CharacterLength::Max => "MAX".to_string(),
     }
+}
+
+/// `CAST(x AS TIME(31))` / `DATETIME(31)` / `TIMESTAMP(31)`: MySQL rejects a
+/// fractional precision above 6 at prepare time (`ER_TOO_BIG_PRECISION`), even
+/// when the cast is never evaluated (no matching rows).
+fn check_cast_temporal_precision(tp: &DataType) -> Result<()> {
+    let fsp = match tp {
+        DataType::Time(fsp, _) | DataType::Timestamp(fsp, _) => *fsp,
+        DataType::Datetime(fsp) => *fsp,
+        _ => None,
+    };
+    if let Some(fsp) = fsp
+        && fsp > 6
+    {
+        return Err(Error::new(
+            ERR_TOO_BIG_PRECISION,
+            format!("Too-big precision {fsp} specified for 'CAST'. Maximum is 6."),
+        ));
+    }
+    Ok(())
 }
 
 fn data_type_name(tp: &DataType) -> String {

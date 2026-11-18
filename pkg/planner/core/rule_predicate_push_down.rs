@@ -1253,6 +1253,7 @@ fn substitute_pinned_columns(
         ExprNode::Cast(cast) => Some(ExprNode::Cast(FuncCastExpr {
             expr: Box::new(substitute_pinned_columns(&cast.expr, table, pinned)?),
             target: cast.target.clone(),
+            json: cast.json,
         })),
         _ => None,
     }

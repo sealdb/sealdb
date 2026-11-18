@@ -1,6 +1,7 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DATA_OUT_OF_RANGE, ERR_DIVISION_BY_ZERO, ERR_TIMESTAMP_IN_DST_TRANSITION,
-    ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
+    ERR_BAD_FIELD, ERR_CANNOT_CONVERT_STRING, ERR_DATA_OUT_OF_RANGE, ERR_DIVISION_BY_ZERO,
+    ERR_TIMESTAMP_IN_DST_TRANSITION, ERR_TOO_BIG_PRECISION, ERR_TRUNCATED_WRONG_VALUE,
+    ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
@@ -675,7 +676,25 @@ pub fn datum_sql_cmp(left: &Datum, right: &Datum) -> Result<std::cmp::Ordering> 
     compare_datums_for_op(left, right, Op::Lt)
 }
 
+thread_local! {
+    /// True while a `WHERE` predicate is evaluated. TiDB pushes the filter to
+    /// the coprocessor, where `LIKE` reads a binary pattern as utf8mb4 and
+    /// rejects invalid bytes (a projection would only warn and yield NULL).
+    static FILTER_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn in_filter_eval() -> bool {
+    FILTER_EVAL.with(std::cell::Cell::get)
+}
+
 pub fn eval_filter(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<bool> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FILTER_EVAL.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(FILTER_EVAL.with(|flag| flag.replace(true)));
     Ok(truthy(&eval_expr_with_row(expr, schema, row)?).unwrap_or(false))
 }
 
@@ -1829,6 +1848,15 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
         // `DATE(expr)` / `TIME(expr)` / `TIMESTAMP(expr)`: the temporal part of
         // the argument (TiDB `builtinCastXxxSig`).
         "DATE" | "TIME" | "TIMESTAMP" => eval_temporal_cast(func, schema, row),
+        "COERCIBILITY" => {
+            let Some(arg) = func.args.first() else {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "COERCIBILITY requires 1 argument",
+                ));
+            };
+            Ok(Datum::I64(coercibility_of(arg, schema, row)?))
+        }
         // MySQL `TRUNCATE(X, D)`: drop the digits right of `D` decimals
         // (toward zero); negative `D` zeroes the integer digits instead.
         "TRUNCATE" => {
@@ -3470,11 +3498,95 @@ fn eval_between(expr: &BetweenExpr, schema: &[String], row: &[Datum]) -> Result<
     Ok(bool_datum(if expr.not { !inside } else { inside }))
 }
 
+/// MySQL `COERCIBILITY(expr)` (TiDB `GetCoercibility`): derived from the
+/// expression's collation source, not from the runtime value alone.
+fn coercibility_of(expr: &ExprNode, schema: &[String], row: &[Datum]) -> Result<i64> {
+    const IGNORABLE: i64 = 6;
+    const NUMERIC: i64 = 5;
+    const LITERAL: i64 = 4;
+    const SYSTEM: i64 = 3;
+    const IMPLICIT: i64 = 2;
+    // String-producing functions inherit the strongest (lowest) coercibility
+    // among their string arguments; a number becoming a string is a literal.
+    fn string_func(args: &[ExprNode], schema: &[String], row: &[Datum]) -> Result<i64> {
+        let mut out = IGNORABLE;
+        for arg in args {
+            let c = coercibility_of(arg, schema, row)?;
+            let c = if c == NUMERIC { LITERAL } else { c };
+            out = out.min(c);
+        }
+        Ok(out)
+    }
+    match expr {
+        ExprNode::Value(v) => Ok(match &v.datum {
+            Datum::Null => IGNORABLE,
+            Datum::Bytes(_) | Datum::Bit(_) => LITERAL,
+            _ => NUMERIC,
+        }),
+        ExprNode::Column(_) => Ok(match eval_expr_with_row(expr, schema, row)? {
+            Datum::Null => IMPLICIT,
+            Datum::Bytes(_) | Datum::Bit(_) | Datum::Enum(_) => IMPLICIT,
+            _ => NUMERIC,
+        }),
+        ExprNode::Cast(c) => {
+            let target = c.target.to_ascii_uppercase();
+            Ok(
+                if target.starts_with("CHAR")
+                    || target.starts_with("VARCHAR")
+                    || target.starts_with("TEXT")
+                    || target == "BINARY"
+                    || target == "CHARSET"
+                {
+                    IMPLICIT
+                } else {
+                    NUMERIC
+                },
+            )
+        }
+        ExprNode::Unary(_) | ExprNode::Binary(_) => Ok(NUMERIC),
+        ExprNode::Func(f) => {
+            let name = f.name.to_ascii_uppercase();
+            match name.as_str() {
+                "BINARY" => Ok(IMPLICIT),
+                "VERSION" | "USER" | "DATABASE" | "CURRENT_USER" | "CURRENT_ROLE"
+                | "CURRENT_USER()" => Ok(SYSTEM),
+                "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIME" | "LOCALTIMESTAMP" | "UTC_TIMESTAMP"
+                | "CURDATE" | "CURRENT_DATE" | "UTC_DATE" | "CURTIME" | "CURRENT_TIME"
+                | "UTC_TIME" | "SYSDATE" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME" | "DATE_ADD"
+                | "DATE_SUB" | "ADDDATE" | "SUBDATE" | "TIMESTAMPDIFF" | "TIMESTAMP"
+                | "TO_DAYS" | "TIME_TO_SEC" | "YEAR" | "MONTH" | "DAY" | "DAYOFMONTH" | "HOUR"
+                | "MINUTE" | "SECOND" | "BIT_COUNT" => Ok(NUMERIC),
+                _ => string_func(&f.args, schema, row),
+            }
+        }
+        ExprNode::Like(_) => Ok(NUMERIC),
+        _ => Ok(LITERAL),
+    }
+}
+
 fn eval_like(expr: &PatternLikeExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let value = eval_expr_with_row(&expr.expr, schema, row)?;
     let pattern = eval_expr_with_row(&expr.pattern, schema, row)?;
     if value.is_null() || pattern.is_null() {
         return Ok(Datum::Null);
+    }
+    if in_filter_eval() {
+        // `WHERE a NOT LIKE convert(b, char)` over a BIT/BINARY value with
+        // bytes that are not valid utf8mb4: TiDB's coprocessor fails instead
+        // of returning NULL like the projection form does.
+        for datum in [&value, &pattern] {
+            if let Datum::Bytes(bytes) = datum
+                && std::str::from_utf8(bytes).is_err()
+            {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    format!(
+                        "Cannot convert string '{}' from binary to utf8mb4",
+                        format_invalid_chars(bytes)
+                    ),
+                ));
+            }
+        }
     }
     let ci = expr.ci || collation_ci();
     let matched = like_match(&value.as_bytes(), &pattern.as_bytes(), ci);
@@ -3520,9 +3632,117 @@ fn bytes_eq(a: u8, b: u8, ci: bool) -> bool {
     }
 }
 
+/// MySQL `CAST(text AS SIGNED/UNSIGNED)`: longest signed integer prefix; any
+/// trailing non-digit (including an exponent or a bare `.5`) warns 1292 and
+/// the prefix value is returned (`'123e456'` → 123, `''` → 0).
+fn integer_prefix(text: &str) -> (i128, bool) {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    let mut end = 0;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let digits = &trimmed[digits_start..end];
+    let negative = trimmed.starts_with('-');
+    let mut value: i128 = 0;
+    for b in digits.bytes() {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i128::from(b - b'0'));
+        if value > i128::from(u64::MAX) {
+            value = i128::from(u64::MAX);
+        }
+    }
+    if negative {
+        value = -value;
+    }
+    // A trailing fractional part also truncates (`'1.9'` → 1 + warning);
+    // an empty/no-digit text is 0 with the same warning.
+    (value, end != trimmed.len() || digits.is_empty())
+}
+
+/// The longest numeric prefix of a string as a DECIMAL literal (`'61qw'` →
+/// `"61"`); an empty/no-digit text is `"0"` with the truncation flag set.
+fn decimal_prefix(text: &str) -> (String, bool) {
+    let trimmed = text.trim().trim_start_matches('+');
+    let bytes = trimmed.as_bytes();
+    let mut end = usize::from(trimmed.starts_with('-'));
+    let int_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let int_end = end;
+    let mut frac_end = end;
+    if end < bytes.len() && bytes[end] == b'.' {
+        let mut i = end + 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > end + 1 {
+            frac_end = i;
+        }
+    }
+    if int_end == int_start {
+        return ("0".to_string(), true);
+    }
+    (trimmed[..frac_end].to_string(), frac_end != trimmed.len())
+}
+
 fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     let value = eval_expr_with_row(&cast.expr, schema, row)?;
     let target = cast.target.to_ascii_uppercase();
+    if matches!(
+        target.as_str(),
+        "SIGNED" | "SIGNED INTEGER" | "UNSIGNED" | "UNSIGNED INTEGER"
+    ) && let Datum::Bytes(bytes) = &value
+    {
+        let text = String::from_utf8_lossy(bytes);
+        let trimmed = text.trim();
+        let (prefix, mut truncated) = integer_prefix(&text);
+        // A plain digit run beyond the target's range: TiDB clamps it to the
+        // bound with a 1292 warning in a query but raises 1690 inside strict
+        // DML (`cast('18446744073709551616' as unsigned)`).
+        let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+        let overflow = !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && if target.starts_with("UNSIGNED") {
+                digits.parse::<u64>().is_err()
+            } else {
+                trimmed.parse::<i64>().is_err()
+            };
+        if overflow {
+            if strict_dml() {
+                return Err(Error::new(
+                    ERR_DATA_OUT_OF_RANGE,
+                    format!(
+                        "BIGINT {}value is out of range in '{trimmed}'",
+                        if target.starts_with("UNSIGNED") {
+                            "UNSIGNED "
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
+            }
+            truncated = true;
+        }
+        if truncated {
+            push_warning(
+                ERR_TRUNCATED_WRONG_VALUE,
+                format!("Truncated incorrect INTEGER value: '{text}'"),
+            );
+        }
+        if target.starts_with("UNSIGNED") {
+            let clamped = prefix.clamp(0, i128::from(u64::MAX));
+            return Ok(Datum::U64(clamped as u64));
+        }
+        let clamped = prefix.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+        return Ok(Datum::I64(clamped as i64));
+    }
     let ft = match target.as_str() {
         "SIGNED" | "SIGNED INTEGER" => FieldType::new_longlong(),
         "UNSIGNED" | "UNSIGNED INTEGER" => {
@@ -3532,6 +3752,22 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
         }
         "DOUBLE" | "REAL" | "FLOAT" => FieldType::new_double(),
         "CHAR" | "BINARY" | "CHARSET" => FieldType::new_string(),
+        // `CAST(x AS CHAR CHARACTER SET gbk)`: the target charset decides the
+        // byte encoding (sorting compares the encoded bytes).
+        _ if target.starts_with("CHAR CHARSET ") => {
+            let mut ft = FieldType::new_string();
+            ft.charset = target["CHAR CHARSET ".len()..]
+                .trim()
+                .trim_end_matches(')')
+                .to_ascii_lowercase();
+            ft
+        }
+        // A BIT/BINARY value casts to the raw bytes, not its integer spelling.
+        // Invalid utf8mb4 bytes are NULL + warning 3854 in a projection, but a
+        // pushed-down filter lifts that to error 1105.
+        _ if target.starts_with("CHAR(") || target.starts_with("VARCHAR(") => {
+            FieldType::new_string()
+        }
         "DECIMAL" | "NUMERIC" => FieldType::new_newdecimal(),
         // `CAST(x AS DECIMAL(p,s))` / `CONVERT(x, DECIMAL(p,s))` keeps the
         // requested precision and scale.
@@ -3556,14 +3792,109 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
             decimal: 0,
             ..FieldType::default()
         },
-        "DATETIME" => FieldType {
-            tp: sealdb_types::field_type::TYPE_DATETIME,
-            flen: 19,
+        "YEAR" => FieldType {
+            tp: sealdb_types::field_type::TYPE_YEAR,
+            flen: 4,
             decimal: 0,
             ..FieldType::default()
         },
+        "DATETIME" => temporal_cast_type(sealdb_types::field_type::TYPE_DATETIME, 19, &target)?,
+        "TIMESTAMP" => temporal_cast_type(sealdb_types::field_type::TYPE_TIMESTAMP, 19, &target)?,
+        "TIME" => temporal_cast_type(sealdb_types::field_type::TYPE_DURATION, 10, &target)?,
+        _ if target.starts_with("DATETIME(") => {
+            temporal_cast_type(sealdb_types::field_type::TYPE_DATETIME, 19, &target)?
+        }
+        _ if target.starts_with("TIMESTAMP(") => {
+            temporal_cast_type(sealdb_types::field_type::TYPE_TIMESTAMP, 19, &target)?
+        }
+        _ if target.starts_with("TIME(") => {
+            temporal_cast_type(sealdb_types::field_type::TYPE_DURATION, 10, &target)?
+        }
         _ => FieldType::new_string(),
     };
+    // A charset conversion re-encodes the bytes (`order by cast(name as char
+    // character set gbk) desc` sorts by GBK bytes).
+    if ft.charset == "gbk" {
+        let text = match &value {
+            Datum::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            other => other.display(),
+        };
+        return Ok(Datum::Bytes(sealdb_parser::charset::encoding_gbk::encode(
+            &text,
+        )));
+    }
+    // TiDB `castJSONAsTime`/`castJSONAsDuration`: only a JSON *string* has a
+    // temporal form; a JSON number/bool/null renders NULL.
+    if cast.json
+        && matches!(
+            ft.tp,
+            sealdb_types::field_type::TYPE_DATE
+                | sealdb_types::field_type::TYPE_DATETIME
+                | sealdb_types::field_type::TYPE_TIMESTAMP
+                | sealdb_types::field_type::TYPE_DURATION
+        )
+        && let Datum::Bytes(bytes) = &value
+    {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let trimmed = text.trim();
+        if trimmed.len() < 2 || !trimmed.starts_with('"') || !trimmed.ends_with('"') {
+            return Ok(Datum::Null);
+        }
+        let inner = trimmed[1..trimmed.len() - 1].as_bytes().to_vec();
+        return Datum::Bytes(inner).cast(&ft);
+    }
+    // `CAST(bit AS CHAR)`: raw bytes; invalid utf8mb4 becomes NULL (3854).
+    if matches!(target.as_str(), "CHAR" | "CHARSET") || target.starts_with("CHAR(") {
+        if let Datum::Bytes(bytes) = &value
+            && std::str::from_utf8(bytes).is_err()
+        {
+            if in_filter_eval() {
+                return Err(Error::new(
+                    ERR_UNKNOWN_ERROR,
+                    format!(
+                        "Cannot convert string '{}' from binary to utf8mb4",
+                        format_invalid_chars(bytes)
+                    ),
+                ));
+            }
+            push_warning(
+                ERR_CANNOT_CONVERT_STRING,
+                format!(
+                    "Cannot convert string '{}' from binary to utf8mb4",
+                    format_invalid_chars(bytes)
+                ),
+            );
+            return Ok(Datum::Null);
+        }
+        if let Datum::Bit(bytes) = &value {
+            let bytes = bytes.clone();
+            if std::str::from_utf8(&bytes).is_err() {
+                if in_filter_eval() {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_ERROR,
+                        format!(
+                            "Cannot convert string '{}' from binary to utf8mb4",
+                            format_invalid_chars(&bytes)
+                        ),
+                    ));
+                }
+                push_warning(
+                    ERR_CANNOT_CONVERT_STRING,
+                    format!(
+                        "Cannot convert string '{}' from binary to utf8mb4",
+                        format_invalid_chars(&bytes)
+                    ),
+                );
+                return Ok(Datum::Null);
+            }
+            return Ok(Datum::Bytes(bytes));
+        }
+    }
+    if target == "BINARY"
+        && let Datum::Bit(bytes) = &value
+    {
+        return Ok(Datum::Bytes(bytes.clone()));
+    }
     // Unsigned integer overflow clamps to u64::MAX (1292 warning), but strict
     // DML raises 1690 (`cast('18446744073709551616' as unsigned)`).
     if ft.unsigned
@@ -3597,7 +3928,73 @@ fn eval_cast(cast: &FuncCastExpr, schema: &[String], row: &[Datum]) -> Result<Da
             &String::from_utf8_lossy(bytes),
         )));
     }
+    // A numeric literal/column that does not form a valid temporal value
+    // (`cast(1311.1 as datetime)`) is NULL; TiDB's constant fold drops the
+    // 1292 warning, and a column value yields NULL silently too.
+    if matches!(
+        ft.tp,
+        sealdb_types::field_type::TYPE_DATE
+            | sealdb_types::field_type::TYPE_DATETIME
+            | sealdb_types::field_type::TYPE_TIMESTAMP
+            | sealdb_types::field_type::TYPE_DURATION
+    ) && matches!(
+        value,
+        Datum::I64(_) | Datum::U64(_) | Datum::F64(_) | Datum::Decimal(_) | Datum::Year(_)
+    ) {
+        return Ok(value.cast(&ft).unwrap_or(Datum::Null));
+    }
+    // A string to DECIMAL keeps its numeric prefix (`cast('61qw' as decimal)`
+    // is 61); the truncation is a warning in a query but an error inside a
+    // strict UPDATE assignment.
+    if ft.tp == sealdb_types::field_type::TYPE_NEW_DECIMAL
+        && let Datum::Bytes(bytes) = &value
+    {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        if MyDecimal::parse(text.trim()).is_err() {
+            let (prefix, truncated) = decimal_prefix(&text);
+            if truncated {
+                let message = format!("Truncated incorrect DECIMAL value: '{text}'");
+                if strict_dml() && current_dml_table().is_some() {
+                    return Err(Error::new(ERR_TRUNCATED_WRONG_VALUE, message));
+                }
+                push_warning(ERR_TRUNCATED_WRONG_VALUE, message);
+            }
+            let d = MyDecimal::parse(&prefix)
+                .map_err(|e| Error::new(ERR_TRUNCATED_WRONG_VALUE, e.to_string()))?
+                .with_frac(ft.decimal)
+                .clamped(ft.flen, ft.decimal);
+            return Ok(Datum::Decimal(d));
+        }
+    }
     value.cast(&ft)
+}
+
+/// `CAST(x AS TIME(n))` / `DATETIME(n)` / `TIMESTAMP(n)`: the declared
+/// fractional precision widens the display length (`19` → `19.n`); above 6 is
+/// `ER_TOO_BIG_PRECISION` (1426), raised while preparing the plan.
+fn temporal_cast_type(tp: u8, base_flen: i32, target: &str) -> Result<FieldType> {
+    let fsp = target
+        .split_once('(')
+        .map(|(_, rest)| rest.trim_end_matches(')').trim())
+        .and_then(|n| n.parse::<i32>().ok())
+        .unwrap_or(0);
+    if fsp > 6 {
+        return Err(Error::new(
+            ERR_TOO_BIG_PRECISION,
+            format!("Too-big precision {fsp} specified for 'CAST'. Maximum is 6."),
+        ));
+    }
+    let fsp = fsp.max(0);
+    Ok(FieldType {
+        tp,
+        flen: if fsp > 0 {
+            base_flen + 1 + fsp
+        } else {
+            base_flen
+        },
+        decimal: fsp,
+        ..FieldType::default()
+    })
 }
 
 fn is_zero_divisor(right: &Datum) -> Result<bool> {

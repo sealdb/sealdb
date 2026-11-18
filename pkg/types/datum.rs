@@ -403,7 +403,16 @@ impl Datum {
         // YEAR keeps MySQL's two-digit window (1-69 → 20xx, 70-99 → 19xx).
         if ft.tp == crate::field_type::TYPE_YEAR {
             let (n, string_zero) = match self {
-                Datum::Time(t) => (i128::from(t.year), false),
+                // TiDB reads a bare TIME's year as the current year
+                // (`CAST(CAST('14:15' AS TIME) AS YEAR)`), not 0.
+                Datum::Time(t) => (
+                    i128::from(if t.tp == crate::time::TimeType::Time && t.year == 0 {
+                        crate::time::Time::current_year()
+                    } else {
+                        i32::from(t.year)
+                    }),
+                    false,
+                ),
                 Datum::F64(v) => (i128::from(v.round() as i64), false),
                 Datum::Decimal(d) => (i128::from(d.to_f64().unwrap_or(0.0).round() as i64), false),
                 Datum::Bytes(b) => {
@@ -583,7 +592,6 @@ impl Datum {
                     // only the clock of the parsed datetime.
                     let whole = numeric_datetime_whole(s.trim());
                     let numeric = whole.and_then(|text| {
-                        let n = text.parse::<i64>().ok()?;
                         if ft.tp == crate::field_type::TYPE_DURATION {
                             return crate::time::duration_from_numeric(text);
                         }
@@ -594,7 +602,10 @@ impl Datum {
                         } else {
                             crate::time::TimeType::Datetime
                         };
-                        crate::time::time_from_number(n, tp)
+                        // A string keeps its digit width (`'2008261'` is
+                        // YYMMDDH); a numeric value of the same digits reads
+                        // as `YYYYMMDD` (`1121212` → 0112-12-12).
+                        crate::time::datetime_from_numeric_string(text, tp)
                     });
                     let mut t = if let Some(t) = numeric {
                         t
@@ -618,6 +629,7 @@ impl Datum {
                                     crate::time::parse_timestamp_literal(&format!("{s} 00:00:00"))
                                 }
                             })
+                            .or_else(|_| crate::time::parse_datetime_prefix(&s))
                             .map_err(|_| {
                                 Error::new(
                                     ERR_TRUNCATED_WRONG_VALUE,

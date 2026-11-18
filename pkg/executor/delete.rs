@@ -598,6 +598,7 @@ fn substitute_outer_columns(
         ExprNode::Cast(c) => ExprNode::Cast(FuncCastExpr {
             expr: Box::new(sub(&c.expr)),
             target: c.target.clone(),
+            json: c.json,
         }),
         ExprNode::Exists(e) => ExprNode::Exists(ExistsExpr {
             not: e.not,

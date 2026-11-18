@@ -115,6 +115,7 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_DEPENDENT_BY_GENERATED_COLUMN => "ErrDependentByGeneratedColumn",
         errcode::ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL => "ErrDependentByPartitionFunctional",
         errcode::ERR_TOO_BIG_DISPLAYWIDTH => "ErrTooBigDisplayWidth",
+        errcode::ERR_TOO_BIG_PRECISION => "ErrTooBigPrecision",
         errcode::ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT => "ErrWrongParamcountToNativeFct",
         errcode::ERR_BLOB_CANT_HAVE_DEFAULT => "ErrBlobCantHaveDefault",
         errcode::ERR_TTL_INVALID_COLUMN => "ErrTTLInvalidColumn",
@@ -160,7 +161,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         | errcode::ERR_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN
         | errcode::ERR_DEPENDENT_BY_GENERATED_COLUMN
         | errcode::ERR_DEPENDENT_BY_PARTITION_FUNCTIONAL => "HY000",
-        errcode::ERR_TOO_BIG_DISPLAYWIDTH => "42000",
+        errcode::ERR_TOO_BIG_DISPLAYWIDTH | errcode::ERR_TOO_BIG_PRECISION => "42000",
         errcode::ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT => "42000",
         errcode::ERR_BLOB_CANT_HAVE_DEFAULT => "42000",
         errcode::ERR_IDENTIFIER_TOO_LONG => "42000",
