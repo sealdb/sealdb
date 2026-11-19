@@ -4,6 +4,7 @@
 # Title:  <type>(<scope>): <subject>   (scope optional but preferred)
 #   - at most 72 characters; up to 80 tolerated for an unusually long subject
 # Body:   wrapped, at most 80 characters per line; up to 100 tolerated
+#   - required: a subject-only message is rejected
 #   - URLs and unbreakable tokens (a single word wider than the limit) are exempt
 #   - `Co-authored-by` trailers are forbidden
 #
@@ -87,5 +88,12 @@ while IFS= read -r line; do
     echo "commit-msg: body line ${lineno} is ${len} chars (target ${BODY_MAX}); acceptable, keep it rare" >&2
   fi
 done <<< "$content"
+
+# A subject alone does not explain the change; require a body.
+body=$(printf '%s\n' "$content" | sed -n '3,$p')
+if [[ -z "${body//[[:space:]]/}" ]]; then
+  echo "commit-msg: a body is required; explain what changed and why" >&2
+  status=1
+fi
 
 exit "$status"

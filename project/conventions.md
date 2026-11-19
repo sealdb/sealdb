@@ -79,6 +79,7 @@ fix(session): ONLY_FULL_GROUP_BY validates CTE and derived-table bodies
   - URL、以及单个不可断词本身已超宽的行不受限制（如
     `ERR_ROW_DOES_NOT_MATCH_GIVEN_PARTITION_SET`）
 - 标题与正文之间空一行；正文说明「改了什么 + 为什么」，不复述 diff
+- **正文必填**：只有标题、没有正文的提交会被 `check_commit_msg.sh` 拒绝
 - 禁止 `Co-authored-by` trailer
 
 72/80 的选择理由：`git log --oneline`、邮件引用（`> `）与 `format-patch`
