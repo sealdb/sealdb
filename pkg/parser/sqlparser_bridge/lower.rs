@@ -436,6 +436,237 @@ pub fn trim_field_comment(text: &str) -> String {
     out
 }
 
+/// Optimizer-hint names TiDB recognises (`parser.hintTokenMap`). An unknown
+/// name inside `/*+ … */` is reported as warning 8061 and ignored.
+const KNOWN_HINT_NAMES: &[&str] = &[
+    "JOIN_FIXED_ORDER",
+    "JOIN_ORDER",
+    "JOIN_PREFIX",
+    "JOIN_SUFFIX",
+    "BKA",
+    "NO_BKA",
+    "BNL",
+    "NO_BNL",
+    "HASH_JOIN",
+    "HASH_JOIN_BUILD",
+    "HASH_JOIN_PROBE",
+    "NO_HASH_JOIN",
+    "MERGE",
+    "NO_MERGE",
+    "INDEX_MERGE",
+    "NO_INDEX_MERGE",
+    "MRR",
+    "NO_MRR",
+    "NO_ICP",
+    "NO_RANGE_OPTIMIZATION",
+    "SKIP_SCAN",
+    "NO_SKIP_SCAN",
+    "SEMIJOIN",
+    "NO_SEMIJOIN",
+    "MAX_EXECUTION_TIME",
+    "SET_VAR",
+    "RESOURCE_GROUP",
+    "QB_NAME",
+    "HYPO_INDEX",
+    "AGG_TO_COP",
+    "LIMIT_TO_COP",
+    "IGNORE_PLAN_CACHE",
+    "WRITE_SLOW_LOG",
+    "HASH_AGG",
+    "MPP_1PHASE_AGG",
+    "MPP_2PHASE_AGG",
+    "IGNORE_INDEX",
+    "INL_HASH_JOIN",
+    "INDEX_HASH_JOIN",
+    "NO_INDEX_HASH_JOIN",
+    "INL_JOIN",
+    "INDEX_JOIN",
+    "NO_INDEX_JOIN",
+    "INL_MERGE_JOIN",
+    "INDEX_MERGE_JOIN",
+    "NO_INDEX_MERGE_JOIN",
+    "MEMORY_QUOTA",
+    "NO_SWAP_JOIN_INPUTS",
+    "QUERY_TYPE",
+    "READ_CONSISTENT_REPLICA",
+    "READ_FROM_STORAGE",
+    "BROADCAST_JOIN",
+    "SHUFFLE_JOIN",
+    "MERGE_JOIN",
+    "NO_MERGE_JOIN",
+    "STREAM_AGG",
+    "SWAP_JOIN_INPUTS",
+    "USE_INDEX_MERGE",
+    "USE_INDEX",
+    "ORDER_INDEX",
+    "NO_ORDER_INDEX",
+    "INDEX_LOOKUP_PUSHDOWN",
+    "NO_INDEX_LOOKUP_PUSHDOWN",
+    "USE_PLAN_CACHE",
+    "USE_TOJA",
+    "TIME_RANGE",
+    "USE_CASCADES",
+    "NTH_PLAN",
+    "FORCE_INDEX",
+    "STRAIGHT_JOIN",
+    "LEADING",
+    "SEMI_JOIN_REWRITE",
+    "NO_DECORRELATE",
+    "TIDB_HJ",
+    "TIDB_INLJ",
+    "TIDB_SMJ",
+];
+
+/// Keywords a `/*+ … */` block may directly follow (`parser.hintedTokens`).
+const HINTABLE_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "REPLACE",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "PARTITION",
+];
+
+/// TiDB hint warnings for one statement text:
+///
+/// * 8066 `ErrWarnOptimizerHintWrongPos` — the `/*+ … */` block does not
+///   directly follow `SELECT` / `INSERT` / `REPLACE` / `UPDATE` / `DELETE` /
+///   `CREATE` / `PARTITION`, so MySQL/TiDB report a warning and ignore it.
+/// * 8061 `ErrWarnOptimizerHintUnsupportedHint` — a hint name that TiDB does
+///   not know, reported as written.
+///
+/// Warnings are generated during parsing in TiDB, so they precede any
+/// execution warning of the same statement.
+pub fn hint_warnings(text: &str) -> Vec<(i32, String)> {
+    const WRONG_POS: i32 = 8066;
+    const UNSUPPORTED: i32 = 8061;
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        if !(bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes[i + 2] == b'+') {
+            i += 1;
+            continue;
+        }
+        let Some(close) = text[i + 3..].find("*/").map(|off| i + 3 + off) else {
+            break;
+        };
+        let inner = &text[i + 3..close];
+        if !hint_block_follows_hintable_keyword(&text[..i]) {
+            out.push((
+                WRONG_POS,
+                "Optimizer hint can only be followed by certain keywords like SELECT, INSERT, etc."
+                    .to_string(),
+            ));
+        } else {
+            for name in hint_names_in_block(inner) {
+                if !KNOWN_HINT_NAMES
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&name))
+                {
+                    out.push((
+                        UNSUPPORTED,
+                        format!("Optimizer hint {name} is not supported by TiDB and is ignored"),
+                    ));
+                }
+            }
+        }
+        i = close + 2;
+    }
+    out
+}
+
+/// Previous significant token before `/*+` is one of [`HINTABLE_KEYWORDS`].
+fn hint_block_follows_hintable_keyword(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    let mut i = bytes.len();
+    loop {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        // A comment between the keyword and the hint does not change the
+        // previous token (`/* c */ /*+ h() */` still follows the keyword).
+        if i >= 2 && bytes[i - 2] == b'*' && bytes[i - 1] == b'/' {
+            let Some(open) = prefix[..i - 2].rfind("/*") else {
+                return false;
+            };
+            i = open;
+            continue;
+        }
+        break;
+    }
+    let end = i;
+    while i > 0 && is_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    if i == end {
+        return false;
+    }
+    let token = &prefix[i..end];
+    HINTABLE_KEYWORDS
+        .iter()
+        .any(|kw| kw.eq_ignore_ascii_case(token))
+}
+
+/// Hint names of one `/*+ … */` body, in source order. Each comma-separated
+/// item starts with its name (`use_index(t1 idx)`); the optional query-block
+/// name (`@qb use_index(…)`) precedes it.
+fn hint_names_in_block(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut item = String::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for ch in inner.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            item.push(ch);
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                item.push(ch);
+            }
+            '(' => {
+                depth += 1;
+                item.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                item.push(ch);
+            }
+            ',' if depth == 0 => {
+                push_hint_name(&item, &mut out);
+                item.clear();
+            }
+            _ => item.push(ch),
+        }
+    }
+    push_hint_name(&item, &mut out);
+    out
+}
+
+fn push_hint_name(item: &str, out: &mut Vec<String>) {
+    let mut rest = item.trim_start();
+    if rest.starts_with('@') {
+        // `@qb_name hint_name(…)`
+        let after_at = &rest[1..];
+        let end = after_at
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after_at.len());
+        rest = after_at[end..].trim_start();
+    }
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    if end >= 2 {
+        out.push(rest[..end].to_string());
+    }
+}
+
 /// Attach TiDB-style original select-list texts for projection naming.
 fn attach_projection_texts(sel: &mut SelectStmt, texts: Option<&Vec<String>>) {
     let Some(texts) = texts else {
@@ -13880,6 +14111,46 @@ mod bang_not2_tests {
             },
             other => panic!("expected select, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hint_warning_tests {
+    use super::*;
+
+    fn codes(sql: &str) -> Vec<i32> {
+        hint_warnings(sql)
+            .into_iter()
+            .map(|(code, _)| code)
+            .collect()
+    }
+
+    #[test]
+    fn flags_hint_in_wrong_position() {
+        assert_eq!(
+            codes("select count(*) /*+ stream_agg() */ from t where a > 1"),
+            vec![8066]
+        );
+        assert_eq!(codes("select 1 from /*+ test1() */ t"), vec![8066]);
+    }
+
+    #[test]
+    fn flags_unknown_hint_name() {
+        let warnings = hint_warnings("select /*+ unknown_hint(c1)*/ 1");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].0, 8061);
+        assert_eq!(
+            warnings[0].1,
+            "Optimizer hint unknown_hint is not supported by TiDB and is ignored"
+        );
+    }
+
+    #[test]
+    fn accepts_known_hints_and_plain_sql() {
+        assert!(codes("select /*+ stream_agg() */ count(*) from t").is_empty());
+        assert!(codes("select /*+ use_index(t idx) */ * from t").is_empty());
+        assert!(codes("select /*+ qb_name(qb t) order_index(t@qb idx) */ * from t").is_empty());
+        assert!(codes("select count(*) from t").is_empty());
     }
 }
 

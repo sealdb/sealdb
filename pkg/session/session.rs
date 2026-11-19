@@ -444,10 +444,23 @@ impl Session {
                 Some(feature) => check_noop_feature(self, feature)?,
                 None => None,
             };
+            // TiDB reports these while parsing: 8066 for a `/*+ … */` block in
+            // a position MySQL does not accept, 8061 for an unknown hint name.
+            let hint_warnings = single_stmt_text
+                .as_deref()
+                .map(sealdb_parser::sqlparser_bridge::hint_warnings)
+                .unwrap_or_default();
             let mut result = self.execute_one(&stmt)?;
             self.end_set_var_hint(previous_sql_mode);
+            if !hint_warnings.is_empty() {
+                let mut warnings = hint_warnings;
+                warnings.append(&mut result.warnings);
+                result.warnings = warnings;
+            }
             if let Some(warning) = noop_warning {
                 result.warnings.push(warning);
+            }
+            if !result.warnings.is_empty() {
                 *self
                     .last_warnings
                     .lock()

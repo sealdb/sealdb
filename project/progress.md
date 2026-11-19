@@ -4415,6 +4415,35 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 实现 hint 解析/告警层（8061/8066/1815）与 `order_index` 系列，
     再推进 `hint/hint`。
 
+### 2026-11-20（hint 解析告警层：8066 位置错误 / 8061 未知提示）
+
+- **Phase**: R7 hint 框架第一步（`hint/hint`、`expression/misc` 前置）
+- **完成**:
+  - `sqlparser_bridge::hint_warnings(text)`：按 TiDB `parser.hintedTokens`
+    与 `parser.hintTokenMap` 一比一实现解析期告警。
+    - `/*+ … */` 未紧跟在 `SELECT` / `INSERT` / `REPLACE` / `UPDATE` /
+      `DELETE` / `CREATE` / `PARTITION` 之后 → `8066`
+      「Optimizer hint can only be followed by certain keywords like SELECT, INSERT, etc.」，
+      提示内容被忽略（列名仍保留原文，见上一条 `field.Text()` 修复）。
+    - 提示块位置合法但 hint 名不在 TiDB 表内 → `8061`
+      「Optimizer hint <name> is not supported by TiDB and is ignored」，
+      `<name>` 按原文输出；`@qb` 前缀会被跳过。
+  - session 执行循环把解析期告警前置到执行告警之前（TiDB 顺序），
+    并写入 `last_warnings` 供 `SHOW WARNINGS` 读取。
+- **验证**:
+  - 单测：`cargo test -p sealdb-parser hint_warning_tests` → 3 passed。
+  - 临时 local 冒烟（`--enable_warnings`）逐条对齐 TiDB 金样：
+    尾部 hint 列名 + 8066 ×2、`select 1 from /*+ test1() */ t` → 8066、
+    `select /*+ unknown_hint(c1)*/ 1` → 8061。
+  - 全量 `run-tests.sh -s memory` → `PASS: memory=122 skipped=132`（无回归）。
+- **阻塞/风险**:
+  - 仅覆盖解析期两类告警；`hint/hint` 剩余差异是 hint 生效语义
+    （`order_index` keep order + embedded limit、`1815`）与 `index/index`
+    的 `IndexJoin`/多值索引形状。
+- **下一步**:
+  - `order_index` / `no_order_index` 生效路径与 `1815`「Can't find a proper
+    physical plan」。
+
 ## 7. 更新模板
 
 每次更新追加一条：
