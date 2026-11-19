@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-19（green 111 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-20（green 114 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -4356,6 +4356,41 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - R6 `ddl/db_table`（外键错误码顺序、charset 元数据、WITH/WITHOUT VALIDATION 告警）
     与 R7 `planner/core/casetest/expression_rewriter`（行值 `IN` 去关联）。
+
+### 2026-11-20（`planner/core/casetest/expression_rewriter` 转绿：行值 `IN` 去关联 + `HAVING` 行值 `IN` + 位聚合）
+
+- **Phase**: R7 `planner/core/casetest/expression_rewriter` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 多列行值 `IN` 去关联（`rule_semi_join.rs`）：`(a, b) IN (SELECT x, y …)`
+    识别为 `from_in_row`，probe 侧补 `not(isnull())` 过滤，build 侧去重为
+    多列 `HashAgg(group by: x, y, funcs:firstrow(x), funcs:firstrow(y))`；
+    `join_keys_on_table` 收集全部等值键，`dedup_in_right` 支持多列 NDV 与
+    空值剔除后的基数缩放，`pin_scan_count` / `with_null_rejection_est`
+    保留 analyze 后的表行数与过滤选择率。
+  - `NOT IN` 走 NAAJ：build 侧不再去重（`TableReader(t2)`），`est_rows`
+    按 analyzed 扫描行数 + 空值剔除选择率重算。
+  - `HAVING (a, count(1)) IN / NOT IN (SELECT a, b …)`（`planbuilder.rs`
+    `having_row_in_explain_plan`）：probe 为 `HashAgg(t1.a)`，build 为去重
+    `HashAgg`（IN）或 `TableReader`（NAAJ），join key 依次为
+    `eq(t2.a, t1.a)` 与 `eq(t2.b, Column#7)`；`explain.rs::set_filter_est`
+    把过滤后基数挂回 `TableReader`。
+  - 执行侧（`agg_hash_executor.rs::rewrite_having`）：HAVING 的行构造器 /
+    `InSubquery` 内聚合调用递归映射到 `filter_schema` 中的输出列名，
+    仅 HAVING 引用的聚合自动追加到 agg 输出（`collect_aggs` 递归进入
+    `InSubquery`/`Row`），避免 `Unknown column 'count(1)'`。
+  - `BIT_AND` / `BIT_OR` / `BIT_XOR` 聚合（`aggfuncs/func_bit.rs`，
+    uint64 视图、`BIT_AND` 初值全 1、`DISTINCT` 支持），并接入
+    coprocessor 下推的 `StreamAgg`。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t planner/core/casetest/expression_rewriter`
+    → `PASS: memory=1 tikv=0 skipped=254`；
+    `-s tikv -t …` → `PASS: memory=0 tikv=1 skipped=253`。
+  - manifest：green 113→114（R7 44→45，pending 122→121）。
+- **阻塞/风险**:
+  - 行值 `IN` 的去重 build 侧目前依赖 `firstrow()` 聚合，与 TiDB 去重
+    `HashAgg` 形状一致；后续若引入 `Distinct` 下推需保持该形状。
+- **下一步**:
+  - R7 `planner/core/casetest/hint/hint` 与 `planner/core/casetest/index/index`。
 
 ## 7. 更新模板
 

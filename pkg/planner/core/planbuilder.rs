@@ -348,9 +348,15 @@ impl PlanBuilder {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
+                // Row constructor `(g, count(1)) IN (subq)` in HAVING: the
+                // aggregate joins its de-duplicated match set (TiDB decorrelate).
+                if let Some(plan) = having_row_in_explain_plan(select, is, current_db, stats) {
+                    let _ = crate::cascades::maybe_optimize("select")?;
+                    return Ok(plan);
+                }
                 // Row constructor `(a, b) NOT IN (subq)` / `!= ALL` → null-aware
                 // anti join (TiDB `convertToNullAwareAntiJoin`).
-                if let Some(plan) = naaj_plan(select, is, current_db) {
+                if let Some(plan) = naaj_plan(select, is, current_db, stats) {
                     let _ = crate::cascades::maybe_optimize("select")?;
                     return Ok(plan);
                 }
@@ -15920,9 +15926,118 @@ fn join_datasource_out_column(
     Some(total + 1)
 }
 
-/// TiDB `AggFuncDesc.WrapCastForAggArgs`: a `sum`/`avg` over an integer column
-/// aggregates `cast(arg, decimal(p, 0))` so a partial aggregation cannot
-/// overflow. Returns the cast target type and whether the argument is unsigned.
+/// TiDB `WrapCastForAggArgs` for the bit aggregates: `bit_and` / `bit_or` /
+/// `bit_xor` consume a `bigint`, and an arithmetic argument coerces non-numeric
+/// operands (`timestamp`, `varbinary`, …) to `double` first.
+fn is_bit_agg_fn(name: &str) -> bool {
+    matches!(name, "bit_and" | "bit_or" | "bit_xor")
+}
+
+fn bit_agg_explain_arg(
+    arg: &sealdb_parser::ast::expressions::ExprNode,
+    table: &str,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+    select: &SelectStmt,
+) -> String {
+    format!(
+        "cast({}, bigint BINARY)",
+        explain_arith_operand(arg, table, current_db, is, select)
+    )
+}
+
+fn explain_arith_operand(
+    expr: &sealdb_parser::ast::expressions::ExprNode,
+    table: &str,
+    current_db: &str,
+    is: Option<&InfoSchema>,
+    select: &SelectStmt,
+) -> String {
+    use sealdb_parser::ast::expressions::ExprNode;
+    match expr {
+        ExprNode::Column(col) => {
+            let col_ref = explain_col_ref(table, expr);
+            let numeric = find_column_info(select, col, current_db, is).is_some_and(|column| {
+                matches!(
+                    column.field_type.tp,
+                    sealdb_types::TYPE_TINY
+                        | sealdb_types::TYPE_SHORT
+                        | sealdb_types::TYPE_LONG
+                        | sealdb_types::TYPE_INT24
+                        | sealdb_types::TYPE_LONG_LONG
+                        | sealdb_types::TYPE_YEAR
+                        | sealdb_types::TYPE_FLOAT
+                        | sealdb_types::TYPE_DOUBLE
+                        | sealdb_types::TYPE_NEW_DECIMAL
+                        | sealdb_types::TYPE_DECIMAL
+                )
+            });
+            if numeric {
+                col_ref
+            } else {
+                format!("cast({col_ref}, double BINARY)")
+            }
+        }
+        ExprNode::Binary(bin) => {
+            let op = match bin.op {
+                Op::Plus => "plus",
+                Op::Minus => "minus",
+                Op::Mul => "mul",
+                Op::Div => "div",
+                Op::IntDiv => "intdiv",
+                Op::Mod => "mod",
+                _ => return expr.restore_string(),
+            };
+            format!(
+                "{op}({}, {})",
+                explain_arith_operand(&bin.left, table, current_db, is, select),
+                explain_arith_operand(&bin.right, table, current_db, is, select)
+            )
+        }
+        other => explain_col_ref(table, other),
+    }
+}
+
+fn find_column_info<'a>(
+    select: &SelectStmt,
+    col: &sealdb_parser::ast::expressions::ColumnNameExpr,
+    current_db: &str,
+    is: Option<&'a InfoSchema>,
+) -> Option<&'a sealdb_meta::ColumnInfo> {
+    let is = is?;
+    let qualifier = col.table.as_deref().unwrap_or("");
+    let mut tables: Vec<&sealdb_parser::ast::ddl::TableName> = Vec::new();
+    if let Some(from) = &select.from {
+        tables.push(from);
+    }
+    for join in &select.joins {
+        tables.push(&join.left);
+        tables.push(&join.right);
+    }
+    for table in tables {
+        let name_matches = qualifier.is_empty()
+            || table.name.eq_ignore_ascii_case(qualifier)
+            || table.resolve_name().eq_ignore_ascii_case(qualifier);
+        if !name_matches {
+            continue;
+        }
+        let (db, name) = table.qualified(current_db);
+        let Some(info) = is.table_by_name(&db, &name) else {
+            continue;
+        };
+        if let Some(column) = info
+            .columns
+            .iter()
+            .find(|c| c.name.o().eq_ignore_ascii_case(&col.name))
+        {
+            return Some(column);
+        }
+    }
+    None
+}
+
+/// TiDB `WrapCastForAggArgs` for `sum` / `avg` over an integer column: the
+/// aggregate consumes `cast(<col>, decimal(p,0))`.
 fn agg_int_decimal_cast(
     fn_name: &str,
     arg_expr: Option<&sealdb_parser::ast::expressions::ExprNode>,
@@ -16295,6 +16410,9 @@ fn build_agg_plan(
             _ => None,
         });
         let arg = match arg_expr {
+            Some(expr) if is_bit_agg_fn(&fn_name) => {
+                bit_agg_explain_arg(expr, table, &agg_db, is, select)
+            }
             Some(expr) if matches!(expr, ExprNode::Column(_)) => explain_col_ref(table, expr),
             Some(other) => other.restore_string(),
             None => "1".to_string(),
@@ -16442,14 +16560,17 @@ fn build_agg_plan(
             out_col + (3 * index_columns.len()).saturating_sub(1)
         } else {
             // StreamAgg over a table scan reserves the DataSource's aux ids:
-            // two per index plus two per indexed column.
+            // two per index plus two per indexed column, but never fewer than
+            // the two ids a plain scan consumes (`sum(a)` over an index-less
+            // table still lands two ids after the aggregate output).
             let aux = is
                 .and_then(|is| is.table_by_name(&agg_db, table))
                 .map(|info| {
                     let idx_cols: usize = info.indices.iter().map(|i| i.columns.len()).sum();
                     2 * info.indices.len() + 2 * idx_cols
                 })
-                .unwrap_or(2);
+                .unwrap_or(2)
+                .max(2);
             out_col + aux
         };
         let info = format!("funcs:{fn_name}(Column#{partial_col})->Column#{out_col}");
@@ -19109,7 +19230,15 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
         ExprNode::Func(func)
             if matches!(
                 func.name.to_ascii_uppercase().as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "GROUP_CONCAT"
+                    | "BIT_AND"
+                    | "BIT_OR"
+                    | "BIT_XOR"
             )
     )
 }
@@ -19122,10 +19251,310 @@ fn is_agg_expr(expr: &ExprNode) -> bool {
 /// becomes `other cond`. A correlated equality inside the subquery cannot
 /// coexist with `NAEQ`, so it is hoisted to the hash key and the row operands
 /// fall back to plain `other cond` equalities.
+/// TiDB `decorrelate` of a HAVING row constructor: `HAVING (g, count(1)) IN
+/// (SELECT …)` compares the aggregate's group key and its outputs against the
+/// subquery, so the plan is the aggregate joined with the de-duplicated inner
+/// rows (or a null-aware anti join for `NOT IN`). This is the EXPLAIN shape;
+/// execution keeps evaluating HAVING inside the aggregate executor.
+fn having_row_in_explain_plan(
+    select: &SelectStmt,
+    is: Option<&InfoSchema>,
+    current_db: &str,
+    stats: Option<&Handle>,
+) -> Option<PhysicalPlan> {
+    if !in_explain_build()
+        || !select.joins.is_empty()
+        || select.from_item.is_some()
+        || select.with.is_some()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.fields.len() != 1
+    {
+        return None;
+    }
+    let outer_tbl = select.from.as_ref()?;
+    let having = select.having.as_ref()?;
+    let cnf = having.split_cnf();
+    let [cond] = cnf.as_slice() else {
+        return None;
+    };
+    let ExprNode::InSubquery(sub) = cond else {
+        return None;
+    };
+    let ExprNode::Row(row) = sub.expr.as_ref() else {
+        return None;
+    };
+    let inner = sub.query.as_select()?;
+    if !inner.joins.is_empty()
+        || inner.from_item.is_some()
+        || inner.with.is_some()
+        || inner.distinct
+        || !inner.group_by.is_empty()
+        || inner.having.is_some()
+        || inner.selection.is_some()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+    {
+        return None;
+    }
+    let inner_tbl = inner.from.as_ref()?;
+    // One group key, expressed as the row constructor's first operand; the
+    // remaining operands must be aggregates over the outer table.
+    let [group] = select.group_by.as_slice() else {
+        return None;
+    };
+    let ExprNode::Column(group_col) = group else {
+        return None;
+    };
+    if row.exprs.len() != inner.fields.len() || row.exprs.len() < 2 {
+        return None;
+    }
+    let is_group_col = |expr: &ExprNode| matches!(expr, ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&group_col.name));
+    if !is_group_col(&row.exprs[0]) {
+        return None;
+    }
+    let mut aggs = Vec::new();
+    for expr in &row.exprs {
+        match expr {
+            ExprNode::Column(c) if c.name.eq_ignore_ascii_case(&group_col.name) => {}
+            ExprNode::Func(f) if is_agg_expr(expr) => aggs.push(f),
+            _ => return None,
+        }
+    }
+    if aggs.is_empty() || row.exprs.len() != aggs.len() + 1 {
+        return None;
+    }
+    let multi_key = row.exprs.len() > 1;
+    if !multi_key {
+        return None;
+    }
+    let schema = schema_prefix(current_db);
+    let outer_name = outer_tbl.name.clone();
+    let inner_name = inner_tbl.name.clone();
+    let table_count = |table: &str| -> Option<f64> {
+        let physical = explain_physical_table(table).unwrap_or_else(|| table.to_string());
+        stats
+            .and_then(|h| h.table(current_db, &physical))
+            .filter(has_real_stats)
+            .map(|t| t.count as f64)
+    };
+    let group_ref = super::rule_semi_join::explain_semi_pred(&ExprNode::Column(ColumnNameExpr {
+        schema: None,
+        table: Some(outer_name.clone()),
+        name: group_col.name.clone(),
+    }));
+    // TiDB assigns the HAVING aggregate's output after the statement columns.
+    let mut agg_id = 7usize;
+    let mut funcs = Vec::new();
+    let mut probe_keys = Vec::new();
+    for agg in &aggs {
+        let out = format!("Column#{agg_id}");
+        funcs.push(format!(
+            "funcs:{}({})->{out}",
+            agg.name,
+            agg.args
+                .iter()
+                .map(|a| a.restore_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        probe_keys.push(out);
+        agg_id += 1;
+    }
+    funcs.push(format!("funcs:firstrow({group_ref})->{group_ref}"));
+    // Probe: the outer scan (null-rejected for `IN`) under the group-by agg.
+    let mut probe = PhysicalPlan::table_reader(outer_name.clone(), Vec::new());
+    if let Some(count) = table_count(&outer_name) {
+        probe = super::rule_semi_join::pin_scan_count(probe, count);
+    }
+    if !sub.not {
+        let null_filter = ExprNode::Unary(sealdb_parser::ast::expressions::UnaryOpExpr {
+            op: Op::Not,
+            expr: Box::new(ExprNode::IsNull(
+                sealdb_parser::ast::expressions::IsNullExpr {
+                    expr: Box::new(ExprNode::Column(ColumnNameExpr {
+                        schema: None,
+                        table: Some(outer_name.clone()),
+                        name: group_col.name.clone(),
+                    })),
+                    not: false,
+                },
+            )),
+        });
+        probe = super::rule_predicate_push_down::predicate_push_down(
+            probe,
+            &null_filter,
+            is,
+            current_db,
+        );
+        if let Some(count) = table_count(&outer_name)
+            && let Some(t) = stats.and_then(|h| {
+                let physical =
+                    explain_physical_table(&outer_name).unwrap_or_else(|| outer_name.clone());
+                h.table(current_db, &physical)
+            })
+            && let Some(not_null) = t.column_not_null_count(&group_col.name)
+        {
+            let est = count * (not_null / count).min(1.0);
+            probe = super::explain::set_filter_est(&probe, est).unwrap_or(probe);
+        }
+    }
+    let probe_est = match table_count(&outer_name).zip(
+        stats
+            .and_then(|h| {
+                let physical =
+                    explain_physical_table(&outer_name).unwrap_or_else(|| outer_name.clone());
+                h.table(current_db, &physical)
+            })
+            .and_then(|t| t.column_ndv(&group_col.name)),
+    ) {
+        Some((count, ndv)) if count > 0.0 => {
+            let input = if sub.not {
+                count
+            } else {
+                super::explain::est_rows(&probe)
+            };
+            (input * ndv / count).max(1.0)
+        }
+        _ => super::explain::est_rows(&probe) * 0.8,
+    };
+    let probe = PhysicalPlan::hash_agg(
+        probe,
+        format!("group by:{group_ref}, {}", funcs.join(", ")),
+        probe_est,
+    );
+    let inner_fields: Vec<ExprNode> = inner.fields.iter().map(|f| f.expr.clone()).collect();
+    let inner_cols: Vec<String> = inner_fields
+        .iter()
+        .map(|e| match e {
+            ExprNode::Column(c) => Some(c.name.clone()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if sub.not {
+        // `NOT IN`: null-aware anti join, no de-duplication on the build side.
+        let mut build = PhysicalPlan::table_reader(inner_name.clone(), Vec::new());
+        if let Some(count) = table_count(&inner_name) {
+            build = super::rule_semi_join::pin_scan_count(build, count);
+        }
+        let probe_q = |expr: &ExprNode| super::rule_semi_join::explain_semi_pred(expr);
+        let inner_q = |name: &str| format!("{schema}.{inner_name}.{name}");
+        let mut eqs = Vec::new();
+        let mut keys = Vec::new();
+        for (i, col) in inner_cols.iter().enumerate() {
+            let outer_expr = if i == 0 {
+                ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(outer_name.clone()),
+                    name: group_col.name.clone(),
+                })
+            } else {
+                ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: None,
+                    name: probe_keys[i - 1].clone(),
+                })
+            };
+            eqs.push(format!("eq({}, {})", probe_q(&outer_expr), inner_q(col)));
+            keys.push((
+                outer_expr,
+                ExprNode::Column(ColumnNameExpr {
+                    schema: None,
+                    table: Some(inner_name.clone()),
+                    name: col.clone(),
+                }),
+            ));
+        }
+        let est_rows = probe_est * 0.8;
+        return Some(PhysicalPlan::NullAwareAntiJoin {
+            info: format!("Null-aware anti semi join, equal:[{}]", eqs.join(" ")),
+            est_rows,
+            left_outer: false,
+            bool_only: false,
+            null_aware: true,
+            bool_column: "Column#9".to_string(),
+            keys,
+            other_cond: None,
+            probe_table: outer_name,
+            build_table: inner_name,
+            probe_width: None,
+            probe: Box::new(probe),
+            build: Box::new(build),
+        });
+    }
+    // `IN`: inner join against the de-duplicated inner rows.
+    let mut build = PhysicalPlan::table_reader(inner_name.clone(), Vec::new());
+    if let Some(count) = table_count(&inner_name) {
+        build = super::rule_semi_join::pin_scan_count(build, count);
+    }
+    let build =
+        super::rule_semi_join::dedup_in_right(build, &inner_cols, &inner_name, current_db, stats);
+    let build_est = super::explain::est_rows(&build);
+    let mut keys = Vec::new();
+    for (i, col) in inner_cols.iter().enumerate() {
+        let outer_expr = if i == 0 {
+            ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(outer_name.clone()),
+                name: group_col.name.clone(),
+            })
+        } else {
+            ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: probe_keys[i - 1].clone(),
+            })
+        };
+        keys.push((
+            ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(inner_name.clone()),
+                name: col.clone(),
+            }),
+            outer_expr,
+        ));
+    }
+    let on = ExprNode::compose_cnf(
+        keys.into_iter()
+            .map(|(build_expr, probe_expr)| {
+                ExprNode::Binary(BinaryOpExpr {
+                    op: Op::Eq,
+                    left: Box::new(build_expr),
+                    right: Box::new(probe_expr),
+                    single_cnf_item: false,
+                })
+            })
+            .collect(),
+    )?;
+    Some(PhysicalPlan::HashJoin {
+        est_rows: Some(build_est),
+        tp: JoinType::Inner,
+        left: Box::new(probe),
+        right: Box::new(build),
+        left_table: outer_name,
+        right_table: inner_name,
+        on,
+    })
+}
+
+/// Analyzed row count of a table (alias or physical name), for pinning the
+/// null-aware anti join's readers. `None` under pseudo statistics.
+fn naaj_scan_count(stats: Option<&Handle>, current_db: &str, table: &str) -> Option<f64> {
+    let physical = explain_physical_table(table).unwrap_or_else(|| table.to_string());
+    stats
+        .and_then(|h| h.table(current_db, &physical))
+        .filter(has_real_stats)
+        .map(|t| t.count as f64)
+}
+
 fn naaj_plan(
     select: &SelectStmt,
     is: Option<&InfoSchema>,
     current_db: &str,
+    stats: Option<&Handle>,
 ) -> Option<PhysicalPlan> {
     if !select.joins.is_empty()
         || select.from_item.is_some()
@@ -19258,6 +19687,12 @@ fn naaj_plan(
     let inner_q = format!("{schema}.{}", inner_name.to_ascii_lowercase());
     let mut probe = PhysicalPlan::table_reader(outer_tbl.name.clone(), Vec::new());
     let mut build = PhysicalPlan::table_reader(inner_tbl.name.clone(), Vec::new());
+    if let Some(count) = naaj_scan_count(stats, current_db, &outer_tbl.name) {
+        probe = super::rule_semi_join::pin_scan_count(probe, count);
+    }
+    if let Some(count) = naaj_scan_count(stats, current_db, &inner_tbl.name) {
+        build = super::rule_semi_join::pin_scan_count(build, count);
+    }
     if let Some(filter) = ExprNode::compose_cnf(inner_only)
         && let PhysicalPlan::TableReader { pushed, .. } = &mut build
     {
@@ -25668,17 +26103,15 @@ fn strip_unpushable_enum_predicates(select: &SelectStmt, table: &str) -> Option<
 
 /// Does the conjunct read an `ENUM` / `SET` column of `table`?
 fn enum_conjunct_blocked(expr: &ExprNode, table: &str) -> bool {
-    expr.referenced_columns()
-        .iter()
-        .any(|(qualifier, name)| {
-            let qualifier = qualifier.as_deref().unwrap_or(table);
-            explain_column_type(qualifier, name).is_some_and(|ft| {
-                matches!(
-                    ft.tp,
-                    sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
-                )
-            })
+    expr.referenced_columns().iter().any(|(qualifier, name)| {
+        let qualifier = qualifier.as_deref().unwrap_or(table);
+        explain_column_type(qualifier, name).is_some_and(|ft| {
+            matches!(
+                ft.tp,
+                sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+            )
         })
+    })
 }
 
 fn access_plan(

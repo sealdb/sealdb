@@ -4740,17 +4740,16 @@ fn emit_cop_children(
                 // GROUP BY StreamAgg needs ordered index input; a global scalar
                 // aggregate over a covering index reads it unordered.
                 if agg_name == "StreamAgg" {
-                    let grouped = root_info.starts_with("group by:")
-                        || cop_info.starts_with("group by:");
-                    scan_info = if grouped
-                        && (cop_info.is_empty() || cop_info.starts_with("group by:"))
-                    {
-                        "keep order:true, stats:pseudo".to_string()
-                    } else if *row_count >= 9_000.0 {
-                        "keep order:false, stats:pseudo".to_string()
-                    } else {
-                        "keep order:false".to_string()
-                    };
+                    let grouped =
+                        root_info.starts_with("group by:") || cop_info.starts_with("group by:");
+                    scan_info =
+                        if grouped && (cop_info.is_empty() || cop_info.starts_with("group by:")) {
+                            "keep order:true, stats:pseudo".to_string()
+                        } else if *row_count >= 9_000.0 {
+                            "keep order:false, stats:pseudo".to_string()
+                        } else {
+                            "keep order:false".to_string()
+                        };
                 }
                 if !cop_info.is_empty() {
                     // Spine-aware: a reader below a Union branch still needs the
@@ -7039,14 +7038,13 @@ fn explain_binary_operand(
         return rendered;
     };
     let qualifier = col.table.as_deref().unwrap_or(table);
-    let is_enum = crate::core::planbuilder::explain_column_type(qualifier, &col.name).is_some_and(
-        |ft| {
+    let is_enum =
+        crate::core::planbuilder::explain_column_type(qualifier, &col.name).is_some_and(|ft| {
             matches!(
                 ft.tp,
                 sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
             )
-        },
-    );
+        });
     if is_enum {
         format!("cast({rendered}, double BINARY)")
     } else {
@@ -7120,6 +7118,7 @@ fn join_role_label(
                 | "TableDual"
                 | "Point_Get"
                 | "PointGet"
+                | "HashAgg"
         )
     {
         "(Probe)"
@@ -8319,6 +8318,50 @@ fn conjunct_list_selectivity(conjuncts: &[sealdb_parser::ast::ExprNode]) -> Opti
         sel *= conjunct_selectivity(conjunct)?;
     }
     Some(sel)
+}
+
+/// Pin a DistSQL reader's filtered cardinality from exact statistics: TiDB
+/// decouples the scan count from the cop `Selection` output, which EXPLAIN
+/// prints in the reader's `estRows`. `None` when the plan is not a plain
+/// reader (an `IndexLookUp` sizes its own probe).
+pub(crate) fn set_filter_est(plan: &PhysicalPlan, est: f64) -> Option<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::TableReader {
+            table,
+            partitions,
+            partition_names,
+            partition_access,
+            row_count,
+            stats_pseudo,
+            range_scan,
+            keep_order,
+            data_limit,
+            pushed,
+            ..
+        } => Some(PhysicalPlan::TableReader {
+            table: table.clone(),
+            partitions: partitions.clone(),
+            partition_names: partition_names.clone(),
+            partition_access: partition_access.clone(),
+            row_count: *row_count,
+            stats_pseudo: *stats_pseudo,
+            filter_est: Some(est),
+            range_scan: range_scan.clone(),
+            keep_order: *keep_order,
+            data_limit: *data_limit,
+            pushed: pushed.clone(),
+        }),
+        PhysicalPlan::Selection {
+            child,
+            filter,
+            est_rows,
+        } => Some(PhysicalPlan::Selection {
+            child: Box::new(set_filter_est(child, est)?),
+            filter: filter.clone(),
+            est_rows: *est_rows,
+        }),
+        _ => None,
+    }
 }
 
 pub(crate) fn est_rows(plan: &PhysicalPlan) -> f64 {

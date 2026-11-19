@@ -2,6 +2,7 @@
 pub mod aggfuncs;
 pub mod builder;
 pub mod func_avg;
+pub mod func_bit;
 pub mod func_count;
 pub mod func_group_concat;
 pub mod func_max_min;

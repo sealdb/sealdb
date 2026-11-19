@@ -242,11 +242,13 @@ fn rewrite_apply(
                 // every join row is a distinct match.
                 let mut tp = spec.tp;
                 let mut right = spec.right;
+                let mut multi_key = false;
                 if spec.dedup_in
                     && super::insubq_to_join_and_agg()
-                    && let Some(key) = join_key_on_table(&spec.on, &spec.right_table)
+                    && let Some(keys) = join_keys_on_table(&spec.on, &spec.right_table)
                 {
-                    right = dedup_in_right(right, &key, &spec.right_table, current_db, stats);
+                    multi_key = keys.len() > 1;
+                    right = dedup_in_right(right, &keys, &spec.right_table, current_db, stats);
                     tp = JoinType::Inner;
                 }
                 // The rewritten inner join rejects NULL keys on both sides:
@@ -261,6 +263,15 @@ fn rewrite_apply(
                     )
                 {
                     plan = push_isnull_filter(plan, filter);
+                }
+                // TiDB sizes the probe's null rejection from the column
+                // statistics (each `not(isnull(col))` keeps
+                // `(count - null_count) / count` of the scan).
+                if tp == JoinType::Inner
+                    && spec.dedup_in
+                    && let Some(keys) = join_keys_on_table(&spec.on, &left_table)
+                {
+                    plan = with_null_rejection_est(plan, &keys, &left_table, current_db, stats);
                 }
                 // TiDB `ExplainInfo` labels an equal-key semi/anti join with the
                 // tables' OrigTblName (`FROM t t1` prints `t`, not `t1`). The
@@ -278,8 +289,16 @@ fn rewrite_apply(
                         }),
                     );
                 }
+                // TiDB sizes the `IN`-rewritten inner join from the probe rows:
+                // the de-duplicated build keeps at most one match per probe
+                // row, so a row-constructor join never multiplies the probe.
+                let est_rows = if tp == JoinType::Inner && spec.dedup_in && multi_key {
+                    Some(super::explain::est_rows(&plan).max(super::explain::est_rows(&right)))
+                } else {
+                    None
+                };
                 plan = PhysicalPlan::HashJoin {
-                    est_rows: None,
+                    est_rows,
                     tp,
                     left: Box::new(plan),
                     right: Box::new(right),
@@ -292,6 +311,39 @@ fn rewrite_apply(
         }
     }
     wrap_leftover(plan, leftover)
+}
+
+/// Pin a reader's null-rejected cardinality from exact column statistics: each
+/// join key that becomes `not(isnull(col))` keeps
+/// `(count - null_count) / count` of the scan rows. `None` under pseudo
+/// statistics (the generic `0.999` deduction applies there).
+fn with_null_rejection_est(
+    plan: PhysicalPlan,
+    keys: &[String],
+    table: &str,
+    current_db: &str,
+    stats: Option<&sealdb_statistics::Handle>,
+) -> PhysicalPlan {
+    let physical = crate::core::planbuilder::explain_physical_table(table)
+        .unwrap_or_else(|| table.to_string());
+    let Some(t) = stats
+        .and_then(|h| h.table(current_db, &physical))
+        .filter(super::plan_cost::has_real_stats)
+    else {
+        return plan;
+    };
+    let count = t.count as f64;
+    if count <= 0.0 {
+        return plan;
+    }
+    let mut est = count;
+    for key in keys {
+        let Some(not_null) = t.column_not_null_count(key) else {
+            return plan;
+        };
+        est *= (not_null / count).min(1.0);
+    }
+    super::explain::set_filter_est(&plan, est).unwrap_or(plan)
 }
 
 fn wrap_leftover(plan: PhysicalPlan, leftover: Vec<ExprNode>) -> PhysicalPlan {
@@ -1293,6 +1345,21 @@ fn from_in(
     let inner_physical = inner.physical.as_deref().unwrap_or(&inner.name);
     // ORDER BY in an IN subquery is meaningless for semi-join and is dropped.
     let (inner_filter, other_conds) = split_in_selection(query.selection.as_ref(), &inner.name)?;
+    // Row constructor operand: `(a, b) IN (SELECT x, y …)` compares each
+    // projected column positionally, so the rewrite emits one equality key per
+    // column (TiDB `ExtractOnCondition` on the row `IN`).
+    if let ExprNode::Row(row) = expr {
+        return from_in_row(
+            &row.exprs,
+            query,
+            &inner,
+            inner_physical,
+            outer_table,
+            not,
+            inner_filter,
+            other_conds,
+        );
+    }
     // `IN (SELECT * FROM t)` compares against the table's (single) column:
     // expand the star so the join gets a real column, not the `*` marker.
     let inner_field = match query.fields.as_slice() {
@@ -1499,29 +1566,89 @@ fn from_in(
     })
 }
 
+/// Row-constructor `IN`: `(a, b) IN (SELECT x, y …)` matches when every column
+/// pair is equal, so the semi/inner join gets one equality key per position.
+/// The positive form rewrites into an inner join against the de-duplicated
+/// inner rows (`dedup_in`); `NOT IN` keeps the null-aware anti semantics from
+/// `naaj_plan` and only reaches here when that rewrite declines.
+#[allow(clippy::too_many_arguments)]
+fn from_in_row(
+    outer_exprs: &[ExprNode],
+    query: &SelectStmt,
+    inner: &TableName,
+    inner_physical: &str,
+    outer_table: Option<&str>,
+    not: bool,
+    inner_filter: Option<ExprNode>,
+    other_conds: Vec<ExprNode>,
+) -> Option<SemiSpec> {
+    if !other_conds.is_empty() || query.fields.len() != outer_exprs.len() {
+        return None;
+    }
+    let outer_table = outer_table?;
+    let mut keys = Vec::with_capacity(outer_exprs.len());
+    for (outer, field) in outer_exprs.iter().zip(query.fields.iter()) {
+        if is_star_field(&field.expr) {
+            return None;
+        }
+        let inner_expr = qualify_table(field.expr.clone(), &inner.name);
+        let outer_expr = qualify_table(outer.clone(), outer_table);
+        if !is_eq_across_tables(&outer_expr, &inner_expr, &inner.name) {
+            return None;
+        }
+        keys.push(eq_expr(outer_expr, inner_expr));
+    }
+    let mut right = PhysicalPlan::table_reader(inner.name.clone(), Vec::new());
+    if let Some(filter) = inner_filter {
+        right = push_isnull_filter(right, filter);
+    }
+    Some(SemiSpec {
+        tp: if not { JoinType::Anti } else { JoinType::Semi },
+        right_table: inner.name.clone(),
+        right,
+        on: ExprNode::compose_cnf(keys)?,
+        outer_filter: None,
+        dedup_in: !not,
+        right_physical: inner_physical.to_string(),
+    })
+}
+
 /// TiDB `buildDistinct` on the `IN` subquery plus `ExtractOnCondition`'s null
 /// rejection: the inner side of the rewritten inner join keeps one row per
 /// distinct key value, so the join can never duplicate an outer row.
-fn dedup_in_right(
+pub(super) fn dedup_in_right(
     right: PhysicalPlan,
-    key: &str,
+    keys: &[String],
     right_table: &str,
     current_db: &str,
     stats: Option<&sealdb_statistics::Handle>,
 ) -> PhysicalPlan {
-    let col = ExprNode::Column(ColumnNameExpr {
-        schema: None,
-        table: Some(right_table.to_string()),
-        name: key.to_string(),
-    });
-    let qualifier = explain_semi_col(&col, None);
-    let null_filter = ExprNode::Unary(UnaryOpExpr {
-        op: Op::Not,
-        expr: Box::new(ExprNode::IsNull(IsNullExpr {
-            expr: Box::new(col),
-            not: false,
-        })),
-    });
+    let cols: Vec<ExprNode> = keys
+        .iter()
+        .map(|key| {
+            ExprNode::Column(ColumnNameExpr {
+                schema: None,
+                table: Some(right_table.to_string()),
+                name: key.clone(),
+            })
+        })
+        .collect();
+    let qualifiers: Vec<String> = cols.iter().map(|col| explain_semi_col(col, None)).collect();
+    // `buildDistinct` keyed on every row-constructor position: the inner side
+    // keeps one row per distinct `(k1, …, kn)` tuple and rejects NULL keys.
+    let null_filters: Vec<ExprNode> = cols
+        .into_iter()
+        .map(|col| {
+            ExprNode::Unary(UnaryOpExpr {
+                op: Op::Not,
+                expr: Box::new(ExprNode::IsNull(IsNullExpr {
+                    expr: Box::new(col),
+                    not: false,
+                })),
+            })
+        })
+        .collect();
+    let null_filter = ExprNode::compose_cnf(null_filters).expect("dedup keys are non-empty");
     // On an `IndexLookUp` the null rejection filters the probed table rows, so
     // TiDB keeps it as `Selection(Probe)` under the cop aggregate rather than a
     // root Selection above the reader.
@@ -1535,25 +1662,50 @@ fn dedup_in_right(
     let table_stats = stats
         .and_then(|h| h.table(current_db, right_table))
         .filter(super::plan_cost::has_real_stats);
-    let right = with_scan_count(right, table_stats.as_ref().map(|t| t.count as f64));
+    let mut right = with_scan_count(right, table_stats.as_ref().map(|t| t.count as f64));
     // TiDB `GroupNDV`: the key column's NDV under real statistics, otherwise the
     // pseudo 0.8 distinct factor over the null-rejected rows.
     let est = match table_stats.as_ref() {
+        Some(t) if keys.len() > 1 => {
+            // A multi-column group by scales the same way as a single key: the
+            // NDV is spread over the rows that survive null rejection, so the
+            // output shrinks with the input selectivity (`ndv * sel`).
+            let count = t.count as f64;
+            let null_kept = keys.iter().fold(count, |rows, key| {
+                t.column_not_null_count(key)
+                    .map_or(rows, |not_null| rows * (not_null / count).min(1.0))
+            });
+            if let Some(filtered) = super::explain::set_filter_est(&right, null_kept) {
+                right = filtered;
+            }
+            t.column_ndv(&keys[0])
+                .map(|ndv| ndv * null_kept / count)
+                .unwrap_or_else(|| super::explain::est_rows(&right))
+        }
         Some(t) => t
-            .column_ndv(key)
+            .column_ndv(&keys[0])
             .map(|ndv| ndv.min(t.count as f64))
             .unwrap_or_else(|| super::explain::est_rows(&right)),
         None => super::explain::est_rows(&right) * 0.8,
     };
-    PhysicalPlan::hash_agg(
-        right,
-        format!("group by:{qualifier}, funcs:firstrow({qualifier})->{qualifier}"),
-        est,
-    )
+    let info = format!(
+        "group by:{}, funcs:{}",
+        qualifiers.join(", "),
+        qualifiers
+            .iter()
+            .map(|q| format!("firstrow({q})->{q}"))
+            .collect::<Vec<_>>()
+            .join(", funcs:")
+    );
+    PhysicalPlan::hash_agg(right, info, est)
 }
 
 /// Pin the underlying reader's cardinality (real stats → analyzed estimate,
 /// `None` → keep the pseudo 10000 default).
+pub(super) fn pin_scan_count(plan: PhysicalPlan, count: f64) -> PhysicalPlan {
+    with_scan_count(plan, Some(count))
+}
+
 fn with_scan_count(plan: PhysicalPlan, count: Option<f64>) -> PhysicalPlan {
     use PhysicalPlan as P;
     match plan {
@@ -1856,6 +2008,11 @@ fn explain_semi_pred_with(expr: &ExprNode, inner: Option<(&str, &str)>) -> Strin
 fn explain_semi_col(expr: &ExprNode, inner: Option<(&str, &str)>) -> String {
     match expr {
         ExprNode::Column(c) => {
+            // Internal `Column#N` handles (aggregate output, cast column) print
+            // bare, like TiDB's join key list.
+            if c.name.starts_with("Column#") {
+                return c.name.clone();
+            }
             let alias = c.table.as_deref().unwrap_or("t");
             // TiDB `OrigTblName`: aliases print as the physical table.
             let table = match inner {
@@ -2039,8 +2196,10 @@ pub fn rewrite_semi_join_agg(
             // LogicAnd(Eq, Bytes explain) — used by CTE EXISTS — skips Distinct
             // (join_key_on_table only matches bare Eq); TiDB has no HashAgg here.
             if tp == JoinType::Semi
-                && let Some(key) = join_key_on_table(&on, &right_table)
+                && let Some(mut keys) = join_keys_on_table(&on, &right_table)
+                && keys.len() == 1
             {
+                let key = keys.pop().expect("one key");
                 PhysicalPlan::HashJoin {
                     est_rows,
                     tp,
@@ -2222,22 +2381,27 @@ pub fn rewrite_semi_join_agg(
     }
 }
 
-fn join_key_on_table(on: &ExprNode, table: &str) -> Option<String> {
-    let ExprNode::Binary(bin) = on else {
-        return None;
-    };
-    if bin.op != Op::Eq {
-        return None;
-    }
-    for side in [&bin.left, &bin.right] {
-        if let ExprNode::Column(col) = side.as_ref()
-            && col
-                .table
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(table))
-        {
-            return Some(col.name.clone());
+fn join_keys_on_table(on: &ExprNode, table: &str) -> Option<Vec<String>> {
+    let mut keys = Vec::new();
+    for part in on.split_cnf() {
+        let ExprNode::Binary(bin) = &part else {
+            return None;
+        };
+        if bin.op != Op::Eq {
+            return None;
         }
+        let key = [&bin.left, &bin.right].into_iter().find_map(|side| {
+            if let ExprNode::Column(col) = side.as_ref()
+                && col
+                    .table
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(table))
+            {
+                return Some(col.name.clone());
+            }
+            None
+        })?;
+        keys.push(key);
     }
-    None
+    if keys.is_empty() { None } else { Some(keys) }
 }

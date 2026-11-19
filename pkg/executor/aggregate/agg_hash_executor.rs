@@ -8,7 +8,9 @@ use crate::join::apply::SubqueryEvalCtx;
 use sealdb_errno::Result;
 use sealdb_expression::{eval_expr_with_row, eval_filter, truthy};
 use sealdb_parser::ast::SelectStmt;
-use sealdb_parser::ast::expressions::{ColumnNameExpr, ExprNode, FuncCallExpr};
+use sealdb_parser::ast::expressions::{
+    ColumnNameExpr, ExprNode, FuncCallExpr, InSubqueryExpr, RowExpr,
+};
 use sealdb_parser::format::RestoreCtx;
 use sealdb_types::Datum;
 use sealdb_util::chunk::{Chunk, DataInDiskByRows, mem_row_limit};
@@ -527,6 +529,9 @@ fn walk_aggs(expr: &ExprNode, out: &mut Vec<FuncCallExpr>) {
         }
         ExprNode::IsNull(is_null) => walk_aggs(&is_null.expr, out),
         ExprNode::QuantifiedCmp(cmp) => walk_aggs(&cmp.expr, out),
+        // HAVING row constructors compare aggregates against a subquery.
+        ExprNode::InSubquery(sub) => walk_aggs(&sub.expr, out),
+        ExprNode::Row(row) => row.exprs.iter().for_each(|item| walk_aggs(item, out)),
         _ => {}
     }
 }
@@ -625,6 +630,22 @@ fn rewrite_having(expr: &ExprNode, select: &SelectStmt) -> ExprNode {
                 query: cmp.query.clone(),
             })
         }
+        // HAVING subqueries compare aggregates: `(a, count(1)) IN (SELECT …)`
+        // resolves `count(1)` to the aggregate output column the filter schema
+        // exposes, then the subquery is materialized per group.
+        ExprNode::InSubquery(sub) => ExprNode::InSubquery(InSubqueryExpr {
+            expr: Box::new(rewrite_having(&sub.expr, select)),
+            not: sub.not,
+            query: sub.query.clone(),
+            all_ne: sub.all_ne,
+        }),
+        ExprNode::Row(row) => ExprNode::Row(RowExpr {
+            exprs: row
+                .exprs
+                .iter()
+                .map(|item| rewrite_having(item, select))
+                .collect(),
+        }),
         other => other.clone(),
     }
 }

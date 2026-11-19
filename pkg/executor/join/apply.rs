@@ -436,39 +436,33 @@ fn eval_in_subquery(
             &ctx.outer_row,
         )?],
     };
-    let left_is_row = matches!(&left_expr, ExprNode::Row(_));
-    if left_values.iter().any(Datum::is_null) {
-        // Row-value `NOT IN` decorrelates to an anti semi join, where a NULL
-        // operand never matches any inner row — TiDB answers TRUE.
-        if left_is_row && sub.not {
-            return Ok(bool_datum(true));
-        }
-        return Ok(Datum::Null);
-    }
     let inner = bind_result_set(&sub.query, ctx)?;
     let result = run_result_set(&inner, ctx, cache)?;
     let mut saw_null = false;
     for row in &result.rows {
-        let mut matched = true;
+        // Three-valued key comparison, matching TiDB's null-aware anti join: a
+        // NULL operand (on either side) only makes the row "possibly equal"
+        // when every other key agrees; a definite mismatch rules the row out.
+        let mut mismatch = false;
         let mut row_null = false;
         for (i, left) in left_values.iter().enumerate() {
             let value = row.get(i).cloned().unwrap_or(Datum::Null);
-            if value.is_null() {
+            if left.is_null() || value.is_null() {
                 row_null = true;
-                matched = false;
-                break;
+                continue;
             }
             if !left.compare(&value).is_eq() {
-                matched = false;
+                mismatch = true;
                 break;
             }
         }
-        if matched {
+        if mismatch {
+            continue;
+        }
+        if !row_null {
             return Ok(bool_datum(!sub.not));
         }
-        if row_null {
-            saw_null = true;
-        }
+        saw_null = true;
     }
     if saw_null {
         Ok(Datum::Null)
