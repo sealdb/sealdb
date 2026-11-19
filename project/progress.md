@@ -4183,6 +4183,47 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - `expression/builtin` / `expression/issues` 等 R7 表达式长尾套件。
 
+### 2026-11-19（`expression/noop_functions` 转绿：`tidb_enable_noop_functions` 三态门、GROUP BY 排序、星号投影）
+
+- **Phase**: R7 `expression/noop_functions` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `tidb_enable_noop_functions` 三态：`OFF` 报 1235 error、`WARN` 记 1235
+    warning、`ON` 静默；变量类型由 `Flag` 改为 `Text` 以接受 `WARN`。
+  - 统一 noop 门（`check_noop_feature`）覆盖四类语法：
+    `SQL_CALC_FOUND_ROWS`、`LOCK IN SHARE MODE`（含 point-get 快路径）、
+    `GROUP BY expr ASC|DESC`、`START TRANSACTION READ ONLY` /
+    `SET TRANSACTION READ ONLY` / `SET tx_read_only|transaction_read_only=1`。
+    带 `AS OF TIMESTAMP` 的 `READ ONLY` 仍是真实 stale read，不受门控。
+  - parser：`rewrite_group_by_order` 按字节扫描（跳过字符串、反引号与注释），
+    删掉 `GROUP BY` 深度上的 `ASC`/`DESC` 并记录 `PENDING_GROUP_BY_ORDER`，
+    session 再把它映射到 noop 门；sqlparser 本身不支持该语法。
+  - `SELECT * … GROUP BY`：`*` 在 lowering 里落成字面量标记，`HashAggExec`
+    在 `open` 后按子节点 schema 展开（同名裸列去歧义、保留 HAVING 槽位），
+    修复星号投影与 `GROUP BY` 共存时的列数/列名。
+  - `IndexLookUp`：聚簇整数主键上的整域 `IndexFullScan` 直接走表行扫描
+    （对齐 TiDB 聚簇索引 cop 任务），covering 时按索引列回填。
+  - `local/txn` 冒烟在 `START TRANSACTION READ ONLY` 前后显式开关
+    `tidb_enable_noop_functions`，保持与 TiDB 默认 OFF 的口径一致。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t expression/noop_functions`
+    → `PASS: memory=1 tikv=0 skipped=253`
+  - `./tests/integrationtest/run-tests.sh -s tikv -t expression/noop_functions`
+    → `PASS: memory=0 tikv=1 skipped=253`
+  - green + local 全量 gate（memory）：
+    `./tests/integrationtest/run-tests.sh -s memory`
+    → `PASS: memory=117 tikv=0 skipped=137`（109 green + 8 local）；
+    TiKV：`-s tikv` → `PASS: memory=0 tikv=115 skipped=139`
+    （108 green + 7 local，`local/txn` 按 manifest `skip_tikv`）。
+  - manifest：`expression/noop_functions` → `green`，green 108→109
+    （R7 41→42，pending 127→126）。
+- **阻塞/风险**:
+  - `GROUP BY … ASC|DESC` 是文本级重写而非语法树支持，`GROUP BY` 后的
+    复杂表达式若恰好含裸 `ASC`/`DESC` 词需依赖深度/子句边界判断。
+  - 星号标记用 `Datum::Bytes(b"*")` 识别，`SELECT '*' FROM t GROUP BY …`
+    这类字符串字面量存在被误判为星号的边界风险，语料未覆盖。
+- **下一步**:
+  - `expression/builtin` / `expression/issues` 等 R7 表达式长尾套件。
+
 ## 7. 更新模板
 
 每次更新追加一条：

@@ -24,12 +24,14 @@ id	name
 2	b
 RELEASE SAVEPOINT sp1;
 COMMIT;
+SET @@tidb_enable_noop_functions='ON';
 START TRANSACTION READ ONLY;
 SELECT * FROM itest.t ORDER BY id;
 id	name
 1	a
 2	b
 ROLLBACK;
+SET @@tidb_enable_noop_functions='OFF';
 START TRANSACTION READ WRITE;
 INSERT INTO itest.t VALUES (4, 'd');
 COMMIT AND CHAIN;

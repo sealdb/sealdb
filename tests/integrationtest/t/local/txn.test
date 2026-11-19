@@ -17,9 +17,13 @@ ROLLBACK TO sp1;
 SELECT * FROM itest.t ORDER BY id;
 RELEASE SAVEPOINT sp1;
 COMMIT;
+# TiDB treats `START TRANSACTION READ ONLY` as a noop gated by
+# tidb_enable_noop_functions (off by default), so enable it for this smoke.
+SET @@tidb_enable_noop_functions='ON';
 START TRANSACTION READ ONLY;
 SELECT * FROM itest.t ORDER BY id;
 ROLLBACK;
+SET @@tidb_enable_noop_functions='OFF';
 START TRANSACTION READ WRITE;
 INSERT INTO itest.t VALUES (4, 'd');
 COMMIT AND CHAIN;

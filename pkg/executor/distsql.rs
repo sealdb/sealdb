@@ -176,85 +176,123 @@ impl Executor for IndexLookUpExecutor {
         self.merge_order =
             self.keep_order && physical.len() > 1 && (index.global || expression_index);
         let merge_order = self.merge_order;
-        self.rows = self.txn.with_txn(|txn| {
-            let mut rows = Vec::new();
-            let mut keyed: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
-            let mut pending: Vec<(i64, i64)> = Vec::new();
-            for physical_id in physical {
-                for access in &self.access {
-                    let (start, end) = scan_bounds(physical_id, index.id, access);
-                    if start.as_bytes() >= end.as_slice() {
-                        continue;
+        // A clustered integer PRIMARY KEY has no separate index entries (the
+        // row handle is the key), so `IndexFullScan` on it reads the table
+        // rows, just like TiDB's clustered-index coprocessor task.
+        let clustered_primary_full = index.primary
+            && info.pk_is_handle
+            && self.access.iter().all(|access| {
+                matches!(
+                    access,
+                    IndexAccess::Range { low, high, .. } if low.is_empty() && high.is_empty()
+                )
+            });
+        self.rows = if clustered_primary_full {
+            crate::table_reader::scan_table(&self.txn, &info, self.lock, self.wait, &physical)?
+                .into_iter()
+                .map(|row| {
+                    if !self.covering {
+                        return row.values;
                     }
-                    for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end) {
-                        let pairs =
-                            txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
-                        for (key, value) in pairs {
-                            let handle = index_handle(&index, &key, &value)?;
-                            if self.covering {
-                                let mut row = covering_row(&info, &index, &key, handle)?;
-                                if info.common_handle && common_handle_columns_missing(&info, &row)
-                                {
-                                    // TiDB stores a clustered PRIMARY KEY as the
-                                    // common handle inside every secondary index key,
-                                    // so `KEY idx(b)` alone answers `SELECT a` when `a`
-                                    // is part of that key. SealDB's index keys carry the
-                                    // heap row id instead, so the covering read fetches
-                                    // the row for the handle columns it cannot decode.
-                                    let row_key = encode_row_key_with_handle(physical_id, handle);
-                                    if let Some(raw) =
-                                        txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?
+                    let mut out = vec![Datum::Null; info.columns.len()];
+                    for col in &index.columns {
+                        if let Some(value) = row.values.get(col.offset as usize) {
+                            out[col.offset as usize] = value.clone();
+                        }
+                    }
+                    if expose_rowid {
+                        out.push(Datum::I64(row.handle));
+                    }
+                    out
+                })
+                .collect()
+        } else {
+            self.txn.with_txn(|txn| {
+                let mut rows = Vec::new();
+                let mut keyed: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+                let mut pending: Vec<(i64, i64)> = Vec::new();
+                for physical_id in physical {
+                    for access in &self.access {
+                        let (start, end) = scan_bounds(physical_id, index.id, access);
+                        if start.as_bytes() >= end.as_slice() {
+                            continue;
+                        }
+                        for range in sealdb_store::split_key_ranges_for_scan(start.as_bytes(), &end)
+                        {
+                            let pairs =
+                                txn.scan_locked(&range.start, &range.end, self.lock, self.wait)?;
+                            for (key, value) in pairs {
+                                let handle = index_handle(&index, &key, &value)?;
+                                if self.covering {
+                                    let mut row = covering_row(&info, &index, &key, handle)?;
+                                    if info.common_handle
+                                        && common_handle_columns_missing(&info, &row)
                                     {
-                                        backfill_row(&info, &mut row, &raw);
+                                        // TiDB stores a clustered PRIMARY KEY as the
+                                        // common handle inside every secondary index key,
+                                        // so `KEY idx(b)` alone answers `SELECT a` when `a`
+                                        // is part of that key. SealDB's index keys carry the
+                                        // heap row id instead, so the covering read fetches
+                                        // the row for the handle columns it cannot decode.
+                                        let row_key =
+                                            encode_row_key_with_handle(physical_id, handle);
+                                        if let Some(raw) = txn.get_locked(
+                                            row_key.as_bytes(),
+                                            self.lock,
+                                            self.wait,
+                                        )? {
+                                            backfill_row(&info, &mut row, &raw);
+                                        }
                                     }
+                                    if expose_rowid {
+                                        row.push(Datum::I64(handle));
+                                    }
+                                    if merge_order {
+                                        keyed.push((index_sort_key(&key), row));
+                                    } else {
+                                        rows.push(row);
+                                    }
+                                    continue;
                                 }
-                                if expose_rowid {
-                                    row.push(Datum::I64(handle));
+                                if probe_batched {
+                                    pending.push((physical_id, handle));
+                                    continue;
                                 }
-                                if merge_order {
-                                    keyed.push((index_sort_key(&key), row));
-                                } else {
-                                    rows.push(row);
-                                }
-                                continue;
-                            }
-                            if probe_batched {
-                                pending.push((physical_id, handle));
-                                continue;
-                            }
-                            let row_key = encode_row_key_with_handle(physical_id, handle);
-                            let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
-                            if let Some(raw) = raw {
-                                let row = decode_lookup_row(&info, &raw, expose_rowid, handle);
-                                if merge_order {
-                                    keyed.push((index_sort_key(&key), row));
-                                } else {
-                                    rows.push(row);
+                                let row_key = encode_row_key_with_handle(physical_id, handle);
+                                let raw =
+                                    txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                                if let Some(raw) = raw {
+                                    let row = decode_lookup_row(&info, &raw, expose_rowid, handle);
+                                    if merge_order {
+                                        keyed.push((index_sort_key(&key), row));
+                                    } else {
+                                        rows.push(row);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            if merge_order {
-                // Index key order: the key's table/index prefix is the same for
-                // every row, so the encoded key values decide.
-                keyed.sort_by(|left, right| left.0.cmp(&right.0));
-                rows.extend(keyed.into_iter().map(|(_, row)| row));
-            }
-            if probe_batched {
-                // Key order is the storage order: table id, then the row handle.
-                pending.sort_unstable();
-                for (physical_id, handle) in pending {
-                    let row_key = encode_row_key_with_handle(physical_id, handle);
-                    let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
-                    if let Some(raw) = raw {
-                        rows.push(decode_lookup_row(&info, &raw, expose_rowid, handle));
+                if merge_order {
+                    // Index key order: the key's table/index prefix is the same for
+                    // every row, so the encoded key values decide.
+                    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+                    rows.extend(keyed.into_iter().map(|(_, row)| row));
+                }
+                if probe_batched {
+                    // Key order is the storage order: table id, then the row handle.
+                    pending.sort_unstable();
+                    for (physical_id, handle) in pending {
+                        let row_key = encode_row_key_with_handle(physical_id, handle);
+                        let raw = txn.get_locked(row_key.as_bytes(), self.lock, self.wait)?;
+                        if let Some(raw) = raw {
+                            rows.push(decode_lookup_row(&info, &raw, expose_rowid, handle));
+                        }
                     }
                 }
-            }
-            Ok(rows)
-        })?;
+                Ok(rows)
+            })?
+        };
         // A covering read only has the index's key values: an expression key
         // part answers the expression it stores, so evaluate the pushed filter
         // on the part (`like(md5(s), …)` → `like(_V$_idx_0, …)`).

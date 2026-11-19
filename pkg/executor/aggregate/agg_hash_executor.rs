@@ -21,6 +21,8 @@ enum OutputItem {
     Agg(usize),
     /// Literal / constant select item (always legal under ONLY_FULL_GROUP_BY).
     Const(Datum),
+    /// `*`: expanded against the child's schema once the child is open.
+    Star,
     /// Non-grouped column allowed when sql_mode lacks ONLY_FULL_GROUP_BY
     /// (MySQL "any value" — first row in the group).
     Any(usize),
@@ -55,6 +57,16 @@ impl HashAggExec {
         let mut outputs = Vec::new();
         let mut schema = Vec::new();
         for field in &select.fields {
+            // `*` is lowered to a literal `*` so the planner can recognise a
+            // star select; the aggregate still has to project every column of
+            // the child (TiDB expands it in `buildProjection`).
+            if is_star_field(&field.expr) {
+                // The child's schema is only known after `open`, so remember a
+                // marker and expand it there (TiDB expands `*` in buildProjection).
+                schema.push(String::new());
+                outputs.push(OutputItem::Star);
+                continue;
+            }
             // TiDB `buildProjectionFieldNameFromExpressions`: an explicit alias
             // wins, a bare column keeps its column name (`t1. col1` → `col1`),
             // otherwise field.Text() (orig_text) without backticks.
@@ -189,6 +201,48 @@ impl HashAggExec {
         self
     }
 
+    /// `SELECT * … GROUP BY`: the child's output columns are only known after
+    /// `open`, so expand the star marker into one output per child column then.
+    fn expand_stars(&mut self) {
+        if !self
+            .outputs
+            .iter()
+            .any(|item| matches!(item, OutputItem::Star))
+        {
+            return;
+        }
+        let star_cols = expand_star_fields(self.child.schema());
+        let mut tail = self.filter_schema.split_off(self.schema.len());
+        let mut schema = Vec::with_capacity(self.schema.len());
+        let mut outputs = Vec::with_capacity(self.outputs.len());
+        let mut names = std::mem::take(&mut self.schema).into_iter();
+        for item in std::mem::take(&mut self.outputs) {
+            if matches!(item, OutputItem::Star) {
+                // The star field's placeholder name is replaced by the child's
+                // column names.
+                let _ = names.next();
+                for (expr, col_name) in &star_cols {
+                    schema.push(col_name.clone());
+                    let idx = self.any_exprs.len();
+                    self.any_exprs.push(expr.clone());
+                    outputs.push(OutputItem::Any(idx));
+                }
+            } else {
+                // HAVING-only aggregates have an output slot but no schema
+                // name; they trail the visible columns.
+                if let Some(name) = names.next() {
+                    schema.push(name);
+                }
+                outputs.push(item);
+            }
+        }
+        let mut filter_schema = schema.clone();
+        filter_schema.append(&mut tail);
+        self.schema = schema;
+        self.outputs = outputs;
+        self.filter_schema = filter_schema;
+    }
+
     pub fn spilled(&self) -> bool {
         self.spilled
     }
@@ -197,6 +251,7 @@ impl HashAggExec {
 impl Executor for HashAggExec {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;
+        self.expand_stars();
         self.spilled = false;
         let input_schema = self.child.schema().to_vec();
         let mut buf: Vec<Vec<Datum>> = Vec::new();
@@ -382,6 +437,8 @@ impl HashAggExec {
                 OutputItem::Group(idx) => Ok(keys.get(*idx).cloned().unwrap_or(Datum::Null)),
                 OutputItem::Agg(idx) => Ok(finals.get(*idx).cloned().unwrap_or(Datum::Null)),
                 OutputItem::Const(d) => Ok(d.clone()),
+                // Expanded away in `expand_stars` before any row is produced.
+                OutputItem::Star => Ok(Datum::Null),
                 OutputItem::Any(idx) => Ok(any_vals.get(*idx).cloned().unwrap_or(Datum::Null)),
                 OutputItem::Expr(expr) => {
                     let mut schema = Vec::with_capacity(self.group_by.len() + self.agg_specs.len());
@@ -399,6 +456,44 @@ impl HashAggExec {
             })
             .collect()
     }
+}
+
+/// `*` in a select list is lowered to this literal so the planner can tell a
+/// star select apart from ordinary expressions.
+fn is_star_field(expr: &ExprNode) -> bool {
+    matches!(expr, ExprNode::Value(v) if matches!(&v.datum, Datum::Bytes(b) if b == b"*"))
+}
+
+/// Expand a star select against the child's output columns. Qualified schema
+/// names (`dbg.t.a`) become the bare column when unambiguous so the header
+/// matches TiDB (`a`), and the value binds through the child row.
+fn expand_star_fields(schema: &[String]) -> Vec<(ExprNode, String)> {
+    let visible: Vec<&String> = schema
+        .iter()
+        .filter(|name| !name.starts_with('\u{1}'))
+        .collect();
+    let bare = |name: &str| name.rsplit('.').next().unwrap_or(name).to_string();
+    visible
+        .iter()
+        .map(|name| {
+            let base = bare(name);
+            let unique = visible
+                .iter()
+                .filter(|other| bare(other).eq_ignore_ascii_case(&base))
+                .count()
+                == 1;
+            let col = ColumnNameExpr {
+                schema: None,
+                table: None,
+                name: if unique {
+                    base.clone()
+                } else {
+                    (*name).clone()
+                },
+            };
+            (ExprNode::Column(col), base)
+        })
+        .collect()
 }
 
 fn collect_aggs(expr: &ExprNode) -> Vec<FuncCallExpr> {

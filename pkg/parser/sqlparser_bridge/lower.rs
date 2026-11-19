@@ -50,6 +50,16 @@ thread_local! {
     /// sqlparser sees and records it here, keyed by index name.
     static PENDING_PARTIAL_INDEX_PREDICATES: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// TiDB `GROUP BY expr [ASC|DESC]` — the ordering is a noop. sqlparser
+    /// rejects the keyword, so the bridge drops it and remembers that the
+    /// statement used the feature (the session gates it on
+    /// `tidb_enable_noop_functions`).
+    static PENDING_GROUP_BY_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last parsed statement carried `GROUP BY expr ASC|DESC`.
+pub fn take_group_by_order_seen() -> bool {
+    PENDING_GROUP_BY_ORDER.with(|cell| cell.replace(false))
 }
 
 /// Take the predicate recorded for `name` (case-insensitive).
@@ -139,6 +149,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.set(None));
     PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(None));
     PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| cell.borrow_mut().clear());
+    PENDING_GROUP_BY_ORDER.with(|cell| cell.set(false));
     let rewritten = strip_tidb_create_table_options(&rewritten);
     // MySQL `INSERT … PARTITION (p0, p1) (cols) VALUES` — sqlparser wants the
     // column list first.
@@ -173,6 +184,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let rewritten = rewrite_rename_index(&rewritten);
     let (rewritten, explain_formats) = rewrite_explain_format(&rewritten);
     let rewritten = rewrite_lock_in_share_mode(&rewritten);
+    // TiDB `GROUP BY expr ASC|DESC` (noop): drop the ordering keyword.
+    let rewritten = rewrite_group_by_order(&rewritten);
     let (rewritten, materialize_hints) = rewrite_cte_materialized(&rewritten);
     let (rewritten, prepares) = extract_prepare_from(&rewritten);
     let (rewritten, ttls) = extract_create_table_ttl(&rewritten)?;
@@ -4886,6 +4899,133 @@ fn rewrite_lock_in_share_mode(sql: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// TiDB `GROUP BY expr [ASC|DESC]` (a noop in TiDB): sqlparser only accepts a
+/// plain group expression, so a trailing `ASC`/`DESC` is dropped from each group
+/// item and the feature is recorded for the session-level noop gate.
+fn rewrite_group_by_order(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    // Copy raw bytes: non-ASCII literals must survive untouched (decoding each
+    // byte as a `char` would double-encode UTF-8 multibyte sequences).
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
+    let mut i = 0;
+    let mut depth = 0i32;
+    // Parenthesis depth at which the active `GROUP BY` clause started.
+    let mut group_by: Option<i32> = None;
+    let mut saw_group = false;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '\'' || ch == '"' || ch == '`' {
+            let quote = ch;
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i] as char;
+                out.push(bytes[i]);
+                i += 1;
+                if c == quote {
+                    // A doubled quote stays inside the literal.
+                    if i < bytes.len() && bytes[i] as char == quote {
+                        out.push(bytes[i]);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '-' && i + 1 < bytes.len() && bytes[i + 1] as char == '-' {
+            let start = i;
+            while i < bytes.len() && bytes[i] as char != '\n' {
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
+        if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] as char == '*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] as char == '*' && bytes[i + 1] as char == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
+        match ch {
+            '(' => {
+                depth += 1;
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+            ')' => {
+                depth -= 1;
+                if let Some(start) = group_by
+                    && depth < start
+                {
+                    group_by = None;
+                }
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] as char == '_')
+            {
+                i += 1;
+            }
+            let upper = sql[start..i].to_ascii_uppercase();
+            if let Some(start_depth) = group_by
+                && depth == start_depth
+            {
+                if upper == "ASC" || upper == "DESC" {
+                    PENDING_GROUP_BY_ORDER.with(|cell| cell.set(true));
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // The group-by item list ends at the next clause keyword.
+                if matches!(
+                    upper.as_str(),
+                    "ORDER"
+                        | "HAVING"
+                        | "LIMIT"
+                        | "WINDOW"
+                        | "UNION"
+                        | "FOR"
+                        | "LOCK"
+                        | "INTO"
+                        | "PROCEDURE"
+                        | "WITH"
+                        | "GROUP"
+                ) {
+                    group_by = None;
+                }
+            }
+            if upper == "GROUP" {
+                saw_group = true;
+            } else if upper == "BY" && saw_group {
+                saw_group = false;
+                group_by = Some(depth);
+            } else {
+                saw_group = false;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 fn rewrite_begin_pessimistic(sql: &str) -> (String, Vec<bool>) {

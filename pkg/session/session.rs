@@ -365,17 +365,6 @@ impl Session {
             return Ok(vec![result]);
         }
         let mode = self.sql_mode.lock().expect("session sql_mode lock").clone();
-        // `LOCK IN SHARE MODE` is only a no-op in TiDB unless noop functions are
-        // explicitly enabled; without the flag the statement is rejected before
-        // planning. (`FOR SHARE` remains a real locking read.)
-        if contains_lock_in_share_mode(sql)
-            && !sysvar_flag_enabled(self, "tidb_enable_noop_functions")
-        {
-            return Err(sealdb_errno::Error::new(
-                sealdb_errno::ERR_UNSUPPORTED,
-                "function LOCK IN SHARE MODE has only noop implementation in tidb now, use tidb_enable_noop_functions to enable these functions",
-            ));
-        }
         reject_create_table_func_call(sql, &mode)?;
         // `group_concat_max_len` lives in an executor thread-local; publish the
         // session value at the start of every statement so a following
@@ -407,6 +396,10 @@ impl Session {
             sealdb_parser::set_high_not_precedence(false);
             parsed?
         };
+        // TiDB `GROUP BY expr ASC|DESC` is a noop: the bridge drops the ordering
+        // keyword for sqlparser and reports that the statement used it.
+        let group_by_order =
+            sealdb_parser::sqlparser_bridge::take_group_by_order_seen() && stmts.len() == 1;
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_PARSE_ERROR,
@@ -423,9 +416,33 @@ impl Session {
                 .lock()
                 .expect("session current stmt sql lock") =
                 single_stmt_text.clone().unwrap_or_default();
-            let result = self.execute_one(&stmt);
+            // Noop features TiDB accepts only behind `tidb_enable_noop_functions`
+            // (warning in WARN mode, error 1235 in OFF mode).
+            let noop_feature = single_stmt_text.as_deref().and_then(|text| {
+                if contains_sql_calc_found_rows(text) {
+                    Some("SQL_CALC_FOUND_ROWS")
+                } else if contains_lock_in_share_mode(text) {
+                    Some("LOCK IN SHARE MODE")
+                } else if group_by_order {
+                    Some("GROUP BY expr ASC|DESC")
+                } else {
+                    None
+                }
+            });
+            let noop_warning = match noop_feature {
+                Some(feature) => check_noop_feature(self, feature)?,
+                None => None,
+            };
+            let mut result = self.execute_one(&stmt)?;
             self.end_set_var_hint(previous_sql_mode);
-            out.push(result?);
+            if let Some(warning) = noop_warning {
+                result.warnings.push(warning);
+                *self
+                    .last_warnings
+                    .lock()
+                    .expect("session last_warnings lock") = result.warnings.clone();
+            }
+            out.push(result);
         }
         Ok(out)
     }
@@ -1180,7 +1197,20 @@ impl Session {
                         map_isolation(isolation);
                 }
                 if let Some(read_only) = set.read_only {
-                    *self.read_only.lock().expect("session read_only lock") = read_only;
+                    // `SET TRANSACTION READ ONLY` is a TiDB noop: it does not
+                    // change the session default.
+                    if read_only && let Some(warning) = check_noop_feature(self, "READ ONLY")? {
+                        let mut result = empty_result();
+                        result.warnings.push(warning);
+                        *self
+                            .last_warnings
+                            .lock()
+                            .expect("session last_warnings lock") = result.warnings.clone();
+                        return Ok(result);
+                    }
+                    if !read_only {
+                        *self.read_only.lock().expect("session read_only lock") = false;
+                    }
                 }
                 return Ok(empty_result());
             }
@@ -1343,9 +1373,17 @@ impl Session {
                     .isolation
                     .map(map_isolation)
                     .unwrap_or_else(|| *self.isolation.lock().expect("session isolation lock"));
-                let read_only = begin
-                    .read_only
-                    .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"));
+                // `START TRANSACTION READ ONLY` is a noop unless it carries
+                // `AS OF TIMESTAMP` (a stale read, which honours the flag).
+                let mut noop_warning = None;
+                let read_only = if begin.read_only == Some(true) && begin.as_of_ts.is_none() {
+                    noop_warning = check_noop_feature(self, "READ ONLY")?;
+                    false
+                } else {
+                    begin
+                        .read_only
+                        .unwrap_or_else(|| *self.read_only.lock().expect("session read_only lock"))
+                };
                 self.apply_pending_schema(true)?;
                 self.reset_temp_table_auto_ids()?;
                 let schema_ver = self.domain.infoschema().schema_meta_version();
@@ -1375,7 +1413,15 @@ impl Session {
                         stale_at,
                     )?;
                 }
-                return Ok(empty_result());
+                let mut result = empty_result();
+                if let Some(warning) = noop_warning {
+                    result.warnings.push(warning);
+                    *self
+                        .last_warnings
+                        .lock()
+                        .expect("session last_warnings lock") = result.warnings.clone();
+                }
+                return Ok(result);
             }
             Statement::Commit(commit) => {
                 let schema_ver = self.domain.infoschema().schema_meta_version();
@@ -5080,6 +5126,15 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                     };
                 session.domain.set_analyze_skip_column_types(types);
             }
+            // TiDB `tx_read_only` / `transaction_read_only`: noop session vars.
+            // Only turning them ON is gated on `tidb_enable_noop_functions`.
+            "tx_read_only" | "transaction_read_only" => {
+                if !set_value_is_off(&value)
+                    && let Some(warning) = check_noop_feature(session, "READ ONLY")?
+                {
+                    warnings.push(warning);
+                }
+            }
             // TiDB session vars used by integrationtest setup; accept as no-op
             // until the matching subsystem is wired (cost model, …).
             other if other.starts_with("tidb_") => {}
@@ -5109,10 +5164,45 @@ fn is_global_only_var(name: &str) -> bool {
     )
 }
 
-/// Whether a boolean session sysvar is currently ON.
-fn sysvar_flag_enabled(session: &Session, name: &str) -> bool {
-    read_session_sysvar(session, name)
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+/// `tidb_enable_noop_functions` state: ON silences a TiDB noop feature, WARN
+/// reports 1235 as a warning, OFF rejects it with error 1235.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoopMode {
+    On,
+    Warn,
+    Off,
+}
+
+fn noop_mode(session: &Session) -> NoopMode {
+    match read_session_sysvar(session, "tidb_enable_noop_functions")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "on" | "true" => NoopMode::On,
+        "warn" => NoopMode::Warn,
+        _ => NoopMode::Off,
+    }
+}
+
+fn noop_message(feature: &str) -> String {
+    format!(
+        "function {feature} has only noop implementation in tidb now, use tidb_enable_noop_functions to enable these functions"
+    )
+}
+
+/// Gate on `tidb_enable_noop_functions` for a TiDB noop feature: `Ok(None)`
+/// when enabled, `Ok(Some(warning))` in WARN mode, `Err(1235)` when disabled.
+fn check_noop_feature(session: &Session, feature: &str) -> Result<Option<(i32, String)>> {
+    let message = noop_message(feature);
+    match noop_mode(session) {
+        NoopMode::On => Ok(None),
+        NoopMode::Warn => Ok(Some((sealdb_errno::ERR_UNSUPPORTED, message))),
+        NoopMode::Off => Err(sealdb_errno::Error::new(
+            sealdb_errno::ERR_UNSUPPORTED,
+            message,
+        )),
+    }
 }
 
 /// Whether a `SET` operand turns a boolean variable off.
@@ -5120,8 +5210,8 @@ fn set_value_is_off(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "0" | "off" | "false")
 }
 
-/// Detect `LOCK IN SHARE MODE` outside string literals and comments.
-fn contains_lock_in_share_mode(sql: &str) -> bool {
+/// Words of `sql` in upper case, skipping string literals and comments.
+fn sql_keywords(sql: &str) -> Vec<String> {
     let mut words = Vec::new();
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -5170,8 +5260,18 @@ fn contains_lock_in_share_mode(sql: &str) -> bool {
         i += 1;
     }
     words
+}
+
+/// Detect `LOCK IN SHARE MODE` outside string literals and comments.
+fn contains_lock_in_share_mode(sql: &str) -> bool {
+    sql_keywords(sql)
         .windows(4)
         .any(|w| w == ["LOCK", "IN", "SHARE", "MODE"])
+}
+
+/// Detect `SQL_CALC_FOUND_ROWS` outside string literals and comments.
+fn contains_sql_calc_found_rows(sql: &str) -> bool {
+    sql_keywords(sql).iter().any(|w| w == "SQL_CALC_FOUND_ROWS")
 }
 
 /// Render a clamped floating-point sysvar without a redundant `.0` suffix.
@@ -5989,7 +6089,7 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("tidb_enable_external_ts_read", "OFF", VarKind::Flag),
     ("tidb_enable_list_partition", "ON", VarKind::Flag),
     ("tidb_enable_non_prepared_plan_cache", "OFF", VarKind::Flag),
-    ("tidb_enable_noop_functions", "OFF", VarKind::Flag),
+    ("tidb_enable_noop_functions", "OFF", VarKind::Text),
     ("tidb_enable_ordered_result_mode", "OFF", VarKind::Flag),
     ("tidb_enable_table_partition", "ON", VarKind::Flag),
     ("tidb_enable_window_function", "ON", VarKind::Flag),

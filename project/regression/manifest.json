@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 108,
+      "green": 109,
       "in_progress": 9,
       "local": 8,
-      "pending": 127
+      "pending": 126
     },
     "by_wave": {
       "D": 2,
@@ -1342,7 +1342,7 @@
     {
       "name": "expression/noop_functions",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/noop_functions.test",
       "result": "r/expression/noop_functions.result",
       "has_result": true,
