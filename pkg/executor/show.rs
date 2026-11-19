@@ -689,6 +689,26 @@ fn render_create_table(info: &TableInfo) -> String {
         .filter(|col| !col.hidden)
         .map(|col| {
             let mut line = format!("  `{}` {}", col.name.o(), col.field_type.type_name());
+            // TiDB prints a column's charset/collation only when it differs from
+            // the table default. An equal collation still prints when it is not
+            // the charset's default collation (TiDB `GetDefaultCollation`).
+            let ft = &col.field_type;
+            if ft.is_character_type() && ft.charset != "binary" {
+                if !ft.charset.is_empty() && !ft.charset.eq_ignore_ascii_case(&info.charset) {
+                    line.push_str(&format!(" CHARACTER SET {}", ft.charset));
+                    if !ft.collate.is_empty() {
+                        line.push_str(&format!(" COLLATE {}", ft.collate));
+                    }
+                } else if !ft.collate.is_empty() {
+                    let charset_default =
+                        sealdb_parser::charset::Collation::default_for_charset(&ft.charset).name;
+                    if !ft.collate.eq_ignore_ascii_case(&info.collate)
+                        || !ft.collate.eq_ignore_ascii_case(&charset_default)
+                    {
+                        line.push_str(&format!(" COLLATE {}", ft.collate));
+                    }
+                }
+            }
             // TiDB prints the generation expression in place of DEFAULT.
             if let Some(expr) = &col.generated_expr {
                 line.push_str(&format!(

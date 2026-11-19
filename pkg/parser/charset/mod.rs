@@ -22,6 +22,68 @@ pub const SUPPORTED_COLLATIONS: &[&str] = &[
     "gbk_chinese_ci",
 ];
 
+/// Charsets accepted as a string-literal introducer (`_utf8mb4'…'`).
+///
+/// TiDB rejects `_gbk'…'` with error 1115 even though `gbk` is a valid table
+/// charset, so this set is narrower than [`SUPPORTED_CHARSETS`].
+pub const SUPPORTED_INTRODUCERS: &[&str] =
+    &["utf8mb4", "utf8", "utf8mb3", "binary", "latin1", "ascii"];
+
+pub fn is_supported_introducer(name: &str) -> bool {
+    let lower = name
+        .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+        .to_ascii_lowercase();
+    SUPPORTED_INTRODUCERS.contains(&lower.as_str())
+}
+
+/// Collations that exist in TiDB's legacy collation table but are not available
+/// with the new collation framework enabled (`utf8mb4_0900_ai_ci`-less builds).
+/// TiDB reports these with a different message than a fully unknown name.
+pub const LEGACY_UNSUPPORTED_COLLATIONS: &[&str] = &[
+    "utf8_roman_ci",
+    "utf8mb4_roman_ci",
+    "utf8_general_mysql500_ci",
+    "utf8mb4_general_mysql500_ci",
+    "utf8_esperanto_ci",
+    "utf8mb4_esperanto_ci",
+];
+
+fn normalized_name(name: &str) -> String {
+    name.trim_matches(|c| c == '\'' || c == '"' || c == '`')
+        .to_ascii_lowercase()
+}
+
+/// The error 1273 TiDB raises for an unusable collation name, or `None` when the
+/// name is supported.
+///
+/// TiDB distinguishes "Unsupported collation when new collation is enabled"
+/// (the name is a legacy collation it knows about) from "Unknown collation"
+/// (no such collation at all).
+pub fn collation_validation_error(name: &str) -> Option<sealdb_errno::Error> {
+    let lower = normalized_name(name);
+    if is_supported_collation(&lower) {
+        return None;
+    }
+    let message = if LEGACY_UNSUPPORTED_COLLATIONS.contains(&lower.as_str()) {
+        format!("Unsupported collation when new collation is enabled: '{lower}'")
+    } else {
+        format!("Unknown collation: '{lower}'")
+    };
+    Some(sealdb_errno::Error::new(
+        sealdb_errno::ERR_UNKNOWN_COLLATION,
+        message,
+    ))
+}
+
+pub fn is_text_encodable(charset: &str, text: &str) -> bool {
+    match normalized_name(charset).as_str() {
+        "gbk" => encoding_gbk::decode(&encoding_gbk::encode(text)) == text,
+        "ascii" => text.is_ascii(),
+        // utf8mb4 / utf8 / latin1 (TiDB keeps latin1 as a UTF-8 nop) / binary.
+        _ => true,
+    }
+}
+
 pub fn is_supported_charset(name: &str) -> bool {
     let lower = name
         .trim_matches(|c| c == '\'' || c == '"')
@@ -61,7 +123,9 @@ impl Collation {
             .trim_matches(|c| c == '\'' || c == '"')
             .to_ascii_lowercase();
         let name = match charset.as_str() {
-            "gbk" => "gbk_bin",
+            // TiDB keeps `gbk_chinese_ci` as the charset default (and thus the
+            // collation `SET NAMES gbk` installs); table defaults use it too.
+            "gbk" => "gbk_chinese_ci",
             "latin1" => "latin1_bin",
             "utf8" => "utf8_bin",
             "ascii" => "ascii_bin",

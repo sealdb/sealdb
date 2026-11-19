@@ -1891,17 +1891,25 @@ impl Session {
         };
         let plan = sealdb_planner::with_planner_blacklist(blacklist, || {
             sealdb_expression::with_current_db(current_db.as_str(), || {
-            sealdb_planner::with_cost_model_version(cost_model_version, || {
-                sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
-                    sealdb_planner::with_insubq_to_join_and_agg(opt_insubq_to_join_and_agg, || {
-                        sealdb_planner::with_hashagg_concurrency(
-                            hashagg_partial_concurrency,
-                            hashagg_final_concurrency,
+                sealdb_planner::with_cost_model_version(cost_model_version, || {
+                    sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
+                        sealdb_planner::with_insubq_to_join_and_agg(
+                            opt_insubq_to_join_and_agg,
                             || {
-                                sealdb_planner::with_foreign_key_checks(foreign_key_checks, || {
-                                    sealdb_planner::with_explicit_txn(explicit_txn, || {
-                                        sealdb_planner::with_dirty_tables(dirty_tables, || {
-                                            sealdb_planner::with_stable_result_mode(
+                                sealdb_planner::with_hashagg_concurrency(
+                                    hashagg_partial_concurrency,
+                                    hashagg_final_concurrency,
+                                    || {
+                                        sealdb_planner::with_foreign_key_checks(
+                                            foreign_key_checks,
+                                            || {
+                                                sealdb_planner::with_explicit_txn(
+                                                    explicit_txn,
+                                                    || {
+                                                        sealdb_planner::with_dirty_tables(
+                                                            dirty_tables,
+                                                            || {
+                                                                sealdb_planner::with_stable_result_mode(
                                                 ordered_result_mode,
                                                 || {
                                                     if use_cache {
@@ -1946,14 +1954,18 @@ impl Session {
                                                     }
                                                 },
                                             )
-                                        })
-                                    })
-                                })
+                                                            },
+                                                        )
+                                                    },
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
                             },
                         )
                     })
                 })
-            })
             })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
@@ -4720,15 +4732,25 @@ fn apply_set(session: &Session, stmt: &sealdb_parser::ast::SetStmt) -> Result<Ve
                 *session.collation.lock().expect("session collation lock") =
                     Collation::default_for_charset(&value);
             }
-            "collation_connection" | "collation_database" => {
-                if !sealdb_parser::charset::is_supported_collation(&value) {
-                    return Err(sealdb_errno::Error::new(
-                        sealdb_errno::ERR_UNKNOWN_COLLATION,
-                        format!("Unknown collation: '{value}'"),
-                    ));
+            "collation_connection" | "collation_database" | "collation_server" => {
+                // `SET … = DEFAULT` restores the built-in default collation
+                // (`utf8mb4_bin`) instead of naming one.
+                if value.eq_ignore_ascii_case("DEFAULT") {
+                    if name != "collation_server" {
+                        *session.collation.lock().expect("session collation lock") =
+                            Collation::bin();
+                    }
+                } else {
+                    if let Some(err) = sealdb_parser::charset::collation_validation_error(&value) {
+                        return Err(err);
+                    }
+                    // `collation_server` is a database default, not the session's
+                    // comparison collation.
+                    if name != "collation_server" {
+                        *session.collation.lock().expect("session collation lock") =
+                            Collation::parse(&value);
+                    }
                 }
-                *session.collation.lock().expect("session collation lock") =
-                    Collation::parse(&value);
             }
             "sql_mode" => {
                 // `SET sql_mode = DEFAULT` restores the instance default, not
@@ -5555,6 +5577,15 @@ fn apply_set_global(session: &Session, name: &str, value: &str) -> Result<Vec<(i
             session
                 .domain
                 .set_global_character_set_connection(value.to_string());
+        }
+        // GLOBAL collation defaults follow the same validation as the session
+        // ones (an unknown/legacy collation is error 1273); `DEFAULT` resets.
+        "collation_connection" | "collation_database" | "collation_server" => {
+            if !value.eq_ignore_ascii_case("DEFAULT")
+                && let Some(err) = sealdb_parser::charset::collation_validation_error(value)
+            {
+                return Err(err);
+            }
         }
         // System-wide memory OOM policy; SealDB tracks per session, so accept
         // the assignment without persisting a domain-wide default.
@@ -9326,7 +9357,10 @@ mod tests {
             .execute_stmt("explain format = 'brief' select * from t where a < 1")
             .unwrap();
         assert_eq!(
-            rows.rows.iter().map(|row| row[0].display()).collect::<Vec<_>>(),
+            rows.rows
+                .iter()
+                .map(|row| row[0].display())
+                .collect::<Vec<_>>(),
             vec!["Selection", "└─TableReader", "  └─TableFullScan"]
         );
         assert_eq!(rows.rows[0][1].display(), "8000.00");
@@ -9355,7 +9389,10 @@ mod tests {
                 .execute_stmt("explain format = 'brief' select * from t where a < 1")
                 .unwrap();
             assert_eq!(
-                rows.rows.iter().map(|row| row[0].display()).collect::<Vec<_>>(),
+                rows.rows
+                    .iter()
+                    .map(|row| row[0].display())
+                    .collect::<Vec<_>>(),
                 vec!["Selection", "└─TableReader", "  └─TableFullScan"],
                 "{name}"
             );
@@ -12389,7 +12426,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             vars.display_rows()[0],
-            vec!["gbk".to_string(), "gbk_bin".to_string()]
+            vec!["gbk".to_string(), "gbk_chinese_ci".to_string()]
         );
 
         // gbk_bin: 啊 (B0A1) < 阿 (B0A2); case-sensitive.
@@ -12536,7 +12573,7 @@ mod tests {
 
         for (charset, coll) in [
             ("utf8mb4", "utf8mb4_bin"),
-            ("gbk", "gbk_bin"),
+            ("gbk", "gbk_chinese_ci"),
             ("latin1", "latin1_bin"),
         ] {
             session

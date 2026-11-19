@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-19（green 109 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-19（green 111 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -4245,6 +4245,51 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
     这类字符串字面量存在被误判为星号的边界风险，语料未覆盖。
 - **下一步**:
   - `expression/builtin` / `expression/issues` 等 R7 表达式长尾套件。
+
+### 2026-11-19（`ddl/table_modify` / `executor/charset` 转绿：表级 charset/collation 校验、ENUM/SET 重复值、MERGE 选项、浮点默认值）
+
+- **Phase**: R6 `ddl/table_modify` + R7 `executor/charset` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `CREATE DATABASE … CHARSET/COLLATE`：`CreateDatabaseStmt` 增加 `charset`/`collate`
+    字段，`create_schema`/`alter_schema` 写入 `DBInfo`，`CREATE TABLE` 未显式声明时
+    继承库级默认（`build_table_info_with_defaults`）。
+  - 表级选项校验下沉到 parser lowering，保留选项书写顺序：
+    `CHARSET utf8 COLLATE utf8mb4_unicode_ci` → 1253
+    `COLLATION '…' is not valid for CHARACTER SET '…'`；
+    `COLLATE … CHARSET …` 字符集冲突 → 1302 `Conflicting declarations`；
+    未知字符集 → 1115。
+  - `ENUM`/`SET` 成员重复值 → 1291（ci collation 下大小写等价），
+    `MERGE UNION=(…)` → 8232、`INSERT_METHOD` → 8233（CREATE 与 ALTER 同一校验），
+    `ALTER TABLE … PRE_SPLIT_REGIONS` → 8200。
+  - 列默认值语义：重复 `DEFAULT` 取最后一个；`double/float` 非引号默认值按
+    float64 最短表示并加引号（`double DEFAULT 2.0` → `DEFAULT '2'`）。
+  - `SHOW CREATE TABLE` 列级 collation 打印对齐 TiDB：字符集与表一致但排序规则
+    非该字符集默认时仍打印 `COLLATE`（`varchar(10) COLLATE utf8_general_ci`）。
+  - collation 聚合修正：binary 操作数按 TiDB `inferCollation` 规则参与聚合
+    （不再把可强制转换的字面量直接提升为 binary 的反向结果），
+    修复 `expression/constant_fold` 中 `collation(ifnull(concat(id),'~'))` 期望 `binary`。
+  - `SET [GLOBAL] collation_server|collation_connection|collation_database = DEFAULT`
+    恢复内置默认（`utf8mb4_bin`），不再报 1273。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory --status pending -t ddl/table_modify`
+    → `PASS: memory=1 tikv=0 skipped=253`；`-s tikv` → `PASS: memory=0 tikv=1`
+  - `./tests/integrationtest/run-tests.sh -s memory --status pending -t executor/charset`
+    → `PASS: memory=1 tikv=0 skipped=253`；`-s tikv` → `PASS: memory=0 tikv=1`
+  - 回归：`expression/constant_fold`、`session/variable` 单套复验 PASS；
+    `cargo test -q -p sealdb-parser -p sealdb-ddl -p sealdb-errno --lib` 全通过。
+  - 全量 green gate：`./tests/integrationtest/run-tests.sh -s both --status green`
+    → `PASS: memory=111 tikv=110 skipped=144`；
+    green + local 全量 gate：`./tests/integrationtest/run-tests.sh`
+    → `PASS: memory=119 tikv=117 skipped=137`。
+  - manifest：`ddl/table_modify`、`executor/charset` → `green`，green 109→111
+    （R6 16→17、R7 42→43，pending 126→124）。
+- **阻塞/风险**:
+  - `COERCIBILITY_NUMERIC` 操作数（数字列参与字符串函数）暂按 `binary` 处理，
+    与 TiDB 的 numeric 级别（3）仍有细粒度差异，语料未覆盖。
+  - 表级 collation 与 charset 的 1253/1302 判定依赖 sqlparser 保留的选项顺序；
+    `ALTER TABLE` 走文本级选项解析，复杂表达式选项未覆盖。
+- **下一步**:
+  - R6 剩余 `ddl/db_table` / `ddl/modify_column` 等，及 R7 表达式长尾套件。
 
 ## 7. 更新模板
 

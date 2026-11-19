@@ -102,10 +102,12 @@ fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
     )
 }
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_DUP_FIELDNAME, ERR_ILLEGAL_VALUE_FOR_TYPE, ERR_INCORRECT_USAGE,
-    ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TOO_BIG_PRECISION,
-    ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_ERROR,
-    ERR_UNSUPPORTED, Error, Result,
+    ERR_BAD_FIELD, ERR_COLLATION_CHARSET_MISMATCH, ERR_CONFLICTING_DECLARATIONS, ERR_DUP_FIELDNAME,
+    ERR_ILLEGAL_VALUE_FOR_TYPE, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
+    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED,
+    ERR_TABLE_OPTION_UNION_UNSUPPORTED, ERR_TOO_BIG_PRECISION, ERR_TTL_MULTI_SCHEMA_CHANGE,
+    ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_CHARACTER_SET, ERR_UNKNOWN_ERROR,
+    ERR_UNSUPPORTED, ERR_UNSUPPORTED_DDL_OPERATION, Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -171,7 +173,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(None));
     PENDING_PARTIAL_INDEX_PREDICATES.with(|cell| cell.borrow_mut().clear());
     PENDING_GROUP_BY_ORDER.with(|cell| cell.set(false));
-    let rewritten = strip_tidb_create_table_options(&rewritten);
+    let rewritten = strip_tidb_create_table_options(&rewritten)?;
     // MySQL `INSERT … PARTITION (p0, p1) (cols) VALUES` — sqlparser wants the
     // column list first.
     let rewritten = rewrite_insert_partition_columns(&rewritten);
@@ -317,6 +319,7 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
                 }
                 AlterPartOp::Options(options) => {
                     for (name, value) in options {
+                        validate_table_option(&name)?;
                         alter
                             .specs
                             .push(AlterTableSpec::TableOption { name, value });
@@ -749,10 +752,14 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         SqlStatement::CreateDatabase {
             db_name,
             if_not_exists,
+            default_charset,
+            default_collation,
             ..
         } => Ok(Statement::CreateDatabase(CreateDatabaseStmt {
             if_not_exists: *if_not_exists,
             name: object_name_last(db_name)?,
+            charset: default_charset.clone(),
+            collate: default_collation.clone(),
         })),
         SqlStatement::CreateSchema {
             schema_name,
@@ -761,6 +768,8 @@ fn lower_statement(stmt: &SqlStatement) -> Result<Statement> {
         } => Ok(Statement::CreateDatabase(CreateDatabaseStmt {
             if_not_exists: *if_not_exists,
             name: schema_name_last(schema_name)?,
+            charset: None,
+            collate: None,
         })),
         SqlStatement::CreateTable(create) => lower_create_table(create),
         SqlStatement::CreateView(create) => lower_create_view(create),
@@ -2110,7 +2119,10 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
                 let after_reload = skip_ws(bytes, j);
                 for (keyword, target) in [
                     ("OPT_RULE_BLACKLIST", AdminReloadKind::OptRuleBlacklist),
-                    ("EXPR_PUSHDOWN_BLACKLIST", AdminReloadKind::ExprPushdownBlacklist),
+                    (
+                        "EXPR_PUSHDOWN_BLACKLIST",
+                        AdminReloadKind::ExprPushdownBlacklist,
+                    ),
                 ] {
                     if keyword_at(bytes, after_reload, keyword) {
                         kind = target;
@@ -3819,7 +3831,7 @@ fn index_def_invisible(options: &[sqlparser::ast::IndexOption]) -> bool {
 /// Drops TiDB `CREATE TABLE` extension clauses sqlparser rejects:
 /// `PRIMARY KEY (c) CLUSTERED|NONCLUSTERED`, `INDEX (c) GLOBAL` index
 /// options, and `pre_split_regions=N` / `shard_row_id_bits=N` table options.
-fn strip_tidb_create_table_options(sql: &str) -> String {
+fn strip_tidb_create_table_options(sql: &str) -> Result<String> {
     let lower = sql.to_ascii_lowercase();
     let start = match lower.find("create table") {
         Some(pos) => pos,
@@ -3831,7 +3843,7 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                 Some(pos) => pos,
                 None => match lower.find("create unique index") {
                     Some(pos) => pos,
-                    None => return sql.to_string(),
+                    None => return Ok(sql.to_string()),
                 },
             },
         },
@@ -3853,6 +3865,9 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
     let mut in_bt = false;
     // Partial-index predicates only exist inside a `CREATE TABLE ( … )` body.
     let partial_ok = lower[start..].trim_start().starts_with("create table");
+    // TiDB only accepts `PRE_SPLIT_REGIONS` in CREATE TABLE; ALTER TABLE
+    // reports the whole statement as unsupported (8200).
+    let alter_ok = lower[start..].trim_start().starts_with("alter table");
     let mut depth = 0i32;
     let mut item_start: Option<usize> = None;
     while i < bytes.len() {
@@ -4019,6 +4034,12 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
                                     PENDING_SHARD_ROW_ID_BITS.with(|cell| cell.set(Some(value)));
                                 }
                                 "pre_split_regions" => {
+                                    if alter_ok {
+                                        return Err(Error::new(
+                                            ERR_UNSUPPORTED_DDL_OPERATION,
+                                            "This type of ALTER TABLE is currently unsupported",
+                                        ));
+                                    }
                                     PENDING_PRE_SPLIT_REGIONS.with(|cell| cell.set(Some(value)));
                                 }
                                 _ => {}
@@ -4038,7 +4059,7 @@ fn strip_tidb_create_table_options(sql: &str) -> String {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// End of a partial-index predicate: the next `,` or `)` at the table-body
@@ -7656,6 +7677,7 @@ const ALTER_TABLE_OPTION_KEYWORDS: &[&str] = &[
     "PASSWORD",
     "ENCRYPTION",
     "INSERT_METHOD",
+    "UNION",
     "KEY_BLOCK_SIZE",
     "MAX_ROWS",
     "MIN_ROWS",
@@ -11575,7 +11597,9 @@ fn lower_create_view(create: &CreateView) -> Result<Statement> {
 }
 
 fn lower_column_default(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<String> {
-    options.iter().find_map(|opt| match &opt.option {
+    // MySQL keeps the last `DEFAULT` when a column repeats it
+    // (`a double DEFAULT 1.0 DEFAULT 2.0` → default 2.0).
+    options.iter().rev().find_map(|opt| match &opt.option {
         sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
         _ => None,
     })
@@ -11584,7 +11608,7 @@ fn lower_column_default(options: &[sqlparser::ast::ColumnOptionDef]) -> Option<S
 /// `DEFAULT <expr>` from an `ALTER TABLE … CHANGE/MODIFY COLUMN` option list
 /// (sqlparser stores those as bare `ColumnOption`s).
 fn lower_column_option_default(options: &[sqlparser::ast::ColumnOption]) -> Option<String> {
-    options.iter().find_map(|opt| match opt {
+    options.iter().rev().find_map(|opt| match opt {
         sqlparser::ast::ColumnOption::Default(expr) => Some(expr.to_string()),
         _ => None,
     })
@@ -11851,7 +11875,8 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
             },
         );
     }
-    let (charset, collate) = lower_table_charset_collate(&create.table_options);
+    validate_create_table_options(&create.table_options)?;
+    let (charset, collate) = lower_table_charset_collate(&create.table_options)?;
     let (shard_row_id_bits, pre_split_regions) = take_tidb_table_options();
     Ok(Statement::CreateTable(CreateTableStmt {
         if_not_exists: create.if_not_exists,
@@ -11875,17 +11900,57 @@ fn lower_create_table(create: &CreateTable) -> Result<Statement> {
     }))
 }
 
+/// TiDB rejects the MERGE `UNION=(...)` and `INSERT_METHOD` table options in
+/// CREATE/ALTER TABLE (8232 / 8233); SealDB never implements them.
+fn validate_table_option(name: &str) -> Result<()> {
+    if name.eq_ignore_ascii_case("UNION") {
+        return Err(Error::new(
+            ERR_TABLE_OPTION_UNION_UNSUPPORTED,
+            "CREATE/ALTER table with union option is not supported",
+        ));
+    }
+    if name.eq_ignore_ascii_case("INSERT_METHOD") {
+        return Err(Error::new(
+            ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED,
+            "CREATE/ALTER table with insert method option is not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject the table options TiDB refuses in `CREATE TABLE`.
+fn validate_create_table_options(options: &sqlparser::ast::CreateTableOptions) -> Result<()> {
+    use sqlparser::ast::{CreateTableOptions, SqlOption};
+    let CreateTableOptions::Plain(list) = options else {
+        return Ok(());
+    };
+    for opt in list {
+        match opt {
+            SqlOption::KeyValue { key, .. } => validate_table_option(&key.value)?,
+            SqlOption::NamedParenthesizedList(list) => validate_table_option(&list.key.value)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Table-level `DEFAULT CHARSET` / `COLLATE` options of `CREATE TABLE`.
+///
+/// TiDB validates here rather than at execution time, so the option order is
+/// still visible: `COLLATE x CHARSET y` with mismatching charsets is a
+/// conflicting declaration (1302), while `CHARSET x COLLATE y` checks that the
+/// collation belongs to the charset (1253).
 fn lower_table_charset_collate(
     options: &sqlparser::ast::CreateTableOptions,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>)> {
     use sqlparser::ast::CreateTableOptions;
     let list = match options {
         CreateTableOptions::Plain(list) => list,
-        _ => return (None, None),
+        _ => return Ok((None, None)),
     };
     let mut charset = None;
     let mut collate = None;
+    let mut collate_seen_first = false;
     for opt in list {
         let sqlparser::ast::SqlOption::KeyValue { key, value } = opt else {
             continue;
@@ -11904,13 +11969,48 @@ fn lower_table_charset_collate(
             // `CHARSET` is shorthand for `CHARACTER SET`; a leading `DEFAULT`
             // is noise in the table options.
             "CHARSET" | "CHARACTER SET" | "DEFAULT CHARSET" | "DEFAULT CHARACTER SET" => {
+                if !crate::charset::is_supported_charset(&text) {
+                    return Err(Error::new(
+                        ERR_UNKNOWN_CHARACTER_SET,
+                        format!("Unknown character set: '{text}'"),
+                    ));
+                }
                 charset = Some(text.to_ascii_lowercase())
             }
-            "COLLATE" | "DEFAULT COLLATE" => collate = Some(text),
+            "COLLATE" | "DEFAULT COLLATE" => {
+                if let Some(err) = crate::charset::collation_validation_error(&text) {
+                    return Err(err);
+                }
+                if charset.is_none() {
+                    collate_seen_first = true;
+                }
+                collate = Some(text)
+            }
             _ => {}
         }
     }
-    (charset, collate)
+    if let (Some(charset), Some(collate)) = (&charset, &collate) {
+        let parsed = crate::charset::Collation::parse(collate);
+        if parsed.charset != *charset {
+            if collate_seen_first {
+                return Err(Error::new(
+                    ERR_CONFLICTING_DECLARATIONS,
+                    format!(
+                        "Conflicting declarations: 'CHARACTER SET {}' and 'CHARACTER SET {}'",
+                        parsed.charset, charset
+                    ),
+                ));
+            }
+            return Err(Error::new(
+                ERR_COLLATION_CHARSET_MISMATCH,
+                format!(
+                    "COLLATION '{}' is not valid for CHARACTER SET '{}'",
+                    parsed.name, charset
+                ),
+            ));
+        }
+    }
+    Ok((charset, collate))
 }
 
 /// `FOREIGN KEY` constraints, in definition order (TiDB keeps them separate
@@ -12121,8 +12221,21 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
         })),
         // `_utf8mb4'…'` / `_binary '…'`: a charset introducer on a string
         // literal. TiDB keeps the literal value and uses the introducer only
-        // for the literal's charset/collation.
+        // for the literal's charset/collation. The parser accepts any
+        // `_<name>` prefix, so the supported set is enforced here: `_gbk'…'`
+        // raises 1115 even though `charset gbk` is a valid table option.
         Expr::Prefixed { prefix, value } if prefix.value.starts_with('_') => {
+            let introducer = prefix
+                .value
+                .trim_start_matches('_')
+                .trim_matches(['`', '\'', '"'])
+                .to_ascii_lowercase();
+            if !crate::charset::is_supported_introducer(&introducer) {
+                return Err(Error::new(
+                    ERR_UNKNOWN_CHARACTER_SET,
+                    format!("Unsupported character introducer: '{introducer}'"),
+                ));
+            }
             Ok(ExprNode::Value(ValueExpr {
                 datum: lower_value_from_expr(value)?,
             }))
@@ -12195,8 +12308,36 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
                 json: false,
             }))
         }
+        // `expr COLLATE <name>` keeps the value; the collation is static
+        // metadata (`COLLATION()`, collation aggregation, weight strings).
+        Expr::Collate { expr, collation } => {
+            let name = collation.to_string();
+            if let Some(err) = crate::charset::collation_validation_error(&name) {
+                return Err(err);
+            }
+            lower_collate_using("__collate", expr, &name)
+        }
+        // `CONVERT(expr USING <charset>)`: charset conversion with metadata
+        // only (storage keeps UTF-8 bytes in this engine).
+        Expr::Convert {
+            is_try: false,
+            expr,
+            data_type: None,
+            charset: Some(charset),
+            ..
+        } => {
+            let name = charset.to_string();
+            if !crate::charset::is_supported_charset(&name) {
+                return Err(Error::new(
+                    ERR_UNKNOWN_CHARACTER_SET,
+                    format!("Unknown character set: '{name}'"),
+                ));
+            }
+            lower_collate_using("__convert_using", expr, &name)
+        }
         // `CONVERT(expr, type)` is `CAST(expr AS type)` in MySQL; the
-        // `USING charset` form has no CAST equivalent and is not supported.
+        // `USING charset` form has no CAST equivalent and is a metadata-only
+        // string function here.
         Expr::Convert {
             is_try: false,
             expr,
@@ -12451,6 +12592,23 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             format!("expression {other} is not available in this phase"),
         )),
     }
+}
+
+/// `expr COLLATE name` / `CONVERT(expr USING charset)` → a one-value metadata
+/// wrapper. Both keep the operand's bytes and only change the static
+/// charset/collation information used by `COLLATION()` and by the
+/// collation-aggregation rules.
+fn lower_collate_using(func_name: &str, expr: &Expr, name: &str) -> Result<ExprNode> {
+    Ok(ExprNode::Func(FuncCallExpr {
+        name: func_name.to_string(),
+        args: vec![
+            lower_expr(expr)?,
+            ExprNode::Value(ValueExpr {
+                datum: Datum::Bytes(name.trim_matches('`').as_bytes().to_vec()),
+            }),
+        ],
+        distinct: false,
+    }))
 }
 
 /// `expr IS [NOT] TRUE|FALSE|UNKNOWN` → dedicated scalar function call; the

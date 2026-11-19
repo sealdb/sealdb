@@ -19,10 +19,44 @@ pub fn create_schema(
         ));
     }
     let id = meta.gen_global_id()?;
-    let db = DBInfo::new(id, stmt.name.clone());
+    let mut db = DBInfo::new(id, stmt.name.clone());
+    apply_schema_charset_collation(&mut db, stmt.charset.as_deref(), stmt.collate.as_deref())?;
     meta.create_database(&db)?;
     meta.gen_schema_version()?;
     Ok(db)
+}
+
+/// `DEFAULT CHARACTER SET` / `COLLATE` of `CREATE`/`ALTER DATABASE`: an
+/// unknown charset is 1115, an unsupported collation is 1273.
+fn apply_schema_charset_collation(
+    db: &mut DBInfo,
+    charset: Option<&str>,
+    collate: Option<&str>,
+) -> Result<()> {
+    if let Some(cs) = charset {
+        if !sealdb_parser::charset::is_supported_charset(cs) {
+            return Err(Error::new(
+                sealdb_errno::ERR_UNKNOWN_CHARACTER_SET,
+                format!("Unknown character set: '{cs}'"),
+            ));
+        }
+        let coll = Collation::default_for_charset(cs);
+        db.charset = coll.charset.clone();
+        if collate.is_none() {
+            db.collate = coll.name;
+        }
+    }
+    if let Some(coll) = collate {
+        if let Some(err) = sealdb_parser::charset::collation_validation_error(coll) {
+            return Err(err);
+        }
+        let parsed = Collation::parse(coll);
+        db.collate = parsed.name;
+        if charset.is_none() {
+            db.charset = parsed.charset;
+        }
+    }
+    Ok(())
 }
 
 pub fn drop_schema(meta: &mut Mutator, is: &InfoSchema, stmt: &DropDatabaseStmt) -> Result<()> {
@@ -61,20 +95,7 @@ pub fn alter_schema(
         return Err(Error::new(ERR_BAD_DB, format!("Unknown database '{name}'")));
     };
     let mut db = existing.clone();
-    if let Some(cs) = &stmt.charset {
-        let coll = Collation::default_for_charset(cs);
-        db.charset = coll.charset.clone();
-        if stmt.collate.is_none() {
-            db.collate = coll.name;
-        }
-    }
-    if let Some(coll) = &stmt.collate {
-        let parsed = Collation::parse(coll);
-        db.collate = parsed.name;
-        if stmt.charset.is_none() {
-            db.charset = parsed.charset;
-        }
-    }
+    apply_schema_charset_collation(&mut db, stmt.charset.as_deref(), stmt.collate.as_deref())?;
     meta.update_database(&db)?;
     meta.gen_schema_version()?;
     Ok(db)

@@ -1,6 +1,6 @@
 use crate::create_table::{
-    build_table_info, build_table_info_with_like, columns_from_select, referenced_by_foreign_key,
-    validate_ttl,
+    build_table_info_with_defaults, build_table_info_with_like, columns_from_select,
+    referenced_by_foreign_key, validate_ttl,
 };
 use sealdb_errno::{
     ERR_BAD_DB, ERR_BAD_TABLE, ERR_NO_DB, ERR_NO_SUCH_TABLE, ERR_TABLE_EXISTS,
@@ -48,7 +48,11 @@ pub fn create_table(
         {
             built.cols = columns_from_select(is, select, current_db)?;
         }
-        let mut info = build_table_info(&built, table_id)?;
+        let mut info = build_table_info_with_defaults(
+            &built,
+            table_id,
+            Some((db.charset.clone(), db.collate.clone())),
+        )?;
         if let Some(ttl) = &built.ttl {
             info.ttl = Some(sealdb_meta::TtlInfo {
                 expr: ttl.expr.clone(),

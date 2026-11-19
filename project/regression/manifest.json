@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 109,
+      "green": 111,
       "in_progress": 9,
       "local": 8,
-      "pending": 126
+      "pending": 124
     },
     "by_wave": {
       "D": 2,
@@ -496,7 +496,7 @@
     {
       "name": "ddl/table_modify",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/table_modify.test",
       "result": "r/ddl/table_modify.result",
       "has_result": true,
@@ -566,7 +566,7 @@
     {
       "name": "executor/charset",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/executor/charset.test",
       "result": "r/executor/charset.result",
       "has_result": true,

@@ -28,6 +28,11 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_AUTOINC_READ_FAILED => "ErrAutoincReadFailed",
         errcode::ERR_WARN_DATA_OUT_OF_RANGE => "ErrWarnDataOutOfRange",
         errcode::ERR_TRUNCATED_WRONG_VALUE => "ErrTruncatedWrongValue",
+        errcode::ERR_DUPLICATED_VALUE_IN_TYPE => "ErrDuplicatedValueInType",
+        errcode::ERR_TABLE_OPTION_UNION_UNSUPPORTED => "ErrTableOptionUnionUnsupported",
+        errcode::ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED => {
+            "ErrTableOptionInsertMethodUnsupported"
+        }
         errcode::ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD => "ErrTruncatedWrongValueForField",
         errcode::ERR_UNKNOWN_FUNCTION => "ErrUnknownFunction",
         errcode::ERR_INVALID_JSON_TEXT => "ErrInvalidJSONText",
@@ -77,6 +82,9 @@ pub fn name_of(code: i32) -> &'static str {
         errcode::ERR_UNKNOWN_STMT_HANDLER => "ErrUnknownStmtHandler",
         errcode::ERR_UNKNOWN_CHARACTER_SET => "ErrUnknownCharacterSet",
         errcode::ERR_UNKNOWN_COLLATION => "ErrUnknownCollation",
+        errcode::ERR_COLLATION_CHARSET_MISMATCH => "ErrCollationCharsetMismatch",
+        errcode::ERR_CONFLICTING_DECLARATIONS => "ErrConflictingDeclarations",
+        errcode::ERR_CANT_AGGREGATE_2COLLATIONS => "ErrCantAggregate2collations",
         errcode::ERR_WRONG_OBJECT => "ErrWrongObject",
         errcode::ERR_VIEW_CHECK_FAILED => "ErrViewCheckFailed",
         errcode::ERR_VIEW_SELECT_VARIABLE => "ErrViewSelectVariable",
@@ -186,6 +194,8 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_WRONG_TYPE_FOR_VAR => "42000",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "25006",
         errcode::ERR_LOCK_DEADLOCK => "40001",
+        errcode::ERR_UNKNOWN_CHARACTER_SET => "42000",
+        errcode::ERR_COLLATION_CHARSET_MISMATCH => "42000",
         _ => "HY000",
     }
 }

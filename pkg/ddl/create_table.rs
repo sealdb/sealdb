@@ -1,9 +1,9 @@
 use sealdb_errno::{
     ERR_BAD_FIELD, ERR_BLOB_CANT_HAVE_DEFAULT, ERR_CANNOT_ADD_FOREIGN, ERR_DUP_FIELDNAME,
-    ERR_FK_DUP_NAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED, ERR_GENERATED_COLUMN_REF_AUTO_INC,
-    ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE, ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN,
-    ERR_TTL_UNSUPPORTED_PK_TYPE, ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error,
-    Result,
+    ERR_DUPLICATED_VALUE_IN_TYPE, ERR_FK_DUP_NAME, ERR_GENERATED_COLUMN_FUNCTION_NOT_ALLOWED,
+    ERR_GENERATED_COLUMN_REF_AUTO_INC, ERR_INVALID_DEFAULT, ERR_NO_SUCH_TABLE,
+    ERR_TOO_BIG_DISPLAYWIDTH, ERR_TTL_INVALID_COLUMN, ERR_TTL_UNSUPPORTED_PK_TYPE,
+    ERR_VIEW_WRONG_LIST, ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_meta::{ColumnInfo, IndexColumn, IndexInfo, Mutator, TableInfo};
@@ -668,7 +668,14 @@ fn unquoted_default(field_type: &FieldType, trimmed: &str) -> Option<String> {
             }
         }
         EvalType::Real if matches!(field_type.tp, TYPE_FLOAT | TYPE_DOUBLE) => {
-            Some(literal.text.to_string())
+            // TiDB stores the float default as a float64 and SHOW CREATE prints
+            // its shortest decimal spelling, quoted (`double DEFAULT 2.0` →
+            // `DEFAULT '2'`).
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(|v| format!("'{v}'"))
         }
         _ => None,
     }
@@ -978,12 +985,23 @@ fn table_charset_and_collation(stmt: &CreateTableStmt) -> Option<(String, String
 }
 
 pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableInfo> {
+    build_table_info_with_defaults(stmt, table_id, None)
+}
+
+/// `build_table_info` with the enclosing database's charset/collation as the
+/// fallback for a table (and its columns) that names neither.
+pub fn build_table_info_with_defaults(
+    stmt: &CreateTableStmt,
+    table_id: i64,
+    schema_defaults: Option<(String, String)>,
+) -> Result<TableInfo> {
     if stmt.cols.is_empty() {
         return Err(Error::unsupported("CREATE TABLE without columns"));
     }
     // Table-level `DEFAULT CHARSET` / `COLLATE` is the default charset of every
-    // character column that does not name one (MySQL/TiDB semantics).
-    let table_defaults = table_charset_and_collation(stmt);
+    // character column that does not name one (MySQL/TiDB semantics). A table
+    // that names neither inherits the database default.
+    let table_defaults = table_charset_and_collation(stmt).or(schema_defaults);
     let mut columns = Vec::with_capacity(stmt.cols.len());
     for (offset, col) in stmt.cols.iter().enumerate() {
         let mut info = ColumnInfo::new(
@@ -1020,6 +1038,7 @@ pub fn build_table_info(stmt: &CreateTableStmt, table_id: i64) -> Result<TableIn
             info.generated_expr = Some(generated.expr.clone());
             info.generated_stored = generated.stored;
         }
+        validate_enum_set_members(&info.name.o().to_string(), &info.field_type)?;
         if let Some(default) = col.default.as_deref() {
             validate_default_expr(default)?;
         }
@@ -1815,6 +1834,35 @@ fn split_type(upper: &str) -> (&str, &str) {
 
 fn parse_len(type_name: &str) -> Option<i32> {
     parse_flen_decimal(type_name).map(|(flen, _)| flen)
+}
+
+/// `ENUM` / `SET` reject a member list with duplicates (MySQL 1291). A
+/// case-insensitive collation makes `'e'` and `'E'` the same member.
+fn validate_enum_set_members(col_name: &str, ft: &FieldType) -> Result<()> {
+    let kind = match ft.tp {
+        sealdb_types::field_type::TYPE_ENUM => "ENUM",
+        sealdb_types::field_type::TYPE_SET => "SET",
+        _ => return Ok(()),
+    };
+    let Some(elems) = &ft.elems else {
+        return Ok(());
+    };
+    let ci = ft.collate.ends_with("_ci") || ft.collate == "gbk_chinese_ci";
+    let mut seen = std::collections::HashSet::new();
+    for elem in elems {
+        let key = if ci {
+            elem.to_ascii_lowercase()
+        } else {
+            elem.clone()
+        };
+        if !seen.insert(key) {
+            return Err(Error::new(
+                ERR_DUPLICATED_VALUE_IN_TYPE,
+                format!("Column '{col_name}' has duplicated value '{elem}' in {kind}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse the member list of `ENUM('a','b')` / `SET('a','b')`, preserving case.

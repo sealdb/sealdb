@@ -34,6 +34,12 @@ pub const ERR_BAD_NULL: i32 = 1048;
 pub const ERR_DUP_ENTRY: i32 = 1062;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_TRUNCATED_WRONG_VALUE: i32 = 1292;
+/// MySQL `ER_DUPLICATED_VALUE_IN_TYPE`: duplicate member in ENUM/SET (1291).
+pub const ERR_DUPLICATED_VALUE_IN_TYPE: i32 = 1291;
+/// TiDB `ErrTableOptionUnionUnsupported`: MERGE `UNION=(...)` table option.
+pub const ERR_TABLE_OPTION_UNION_UNSUPPORTED: i32 = 8232;
+/// TiDB `ErrTableOptionInsertMethodUnsupported`: `INSERT_METHOD` table option.
+pub const ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED: i32 = 8233;
 /// MySQL `ER_TRUNCATED_WRONG_VALUE_FOR_FIELD`: a value that cannot be
 /// converted to the column's type (`Incorrect bigint value: '…'`), 1366.
 pub const ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD: i32 = 1366;
@@ -124,6 +130,12 @@ pub const ERR_INFO_SCHEMA_CHANGED: i32 = 8028;
 pub const ERR_UNKNOWN_STMT_HANDLER: i32 = 1243;
 pub const ERR_UNKNOWN_CHARACTER_SET: i32 = 1115;
 pub const ERR_UNKNOWN_COLLATION: i32 = 1273;
+/// MySQL `ER_COLLATION_CHARSET_MISMATCH`: a COLLATE names a collation that
+/// does not belong to the declared CHARACTER SET (1253).
+pub const ERR_COLLATION_CHARSET_MISMATCH: i32 = 1253;
+/// MySQL `ER_CONFLICTING_DECLARATIONS`: COLLATE before CHARSET names a
+/// different charset than CHARSET (1302).
+pub const ERR_CONFLICTING_DECLARATIONS: i32 = 1302;
 pub const ERR_WRONG_OBJECT: i32 = 1347;
 pub const ERR_VIEW_CHECK_FAILED: i32 = 1369;
 /// TiDB `ErrViewSelectVariable`: a VIEW SELECT references a variable or
@@ -237,3 +249,6 @@ pub const ERR_WRONG_PARAMCOUNT_TO_NATIVE_FCT: i32 = 1582;
 /// MySQL `ER_BLOB_CANT_HAVE_DEFAULT` (1101): a literal default on a
 /// `BLOB`/`TEXT`/`JSON` column.
 pub const ERR_BLOB_CANT_HAVE_DEFAULT: i32 = 1101;
+/// TiDB `ErrCantAggregate2collations` (1267): two operands of a string
+/// function have collations that cannot be aggregated.
+pub const ERR_CANT_AGGREGATE_2COLLATIONS: i32 = 1267;

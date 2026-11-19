@@ -1227,6 +1227,17 @@ fn now_fsp(args: &[ExprNode]) -> i8 {
 
 fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
     match func.name.to_ascii_uppercase().as_str() {
+        // `expr COLLATE name` / `CONVERT(expr USING charset)`: metadata-only
+        // wrappers, the value is the operand unchanged.
+        "__COLLATE" | "__CONVERT_USING" => {
+            let arg = func.args.first().ok_or_else(|| {
+                Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    format!("{} requires 1 argument", func.name),
+                )
+            })?;
+            eval_expr_with_row(arg, schema, row)
+        }
         "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
         // `LAST_INSERT_ID()` reads the session value; the one-argument form
         // sets it and returns the argument (MySQL semantics).

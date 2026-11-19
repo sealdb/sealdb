@@ -132,7 +132,7 @@ impl ExecutorBuilder {
                 // argument, so fold it here where the table types are known.
                 // The output names were derived from the original fields, so
                 // the display label keeps `collation(…)`.
-                let exprs = resolve_collation_exprs(&domain, select, current_db, exprs);
+                let exprs = resolve_collation_exprs(&domain, select, current_db, exprs)?;
                 // A covering read over an expression index only carries the
                 // hidden key column, so the SELECT expressions re-evaluate
                 // against it (`plus(t.a, 1)` → the stored `(a+1)` value).
@@ -1976,9 +1976,9 @@ fn resolve_collation_exprs(
     select: &SelectStmt,
     current_db: &str,
     exprs: Vec<ExprNode>,
-) -> Vec<ExprNode> {
+) -> Result<Vec<ExprNode>> {
     if !exprs.iter().any(contains_collation) {
-        return exprs;
+        return Ok(exprs);
     }
     let is = domain.infoschema();
     let info = select
@@ -2009,73 +2009,178 @@ fn contains_collation(expr: &ExprNode) -> bool {
     }
 }
 
-fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> ExprNode {
+fn fold_collation(expr: ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Result<ExprNode> {
     match expr {
         ExprNode::Func(mut func) => {
             if func.name.eq_ignore_ascii_case("collation") && func.args.len() == 1 {
-                let collation = expr_collation(&func.args[0], info);
-                return ExprNode::Value(sealdb_parser::ast::expressions::ValueExpr {
-                    datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
-                });
+                let collation = expr_collation(&func.args[0], info)?.collation;
+                return Ok(ExprNode::Value(
+                    sealdb_parser::ast::expressions::ValueExpr {
+                        datum: sealdb_types::Datum::Bytes(collation.into_bytes()),
+                    },
+                ));
             }
             func.args = func
                 .args
                 .into_iter()
                 .map(|arg| fold_collation(arg, info))
-                .collect();
-            ExprNode::Func(func)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ExprNode::Func(func))
         }
         ExprNode::Cast(mut cast) => {
-            cast.expr = Box::new(fold_collation(*cast.expr, info));
-            ExprNode::Cast(cast)
+            cast.expr = Box::new(fold_collation(*cast.expr, info)?);
+            Ok(ExprNode::Cast(cast))
         }
         ExprNode::Binary(mut binary) => {
-            binary.left = Box::new(fold_collation(*binary.left, info));
-            binary.right = Box::new(fold_collation(*binary.right, info));
-            ExprNode::Binary(binary)
+            binary.left = Box::new(fold_collation(*binary.left, info)?);
+            binary.right = Box::new(fold_collation(*binary.right, info)?);
+            Ok(ExprNode::Binary(binary))
         }
         ExprNode::Unary(mut unary) => {
-            unary.expr = Box::new(fold_collation(*unary.expr, info));
-            ExprNode::Unary(unary)
+            unary.expr = Box::new(fold_collation(*unary.expr, info)?);
+            Ok(ExprNode::Unary(unary))
         }
-        other => other,
+        other => Ok(other),
+    }
+}
+
+/// MySQL coercibility levels that matter for collation aggregation, in
+/// strength order (`EXPLICIT` beats `IMPLICIT` beats `COERCIBLE`). `IGNORABLE`
+/// (NULL) and `NUMERIC` operands do not participate.
+const COERCIBILITY_EXPLICIT: u8 = 0;
+const COERCIBILITY_IMPLICIT: u8 = 2;
+const COERCIBILITY_COERCIBLE: u8 = 4;
+const COERCIBILITY_IGNORABLE: u8 = 6;
+
+/// Collation metadata of one string operand (TiDB `types.FieldType` collation
+/// subset needed by `aggregateType`).
+#[derive(Clone, Debug)]
+struct CollationInfo {
+    collation: String,
+    charset: String,
+    coercibility: u8,
+    /// Literal text, when this operand is a coercible constant; used to check
+    /// that the value is representable in the aggregated charset.
+    text: Option<String>,
+}
+
+impl CollationInfo {
+    fn ignorable() -> Self {
+        Self {
+            collation: String::new(),
+            charset: String::new(),
+            coercibility: COERCIBILITY_IGNORABLE,
+            text: None,
+        }
+    }
+
+    fn is_neutral(&self) -> bool {
+        self.charset.is_empty()
+    }
+
+    fn coercibility_name(&self) -> &'static str {
+        match self.coercibility {
+            COERCIBILITY_EXPLICIT => "EXPLICIT",
+            COERCIBILITY_IMPLICIT => "IMPLICIT",
+            COERCIBILITY_COERCIBLE => "COERCIBLE",
+            _ => "IGNORABLE",
+        }
     }
 }
 
 /// TiDB `expression.GetCollation`: the collation of an expression's static
-/// type. A binary string (VARBINARY/BLOB) or a non-string operand reports
-/// `binary`; string literals and character columns report their charset's
-/// default collation. `binary` wins when a control function unifies arms.
-fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> String {
-    const DEFAULT: &str = "utf8mb4_general_ci";
-    let neutral = |coll: &str| coll.is_empty();
+/// type, together with the charset and coercibility used by the aggregation
+/// rules. A binary string (VARBINARY/BLOB/JSON) or a non-string operand
+/// reports `binary`; string literals report the utf8mb4 default collation.
+fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Result<CollationInfo> {
+    // String literals take the charset's default collation (`utf8mb4_bin`).
+    const DEFAULT: &str = "utf8mb4_bin";
     match expr {
-        ExprNode::Value(value) => match &value.datum {
-            sealdb_types::Datum::Bytes(_) => DEFAULT.to_string(),
-            sealdb_types::Datum::Null => String::new(),
-            _ => "binary".to_string(),
-        },
-        ExprNode::Column(column) => info
+        ExprNode::Value(value) => Ok(match &value.datum {
+            sealdb_types::Datum::Bytes(bytes) => CollationInfo {
+                collation: DEFAULT.to_string(),
+                charset: "utf8mb4".to_string(),
+                coercibility: COERCIBILITY_COERCIBLE,
+                text: Some(String::from_utf8_lossy(bytes).into_owned()),
+            },
+            sealdb_types::Datum::Null => CollationInfo::ignorable(),
+            _ => CollationInfo {
+                collation: "binary".to_string(),
+                charset: "binary".to_string(),
+                coercibility: COERCIBILITY_IGNORABLE,
+                text: None,
+            },
+        }),
+        ExprNode::Column(column) => Ok(info
             .and_then(|info| {
                 info.columns
                     .iter()
                     .find(|col| col.name.o().eq_ignore_ascii_case(&column.name))
             })
-            .map(|col| {
-                if col.field_type.charset == "binary" || col.field_type.collate == "binary" {
-                    "binary".to_string()
-                } else if !col.field_type.collate.is_empty() {
-                    col.field_type.collate.clone()
-                } else if col.field_type.eval_type() == sealdb_types::field_type::EvalType::String {
-                    DEFAULT.to_string()
-                } else {
-                    "binary".to_string()
-                }
-            })
-            .unwrap_or_else(|| DEFAULT.to_string()),
-        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => unify_collations(
+            .map(column_collation_info)
+            .unwrap_or_else(|| CollationInfo {
+                collation: DEFAULT.to_string(),
+                charset: "utf8mb4".to_string(),
+                coercibility: COERCIBILITY_IMPLICIT,
+                text: None,
+            })),
+        // `expr COLLATE <name>`: the explicit collation decides the charset and
+        // keeps the operand's coercibility (explicit).
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("__collate") => {
+            let collation = func
+                .args
+                .get(1)
+                .and_then(|arg| match arg {
+                    ExprNode::Value(v) => match &v.datum {
+                        sealdb_types::Datum::Bytes(bytes) => {
+                            Some(String::from_utf8_lossy(bytes).into_owned())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let mut out = func
+                .args
+                .first()
+                .map(|arg| expr_collation(arg, info))
+                .transpose()?
+                .unwrap_or_else(CollationInfo::ignorable);
+            out.charset = charset_of_collation(&collation);
+            out.collation = collation;
+            out.coercibility = COERCIBILITY_EXPLICIT;
+            Ok(out)
+        }
+        // `CONVERT(expr USING charset)`: a function result (implicit) whose
+        // charset is the conversion target.
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("__convert_using") => {
+            let charset = func
+                .args
+                .get(1)
+                .and_then(|arg| match arg {
+                    ExprNode::Value(v) => match &v.datum {
+                        sealdb_types::Datum::Bytes(bytes) => {
+                            Some(String::from_utf8_lossy(bytes).to_ascii_lowercase())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| "utf8mb4".to_string());
+            let mut out = func
+                .args
+                .first()
+                .map(|arg| expr_collation(arg, info))
+                .transpose()?
+                .unwrap_or_else(CollationInfo::ignorable);
+            out.collation = default_collation_for_charset(&charset);
+            out.charset = charset;
+            out.coercibility = COERCIBILITY_IMPLICIT;
+            Ok(out)
+        }
+        ExprNode::Func(func) if func.name.eq_ignore_ascii_case("concat") => aggregate_collations(
+            "concat",
             func.args.iter().map(|arg| expr_collation(arg, info)),
-            neutral,
         ),
         ExprNode::Func(func)
             if matches!(
@@ -2083,43 +2188,198 @@ fn expr_collation(expr: &ExprNode, info: Option<&sealdb_meta::TableInfo>) -> Str
                 "ifnull" | "coalesce" | "if" | "nullif" | "greatest" | "least"
             ) =>
         {
-            unify_collations(
-                func.args.iter().map(|arg| expr_collation(arg, info)),
-                neutral,
-            )
+            let op = func.name.to_ascii_lowercase();
+            aggregate_collations(&op, func.args.iter().map(|arg| expr_collation(arg, info)))
         }
-        ExprNode::Case(case) => unify_collations(
+        ExprNode::Cast(cast)
+            if cast.target.to_ascii_uppercase().starts_with("CHAR")
+                || cast.target.to_ascii_uppercase().starts_with("VARCHAR")
+                || cast.target.to_ascii_uppercase().starts_with("TEXT") =>
+        {
+            expr_collation(&cast.expr, info)
+        }
+        ExprNode::Case(case) => aggregate_collations(
+            "case",
             case.when_then
                 .iter()
                 .map(|(_, then)| expr_collation(then, info))
                 .chain(case.else_expr.as_deref().map(|e| expr_collation(e, info))),
-            neutral,
         ),
-        _ => "binary".to_string(),
+        _ => Ok(CollationInfo {
+            collation: "binary".to_string(),
+            charset: "binary".to_string(),
+            coercibility: COERCIBILITY_IMPLICIT,
+            text: None,
+        }),
     }
 }
 
-fn unify_collations(
-    collations: impl Iterator<Item = String>,
-    neutral: impl Fn(&str) -> bool,
-) -> String {
-    const DEFAULT: &str = "utf8mb4_general_ci";
-    let mut out = String::new();
-    for coll in collations {
-        if neutral(&coll) {
+/// Column field type → collation metadata (implicit coercibility).
+fn column_collation_info(col: &sealdb_meta::ColumnInfo) -> CollationInfo {
+    let ft = &col.field_type;
+    if ft.charset == "binary" || ft.collate == "binary" {
+        return CollationInfo {
+            collation: "binary".to_string(),
+            charset: "binary".to_string(),
+            coercibility: COERCIBILITY_IMPLICIT,
+            text: None,
+        };
+    }
+    if ft.eval_type() != sealdb_types::field_type::EvalType::String {
+        return CollationInfo {
+            collation: "binary".to_string(),
+            charset: "binary".to_string(),
+            coercibility: COERCIBILITY_IMPLICIT,
+            text: None,
+        };
+    }
+    let charset = if ft.charset.is_empty() {
+        "utf8mb4".to_string()
+    } else {
+        ft.charset.clone()
+    };
+    let collation = if ft.collate.is_empty() {
+        default_collation_for_charset(&charset)
+    } else {
+        ft.collate.clone()
+    };
+    CollationInfo {
+        collation,
+        charset,
+        coercibility: COERCIBILITY_IMPLICIT,
+        text: None,
+    }
+}
+
+/// TiDB `charset.DefaultCollationForCharset`.
+fn default_collation_for_charset(charset: &str) -> String {
+    match charset.to_ascii_lowercase().as_str() {
+        "utf8mb4" | "utf8mb3" => "utf8mb4_bin".to_string(),
+        "utf8" => "utf8_bin".to_string(),
+        "latin1" => "latin1_bin".to_string(),
+        "ascii" => "ascii_bin".to_string(),
+        "gbk" => "gbk_chinese_ci".to_string(),
+        "binary" => "binary".to_string(),
+        other => format!("{other}_bin"),
+    }
+}
+
+/// Charset a collation belongs to (`gbk_bin` → `gbk`).
+fn charset_of_collation(collation: &str) -> String {
+    let lower = collation.to_ascii_lowercase();
+    match lower.as_str() {
+        "binary" => "binary".to_string(),
+        _ => lower
+            .split('_')
+            .next()
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or("utf8mb4")
+            .to_string(),
+    }
+}
+
+/// TiDB `types.aggregateType` over the operands of a string function.
+fn aggregate_collations(
+    op: &str,
+    infos: impl Iterator<Item = Result<CollationInfo>>,
+) -> Result<CollationInfo> {
+    let mut out: Option<CollationInfo> = None;
+    for info in infos {
+        let info = info?;
+        if info.is_neutral() {
             continue;
         }
-        if out.is_empty() {
-            out = coll;
-        } else if coll == "binary" || out == "binary" {
-            out = "binary".to_string();
-        }
+        out = Some(match out {
+            None => info,
+            Some(current) => aggregate_collation_pair(current, info, op)?,
+        });
     }
-    if out.is_empty() {
-        DEFAULT.to_string()
+    Ok(out.unwrap_or_else(|| CollationInfo {
+        collation: "utf8mb4_general_ci".to_string(),
+        charset: "utf8mb4".to_string(),
+        coercibility: COERCIBILITY_COERCIBLE,
+        text: None,
+    }))
+}
+
+fn aggregate_collation_pair(a: CollationInfo, b: CollationInfo, op: &str) -> Result<CollationInfo> {
+    if a.collation == b.collation {
+        // Same collation: the operand with the larger repertoire wins (an
+        // ASCII-only operand cannot carry the union's characters).
+        return Ok(if a.charset == "binary" || b.charset != "binary" {
+            a
+        } else {
+            b
+        });
+    }
+    // Binary strings (TiDB `inferCollation`): a binary operand wins unless the
+    // other side has a strictly stronger coercibility, or the same coercibility
+    // and the newer operand is itself binary.
+    if a.charset == "binary" || b.charset == "binary" {
+        let take_arg = a.coercibility > b.coercibility
+            || (a.coercibility == b.coercibility && b.charset == "binary");
+        return Ok(if take_arg { b } else { a });
+    }
+    let (strong, weak) = if a.coercibility <= b.coercibility {
+        (&a, &b)
     } else {
-        out
+        (&b, &a)
+    };
+    if strong.coercibility < weak.coercibility {
+        // An explicit collation over an implicit operand is not allowed even
+        // though it has higher precedence (TiDB parity).
+        if strong.coercibility == COERCIBILITY_EXPLICIT
+            && weak.coercibility == COERCIBILITY_IMPLICIT
+        {
+            return Err(illegal_mix_of_collations(&a, &b, op));
+        }
+        // The coercible operand converts to the stronger side's charset when
+        // its characters are representable there.
+        if !strong.charset.is_empty()
+            && let Some(text) = &weak.text
+            && !sealdb_parser::charset::is_text_encodable(&strong.charset, text)
+        {
+            return Err(illegal_mix_of_collations(&a, &b, op));
+        }
+        return Ok(strong.clone());
     }
+    // Equal coercibility: resolve by charset (`ascii` coerces to any other
+    // charset, and a Unicode charset wins over a non-Unicode one).
+    if a.charset == b.charset {
+        return Ok(a);
+    }
+    if a.charset == "ascii" {
+        return Ok(b);
+    }
+    if b.charset == "ascii" {
+        return Ok(a);
+    }
+    let unicode = |charset: &str| charset == "utf8mb4" || charset == "utf8";
+    if unicode(&a.charset) && !unicode(&b.charset) {
+        return Ok(a);
+    }
+    if unicode(&b.charset) && !unicode(&a.charset) {
+        return Ok(b);
+    }
+    Err(illegal_mix_of_collations(&a, &b, op))
+}
+
+fn illegal_mix_of_collations(
+    a: &CollationInfo,
+    b: &CollationInfo,
+    op: &str,
+) -> sealdb_errno::Error {
+    sealdb_errno::Error::new(
+        sealdb_errno::ERR_CANT_AGGREGATE_2COLLATIONS,
+        format!(
+            "Illegal mix of collations ({},{}) and ({},{}) for operation '{}'",
+            a.collation,
+            a.coercibility_name(),
+            b.collation,
+            b.coercibility_name(),
+            op
+        ),
+    )
 }
 
 /// Attach FROM table name onto bare columns so overflow messages match TiDB

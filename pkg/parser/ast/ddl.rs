@@ -222,6 +222,10 @@ impl ColumnDef {
 pub struct CreateDatabaseStmt {
     pub if_not_exists: bool,
     pub name: String,
+    /// `[DEFAULT] CHARACTER SET <name>` / `CHARSET [=] <name>`.
+    pub charset: Option<String>,
+    /// `[DEFAULT] COLLATE [=] <name>`.
+    pub collate: Option<String>,
 }
 
 impl CreateDatabaseStmt {
@@ -231,6 +235,14 @@ impl CreateDatabaseStmt {
             ctx.write_str("IF NOT EXISTS ");
         }
         ctx.write_name(&self.name);
+        if let Some(charset) = &self.charset {
+            ctx.write_str(" DEFAULT CHARACTER SET ");
+            ctx.write_str(charset);
+        }
+        if let Some(collate) = &self.collate {
+            ctx.write_str(" COLLATE ");
+            ctx.write_str(collate);
+        }
         Ok(())
     }
 }
