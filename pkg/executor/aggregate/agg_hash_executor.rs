@@ -80,7 +80,8 @@ impl HashAggExec {
                     ExprNode::Column(col) => col.name.clone(),
                     _ => field
                         .orig_text
-                        .clone()
+                        .as_deref()
+                        .map(sealdb_parser::sqlparser_bridge::trim_field_comment)
                         .unwrap_or_else(|| restore_expr(&field.expr)),
                 });
             schema.push(name);

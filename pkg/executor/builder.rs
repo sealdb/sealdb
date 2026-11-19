@@ -2826,7 +2826,7 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
         _ => {
             // Non-literal: TiDB uses field.Text().
             if let Some(text) = orig_text {
-                strip_inner_comment_terminators(text.trim())
+                strip_field_comment_markers(text.trim())
             } else {
                 tidb_expr_display_name(expr)
             }
@@ -2834,26 +2834,10 @@ fn tidb_projection_field_name(expr: &ExprNode, orig_text: Option<&str>) -> Strin
     }
 }
 
-/// TiDB `SelectField.Text()` keeps a comment that ends the text (`1 /* c */`)
-/// but drops the `*/` terminator of a comment followed by more tokens:
-/// `(1 /* c */ + 2)` renders as `(1 /* c  + 2)`.
-fn strip_inner_comment_terminators(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(idx) = rest.find("*/") {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 2..];
-        let has_open = rest[..idx].rfind("/*").is_some();
-        let more_after = !after
-            .trim_end_matches(|c: char| c.is_whitespace() || c == ')')
-            .is_empty();
-        if !(has_open && more_after) {
-            out.push_str("*/");
-        }
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+/// TiDB `SelectField.Text()` drops the MySQL special-comment markers from the
+/// select-list text (see `sealdb_parser::sqlparser_bridge::trim_field_comment`).
+fn strip_field_comment_markers(text: &str) -> String {
+    sealdb_parser::sqlparser_bridge::trim_field_comment(text)
 }
 
 fn unwrap_paren_and_unary_plus(expr: &ExprNode) -> &ExprNode {

@@ -4392,6 +4392,29 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - R7 `planner/core/casetest/hint/hint` 与 `planner/core/casetest/index/index`。
 
+### 2026-11-20（`hint` 前置：`field.Text()` 注释裁剪对齐 TiDB `TrimComment`）
+
+- **Phase**: R7 `planner/core/casetest/hint/hint` 前置修复（suite 仍 `pending`）
+- **完成**:
+  - 新增 `sealdb_parser::sqlparser_bridge::trim_field_comment`，一比一移植
+    TiDB `parser.SpecFieldPattern`(`/\*!`, `/\*!M?NNNNN`, `\*/`) +
+    `parser.TrimComment`：投影文本里所有 `*/` 移除，`/*!` 版本前缀移除，
+    其余正文保留。`select count(*) /*+ stream_agg() */ from t` 的列名因此为
+    `count(*) /*+ stream_agg() `（TiDB 金样）。
+  - `builder::tidb_projection_field_name` 与 `HashAggExec::new` 的投影列名
+    统一走该函数（原先 `strip_inner_comment_terminators` 会保留尾随 `*/`）。
+- **验证**:
+  - `cargo test -p sealdb-parser field_text_tests` → 1 passed。
+  - 全量 `run-tests.sh -s memory` → `PASS: memory=122 skipped=132`（无回归）。
+- **阻塞/风险**:
+  - `hint/hint` 仍需 hint 框架本体：`order_index` / `no_order_index`
+    （keep order + embedded limit）、`8061`/`8066` 提示告警、`1815`
+    「Can't find a proper physical plan」。`index/index` 还需要
+    `IndexJoin` over `IndexLookUp` 形状与多值索引（`MEMBER OF`）。
+- **下一步**:
+  - 实现 hint 解析/告警层（8061/8066/1815）与 `order_index` 系列，
+    再推进 `hint/hint`。
+
 ## 7. 更新模板
 
 每次更新追加一条：

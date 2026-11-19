@@ -398,6 +398,44 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     Ok(out)
 }
 
+/// TiDB `SelectField.Text()` result: the select-list source text with the
+/// MySQL special-comment markers removed. `parser.SpecFieldPattern`
+/// (`/*!`, `/*!M?NNNNN`, `*/`) is replaced through `parser.TrimComment`, so
+/// every `*/` disappears and a trailing optimizer hint keeps its body only —
+/// `count(*) /*+ stream_agg() */` becomes `count(*) /*+ stream_agg() `.
+pub fn trim_field_comment(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            out.push_str(&text[last..i]);
+            i += 2;
+            last = i;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' && bytes.get(i + 2) == Some(&b'!') {
+            // `/*!` plus an optional `M?NNNNN` version prefix (5 or 6 digits).
+            let mut j = i + 3;
+            if j < bytes.len() && (bytes[j] == b'M' || bytes[j] == b'm') {
+                j += 1;
+            }
+            let digits = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - digits < 6 {
+                j += 1;
+            }
+            out.push_str(&text[last..i]);
+            i = if j - digits >= 5 { j } else { i + 3 };
+            last = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Attach TiDB-style original select-list texts for projection naming.
 fn attach_projection_texts(sel: &mut SelectStmt, texts: Option<&Vec<String>>) {
     let Some(texts) = texts else {
@@ -13842,6 +13880,28 @@ mod bang_not2_tests {
             },
             other => panic!("expected select, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod field_text_tests {
+    use super::*;
+
+    #[test]
+    fn drops_special_comment_markers() {
+        // TiDB `SpecFieldPattern` + `TrimComment`: the trailing `*/` goes away
+        // but the hint body stays part of the select-list text.
+        assert_eq!(
+            trim_field_comment("count(*) /*+ stream_agg() */"),
+            "count(*) /*+ stream_agg() "
+        );
+        assert_eq!(
+            trim_field_comment("a+1 /*!80000 INVISIBLE */"),
+            "a+1  INVISIBLE "
+        );
+        // No comment: the text is returned verbatim.
+        assert_eq!(trim_field_comment("a + b"), "a + b");
+        assert_eq!(trim_field_comment("count(*)"), "count(*)");
     }
 }
 
