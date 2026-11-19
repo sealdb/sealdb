@@ -234,6 +234,11 @@ pub struct TableInfo {
     /// TiDB `PRE_SPLIT_REGIONS` (echoed by SHOW CREATE TABLE).
     #[serde(default)]
     pub pre_split_regions: u8,
+    /// TiDB cached-table flag (`ALTER TABLE … CACHE`): the table is held in
+    /// memory by TiKV. `SHOW CREATE TABLE` echoes `/* CACHED ON */`, and most
+    /// DDL (and any DDL on a partitioned table) is refused with 8242.
+    #[serde(default)]
+    pub cached_table: bool,
     /// TiDB `AUTO_RANDOM_BASE` / `_tidb_rowid` shard seed, unused here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_random_base: Option<i64>,
@@ -293,6 +298,7 @@ impl TableInfo {
             attributes: Vec::new(),
             shard_row_id_bits: 0,
             pre_split_regions: 0,
+            cached_table: false,
             auto_random_base: None,
         }
     }

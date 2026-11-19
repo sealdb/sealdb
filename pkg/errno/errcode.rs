@@ -40,6 +40,9 @@ pub const ERR_DUPLICATED_VALUE_IN_TYPE: i32 = 1291;
 pub const ERR_TABLE_OPTION_UNION_UNSUPPORTED: i32 = 8232;
 /// TiDB `ErrTableOptionInsertMethodUnsupported`: `INSERT_METHOD` table option.
 pub const ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED: i32 = 8233;
+/// TiDB `ErrUnsupportedOnCacheTable`: the operation is not allowed on a table
+/// declared `CACHE` (`'Alter Table' is unsupported on cache tables.`), 8242.
+pub const ERR_UNSUPPORTED_ON_CACHE_TABLE: i32 = 8242;
 /// MySQL `ER_TRUNCATED_WRONG_VALUE_FOR_FIELD`: a value that cannot be
 /// converted to the column's type (`Incorrect bigint value: '…'`), 1366.
 pub const ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD: i32 = 1366;

@@ -6,7 +6,7 @@ use crate::reorg::{INDEX_REORG_STATES, is_write_reorg};
 use crate::table::resolve_name;
 use sealdb_errno::{
     ERR_BAD_DB, ERR_CANT_DROP_FIELD_OR_KEY, ERR_DUP_ENTRY, ERR_DUP_KEYNAME, ERR_NO_SUCH_TABLE,
-    Error, Result,
+    ERR_UNSUPPORTED_ON_CACHE_TABLE, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -25,6 +25,17 @@ pub fn create_index(
     current_db: &str,
     storage: &dyn Storage,
 ) -> Result<()> {
+    // TiDB refuses `CREATE INDEX` on a cached table (8242).
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    if is
+        .table_by_name(&schema, &table)
+        .is_some_and(|info| info.cached_table)
+    {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_ON_CACHE_TABLE,
+            "'Create Index' is unsupported on cache tables.",
+        ));
+    }
     add_index(
         meta,
         is,

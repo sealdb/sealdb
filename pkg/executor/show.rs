@@ -837,6 +837,11 @@ fn render_create_table(info: &TableInfo) -> String {
         info.charset,
         info.collate
     );
+    // TiDB echoes a cached table as a trailing comment
+    // (`… COLLATE=utf8mb4_bin /* CACHED ON */`).
+    if info.cached_table {
+        out.push_str(" /* CACHED ON */");
+    }
     // TiDB echoes the shard options as a TiDB-only comment at the end.
     let mut shard_opts = String::new();
     if info.shard_row_id_bits > 0 {

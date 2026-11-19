@@ -266,7 +266,7 @@
     {
       "name": "ddl/db_cache",
       "wave": "R6",
-      "status": "pending",
+      "status": "green",
       "test": "t/ddl/db_cache.test",
       "result": "r/ddl/db_cache.result",
       "has_result": true,

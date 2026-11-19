@@ -4330,6 +4330,33 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - R7 剩余长尾（`expression/builtin`、`expression/issues` 等），
     及 R6 `ddl/db_table` / `ddl/modify_column`。
 
+### 2026-11-19（`ddl/db_cache` 转绿：缓存表元数据 + DDL 拒绝矩阵）
+
+- **Phase**: R6 `ddl/db_cache` → green（Mem + TiKV 双通过）
+- **完成**:
+  - `TableInfo.cached_table`：`ALTER TABLE … CACHE / NOCACHE` 解析（bridge 已产出
+    `AlterTableSpec::Cache`）后落库并递增 schema version。
+  - `SHOW CREATE TABLE` 在 `ENGINE/CHARSET/COLLATE` 之后追加 ` /* CACHED ON */`。
+  - 拒绝矩阵：分区表 `CACHE` → 8242 `'partition mode' is unsupported on cache
+    tables.`；视图 → 1347 `'db.v' is not BASE TABLE`；缓存表上的其它
+    `ALTER TABLE`（ADD/DROP/RENAME INDEX 等）→ 8242 `'Alter Table' …`；
+    `CREATE INDEX` → 8242 `'Create Index' …`。
+  - `CACHE` / `NOCACHE` 幂等：重复 `NOCACHE`、未缓存表 `NOCACHE`、
+    `CACHE → NOCACHE → CACHE` 均无告警。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t ddl/db_cache`
+    → `PASS: memory=1 tikv=0 skipped=253`；
+    `-s tikv -t ddl/db_cache` → `PASS: memory=0 tikv=1`。
+  - 全量 gate：`-s memory` → `PASS: memory=121 tikv=0 skipped=133`
+    （113 green + 8 local）；`-s tikv` → `PASS: memory=0 tikv=119 skipped=135`
+    （112 green + 7 local，`executor/adapter` skip_tikv）。
+  - manifest：`ddl/db_cache` → `green`，green 112→113（R6 17→18，pending 123→122）。
+- **阻塞/风险**:
+  - 仅实现语义层面的缓存标记；TiKV 侧没有真正的内存表（不影响 EXPLAIN/结果）。
+- **下一步**:
+  - R6 `ddl/db_table`（外键错误码顺序、charset 元数据、WITH/WITHOUT VALIDATION 告警）
+    与 R7 `planner/core/casetest/expression_rewriter`（行值 `IN` 去关联）。
+
 ## 7. 更新模板
 
 每次更新追加一条：

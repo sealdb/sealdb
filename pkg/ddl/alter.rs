@@ -18,8 +18,8 @@ use sealdb_errno::{
     ERR_DUP_KEYNAME, ERR_FK_INCOMPATIBLE_COLUMNS, ERR_FORBID_SCHEMA_CHANGE, ERR_KEY_DOES_NOT_EXIST,
     ERR_NO_SUCH_TABLE, ERR_PRIMARY_CANT_HAVE_NULL, ERR_TABLE_EXISTS, ERR_TTL_DROP_COLUMN,
     ERR_TTL_FK_REFERENCED, ERR_TTL_INVALID_COLUMN, ERR_TTL_NO_CONFIG, ERR_UNKNOWN_PARTITION,
-    ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET,
-    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, Error, Result,
+    ERR_UNSUPPORTED_DDL_OPERATION, ERR_UNSUPPORTED_MODIFY_CHARSET, ERR_UNSUPPORTED_ON_CACHE_TABLE,
+    ERR_UNSUPPORTED_ON_GENERATED_COLUMN, ERR_WRONG_OBJECT, Error, Result,
 };
 use sealdb_infoschema::InfoSchema;
 use sealdb_kv::Storage;
@@ -44,6 +44,24 @@ pub fn alter_table(
 ) -> Result<()> {
     let mut snapshot = is.clone();
     for spec in &stmt.specs {
+        // TiDB refuses every other ALTER TABLE on a cached table
+        // (`ALTER TABLE … NOCACHE` itself is the way out).
+        if !matches!(
+            spec,
+            AlterTableSpec::Cache { .. }
+                | AlterTableSpec::Algorithm(_)
+                | AlterTableSpec::Lock(_)
+                | AlterTableSpec::TableOption { .. }
+        ) && let Ok((schema, table)) = resolve_name(&stmt.table, current_db)
+            && snapshot
+                .table_by_name(&schema, &table)
+                .is_some_and(|info| info.cached_table)
+        {
+            return Err(Error::new(
+                ERR_UNSUPPORTED_ON_CACHE_TABLE,
+                "'Alter Table' is unsupported on cache tables.",
+            ));
+        }
         match spec {
             AlterTableSpec::AddColumn {
                 if_not_exists,
@@ -172,8 +190,10 @@ pub fn alter_table(
             // ignored; SealDB DDL is in-place and engine-independent.
             AlterTableSpec::Algorithm(_)
             | AlterTableSpec::Lock(_)
-            | AlterTableSpec::Cache { .. }
             | AlterTableSpec::TableOption { .. } => {}
+            AlterTableSpec::Cache { cached } => {
+                alter_cache(meta, &snapshot, stmt, *cached, current_db)?
+            }
             AlterTableSpec::AddPartition { defs } => {
                 add_partitions(meta, &snapshot, &stmt.table, defs, current_db)?;
             }
@@ -249,6 +269,50 @@ pub fn alter_table(
         }
         snapshot = InfoSchema::from_meta(meta)?;
     }
+    Ok(())
+}
+
+/// `ALTER TABLE t CACHE` / `NOCACHE` (TiDB cached tables).
+///
+/// A cached table is pinned in TiKV's memory: `SHOW CREATE TABLE` echoes
+/// `/* CACHED ON */`, a partitioned table cannot be cached (8242 `'partition
+/// mode'`), and a view is not a base table (1347).
+fn alter_cache(
+    meta: &mut Mutator,
+    is: &InfoSchema,
+    stmt: &AlterTableStmt,
+    cached: bool,
+    current_db: &str,
+) -> Result<()> {
+    let (schema, table) = resolve_name(&stmt.table, current_db)?;
+    let db = is
+        .schema_by_name(&schema)
+        .ok_or_else(|| Error::new(ERR_BAD_DB, format!("Unknown database '{schema}'")))?;
+    let Some(info) = is.table_by_name(&schema, &table) else {
+        return Err(Error::new(
+            ERR_NO_SUCH_TABLE,
+            format!("Table '{schema}.{table}' doesn't exist"),
+        ));
+    };
+    if info.is_view() {
+        return Err(Error::new(
+            ERR_WRONG_OBJECT,
+            format!("'{schema}.{table}' is not BASE TABLE"),
+        ));
+    }
+    if cached && info.partition.is_some() {
+        return Err(Error::new(
+            ERR_UNSUPPORTED_ON_CACHE_TABLE,
+            "'partition mode' is unsupported on cache tables.",
+        ));
+    }
+    if info.cached_table == cached {
+        return Ok(());
+    }
+    let mut updated = info.clone();
+    updated.cached_table = cached;
+    meta.update_table(db.id, &updated)?;
+    meta.gen_schema_version()?;
     Ok(())
 }
 
