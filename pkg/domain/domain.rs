@@ -95,6 +95,9 @@ pub struct Domain {
     resource_control: AtomicBool,
     /// `tidb_analyze_skip_column_types`: column type names ANALYZE ignores.
     analyze_skip_column_types: Mutex<Vec<String>>,
+    /// `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist` snapshot.
+    /// `None` until the first load (lazy) or `ADMIN RELOAD`.
+    planner_blacklist: Mutex<Option<sealdb_planner::PlannerBlacklist>>,
 }
 
 /// One shard allocation window: `remaining` row ids may still be drawn from
@@ -231,6 +234,7 @@ impl Domain {
             resource_groups: Mutex::new(HashMap::new()),
             resource_control: AtomicBool::new(true),
             analyze_skip_column_types: Mutex::new(Vec::new()),
+            planner_blacklist: Mutex::new(None),
         })
     }
 
@@ -723,6 +727,23 @@ impl Domain {
             .lock()
             .expect("analyze skip column types lock")
             .clone()
+    }
+
+    /// Cached `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist`
+    /// snapshot. `None` until a session loads it (`ADMIN RELOAD` or first use).
+    pub fn planner_blacklist(&self) -> Option<sealdb_planner::PlannerBlacklist> {
+        self.planner_blacklist
+            .lock()
+            .expect("domain planner blacklist lock")
+            .clone()
+    }
+
+    /// Publish a fresh blacklist snapshot to the shared domain.
+    pub fn set_planner_blacklist(&self, blacklist: sealdb_planner::PlannerBlacklist) {
+        *self
+            .planner_blacklist
+            .lock()
+            .expect("domain planner blacklist lock") = Some(blacklist);
     }
 
     pub fn infoschema(&self) -> InfoSchema {

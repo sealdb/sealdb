@@ -1,5 +1,6 @@
 pub mod access_range;
 pub mod apply;
+pub mod blacklist;
 pub mod cte;
 pub mod explain;
 pub mod expr_index;
@@ -27,6 +28,10 @@ pub mod rule_semi_join;
 pub mod union;
 pub mod window;
 
+pub use blacklist::{
+    PlannerBlacklist, expr_contains_blacklisted_pushdown, expr_node_pushdown_disabled,
+    expr_pushdown_disabled, normalize_expr_name, opt_rule_disabled, with_planner_blacklist,
+};
 pub use foreign_key::{foreign_key_checks, with_foreign_key_checks};
 pub use natural_join::{expand_natural_joins, stmt_has_natural_join};
 pub use physical_plans::{DdlKind, JoinType, PhysicalPlan};

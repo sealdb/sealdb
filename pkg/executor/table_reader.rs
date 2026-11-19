@@ -188,6 +188,23 @@ pub(crate) fn scan_table(
     scan_table_filtered(handle, info, lock, wait, physical_ids, None)
 }
 
+/// Every row of `info` as plain column values, read straight from storage.
+///
+/// The session uses it to refresh the optimizer blacklists
+/// (`mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist`) without
+/// building a plan — a plan build would need the blacklist it is loading.
+pub fn scan_all_rows(handle: &TxnHandle, info: &TableInfo) -> Result<Vec<Vec<Datum>>> {
+    // A partitioned table stores rows under its physical partition ids, so the
+    // scan has to name them (a bare table id would read nothing).
+    let physical = sealdb_planner::core::prune_partitions(info, None);
+    Ok(
+        scan_table(handle, info, RowLock::None, LockWait::Block, &physical)?
+            .into_iter()
+            .map(|row| row.values)
+            .collect(),
+    )
+}
+
 /// Like [`scan_table`], with the coprocessor selection fed into the scan so
 /// row locking only covers rows the query actually returns (TiDB
 /// `SelectLockExec` sits above the `Selection`).

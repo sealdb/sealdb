@@ -55,6 +55,27 @@ thread_local! {
     /// statement used the feature (the session gates it on
     /// `tidb_enable_noop_functions`).
     static PENDING_GROUP_BY_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// TiDB `ADMIN RELOAD <target>`: the reload itself is a no-op statement
+    /// (`DO 0`), but the session must refresh the target's cache, so the bridge
+    /// records which one the statement named.
+    static PENDING_ADMIN_RELOAD: std::cell::Cell<Option<AdminReloadKind>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Target of an `ADMIN RELOAD` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminReloadKind {
+    /// `ADMIN RELOAD OPT_RULE_BLACKLIST`
+    OptRuleBlacklist,
+    /// `ADMIN RELOAD EXPR_PUSHDOWN_BLACKLIST`
+    ExprPushdownBlacklist,
+    /// `ADMIN RELOAD BINDINGS` and any other target.
+    Other,
+}
+
+/// Which `ADMIN RELOAD` target the last parsed statement named, if any.
+pub fn take_admin_reload() -> Option<AdminReloadKind> {
+    PENDING_ADMIN_RELOAD.with(|cell| cell.replace(None))
 }
 
 /// Whether the last parsed statement carried `GROUP BY expr ASC|DESC`.
@@ -2082,12 +2103,25 @@ fn rewrite_admin_show_ddl(sql: &str) -> String {
             }
             if keyword_at(bytes, after_admin, "RELOAD") {
                 // `ADMIN RELOAD [OPT_RULE_BLACKLIST|EXPR_PUSHDOWN_BLACKLIST|BINDINGS]`:
-                // SealDB reads the blacklist tables at planning time, so the
-                // reload itself is a no-op.
+                // the blacklist tables are read into the Domain cache when the
+                // statement names one, so record the target and emit `DO 0`.
                 let mut j = after_admin + "RELOAD".len();
+                let mut kind = AdminReloadKind::Other;
+                let after_reload = skip_ws(bytes, j);
+                for (keyword, target) in [
+                    ("OPT_RULE_BLACKLIST", AdminReloadKind::OptRuleBlacklist),
+                    ("EXPR_PUSHDOWN_BLACKLIST", AdminReloadKind::ExprPushdownBlacklist),
+                ] {
+                    if keyword_at(bytes, after_reload, keyword) {
+                        kind = target;
+                        j = after_reload + keyword.len();
+                        break;
+                    }
+                }
                 while j < bytes.len() && bytes[j] != b';' {
                     j += 1;
                 }
+                PENDING_ADMIN_RELOAD.with(|cell| cell.set(Some(kind)));
                 out.push_str("DO 0");
                 i = j;
                 continue;

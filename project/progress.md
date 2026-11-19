@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-18（green 107 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-19（green 109 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -353,6 +353,28 @@
 
 剩余 36 行：`x < 5000000` 的 ±1 行估计、`IndexMerge` 节点编号、以及 issue 61093 的
 `TopN` 下推到 probe + 同索引多区间合并（需 fix control 52869）。Gate：memory=46 / tikv=45 PASS。
+
+### 2.0w R7 优化器黑名单（2026-11-19）
+
+`black_list` 之前只入库不改行为：`mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist`
+是真实 bootstrap 表，`ADMIN RELOAD …` 被降级成 `DO 0`，规划期无人读取。现在把两张表接进规划链路：
+
+| 子能力 | TiDB 对齐点 | SealDB 改动 | 证据 |
+|---|---|---|---|
+| 快照加载 | `handleReloadOptRuleBlacklist` / `handleReloadExprPushdownBlacklist` 只在 RELOAD 时读表 | 桥接层把 `ADMIN RELOAD` 目标记入 `PENDING_ADMIN_RELOAD`，session 读两张表并写入 `Domain.planner_blacklist`（首次使用时懒加载一次） | `admin reload` 后 `explain` 生效 |
+| 规则门控 | `opt_rule_blacklist('predicate_push_down')` 使该规则整条不跑 | `predicate_push_down` 入口短路，直接返回根 `Selection`；`buildSelection` 语义用 0.8 `selectionFactor`（`est_rows: Some(child × 0.8)`） | `Selection 8000.00 → TableReader 10000.00 data:TableFullScan` |
+| 表达式门控 | 表达式自身 `ScalarFunction` 名命中黑名单时整条 conjunct 留在 tidb 侧 | `blacklist::expr_contains_blacklisted_pushdown` 递归检查，`cop_pushable` 首节点即拒绝；`wrap_residual` 用 0.8 估算残差 | `<` / `lt` 两种写法都生效，`Selection 8000.00` |
+| 名称归一 | `EvalAstExpr(name)`：`'<'` 与 `'lt'` 同为一个函数 | `normalize_expr_name` 把运算符拼写映射为 TiDB 名（`lt`/`gt`/`plus`…） | 单元测试覆盖 |
+
+剩余 diff：`enum` 黑名单段。TiDB 侧 `desc select /*+ HASH_AGG() */ max(a) from t` 在 cost model v1 下
+走覆盖索引 `IndexReader(index:HashAgg|StreamAgg)`，黑名单生效时保留覆盖索引但**不下推聚合**
+（根 `HashAgg`/`StreamAgg` 直接 `funcs:max(t.a)`），且 `Selection` 未被下推时 enum 运算打印
+`cast(col, double BINARY)`。这块属于「标量聚合选覆盖索引 + 聚合 hint + 黑名单门控聚合下推」
+的独立特性，另行开工；当前套件 diff 由 8 段降到 1 段（余下为上述形状差异引起的整体位移）。
+
+Gate：`./tests/integrationtest/run-tests.sh -s memory` → `PASS: memory=117 tikv=0 skipped=137`；
+`black_list` 仍为 `pending`。单元测试：`sealdb-planner --lib blacklist`（3）、
+`sealdb-session --lib test_planner_blacklist_reload`。
 
 ### 2.1 历史阶段（归档，不作为对齐进度）
 下列 Phase / F*/C* `core-ported` 保留为工程里程碑；**对齐进度只看 suite green**。

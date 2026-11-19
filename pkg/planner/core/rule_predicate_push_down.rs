@@ -17,6 +17,30 @@ pub fn predicate_push_down(
     is: Option<&InfoSchema>,
     current_db: &str,
 ) -> PhysicalPlan {
+    // TiDB `mysql.opt_rule_blacklist('predicate_push_down')`: the rule never
+    // runs, so the filter stays a root `Selection` and the scan below it keeps
+    // the table's full row count. `buildSelection` sizes that `Selection` with
+    // the 0.8 `selectionFactor` because no range was derived for it.
+    if super::blacklist::opt_rule_disabled("predicate_push_down") {
+        let Some(filter) = ExprNode::compose_cnf(filter.split_cnf()) else {
+            return plan;
+        };
+        let est_rows = super::explain::est_rows(&plan) * 0.8;
+        return if filter.has_subquery() {
+            PhysicalPlan::Apply {
+                child: Box::new(plan),
+                filter,
+                probe: None,
+                info: None,
+            }
+        } else {
+            PhysicalPlan::Selection {
+                child: Box::new(plan),
+                filter,
+                est_rows: Some(est_rows),
+            }
+        };
+    }
     push_into(plan, filter.split_cnf(), is, current_db)
 }
 
@@ -1027,6 +1051,12 @@ fn pk_eq_handle(
 /// implementation. `tidb_shard` is evaluated by TiDB alone, so a predicate
 /// that mentions it stays a root `Selection` (`explain_shard_index`).
 fn cop_pushable(expr: &ExprNode) -> bool {
+    // `mysql.expr_pushdown_blacklist`: TiDB checks the expression's own
+    // `ScalarFunction` name at every node of the conjunct, so a blacklisted
+    // `lt` keeps the whole conjunct (and its children) on the tidb side.
+    if super::blacklist::expr_node_pushdown_disabled(expr) {
+        return false;
+    }
     match expr {
         ExprNode::Func(func) => {
             !func.name.eq_ignore_ascii_case("tidb_shard") && func.args.iter().all(cop_pushable)
@@ -1182,7 +1212,7 @@ fn mark_mem_table_like_ci(mut expr: ExprNode, columns: &[String]) -> ExprNode {
 }
 
 fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
-    let Some(filter) = ExprNode::compose_cnf(residual) else {
+    let Some(filter) = ExprNode::compose_cnf(residual.clone()) else {
         return plan;
     };
     if filter.has_subquery() {
@@ -1193,10 +1223,17 @@ fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
             info: None,
         }
     } else {
+        // A conjunct the expression blacklist kept out of the coprocessor never
+        // had a range derived for it, so TiDB sizes the `Selection` with the
+        // plain 0.8 `selectionFactor` instead of the pseudo range selectivity.
+        let est_rows = residual
+            .iter()
+            .any(super::blacklist::expr_contains_blacklisted_pushdown)
+            .then(|| super::explain::est_rows(&plan) * 0.8);
         PhysicalPlan::Selection {
             child: Box::new(plan),
             filter,
-            est_rows: None,
+            est_rows,
         }
     }
 }

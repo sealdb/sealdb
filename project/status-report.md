@@ -1,6 +1,6 @@
 # 整体进展报告（Status Report）
 
-> 生成时间：2026-11-19 19:30 (+08:00)
+> 生成时间：2026-11-19 20:40 (+08:00)
 > 事实来源：`project/regression/manifest.json`（suite 状态）、`project/parity/status.json`（包级对齐）、`git log`
 > 规范：[testing.md](./testing.md) · [parity-discipline.md](./parity-discipline.md) · [progress.md](./progress.md)
 
@@ -245,7 +245,8 @@ TiKV 侧：本地 PD v8.5.0 + store `127.0.0.1:20160`（state=Up，空数据目�
 
 1. `index_merge`：IN 子查询去关联成 semi/anti + `use_index_merge` 提示（`globalindex/mem_index_merge*` 已转绿，IndexMerge 侧骨架可直接复用）。
 2. `explain_indexmerge_stats`：统计驱动的交叉臂选择与 sel 估算。
-3. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
+3. `black_list`：规则/表达式黑名单已接进规划（`ADMIN RELOAD` + `Domain` 快照 + `cop_pushable` 门控）；余下 `enum` 段需补「标量聚合选覆盖索引 + `HASH_AGG`/`STREAM_AGG` 提示 + 黑名单门控聚合下推」与未下推 `Selection` 上的 enum 强转渲染。
+4. 回到 R2 剩余 `cte` / `explain_cte` / `join_reorder*`。
 5. 按波次推进 R4–R7；TiFlash/MPP 维持 deferred。
 
 ---

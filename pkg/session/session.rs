@@ -400,6 +400,17 @@ impl Session {
         // keyword for sqlparser and reports that the statement used it.
         let group_by_order =
             sealdb_parser::sqlparser_bridge::take_group_by_order_seen() && stmts.len() == 1;
+        // `ADMIN RELOAD OPT_RULE_BLACKLIST` / `EXPR_PUSHDOWN_BLACKLIST`: the
+        // statement itself lowers to `DO 0`, so refresh the Domain cache here.
+        if matches!(
+            sealdb_parser::sqlparser_bridge::take_admin_reload(),
+            Some(
+                sealdb_parser::sqlparser_bridge::AdminReloadKind::OptRuleBlacklist
+                    | sealdb_parser::sqlparser_bridge::AdminReloadKind::ExprPushdownBlacklist
+            )
+        ) {
+            self.refresh_planner_blacklist()?;
+        }
         if stmts.is_empty() {
             return Err(sealdb_errno::Error::new(
                 sealdb_errno::ERR_PARSE_ERROR,
@@ -445,6 +456,69 @@ impl Session {
             out.push(result);
         }
         Ok(out)
+    }
+
+    /// Scan `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist` and
+    /// publish a fresh snapshot to the Domain.
+    ///
+    /// TiDB picks up edits to these tables only on `ADMIN RELOAD`, so the
+    /// snapshot lives on the Domain: one scan per reload instead of one per
+    /// statement.
+    fn refresh_planner_blacklist(&self) -> Result<()> {
+        use sealdb_types::Datum;
+        fn cell_text(value: Option<&Datum>) -> String {
+            match value {
+                Some(Datum::Bytes(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+                Some(Datum::I64(number)) => number.to_string(),
+                Some(Datum::U64(number)) => number.to_string(),
+                _ => String::new(),
+            }
+        }
+        /// `store_type` lists the stores a row applies to; SealDB pushes to the
+        /// `tikv` coprocessor, so a row naming neither `tikv` nor `tidb` is
+        /// ignored.
+        fn applies_to_coprocessor(store_type: &str) -> bool {
+            let store_type = store_type.trim();
+            // TiDB's default when the column is omitted/empty.
+            if store_type.is_empty() {
+                return true;
+            }
+            store_type
+                .split(',')
+                .any(|store| matches!(store.trim(), "tikv" | "tidb"))
+        }
+
+        let is = self.domain.infoschema();
+        let handle = {
+            let mut txn = self.txn.lock().expect("session txn lock");
+            txn.ensure(self.domain.storage().as_ref())?
+        };
+        let mut blacklist = sealdb_planner::PlannerBlacklist::default();
+        if let Some(info) = is.table_by_name("mysql", "opt_rule_blacklist").cloned() {
+            for row in sealdb_executor::table_reader::scan_all_rows(&handle, &info)? {
+                let name = cell_text(row.first()).trim().to_ascii_lowercase();
+                if !name.is_empty() {
+                    blacklist.opt_rules.insert(name);
+                }
+            }
+        }
+        if let Some(info) = is
+            .table_by_name("mysql", "expr_pushdown_blacklist")
+            .cloned()
+        {
+            for row in sealdb_executor::table_reader::scan_all_rows(&handle, &info)? {
+                let name = cell_text(row.first());
+                let store_type = cell_text(row.get(1));
+                if name.trim().is_empty() || !applies_to_coprocessor(&store_type) {
+                    continue;
+                }
+                blacklist
+                    .exprs
+                    .insert(sealdb_planner::normalize_expr_name(&name));
+            }
+        }
+        self.domain.set_planner_blacklist(blacklist);
+        Ok(())
     }
 
     /// TiDB `SET_VAR` optimizer hint: apply the listed session variables for a
@@ -1805,7 +1879,18 @@ impl Session {
         } else {
             format!("{cache_key}/*cost_model_version={cost_model_version}*/")
         };
-        let plan = sealdb_expression::with_current_db(current_db.as_str(), || {
+        // `mysql.opt_rule_blacklist` / `mysql.expr_pushdown_blacklist`: load the
+        // Domain snapshot lazily (or after `ADMIN RELOAD`) and publish it for
+        // the whole plan build.
+        let blacklist = match self.domain.planner_blacklist() {
+            Some(blacklist) => blacklist,
+            None => {
+                self.refresh_planner_blacklist()?;
+                self.domain.planner_blacklist().unwrap_or_default()
+            }
+        };
+        let plan = sealdb_planner::with_planner_blacklist(blacklist, || {
+            sealdb_expression::with_current_db(current_db.as_str(), || {
             sealdb_planner::with_cost_model_version(cost_model_version, || {
                 sealdb_planner::with_agg_push_down(opt_agg_push_down, || {
                     sealdb_planner::with_insubq_to_join_and_agg(opt_insubq_to_join_and_agg, || {
@@ -1868,6 +1953,7 @@ impl Session {
                         )
                     })
                 })
+            })
             })
         })?;
         let persist_ddl = !self.txn.lock().expect("session txn lock").is_explicit();
@@ -9198,6 +9284,94 @@ mod tests {
             .unwrap();
         assert_eq!(ok.rows.len(), 1, "{:?}", ok.rows);
         assert_eq!(ok.rows[0][1].display(), "孵化投入");
+    }
+
+    /// `mysql.opt_rule_blacklist('predicate_push_down')` (and the expression
+    /// blacklist) only take effect after `ADMIN RELOAD`, and the rule coming
+    /// back re-pushes the filter (TiDB `black_list` suite).
+    #[test]
+    fn test_planner_blacklist_reload() {
+        let session = Session::new();
+        session
+            .execute_stmt("set tidb_cost_model_version=1")
+            .unwrap();
+        session
+            .execute_stmt("CREATE DATABASE IF NOT EXISTS plan_blacklist")
+            .unwrap();
+        session.execute_stmt("USE plan_blacklist").unwrap();
+        session.execute_stmt("DROP TABLE IF EXISTS t").unwrap();
+        session.execute_stmt("CREATE TABLE t (a int)").unwrap();
+        let plan = |session: &Session| -> Vec<String> {
+            session
+                .execute_stmt("explain format = 'brief' select * from t where a < 1")
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row[0].display())
+                .collect()
+        };
+        // Pushed into the coprocessor by default.
+        assert_eq!(
+            plan(&session),
+            vec!["TableReader", "└─Selection", "  └─TableFullScan"]
+        );
+        // The rule blacklist keeps the filter at the root with the 0.8 factor.
+        session
+            .execute_stmt("insert into mysql.opt_rule_blacklist values('predicate_push_down')")
+            .unwrap();
+        session
+            .execute_stmt("admin reload opt_rule_blacklist")
+            .unwrap();
+        let rows = session
+            .execute_stmt("explain format = 'brief' select * from t where a < 1")
+            .unwrap();
+        assert_eq!(
+            rows.rows.iter().map(|row| row[0].display()).collect::<Vec<_>>(),
+            vec!["Selection", "└─TableReader", "  └─TableFullScan"]
+        );
+        assert_eq!(rows.rows[0][1].display(), "8000.00");
+        session
+            .execute_stmt("delete from mysql.opt_rule_blacklist")
+            .unwrap();
+        session
+            .execute_stmt("admin reload opt_rule_blacklist")
+            .unwrap();
+        assert_eq!(
+            plan(&session),
+            vec!["TableReader", "└─Selection", "  └─TableFullScan"]
+        );
+        // The expression blacklist accepts the operator spelling as well as
+        // the function name, and keeps `lt` out of the coprocessor.
+        for name in ["<", "lt"] {
+            session
+                .execute_stmt(&format!(
+                    "insert into mysql.expr_pushdown_blacklist values('{name}', 'tikv,tiflash,tidb', 'for test')"
+                ))
+                .unwrap();
+            session
+                .execute_stmt("admin reload expr_pushdown_blacklist")
+                .unwrap();
+            let rows = session
+                .execute_stmt("explain format = 'brief' select * from t where a < 1")
+                .unwrap();
+            assert_eq!(
+                rows.rows.iter().map(|row| row[0].display()).collect::<Vec<_>>(),
+                vec!["Selection", "└─TableReader", "  └─TableFullScan"],
+                "{name}"
+            );
+            assert_eq!(rows.rows[0][1].display(), "8000.00", "{name}");
+            session
+                .execute_stmt("delete from mysql.expr_pushdown_blacklist")
+                .unwrap();
+            session
+                .execute_stmt("admin reload expr_pushdown_blacklist")
+                .unwrap();
+            assert_eq!(
+                plan(&session),
+                vec!["TableReader", "└─Selection", "  └─TableFullScan"],
+                "{name}"
+            );
+        }
     }
 
     #[test]
