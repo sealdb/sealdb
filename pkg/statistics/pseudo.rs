@@ -564,6 +564,8 @@ pub fn range_text(low: Option<&(Datum, bool)>, high: Option<&(Datum, bool)>) -> 
 pub fn format_datum(value: &Datum) -> String {
     match value {
         Datum::Bytes(bytes) | Datum::Bit(bytes) => quote_go_string(bytes),
+        // An `ENUM` key part stores the member label, which TiDB prints quoted.
+        Datum::Enum(e) => quote_go_string(&e.label),
         other => other.display(),
     }
 }

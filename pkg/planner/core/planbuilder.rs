@@ -15304,6 +15304,72 @@ fn group_by_index_plan(
     None
 }
 
+/// Scalar aggregate (`SELECT max(a) …`, no `GROUP BY`) over a covering index:
+/// when an index answers every column the aggregate reads, TiDB replaces the
+/// table scan with `IndexFullScan` (`find_best_task` prices the narrower read
+/// below the full row scan). Only EXPLAIN builds pick the index here: the
+/// executor keeps the table-scan plan.
+fn scalar_agg_index_plan(
+    select: &SelectStmt,
+    from: &TableName,
+    info: &sealdb_meta::TableInfo,
+    prune_mode: PartitionPruneMode,
+    join_keys: &[String],
+) -> Option<PhysicalPlan> {
+    if !in_explain_build()
+        || !select.group_by.is_empty()
+        || !select.joins.is_empty()
+        || select.from_item.is_some()
+        || select.selection.is_some()
+        || select.distinct
+        || select.fields.is_empty()
+    {
+        return None;
+    }
+    let mut needed: Vec<String> = Vec::new();
+    for field in &select.fields {
+        if !is_agg_expr(&field.expr) {
+            return None;
+        }
+        let ExprNode::Func(func) = &field.expr else {
+            return None;
+        };
+        // `count(*)` / `count(1)` read no column: TiDB scans the narrowest
+        // index for them, a shape this table-scan path does not model.
+        if !matches!(
+            func.name.to_ascii_lowercase().as_str(),
+            "max" | "min" | "sum" | "avg"
+        ) {
+            return None;
+        }
+        let arg = func.args.first()?;
+        let ExprNode::Column(column) = arg else {
+            return None;
+        };
+        if column.name.eq_ignore_ascii_case("_tidb_rowid") {
+            return None;
+        }
+        if !needed
+            .iter()
+            .any(|name: &String| name.eq_ignore_ascii_case(&column.name))
+        {
+            needed.push(column.name.clone());
+        }
+    }
+    if needed.is_empty() {
+        return None;
+    }
+    let index = info
+        .indices
+        .iter()
+        .filter(|idx| !(idx.primary && info.pk_is_clustered()))
+        .filter(|idx| !index_ignored(from, idx.name.o()))
+        .filter(|idx| !super::expr_index::has_expression_part(info, idx))
+        .filter(|idx| info.index_covers(idx, &needed))
+        .min_by_key(|idx| idx.columns.len())?;
+    Some(index_plan(select, from, info, index, prune_mode, join_keys))
+}
+
 /// TiDB `OuterJoinEliminator` (`rule_join_elimination.go`).
 ///
 /// A `LEFT`/`RIGHT OUTER JOIN` is dropped when
@@ -16326,8 +16392,48 @@ fn build_agg_plan(
         // after the aggregate output; StreamAgg reserves its partial state over
         // the access path's columns, three ids per index (table) column minus
         // the one the aggregate output already took.
-        let use_hash = scalar_agg_prefers_hash(&plan);
-        let partial_col = if use_hash {
+        let use_hash = select_hint(&select.text, "hash_agg")
+            || (!select_hint(&select.text, "stream_agg") && scalar_agg_prefers_hash(&plan));
+        // An `ENUM` / `SET` aggregate argument is pushed as `cast_enum`; with a
+        // blacklisted `enum` the cop task cannot evaluate it, so the whole
+        // aggregate stays at root and prints its real argument.
+        if super::blacklist::expr_pushdown_disabled("enum")
+            && arg_expr.is_some_and(|arg_expr| {
+                is.and_then(|is| is.table_by_name(&agg_db, table))
+                    .is_some_and(|info| {
+                        arg_expr.referenced_columns().iter().any(|(_, name)| {
+                            info.columns.iter().any(|column| {
+                                column.name.o().eq_ignore_ascii_case(name)
+                                    && matches!(
+                                        column.field_type.tp,
+                                        sealdb_types::field_type::TYPE_ENUM
+                                            | sealdb_types::field_type::TYPE_SET
+                                    )
+                            })
+                        })
+                    })
+            })
+        {
+            let info = format!("funcs:{fn_name}({arg})->Column#{out_col}");
+            return (
+                if use_hash {
+                    PhysicalPlan::hash_agg(plan, info, est)
+                } else {
+                    PhysicalPlan::stream_agg(plan, info, String::new(), est)
+                },
+                false,
+            );
+        }
+        // A scalar aggregate that reads a column of a covering index allocates
+        // the argument column right after the aggregate output, so the partial
+        // state lands one id later: `max(a)` over `idx(b, a)` prints
+        // `funcs:max(Column#7)->Column#5` for both the HashAgg and StreamAgg
+        // shapes.
+        let agg_reads_column = matches!(plan, PhysicalPlan::IndexReader { .. })
+            && arg_expr.is_some_and(|arg_expr| !arg_expr.referenced_columns().is_empty());
+        let partial_col = if agg_reads_column {
+            out_col + 2
+        } else if use_hash {
             out_col + 1
         } else if let PhysicalPlan::IndexReader { index_columns, .. } = &plan {
             // StreamAgg over a covering index reserves its partial state over
@@ -25539,6 +25645,42 @@ fn with_derived_selection(select: &SelectStmt, extra: Vec<ExprNode>) -> Option<S
     Some(derived)
 }
 
+/// Drop the conjuncts an `enum` expression blacklist keeps out of the
+/// coprocessor, so access-path selection does not derive a range (and a
+/// covering `IndexReader`) from a predicate that can never be pushed.
+fn strip_unpushable_enum_predicates(select: &SelectStmt, table: &str) -> Option<SelectStmt> {
+    if !super::blacklist::expr_pushdown_disabled("enum") {
+        return None;
+    }
+    let conjuncts = select.selection.as_ref()?.split_cnf();
+    let kept: Vec<ExprNode> = conjuncts
+        .iter()
+        .filter(|conjunct| !enum_conjunct_blocked(conjunct, table))
+        .cloned()
+        .collect();
+    if kept.len() == conjuncts.len() {
+        return None;
+    }
+    let mut out = select.clone();
+    out.selection = ExprNode::compose_cnf(kept);
+    Some(out)
+}
+
+/// Does the conjunct read an `ENUM` / `SET` column of `table`?
+fn enum_conjunct_blocked(expr: &ExprNode, table: &str) -> bool {
+    expr.referenced_columns()
+        .iter()
+        .any(|(qualifier, name)| {
+            let qualifier = qualifier.as_deref().unwrap_or(table);
+            explain_column_type(qualifier, name).is_some_and(|ft| {
+                matches!(
+                    ft.tp,
+                    sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+                )
+            })
+        })
+}
+
 fn access_plan(
     select: &SelectStmt,
     from: &TableName,
@@ -25821,6 +25963,12 @@ fn access_plan_inner(
     let join_keys = side_join_key_columns(select, from);
     let join_key_exprs = side_join_key_exprs(select, from);
     let select = side_select.as_ref().unwrap_or(select);
+    // Predicates over an `ENUM` / `SET` column reach cop through `cast_enum`;
+    // with a blacklisted `enum` TiDB derives no access range from them, so the
+    // access path is selected without them and predicate pushdown keeps them as
+    // a root `Selection`.
+    let enum_stripped = strip_unpushable_enum_predicates(select, &from.name);
+    let select = enum_stripped.as_ref().unwrap_or(select);
 
     if is_information_schema(from, current_db) || is_mysql_stats_table(from, current_db) {
         return PhysicalPlan::InfoSchema {
@@ -26313,6 +26461,11 @@ fn access_plan_inner(
         if let Some(plan) = group_by_index_plan(
             select, from, info, prune_mode, &join_keys, stats, current_db,
         ) {
+            return plan;
+        }
+        // Scalar aggregate whose arguments a secondary index covers →
+        // `IndexFullScan` instead of the full table scan.
+        if let Some(plan) = scalar_agg_index_plan(select, from, info, prune_mode, &join_keys) {
             return plan;
         }
         // Plain column projection fully covered by a secondary index (or by a

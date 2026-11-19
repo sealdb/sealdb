@@ -86,7 +86,7 @@
     {
       "name": "black_list",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/black_list.test",
       "result": "r/black_list.result",
       "has_result": true,

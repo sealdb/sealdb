@@ -10,6 +10,7 @@ use super::physical_plans::IndexScanRange;
 use sealdb_meta::{IndexInfo, TableInfo};
 use sealdb_parser::ast::expressions::ExprNode;
 use sealdb_statistics::pseudo;
+use sealdb_types::{Datum, EnumValue};
 
 pub struct IndexAccessRange {
     /// `range:…` text + estRows for EXPLAIN.
@@ -259,6 +260,24 @@ fn conjunction_key_ranges(
             consumed.extend(part_conjuncts);
             continue;
         }
+        // A string comparison on an `ENUM` column selects whole members
+        // (`a > 'a'` → members `'b'`, `'c'`), so the ranger seeks one point
+        // range per surviving member instead of an open interval.
+        if let Some(members) = enum_member_points(&part.field_type, &bounds_set) {
+            for member in members {
+                let mut values: Vec<(sealdb_types::Datum, bool)> =
+                    pinned.iter().cloned().map(|value| (value, true)).collect();
+                values.push((member, true));
+                ranges.push(pseudo::KeyRange {
+                    low: values.clone(),
+                    high: values,
+                    low_open: false,
+                    high_open: false,
+                });
+            }
+            consumed.extend(part_conjuncts);
+            break;
+        }
         // The range stops at this part: every remaining bound becomes a range
         // on the pinned prefix (`(1 1,1 +inf]` for `c2 = 1 and c1 > 1`).
         for (low, high) in &bounds_set {
@@ -494,12 +513,78 @@ pub fn index_access_range(
 
 /// Convert one range bound to the index column's type (TiDB `ranger` keeps a
 /// typed key so the encoded bound can be compared with the histogram's keys).
+/// `ENUM` member datum for a 1-based ordinal (`a = 2` on `enum('a','b')`).
+fn enum_datum_for_number(field_type: &sealdb_types::FieldType, number: i64) -> Option<Datum> {
+    if number <= 0 {
+        return None;
+    }
+    let label = field_type.elems.as_ref()?.get(number as usize - 1)?;
+    Some(Datum::Enum(EnumValue::new(
+        label.as_bytes().to_vec(),
+        number as u64,
+    )))
+}
+
+/// Point values of the `ENUM` members a bound set selects.
+///
+/// A label comparison (`a > 'a'`) has to enumerate the remaining members, so
+/// the ranger seeks one point range per member. Ordinal comparisons (`a > 1`)
+/// stay interval ranges and report `None`.
+fn enum_member_points(
+    field_type: &sealdb_types::FieldType,
+    bounds_set: &[pseudo::Bounds],
+) -> Option<Vec<Datum>> {
+    if field_type.tp != sealdb_types::field_type::TYPE_ENUM {
+        return None;
+    }
+    let elems = field_type.elems.as_ref()?;
+    let label_bound = bounds_set.iter().any(|(low, high)| {
+        matches!(low, Some((Datum::Bytes(_), _))) || matches!(high, Some((Datum::Bytes(_), _)))
+    });
+    if !label_bound {
+        return None;
+    }
+    let mut points: Vec<Datum> = Vec::new();
+    for (pos, label) in elems.iter().enumerate() {
+        let member = Datum::Enum(EnumValue::new(label.as_bytes().to_vec(), pos as u64 + 1));
+        let selected = bounds_set.iter().any(|(low, high)| {
+            let above = match low {
+                Some((value, inclusive)) => match member.compare(value) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => *inclusive,
+                    std::cmp::Ordering::Less => false,
+                },
+                None => true,
+            };
+            let below = match high {
+                Some((value, inclusive)) => match member.compare(value) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => *inclusive,
+                    std::cmp::Ordering::Greater => false,
+                },
+                None => true,
+            };
+            above && below
+        });
+        if selected && !points.contains(&member) {
+            points.push(member);
+        }
+    }
+    (!points.is_empty()).then_some(points)
+}
+
 fn coerce_bound(
     field_type: &sealdb_types::FieldType,
     bound: Option<(sealdb_types::Datum, bool)>,
 ) -> Option<(sealdb_types::Datum, bool)> {
     let (value, inclusive) = bound?;
     let value = match field_type.tp {
+        // An `ENUM` key part stores the member label, so a numeric bound is
+        // the member's ordinal (`a > 1` seeks past the first member).
+        sealdb_types::field_type::TYPE_ENUM => match &value {
+            sealdb_types::Datum::Enum(_) | sealdb_types::Datum::Bytes(_) => value,
+            other => enum_datum_for_number(field_type, other.as_i64().ok()?)?,
+        },
         // A REAL key part is a float: `e = 3` seeks the encoded `3.0`, so an
         // integer (or decimal) literal has to take the column's type first or
         // the encoded bounds never match the stored keys.

@@ -94,7 +94,7 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
-                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr, &table));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -213,7 +213,7 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
-                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr, &table));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -398,7 +398,7 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
-                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr, &table));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -490,7 +490,7 @@ fn push_into(
         } => {
             let (pushable, residual): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
-                .partition(|expr| !expr.has_subquery() && cop_pushable(expr));
+                .partition(|expr| !expr.has_subquery() && cop_pushable(expr, &table));
             // `c BETWEEN T::MIN AND T::MAX` covers the whole domain of a NOT
             // NULL column: it filters nothing, so TiDB folds it away and the
             // scan stays a bare TableFullScan.
@@ -1050,36 +1050,69 @@ fn pk_eq_handle(
 /// TiDB pushes a predicate into cop only when every function has a cop
 /// implementation. `tidb_shard` is evaluated by TiDB alone, so a predicate
 /// that mentions it stays a root `Selection` (`explain_shard_index`).
-fn cop_pushable(expr: &ExprNode) -> bool {
+///
+/// An `ENUM` / `SET` column reaches the coprocessor through an implicit
+/// `cast_enum` (`cast(col, double)` / `cast(col, var_string)`), so a
+/// blacklisted `enum` row keeps every predicate over such a column on the TiDB
+/// side — even a plain `gt(b, 1)`.
+fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
     // `mysql.expr_pushdown_blacklist`: TiDB checks the expression's own
     // `ScalarFunction` name at every node of the conjunct, so a blacklisted
     // `lt` keeps the whole conjunct (and its children) on the tidb side.
     if super::blacklist::expr_node_pushdown_disabled(expr) {
         return false;
     }
+    if super::blacklist::expr_pushdown_disabled("enum") && expr_references_enum_column(expr, table)
+    {
+        return false;
+    }
     match expr {
         ExprNode::Func(func) => {
-            !func.name.eq_ignore_ascii_case("tidb_shard") && func.args.iter().all(cop_pushable)
+            !func.name.eq_ignore_ascii_case("tidb_shard")
+                && func.args.iter().all(|arg| cop_pushable(arg, table))
         }
-        ExprNode::Binary(bin) => cop_pushable(&bin.left) && cop_pushable(&bin.right),
-        ExprNode::Unary(unary) => cop_pushable(&unary.expr),
-        ExprNode::Cast(cast) => cop_pushable(&cast.expr),
-        ExprNode::InList(list) => cop_pushable(&list.expr) && list.list.iter().all(cop_pushable),
+        ExprNode::Binary(bin) => cop_pushable(&bin.left, table) && cop_pushable(&bin.right, table),
+        ExprNode::Unary(unary) => cop_pushable(&unary.expr, table),
+        ExprNode::Cast(cast) => cop_pushable(&cast.expr, table),
+        ExprNode::InList(list) => {
+            cop_pushable(&list.expr, table)
+                && list.list.iter().all(|item| cop_pushable(item, table))
+        }
         ExprNode::Between(between) => {
-            cop_pushable(&between.expr) && cop_pushable(&between.low) && cop_pushable(&between.high)
+            cop_pushable(&between.expr, table)
+                && cop_pushable(&between.low, table)
+                && cop_pushable(&between.high, table)
         }
-        ExprNode::IsNull(is_null) => cop_pushable(&is_null.expr),
-        ExprNode::Like(like) => cop_pushable(&like.expr) && cop_pushable(&like.pattern),
+        ExprNode::IsNull(is_null) => cop_pushable(&is_null.expr, table),
+        ExprNode::Like(like) => cop_pushable(&like.expr, table) && cop_pushable(&like.pattern, table),
         ExprNode::Case(case) => {
-            case.operand.as_ref().is_none_or(|o| cop_pushable(o))
+            case.operand
+                .as_ref()
+                .is_none_or(|o| cop_pushable(o, table))
                 && case
                     .when_then
                     .iter()
-                    .all(|(when, then)| cop_pushable(when) && cop_pushable(then))
-                && case.else_expr.as_ref().is_none_or(|e| cop_pushable(e))
+                    .all(|(when, then)| cop_pushable(when, table) && cop_pushable(then, table))
+                && case
+                    .else_expr
+                    .as_ref()
+                    .is_none_or(|e| cop_pushable(e, table))
         }
         _ => true,
     }
+}
+
+/// Does `expr` read an `ENUM` / `SET` column of `table`?
+fn expr_references_enum_column(expr: &ExprNode, table: &str) -> bool {
+    expr.referenced_columns().iter().any(|(qualifier, name)| {
+        let qualifier = qualifier.as_deref().unwrap_or(table);
+        crate::core::planbuilder::explain_column_type(qualifier, name).is_some_and(|ft| {
+            matches!(
+                ft.tp,
+                sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+            )
+        })
+    })
 }
 
 /// Key columns a point get pins: the index key parts (an expression part is
@@ -1226,9 +1259,14 @@ fn wrap_residual(plan: PhysicalPlan, residual: Vec<ExprNode>) -> PhysicalPlan {
         // A conjunct the expression blacklist kept out of the coprocessor never
         // had a range derived for it, so TiDB sizes the `Selection` with the
         // plain 0.8 `selectionFactor` instead of the pseudo range selectivity.
+        let read_table = crate::core::explain::first_read_table(&plan).unwrap_or_default();
         let est_rows = residual
             .iter()
-            .any(super::blacklist::expr_contains_blacklisted_pushdown)
+            .any(|expr| {
+                super::blacklist::expr_contains_blacklisted_pushdown(expr)
+                    || (super::blacklist::expr_pushdown_disabled("enum")
+                        && expr_references_enum_column(expr, read_table))
+            })
             .then(|| super::explain::est_rows(&plan) * 0.8);
         PhysicalPlan::Selection {
             child: Box::new(plan),

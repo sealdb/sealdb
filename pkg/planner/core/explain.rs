@@ -1928,7 +1928,7 @@ fn explain_decorr_dml_apply(plan: &PhysicalPlan) -> Option<Vec<ExplainRow>> {
 }
 
 /// Root table a plan reads (`TableReader`/`IndexReader`/… `table` label).
-fn first_read_table(plan: &PhysicalPlan) -> Option<&str> {
+pub(crate) fn first_read_table(plan: &PhysicalPlan) -> Option<&str> {
     match plan {
         PhysicalPlan::TableReader { table, .. }
         | PhysicalPlan::IndexReader { table, .. }
@@ -4736,11 +4736,15 @@ fn emit_cop_children(
                 );
                 scan_depth = depth + 1;
             }
-            if let Some((agg_name, _, cop_info, est)) = stream_parent {
+            if let Some((agg_name, root_info, cop_info, est)) = stream_parent {
                 // GROUP BY StreamAgg needs ordered index input; a global scalar
-                // count over a covering index reads it unordered.
+                // aggregate over a covering index reads it unordered.
                 if agg_name == "StreamAgg" {
-                    scan_info = if cop_info.is_empty() || cop_info.starts_with("group by:") {
+                    let grouped = root_info.starts_with("group by:")
+                        || cop_info.starts_with("group by:");
+                    scan_info = if grouped
+                        && (cop_info.is_empty() || cop_info.starts_with("group by:"))
+                    {
                         "keep order:true, stats:pseudo".to_string()
                     } else if *row_count >= 9_000.0 {
                         "keep order:false, stats:pseudo".to_string()
@@ -6770,6 +6774,11 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
         ),
+        // An `ENUM` constant keeps its ordinal in TiDB's `Constant.ExplainInfo`
+        // (`where e = 1` prints `1`, not the member label the ranger seeks).
+        ExprNode::Value(ValueExpr {
+            datum: Datum::Enum(e),
+        }) => e.number.to_string(),
         ExprNode::Binary(bin) => {
             let op = match bin.op {
                 Op::Gt => "gt",
@@ -6789,10 +6798,14 @@ pub(crate) fn explain_scalar_expr(expr: &sealdb_parser::ast::ExprNode, table: &s
                 Op::RightShift => "rightshift",
                 _ => return expr.restore_string(),
             };
+            let arithmetic = matches!(
+                bin.op,
+                Op::Plus | Op::Minus | Op::Mul | Op::Div | Op::IntDiv | Op::Mod
+            );
             format!(
                 "{op}({}, {})",
-                explain_scalar_expr(&bin.left, table),
-                explain_scalar_expr(&bin.right, table)
+                explain_binary_operand(&bin.left, table, arithmetic),
+                explain_binary_operand(&bin.right, table, arithmetic)
             )
         }
         ExprNode::Cast(c) => {
@@ -6996,13 +7009,48 @@ pub(crate) fn explain_pushed_filter(table: &str, filter: &sealdb_parser::ast::Ex
                     return explain_scalar_expr(filter, table);
                 }
             };
+            let arithmetic = matches!(
+                bin.op,
+                Op::Plus | Op::Minus | Op::Mul | Op::Div | Op::IntDiv | Op::Mod
+            );
             format!(
                 "{op}({}, {})",
-                explain_scalar_expr(&bin.left, table),
-                explain_scalar_expr(&bin.right, table)
+                explain_binary_operand(&bin.left, table, arithmetic),
+                explain_binary_operand(&bin.right, table, arithmetic)
             )
         }
         other => explain_scalar_expr(other, table),
+    }
+}
+
+/// Operand of a rendered binary expression. TiDB spells out the implicit
+/// `cast(col, double BINARY)` that numeric arithmetic applies to an `ENUM` /
+/// `SET` column (`plus(cast(t.a, double BINARY), cast(t.b, double BINARY))`).
+fn explain_binary_operand(
+    expr: &sealdb_parser::ast::ExprNode,
+    table: &str,
+    arithmetic: bool,
+) -> String {
+    let rendered = explain_scalar_expr(expr, table);
+    if !arithmetic {
+        return rendered;
+    }
+    let sealdb_parser::ast::ExprNode::Column(col) = expr else {
+        return rendered;
+    };
+    let qualifier = col.table.as_deref().unwrap_or(table);
+    let is_enum = crate::core::planbuilder::explain_column_type(qualifier, &col.name).is_some_and(
+        |ft| {
+            matches!(
+                ft.tp,
+                sealdb_types::field_type::TYPE_ENUM | sealdb_types::field_type::TYPE_SET
+            )
+        },
+    );
+    if is_enum {
+        format!("cast({rendered}, double BINARY)")
+    } else {
+        rendered
     }
 }
 

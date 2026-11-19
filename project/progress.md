@@ -4291,6 +4291,45 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - R6 剩余 `ddl/db_table` / `ddl/modify_column` 等，及 R7 表达式长尾套件。
 
+### 2026-11-19（`black_list` 转绿：ENUM 覆盖索引标量聚合、聚合提示、enum 黑名单门控）
+
+- **Phase**: R7 `black_list` → green（Mem + TiKV 双通过）
+- **完成**:
+  - 标量聚合选择覆盖索引：`SELECT max(a) FROM t`（无 `GROUP BY`/`WHERE`）在
+    `in_explain_build()` 下按 `IndexFullScan` 规划，取覆盖聚合参数的最窄二级索引
+    （跳过表达式索引、invisible 索引、聚簇主键与 `_tidb_rowid`）。
+  - 聚合提示：标量聚合遵循 `/*+ HASH_AGG() */` / `/*+ STREAM_AGG() */`，
+    下推形态同时决定根聚合与 cop 分片类型（`data:HashAgg` / `index:StreamAgg`）。
+  - `ENUM` 聚合下推门控：`expr_pushdown_blacklist(name='enum')` 时
+    `cast_enum` 无法下推，标量聚合整体留在 tidb 侧（`funcs:max(t.a)`）。
+  - 聚合分片列号：两阶段 `HashAgg` 取 `out_col + 1`；`StreamAgg` 覆盖索引按
+    「每个索引键 3 个 id 减 1」保留分片状态；聚合参数是真实列时（`max(a)`
+    over `idx(b, a)`）参数列占一个 id，`HashAgg` / `StreamAgg` 一致落在
+    `out_col + 2`（`funcs:max(Column#7)->Column#5`）。
+  - ENUM 谓词渲染：算术语境下 enum/set 列按 TiDB 隐式强转打印为
+    `cast(t.a, double BINARY)`；`Datum::Enum` 常量在 `Selection` 中打印序号而非成员名。
+  - enum 黑名单影响访问路径：被黑名单挡住的 enum 谓词不参与范围推导
+    （回退 `TableReader` 全表扫 + 根 `Selection`，`estRows` 取 0.8 选择率），
+    residual `Selection` 的 estRows 也按同一规则计算。
+  - ENUM 范围语义：数值边界按成员序号 `coerce_bound` 为成员值；字符串比较
+    （`a > 'a'`）按成员枚举展开为多个点范围（`"b"`、`"c"`），范围文本按
+    Go `strconv.Quote` 打印成员（`range:["a" "a","a" "a"]`）。
+- **验证**:
+  - `./tests/integrationtest/run-tests.sh -s memory -t black_list`
+    → `PASS: memory=1 tikv=0 skipped=253`；
+    `-s tikv -t black_list` → `PASS: memory=0 tikv=1`。
+  - `clustered_index` 回归复验：`-s memory` / `-s tikv` 均 `PASS: 1`。
+  - 全量 gate：`-s memory` → `PASS: memory=120 tikv=0 skipped=134`
+    （112 green + 8 local）；`-s tikv` → `PASS: memory=0 tikv=118 skipped=136`
+    （111 green + 7 local，`executor/adapter` skip_tikv）。
+  - manifest：`black_list` → `green`，green 111→112（R7 43→44，pending 124→123）。
+- **阻塞/风险**:
+  - 覆盖索引标量聚合目前仅在 EXPLAIN 构建期选择（执行仍走 TableReader），
+    与 TiDB 的实际执行计划存在优化差异；`set` 列的字符串范围扩展未覆盖。
+- **下一步**:
+  - R7 剩余长尾（`expression/builtin`、`expression/issues` 等），
+    及 R6 `ddl/db_table` / `ddl/modify_column`。
+
 ## 7. 更新模板
 
 每次更新追加一条：
