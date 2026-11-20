@@ -1084,11 +1084,11 @@ fn cop_pushable(expr: &ExprNode, table: &str) -> bool {
                 && cop_pushable(&between.high, table)
         }
         ExprNode::IsNull(is_null) => cop_pushable(&is_null.expr, table),
-        ExprNode::Like(like) => cop_pushable(&like.expr, table) && cop_pushable(&like.pattern, table),
+        ExprNode::Like(like) => {
+            cop_pushable(&like.expr, table) && cop_pushable(&like.pattern, table)
+        }
         ExprNode::Case(case) => {
-            case.operand
-                .as_ref()
-                .is_none_or(|o| cop_pushable(o, table))
+            case.operand.as_ref().is_none_or(|o| cop_pushable(o, table))
                 && case
                     .when_then
                     .iter()

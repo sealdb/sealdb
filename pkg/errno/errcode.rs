@@ -171,6 +171,15 @@ pub const ERR_FUNCTIONAL_INDEX_ROW_VALUE_IS_NOT_ALLOWED: i32 = 3800;
 /// TiDB `ErrNonUpdatableTable`: the UPDATE/DELETE target is a view, sequence
 /// or derived table (`The target table v of the UPDATE is not updatable`).
 pub const ERR_NON_UPDATABLE_TABLE: i32 = 1288;
+/// TiDB `ErrInvalidRequiresSingleReference`: the recursive part of a recursive
+/// CTE references the CTE table more than once, or inside a subquery.
+pub const ERR_INVALID_REQUIRES_SINGLE_REFERENCE: i32 = 3577;
+/// TiDB `ErrCTERecursiveRequiresNonRecursiveFirst`: the recursive CTE body does
+/// not start with non-recursive blocks (or a later block skips the CTE).
+pub const ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST: i32 = 3574;
+/// TiDB `ErrCTERecursiveForbiddenJoinOrder`: the recursive table sits in the
+/// right argument of a LEFT JOIN (or is forced non-first by a hint).
+pub const ERR_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER: i32 = 3576;
 /// TiDB `ErrMultiUpdateKeyConflict`: the same table is updated under two
 /// aliases and one of them assigns the primary key / partition key (1706).
 pub const ERR_MULTI_UPDATE_KEY_CONFLICT: i32 = 1706;

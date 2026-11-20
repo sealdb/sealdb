@@ -254,6 +254,7 @@ impl WithClause {
             return Ok(None);
         };
         let mut rec = rec;
+        check_recursive_reference(name, &rec)?;
         if rec.with.is_none()
             && let Some(scope) = self.body_scope(name)
         {
@@ -273,6 +274,9 @@ impl WithClause {
         if let Some((op, rec)) = cte.recursive.clone() {
             arms.push((op, rec));
             arms.extend(cte.recursive_rest.iter().cloned());
+        }
+        for (_, rec) in arms.iter() {
+            check_recursive_reference(name, rec)?;
         }
         let scope = self.body_scope(name);
         for (_, rec) in arms.iter_mut() {
@@ -387,6 +391,24 @@ impl SelectStmt {
             tables.push(&join.right);
         }
         tables
+    }
+
+    /// Whether any query block reachable from this select references `name`,
+    /// including derived tables and subquery expressions. TiDB splits a
+    /// `WITH RECURSIVE` body at the first arm that names the CTE at any depth
+    /// (`buildRecursiveCTE`).
+    pub fn references_table_nested(&self, name: &str) -> bool {
+        let mut refs = RecursiveRefs::default();
+        collect_recursive_refs(self, name, false, &mut refs);
+        refs.count > 0
+    }
+
+    /// Whether this query block's own `WITH` defines `name`, hiding the recursive
+    /// CTE for the block (`WITH RECURSIVE cte AS (WITH cte AS (…) SELECT …)`).
+    pub fn shadows_cte(&self, name: &str) -> bool {
+        self.with
+            .as_ref()
+            .is_some_and(|with| with.find(name).is_some())
     }
 
     pub fn restore(&self, ctx: &mut RestoreCtx) -> Result<()> {
@@ -1156,5 +1178,342 @@ impl ResultSetNode {
                 set.limit = Some(set.limit.unwrap_or(n).min(n));
             }
         }
+    }
+}
+
+/// TiDB `checkRecursiveCTE` (errno 3577): inside the recursive part of a
+/// recursive CTE the CTE table may be referenced exactly once, at the top
+/// level of the query block — never twice, and never inside a subquery.
+fn check_recursive_reference(name: &str, select: &SelectStmt) -> Result<()> {
+    let mut refs = RecursiveRefs::default();
+    collect_recursive_refs(select, name, false, &mut refs);
+    if refs.count > 1 || refs.in_subquery {
+        return Err(Error::new(
+            sealdb_errno::ERR_INVALID_REQUIRES_SINGLE_REFERENCE,
+            format!(
+                "In recursive query block of Recursive Common Table Expression '{name}', the recursive table must be referenced only once, and not in any subquery"
+            ),
+        ));
+    }
+    if refs.forbidden_join_order {
+        return Err(Error::new(
+            sealdb_errno::ERR_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER,
+            format!(
+                "In recursive query block of Recursive Common Table Expression '{name}', the recursive table must neither be in the right argument of a LEFT JOIN, nor be forced to be non-first with join order hints"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecursiveRefs {
+    /// References to the CTE table in the recursive part.
+    count: usize,
+    /// At least one of them sits inside a subquery.
+    in_subquery: bool,
+    /// The CTE table is the right argument of a LEFT JOIN (errno 3576).
+    forbidden_join_order: bool,
+}
+
+impl RecursiveRefs {
+    fn note(&mut self, in_subquery: bool) {
+        self.count += 1;
+        self.in_subquery |= in_subquery;
+    }
+}
+
+fn collect_recursive_refs(
+    select: &SelectStmt,
+    name: &str,
+    in_subquery: bool,
+    refs: &mut RecursiveRefs,
+) {
+    // A `WITH` in this block that defines the same name shadows the CTE for the
+    // whole block (TiDB resolves the innermost definition first), so its
+    // references are not recursive references.
+    if select
+        .with
+        .as_ref()
+        .is_some_and(|with| with.find(name).is_some())
+    {
+        return;
+    }
+    for table in select.join_tables() {
+        // `db.cte` names a real table, never the CTE.
+        if table.schema.is_none() && table.resolve_name().eq_ignore_ascii_case(name) {
+            refs.note(in_subquery);
+        }
+    }
+    for join in &select.joins {
+        collect_expr_recursive_refs(&join.on, name, refs);
+    }
+    // TiDB errno 3576: the recursive table cannot be the right side of a LEFT
+    // JOIN (`… from t left join cte on …`); join-order hints are not modelled.
+    if let Some(item) = &select.from_item {
+        collect_left_join_refs(item, name, refs);
+    } else {
+        for join in &select.joins {
+            if matches!(join.tp, JoinType::LeftOuter)
+                && join.right.schema.is_none()
+                && join.right.resolve_name().eq_ignore_ascii_case(name)
+            {
+                refs.forbidden_join_order = true;
+            }
+        }
+    }
+    for field in &select.fields {
+        collect_expr_recursive_refs(&field.expr, name, refs);
+    }
+    if let Some(selection) = &select.selection {
+        collect_expr_recursive_refs(selection, name, refs);
+    }
+    for group in &select.group_by {
+        collect_expr_recursive_refs(group, name, refs);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_recursive_refs(having, name, refs);
+    }
+    for item in &select.order_by {
+        collect_expr_recursive_refs(&item.expr, name, refs);
+    }
+    // Derived tables are lowered to `with` entries; a reference inside one is
+    // "in any subquery" (`… union select * from (select * from cte) c1`).
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            let nested = in_subquery || cte.derived;
+            collect_recursive_refs(&cte.query, name, nested, refs);
+            for (_, arm) in &cte.set_rest {
+                collect_recursive_refs(arm, name, nested, refs);
+            }
+            if let Some((_, rec)) = &cte.recursive {
+                collect_recursive_refs(rec, name, nested, refs);
+            }
+            for (_, arm) in &cte.recursive_rest {
+                collect_recursive_refs(arm, name, nested, refs);
+            }
+        }
+    }
+}
+
+/// Flag refs to `name` that sit in the right argument of a `LEFT JOIN`.
+fn collect_left_join_refs(item: &FromItem, name: &str, refs: &mut RecursiveRefs) {
+    let FromItem::Join {
+        left, right, tp, ..
+    } = item
+    else {
+        return;
+    };
+    if matches!(tp, JoinType::LeftOuter)
+        && right
+            .tables()
+            .iter()
+            .any(|table| table.schema.is_none() && table.resolve_name().eq_ignore_ascii_case(name))
+    {
+        refs.forbidden_join_order = true;
+    }
+    collect_left_join_refs(left, name, refs);
+    collect_left_join_refs(right, name, refs);
+}
+
+fn collect_result_set_recursive_refs(node: &ResultSetNode, name: &str, refs: &mut RecursiveRefs) {
+    match node {
+        ResultSetNode::Select(select) => collect_recursive_refs(select, name, true, refs),
+        ResultSetNode::SetOpr(set) => {
+            collect_recursive_refs(&set.first, name, true, refs);
+            for (_, select) in &set.rest {
+                collect_recursive_refs(select, name, true, refs);
+            }
+            if let Some(with) = &set.with {
+                for cte in &with.ctes {
+                    collect_recursive_refs(&cte.query, name, true, refs);
+                    for (_, arm) in &cte.set_rest {
+                        collect_recursive_refs(arm, name, true, refs);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_expr_recursive_refs(expr: &ExprNode, name: &str, refs: &mut RecursiveRefs) {
+    match expr {
+        ExprNode::Value(_) | ExprNode::Column(_) => {}
+        ExprNode::Binary(bin) => {
+            collect_expr_recursive_refs(&bin.left, name, refs);
+            collect_expr_recursive_refs(&bin.right, name, refs);
+        }
+        ExprNode::Unary(unary) => collect_expr_recursive_refs(&unary.expr, name, refs),
+        ExprNode::Func(func) => {
+            for arg in &func.args {
+                collect_expr_recursive_refs(arg, name, refs);
+            }
+        }
+        ExprNode::Cast(cast) => collect_expr_recursive_refs(&cast.expr, name, refs),
+        ExprNode::InList(list) => {
+            collect_expr_recursive_refs(&list.expr, name, refs);
+            for item in &list.list {
+                collect_expr_recursive_refs(item, name, refs);
+            }
+        }
+        ExprNode::Between(between) => {
+            collect_expr_recursive_refs(&between.expr, name, refs);
+            collect_expr_recursive_refs(&between.low, name, refs);
+            collect_expr_recursive_refs(&between.high, name, refs);
+        }
+        ExprNode::Like(like) => {
+            collect_expr_recursive_refs(&like.expr, name, refs);
+            collect_expr_recursive_refs(&like.pattern, name, refs);
+        }
+        ExprNode::IsNull(is_null) => collect_expr_recursive_refs(&is_null.expr, name, refs),
+        ExprNode::Case(case) => {
+            if let Some(operand) = &case.operand {
+                collect_expr_recursive_refs(operand, name, refs);
+            }
+            for (when, then) in &case.when_then {
+                collect_expr_recursive_refs(when, name, refs);
+                collect_expr_recursive_refs(then, name, refs);
+            }
+            if let Some(else_expr) = &case.else_expr {
+                collect_expr_recursive_refs(else_expr, name, refs);
+            }
+        }
+        ExprNode::Row(row) => {
+            for item in &row.exprs {
+                collect_expr_recursive_refs(item, name, refs);
+            }
+        }
+        ExprNode::Window(window) => {
+            for arg in &window.args {
+                collect_expr_recursive_refs(arg, name, refs);
+            }
+            for part in &window.spec.partition_by {
+                collect_expr_recursive_refs(part, name, refs);
+            }
+            for item in &window.spec.order_by {
+                collect_expr_recursive_refs(&item.expr, name, refs);
+            }
+        }
+        // Subquery expressions: any reference inside counts as "in a subquery".
+        ExprNode::Exists(exists) => collect_result_set_recursive_refs(&exists.query, name, refs),
+        ExprNode::InSubquery(sub) => {
+            collect_expr_recursive_refs(&sub.expr, name, refs);
+            collect_result_set_recursive_refs(&sub.query, name, refs);
+        }
+        ExprNode::ScalarSubquery(sub) => collect_result_set_recursive_refs(&sub.query, name, refs),
+        ExprNode::QuantifiedCmp(cmp) => {
+            collect_expr_recursive_refs(&cmp.expr, name, refs);
+            collect_result_set_recursive_refs(&cmp.query, name, refs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod recursive_ref_tests {
+    use crate::Parser;
+    use crate::ast::Statement;
+
+    fn arm_error(sql: &str) -> Option<i32> {
+        let stmt = Parser::new().parse_one_stmt(sql).expect("parse");
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let with = select.with.expect("with clause");
+        with.recursive_arm("cte").err().map(|err| err.code)
+    }
+
+    /// Lowering rejects a bad seed/recursive split before planning.
+    fn parse_error(sql: &str) -> Option<i32> {
+        Parser::new().parse_one_stmt(sql).err().map(|err| err.code)
+    }
+
+    #[test]
+    fn single_reference_is_allowed() {
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select n + 1 from cte where n < 3) select * from cte"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn second_reference_is_3577() {
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select * from cte, cte c1) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_INVALID_REQUIRES_SINGLE_REFERENCE)
+        );
+    }
+
+    #[test]
+    fn reference_in_derived_table_is_3577() {
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select * from (select * from cte) c1) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_INVALID_REQUIRES_SINGLE_REFERENCE)
+        );
+    }
+
+    #[test]
+    fn seed_must_be_non_recursive() {
+        assert_eq!(
+            parse_error(
+                "with recursive cte(n) as (select * from cte union select * from cte) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST)
+        );
+        // A block after the recursive part that skips the CTE is 3574 too.
+        assert_eq!(
+            parse_error(
+                "with recursive cte(n) as (select 1 intersect select 2 union select * from cte union select 1) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST)
+        );
+    }
+
+    #[test]
+    fn non_union_between_seed_and_recursive_is_1235() {
+        for sql in [
+            "with recursive cte(n) as (select 1 intersect select * from cte) select * from cte",
+            "with recursive cte(n) as (select 1 union select 1 intersect select * from cte) select * from cte",
+            "with recursive cte(n) as (select 1 except select * from cte) select * from cte",
+            "with recursive cte(n) as (select 1 union select 1 except select * from cte) select * from cte",
+        ] {
+            assert_eq!(
+                parse_error(sql),
+                Some(sealdb_errno::ERR_UNSUPPORTED),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn left_join_right_side_is_3576() {
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select * from t left join cte on t.a = cte.n) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER)
+        );
+        // The CTE on the left of the join is fine.
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select * from cte left join t on t.a = cte.n) select * from cte"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn reference_in_subquery_expression_is_3577() {
+        assert_eq!(
+            arm_error(
+                "with recursive cte(n) as (select 1 union select n + 1 from cte where n in (select n from cte)) select * from cte"
+            ),
+            Some(sealdb_errno::ERR_INVALID_REQUIRES_SINGLE_REFERENCE)
+        );
     }
 }

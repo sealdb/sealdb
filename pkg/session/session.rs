@@ -7363,6 +7363,27 @@ fn expand_views(
                     format!("The target table {view} of the UPDATE is not updatable"),
                 ));
             }
+            // A `WITH` name shadows a base table and is not a real table, so
+            // `WITH cte AS (…) UPDATE cte …` is 1288 too (TiDB `buildUpdate`).
+            if update.join.is_none()
+                && let Some(cte) = cte_target(update.with.as_ref(), &update.table)
+            {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_NON_UPDATABLE_TABLE,
+                    format!("The target table {cte} of the UPDATE is not updatable"),
+                ));
+            }
+        }
+        Statement::Delete(delete) => {
+            if delete.join.is_none()
+                && delete.tables.is_empty()
+                && let Some(cte) = cte_target(delete.with.as_ref(), &delete.table)
+            {
+                return Err(sealdb_errno::Error::new(
+                    sealdb_errno::ERR_NON_UPDATABLE_TABLE,
+                    format!("The target table {cte} of the DELETE is not updatable"),
+                ));
+            }
         }
         Statement::SetOpr(set) => {
             expand_views_in_select(&mut set.first, is, current_db, view_priv, &mut Vec::new())?;
@@ -7379,6 +7400,17 @@ fn expand_views(
         _ => {}
     }
     Ok(())
+}
+
+/// Name of the CTE a single-table DML target resolves to (TiDB 1288). A `WITH`
+/// name shadows a base table, and a CTE is not a real table to update.
+fn cte_target(with: Option<&WithClause>, table: &TableName) -> Option<String> {
+    // `db.cte` is a qualified table reference, never a CTE.
+    if table.schema.is_some() {
+        return None;
+    }
+    let cte = with?.find(table.resolve_name())?;
+    Some(cte.name.clone())
 }
 
 /// Name of the view a single-table DML target resolves to (TiDB 1288).

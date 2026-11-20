@@ -4461,3 +4461,41 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **下一步**:
   - ...
 ```
+
+### 2026-11-20（递归 CTE 错误矩阵：3577 / 3574 / 3576 + DML 目标 1288 + 1052/1046）
+
+- **Phase**: R7 `expression/misc` 推进（suite 仍 `pending`），顺带修正错误码语义
+- **完成**:
+  - 递归 CTE 校验（`parser/ast/dml.rs`）：`WithClause::recursive_arm(s)`
+    在取递归臂时按 TiDB `checkRecursiveCTE` 校验——CTE 表只能引用一次且不能
+    出现在任何子查询（派生表 / 子查询表达式）内 → `3577`；CTE 表位于
+    `LEFT JOIN` 右参数 → `3576`。
+  - `WITH RECURSIVE` 分体（`lower.rs::lower_cte`）：首个引用 CTE 的臂之前
+    必须至少有一个非递归种子臂，且之后所有臂都必须引用 CTE，否则
+    `3574`；`INTERSECT`/`EXCEPT` 作为种子/递归分隔符 → `1235`。
+    同名嵌套 `WITH` 会遮蔽外层 CTE（`shadows_cte`），该块内的引用不计入
+    递归引用（`WITH RECURSIVE tbl_0 AS (WITH RECURSIVE tbl_0 AS …)` 仍按
+    TiDB 报 `1054`）。`references_table_nested` 让分体识别派生表内的引用。
+  - DML 目标为 `WITH` 名（`WITH cte AS (…) UPDATE/DELETE cte`）→ `1288`
+    「The target table cte of the UPDATE/DELETE is not updatable」，
+    与既有 view 目标一致（`session::expand_views`）。
+  - 未知函数名解析对齐 TiDB：无当前库且未限定 → `1046`
+    「No database selected」；否则消息带库前缀/限定名，
+    如 `FUNCTION test.xxx does not exist`、`FUNCTION t.upper does not exist`。
+  - 歧义列错误码由 `1054` 修正为 `1052`
+    「Column 'a' in field list is ambiguous」（`expression::resolve_column`）。
+- **验证**:
+  - `cargo test -p sealdb-parser --lib` → 67 passed（含新增 4 个递归引用单测）。
+  - 全量 `run-tests.sh -s memory` → `PASS: memory=122 skipped=132`；
+    全量 `-s tikv` → `PASS: memory=0 tikv=120 skipped=134`（无回归）。
+  - `expression/misc` 剩余差异：空二进制字面量 `LENGTH(b'')`、
+    `TIME '…'` 字面量（`'33:33'`、`'1.1'`、`'1 01:00:00'`、负值）、
+    `TIMESTAMP` 数字/短格式字面量。
+- **阻塞/风险**:
+  - 负 TIME 值（`-01:01:01.123455`）需要 `Time` 带符号（当前 `hour: u8`
+    无法表达），会牵扯 `Display` / `Ord` / `to_packed_u64` 与存储编解码，
+    需单独评估。
+- **下一步**:
+  - 按 TiDB `matchDuration`（`matchDayHHMMSS` / `matchHHMMSSDelimited` /
+    `matchHHMMSSCompact` / `matchFrac`）重写 `parse_time_literal`，
+    再处理 `parse_timestamp_literal` 的短格式与数字格式。

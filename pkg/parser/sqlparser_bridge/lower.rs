@@ -102,12 +102,13 @@ fn take_tidb_table_options() -> (Option<u32>, Option<u32>) {
     )
 }
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_COLLATION_CHARSET_MISMATCH, ERR_CONFLICTING_DECLARATIONS, ERR_DUP_FIELDNAME,
-    ERR_ILLEGAL_VALUE_FOR_TYPE, ERR_INCORRECT_USAGE, ERR_PARSE_ERROR,
-    ERR_PRIMARY_KEY_ON_EXPR_COLUMN, ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED,
-    ERR_TABLE_OPTION_UNION_UNSUPPORTED, ERR_TOO_BIG_PRECISION, ERR_TTL_MULTI_SCHEMA_CHANGE,
-    ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE, ERR_UNKNOWN_CHARACTER_SET, ERR_UNKNOWN_ERROR,
-    ERR_UNSUPPORTED, ERR_UNSUPPORTED_DDL_OPERATION, Error, Result,
+    ERR_BAD_FIELD, ERR_COLLATION_CHARSET_MISMATCH, ERR_CONFLICTING_DECLARATIONS,
+    ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST, ERR_DUP_FIELDNAME, ERR_ILLEGAL_VALUE_FOR_TYPE,
+    ERR_INCORRECT_USAGE, ERR_PARSE_ERROR, ERR_PRIMARY_KEY_ON_EXPR_COLUMN,
+    ERR_TABLE_OPTION_INSERT_METHOD_UNSUPPORTED, ERR_TABLE_OPTION_UNION_UNSUPPORTED,
+    ERR_TOO_BIG_PRECISION, ERR_TTL_MULTI_SCHEMA_CHANGE, ERR_TTL_NO_CONFIG, ERR_TTL_TEMPORARY_TABLE,
+    ERR_UNKNOWN_CHARACTER_SET, ERR_UNKNOWN_ERROR, ERR_UNSUPPORTED, ERR_UNSUPPORTED_DDL_OPERATION,
+    Error, Result,
 };
 use sealdb_types::{Datum, parse_date_literal, parse_time_literal, parse_timestamp_literal};
 use sqlparser::ast::{
@@ -9598,10 +9599,15 @@ fn lower_with(with: Option<&With>) -> Result<Option<WithClause>> {
 
 /// Does `select` read table `name` anywhere in its FROM / JOIN tree?
 fn select_references_table(select: &SelectStmt, name: &str) -> bool {
-    select
-        .join_tables()
-        .into_iter()
-        .any(|table| table.resolve_name().eq_ignore_ascii_case(name))
+    // TiDB counts a reference at any depth when it splits the body, so
+    // `select * from (select * from cte) c1` is a recursive arm (errno 3577).
+    select.references_table_nested(name)
+}
+
+/// Whether the arm's own `WITH` defines `name`, so its self-reference is not a
+/// recursive one (`WITH RECURSIVE cte AS (WITH cte AS (…) SELECT …)`).
+fn arm_shadows_cte(select: &SelectStmt, name: &str) -> bool {
+    select.shadows_cte(name)
 }
 
 /// Lower a `WITH` item. Recursive CTEs must be `seed UNION [ALL] recursive_arm`.
@@ -9675,7 +9681,48 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             // same-name nested WITH shadows it), the first arm still acts as
             // the seed and every later arm is recursive; binding then reports
             // the shadowing mismatch (errno 1054).
-            let split = split.max(1);
+            let split = if split == 0 {
+                if !arm_shadows_cte(&arms[0].1, &name) {
+                    return Err(Error::new(
+                        ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST,
+                        format!(
+                            "Recursive Common Table Expression '{name}' should have one or more non-recursive query blocks followed by one or more recursive ones"
+                        ),
+                    ));
+                }
+                1
+            } else {
+                split
+            };
+            // The operator joining the seed to the recursive part must be a
+            // UNION; a later non-union arm (or one that skips the CTE) is
+            // rejected the same way as an empty seed.
+            if let Some(op) = arms[split].0
+                && !matches!(op, SetOprType::Union | SetOprType::UnionAll)
+            {
+                return Err(Error::unsupported(format!(
+                    "{} between seed part and recursive part, hint: The operator between seed part and recursive part must bu UNION[DISTINCT] or UNION ALL",
+                    op.restore()
+                )));
+            }
+            for (op, select) in arms.iter().skip(split + 1) {
+                if let Some(op) = op
+                    && !matches!(op, SetOprType::Union | SetOprType::UnionAll)
+                {
+                    return Err(Error::unsupported(format!(
+                        "{} between recursive part's selects, hint: The operator between recursive part's selects must bu UNION[DISTINCT] or UNION ALL",
+                        op.restore()
+                    )));
+                }
+                if !select.references_table_nested(&name) {
+                    return Err(Error::new(
+                        ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST,
+                        format!(
+                            "Recursive Common Table Expression '{name}' should have one or more non-recursive query blocks followed by one or more recursive ones"
+                        ),
+                    ));
+                }
+            }
             let mut arms = arms.into_iter();
             let (_, seed) = arms.next().expect("seed arm");
             let set_rest: Vec<(SetOprType, SelectStmt)> = arms

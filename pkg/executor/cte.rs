@@ -5,8 +5,9 @@ use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_DUP_FIELDNAME, ERR_UNSUPPORTED,
-    ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
+    ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_DUP_FIELDNAME,
+    ERR_INVALID_REQUIRES_SINGLE_REFERENCE, ERR_UNSUPPORTED, ERR_VIEW_WRONG_LIST,
+    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
@@ -362,6 +363,7 @@ fn iterate_recursive(
                 "This version of TiDB doesn't yet support 'ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression'",
             ));
         }
+        check_recursive_refs(rec, name)?;
     }
     let distinct = arms[0].0.is_distinct();
     // UNION (distinct) also collapses duplicate seed rows (TiDB / MySQL).
@@ -488,6 +490,28 @@ fn select_refs_table(select: &SelectStmt, name: &str) -> bool {
         .join_tables()
         .into_iter()
         .any(|t| t.resolve_name().eq_ignore_ascii_case(name))
+}
+
+/// TiDB `checkRecursiveCTE` (3577): the recursive part may reference the CTE
+/// table exactly once, at the top level of the query block. The planner runs
+/// the same check when it picks up the arm (`WithClause::recursive_arm`); this
+/// keeps the executor honest for arms built without that path.
+fn check_recursive_refs(select: &SelectStmt, name: &str) -> Result<()> {
+    if select
+        .join_tables()
+        .iter()
+        .filter(|t| t.schema.is_none() && t.resolve_name().eq_ignore_ascii_case(name))
+        .count()
+        > 1
+    {
+        return Err(Error::new(
+            ERR_INVALID_REQUIRES_SINGLE_REFERENCE,
+            format!(
+                "In recursive query block of Recursive Common Table Expression '{name}', the recursive table must be referenced only once, and not in any subquery"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn run_select(

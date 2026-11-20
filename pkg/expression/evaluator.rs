@@ -1,7 +1,7 @@
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_CANNOT_CONVERT_STRING, ERR_DATA_OUT_OF_RANGE, ERR_DIVISION_BY_ZERO,
-    ERR_TIMESTAMP_IN_DST_TRANSITION, ERR_TOO_BIG_PRECISION, ERR_TRUNCATED_WRONG_VALUE,
-    ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
+    ERR_AMBIGUOUS_COLUMN, ERR_BAD_FIELD, ERR_CANNOT_CONVERT_STRING, ERR_DATA_OUT_OF_RANGE,
+    ERR_DIVISION_BY_ZERO, ERR_NO_DB, ERR_TIMESTAMP_IN_DST_TRANSITION, ERR_TOO_BIG_PRECISION,
+    ERR_TRUNCATED_WRONG_VALUE, ERR_UNKNOWN_ERROR, ERR_UNKNOWN_FUNCTION, Error, Result,
 };
 use sealdb_meta::TableInfo;
 use sealdb_parser::ast::expressions::{
@@ -819,7 +819,7 @@ fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Res
         if column_matches(col, name) {
             if found.is_some() && col.table.is_none() {
                 return Err(Error::new(
-                    ERR_BAD_FIELD,
+                    ERR_AMBIGUOUS_COLUMN,
                     format!("Column '{}' in field list is ambiguous", col.name),
                 ));
             }
@@ -1968,10 +1968,27 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 }
             }
         }
-        other => Err(Error::new(
-            ERR_UNKNOWN_FUNCTION,
-            format!("FUNCTION {other} does not exist"),
-        )),
+        other => {
+            let _ = other;
+            // TiDB resolves a function name like a table name: a qualified
+            // name (`t.upper`, `db.fn`) is used as written, an unqualified one
+            // takes the current database as its prefix, and with no database
+            // selected MySQL reports 1046 before the function lookup.
+            let name = func.name.to_ascii_lowercase();
+            if !name.contains('.') && current_db().is_empty() {
+                return Err(Error::new(ERR_NO_DB, "No database selected"));
+            }
+            let db = current_db().to_ascii_lowercase();
+            let rendered = if name.contains('.') || db.is_empty() {
+                name
+            } else {
+                format!("{db}.{name}")
+            };
+            Err(Error::new(
+                ERR_UNKNOWN_FUNCTION,
+                format!("FUNCTION {rendered} does not exist"),
+            ))
+        }
     }
 }
 
