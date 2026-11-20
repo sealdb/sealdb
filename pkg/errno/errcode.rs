@@ -180,6 +180,9 @@ pub const ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST: i32 = 3574;
 /// TiDB `ErrCTERecursiveForbiddenJoinOrder`: the recursive table sits in the
 /// right argument of a LEFT JOIN (or is forced non-first by a hint).
 pub const ERR_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER: i32 = 3576;
+/// TiDB `ErrCTERecursiveForbiddenOperator`: the recursive query block contains
+/// an aggregation or a window function.
+pub const ERR_CTE_RECURSIVE_FORBIDDEN_OPERATOR: i32 = 3575;
 /// TiDB `ErrMultiUpdateKeyConflict`: the same table is updated under two
 /// aliases and one of them assigns the primary key / partition key (1706).
 pub const ERR_MULTI_UPDATE_KEY_CONFLICT: i32 = 1706;

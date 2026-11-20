@@ -339,8 +339,9 @@ impl Datum {
             (Datum::F64(a), Datum::Time(b)) => a
                 .partial_cmp(&(b.to_number() as f64))
                 .unwrap_or(Ordering::Equal),
-            // ENUM/SET: numbers compare by member index / bitmask, strings
-            // (and other enum/set labels) compare by label.
+            // ENUM/SET: two ENUMs compare by label (TiDB's `MIN`/`MAX` and
+            // generic datum comparison are string comparisons); ORDER BY and
+            // index scans are responsible for using the member index.
             (Datum::Enum(a), Datum::Enum(b)) => a.label.cmp(&b.label),
             (Datum::Enum(a), Datum::Bytes(b)) => a.label.cmp(b),
             (Datum::Bytes(a), Datum::Enum(b)) => a.cmp(&b.label),
@@ -1125,16 +1126,13 @@ fn bit_bytes_for(value: &Datum, flen: i32) -> Vec<u8> {
         Datum::Year(v) => *v as u64,
         Datum::F64(v) => *v as u64,
         Datum::Decimal(d) => d.to_f64().unwrap_or(0.0) as u64,
-        // A string constant read into a BIT column is a number (`'48'` → 48);
-        // non-decimal text (and hex bytes that are not digits) keeps its
-        // big-endian binary value.
-        Datum::Bytes(b) => std::str::from_utf8(b)
-            .ok()
-            .map(str::trim)
-            .and_then(|text| text.parse::<u64>().ok())
-            .unwrap_or_else(|| bit_as_u64(b)),
+        // TiDB `convertToMysqlBit`: a string is read as a binary value
+        // (`'10'` → 0x3130 = 12592), not as its decimal spelling.
+        Datum::Bytes(b) => bit_as_u64(b),
         Datum::Bit(b) => bit_as_u64(b),
-        Datum::Time(t) => t.to_packed_u64(),
+        // TiDB `convertToUint` on a temporal value uses `ToNumber()`
+        // (`2009-01-01 00:00:00` → 20090101000000).
+        Datum::Time(t) => t.to_number() as u64,
         Datum::Enum(e) => e.number,
         Datum::Null => 0,
     };
@@ -1144,8 +1142,17 @@ fn bit_bytes_for(value: &Datum, flen: i32) -> Vec<u8> {
 }
 
 fn format_float(v: f64) -> String {
-    if !v.is_finite() {
-        return v.to_string();
+    // MySQL has no `inf` literal: an overflowed DOUBLE prints as the largest
+    // representable value (`select '1e800' + 1e100` → 1.7976931348623157e308).
+    if v.is_infinite() {
+        return if v > 0.0 {
+            "1.7976931348623157e308".to_string()
+        } else {
+            "-1.7976931348623157e308".to_string()
+        };
+    }
+    if v.is_nan() {
+        return "NaN".to_string();
     }
     // A FLOAT column stores float32: print its shortest float32 form
     // (`281.3699951171875` → `281.37`). Large values keep float64 digits so

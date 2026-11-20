@@ -5,9 +5,9 @@ use crate::builder::ExecutorBuilder;
 use crate::internal::exec::{Executor, QueryResult};
 use sealdb_domain::Domain;
 use sealdb_errno::{
-    ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_DUP_FIELDNAME,
-    ERR_INVALID_REQUIRES_SINGLE_REFERENCE, ERR_UNSUPPORTED, ERR_VIEW_WRONG_LIST,
-    ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
+    ERR_BAD_FIELD, ERR_CTE_MAX_RECURSION_DEPTH, ERR_CTE_RECURSIVE_FORBIDDEN_OPERATOR,
+    ERR_DUP_FIELDNAME, ERR_INVALID_REQUIRES_SINGLE_REFERENCE, ERR_UNSUPPORTED,
+    ERR_VIEW_WRONG_LIST, ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT, Error, Result,
 };
 use sealdb_kv::TxnHandle;
 use sealdb_parser::ast::ddl::TableName;
@@ -361,6 +361,20 @@ fn iterate_recursive(
             return Err(Error::new(
                 ERR_UNSUPPORTED,
                 "This version of TiDB doesn't yet support 'ORDER BY / LIMIT / SELECT DISTINCT in recursive query block of Common Table Expression'",
+            ));
+        }
+        // TiDB `ErrCTERecursiveForbiddenOperator`: the recursive block cannot
+        // aggregate or use window functions (`sum(n) … group by n`,
+        // `row_number() over (…)`).
+        if !rec.group_by.is_empty()
+            || rec.fields.iter().any(|f| expr_has_agg_or_window(&f.expr))
+            || rec.having.as_ref().is_some_and(expr_has_agg_or_window)
+        {
+            return Err(Error::new(
+                ERR_CTE_RECURSIVE_FORBIDDEN_OPERATOR,
+                format!(
+                    "Recursive Common Table Expression '{name}' can contain neither aggregation nor window functions in recursive query block"
+                ),
             ));
         }
         check_recursive_refs(rec, name)?;
@@ -777,6 +791,70 @@ fn unknown_outer_col_in_recursive(
         walk_expr_columns(&field.expr, &mut visit);
     }
     found
+}
+
+/// Aggregate function names (`aggregation.GetAggFunc`) that TiDB rejects in a
+/// recursive CTE block.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "GROUP_CONCAT"
+            | "BIT_AND"
+            | "BIT_OR"
+            | "BIT_XOR"
+            | "STD"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
+            | "JSON_ARRAYAGG"
+            | "JSON_OBJECTAGG"
+            | "APPROX_COUNT_DISTINCT"
+    )
+}
+
+/// Whether `expr` contains an aggregation or a window function.
+fn expr_has_agg_or_window(expr: &ExprNode) -> bool {
+    match expr {
+        ExprNode::Window(_) => true,
+        ExprNode::Func(f) => {
+            is_aggregate_name(&f.name) || f.args.iter().any(expr_has_agg_or_window)
+        }
+        ExprNode::Binary(b) => expr_has_agg_or_window(&b.left) || expr_has_agg_or_window(&b.right),
+        ExprNode::Unary(u) => expr_has_agg_or_window(&u.expr),
+        ExprNode::Cast(c) => expr_has_agg_or_window(&c.expr),
+        ExprNode::InList(i) => {
+            expr_has_agg_or_window(&i.expr) || i.list.iter().any(expr_has_agg_or_window)
+        }
+        ExprNode::Between(b) => {
+            expr_has_agg_or_window(&b.expr)
+                || expr_has_agg_or_window(&b.low)
+                || expr_has_agg_or_window(&b.high)
+        }
+        ExprNode::Like(l) => expr_has_agg_or_window(&l.expr) || expr_has_agg_or_window(&l.pattern),
+        ExprNode::IsNull(i) => expr_has_agg_or_window(&i.expr),
+        ExprNode::Case(c) => {
+            c.operand.as_ref().is_some_and(|e| expr_has_agg_or_window(e))
+                || c.when_then
+                    .iter()
+                    .any(|(w, t)| expr_has_agg_or_window(w) || expr_has_agg_or_window(t))
+                || c.else_expr.as_ref().is_some_and(|e| expr_has_agg_or_window(e))
+        }
+        ExprNode::Row(r) => r.exprs.iter().any(expr_has_agg_or_window),
+        ExprNode::Exists(_)
+        | ExprNode::InSubquery(_)
+        | ExprNode::ScalarSubquery(_)
+        | ExprNode::QuantifiedCmp(_)
+        | ExprNode::Column(_)
+        | ExprNode::Value(_) => false,
+    }
 }
 
 fn walk_expr_columns(expr: &ExprNode, visit: &mut impl FnMut(&ColumnNameExpr)) {

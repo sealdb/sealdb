@@ -260,9 +260,10 @@ fn conjunction_key_ranges(
             consumed.extend(part_conjuncts);
             continue;
         }
-        // A string comparison on an `ENUM` column selects whole members
-        // (`a > 'a'` → members `'b'`, `'c'`), so the ranger seeks one point
-        // range per surviving member instead of an open interval.
+        // A comparison on an `ENUM` column selects whole members
+        // (`a > 'a'` → members `'b'`, `'c'`; `a > 1` → every member after the
+        // first), so the ranger seeks one point range per surviving member
+        // instead of an open interval over the stored labels.
         if let Some(members) = enum_member_points(&part.field_type, &bounds_set) {
             for member in members {
                 let mut values: Vec<(sealdb_types::Datum, bool)> =
@@ -527,9 +528,13 @@ fn enum_datum_for_number(field_type: &sealdb_types::FieldType, number: i64) -> O
 
 /// Point values of the `ENUM` members a bound set selects.
 ///
-/// A label comparison (`a > 'a'`) has to enumerate the remaining members, so
-/// the ranger seeks one point range per member. Ordinal comparisons (`a > 1`)
-/// stay interval ranges and report `None`.
+/// ENUM index keys hold member *labels*, so ordinal ordering can disagree with
+/// the key order (`enum('c','b','a')` sorts `c < b < a` by ordinal but
+/// `a < b < c` by bytes). Label comparisons (`a > 'a'`) and ordinal ones on a
+/// non-monotonic ENUM (`a > 1`) therefore enumerate the selected members and
+/// seek one point range per member instead of relying on an interval. A
+/// monotonic ENUM keeps the interval shape (`("a" "a","a" +inf]`), because
+/// there the two orderings agree.
 fn enum_member_points(
     field_type: &sealdb_types::FieldType,
     bounds_set: &[pseudo::Bounds],
@@ -538,18 +543,28 @@ fn enum_member_points(
         return None;
     }
     let elems = field_type.elems.as_ref()?;
-    let label_bound = bounds_set.iter().any(|(low, high)| {
-        matches!(low, Some((Datum::Bytes(_), _))) || matches!(high, Some((Datum::Bytes(_), _)))
-    });
-    if !label_bound {
+    // Ordinal bounds (`a > 1`) on an ENUM whose labels ascend with the member
+    // index are equivalent to an open interval over the labels, and that is the
+    // shape TiDB's ranger produces (`("a" "a","a" +inf]`). Only non-monotonic
+    // labels (`enum('c','b','a')`) need explicit point seeks.
+    let has_label_bound = bounds_set
+        .iter()
+        .any(|(low, high)| bounds_have_label(low, high));
+    let monotonic = elems
+        .windows(2)
+        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes());
+    if !has_label_bound && monotonic {
         return None;
     }
     let mut points: Vec<Datum> = Vec::new();
     for (pos, label) in elems.iter().enumerate() {
         let member = Datum::Enum(EnumValue::new(label.as_bytes().to_vec(), pos as u64 + 1));
         let selected = bounds_set.iter().any(|(low, high)| {
+            // Ordinal bounds (`e > 2`) were coerced to an ENUM datum and
+            // compare by member index; label bounds stay strings and compare
+            // by label, matching TiDB's `e > 'b'` semantics.
             let above = match low {
-                Some((value, inclusive)) => match member.compare(value) {
+                Some((value, inclusive)) => match compare_member(&member, value) {
                     std::cmp::Ordering::Greater => true,
                     std::cmp::Ordering::Equal => *inclusive,
                     std::cmp::Ordering::Less => false,
@@ -557,7 +572,7 @@ fn enum_member_points(
                 None => true,
             };
             let below = match high {
-                Some((value, inclusive)) => match member.compare(value) {
+                Some((value, inclusive)) => match compare_member(&member, value) {
                     std::cmp::Ordering::Less => true,
                     std::cmp::Ordering::Equal => *inclusive,
                     std::cmp::Ordering::Greater => false,
@@ -571,6 +586,24 @@ fn enum_member_points(
         }
     }
     (!points.is_empty()).then_some(points)
+}
+
+/// Does either side of a bound come from a string label (`e > 'b'`) rather
+/// than an ENUM ordinal (`e > 2`)?
+fn bounds_have_label(low: &Option<(Datum, bool)>, high: &Option<(Datum, bool)>) -> bool {
+    let is_label = |bound: &Option<(Datum, bool)>| {
+        matches!(bound, Some((Datum::Bytes(_), _)))
+    };
+    is_label(low) || is_label(high)
+}
+
+/// Compare an ENUM member with an index bound. An ENUM bound is an ordinal
+/// bound (`e > 2`); anything else compares as a string label (`e > 'b'`).
+fn compare_member(member: &Datum, bound: &Datum) -> std::cmp::Ordering {
+    match (member, bound) {
+        (Datum::Enum(a), Datum::Enum(b)) => a.number.cmp(&b.number),
+        _ => member.compare(bound),
+    }
 }
 
 fn coerce_bound(

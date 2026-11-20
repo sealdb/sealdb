@@ -2,7 +2,7 @@
 
 > **唯一进度事实来源 = `project/regression/manifest.json` 中 suite `green`。**  
 > 功能波 `core-ported` / 包级 parity **不再**计为生产对齐进度。  
-> 最后更新：2026-11-20（green 114 套件；整体进展快照见 [status-report.md](./status-report.md)）
+> 最后更新：2026-11-20（green 115 套件；整体进展快照见 [status-report.md](./status-report.md)）
 > 测试规范：[testing.md](./testing.md) · 对齐纪律：[parity-discipline.md](./parity-discipline.md) · 波次：[regression/waves/README.md](./regression/waves/README.md)
 
 ---
@@ -4499,3 +4499,34 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
   - 按 TiDB `matchDuration`（`matchDayHHMMSS` / `matchHHMMSSDelimited` /
     `matchHHMMSSCompact` / `matchFrac`）重写 `parse_time_literal`，
     再处理 `parse_timestamp_literal` 的短格式与数字格式。
+
+### 2026-11-20（`expression/misc` / `planner/core/casetest/point_get_plan` 转绿：`tidb_decode_plan`、BIT/DOUBLE 常量归一）
+
+- **完成**:
+  - `TIDB_DECODE_PLAN`：新增 `pkg/expression/plancodec.rs`，按 TiDB
+    `plancodec.DecodePlan` 解 base64 + snappy，物理算子 ID 映射
+    `PhysicalIDToTypeString`，按 depth 重建 `│ ├ └ ─` 树并跨行对齐列宽；
+    `[discard]` 输出 `(plan discarded because too long)`，坏输入原样返回。
+  - `information_schema.slow_query` 虚拟表：`pkg/infoschema/tables.rs`
+    登记 TiDB 28 列 schema，空结果满足慢日志查询。
+  - ENUM 语义：`Datum::Enum` 通用比较（含 `MIN`/`MAX`）按 label；
+    `ORDER BY` 裸 ENUM 列仍按成员序号（`sortexec` 的 `enum_sort_key`）；
+    `access_range` 仅在单调 ENUM + 纯序号边界时保留开区间，其余
+    （非单调 ENUM 或字符串边界）按存活成员展开点范围。
+  - BIT 常量：session 规划前调用 `normalize_bit_constants`，把比较常量
+    归一为列宽大端字节（`bit(64)` 上 `id in ('0')` 按数值 0，不匹配存储的
+    48）；`Datum::cast` 的 `convertToMysqlBit` 保持字符串按二进制字节
+    （`CAST('10' AS BIT(64))` = 12592）。
+  - DOUBLE 常量：`coerce_comparison_literals` 给字符串列加
+    `cast(…, double BINARY)` 时同步把数值常量转成 `F64`，EXPLAIN 打印
+    `eq(cast(t.id, double BINARY), 0)` 而不是 `0.0`。
+  - 语句作用域用户变量只回写执行期真正修改的 key；`DECIMAL` 仅截断尾零
+    时不发 1366 截断告警。
+- **验证**:
+  - `-t expression/misc` / `-t planner/core/casetest/point_get_plan`：
+    MemStorage + TiKV 均通过。
+  - 全量 `./tests/integrationtest/run-tests.sh -s memory` →
+    `PASS: memory=123 tikv=0 skipped=131`（115 green + 8 local，无回归）。
+- **下一步**:
+  - 按 manifest 继续推 R7 pending：优先 `expression/*` 与 `planner/core`
+    同包未绿套件，复用本次 decode/常量归一与 ENUM 比较实现。

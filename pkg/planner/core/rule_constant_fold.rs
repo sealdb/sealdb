@@ -53,6 +53,10 @@ fn is_volatile_func(name: &str) -> bool {
             | "release_lock"
             | "default"
             | "values"
+            // `@v := expr` / eval-time `@v` read: the read must see the row's
+            // own assignment, so folding would double the side effect.
+            | "__sealdb_assign"
+            | "__sealdb_getvar"
     )
 }
 
@@ -133,9 +137,15 @@ fn as_const(expr: &ExprNode) -> Option<&Datum> {
 fn fold_control(func: &sealdb_parser::ast::expressions::FuncCallExpr) -> Option<ExprNode> {
     let name = func.name.to_ascii_lowercase();
     match name.as_str() {
-        "ifnull" | "nvl" if func.args.len() == 2 => as_const(&func.args[0])?
-            .is_null()
-            .then(|| func.args[1].clone()),
+        // `ifnull(const, x)` keeps the constant when it is not NULL.
+        "ifnull" | "nvl" if func.args.len() == 2 => {
+            let first = as_const(&func.args[0])?;
+            Some(if first.is_null() {
+                func.args[1].clone()
+            } else {
+                func.args[0].clone()
+            })
+        }
         "if" if func.args.len() == 3 => {
             let cond = as_const(&func.args[0])?;
             let taken = if truthy(cond)? {

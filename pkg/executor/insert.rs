@@ -1739,11 +1739,20 @@ fn check_decimal_scale(raw: &Datum, col: &sealdb_meta::ColumnInfo) -> Result<()>
         Datum::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         _ => return Ok(()),
     };
-    let frac_digits = text
-        .split_once('.')
-        .map(|(_, frac)| frac.chars().take_while(|c| c.is_ascii_digit()).count())
-        .unwrap_or(0);
-    if frac_digits <= ft.decimal.max(0) as usize {
+    let (frac_text, frac_digits) = match text.split_once('.') {
+        Some((_, frac)) => {
+            let digits = frac.chars().take_while(|c| c.is_ascii_digit()).count();
+            (frac, digits)
+        }
+        None => ("", 0),
+    };
+    let scale = ft.decimal.max(0) as usize;
+    if frac_digits <= scale {
+        return Ok(());
+    }
+    // Discarding only trailing zeros (`1.000000` into DECIMAL(4,2)) changes
+    // neither the value nor TiDB's truncation flag, so no warning is raised.
+    if frac_text[scale..frac_digits].bytes().all(|b| b == b'0') {
         return Ok(());
     }
     // An INSERT reports the value-conversion form (1366 with the column
@@ -2281,11 +2290,12 @@ fn relaxed_temporal(s: &str, tp: u8) -> Option<sealdb_types::Time> {
         year,
         month,
         day,
-        hour,
+        hour: hour as u16,
         minute,
         second,
         micro,
         fsp: if micro == 0 { 0 } else { 6 },
+        neg: false,
         tp: match tp {
             TYPE_DATE => sealdb_types::TimeType::Date,
             TYPE_TIMESTAMP => sealdb_types::TimeType::Timestamp,
@@ -2332,7 +2342,9 @@ fn cast_enum_set(v: &Datum, ft: &FieldType, col: &str) -> Result<Datum> {
         // picks the label `4`, not index 4); numeric values and unmatched
         // numeric strings are indexes. A hex/bit literal compares by its raw
         // bytes, so `enum(0x61)` selects the label `a`.
-        if matches!(v, Datum::Bytes(_) | Datum::Bit(_)) {
+        // A value already coerced to this ENUM (e.g. `VALUES(col)` in
+        // `ON DUPLICATE KEY UPDATE`) carries its label, not an index.
+        if matches!(v, Datum::Bytes(_) | Datum::Bit(_) | Datum::Enum(_)) {
             let s = String::from_utf8_lossy(&v.as_bytes()).into_owned();
             if s.is_empty() {
                 return Ok(Datum::Enum(EnumValue::new(Vec::new(), 0)));

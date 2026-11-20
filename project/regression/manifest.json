@@ -15,10 +15,10 @@
     "total": 254,
     "by_status": {
       "deferred": 2,
-      "green": 114,
+      "green": 115,
       "in_progress": 9,
       "local": 8,
-      "pending": 121
+      "pending": 120
     },
     "by_wave": {
       "D": 2,
@@ -1322,7 +1322,7 @@
     {
       "name": "expression/misc",
       "wave": "R7",
-      "status": "pending",
+      "status": "green",
       "test": "t/expression/misc.test",
       "result": "r/expression/misc.result",
       "has_result": true,

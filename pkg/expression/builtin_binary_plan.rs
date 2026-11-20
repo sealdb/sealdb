@@ -29,7 +29,7 @@ pub fn decode_binary_plan(encoded: &str) -> Result<String, String> {
 }
 
 /// Standard (padded) base64 decode with Go-compatible error messages.
-fn base64_decode_std(input: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn base64_decode_std(input: &str) -> Result<Vec<u8>, String> {
     fn value(byte: u8, index: usize) -> Result<u8, String> {
         match byte {
             b'A'..=b'Z' => Ok(byte - b'A'),
@@ -88,7 +88,7 @@ fn base64_decode_std(input: &str) -> Result<Vec<u8>, String> {
 
 /// Snappy block-format decompression; every failure is `snappy: corrupt input`
 /// like the reference implementation.
-fn snappy_decode(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn snappy_decode(input: &[u8]) -> Result<Vec<u8>, String> {
     const CORRUPT: &str = "snappy: corrupt input";
     let mut pos = 0usize;
     let mut expected = 0usize;

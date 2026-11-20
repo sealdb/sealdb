@@ -274,6 +274,95 @@ impl MyDecimal {
         Ok(out)
     }
 
+    /// Exact decimal `+` / `-` (MySQL `DecimalAdd` / `DecimalSub`): the result
+    /// keeps the wider operand scale, so `1.10 + 2` is `3.10`.
+    pub fn checked_add(&self, other: &Self, subtract: bool) -> Self {
+        let (int1, frac1) = self.int_frac();
+        let (int2, frac2) = other.int_frac();
+        let scale = frac1.len().max(frac2.len());
+        let a = format!("{int1}{frac1:0<scale$}", scale = scale);
+        let b = format!("{int2}{frac2:0<scale$}", scale = scale);
+        let b_negative = other.negative != subtract;
+        let cmp = ucmp(&a, &b);
+        let (negative, magnitude) = match (self.negative, b_negative) {
+            (false, false) => (false, uadd(&a, &b)),
+            (true, true) => (true, uadd(&a, &b)),
+            (false, true) => match cmp {
+                Ordering::Less => (true, usub(&b, &a)),
+                _ => (false, usub(&a, &b)),
+            },
+            (true, false) => match cmp {
+                Ordering::Less => (false, usub(&b, &a)),
+                _ => (true, usub(&a, &b)),
+            },
+        };
+        Self::from_unscaled(negative, &magnitude, scale)
+    }
+
+    /// Exact decimal `*` (MySQL `DecimalMul`). The product keeps `s1 + s2`
+    /// fractional digits, capped at MySQL's maximum scale of 30 (rounded).
+    pub fn checked_mul(&self, other: &Self) -> Self {
+        let (int1, frac1) = self.int_frac();
+        let (int2, frac2) = other.int_frac();
+        let a = format!("{int1}{frac1}");
+        let b = format!("{int2}{frac2}");
+        let product = umul(&a, &b);
+        let scale = frac1.len() + frac2.len();
+        Self::from_unscaled(self.negative != other.negative, &product, scale)
+            .with_frac((scale.min(MAX_DECIMAL_SCALE)) as i32)
+    }
+
+    /// Exact decimal `/` (MySQL `DecimalDiv`): `frac_incr` extra fractional
+    /// digits over the dividend's scale, capped at 30 and rounded.
+    pub fn checked_div(&self, other: &Self, frac_incr: usize) -> Option<Self> {
+        if other.digits.chars().all(|c| c == '0' || c == '.') {
+            return None;
+        }
+        let (int1, frac1) = self.int_frac();
+        let (int2, frac2) = other.int_frac();
+        let scale = (frac1.len() + frac_incr).min(MAX_DECIMAL_SCALE);
+        // a / b = (A * 10^(s2 + scale)) / (B * 10^s1), with A/B the literal
+        // digit strings.
+        let mut num = format!("{int1}{frac1}");
+        num.push_str(&"0".repeat(frac2.len() + scale));
+        let mut den = format!("{int2}{frac2}");
+        den.push_str(&"0".repeat(frac1.len()));
+        let (mut quotient, remainder) = udivmod(&num, &den);
+        // Round half away from zero on the next digit.
+        if ucmp(&uadd(&remainder, &remainder), &den) != Ordering::Less {
+            quotient = uadd(&quotient, "1");
+        }
+        Some(Self::from_unscaled(
+            self.negative != other.negative,
+            &quotient,
+            scale,
+        ))
+    }
+
+    fn int_frac(&self) -> (String, String) {
+        match self.digits.split_once('.') {
+            Some((int, frac)) => (int.to_string(), frac.to_string()),
+            None => (self.digits.clone(), String::new()),
+        }
+    }
+
+    /// Build a decimal from an unscaled digit string and its implied scale.
+    fn from_unscaled(negative: bool, digits: &str, scale: usize) -> Self {
+        let digits = strip_leading_zeros(digits);
+        let text = if scale == 0 {
+            digits
+        } else if digits.len() > scale {
+            let split = digits.len() - scale;
+            format!("{}.{}", &digits[..split], &digits[split..])
+        } else {
+            format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+        };
+        let mut value = Self::parse(&text).unwrap_or_else(|_| Self::from_i64(0));
+        let is_zero = value.digits.bytes().all(|b| b == b'0' || b == b'.');
+        value.negative = negative && !is_zero;
+        value
+    }
+
     /// Number of fractional digits in the literal (`1.500` → 3).
     pub fn frac_digits(&self) -> i32 {
         self.digits
@@ -305,5 +394,143 @@ impl Ord for MyDecimal {
             (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
             _ => self.to_string().cmp(&other.to_string()),
         }
+    }
+}
+
+/// MySQL's maximum `DECIMAL` scale.
+const MAX_DECIMAL_SCALE: usize = 30;
+
+fn strip_leading_zeros(s: &str) -> String {
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Compare two unsigned integer digit strings (no sign, leading zeros ok).
+fn ucmp(a: &str, b: &str) -> Ordering {
+    let a = strip_leading_zeros(a);
+    let b = strip_leading_zeros(b);
+    a.len().cmp(&b.len()).then_with(|| a.cmp(&b))
+}
+
+/// Schoolbook addition of two unsigned integer digit strings.
+fn uadd(a: &str, b: &str) -> String {
+    let a: Vec<u8> = a.bytes().rev().map(|c| c - b'0').collect();
+    let b: Vec<u8> = b.bytes().rev().map(|c| c - b'0').collect();
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let sum = a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0) + carry;
+        out.push(sum % 10);
+        carry = sum / 10;
+    }
+    if carry > 0 {
+        out.push(carry);
+    }
+    let text: String = out.iter().rev().map(|d| (d + b'0') as char).collect();
+    strip_leading_zeros(&text)
+}
+
+/// `a - b` for unsigned digit strings with `a >= b`.
+fn usub(a: &str, b: &str) -> String {
+    let a: Vec<u8> = a.bytes().rev().map(|c| c - b'0').collect();
+    let b: Vec<u8> = b.bytes().rev().map(|c| c - b'0').collect();
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0i8;
+    for (i, digit) in a.iter().enumerate() {
+        let mut diff = *digit as i8 - borrow - b.get(i).copied().unwrap_or(0) as i8;
+        borrow = 0;
+        if diff < 0 {
+            diff += 10;
+            borrow = 1;
+        }
+        out.push(diff as u8);
+    }
+    let text: String = out.iter().rev().map(|d| (d + b'0') as char).collect();
+    strip_leading_zeros(&text)
+}
+
+/// Schoolbook multiplication of two unsigned integer digit strings.
+fn umul(a: &str, b: &str) -> String {
+    let a: Vec<u32> = a.bytes().map(|c| u32::from(c - b'0')).collect();
+    let b: Vec<u32> = b.bytes().map(|c| u32::from(c - b'0')).collect();
+    if a.iter().all(|d| *d == 0) || b.iter().all(|d| *d == 0) {
+        return "0".to_string();
+    }
+    let mut out = vec![0u32; a.len() + b.len()];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            let pos = i + j + 1;
+            let cur = out[pos] + a[i] * b[j];
+            out[pos] = cur % 10;
+            out[pos - 1] += cur / 10;
+        }
+    }
+    let text: String = out.iter().map(|d| (d + u32::from(b'0')) as u8 as char).collect();
+    strip_leading_zeros(&text)
+}
+
+/// Long division `(quotient, remainder)` of unsigned digit strings.
+fn udivmod(a: &str, b: &str) -> (String, String) {
+    let a = strip_leading_zeros(a);
+    let b = strip_leading_zeros(b);
+    if ucmp(&a, &b) == Ordering::Less {
+        return ("0".to_string(), a);
+    }
+    let mut quotient = String::new();
+    let mut remainder = String::from("0");
+    for digit in a.chars() {
+        remainder.push(digit);
+        remainder = strip_leading_zeros(&remainder);
+        let mut count = 0u8;
+        while ucmp(&remainder, &b) != Ordering::Less {
+            remainder = usub(&remainder, &b);
+            count += 1;
+        }
+        quotient.push((b'0' + count) as char);
+    }
+    (strip_leading_zeros(&quotient), remainder)
+}
+
+#[cfg(test)]
+mod arith_tests {
+    use super::*;
+
+    fn d(text: &str) -> MyDecimal {
+        MyDecimal::parse(text).unwrap()
+    }
+
+    #[test]
+    fn exact_add_sub_keep_scale() {
+        assert_eq!(d("1.10").checked_add(&d("2"), false).to_string(), "3.10");
+        assert_eq!(d("1").checked_add(&d("2.5"), false).to_string(), "3.5");
+        assert_eq!(d("1.5").checked_add(&d("2.5"), true).to_string(), "-1.0");
+        assert_eq!(d("2.5").checked_add(&d("1.5"), true).to_string(), "1.0");
+        assert_eq!(d("-1.5").checked_add(&d("1.5"), false).to_string(), "0.0");
+    }
+
+    #[test]
+    fn exact_mul_caps_scale_at_30() {
+        assert_eq!(d("1.5").checked_mul(&d("2")).to_string(), "3.0");
+        let big = d("2.00000000000000000000000000000001")
+            .checked_mul(&d("1.000000000000000000000000000000000000000000002"));
+        assert_eq!(big.to_string(), "2.000000000000000000000000000000");
+        let p = d("0.5999991229316").checked_mul(&d("0.918755041726043"));
+        assert_eq!(p.with_frac(17).to_string(), "0.55125221922461136");
+    }
+
+    #[test]
+    fn exact_div_uses_frac_increment() {
+        assert_eq!(d("1").checked_div(&d("3"), 4).unwrap().to_string(), "0.3333");
+        let one = format!("1.{}", "0".repeat(30));
+        let three = format!("3.{}", "0".repeat(30));
+        assert_eq!(
+            d(&one).checked_div(&d(&three), 4).unwrap().to_string(),
+            format!("0.{}", "3".repeat(30))
+        );
+        assert!(d("1").checked_div(&d("0"), 4).is_none());
     }
 }

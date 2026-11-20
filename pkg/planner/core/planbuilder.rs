@@ -11849,10 +11849,19 @@ fn coerce_numeric_literals(expr: &ExprNode, info: &sealdb_meta::TableInfo) -> Ex
                 if column_class(&left, info) == Some(ColumnClass::String) && numeric_literal(&right)
                 {
                     left = cast_double(left);
+                    // TiDB's comparison type unification also casts the literal
+                    // to DOUBLE, so the plan prints `0` rather than the decimal
+                    // spelling `0.0`.
+                    if let Some(datum) = double_literal(&right) {
+                        right = datum;
+                    }
                 } else if column_class(&right, info) == Some(ColumnClass::String)
                     && numeric_literal(&left)
                 {
                     right = cast_double(right);
+                    if let Some(datum) = double_literal(&left) {
+                        left = datum;
+                    }
                 }
                 if column_class(&left, info) == Some(ColumnClass::Numeric)
                     && let Some(datum) = bytes_number(&right)
@@ -12106,6 +12115,16 @@ fn numeric_literal(expr: &ExprNode) -> bool {
     )
 }
 
+/// Rebuild a numeric literal as a `DOUBLE` value, mirroring the type
+/// unification TiDB applies to the constant operand of a `cast(…, double)`
+/// comparison (`eq(cast(id, double BINARY), 0)`).
+fn double_literal(expr: &ExprNode) -> Option<ExprNode> {
+    let ExprNode::Value(ValueExpr { datum }) = expr else {
+        return None;
+    };
+    datum.as_f64().ok().map(|v| value_expr(Datum::F64(v)))
+}
+
 fn bytes_number(expr: &ExprNode) -> Option<Datum> {
     let ExprNode::Value(ValueExpr {
         datum: Datum::Bytes(bytes),
@@ -12172,11 +12191,12 @@ fn comparison_temporal_literal(expr: &ExprNode, ft: &sealdb_types::FieldType) ->
                         year: 0,
                         month: 0,
                         day: 0,
-                        hour: (secs / 3600) as u8,
+                        hour: (secs / 3600) as u16,
                         minute: ((secs % 3600) / 60) as u8,
                         second: (secs % 60) as u8,
                         micro: 0,
                         fsp: 6,
+                        neg: false,
                         tp: sealdb_types::TimeType::Time,
                     }
                 }

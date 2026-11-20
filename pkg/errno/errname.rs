@@ -190,7 +190,7 @@ pub fn sqlstate_of(code: i32) -> &'static str {
         errcode::ERR_OPERAND_COLUMNS => "21000",
         errcode::ERR_WRONG_NUMBER_OF_COLUMNS_IN_SELECT => "21000",
         errcode::ERR_WRONG_VALUE_COUNT | errcode::ERR_WRONG_VALUE_COUNT_ON_ROW => "21S01",
-        errcode::ERR_UNSUPPORTED => "42000",
+        errcode::ERR_UNSUPPORTED | errcode::ERR_UNKNOWN_FUNCTION => "42000",
         errcode::ERR_WRONG_TYPE_FOR_VAR => "42000",
         errcode::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION => "25006",
         errcode::ERR_LOCK_DEADLOCK => "40001",

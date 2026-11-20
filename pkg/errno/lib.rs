@@ -23,10 +23,14 @@ impl Error {
         }
     }
 
+    /// TiDB's `ErrUnsupportedYet` template (`ER_UNSUPPORTED` 1235).
     pub fn unsupported(feature: impl Into<String>) -> Self {
         Self::new(
             ERR_UNSUPPORTED,
-            format!("{} is not available in this phase", feature.into()),
+            format!(
+                "This version of TiDB doesn't yet support '{}'",
+                feature.into()
+            ),
         )
     }
 }

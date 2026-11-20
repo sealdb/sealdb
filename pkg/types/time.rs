@@ -17,17 +17,19 @@ pub struct Time {
     pub year: u16,
     pub month: u8,
     pub day: u8,
-    pub hour: u8,
+    pub hour: u16,
     pub minute: u8,
     pub second: u8,
     pub micro: u32,
     /// Fractional seconds precision for display (0..=6).
     pub fsp: i8,
+    /// Negative `TIME` (`'-01:01:01'`); always false for the date types.
+    pub neg: bool,
     pub tp: TimeType,
 }
 
 impl Time {
-    pub fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Self {
+    pub fn new(year: u16, month: u8, day: u8, hour: u16, minute: u8, second: u8) -> Self {
         Self {
             year,
             month,
@@ -37,6 +39,7 @@ impl Time {
             second,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp: TimeType::Datetime,
         }
     }
@@ -60,11 +63,12 @@ impl Time {
             year: year.clamp(0, u16::MAX as i64) as u16,
             month: month as u8,
             day: day as u8,
-            hour: (rem / 3_600) as u8,
+            hour: (rem / 3_600) as u16,
             minute: ((rem % 3_600) / 60) as u8,
             second: (rem % 60) as u8,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp,
         }
     }
@@ -73,7 +77,14 @@ impl Time {
         let ymd = (u64::from(self.year) * 13 + u64::from(self.month)) << 5 | u64::from(self.day);
         let hms =
             (u64::from(self.hour) << 12) | (u64::from(self.minute) << 6) | u64::from(self.second);
-        ((ymd << 17) | hms) << 24 | u64::from(self.micro)
+        let packed = ((ymd << 17) | hms) << 24 | u64::from(self.micro);
+        // A negative `TIME` keeps its magnitude in the low bits with the top
+        // bit as the sign (a date type never uses it: `year < 2^16`).
+        if self.neg && self.tp == TimeType::Time {
+            packed | (1 << 63)
+        } else {
+            packed
+        }
     }
 
     /// MySQL numeric value: `YYYYMMDD` for DATE, `YYYYMMDDHHMMSS` for the
@@ -92,6 +103,8 @@ impl Time {
     }
 
     pub fn from_packed_u64(v: u64) -> Self {
+        let neg = v >> 63 == 1;
+        let v = v & !(1 << 63);
         let ymdhms = v >> 24;
         let ymd = ymdhms >> 17;
         let day = (ymd & ((1 << 5) - 1)) as u8;
@@ -99,7 +112,7 @@ impl Time {
         let month = (ym % 13) as u8;
         let year = (ym / 13) as u16;
         let hms = ymdhms & ((1 << 17) - 1);
-        let hour = (hms >> 12) as u8;
+        let hour = (hms >> 12) as u16;
         let minute = ((hms >> 6) & 0x3f) as u8;
         let second = (hms & 0x3f) as u8;
         let micro = (v & ((1 << 24) - 1)) as u32;
@@ -119,6 +132,7 @@ impl Time {
             second,
             micro,
             fsp,
+            neg,
             tp: TimeType::Datetime,
         }
     }
@@ -142,11 +156,12 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
             year: 0,
             month: 0,
             day: 0,
-            hour: hour as u8,
+            hour: hour as u16,
             minute: minute as u8,
             second: second as u8,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp: TimeType::Time,
         });
     }
@@ -165,6 +180,7 @@ pub fn time_from_number(n: i64, tp: TimeType) -> Option<Time> {
             second: 0,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp,
         });
     }
@@ -218,11 +234,12 @@ fn datetime_from_packed(packed: i64, tp: TimeType) -> Option<Time> {
         year: year as u16,
         month: month as u8,
         day: day as u8,
-        hour: hour as u8,
+        hour: hour as u16,
         minute: minute as u8,
         second: second as u8,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp,
     })
 }
@@ -291,11 +308,12 @@ pub fn datetime_from_numeric_string(digits: &str, tp: TimeType) -> Option<Time> 
         year: year as u16,
         month: month as u8,
         day: day as u8,
-        hour: hour as u8,
+        hour: hour as u16,
         minute: minute as u8,
         second: second as u8,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp,
     })
 }
@@ -322,67 +340,173 @@ pub fn duration_from_numeric(int_digits: &str) -> Option<Time> {
         year: 0,
         month: 0,
         day: 0,
-        hour: hour as u8,
+        hour: hour as u16,
         minute: minute as u8,
         second: second as u8,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp: TimeType::Time,
     })
 }
 
-/// Duration text (`'01:01:01'`, `'838:59:59'`) → TIME.
-pub fn parse_duration_string(s: &str) -> Option<Time> {
-    let s = s.trim();
-    let (negative, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
+/// TiDB `matchDuration` (`types.ParseDuration`): `[-] [D ]HH[:MM[:SS]][.frac]`,
+/// also accepting the compact `HHMMSS` digits. The fraction is rounded to six
+/// digits; `None` covers both unparsable text and an out-of-range hour.
+fn match_duration(s: &str) -> Option<Time> {
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
         None => (false, s),
     };
-    let (hms, frac) = match body.split_once('.') {
-        Some((hms, frac)) => (hms, Some(frac)),
-        None => (body, None),
-    };
-    let parts: Vec<&str> = hms.split(':').collect();
-    // TiDB `matchHHMMSSDelimited`: `'14:15'` is `14:15:00`.
-    let (hour_text, minute_text, second_text) = match parts.len() {
-        3 => (parts[0], parts[1], parts[2]),
-        2 => (parts[0], parts[1], "0"),
-        _ => return None,
-    };
-    let mut hour: i64 = hour_text.trim().parse().ok()?;
-    let minute: u8 = minute_text.trim().parse().ok()?;
-    let second: u8 = second_text.trim().parse().ok()?;
-    if negative {
-        hour = -hour;
-    }
-    if !(-838..=838).contains(&hour) || minute > 59 || second > 59 {
+    if rest.is_empty() {
         return None;
     }
-    let mut micro = 0u32;
-    let mut fsp = 0i8;
-    if let Some(frac) = frac
-        && !frac.is_empty()
-    {
-        let digits: String = frac.chars().take(6).collect();
-        let fsp_len = digits.len() as i8;
-        let mut padded = digits.clone();
-        while padded.len() < 6 {
-            padded.push('0');
+    let chars_len = rest.len();
+    let (hour, minute, second, rest) = match_day_hhmmss(rest)
+        .or_else(|| match_hhmmss_delimited(rest, true))
+        .or_else(|| match_hhmmss_compact(rest))?;
+    // TiDB `matchFrac` + `matchDuration`: a trailing `.digits` rounds into the
+    // seconds; leftover text on a long literal is a malformed time.
+    let (micro, fsp, overflow, rest) = match rest.strip_prefix('.') {
+        Some(after) => {
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            let fsp = digits.len().min(6);
+            let (micro, overflow) = parse_frac_digits(&digits, fsp)?;
+            (micro, fsp as i8, overflow, &after[digits.len()..])
         }
-        micro = padded.parse().ok()?;
-        fsp = fsp_len;
+        None => (0, 0, false, rest),
+    };
+    if !rest.is_empty() && chars_len >= 12 {
+        return None;
+    }
+    let (mut hour, mut minute, mut second) = (hour, minute, second);
+    if overflow {
+        // TiDB `hhmmssAddOverflow`: the rounded-up fraction carries into the
+        // clock (seconds → minutes → hours, never into a day).
+        second += 1;
+        if second == 60 {
+            second = 0;
+            minute += 1;
+            if minute == 60 {
+                minute = 0;
+                hour += 1;
+            }
+        }
+    }
+    if minute >= 60 || second >= 60 || hour > 838 {
+        return None;
     }
     Some(Time {
         year: 0,
         month: 0,
         day: 0,
-        hour: hour.unsigned_abs() as u8,
-        minute,
-        second,
-        micro,
-        fsp,
+        hour: hour as u16,
+        minute: minute as u8,
+        second: second as u8,
+        micro: if overflow { 0 } else { micro },
+        fsp: if overflow { 0 } else { fsp },
+        neg: negative && (hour != 0 || minute != 0 || second != 0 || micro != 0),
         tp: TimeType::Time,
     })
+}
+
+/// TiDB `ParseFrac`: the six-digit microseconds of `digits` rounded to `fsp`
+/// digits, plus whether the rounding carried out of the fraction.
+fn parse_frac_digits(digits: &str, fsp: usize) -> Option<(u32, bool)> {
+    if digits.is_empty() {
+        return Some((0, false));
+    }
+    if fsp >= digits.len() {
+        let value: u64 = digits.parse().ok()?;
+        return Some(((value * 10u64.pow((6 - digits.len()) as u32)) as u32, false));
+    }
+    // Round on the next digit (`(x + 5) / 10`), which may carry out of range.
+    let head: u64 = digits[..=fsp].parse().ok()?;
+    let rounded = (head + 5) / 10;
+    if rounded >= 10u64.pow(fsp as u32) {
+        return Some((0, true));
+    }
+    Some(((rounded * 10u64.pow((6 - fsp) as u32)) as u32, false))
+}
+
+/// TiDB `matchDayHHMMSS`: `'D HH:MM[:SS]'`, hours become `24 * D + HH`.
+fn match_day_hhmmss(s: &str) -> Option<(i64, i64, i64, &str)> {
+    let digits = digit_prefix(s);
+    if digits.is_empty() {
+        return None;
+    }
+    let day: i64 = digits.parse().ok()?;
+    let after = &s[digits.len()..];
+    // `parser.Space(rest, 1)` requires at least one space after the day.
+    let rest = after.trim_start();
+    if rest.len() == after.len() {
+        return None;
+    }
+    let (hour, minute, second, rest) = match_hhmmss_delimited(rest, false)?;
+    Some((day * 24 + hour, minute, second, rest))
+}
+
+/// TiDB `matchHHMMSSDelimited`: `HH[:MM[:SS]]`; when `require_colon` the first
+/// separator is mandatory (so the compact form is only tried afterwards).
+fn match_hhmmss_delimited(s: &str, require_colon: bool) -> Option<(i64, i64, i64, &str)> {
+    let digits = digit_prefix(s);
+    if digits.is_empty() {
+        return None;
+    }
+    let hour: i64 = digits.parse().ok()?;
+    let mut rest = &s[digits.len()..];
+    let mut hms = [hour, 0, 0];
+    for i in 1..3 {
+        match rest.trim_start().strip_prefix(':') {
+            Some(after) => {
+                let after = after.trim_start();
+                let digits = digit_prefix(after);
+                if digits.is_empty() {
+                    return None;
+                }
+                hms[i] = digits.parse().ok()?;
+                rest = &after[digits.len()..];
+            }
+            None => {
+                if i == 1 && require_colon {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    Some((hms[0], hms[1], hms[2], rest))
+}
+
+/// TiDB `matchHHMMSSCompact`: a bare number read as `HHMMSS`.
+fn match_hhmmss_compact(s: &str) -> Option<(i64, i64, i64, &str)> {
+    let digits = digit_prefix(s);
+    if digits.is_empty() {
+        return None;
+    }
+    let num: i64 = digits.parse().ok()?;
+    Some((
+        num / 10_000,
+        (num / 100) % 100,
+        num % 100,
+        &s[digits.len()..],
+    ))
+}
+
+fn digit_prefix(s: &str) -> &str {
+    let end = s
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Duration text (`'01:01:01'`, `'838:59:59'`) → TIME.
+pub fn parse_duration_string(s: &str) -> Option<Time> {
+    match_duration(s.trim())
 }
 
 /// Howard Hinnant's civil-from-days: days since 1970-01-01 → (y, m, d).
@@ -404,6 +528,9 @@ impl Display for Time {
         match self.tp {
             TimeType::Date => write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day),
             TimeType::Time => {
+                if self.neg {
+                    write!(f, "-")?;
+                }
                 write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)?;
                 fmt_frac(f, self.micro, self.fsp)
             }
@@ -437,6 +564,15 @@ impl PartialOrd for Time {
 
 impl Ord for Time {
     fn cmp(&self, other: &Self) -> Ordering {
+        // A negative `TIME` sorts below zero, which the packed magnitude
+        // encoding alone cannot express.
+        if self.neg != other.neg {
+            return if self.neg {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
         self.to_packed_u64().cmp(&other.to_packed_u64())
     }
 }
@@ -693,6 +829,16 @@ pub fn parse_datetime_literal(s: &str) -> Result<Time> {
     parse_datetime_string(s)
 }
 
+/// TiDB `adjustYear`: a bare one- or two-digit year maps into 1900/2000
+/// (`'09-01-01'` → 2009-01-01).
+fn adjust_two_digit_year(year: u32) -> u32 {
+    match year {
+        0..=69 => 2000 + year,
+        70..=99 => 1900 + year,
+        _ => year,
+    }
+}
+
 fn parse_datetime_string(s: &str) -> Result<Time> {
     let fsp = get_fsp(s);
     let s_trim = s.trim();
@@ -726,7 +872,7 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
         5 | 6 => {}
         _ => return Err(incorrect("datetime", s)),
     }
-    let year = parse_u(0)? as u16;
+    let mut year = parse_u(0)?;
     let month = parse_u(1)? as u8;
     let day = parse_u(2)? as u8;
     let hour = parse_u(3)? as u8;
@@ -756,6 +902,14 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
             return Err(incorrect("datetime", s));
         }
     }
+    // A delimited year written with one or two digits is a 2-digit year
+    // (`'09-01-01'`), except for the all-zero date.
+    if seps[0].len() <= 2
+        && !(year == 0 && month == 0 && day == 0 && hour == 0 && minute == 0 && second == 0)
+    {
+        year = adjust_two_digit_year(year);
+    }
+    let year = year as u16;
     let zero_date = year == 0 && month == 0 && day == 0;
     // `0000-00-00 …` is the zero date. TiDB parses it at the literal layer and
     // leaves `NO_ZERO_DATE` / strict-mode checks to storage.
@@ -783,11 +937,12 @@ fn parse_datetime_string(s: &str) -> Result<Time> {
         year,
         month,
         day,
-        hour,
+        hour: hour as u16,
         minute,
         second,
         micro,
         fsp: display_fsp,
+        neg: false,
         tp: TimeType::Datetime,
     })
 }
@@ -863,6 +1018,13 @@ pub fn parse_datetime_lenient(s: &str) -> Result<Time> {
             }
         }
     }
+    let year = if groups[0].0.len() <= 2
+        && !(year == 0 && month == 0 && day == 0 && hour == 0 && minute == 0 && second == 0)
+    {
+        adjust_two_digit_year(year)
+    } else {
+        year
+    };
     let year = year as u16;
     let month = month as u8;
     let day = day as u8;
@@ -874,11 +1036,12 @@ pub fn parse_datetime_lenient(s: &str) -> Result<Time> {
         year,
         month,
         day,
-        hour: hour as u8,
+        hour: hour as u16,
         minute: minute as u8,
         second: second as u8,
         micro,
         fsp,
+        neg: false,
         tp: TimeType::Datetime,
     })
 }
@@ -988,34 +1151,14 @@ pub fn parse_date_literal(s: &str) -> Result<Time> {
         second: 0,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp: TimeType::Date,
     })
 }
 
 /// Parse `TIME '...'` / `{t '...'}` literal (suite: HH:MM:SS).
 pub fn parse_time_literal(s: &str) -> Result<Time> {
-    let s = s.trim();
-    let seps = split_digit_parts(s);
-    if seps.len() != 3 {
-        return Err(incorrect("time", s));
-    }
-    let hour: u8 = seps[0].parse().map_err(|_| incorrect("time", s))?;
-    let minute: u8 = seps[1].parse().map_err(|_| incorrect("time", s))?;
-    let second: u8 = seps[2].parse().map_err(|_| incorrect("time", s))?;
-    if minute > 59 || second > 59 {
-        return Err(incorrect("time", s));
-    }
-    Ok(Time {
-        year: 0,
-        month: 0,
-        day: 0,
-        hour,
-        minute,
-        second,
-        micro: 0,
-        fsp: 0,
-        tp: TimeType::Time,
-    })
+    match_duration(s.trim()).ok_or_else(|| incorrect("time", s))
 }
 
 #[cfg(test)]
@@ -1039,6 +1182,47 @@ mod parse_tests {
     fn timestamp_frac_round() {
         let t = parse_timestamp_literal("2024-01-01 14:00:00.999999999999").unwrap();
         assert_eq!(t.to_string(), "2024-01-01 14:00:01.000000");
+    }
+
+    fn time_lit(text: &str) -> String {
+        parse_time_literal(text)
+            .unwrap_or_else(|e| panic!("{text}: {e:?}"))
+            .to_string()
+    }
+
+    #[test]
+    fn time_literal_forms() {
+        assert_eq!(time_lit("117:01:12"), "117:01:12");
+        assert_eq!(time_lit("01:00:00.999999"), "01:00:00.999999");
+        assert_eq!(time_lit("1 01:00:00"), "25:00:00");
+        assert_eq!(time_lit("20 20:20"), "500:20:00");
+        assert_eq!(time_lit("110:00:00"), "110:00:00");
+        // Compact forms: `HHMMSS` digits and a bare number as seconds.
+        assert_eq!(time_lit("33:33"), "33:33:00");
+        assert_eq!(time_lit("1.1"), "00:00:01.1");
+        assert_eq!(time_lit("21"), "00:00:21");
+        assert_eq!(time_lit("-1:1:1.123454656"), "-01:01:01.123455");
+    }
+
+    #[test]
+    fn time_literal_rejects_datetime_and_long_digits() {
+        for bad in ["2017-01-01 00:00:00", "071231235959.999999", "20171231235959.999999"] {
+            let err = parse_time_literal(bad).unwrap_err();
+            assert_eq!(err.code, ERR_TRUNCATED_WRONG_VALUE);
+            assert!(err.message.contains("Incorrect time value"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn negative_time_round_trips_through_packed() {
+        let t = parse_time_literal("-01:01:01.123455").unwrap();
+        let mut back = Time::from_packed_u64(t.to_packed_u64());
+        // The packed form does not carry the temporal kind; the decoder in the
+        // row/coprocessor layers restores it from the column type.
+        back.tp = TimeType::Time;
+        assert_eq!(back.to_string(), t.to_string());
+        assert!(back.neg);
+        assert!(t < parse_time_literal("00:00:00").unwrap());
     }
 
     #[test]

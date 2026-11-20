@@ -450,7 +450,33 @@ impl Session {
                 .as_deref()
                 .map(sealdb_parser::sqlparser_bridge::hint_warnings)
                 .unwrap_or_default();
-            let mut result = self.execute_one(&stmt)?;
+            let mut result = {
+                // Install the session user variables for eval-time `@v` reads /
+                // `@v := …` writes, then merge whatever the statement assigned
+                // back into the session store.
+                let vars = self
+                    .user_vars
+                    .lock()
+                    .expect("session user vars lock")
+                    .clone();
+                let before = vars.clone();
+                let (result, updated) =
+                    sealdb_expression::with_user_vars(vars, || self.execute_one(&stmt));
+                {
+                    let mut stored = self.user_vars.lock().expect("session user vars lock");
+                    for (key, value) in updated {
+                        // A `SET @v = …` writes the session map directly and
+                        // leaves this statement's eval-time snapshot stale;
+                        // only merge values the statement actually assigned
+                        // through `@v := …`.
+                        if before.get(&key) == Some(&value) {
+                            continue;
+                        }
+                        stored.insert(key, value);
+                    }
+                }
+                result?
+            };
             self.end_set_var_hint(previous_sql_mode);
             if !hint_warnings.is_empty() {
                 let mut warnings = hint_warnings;
@@ -1756,6 +1782,10 @@ impl Session {
         // `ENUM`/`SET` numeric constants become member labels before planning so
         // index point gets encode the stored label (`a = 1` → `a = 'a'`).
         sealdb_planner::normalize_enum_constants(&mut expanded, Some(&is), &current_db);
+        // BIT column constants are normalized to the column's big-endian width
+        // (`id in ('0')` on `bit(64)` compares as numeric 0, not the byte
+        // `0x30`), so point gets and residuals agree before execution.
+        sealdb_planner::normalize_bit_constants(&mut expanded, Some(&is), &current_db);
         // String-vs-number comparisons get a `double` cast on the column before
         // planning (and execution) so point gets and residuals agree.
         sealdb_planner::normalize_comparison_literals(&mut expanded, Some(&is), &current_db);
@@ -1791,6 +1821,7 @@ impl Session {
             drop(mdl_guard);
             return Ok(show_variables_result(self, show));
         }
+        check_group_by_ambiguity(stmt)?;
         check_only_full_group_by(self, stmt)?;
         if let Some(result) = system_var_result(self, stmt) {
             *self
@@ -3054,6 +3085,75 @@ fn table_status_result(op: &str, tables: &[TableName], current_db: &str) -> Quer
     }
 }
 
+/// TiDB resolves a bare GROUP BY name against the SELECT output names. When
+/// the same name is projected from two tables the reference is ambiguous even
+/// for a `USING` join that merged the column:
+/// `select t1.a, t2.a from t1 join t2 using(a) group by a` → 1052
+/// "Column 'a' in group statement is ambiguous".
+fn check_group_by_ambiguity(stmt: &Statement) -> Result<()> {
+    let select = match stmt {
+        Statement::Select(s) => s,
+        Statement::Explain(e) => match e.stmt.as_ref() {
+            Statement::Select(s) => s,
+            _ => return Ok(()),
+        },
+        Statement::Insert(insert) => match insert.select.as_ref() {
+            Some(s) => s,
+            None => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    check_select_group_by_ambiguity(select)
+}
+
+fn check_select_group_by_ambiguity(select: &SelectStmt) -> Result<()> {
+    for expr in &select.group_by {
+        let ExprNode::Column(col) = expr else {
+            continue;
+        };
+        if col.table.is_some() {
+            continue;
+        }
+        let mut owners: Vec<(Option<String>, String)> = Vec::new();
+        for field in &select.fields {
+            let ExprNode::Column(f) = &field.expr else {
+                continue;
+            };
+            if !f.name.eq_ignore_ascii_case(&col.name) {
+                continue;
+            }
+            let key = (
+                f.table.as_ref().map(|t| t.to_ascii_lowercase()),
+                f.name.to_ascii_lowercase(),
+            );
+            if !owners.contains(&key) {
+                owners.push(key);
+            }
+        }
+        if owners.len() > 1 {
+            return Err(sealdb_errno::Error::new(
+                sealdb_errno::ERR_AMBIGUOUS_COLUMN,
+                format!("Column '{}' in group statement is ambiguous", col.name),
+            ));
+        }
+    }
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            check_select_group_by_ambiguity(&cte.query)?;
+            if let Some((_, arm)) = &cte.recursive {
+                check_select_group_by_ambiguity(arm)?;
+            }
+            for (_, arm) in &cte.recursive_rest {
+                check_select_group_by_ambiguity(arm)?;
+            }
+            for (_, arm) in &cte.set_rest {
+                check_select_group_by_ambiguity(arm)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// MySQL/TiDB ONLY_FULL_GROUP_BY: when the mode is set and the query has
 /// GROUP BY, every SELECT item must be an aggregate, a constant, or appear
 /// in the GROUP BY list (exact restore match). CTE/derived single-source
@@ -4271,8 +4371,35 @@ fn needs_user_var_subst(stmt: &Statement) -> bool {
     let Statement::Select(select) = stmt else {
         return false;
     };
+    select_has_session_var(select)
+}
+
+/// Session variables may sit anywhere in the statement tree (derived tables
+/// are flattened into `with` CTEs, so the walk has to follow them).
+fn select_has_session_var(select: &sealdb_parser::ast::SelectStmt) -> bool {
     select.fields.iter().any(|f| expr_has_session_var(&f.expr))
         || select.selection.as_ref().is_some_and(expr_has_session_var)
+        || select.group_by.iter().any(expr_has_session_var)
+        || select.having.as_ref().is_some_and(expr_has_session_var)
+        || select.order_by.iter().any(|b| expr_has_session_var(&b.expr))
+        || select.joins.iter().any(|j| expr_has_session_var(&j.on))
+        || select.with.as_ref().is_some_and(|with| {
+            with.ctes.iter().any(|cte| {
+                select_has_session_var(&cte.query)
+                    || cte
+                        .recursive
+                        .as_ref()
+                        .is_some_and(|(_, rec)| select_has_session_var(rec))
+                    || cte
+                        .recursive_rest
+                        .iter()
+                        .any(|(_, rec)| select_has_session_var(rec))
+                    || cte
+                        .set_rest
+                        .iter()
+                        .any(|(_, arm)| select_has_session_var(arm))
+            })
+        })
 }
 
 fn is_system_var_column(col: &sealdb_parser::ast::expressions::ColumnNameExpr) -> bool {
@@ -4330,32 +4457,184 @@ fn subst_user_vars_in_stmt(session: &Session, stmt: &Statement) -> Statement {
     let Statement::Select(select) = stmt else {
         return stmt.clone();
     };
+    // Variables assigned inside this statement must be read at eval time, so
+    // `@v := …` sees each row's update instead of the pre-statement value.
+    let targets = select_assignment_targets(select);
+    ASSIGN_TARGETS.with(|cell| *cell.borrow_mut() = targets);
     let mut select = select.clone();
-    select.fields = select
-        .fields
-        .into_iter()
-        .map(|mut field| {
-            // Preserve TiDB display names (`@@autocommit`, `@b + "123"`) when
-            // substituting vars to Values for evaluation.
-            if field.as_name.as_ref().is_none_or(|s| s.is_empty())
-                && expr_has_session_var(&field.expr)
-            {
-                field.as_name = Some(session_var_field_name(&field.expr));
+    subst_select_user_vars(session, &mut select);
+    ASSIGN_TARGETS.with(|cell| cell.borrow_mut().clear());
+    Statement::Select(select)
+}
+
+/// Rewrite user/system variable references in one query block and every nested
+/// block (CTEs, including flattened derived tables, joins, grouping, ORDER BY).
+fn subst_select_user_vars(session: &Session, select: &mut sealdb_parser::ast::SelectStmt) {
+    if let Some(with) = select.with.as_mut() {
+        for cte in &mut with.ctes {
+            subst_select_user_vars(session, &mut cte.query);
+            if let Some((_, rec)) = cte.recursive.as_mut() {
+                subst_select_user_vars(session, rec);
             }
-            field.expr = subst_user_vars_in_expr(session, &field.expr);
-            field
-        })
-        .collect();
+            for (_, rec) in &mut cte.recursive_rest {
+                subst_select_user_vars(session, rec);
+            }
+            for (_, arm) in &mut cte.set_rest {
+                subst_select_user_vars(session, arm);
+            }
+        }
+    }
+    for field in &mut select.fields {
+        // Preserve TiDB display names (`@@autocommit`, `@b + "123"`) when
+        // substituting vars to Values for evaluation.
+        if field.as_name.as_ref().is_none_or(|s| s.is_empty())
+            && expr_has_session_var(&field.expr)
+        {
+            field.as_name = Some(session_var_field_name(&field.expr));
+        }
+        field.expr = subst_user_vars_in_expr(session, &field.expr);
+    }
     if let Some(sel) = select.selection.take() {
         select.selection = Some(subst_user_vars_in_expr(session, &sel));
     }
-    Statement::Select(select)
+    for group in &mut select.group_by {
+        *group = subst_user_vars_in_expr(session, group);
+    }
+    if let Some(having) = select.having.take() {
+        select.having = Some(subst_user_vars_in_expr(session, &having));
+    }
+    for item in &mut select.order_by {
+        item.expr = subst_user_vars_in_expr(session, &item.expr);
+    }
+    for join in &mut select.joins {
+        join.on = subst_user_vars_in_expr(session, &join.on);
+    }
+}
+
+thread_local! {
+    /// User variables assigned (`@v := …`) in the statement being rewritten.
+    static ASSIGN_TARGETS: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// `@v` names assigned anywhere in `select`.
+fn select_assignment_targets(select: &sealdb_parser::ast::SelectStmt) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_select_assignment_targets(select, &mut out);
+    out
+}
+
+fn collect_select_assignment_targets(
+    select: &sealdb_parser::ast::SelectStmt,
+    out: &mut Vec<String>,
+) {
+    if let Some(with) = select.with.as_ref() {
+        for cte in &with.ctes {
+            collect_select_assignment_targets(&cte.query, out);
+            if let Some((_, rec)) = cte.recursive.as_ref() {
+                collect_select_assignment_targets(rec, out);
+            }
+            for (_, rec) in &cte.recursive_rest {
+                collect_select_assignment_targets(rec, out);
+            }
+            for (_, arm) in &cte.set_rest {
+                collect_select_assignment_targets(arm, out);
+            }
+        }
+    }
+    for field in &select.fields {
+        assignment_targets(&field.expr, out);
+    }
+    if let Some(sel) = &select.selection {
+        assignment_targets(sel, out);
+    }
+    for group in &select.group_by {
+        assignment_targets(group, out);
+    }
+    if let Some(having) = &select.having {
+        assignment_targets(having, out);
+    }
+    for item in &select.order_by {
+        assignment_targets(&item.expr, out);
+    }
+    for join in &select.joins {
+        assignment_targets(&join.on, out);
+    }
+}
+
+fn assignment_targets(expr: &ExprNode, out: &mut Vec<String>) {
+    match expr {
+        ExprNode::Func(f) => {
+            if f.name.eq_ignore_ascii_case("__SEALDB_ASSIGN")
+                && let Some(sealdb_parser::ast::expressions::ExprNode::Value(v)) = f.args.first()
+                && let sealdb_types::Datum::Bytes(name) = &v.datum
+            {
+                out.push(user_var_key(&String::from_utf8_lossy(name)));
+            }
+            for arg in &f.args {
+                assignment_targets(arg, out);
+            }
+        }
+        ExprNode::Binary(b) => {
+            assignment_targets(&b.left, out);
+            assignment_targets(&b.right, out);
+        }
+        ExprNode::Unary(u) => assignment_targets(&u.expr, out),
+        ExprNode::Cast(c) => assignment_targets(&c.expr, out),
+        ExprNode::InList(i) => {
+            assignment_targets(&i.expr, out);
+            for item in &i.list {
+                assignment_targets(item, out);
+            }
+        }
+        ExprNode::Between(b) => {
+            assignment_targets(&b.expr, out);
+            assignment_targets(&b.low, out);
+            assignment_targets(&b.high, out);
+        }
+        ExprNode::Like(l) => {
+            assignment_targets(&l.expr, out);
+            assignment_targets(&l.pattern, out);
+        }
+        ExprNode::IsNull(i) => assignment_targets(&i.expr, out),
+        ExprNode::Case(c) => {
+            if let Some(op) = &c.operand {
+                assignment_targets(op, out);
+            }
+            for (when, then) in &c.when_then {
+                assignment_targets(when, out);
+                assignment_targets(then, out);
+            }
+            if let Some(other) = &c.else_expr {
+                assignment_targets(other, out);
+            }
+        }
+        ExprNode::Row(r) => {
+            for item in &r.exprs {
+                assignment_targets(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn subst_user_vars_in_expr(session: &Session, expr: &ExprNode) -> ExprNode {
     match expr {
         ExprNode::Column(col) if is_user_var_name(&col.name) => {
             let key = user_var_key(&col.name);
+            if ASSIGN_TARGETS.with(|cell| cell.borrow().contains(&key)) {
+                // Assigned by this statement: read the live eval-time value.
+                return ExprNode::Func(sealdb_parser::ast::expressions::FuncCallExpr {
+                    name: "__SEALDB_GETVAR".to_string(),
+                    args: vec![ExprNode::Value(
+                        sealdb_parser::ast::expressions::ValueExpr {
+                            datum: sealdb_types::Datum::Bytes(col.name.clone().into_bytes()),
+                        },
+                    )],
+                    distinct: false,
+                });
+            }
             let datum = session
                 .user_vars
                 .lock()
@@ -5854,6 +6133,18 @@ fn read_session_sysvar(session: &Session, name: &str) -> Option<String> {
     None
 }
 
+/// The host zone reported for `SYSTEM`, matching the `system_time_zone`
+/// fixture (`SHOW VARIABLES`/`@@time_zone` resolve `SYSTEM`, as TiDB does).
+const HOST_TIME_ZONE: &str = "Asia/Shanghai";
+
+fn display_time_zone(value: &str) -> String {
+    if value.eq_ignore_ascii_case("SYSTEM") {
+        HOST_TIME_ZONE.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 /// Typed session getters; `None` means the variable has no session-local state.
 fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
     Some(match name {
@@ -5871,11 +6162,17 @@ fn read_session_sysvar_typed(session: &Session, name: &str) -> Option<String> {
             .lock()
             .expect("session sql_mode lock")
             .clone(),
-        "time_zone" => session
-            .time_zone
-            .lock()
-            .expect("session time_zone lock")
-            .clone(),
+        // `@@identity` / `@@last_insert_id` report LAST_INSERT_ID() (0 before
+        // the first insert).
+        "identity" | "last_insert_id" => {
+            sealdb_expression::current_last_insert_id().to_string()
+        }
+        "time_zone" => display_time_zone(
+            &session
+                .time_zone
+                .lock()
+                .expect("session time_zone lock"),
+        ),
         "collation_connection" => session
             .collation
             .lock()
@@ -6176,7 +6473,6 @@ const SHOW_VARIABLE_DEFAULTS: &[(&str, &str, VarKind)] = &[
     ("innodb_file_format", "Barracuda", VarKind::Text),
     ("innodb_large_prefix", "ON", VarKind::Flag),
     ("interactive_timeout", "28800", VarKind::Text),
-    ("language", "", VarKind::Text),
     ("last_plan_from_binding", "OFF", VarKind::Flag),
     ("last_plan_from_cache", "OFF", VarKind::Flag),
     ("license", "Apache License 2.0", VarKind::Text),
@@ -11675,7 +11971,15 @@ mod tests {
             .execute_stmt("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .unwrap();
         session.execute_stmt("ROLLBACK").unwrap();
+        // TiDB treats `START TRANSACTION READ ONLY` as a noop gated by
+        // `tidb_enable_noop_functions` (off by default).
+        session
+            .execute_stmt("SET @@tidb_enable_noop_functions = 'ON'")
+            .unwrap();
         session.execute_stmt("START TRANSACTION READ ONLY").unwrap();
+        session
+            .execute_stmt("SET @@tidb_enable_noop_functions = 'OFF'")
+            .unwrap();
         let ro = session
             .execute_stmt("SELECT * FROM db1.t ORDER BY id")
             .unwrap();
@@ -11686,13 +11990,10 @@ mod tests {
                 vec!["2".to_string(), "b".to_string()]
             ]
         );
-        let err = session
+        // `READ ONLY` is a TiDB noop: the transaction stays writable.
+        session
             .execute_stmt("INSERT INTO db1.t VALUES (4, 'd')")
-            .unwrap_err();
-        assert_eq!(
-            err.code,
-            sealdb_errno::ERR_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
-        );
+            .unwrap();
         session.execute_stmt("ROLLBACK").unwrap();
         session
             .execute_stmt(
@@ -15090,12 +15391,10 @@ mod cte_limit_tests {
             )]
         );
         // Both header spellings work and no row means an empty result.
+        // `language` does not exist in TiDB (MySQL 5.6+ dropped it).
         assert_eq!(
             rows("SHOW VARIABLES WHERE Variable_name = 'language' OR Variable_name = 'license'"),
-            vec![
-                ("language".to_string(), String::new()),
-                ("license".to_string(), "Apache License 2.0".to_string()),
-            ]
+            vec![("license".to_string(), "Apache License 2.0".to_string())]
         );
         assert!(rows("SHOW VARIABLES LIKE 'no_such_variable'").is_empty());
         assert!(

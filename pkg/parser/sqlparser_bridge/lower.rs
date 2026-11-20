@@ -140,6 +140,8 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     // the `SHOW COLUMNS` rewrite below would otherwise consume the token.
     reject_describe_column_syntax(sql)?;
     let (rewritten, pessimistic_flags) = rewrite_begin_pessimistic(sql);
+    // MySQL `SET @v := expr`: sqlparser's SET grammar only knows `=` / `TO`.
+    let rewritten = rewrite_set_assign_operator(&rewritten);
     // TiDB `/*T![clustered_index] clustered */` → keyword before MySQL version
     // comments are expanded (the "T" comment is otherwise an ordinary comment).
     let rewritten = rewrite_tidb_clustered_comment(&rewritten);
@@ -9682,7 +9684,13 @@ fn lower_cte(cte: &Cte, recursive: bool) -> Result<CommonTableExpression> {
             // the seed and every later arm is recursive; binding then reports
             // the shadowing mismatch (errno 1054).
             let split = if split == 0 {
-                if !arm_shadows_cte(&arms[0].1, &name) {
+                // The CTE body's own `WITH` (attached to the seed below) may be
+                // what shadows the name, so the first arm's text alone cannot
+                // tell us.
+                let shadowed_by_body_with = nested_with
+                    .as_ref()
+                    .is_some_and(|with| with.find(&name).is_some());
+                if !arm_shadows_cte(&arms[0].1, &name) && !shadowed_by_body_with {
                     return Err(Error::new(
                         ERR_CTE_RECURSIVE_REQUIRES_NONRECURSIVE_FIRST,
                         format!(
@@ -11272,6 +11280,104 @@ fn is_sql_space(c: char) -> bool {
 }
 
 /// Split into statements on `;` outside quotes and comments.
+/// MySQL `SET @v := expr` (assignment operator) — sqlparser's SET grammar
+/// only accepts `=` / `TO`, so rewrite `:=` to `=` inside SET statements.
+/// `:=` in any other statement stays for the expression lowering.
+fn rewrite_set_assign_operator(sql: &str) -> String {
+    if !sql.contains(":=") {
+        return sql.to_string();
+    }
+    let stmts = split_top_level_statements(sql);
+    let mut out = String::with_capacity(sql.len());
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if idx > 0 {
+            out.push(';');
+        }
+        if statement_is_set(stmt) {
+            out.push_str(&replace_assign_operator(stmt));
+        } else {
+            out.push_str(stmt);
+        }
+    }
+    out
+}
+
+/// Whether the statement text (comments / whitespace skipped) starts with SET.
+fn statement_is_set(stmt: &str) -> bool {
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        break;
+    }
+    let rest = &stmt[i..];
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    word.eq_ignore_ascii_case("set")
+}
+
+/// Replace `:=` with `=` outside quoted strings / comments.
+fn replace_assign_operator(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                out.push(quote as char);
+                i += 1;
+                while i < bytes.len() {
+                    let ch = bytes[i];
+                    out.push(ch as char);
+                    if ch == b'\\' && quote != b'`' {
+                        if i + 1 < bytes.len() {
+                            out.push(bytes[i + 1] as char);
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    if ch == quote {
+                        if i < bytes.len() && bytes[i] == quote {
+                            out.push(quote as char);
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            b':' if bytes.get(i + 1) == Some(&b'=') => {
+                out.push('=');
+                i += 2;
+            }
+            other => {
+                out.push(other as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn split_top_level_statements(sql: &str) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
@@ -12557,6 +12663,32 @@ fn lower_expr(expr: &Expr) -> Result<ExprNode> {
             }))
         }
         Expr::BinaryOp { left, op, right } => {
+            // MySQL/TiDB assignment operator `@v := expr`. The session
+            // evaluates it per row (user variables live in an eval-time store),
+            // so it lowers to a builtin that carries the target name as a
+            // literal instead of a column reference.
+            if matches!(op, BinaryOperator::Assignment) {
+                let target = lower_expr(left)?;
+                let ExprNode::Column(col) = target else {
+                    return Err(Error::unsupported(format!("operator {op}")));
+                };
+                if col.table.is_some()
+                    || !col.name.starts_with('@')
+                    || col.name.starts_with("@@")
+                {
+                    return Err(Error::unsupported(format!("operator {op}")));
+                }
+                return Ok(ExprNode::Func(FuncCallExpr {
+                    name: "__SEALDB_ASSIGN".to_string(),
+                    args: vec![
+                        ExprNode::Value(ValueExpr {
+                            datum: Datum::Bytes(col.name.into_bytes()),
+                        }),
+                        lower_expr(right)?,
+                    ],
+                    distinct: false,
+                }));
+            }
             // MySQL JSON arrow operators: `doc -> path` = `JSON_EXTRACT(doc,
             // path)` returning JSON, `doc ->> path` additionally unquotes to a
             // string.
@@ -13342,26 +13474,13 @@ fn lower_value(value: &Value) -> Result<Datum> {
                 }
                 Ok(Datum::F64(parsed))
             } else if n.contains('.') {
-                // TiDB keeps a decimal literal's precision when the double
-                // cannot round-trip it: `20201030082133.455555` stays a DECIMAL
-                // (the nearest DOUBLE prints `20201030082133.457`), while
-                // `333.33` is exact as a DOUBLE and stays one. A trailing
-                // `.0` fraction folds to the plain double (`0.0` → `0`).
-                let parsed = n
-                    .parse::<f64>()
-                    .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))?;
-                let shortest = sealdb_types::shortest_f64(parsed);
-                let float_literal = shortest == n.as_str()
-                    || n.split_once('.').is_some_and(|(int_part, frac)| {
-                        frac.bytes().all(|b| b == b'0') && shortest == int_part
-                    });
-                if float_literal {
-                    Ok(Datum::F64(parsed))
-                } else {
-                    sealdb_types::MyDecimal::parse(n)
-                        .map(Datum::Decimal)
-                        .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
-                }
+                // TiDB lexes `D1.D2` without an exponent as a decimal literal
+                // (`decLit`), so the value stays exact: `0.5999991229316 *
+                // 0.918755041726043` keeps 17 digits instead of the double's
+                // binary rounding.
+                sealdb_types::MyDecimal::parse(n)
+                    .map(Datum::Decimal)
+                    .map_err(|e| Error::new(ERR_PARSE_ERROR, e.to_string()))
             } else if let Ok(v) = n.parse::<i64>() {
                 Ok(Datum::I64(v))
             } else if let Ok(v) = n.parse::<u64>() {
@@ -13395,7 +13514,12 @@ fn lower_value(value: &Value) -> Result<Datum> {
 /// Decode `b'0101'` bit-value digits into the minimal big-endian byte string
 /// TiDB stores (at least one byte; `b'00'` is a single `0x00` byte).
 fn bit_literal_bytes(bits: &str) -> Result<Vec<u8>> {
-    let digits = if bits.is_empty() { "0" } else { bits };
+    // `b''` is the empty binary string (TiDB `NewBinaryLiteralDatum`); only a
+    // written zero digit (`b'0'`) is one NUL byte.
+    if bits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let digits = bits;
     let value = u64::from_str_radix(digits, 2)
         .map_err(|_| Error::new(ERR_PARSE_ERROR, format!("invalid bit literal b'{bits}'")))?;
     let bytes = value.to_be_bytes();

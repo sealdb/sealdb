@@ -814,6 +814,17 @@ pub fn locate_partition_for_row(info: &TableInfo, values: &[Datum]) -> Result<i6
 }
 
 fn resolve_column(col: &ColumnNameExpr, schema: &[String], row: &[Datum]) -> Result<Datum> {
+    // Eval-time user variable read (`@v := …` statements skip plan-time
+    // substitution so reads see per-row updates).
+    if col.table.is_none() && col.name.starts_with('@') && !col.name.starts_with("@@") {
+        if let Some(value) = user_var_lookup(&col.name) {
+            return Ok(value);
+        }
+        // A variable that was never assigned reads as NULL.
+        if USER_VARS.with(|cell| cell.borrow().is_some()) {
+            return Ok(Datum::Null);
+        }
+    }
     let mut found = None;
     for (i, name) in schema.iter().enumerate() {
         if column_matches(col, name) {
@@ -909,6 +920,14 @@ fn eval_binary(expr: &BinaryOpExpr, schema: &[String], row: &[Datum]) -> Result<
     }
     if left.is_null() || right.is_null() {
         return Ok(Datum::Null);
+    }
+    // Exact-value arithmetic: a DECIMAL operand keeps the result in DECIMAL
+    // (`2.5 * 2` is `5.0`, not a floored integer). A string or DOUBLE operand
+    // makes MySQL compute in real, so those stay on the `f64` path.
+    if is_decimal_arith(&left, &right)
+        && let Some(out) = eval_decimal_binary(expr.op, &left, &right)?
+    {
+        return Ok(out);
     }
     match expr.op {
         Op::Plus => num_bin(&left, &right, |a, b| Ok(a + b), |a, b| Ok(a + b)),
@@ -1179,6 +1198,46 @@ thread_local! {
     static SESSION_TIMESTAMP: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
     /// Value returned by `LAST_INSERT_ID()` for the session.
     static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// Session user variables (`@v`), installed per statement so eval-time
+    /// reads and `@v := expr` assignments share one store. `None` outside a
+    /// statement (a bare `SELECT @v` goes through plan-time substitution).
+    static USER_VARS: RefCell<Option<std::collections::HashMap<String, Datum>>> =
+        const { RefCell::new(None) };
+}
+
+/// Run `f` with `vars` installed as the session user variables and return the
+/// (possibly updated) map afterwards.
+pub fn with_user_vars<T>(
+    vars: std::collections::HashMap<String, Datum>,
+    f: impl FnOnce() -> T,
+) -> (T, std::collections::HashMap<String, Datum>) {
+    USER_VARS.with(|cell| *cell.borrow_mut() = Some(vars));
+    let out = f();
+    let vars = USER_VARS.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (out, vars)
+}
+
+/// Eval-time `@v` read (assignment statements bypass plan-time substitution).
+fn user_var_lookup(name: &str) -> Option<Datum> {
+    USER_VARS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|vars| vars.get(&name.trim_start_matches('@').to_ascii_lowercase()).cloned())
+    })
+}
+
+/// `@v := value` — TiDB stores the value and yields it as the expression
+/// result.
+fn user_var_assign(name: &str, value: Datum) -> Datum {
+    USER_VARS.with(|cell| {
+        if let Some(vars) = cell.borrow_mut().as_mut() {
+            vars.insert(
+                name.trim_start_matches('@').to_ascii_lowercase(),
+                value.clone(),
+            );
+        }
+    });
+    value
 }
 
 /// Set the value returned by `LAST_INSERT_ID()`.
@@ -1188,6 +1247,12 @@ pub fn set_last_insert_id(value: i64) {
 
 fn last_insert_id() -> i64 {
     LAST_INSERT_ID.with(std::cell::Cell::get)
+}
+
+/// Session `LAST_INSERT_ID()` value, also read by `@@identity` /
+/// `@@last_insert_id`.
+pub fn current_last_insert_id() -> i64 {
+    last_insert_id()
 }
 
 /// Freeze (or with `None`, unfreeze) the session clock at `secs` epoch seconds.
@@ -1238,6 +1303,37 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             })?;
             eval_expr_with_row(arg, schema, row)
         }
+        // `VALUES(col)` only has meaning inside `ON DUPLICATE KEY UPDATE`,
+        // where the insert path rewrites it; elsewhere (a plain `SELECT`) it is
+        // a noop that evaluates to NULL.
+        // `@v` read in a statement that also assigns it (substitution is
+        // skipped so assignments stay per-row).
+        "__SEALDB_GETVAR" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__SEALDB_GETVAR requires 1 argument",
+                ));
+            }
+            let target = eval_expr_with_row(&func.args[0], schema, row)?;
+            let name = String::from_utf8_lossy(target.as_bytes().as_slice()).into_owned();
+            Ok(user_var_lookup(&name).unwrap_or(Datum::Null))
+        }
+        // `@v := expr`: TiDB's assignment operator. The target name travels as
+        // a literal so plan-time user-var substitution cannot consume it.
+        "__SEALDB_ASSIGN" => {
+            if func.args.len() != 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "__SEALDB_ASSIGN requires 2 arguments",
+                ));
+            }
+            let target = eval_expr_with_row(&func.args[0], schema, row)?;
+            let name = String::from_utf8_lossy(target.as_bytes().as_slice()).into_owned();
+            let value = eval_expr_with_row(&func.args[1], schema, row)?;
+            Ok(user_var_assign(&name, value))
+        }
+        "VALUES" => Ok(Datum::Null),
         "UUID" => Ok(Datum::Bytes(new_uuid().into_bytes())),
         // `LAST_INSERT_ID()` reads the session value; the one-argument form
         // sets it and returns the argument (MySQL semantics).
@@ -1470,6 +1566,59 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
                 Datum::F64(v) => Ok(Datum::F64(v.abs())),
                 other => Ok(Datum::I64(other.as_i64()?.saturating_abs())),
             }
+        }
+        // `ROUND(x[, d])`: half away from zero. A string argument makes the
+        // result a double (`ROUND('1200','1')` → 1200), a decimal keeps its
+        // decimal type at scale `d` (negative `d` rounds to tens, hundreds…).
+        "ROUND" => {
+            if func.args.is_empty() || func.args.len() > 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ROUND requires 1 or 2 arguments",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let digits = match func.args.get(1) {
+                None => 0,
+                Some(arg) => {
+                    let d = eval_expr_with_row(arg, schema, row)?;
+                    if d.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    d.as_i64()?.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                }
+            };
+            match &value {
+                Datum::F64(v) => Ok(Datum::F64(round_f64(*v, digits))),
+                Datum::Decimal(d) => Ok(Datum::Decimal(round_decimal(d, digits))),
+                Datum::Bytes(_) => Ok(Datum::F64(round_f64(value.as_f64()?, digits))),
+                Datum::I64(v) => Ok(Datum::I64(round_i64(*v, digits))),
+                Datum::U64(v) => Ok(Datum::U64(round_i64(*v as i64, digits) as u64)),
+                other => Ok(Datum::I64(round_i64(other.as_i64()?, digits))),
+            }
+        }
+        // `ELT(n, str1, str2, …)` returns the `n`-th argument unchanged
+        // (ENUM/SET keep their member index, so `elt(1,e) = 3` compares
+        // numerically).
+        "ELT" => {
+            if func.args.len() < 2 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "ELT requires at least 2 arguments",
+                ));
+            }
+            let n = eval_expr_with_row(&func.args[0], schema, row)?;
+            if n.is_null() {
+                return Ok(Datum::Null);
+            }
+            let index = n.as_i64()?;
+            if index < 1 || index as usize >= func.args.len() {
+                return Ok(Datum::Null);
+            }
+            eval_expr_with_row(&func.args[index as usize], schema, row)
         }
         "HEX" => {
             if func.args.len() != 1 {
@@ -1948,6 +2097,27 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
             };
             Ok(Datum::U64(crate::shard::hash_uint64(bits)))
         }
+        // TiDB `tidb_decode_plan(str)`: decode a base64 + snappy encoded text
+        // plan into the pretty-printed tree. Malformed input is returned
+        // unchanged (v8.5 behaviour), while the empty string decodes to empty.
+        "TIDB_DECODE_PLAN" => {
+            if func.args.len() != 1 {
+                return Err(Error::new(
+                    sealdb_errno::ERR_WRONG_ARGUMENTS,
+                    "TIDB_DECODE_PLAN requires 1 argument",
+                ));
+            }
+            let value = eval_expr_with_row(&func.args[0], schema, row)?;
+            if value.is_null() {
+                return Ok(Datum::Null);
+            }
+            let raw = value.as_bytes();
+            let encoded = String::from_utf8_lossy(raw.as_slice()).into_owned();
+            match crate::plancodec::decode_plan(&encoded) {
+                Some(text) => Ok(Datum::Bytes(text.into_bytes())),
+                None => Ok(Datum::Bytes(raw)),
+            }
+        }
         "TIDB_DECODE_BINARY_PLAN" => {
             if func.args.len() != 1 {
                 return Err(Error::new(
@@ -1994,6 +2164,56 @@ fn eval_func(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> Result<Da
 
 /// TiDB `UUID()`: a version-1 (time based) UUID; the clock sequence keeps
 /// successive calls on one node distinct.
+/// `ROUND(double, d)`: half away from zero, implemented with a power-of-ten
+/// scale (the naive `round(v*10^d)/10^d` loses precision for large `d`, so
+/// clamp the usable range).
+fn round_f64(value: f64, digits: i32) -> f64 {
+    if !value.is_finite() || digits == 0 {
+        return if digits == 0 { value.round() } else { value };
+    }
+    if digits > 0 {
+        let factor = 10f64.powi(digits);
+        if !factor.is_finite() {
+            return value;
+        }
+        return (value * factor).round() / factor;
+    }
+    let factor = 10f64.powi(-digits);
+    if !factor.is_finite() {
+        return 0.0;
+    }
+    (value / factor).round() * factor
+}
+
+/// `ROUND(int, d)`: `d >= 0` keeps the integer as-is, `d < 0` rounds the
+/// integer to a power of ten (`ROUND(150, -2)` → 200).
+fn round_i64(value: i64, digits: i32) -> i64 {
+    if digits >= 0 {
+        return value;
+    }
+    let shift = (-digits).min(18) as u32;
+    let factor = 10i64.checked_pow(shift).unwrap_or(i64::MAX);
+    let half = factor / 2;
+    let rounded = if value >= 0 {
+        (value + half) / factor * factor
+    } else {
+        (value - half) / factor * factor
+    };
+    rounded
+}
+
+/// `ROUND(decimal, d)`: `d >= 0` rounds the fractional part (TiDB keeps the
+/// decimal type, so the result is `decimal(…, d)`); `d < 0` zeroes the
+/// corresponding integer digits after rounding.
+fn round_decimal(value: &MyDecimal, digits: i32) -> MyDecimal {
+    if digits >= 0 {
+        return value.with_frac(digits);
+    }
+    let rounded = round_f64(value.to_f64().unwrap_or(0.0), digits);
+    let text = format!("{rounded:.0}");
+    MyDecimal::parse(&text).unwrap_or_else(|_| value.clone())
+}
+
 fn new_uuid() -> String {
     use std::sync::atomic::{AtomicU16, Ordering};
     static CLOCK_SEQ: AtomicU16 = AtomicU16::new(0);
@@ -2561,11 +2781,12 @@ fn time_from_yyyymmdd(n: i64) -> Option<Time> {
         year: year as u16,
         month: month as u8,
         day: day as u8,
-        hour: hour as u8,
+        hour: hour as u16,
         minute: minute as u8,
         second: second as u8,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp: TimeType::Datetime,
     })
 }
@@ -2770,7 +2991,7 @@ fn add_interval(mut t: Time, unit: &str, amount: i64, subtract: bool) -> Result<
         "HOUR" | "HOURS" => {
             let total = i64::from(t.hour) + amount;
             let days = total.div_euclid(24);
-            t.hour = total.rem_euclid(24) as u8;
+            t.hour = total.rem_euclid(24) as u16;
             if days != 0 {
                 add_days(&mut t, days)?;
             }
@@ -2861,6 +3082,7 @@ fn zero_datetime() -> Time {
         second: 0,
         micro: 0,
         fsp: 0,
+        neg: false,
         tp: TimeType::Datetime,
     }
 }
@@ -2912,19 +3134,42 @@ fn eval_date_add_sub(
     row: &[Datum],
     subtract: bool,
 ) -> Result<Datum> {
-    if func.args.len() != 3 {
-        return Err(Error::new(
-            sealdb_errno::ERR_WRONG_ARGUMENTS,
-            "DATE_ADD/DATE_SUB requires datetime, interval value, unit",
-        ));
-    }
+    // MySQL's two-argument form `ADDDATE(expr, days)` / `SUBDATE(expr, days)`
+    // is the DAY interval of `DATE_ADD` / `DATE_SUB`.
+    let (amount_index, days_form) = match func.args.len() {
+        2 => (1, true),
+        3 => (1, false),
+        _ => {
+            return Err(Error::new(
+                sealdb_errno::ERR_WRONG_ARGUMENTS,
+                "DATE_ADD/DATE_SUB requires datetime, interval value, unit",
+            ));
+        }
+    };
     let base = eval_expr_with_row(&func.args[0], schema, row)?;
     if base.is_null() {
         return Ok(Datum::Null);
     }
-    let amount = eval_expr_with_row(&func.args[1], schema, row)?.as_i64()?;
-    let unit = unit_name(&eval_expr_with_row(&func.args[2], schema, row)?)?;
-    let mut t = datum_as_time(&base)?;
+    let amount = eval_expr_with_row(&func.args[amount_index], schema, row)?.as_i64()?;
+    let unit = if days_form {
+        "DAY".to_string()
+    } else {
+        unit_name(&eval_expr_with_row(&func.args[2], schema, row)?)?
+    };
+    // An unparsable datetime argument warns 1292 and yields NULL (TiDB
+    // `builtinDateArithmeticSig` on a bad string), it does not fail the query.
+    let mut t = match datum_as_time(&base) {
+        Ok(t) => t,
+        Err(err) if err.code == sealdb_errno::ERR_TRUNCATED_WRONG_VALUE => {
+            let text = String::from_utf8_lossy(&base.as_bytes()).into_owned();
+            push_warning(
+                sealdb_errno::ERR_TRUNCATED_WRONG_VALUE,
+                format!("Incorrect datetime value: '{text}'"),
+            );
+            return Ok(Datum::Null);
+        }
+        Err(err) => return Err(err),
+    };
     if let Datum::Time(base_time) = &base {
         // Only a TIMESTAMP column is stored in UTC; DATE and DATETIME columns
         // are wall clocks and must not shift with the session time zone.
@@ -3190,7 +3435,7 @@ fn shift_minutes(t: &mut Time, minutes: i64) -> Result<()> {
     let total = i64::from(t.hour) * 60 + i64::from(t.minute) + minutes;
     let days = total.div_euclid(1440);
     let rem = total.rem_euclid(1440);
-    t.hour = (rem / 60) as u8;
+    t.hour = (rem / 60) as u16;
     t.minute = (rem % 60) as u8;
     if days != 0 {
         add_days(t, days)?;
@@ -3397,6 +3642,7 @@ fn eval_from_unixtime(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
             second: 59,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp: TimeType::Datetime,
         }));
     }
@@ -3410,6 +3656,7 @@ fn eval_from_unixtime(func: &FuncCallExpr, schema: &[String], row: &[Datum]) -> 
             second: 0,
             micro: 0,
             fsp: 0,
+            neg: false,
             tp: TimeType::Datetime,
         }));
     }
@@ -4042,6 +4289,47 @@ fn div_by_zero() -> Result<Datum> {
     }
 }
 
+/// Whether MySQL would do this operator in exact `DECIMAL` arithmetic.
+fn is_decimal_arith(left: &Datum, right: &Datum) -> bool {
+    let exact_operand = |d: &Datum| {
+        matches!(
+            d,
+            Datum::Decimal(_) | Datum::I64(_) | Datum::U64(_) | Datum::Year(_)
+        )
+    };
+    // A DOUBLE, string, bit or temporal operand makes MySQL compute in real.
+    if !exact_operand(left) || !exact_operand(right) {
+        return false;
+    }
+    matches!(left, Datum::Decimal(_)) || matches!(right, Datum::Decimal(_))
+}
+
+fn decimal_of(d: &Datum) -> Result<MyDecimal> {
+    match d {
+        Datum::Decimal(dec) => Ok(dec.clone()),
+        Datum::I64(v) => Ok(MyDecimal::from_i64(*v)),
+        Datum::U64(v) => Ok(MyDecimal::from_i64(*v as i64)),
+        Datum::Year(v) => Ok(MyDecimal::from_i64(i64::from(*v))),
+        other => MyDecimal::parse(&format!("{}", other.as_f64()?)),
+    }
+}
+
+fn eval_decimal_binary(op: Op, left: &Datum, right: &Datum) -> Result<Option<Datum>> {
+    let a = decimal_of(left)?;
+    let b = decimal_of(right)?;
+    let out = match op {
+        Op::Plus => a.checked_add(&b, false),
+        Op::Minus => a.checked_add(&b, true),
+        Op::Mul => a.checked_mul(&b),
+        Op::Div => match a.checked_div(&b, 4) {
+            Some(v) => v,
+            None => return Ok(Some(Datum::Null)),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(Datum::Decimal(out)))
+}
+
 fn num_bin(
     left: &Datum,
     right: &Datum,
@@ -4114,6 +4402,21 @@ fn numeric_prefix(s: &str) -> &str {
             end += 1;
         } else {
             break;
+        }
+    }
+    // Exponent form (`'1e800' + 1`): `e` only joins the number when at least
+    // one exponent digit follows.
+    if matches!(bytes.get(end), Some(b'e') | Some(b'E')) {
+        let mut probe = end + 1;
+        if matches!(bytes.get(probe), Some(b'+') | Some(b'-')) {
+            probe += 1;
+        }
+        let digits_start = probe;
+        while bytes.get(probe).is_some_and(u8::is_ascii_digit) {
+            probe += 1;
+        }
+        if probe > digits_start {
+            end = probe;
         }
     }
     &s[..end]

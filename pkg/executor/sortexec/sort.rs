@@ -95,10 +95,28 @@ fn eval_order_key(expr: &sealdb_parser::ast::ExprNode, schema: &[String], row: &
         if let Some(i) = idx
             && let Some(cell) = row.get(i)
         {
-            return cell.clone();
+            return enum_sort_key(cell.clone());
         }
     }
-    eval_expr_with_row(expr, schema, row).unwrap_or(Datum::Null)
+    let value = eval_expr_with_row(expr, schema, row).unwrap_or(Datum::Null);
+    // A bare ENUM column sorts by member index (`enum('c','b','a')` sorts
+    // `c < b < a`), while an expression that merely yields an ENUM value
+    // (e.g. `if(..., c_enum, c_enum)`) has a string type in TiDB and compares
+    // by label. Only direct column references keep the numeric ordering.
+    if matches!(expr, sealdb_parser::ast::ExprNode::Column(_)) {
+        enum_sort_key(value)
+    } else {
+        value
+    }
+}
+
+/// Replace a bare `ENUM` value with its member index so sorting uses the
+/// declaration order rather than the label text.
+fn enum_sort_key(cell: Datum) -> Datum {
+    match cell {
+        Datum::Enum(e) => Datum::I64(e.number as i64),
+        other => other,
+    }
 }
 
 pub(crate) fn compare_rows(

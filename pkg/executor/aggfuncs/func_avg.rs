@@ -39,6 +39,9 @@ impl AggFunc for Avg {
         }
         match v {
             Datum::F64(_) => self.float_input = true,
+            // TiDB casts ENUM to DOUBLE before AVG, so the result is a double
+            // (`avg(enum('c','b','a'))` over 1,2,3 → 2.3333333333333335).
+            Datum::Enum(_) => self.float_input = true,
             Datum::Decimal(d) => {
                 let frac = d.frac_digits();
                 self.frac = Some(self.frac.map_or(frac, |f| f.max(frac)));

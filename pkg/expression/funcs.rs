@@ -58,7 +58,7 @@ const FUNCS: &[FuncMeta] = &[
     meta("CEIL", FuncCategory::Math, 1, 1, false),
     meta("CEILING", FuncCategory::Math, 1, 1, false),
     meta("FLOOR", FuncCategory::Math, 1, 1, false),
-    meta("ROUND", FuncCategory::Math, 1, 2, false),
+    meta("ROUND", FuncCategory::Math, 1, 2, true),
     meta("SQRT", FuncCategory::Math, 1, 1, false),
     meta("POW", FuncCategory::Math, 2, 2, false),
     meta("POWER", FuncCategory::Math, 2, 2, false),
@@ -91,8 +91,10 @@ const FUNCS: &[FuncMeta] = &[
     meta("RIGHT", FuncCategory::String, 2, 2, true),
     meta("LPAD", FuncCategory::String, 3, 3, true),
     meta("RPAD", FuncCategory::String, 3, 3, true),
+    meta("ELT", FuncCategory::String, 2, -1, true),
     // info
     meta("TIDB_DECODE_BINARY_PLAN", FuncCategory::Info, 1, 1, true),
+    meta("TIDB_DECODE_PLAN", FuncCategory::Info, 1, 1, true),
     meta("VITESS_HASH", FuncCategory::Miscellaneous, 1, 1, true),
 ];
 
