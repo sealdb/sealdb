@@ -561,12 +561,16 @@ const HINTABLE_KEYWORDS: &[&str] = &[
 ///   `CREATE` / `PARTITION`, so MySQL/TiDB report a warning and ignore it.
 /// * 8061 `ErrWarnOptimizerHintUnsupportedHint` — a hint name that TiDB does
 ///   not know, reported as written.
+/// * 1815 — `INL_MERGE_JOIN(…)` / `INDEX_MERGE_JOIN(…)` with table arguments
+///   is deprecated: TiDB emits `ErrInternal` 1815 and drops the hint
+///   (`hint.go` `case HintINLMJ`).
 ///
 /// Warnings are generated during parsing in TiDB, so they precede any
 /// execution warning of the same statement.
 pub fn hint_warnings(text: &str) -> Vec<(i32, String)> {
     const WRONG_POS: i32 = 8066;
     const UNSUPPORTED: i32 = 8061;
+    const INDEX_MERGE_JOIN_DEPRECATED: i32 = 1815;
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -586,7 +590,7 @@ pub fn hint_warnings(text: &str) -> Vec<(i32, String)> {
                     .to_string(),
             ));
         } else {
-            for name in hint_names_in_block(inner) {
+            for (name, has_args) in hint_items_in_block(inner) {
                 if !KNOWN_HINT_NAMES
                     .iter()
                     .any(|known| known.eq_ignore_ascii_case(&name))
@@ -594,6 +598,15 @@ pub fn hint_warnings(text: &str) -> Vec<(i32, String)> {
                     out.push((
                         UNSUPPORTED,
                         format!("Optimizer hint {name} is not supported by TiDB and is ignored"),
+                    ));
+                } else if has_args
+                    && (name.eq_ignore_ascii_case("inl_merge_join")
+                        || name.eq_ignore_ascii_case("index_merge_join"))
+                {
+                    out.push((
+                        INDEX_MERGE_JOIN_DEPRECATED,
+                        "The INDEX MERGE JOIN hint is deprecated for usage, try other hints."
+                            .to_string(),
                     ));
                 }
             }
@@ -635,10 +648,12 @@ fn hint_block_follows_hintable_keyword(prefix: &str) -> bool {
         .any(|kw| kw.eq_ignore_ascii_case(token))
 }
 
-/// Hint names of one `/*+ … */` body, in source order. Each comma-separated
+/// Hint items of one `/*+ … */` body, in source order: each comma-separated
 /// item starts with its name (`use_index(t1 idx)`); the optional query-block
-/// name (`@qb use_index(…)`) precedes it.
-fn hint_names_in_block(inner: &str) -> Vec<String> {
+/// name (`@qb use_index(…)`) precedes it. The flag reports whether the item
+/// carries arguments: TiDB's `Hint.Tables` is only non-nil for `hint(…)`,
+/// which the deprecated `INL_MERGE_JOIN` warning keys on.
+fn hint_items_in_block(inner: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut item = String::new();
     let mut depth = 0i32;
@@ -665,17 +680,24 @@ fn hint_names_in_block(inner: &str) -> Vec<String> {
                 item.push(ch);
             }
             ',' if depth == 0 => {
-                push_hint_name(&item, &mut out);
+                push_hint_item(&item, &mut out);
                 item.clear();
             }
             _ => item.push(ch),
         }
     }
-    push_hint_name(&item, &mut out);
+    push_hint_item(&item, &mut out);
     out
 }
 
-fn push_hint_name(item: &str, out: &mut Vec<String>) {
+fn push_hint_item(item: &str, out: &mut Vec<(String, bool)>) {
+    if let Some(name) = hint_item_name(item) {
+        out.push(name);
+    }
+}
+
+/// Hint name plus whether an argument list follows it (`name(…)`).
+fn hint_item_name(item: &str) -> Option<(String, bool)> {
     let mut rest = item.trim_start();
     if rest.starts_with('@') {
         // `@qb_name hint_name(…)`
@@ -688,9 +710,11 @@ fn push_hint_name(item: &str, out: &mut Vec<String>) {
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
         .unwrap_or(rest.len());
-    if end >= 2 {
-        out.push(rest[..end].to_string());
+    if end < 2 {
+        return None;
     }
+    let has_args = rest[end..].trim_start().starts_with('(');
+    Some((rest[..end].to_string(), has_args))
 }
 
 /// Attach TiDB-style original select-list texts for projection naming.
@@ -14964,6 +14988,24 @@ mod hint_warning_tests {
         assert!(codes("select /*+ use_index(t idx) */ * from t").is_empty());
         assert!(codes("select /*+ qb_name(qb t) order_index(t@qb idx) */ * from t").is_empty());
         assert!(codes("select count(*) from t").is_empty());
+    }
+
+    #[test]
+    fn flags_deprecated_index_merge_join_with_tables() {
+        // TiDB `hint.go` `case HintINLMJ`: table arguments → warning 1815 and
+        // the hint is dropped; a bare `/*+ INL_MERGE_JOIN */` stays silent.
+        let warnings = hint_warnings("select /*+ inl_merge_join(t1, t2) */ * from t1, t2");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].0, 1815);
+        assert_eq!(
+            warnings[0].1,
+            "The INDEX MERGE JOIN hint is deprecated for usage, try other hints."
+        );
+        assert_eq!(
+            codes("select /*+ index_merge_join(t1@qb, t2) */ * from t1, t2"),
+            vec![1815]
+        );
+        assert!(codes("select /*+ inl_merge_join */ * from t1, t2").is_empty());
     }
 }
 
