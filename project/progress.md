@@ -3350,10 +3350,15 @@ tools/oracle parse         -> SELECT `id`,`name` FROM `users` WHERE `id`=1
 - **附带修复**:
   - 本地 TiKV 全量 gate 卡死的根因定位为 store 膨胀到 51 GB（tombstone 与失效
     region 引发持续 `skip invalid split key`），清空 `/tmp/sealdb-pd-tikv` 重启全新
-    单节点集群后全量 gate 从「30+ 分钟无输出」降到 4 分半；已写入 status-report。
+    单节点集群后全量 gate 从「30+ 分钟无输出」降到 4 分半（实测每轮全量 gate 增长
+    约 20 GB，23 GB 时耗时已升到 8 分钟）；已写入 status-report。
 - **下一步**:
-  - 继续 R7 `executor/index_lookup_*`（`index_lookup_join` /
-    `index_lookup_merge_join` / `index_lookup_pushdown`）与 `planner/core/indexjoin`。
+  - 进行中的 `executor/index_lookup_merge_join`：`INL_MERGE_JOIN` 弃用告警（1815）
+    已对齐，剩余差异集中在分区表上的 INL 计划形状（static 模式
+    `PartitionUnion` 构建侧/探针侧、分区统计回退 10000 行 `stats:pseudo`、
+    `IndexHashJoin` 命名与 `Projection` 包裹）。
+  - 之后继续 R7 `executor/index_lookup_*`（`index_lookup_join` /
+    `index_lookup_pushdown`）与 `planner/core/indexjoin`。
 
 ### 2026-11-21（`ddl/affinity` 转正：`AFFINITY` 选项、分区运维拦截与 `SHOW CREATE` 形状）
 
